@@ -52,7 +52,7 @@ async fn define_only(dsn: &str) -> Trellis {
     .expect("connect a define-only Trellis")
 }
 
-/// The whole engine: intake, the maintenance loop (the only discharger of
+/// The whole engine: capture, the maintenance loop (the only discharger of
 /// backfill markers) and drain threads.
 async fn running(dsn: &str) -> Trellis {
     Trellis::connect(
@@ -159,7 +159,6 @@ async fn wait_until_held(raw: &Client, key: i64) {
 async fn seed_sales(raw: &Client) {
     raw.batch_execute(
         "create table public.sales (id integer primary key, sku text, amount integer); \
-         alter table public.sales replica identity full; \
          insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
     )
     .await
@@ -230,7 +229,6 @@ async fn a_chunked_build_is_live_only_with_a_change_drained_during_it_folded_in(
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, a integer); \
-         alter table public.orders replica identity full; \
          insert into public.orders values (1, 1), (2, 2)",
     )
     .await
@@ -293,7 +291,7 @@ async fn a_chunked_build_is_live_only_with_a_change_drained_during_it_folded_in(
 
 /// A ring enumeration whose source is another definition's target (an
 /// aggregate's, which has no primary key to chunk by). That target is never
-/// published: only the target-mutation seam carries its writes, and only to
+/// captured: only the target-mutation seam carries its writes, and only to
 /// a reader that is already applying. So the chained definition applies from
 /// its enumeration on but reports `live` only once the catch-up on its
 /// source has run. At `live`, a change upstream is reflected downstream once
@@ -416,7 +414,6 @@ async fn a_chunked_row_deleted_during_its_build_is_gone_at_live() {
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, a integer); \
-         alter table public.orders replica identity full; \
          insert into public.orders values (1, 1), (2, 2), (3, 3)",
     )
     .await

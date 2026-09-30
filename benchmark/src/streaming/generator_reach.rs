@@ -1,6 +1,6 @@
 //! The load generator's own reach (issue #276): [`run_parallel_load`] at
 //! [`Pace::Max`] against a plain source table with **no engine running** —
-//! no client, no replication slot, nothing decoding the WAL.
+//! no client, no capture triggers, nothing draining the staging ring.
 //!
 //! This validates the instrument rather than measuring Trellis. A throughput
 //! scenario can only report an engine ceiling below the rate the generator

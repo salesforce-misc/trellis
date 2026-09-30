@@ -92,8 +92,7 @@ const SOURCE_DDL: &str = "create table s ( \
      tmtz timetz, \
      iv interval, \
      n numeric \
-   ); \
-   alter table s replica identity full";
+   )";
 
 fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -317,7 +316,7 @@ async fn the_text_stability_verdict_is_the_server_s_not_this_crate_s() {
         // Trellis couldn't pin until issue #246
         // (`timestamptz_text_moves_with_the_session_timezone` below still
         // demonstrates the underlying hazard `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`
-        // now defends against on both the pool and the walsender). Both
+        // now defends against on the pool and in the capture function). Both
         // fixes landed, which is why both families are admitted today.
         //
         // So admission is the conjunction, and this asserts the conjunction
@@ -1277,14 +1276,7 @@ async fn temporal_join_keys_are_admitted_per_family() {
              create table p_iv (k interval primary key); \
              create table child ( \
                id bigint primary key, d date, ts timestamp, tm time, \
-               tmtz timetz, tstz timestamptz, iv interval); \
-             alter table child replica identity full; \
-             alter table p_date replica identity full; \
-             alter table p_ts replica identity full; \
-             alter table p_tm replica identity full; \
-             alter table p_tmtz replica identity full; \
-             alter table p_tstz replica identity full; \
-             alter table p_iv replica identity full",
+               tmtz timetz, tstz timestamptz, iv interval)",
         )
         .await
         .expect("create relationship tables");
@@ -1303,9 +1295,8 @@ async fn temporal_join_keys_are_admitted_per_family() {
         // `timestamptz` used to be refused for a *second*, independent
         // reason on top of the `to_jsonb` one above: its rendering moved
         // with `TimeZone`, and issue #113 could pin that on the pool but
-        // not on the walsender. Issue #246 closed that gap
-        // (`pgwire_replication::ReplicationConfig::with_options`), so
-        // `timestamptz` joins the accepted group too.
+        // not on the walsender. Issue #246 closed that gap, so `timestamptz`
+        // joins the accepted group too.
         ("r_tstz", "tstz", "p_tstz"),
     ] {
         create_relationship(
@@ -1374,9 +1365,7 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
     client
         .batch_execute(
             "create table p3 (k timetz(2) primary key); \
-             create table c3 (id bigint primary key, k timetz(2)); \
-             alter table c3 replica identity full; \
-             alter table p3 replica identity full",
+             create table c3 (id bigint primary key, k timetz(2))",
         )
         .await
         .expect("create modified-precision tables");
@@ -1590,8 +1579,7 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
     client
         .batch_execute(
             "create table shifts ( \
-               id integer primary key, crew integer, worked interval, on_day date); \
-             alter table shifts replica identity full",
+               id integer primary key, crew integer, worked interval, on_day date)",
         )
         .await
         .expect("create source table");
@@ -1718,7 +1706,7 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
         .await
         .expect("seed source rows");
     // The staged images carry `interval_out`'s **canonical** spelling,
-    // because that is what a real walsender emits — `'24 hours'` reaches
+    // because that is what a capture trigger renders — `'24 hours'` reaches
     // the engine as `24:00:00`. Staging the input spelling instead would
     // be testing a shape CDC cannot produce.
     for (key, crew, worked, day) in [
@@ -1863,8 +1851,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp timestamp, amount numeric); \
-             alter table events replica identity full",
+               id integer primary key, grp timestamp, amount numeric)",
         )
         .await
         .expect("create source table");

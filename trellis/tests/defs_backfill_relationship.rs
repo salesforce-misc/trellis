@@ -134,8 +134,6 @@ async fn setup(db: &testkit::TestDatabase) -> TransformDef {
             "create table authors (id integer primary key, name text); \
              create table posts (id integer primary key, author_id integer, words integer); \
              create table comments (id integer primary key, author_id integer); \
-             alter table posts replica identity full; \
-             alter table comments replica identity full; \
              insert into authors (id, name) values (1, 'a'), (2, 'b'), (3, 'c'); \
              insert into posts (id, author_id, words) values \
                (100, 1, 10), (101, 1, 20), (102, 2, null); \

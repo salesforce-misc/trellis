@@ -51,7 +51,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "oneone_deleted_target_test_backfill_worker";
@@ -197,19 +197,15 @@ const ORDER_VIEW: &str =
 const CUSTOMER_TOTALS: &str =
     "TRANSFORM customer_totals FROM order_view GROUP BY customer SELECT sum(amt) AS total";
 
-/// `orders` needs `REPLICA IDENTITY FULL` because `order_view` is a plain
-/// mirror of it and this harness stages hand-built CDC rows carrying old
-/// images directly; `order_view` needs it once `customer_totals` chains onto
-/// it (an aggregate source's replica identity must support recovering an old
-/// row image — `catalog::assert_replica_identity_supports_aggregate`), and
-/// can only be widened after `install_definition` has created it.
+/// `order_view` is a plain mirror of `orders`, and this harness stages
+/// hand-built CDC rows carrying old images directly; `customer_totals`
+/// chains onto `order_view` as an aggregate.
 async fn create_schema(client: &Client) {
     client
         .batch_execute(
             "create table orders ( \
                  id integer primary key, customer text, amount integer \
              ); \
-             alter table orders replica identity full; \
              insert into orders (id, customer, amount) values \
                (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), (4, 'c', 11)",
         )
@@ -248,11 +244,6 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
         .expect("install the 1-1 order_view mirror");
     drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
-
-    client
-        .batch_execute("alter table order_view replica identity full")
-        .await
-        .expect("widen order_view's replica identity");
 
     install_definition(&db.pool, CUSTOMER_TOTALS, &order_view_columns(), "public")
         .await

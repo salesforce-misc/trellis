@@ -5,7 +5,7 @@
 //!
 //! A plain (non-relationship) 1-1 definition's PK-range chunks are not run
 //! back-to-back in one call: once the definition's capture point has passed,
-//! the backfill discharge (`intake::publication::run_pending_backfills`,
+//! the backfill discharge (`intake::markers::run_pending_backfills`,
 //! ADR-0016) plans the same boundaries [`super::backfill::plan_one_to_one_chunks`]
 //! always computed and [`dispatch_one_to_one`] persists each as a row in the
 //! `backfill_chunks` table (`V20__backfill_chunks.sql`), in the discharge's own
@@ -578,7 +578,7 @@ pub async fn release_chunk(
 /// discharge** (ADR-0016, issue #419), in one transaction: the job row is
 /// deleted, the definition moves `backfilling` -> `waiting_to_backfill`, and
 /// its source's marker is re-parked carrying the failure as its retry state
-/// (`intake::publication::park_failed_build`). The marker's backoff (issue
+/// (`intake::markers::park_failed_build`). The marker's backoff (issue
 /// #407) then paces the retry, rather than a drain worker re-running a
 /// whole-table build as fast as it can fail, and [`crate::Trellis::status`]
 /// reports the error through the marker like any failed discharge. The
@@ -645,8 +645,7 @@ pub async fn fail_chunk(
         .await?;
         let source_table: String = row.get(2);
         let attempts = row.get::<_, i32>(1).saturating_add(1);
-        crate::intake::publication::park_failed_build(&*txn, &source_table, attempts, error)
-            .await?;
+        crate::intake::markers::park_failed_build(&*txn, &source_table, attempts, error).await?;
         tracing::info!(
             definition_id = chunk.definition_id,
             from = %TransformStatus::Backfilling.as_str(),
@@ -838,8 +837,8 @@ async fn run_direct_build(
 /// `aggregate_extinct_horizon`) to the WAL insert position after its direct
 /// build read the source. The build is a live `GROUP BY` read, and it writes
 /// no row for a group it found empty, so a delta for such a group that drains
-/// after the definition goes live (the build runs after its source joined the
-/// publication, so a commit it read is streamed too) is judged against this
+/// after the definition goes live (the build runs after its source's capture
+/// was installed, so a commit it read is captured too) is judged against this
 /// value, the same way a delta on a group a forced recompute found empty is.
 /// Raising a horizon is always safe: the worst it does is send a delta to
 /// the re-deriving path.
@@ -1658,8 +1657,6 @@ mod tests {
         // target is applying, so `create_relationship` accepts it.
         raw.batch_execute(
             "create table public.reports (id bigint primary key, oid bigint); \
-             alter table public.reports replica identity full; \
-             alter table public.order_doubles replica identity full; \
              insert into public.reports values (1, 1)",
         )
         .await

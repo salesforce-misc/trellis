@@ -23,9 +23,10 @@
 //!   `TimeZone`, `bytea_output`, `IntervalStyle` and `extra_float_digits`
 //!   (#565 E3). Literals in the body never contain a backslash, so
 //!   `standard_conforming_strings` can't change their meaning either.
-//! - **It renders a value the way intake does.** `format('%s', col)` calls
-//!   the type's output function, which is what `pgoutput` sends and what
-//!   `intake::tuple_to_json` writes. `::text` is not the same: for example,
+//! - **It renders a value with the type's output function.** That is what
+//!   `format('%s', col)` calls, and what the rest of Trellis compares a
+//!   value's text against; `tests/capture_parity.rs` pins it against a golden
+//!   fixture. `::text` is not the same: for example,
 //!   it strips `char(n)` padding. A `NULL` stays a JSON `null`, because
 //!   `format('%s', NULL)` is an empty string.
 //! - **It reads the active slot the way every ring writer must** (#597): from
@@ -97,7 +98,7 @@ const MAX_PAIRS_PER_BUILD: usize = 50;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureSpec {
     /// The captured table's unquoted `schema.table` identity, the same
-    /// spelling `intake::publication::qualify` builds and the ring's
+    /// spelling `intake::markers::qualify` builds and the ring's
     /// `src_table` holds.
     table: String,
     /// The primary key's columns, in the key's declared order
@@ -107,9 +108,9 @@ pub struct CaptureSpec {
     columns: Vec<String>,
     /// The columns whose values make up the ring's `group_key` (every
     /// outbound relationship's `from_col`, #133), in the table's physical
-    /// column order. The order is load-bearing: `intake::touched_group_key`
-    /// collects values in `pgoutput`'s column order, so the array's element
-    /// order matches only if this does.
+    /// column order. The order is load-bearing: it is the element order every
+    /// ring row's `group_key` array has had (issue #133), and a reader
+    /// comparing arrays relies on it.
     group_key: Vec<String>,
 }
 
@@ -786,11 +787,10 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
     }
 }
 
-/// `alias`'s ring key: `intake::extract_key`'s encoding. A single-column key
-/// is the column's text verbatim; a composite key joins its parts, each with
-/// #200's separator escape, on U+001F in declared order
-/// ([`crate::defs::ddl::join_pk_key`]). Primary-key columns are never `NULL`,
-/// so #110's null encoding never applies.
+/// `alias`'s ring key. A single-column key is the column's text verbatim; a
+/// composite key joins its parts, each with #200's separator escape, on
+/// U+001F in declared order ([`crate::defs::ddl::join_pk_key`]). Primary-key
+/// columns are never `NULL`, so #110's null encoding never applies.
 fn key_expr(spec: &CaptureSpec, alias: &str) -> String {
     let parts: Vec<String> = spec
         .key
@@ -810,12 +810,12 @@ fn key_expr(spec: &CaptureSpec, alias: &str) -> String {
     }
 }
 
-/// One column's value as intake renders it: the output function's text, or
-/// `NULL`.
+/// One column's value as an image carries it: the output function's text,
+/// or `NULL`.
 ///
 /// The null test is `num_nulls`, not `IS NULL`. On a composite value `IS
 /// NULL` is also true when every field is null, so `ROW(NULL, NULL)` would be
-/// imaged as `NULL` where `pgoutput` sends its text, `(,)`. `num_nulls` asks
+/// imaged as `NULL` where its output function prints `(,)`. `num_nulls` asks
 /// only whether the value itself is null, for every type.
 fn value_text(alias: &str, column: &str) -> String {
     let col = format!("{alias}.{}", quote_ident(column));
@@ -849,8 +849,8 @@ fn group_key_array(spec: &CaptureSpec, alias: &str) -> String {
 }
 
 /// The ring's `group_key` for rows drawn from `aliases` (old before new):
-/// `intake::touched_group_key`'s union of every non-null group-key value, in
-/// first-seen order, or `NULL` when there are none.
+/// the union of every non-null group-key value, in first-seen order, or
+/// `NULL` when there are none.
 fn group_key_expr(spec: &CaptureSpec, aliases: &[&str], render: Render) -> String {
     if spec.group_key.is_empty() {
         return "null::text[]".to_string();

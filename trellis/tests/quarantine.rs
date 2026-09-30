@@ -236,7 +236,7 @@ async fn poison_marker_exists(client: &Client, src_table: &str, key: &str) -> bo
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // Issue #132: a throwaway, always-caught-up watermark — no live
-    // `Intake` runs in this test file, and it isn't exercising guard (a).
+    // capture runs in this test file, and it isn't exercising guard (a).
     apply::drain_once(
         pool,
         seg_seq,
@@ -669,7 +669,7 @@ async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_hal
         .await
         .expect("create source table with a composite primary key");
     // Seeded before `create_definition` so its own initial backfill
-    // enumeration (`intake::publication::enumerate_and_append`) stages this
+    // enumeration (`intake::markers::enumerate_and_append`) stages this
     // row as a `Recompute` into the ring, exercising the same
     // `staging::apply` drain path (pre-lock/upsert, no-op-suppression, key
     // decoding) every other scenario in this file drives.
@@ -850,8 +850,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     // Shape 3: an aggregate over an ordinary table keyed on `numeric`.
     client
         .batch_execute(
-            "create table ledger (entry_id numeric primary key, account text, cents integer); \
-             alter table ledger replica identity full",
+            "create table ledger (entry_id numeric primary key, account text, cents integer)",
         )
         .await
         .expect("create source table with a numeric primary key");
@@ -878,10 +877,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     // upstream itself is fine: its source is integer-keyed, and `numeric` is
     // an admitted `GROUP BY` key type.
     client
-        .batch_execute(
-            "create table sales (id integer primary key, price numeric, qty integer); \
-             alter table sales replica identity full",
-        )
+        .batch_execute("create table sales (id integer primary key, price numeric, qty integer)")
         .await
         .expect("create integer-keyed source table");
     let sales_columns: HashMap<String, ValueType> = [
@@ -901,11 +897,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     )
     .await
     .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
-    client
-        .batch_execute("alter table price_totals replica identity full")
-        .await
-        .expect("widen price_totals's replica identity");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     let price_totals_columns: HashMap<String, ValueType> =
         [("price", ValueType::Numeric), ("units", ValueType::Numeric)]
             .into_iter()
@@ -1176,8 +1168,7 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
-             alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -2517,8 +2508,7 @@ async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
-             alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");

@@ -204,9 +204,7 @@ async fn bit_and_varbit_join_keys_and_primary_keys_are_admitted() {
         client
             .batch_execute(&format!(
                 "create table parent (k {pg_decl} primary key); \
-                 create table child (id bigint primary key, k {pg_decl}); \
-                 alter table child replica identity full; \
-                 alter table parent replica identity full"
+                 create table child (id bigint primary key, k {pg_decl})"
             ))
             .await
             .expect("create relationship tables");
@@ -593,8 +591,7 @@ async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two(
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp bit varying, amount numeric); \
-             alter table events replica identity full",
+               id integer primary key, grp bit varying, amount numeric)",
         )
         .await
         .expect("create source table");

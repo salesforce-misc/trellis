@@ -804,7 +804,6 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let index_start = Instant::now();
     raw.batch_execute(&format!(
         "alter table public.{SOURCE} add primary key (id); \
-         alter table public.{SOURCE} replica identity full; \
          analyze public.{SOURCE};"
     ))
     .await

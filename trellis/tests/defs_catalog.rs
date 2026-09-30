@@ -17,7 +17,7 @@ use trellis::defs::{
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     loop {
@@ -81,19 +81,13 @@ async fn create_bare_source_table(pool: &trellis::pool::Pool, name: &str) {
 /// A table usable as either endpoint of a relationship declared by
 /// [`create_relationship`] (issue #65's `all_source_tables` tests): `id` is
 /// a serial primary key, suitable as a relationship's unique `to_col`
-/// (cardinality `ToOne`, avoiding the to-many replica-identity requirement
-/// these tests don't care about); `fk_col` is a plain, non-unique integer
-/// column of the same type family, suitable as a relationship's `from_col`.
-/// `REPLICA IDENTITY FULL` unconditionally (issue #129, epic #127): several
-/// of this file's tests chain this table as the to-side of a to-one
-/// relationship, which now requires it regardless of whether the table is
-/// used as a from-side or to-side in any given test — harmless either way.
+/// (cardinality `ToOne`); `fk_col` is a plain, non-unique integer column of
+/// the same type family, suitable as a relationship's `from_col`.
 async fn create_bare_relationship_table(pool: &trellis::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
         .batch_execute(&format!(
-            "create table {name} (id serial primary key, fk_col integer); \
-             alter table {name} replica identity full"
+            "create table {name} (id serial primary key, fk_col integer)"
         ))
         .await
         .expect("create bare relationship table");
@@ -1318,7 +1312,7 @@ async fn all_source_tables_does_not_leak_relationships_unreachable_from_any_tran
 /// assumed `target_schema`), while the real, registered source lives in
 /// `custom`, named explicitly via `FROM custom.orders`. If the bare-suffix
 /// bug were still present, this would return `public.orders` (the decoy) —
-/// exactly the wrong table a publication reconcile would then add.
+/// exactly the wrong table capture would then install its trigger on.
 #[tokio::test]
 async fn all_source_tables_returns_the_actual_schema_not_a_target_schema_guess() {
     let cluster = TestCluster::start();
@@ -1438,102 +1432,16 @@ async fn create_authors_and_posts(pool: &trellis::pool::Pool) {
         .expect("seed authors and posts");
 }
 
-/// Issue #47: a 1-1 transform (`posts_calc`) against `posts` must succeed
-/// regardless of `posts`'s replica identity — [`KeySpace::OneToOne`]
-/// derivations are a pure function of the *current* row and never need an
-/// old image.
+/// Issue #47: an aggregate (`GROUP BY`) transform's delta maintenance needs
+/// the source row's old image on delete/update/re-parent to find which group
+/// to decrement. The capture trigger sees every column of the old row
+/// whatever the table's settings, so an aggregate over a plain table is
+/// accepted as is.
 #[tokio::test]
-async fn a_one_to_one_transform_succeeds_regardless_of_replica_identity() {
+async fn an_aggregate_transform_on_a_plain_table_is_accepted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_authors_and_posts(&db.pool).await;
-
-    let source_columns: HashMap<String, ValueType> =
-        HashMap::from([("author".to_string(), ValueType::Numeric)]);
-
-    create_definition(
-        &db.pool,
-        "TRANSFORM posts_calc FROM posts SELECT author AS author",
-        &source_columns,
-    )
-    .await
-    .expect("a 1-1 transform needs no old image, so it must succeed at default replica identity");
-}
-
-/// Issue #47's exact repro: an aggregate (`GROUP BY`) transform's
-/// delta-maintenance path (`apply_aggregate.rs`) needs the source row's old
-/// image on delete/update/re-parent to find which group to decrement — a
-/// requirement `defs::catalog::create_definition` never checked, so defining
-/// `posts_totals` (`GROUP BY author`) against `posts` at its default (PK-only)
-/// replica identity must be rejected at define time, naming the exact `ALTER
-/// TABLE posts REPLICA IDENTITY FULL;` fix — not silently accepted only to
-/// corrupt totals later on a delete or non-key update.
-#[tokio::test]
-async fn an_aggregate_transform_against_default_replica_identity_is_rejected() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_authors_and_posts(&db.pool).await;
-
-    let source_columns: HashMap<String, ValueType> =
-        HashMap::from([("author".to_string(), ValueType::Numeric)]);
-
-    // The 1-1 transform above is unaffected by `posts`'s replica identity
-    // and should still succeed even though the aggregate attempt below will
-    // be rejected.
-    create_definition(
-        &db.pool,
-        "TRANSFORM posts_calc FROM posts SELECT author AS author",
-        &source_columns,
-    )
-    .await
-    .expect("1-1 transform should succeed regardless of replica identity");
-
-    let err = create_definition(
-        &db.pool,
-        "TRANSFORM posts_totals FROM posts GROUP BY author SELECT author AS author, \
-         COUNT(*) AS post_count",
-        &source_columns,
-    )
-    .await
-    .unwrap_err();
-
-    match &err {
-        CatalogError::ReplicaIdentityRequired(_) => {}
-        other => panic!("expected ReplicaIdentityRequired, got {other:?}"),
-    }
-    let message = err.to_string();
-    assert!(
-        message.contains("ALTER TABLE posts REPLICA IDENTITY FULL;"),
-        "expected the exact ALTER TABLE fix in the error message, got: {message}"
-    );
-
-    // The rejected attempt must not have left a row behind.
-    let subscribers = transforms_for_source(&db.pool, &qualified("posts"))
-        .await
-        .expect("query mapping");
-    assert_eq!(
-        subscribers.len(),
-        1,
-        "only posts_calc should be registered; posts_totals must not have been persisted"
-    );
-    assert_eq!(subscribers[0].def.target, "posts_calc");
-}
-
-/// Issue #47: the same aggregate definition succeeds once `posts` has
-/// `REPLICA IDENTITY FULL`, which puts every column (including `author`) into
-/// delete/update pre-images.
-#[tokio::test]
-async fn an_aggregate_transform_against_replica_identity_full_is_accepted() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_authors_and_posts(&db.pool).await;
-    {
-        let client = db.pool.get().await.expect("get connection");
-        client
-            .batch_execute("alter table posts replica identity full")
-            .await
-            .expect("set replica identity full");
-    }
 
     let source_columns: HashMap<String, ValueType> =
         HashMap::from([("author".to_string(), ValueType::Numeric)]);
@@ -1545,126 +1453,19 @@ async fn an_aggregate_transform_against_replica_identity_full_is_accepted() {
         &source_columns,
     )
     .await
-    .expect("aggregate transform with REPLICA IDENTITY FULL should be accepted");
+    .expect("an aggregate transform on a plain table should be accepted");
 }
 
-/// Reviewer follow-up to issue #76: `assert_replica_identity_supports_aggregate`
-/// (issue #47's guard, in `create_definition_inner`) used to check
-/// `def.source` *bare* against `pg_class` via `to_regclass`'s own
-/// `search_path` walk — running before `qualified_source` resolution a few
-/// lines later, and never consulting `def.explicit_source_schema` at all.
-/// For an aggregate definition with an explicit `FROM <schema>.<source>`,
-/// that meant the check could silently examine the wrong relation whenever a
-/// same-named table also existed earlier on `search_path`.
-///
-/// This is the dangerous direction: a decoy `orders` (landed in the
-/// Trellis-pinned schema, first on `search_path` — see
-/// `create_bare_source_table`'s own doc comment) has `REPLICA IDENTITY
-/// FULL`, but the *real*, explicitly-qualified source `custom.orders` is
-/// left at the default (PK-only) identity. A bare `to_regclass` lookup would
-/// resolve to the decoy and wrongly *accept* this aggregate, silently
-/// reintroducing issue #47's aggregate-corruption bug (delta-maintenance
-/// can't recover the old row image on delete/non-key update) through this
-/// issue's own new grammar. Checking the real, qualified source must instead
-/// reject it.
+/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): a
+/// bare aggregate `FROM t` chained off a *different* definition's target
+/// that was explicitly qualified into a non-default schema. `custom` is
+/// nowhere on this pool's pinned `search_path`
+/// (`Config::schema`/`Config::target_schema`/`public`), so a bare
+/// `to_regclass("t")` finds nothing: the definition must resolve `t` to def
+/// A's `custom.t` rather than fail with an opaque `Db(Error{kind: RowCount})`.
 #[tokio::test]
-async fn an_aggregate_against_an_explicitly_qualified_source_is_rejected_despite_a_full_identity_decoy()
- {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create table orders (id serial primary key, customer integer not null); \
-             alter table orders replica identity full; \
-             create schema custom; \
-             create table custom.orders (id serial primary key, customer integer not null)",
-        )
-        .await
-        .expect("seed decoy orders (FULL) and real custom.orders (default)");
-
-    let source_columns: HashMap<String, ValueType> =
-        HashMap::from([("customer".to_string(), ValueType::Numeric)]);
-
-    let err = create_definition(
-        &db.pool,
-        "TRANSFORM order_totals FROM custom.orders GROUP BY customer SELECT customer AS customer, \
-         COUNT(*) AS order_count",
-        &source_columns,
-    )
-    .await
-    .unwrap_err();
-
-    match &err {
-        CatalogError::ReplicaIdentityRequired(_) => {}
-        other => panic!("expected ReplicaIdentityRequired, got {other:?}"),
-    }
-
-    let count: i64 = client
-        .query_one("select count(*) from transform_definitions", &[])
-        .await
-        .expect("count definitions")
-        .get(0);
-    assert_eq!(
-        count, 0,
-        "the wrongly-would-be-accepted definition must not persist"
-    );
-}
-
-/// The mirror of the test above: the real, explicitly-qualified source
-/// `custom.orders` has `REPLICA IDENTITY FULL`, while a same-named decoy
-/// `orders` (Trellis-pinned schema, first on `search_path`) is left at the
-/// default identity. A bare `to_regclass` lookup would resolve to the decoy
-/// and wrongly *reject* this otherwise-legitimate aggregate. Checking the
-/// real, qualified source must instead accept it.
-#[tokio::test]
-async fn an_aggregate_against_an_explicitly_qualified_source_is_accepted_despite_a_default_identity_decoy()
- {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create table orders (id serial primary key, customer integer not null); \
-             create schema custom; \
-             create table custom.orders (id serial primary key, customer integer not null); \
-             alter table custom.orders replica identity full",
-        )
-        .await
-        .expect("seed decoy orders (default) and real custom.orders (FULL)");
-
-    let source_columns: HashMap<String, ValueType> =
-        HashMap::from([("customer".to_string(), ValueType::Numeric)]);
-
-    create_definition(
-        &db.pool,
-        "TRANSFORM order_totals FROM custom.orders GROUP BY customer SELECT customer AS customer, \
-         COUNT(*) AS order_count",
-        &source_columns,
-    )
-    .await
-    .expect(
-        "aggregate against the explicitly-qualified custom.orders (REPLICA IDENTITY FULL) \
-         must be accepted even though a same-named decoy lacks it",
-    );
-}
-
-/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
-/// unlike the two tests above (an aggregate whose *own* `FROM` is explicitly
-/// schema-qualified), this covers a bare aggregate `FROM t` chained off a
-/// *different* definition's target that was explicitly qualified into a
-/// non-default schema. `assert_replica_identity_supports_aggregate` runs
-/// before `create_definition_inner` resolves `qualified_source`, so it used
-/// to pass the bare `def.source` straight to `to_regclass` in the `None`
-/// (bare) branch — no `search_path` fallback at all, unlike the explicit
-/// branch just above. `custom` is nowhere on this pool's pinned
-/// `search_path` (`Config::schema`/`Config::target_schema`/`public`), so
-/// `to_regclass("t")` returned `NULL` and the identity query then matched
-/// zero `pg_class` rows — an opaque `Db(Error{kind: RowCount})`, not the
-/// `custom.t` lookup this test expects.
-#[tokio::test]
-async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_target_is_accepted_when_full()
- {
+async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_target_is_accepted()
+{
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
@@ -1677,9 +1478,8 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
         .await
         .expect("seed source and create the custom schema");
 
-    // Def A: installs with an explicit non-default target schema, exactly
-    // like the two tests above's own decoy setup — `custom` is nowhere on
-    // this pool's pinned `search_path`.
+    // Def A: installs with an explicit non-default target schema — `custom`
+    // is nowhere on this pool's pinned `search_path`.
     install_definition(
         &db.pool,
         "TRANSFORM custom.t FROM s SELECT a AS x",
@@ -1690,15 +1490,10 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     .expect("def A installs with an explicit non-default target schema");
     drain_backfill_chunks(&db.pool).await;
 
-    client
-        .batch_execute("alter table custom.t replica identity full")
-        .await
-        .expect("grant custom.t full replica identity");
-
     // Def B: a bare aggregate `FROM t` must still resolve to def A's
     // `custom.t` — a plain `search_path` walk alone (what `to_regclass` did
     // here before this fix) would find nothing and fail with an opaque
-    // RowCount error, never reaching the identity check at all.
+    // RowCount error.
     create_definition(
         &db.pool,
         "TRANSFORM totals FROM t GROUP BY x SELECT x AS x, COUNT(*) AS n",
@@ -1707,47 +1502,8 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     .await
     .expect(
         "aggregate's bare FROM must resolve to def A's explicitly-qualified custom.t \
-         target (REPLICA IDENTITY FULL), not fail with a RowCount resolution miss",
+         target, not fail with a RowCount resolution miss",
     );
-}
-
-/// The mirror of the test above, with `custom.t` left at its default
-/// replica identity: since issue #315 that is accepted too. A target's
-/// changes reach a chained definition through the target-mutation seam, never
-/// through CDC, so a seam-only target never needs an old image in WAL.
-#[tokio::test]
-async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_target_needs_no_full_identity()
- {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create schema custom; \
-             create table s (id bigint primary key, a numeric); \
-             insert into s (id, a) values (1, 10), (2, 20)",
-        )
-        .await
-        .expect("seed source and create the custom schema");
-
-    install_definition(
-        &db.pool,
-        "TRANSFORM custom.t FROM s SELECT a AS x",
-        &columns(&["a"]),
-        "public",
-    )
-    .await
-    .expect("def A installs with an explicit non-default target schema");
-    drain_backfill_chunks(&db.pool).await;
-    // `custom.t` is left at the default replica identity deliberately.
-
-    create_definition(
-        &db.pool,
-        "TRANSFORM totals FROM t GROUP BY x SELECT x AS x, COUNT(*) AS n",
-        &columns(&["x"]),
-    )
-    .await
-    .expect("an aggregate over a seam-only target needs no REPLICA IDENTITY FULL");
 }
 
 /// Issue #121: a `OneToOne` target's primary key used to be narrowed down to

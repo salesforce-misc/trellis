@@ -92,7 +92,7 @@ async fn stage_cdc(
     let src_table = qualify_fixture_table(src_table);
     let table = active_seg_table(client).await;
     // The WAL position now, which is at or past the commit of the write this
-    // stands in for, as intake's own `lsn` would be. A fixed low value would
+    // stands in for, as capture's own `lsn` would be. A fixed low value would
     // sit below the recompute horizon the direct build stamps (#419), which
     // sends the change down the live re-derive path instead of the delta
     // path these tests exercise.
@@ -114,7 +114,7 @@ async fn stage_cdc(
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -161,20 +161,13 @@ fn post_tags_columns() -> HashMap<String, ValueType> {
 const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
      SELECT COUNT(*) AS post_count, SUM(post.word_count) AS total_words";
 
-/// Issue #94's exact schema. `post_tags` needs `REPLICA IDENTITY FULL` because
-/// it is an *aggregate* source (the delta/recompute path needs the old image to
-/// locate the group a changed row is leaving) — unrelated to the relationship.
-/// `posts` needs it too, as of issue #129: it's the to-side of a to-one
-/// relationship, whose settled parent projection now requires `REPLICA
-/// IDENTITY FULL` unconditionally (`assert_replica_identity_supports_projection`),
-/// independent of and in addition to the aggregate-source reason above.
+/// Issue #94's exact schema. `post_tags` is an *aggregate* source, and
+/// `posts` is the to-side of a to-one relationship.
 async fn create_schema(client: &Client) {
     client
         .batch_execute(
             "create table posts (id integer primary key, word_count integer); \
              create table post_tags (id integer primary key, post integer, tag text); \
-             alter table post_tags replica identity full; \
-             alter table posts replica identity full; \
              create index on post_tags (post); \
              insert into posts (id, word_count) values (1, 100), (2, 250), (3, null); \
              insert into post_tags (id, post, tag) values \
@@ -306,7 +299,7 @@ async fn aggregate_over_a_to_one_relationship_backfills_to_the_oracle() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     drain_to_quiescence(&db.pool, &mut client).await;
 
@@ -343,7 +336,7 @@ async fn inserting_a_from_side_row_updates_its_groups_total() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -409,7 +402,7 @@ async fn inserting_a_from_side_row_resolves_from_the_projection_not_live_parent_
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = relationship_projection(&db.pool, relationship.id)
@@ -489,7 +482,7 @@ async fn updating_a_to_side_row_updates_every_dependent_group() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -557,7 +550,7 @@ async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contrib
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let totals_before = target_totals(&client).await;
@@ -637,7 +630,7 @@ async fn a_from_side_re_point_to_a_nonexistent_parent_subtracts_the_old_contribu
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let totals_before = target_totals(&client).await;
@@ -773,7 +766,7 @@ async fn avg_over_a_relationship_read_column_maintains_through_backfill_and_forw
     )
     .await
     .expect("install the AVG-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
@@ -842,12 +835,10 @@ async fn two_relationships_sharing_a_to_side_column_name_resolve_independently()
     client
         .batch_execute(
             "create table users (id integer primary key, score numeric); \
-             alter table users replica identity full; \
              insert into users (id, score) values (1, 10), (2, 20), (3, 30); \
              create table reviews \
                (id integer primary key, article_id integer, author_id integer, \
                 editor_id integer); \
-             alter table reviews replica identity full; \
              insert into reviews (id, article_id, author_id, editor_id) values \
                (1, 100, 1, 2), (2, 100, 2, 3)",
         )
@@ -883,7 +874,7 @@ async fn two_relationships_sharing_a_to_side_column_name_resolve_independently()
     )
     .await
     .expect("install the two-relationship aggregate definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     async fn review_totals(
@@ -1080,7 +1071,7 @@ async fn sum_and_relationship_min_mixed_single_group_forward_insert() {
     install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the mixed sum/relationship-min definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
@@ -1152,7 +1143,7 @@ async fn sum_and_relationship_min_mixed_two_groups_in_one_batch() {
     install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the mixed sum/relationship-min definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -1263,9 +1254,7 @@ async fn a_to_many_path_in_an_aggregate_is_still_rejected() {
     client
         .batch_execute(
             "create table posts (id integer primary key, word_count integer, tag text); \
-             create table comments (id integer primary key, post_id integer, length integer); \
-             alter table posts replica identity full; \
-             alter table comments replica identity full",
+             create table comments (id integer primary key, post_id integer, length integer)",
         )
         .await
         .expect("create tables");
@@ -1441,7 +1430,7 @@ async fn count_of_a_relationship_path_folds_through_backfill_forward_and_reverse
     install_definition(&db.pool, TAG_WORD_COUNTS, &post_tags_columns(), "public")
         .await
         .expect("install COUNT(<rel>.<column>) in a GROUP BY definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Backfill: `rust` = rows 10 (post 1, wc 100), 11 (post 2, wc 250), 13

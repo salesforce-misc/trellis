@@ -11,7 +11,7 @@
 //! family the design doc's SQL literally shows. tokio-postgres has no
 //! `FromSql`/`ToSql` for `xid8`/`pg_snapshot`, so every value crosses the
 //! wire as text (`::text` out, `::text::xid8`/`::text::pg_snapshot` back
-//! in) — the same bridge `trellis::intake::publication`'s snapshot and
+//! in) — the same bridge `trellis::intake::markers`'s snapshot and
 //! `fence_xid` handling uses.
 
 use std::time::Duration;
@@ -271,27 +271,24 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// actually publishes the fence (issue #271) — this is the one transition
 /// that makes the segment claimable, so it is the edge a drain worker
 /// parked on `wake_channel` actually wants to hear about, not the "rows
-/// landed in the active segment" edge `intake::advance_watermark_and_notify`
-/// and `apply::drain_once`'s downstream-propagation notify already cover.
+/// landed in the active segment" edge `apply::drain_once`'s
+/// downstream-propagation notify already covers.
 ///
-/// The `update` and the `pg_notify` are one statement (a `with` clause
-/// feeding the updated row, if any, into `pg_notify`), not two — matching
-/// `advance_watermark_and_notify`'s own "notify must not precede the fact it
-/// announces" discipline, just achieved differently. That function opens an
-/// explicit `Transaction` and issues the mutation and the `pg_notify` as two
-/// statements inside it, relying on the caller's own commit to make both
-/// atomic. This function can't do that: its first two statements (the
-/// `xmax` fix and the snapshot capture, above) must each be *their own*
-/// committed, autocommit statement — running them inside a transaction would
-/// silently reintroduce the trap this function's own doc comment describes.
-/// So instead of widening that transaction, this folds the mutation and the
-/// notify into a single statement, which Postgres itself wraps in one
-/// implicit transaction: `pg_notify` only evaluates for a row the `update`
-/// actually touched, and a NOTIFY queued during a statement/transaction is
-/// only delivered to another backend once that statement's implicit
-/// transaction commits — so a listener can never observe this notify before
-/// the fence it announces is durably visible, and a raced no-op call (the
-/// `with` clause returns zero rows) never notifies at all.
+/// The `update` and the `pg_notify` are one statement (a `with` clause feeding
+/// the updated row, if any, into `pg_notify`), not two, so the notify can't
+/// precede the fact it announces. Two statements in one explicit transaction
+/// would do the same, but this function can't open one: its first two
+/// statements (the `xmax` fix and the snapshot capture, above) must each be
+/// *their own* committed, autocommit statement — running them inside a
+/// transaction would silently reintroduce the trap this function's own doc
+/// comment describes. So instead this folds the mutation and the notify into a
+/// single statement, which Postgres itself wraps in one implicit transaction:
+/// `pg_notify` only evaluates for a row the `update` actually touched, and a
+/// NOTIFY queued during a statement/transaction is only delivered to another
+/// backend once that statement's implicit transaction commits — so a listener
+/// can never observe this notify before the fence it announces is durably
+/// visible, and a raced no-op call (the `with` clause returns zero rows) never
+/// notifies at all.
 pub async fn seal_phase2(
     client: &Client,
     seg_seq: i64,

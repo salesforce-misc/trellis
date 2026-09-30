@@ -343,9 +343,7 @@ async fn bytea_join_keys_and_primary_keys_are_admitted() {
     client
         .batch_execute(
             "create table parent (k bytea primary key); \
-             create table child (id bigint primary key, k bytea); \
-             alter table child replica identity full; \
-             alter table parent replica identity full",
+             create table child (id bigint primary key, k bytea)",
         )
         .await
         .expect("create relationship tables");
@@ -459,8 +457,7 @@ async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp bytea, amount numeric); \
-             alter table events replica identity full",
+               id integer primary key, grp bytea, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -542,7 +539,7 @@ async fn a_bytea_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_
     }
 
     // Row 1: an ordinary image-bearing insert, the shape real CDC produces —
-    // canonical hex text, exactly what a walsender emits under the pinned
+    // canonical hex text, exactly what a capture trigger renders under the pinned
     // `bytea_output = 'hex'`.
     stage_image(&client, "seg_0", "1", r#"{"grp":"\\x00","amount":"10"}"#).await;
     // Row 2: a bare recompute trigger — no image at all — forcing

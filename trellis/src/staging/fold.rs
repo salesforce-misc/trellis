@@ -196,8 +196,8 @@ pub struct FoldedChange {
     /// over the group, after the truncate-void filter (a row a later
     /// truncate voided was never applied, so it isn't counted). This is the
     /// unit `trellis_changes_applied_total` counts in: one change per staged
-    /// row, whether intake staged it from logical replication or an upstream
-    /// hop's target write staged it as a `recompute`. A truncate sentinel is
+    /// row, whether a capture trigger staged it or an upstream hop's target
+    /// write staged it as a `recompute`. A truncate sentinel is
     /// one row like any other, not the number of rows it erased. Always at
     /// least 1 for a record [`fold`] returns; [`merge_folded_changes`] sums
     /// it across segments.
@@ -587,8 +587,8 @@ fn fold_sql(
     // truncate erased whatever it recorded — and must not survive into the
     // group at all, not just lose an arg-extreme. `(t.lsn, t.change_id) >
     // (f.lsn, f.change_id)` is the "strictly above" test; a truncate and an
-    // insert in the *same* source transaction share one commit `lsn`, so
-    // `change_id` (intake's append order = execution order) is what orders
+    // insert in the *same* source transaction can share one `lsn`, so
+    // `change_id` (the ring's append order = execution order) is what orders
     // a same-transaction truncate-then-insert correctly.
     //
     // Load-bearing subtlety: a recompute row's `lsn` is NULL, and Postgres's
@@ -851,8 +851,8 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     // rows are the one op where "earlier-sealed segment" does *not*
     // approximate "chronologically earlier transition" the way it does for
     // every other op this function merges. Ordinary CDC's own `lsn` is
-    // stamped at intake time and a row's *segment* is essentially "whichever
-    // one happened to be active when its source committed" — the two are
+    // stamped by its capture trigger and a row's *segment* is essentially
+    // "whichever one happened to be active when that trigger ran" — the two are
     // naturally correlated, which is what makes the `earlier`/`later`
     // segment-order convention below a sound proxy for chronological order
     // in the general case. A deferred reverse's *segment* instead reflects

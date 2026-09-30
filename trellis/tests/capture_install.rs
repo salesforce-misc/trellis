@@ -37,7 +37,7 @@ use trellis::capture::install::{self, CaptureAction, Installed, LockingOperation
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, function_name, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{TransformStatus, ValueType, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
 use trellis::staging::{
@@ -1281,7 +1281,6 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
-             alter table public.sales replica identity full; \
              insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
         )
         .await
@@ -1305,7 +1304,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
         ),
         CaptureAction::Install
     );
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     assert_eq!(status_of(&client, "public.sku_of").await, "live");
     drain_to_quiescence(&db.pool, &mut client).await;
 
@@ -1349,7 +1348,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
     );
 
     // The discharge and a build pass: the gate holds the aggregate back.
-    publication::settle_builds(&db.pool).await;
+    markers::settle_builds(&db.pool).await;
     assert_eq!(
         status_of(&client, "public.sku_totals").await,
         "waiting_to_backfill",
@@ -1363,7 +1362,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
             .await
             .expect("gate predicate")
     );
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
 
     client

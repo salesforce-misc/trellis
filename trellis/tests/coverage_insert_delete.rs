@@ -30,7 +30,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -76,7 +76,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 async fn discharge_markers(pool: &trellis::Pool, client: &mut Client) {
-    publication::run_pending_backfills(client, WAKE, &StagedWatermark::saturated(), Duration::ZERO)
+    markers::run_pending_backfills(client, WAKE, &StagedWatermark::saturated(), Duration::ZERO)
         .await
         .expect("run_pending_backfills");
     drain_to_quiescence(pool, client).await;
@@ -124,7 +124,7 @@ async fn wait_for_hold(client: &Client, lock: i64) {
 }
 
 /// Commits `sql` and stages `change` (built from the write's LSN) in one
-/// transaction, as intake would stage it.
+/// transaction, as capture would stage it.
 async fn commit_and_stage(client: &mut Client, sql: &str, change: impl Fn(PgLsn) -> StagedChange) {
     let txn = client.transaction().await.expect("begin source write");
     txn.batch_execute(sql).await.expect("source write");
@@ -161,7 +161,6 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
-             alter table public.sales replica identity full; \
              insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
         )
         .await
@@ -186,7 +185,7 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     .await
     .expect("install the aggregate");
     let pool = pool.clone();
-    let build = tokio::spawn(async move { publication::settle_registrations(&pool).await });
+    let build = tokio::spawn(async move { markers::settle_registrations(&pool).await });
     wait_for_hold(client, BEFORE_READ).await;
     build
 }

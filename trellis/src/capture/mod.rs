@@ -22,28 +22,17 @@
 //!
 //! # What the images must equal
 //!
-//! Until C8 deletes it, intake is the reference: every key, op, image and
-//! `group_key` a trigger writes must be byte-identical to what intake stages
-//! for the same write (`intake::tuple_to_json`, `intake::extract_key`,
-//! `intake::touched_group_key`), restricted to the columns the trigger
-//! images. `tests/capture_parity.rs` checks that against intake, and against
-//! a checked-in golden fixture that outlives intake.
-//!
-//! Three differences are by design:
+//! Every key, op, image and `group_key` a trigger writes must equal the
+//! golden fixture `tests/capture_parity.rs` checks. Of note:
 //!
 //! - **Narrow images.** A trigger images only the primary key and the
-//!   columns some reader needs ([`columns`]). Intake images every column.
-//! - **No omitted TOAST columns.** Intake leaves out an unchanged TOASTed
-//!   column of an update's new tuple. A transition table carries the whole
-//!   row, so a trigger image always has every column it names.
+//!   columns some reader needs ([`columns`]).
+//! - **Whole images.** A transition table carries the whole row, so an image
+//!   always has every column it names, TOASTed or not.
 //! - **A key move is a delete plus an insert.** A statement trigger sees an
 //!   update's old and new rows as two sets, which [`sql`] pairs by primary
 //!   key. A row whose key changed has no partner, so it becomes a delete of
-//!   the old key and an insert of the new one. Intake stages one `update`
-//!   keyed by the new key, whose old image carries the old key.
-//!
-//! Two more are in the metadata, not the images:
-//!
+//!   the old key and an insert of the new one.
 //! - **`lsn` and `origin_lsn`** are `pg_current_wal_insert_lsn()` when the
 //!   trigger runs, not the commit LSN. Per-key order stays `(lsn,
 //!   change_id)`. A second writer of the same key runs its trigger only
@@ -87,7 +76,7 @@ pub enum CaptureError {
     /// definition (C6, `staging::schema_change`).
     MissingColumn { table: String, column: String },
     /// A table name that isn't a `schema.table` identity with exactly one
-    /// separating `.` (see `intake::publication::qualify`).
+    /// separating `.` (see `intake::markers::qualify`).
     InvalidTableName(String),
     /// Reading the catalog failed.
     Catalog(crate::defs::catalog::CatalogError),

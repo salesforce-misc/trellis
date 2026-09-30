@@ -4,7 +4,7 @@
 //!
 //! [`Pipeline::attach`] runs the staging worker's reconcile pass by hand
 //! (`trellis::client::reconcile_pass`), which installs the real capture
-//! triggers on every table [`trellis::defs::publication_tables`] names and
+//! triggers on every table [`trellis::defs::tables_to_capture`] names and
 //! discharges their join markers. From then on the application's own writes
 //! stage their ring rows, and [`Pipeline::drain`] seals and drains the ring
 //! by hand until nothing is pending. So a source row reaches the ring spelled
@@ -14,7 +14,7 @@
 //! its own batch, so a hop's own downstream staging always lands in a later
 //! batch than the write that produced it.
 //!
-//! The captured set is exactly what [`trellis::defs::publication_tables`]
+//! The captured set is exactly what [`trellis::defs::tables_to_capture`]
 //! asks for, and [`Pipeline::attach`] asserts it up front: since issue #315
 //! no Trellis-owned target is ever captured, and since #375 not even one
 //! that is a relationship endpoint.
@@ -99,7 +99,7 @@ async fn dump_ring(raw: &Client) -> String {
     out
 }
 
-/// The capture triggers over the tables [`trellis::defs::publication_tables`]
+/// The capture triggers over the tables [`trellis::defs::tables_to_capture`]
 /// names, with the ring sealed and drained by hand.
 pub struct Pipeline {
     pub raw: Client,
@@ -108,7 +108,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Asserts [`trellis::defs::publication_tables`] is exactly
+    /// Asserts [`trellis::defs::tables_to_capture`] is exactly
     /// `expected_captured`, then runs reconcile passes until each of those
     /// tables' capture is installed and every join marker has discharged,
     /// and drains what that staged. Call it after every definition is
@@ -119,9 +119,9 @@ impl Pipeline {
         mut raw: Client,
         expected_captured: &[&str],
     ) -> Self {
-        let desired = trellis::defs::publication_tables(&db.pool)
+        let desired = trellis::defs::tables_to_capture(&db.pool)
             .await
-            .expect("publication_tables");
+            .expect("tables_to_capture");
         assert_eq!(
             desired, expected_captured,
             "only tables this instance does not own are captured (issues #315, #375)"

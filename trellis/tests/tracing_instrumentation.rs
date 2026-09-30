@@ -644,7 +644,7 @@ async fn backfill_status_transitions_emit_info_events() {
     )
     .await
     .expect("reconcile pass (settled)");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     let events = captured.events();
     let to_backfilling = events.iter().find(|e| {

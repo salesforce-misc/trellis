@@ -290,7 +290,7 @@ fn commit_id_range(first_id: i64, k: u64, rows_per_commit: usize) -> (i64, i64) 
 /// carry the same values [`insert_batch`] writes — `(id, val = id)`, or
 /// `(id, grp = id % groups, val = id)` — but Postgres generates them from the
 /// `$1..=$2` id range, so a commit costs one small bind regardless of its row
-/// count. What CDC decodes is identical either way: the same row images in
+/// count. What the capture triggers see is identical either way: the same row images in
 /// one transaction per commit.
 pub(crate) fn parallel_insert_sql(source_table: &str, groups: Option<usize>) -> String {
     match groups {

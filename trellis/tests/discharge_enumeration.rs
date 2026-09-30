@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, create_relationship, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -92,7 +92,7 @@ async fn a_table_with_a_reader_is_enumerated() {
 
     let table = format!("{DEFAULT_SCHEMA}.widgets");
     capture(&mut client, std::slice::from_ref(&table)).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -122,7 +122,6 @@ async fn a_direct_builds_catch_up_re_reads_an_unchanged_table() {
         .batch_execute(
             "create table public.authors (id integer primary key, name text); \
              create table public.posts (id integer primary key, author_id integer, words integer); \
-             alter table public.posts replica identity full; \
              insert into public.authors (id, name) values (1, 'a'), (2, 'b'), (3, 'c'); \
              insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 1, 20), (102, 2, 5);",
         )
@@ -142,14 +141,14 @@ async fn a_direct_builds_catch_up_re_reads_an_unchanged_table() {
     )
     .await
     .expect("install_definition via the direct relationship path");
-    publication::settle_builds(&db.pool).await;
+    markers::settle_builds(&db.pool).await;
     assert_eq!(
         pending_marker_count(&client).await,
         2,
         "one catch-up per table read"
     );
 
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -177,7 +176,6 @@ async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
         .batch_execute(
             "create table public.authors (id integer primary key, name text); \
              create table public.posts (id integer primary key, author_id integer, words integer); \
-             alter table public.posts replica identity full; \
              insert into public.authors (id, name) values (1, 'a'), (2, 'b'); \
              insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5)",
         )
@@ -197,7 +195,7 @@ async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
     )
     .await
     .expect("install_definition via the direct relationship path");
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     // The build's own go-live catch-ups already enumerated both tables.
     let before = recompute_count(&client, "public.posts").await;
     client
@@ -206,7 +204,7 @@ async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
         .expect("write posts after the build");
 
     capture(&mut client, &["public.posts".to_string()]).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),

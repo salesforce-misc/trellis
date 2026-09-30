@@ -27,7 +27,7 @@ use crate::integer::IntWidth;
 /// `&def.source`/`&def.target` straight into `quote_ident`, which quotes its
 /// argument as a *single* identifier — handing it `"schema.table"` would
 /// quote the dot right along with it, producing an invalid, never-resolving
-/// identifier instead of a schema-qualified one. `intake::publication::qualify`
+/// identifier instead of a schema-qualified one. `intake::markers::qualify`
 /// enforces the same assumption from the other direction: it hard-rejects a
 /// `.`-containing component rather than silently double-qualifying. So the
 /// dotted spelling a definition writes never survives into these fields —

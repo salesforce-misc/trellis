@@ -39,7 +39,7 @@ pub const STOCK_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// [`ClientOptions::reconcile_interval`]'s own stock default (5 s), and what
 /// the single-hop scenarios run at: they have no intermediate hops for the
-/// reconcile pass to publish, so the stock value is the honest one.
+/// reconcile pass to start capturing, so the stock value is the honest one.
 ///
 /// It used to matter to them in one way: the reconcile pass discharged the
 /// catch-up backfill a definition parked when it went live, and that

@@ -1,6 +1,6 @@
 //! Issue #330: `RESUME TRANSFORM` rebuilds a frozen target by re-enumerating
 //! the source's *current* keys (`pending_backfill`'s discharge,
-//! `publication::run_pending_backfills`). That enumeration never visits a
+//! `markers::run_pending_backfills`). That enumeration never visits a
 //! target row whose source rows all went away while the transform was frozen,
 //! so the discharge also deletes every target row no source row backs any
 //! more (`intake::resume_orphans`), reporting each deletion through the
@@ -11,7 +11,7 @@
 //! share of the change stream is never folded into its target. Every test
 //! drives the discharge and the drain by hand, so they wait on nothing. The
 //! ordering of the delete against the enumeration's snapshot is pinned by
-//! `intake::publication`'s own unit tests, which can hold a discharge
+//! `intake::markers`'s own unit tests, which can hold a discharge
 //! mid-flight.
 //!
 //! The issue as filed says a 1-1 transform already drops such rows. It does
@@ -25,7 +25,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{ValueType, chunk_queue, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
@@ -59,7 +59,7 @@ async fn define_only(dsn: &str) -> Trellis {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     loop {
@@ -71,7 +71,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
         if claimed.is_empty() {
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
-            trellis::intake::publication::discharge_registrations(pool)
+            trellis::intake::markers::discharge_registrations(pool)
                 .await
                 .expect("discharge the go-live catch-ups");
             return;
@@ -132,7 +132,7 @@ async fn run_resume_rebuild(pool: &trellis::Pool, client: &mut Client) {
         .batch_execute("select txid_current()")
         .await
         .expect("consume an xid");
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         client,
         "wake",
         &StagedWatermark::saturated(),
@@ -178,7 +178,6 @@ async fn create_orders(client: &Client) {
     client
         .batch_execute(
             "create table orders (id bigint primary key, g bigint, a numeric); \
-             alter table orders replica identity full; \
              insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
         )
         .await
@@ -206,7 +205,7 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     // job, then discharge the catch-up marker going live parks, so the only
     // marker the rebuild below sees is the resume's.
     drain_backfill_chunks(&db.pool).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &StagedWatermark::saturated(),
@@ -292,7 +291,7 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
     drain_backfill_chunks(&db.pool).await;
     // The chunked build's completion parks its own catch-up marker; discharge
     // it now so the only marker the rebuild below sees is the resume's.
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &StagedWatermark::saturated(),
@@ -356,7 +355,7 @@ async fn settle(pool: &trellis::Pool, client: &mut Client) {
             .batch_execute("select txid_current()")
             .await
             .expect("consume an xid");
-        publication::run_pending_backfills(
+        markers::run_pending_backfills(
             client,
             "wake",
             &StagedWatermark::saturated(),
@@ -531,7 +530,6 @@ async fn resume_drops_extinct_composite_and_null_groups() {
     client
         .batch_execute(
             "create table lines (id bigint primary key, g bigint, h text, a numeric); \
-             alter table lines replica identity full; \
              insert into lines values \
                  (1, 0, null, 1), (2, 0, null, 2), (3, 1, null, 3), \
                  (4, 1, 'x', 4), (5, 2, 'y', 5), (6, 2, 'y', 6);",
@@ -583,9 +581,7 @@ async fn resume_drops_groups_a_relationship_key_no_longer_reaches() {
     client
         .batch_execute(
             "create table customers (id bigint primary key, region text); \
-             alter table customers replica identity full; \
              create table orders (id bigint primary key, customer_id bigint, a numeric); \
-             alter table orders replica identity full; \
              insert into customers values (1, 'eu'), (2, 'us'), (3, 'apac'); \
              insert into orders values (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 3, 4), (5, 99, 5);",
         )
@@ -854,7 +850,7 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
         .await
         .expect("make the marker delete fail, and consume an xid");
 
-    let error = publication::run_pending_backfills(
+    let error = markers::run_pending_backfills(
         &mut client,
         "wake",
         &StagedWatermark::saturated(),

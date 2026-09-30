@@ -59,8 +59,8 @@ impl Chain {
 ///
 /// Split out from [`install_chain_hops`] so a caller can create the table,
 /// start the client, and only then install the chain — see
-/// [`install_chain_hops`]. The staging worker publishes the table once the
-/// first hop reads it (issue #427).
+/// [`install_chain_hops`]. The staging worker starts capturing the table once
+/// the first hop reads it (issue #427).
 pub async fn create_chain_source_table(raw: &RawClient, prefix: &str) -> String {
     let source = format!("{prefix}_src");
     raw.batch_execute(&format!(

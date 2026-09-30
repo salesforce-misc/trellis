@@ -166,7 +166,7 @@
 //! - Awkward text values (empty string, the literal text `"NULL"`, a
 //!   U+001F-containing string, a comma/quote/backslash string) are drawn
 //!   here, but this does **not** close the improvement plan's "attacks the
-//!   key encoding" framing for B1: `intake::extract_key`'s
+//!   key encoding" framing for B1: `defs::ddl::join_pk_key`'s
 //!   composite-key delimiter and `defs::oracle::group_key`'s `Aggregate`
 //!   grouping-key encoding only matter for a *multi-column* primary key
 //!   (never drawn — the pk stays single-column `Numeric`) or a *`Text`-typed*
@@ -1700,11 +1700,7 @@ pub struct RelFieldSpec {
 ///   it as to-one.
 /// * **to-many** — `FROM <source>.<key> TO <to>.<fk>`; the to-side FK column
 ///   has no unique constraint, so the same introspection resolves it as
-///   to-many. The to-side table needs `REPLICA IDENTITY FULL` for reverse
-///   propagation over a non-PK join key (ADR-0006, enforced at define time
-///   by `ValidationError::RelationshipToManyRequiresReplicaIdentity`);
-///   `crate::backend::ManualBackend::create_source_table` already sets it on
-///   every table it creates.
+///   to-many.
 ///
 /// Both endpoints are `Text`, the only one of this crate's value types that
 /// is both in [`TEXT_STABLE_JOIN_KEY_TYPES`] and freely drawable — see that
@@ -2511,7 +2507,7 @@ pub struct ActionDraw {
 /// Resolves `draws` against `program` and adds them to `plan`'s bursts
 /// (issue #557 part 2). Every action lands in a burst after the first: by
 /// then the previous burst has quiesced, so every definition installed up
-/// front is `live` and its tables are published, which `request_backfill`
+/// front is `live` and its tables are captured, which `request_backfill`
 /// and a column resume both require. Only definitions installed up front
 /// (`def_install_after_op == 0`) are paused, and their tables re-read.
 ///
@@ -3213,7 +3209,7 @@ mod strategy {
     /// task B1): the empty string; the literal four-character text `"NULL"`
     /// (distinct from SQL `NULL`, i.e. `None` — that's [`value`]'s job, this
     /// is the string that spells the word); a string containing the U+001F
-    /// unit-separator (`intake::extract_key`'s composite-key
+    /// unit-separator (`defs::ddl::join_pk_key`'s composite-key
     /// delimiter — see the module doc comment's scope-cut note on why this
     /// doesn't yet reach that risk); and a string containing a
     /// comma/quote/backslash (SQL-binding/escaping awkwardness, independent

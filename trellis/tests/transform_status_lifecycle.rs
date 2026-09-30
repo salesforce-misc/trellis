@@ -51,7 +51,7 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{
     TransformStatus, ValueType, chunk_queue, create_definition, install_definition,
 };
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::apply;
 use trellis::staging::quarantine;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -141,7 +141,7 @@ async fn insert_cdc_row(
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     drain_backfill_chunks(pool).await;
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -186,7 +186,7 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
     if status_of(client, target).await == TransformStatus::Live {
         return;
     }
-    // Issue #132: see `drain_to_quiescence`'s own comment — no live `Intake`
+    // Issue #132: see `drain_to_quiescence`'s own comment — no live capture
     // is running here either, so a throwaway, always-caught-up watermark is
     // correct.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -221,7 +221,7 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "status_lifecycle_test_backfill_worker";
@@ -234,7 +234,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
         if claimed.is_empty() {
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
-            trellis::intake::publication::discharge_registrations(pool)
+            trellis::intake::markers::discharge_registrations(pool)
                 .await
                 .expect("discharge the go-live catch-ups");
             return;
@@ -343,7 +343,7 @@ async fn evict_keys_for_real(
     // `DEFAULT_DEATH_THRESHOLD` (5) takes five external failures, the fifth
     // of which evicts every one of `keys` together (they all fail every
     // attempt alike) and lets the retry drain succeed within that same call.
-    // Issue #132: see `drain_to_quiescence`'s own comment — no live `Intake`
+    // Issue #132: see `drain_to_quiescence`'s own comment — no live capture
     // is running here either, so a throwaway, always-caught-up watermark is
     // correct.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -554,7 +554,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     // call below discharges so it can't be mistaken for the marker
     // `resume_transform` parks later).
     drain_backfill_chunks(&db.pool).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -592,7 +592,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
 
     // No concurrent transaction pins the fence this time, so a single
     // discharge pass both settles and processes the re-parked marker.
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -667,7 +667,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     .await
     .expect("install_definition");
     drain_backfill_chunks(&db.pool).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -739,7 +739,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
         "resume must drop straight to waiting_to_backfill, never directly to backfilling/live"
     );
 
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -818,7 +818,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     .await
     .expect("install_definition");
     drain_backfill_chunks(&db.pool).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -852,7 +852,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     quarantine::resume_transform(&db.pool, "t6")
         .await
         .expect("resume_transform");
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -984,7 +984,6 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
         "create table plain_s (id bigint primary key, a numeric); \
          insert into plain_s (id, a) select g, g from generate_series(1, 10) g; \
          create table agg_s (id bigint primary key, grp bigint, a numeric); \
-         alter table agg_s replica identity full; \
          insert into agg_s (id, grp, a) select g, g % 3, g from generate_series(1, 10) g;",
     )
     .await
@@ -1075,7 +1074,7 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         .await
         .expect("drop the source's primary key");
 
-    let error = publication::discharge_registrations(&db.pool)
+    let error = markers::discharge_registrations(&db.pool)
         .await
         .expect_err("the discharge fails on the missing key");
     let status = trellis
@@ -1137,7 +1136,7 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         "a marker with no recorded failure reports none"
     );
     assert_eq!(backfill_failures_listed(&trellis).await, vec![None, None]);
-    publication::discharge_registrations(&db.pool)
+    markers::discharge_registrations(&db.pool)
         .await
         .expect("the retry goes through");
     let status = trellis

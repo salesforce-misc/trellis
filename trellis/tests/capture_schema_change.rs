@@ -62,7 +62,7 @@ async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
 
 /// The capture half of one pass only.
 async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) -> reconcile::PassOutcome {
-    let desired = trellis::defs::publication_tables(pool)
+    let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
     reconcile::reconcile(
@@ -263,7 +263,6 @@ async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
 async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.u (id int primary key, g int, a int, b int, c int, spare int); \
-         alter table public.u replica identity full; \
          insert into public.u select i, i % 2, i, 10 * i, 100 * i, 0 \
            from generate_series(1, 4) i;",
     )
@@ -627,8 +626,7 @@ async fn the_partial_images_match_the_static_ones_for_the_columns_left() {
     raw.batch_execute(
         "create table public.p (id int primary key, t text, n numeric, f float8, \
            ts timestamptz, iv interval, b bytea, arr int[], j jsonb, flag bool, \
-           nothing text, gone int); \
-         alter table public.p replica identity full;",
+           nothing text, gone int)",
     )
     .await
     .expect("seed");
@@ -742,8 +740,6 @@ async fn renaming_a_to_side_column_pauses_only_its_readers_through_the_relations
     raw.batch_execute(
         "create table public.p (id int primary key, name text, tier text); \
          create table public.c (id int primary key, pid int, amount int); \
-         alter table public.p replica identity full; \
-         alter table public.c replica identity full; \
          insert into public.p select i, 'n' || i, 't' || i from generate_series(1, 3) i; \
          insert into public.c select i, 1 + i % 3, i from generate_series(1, 6) i;",
     )

@@ -7,7 +7,7 @@
 //! source table, definition, and target table by hand (mirroring
 //! `defs_ddl.rs`/`defs_oracle.rs`'s convention) and stages changes directly
 //! into the ring (mirroring `claims.rs`/`fold.rs`'s convention), rather than
-//! going through CDC intake — intake is out of scope here.
+//! going through capture — capture is out of scope here.
 
 use std::collections::HashMap;
 
@@ -165,7 +165,7 @@ fn order_totals_def() -> TransformDef {
 /// standard "drain and expect it to succeed" step.
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // Issue #132: a throwaway, always-caught-up watermark — no live
-    // `Intake` runs in this test file, and it isn't exercising guard (a).
+    // capture runs in this test file, and it isn't exercising guard (a).
     apply::drain_once(
         pool,
         seg_seq,
@@ -1448,8 +1448,8 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     // downstream reader, landing in the ring's active segment — under
     // `order_totals`'s *qualified* identity (issue #267: propagation used to
     // stage the bare `def.target`, which the fold could never coalesce with
-    // the qualified spelling CDC intake stages for the very same table once
-    // an intermediate hop joins the publication).
+    // the qualified spelling CDC intake staged for the very same table once
+    // an intermediate hop was captured).
     let staged: i64 = client
         .query_one(
             "select count(*) from (
@@ -1807,8 +1807,8 @@ async fn a_jsonb_column_passthrough_round_trips_through_compute() {
         .await
         .expect("seed source rows after the definition exists");
 
-    // The exact CDC-decoded text a real logical-decoding stream would send
-    // for each row is jsonb's own canonical text rendering — captured live
+    // The exact text a real capture trigger would stage for each row is
+    // jsonb's own canonical text rendering — captured live
     // rather than hand-guessed, so this test doesn't depend on Postgres's
     // exact jsonb whitespace-normalization rules.
     let seeded = client

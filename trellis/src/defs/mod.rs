@@ -53,7 +53,7 @@ pub mod validate;
 // `cargo build` free of `unused_imports` rather than an `allow`.
 pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, TransformRef, ValueType};
 pub use catalog::{
-    CatalogError, alter_transform, create_relationship, install_definition, publication_tables,
+    CatalogError, alter_transform, create_relationship, install_definition, tables_to_capture,
 };
 pub use error::ParseError;
 pub use model::{

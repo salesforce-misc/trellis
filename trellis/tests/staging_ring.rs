@@ -92,8 +92,8 @@ async fn route_is_identical_for_client_side_and_server_side_appends() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    // Client-rendered VALUES tuple (the shape CDC intake, reverse
-    // propagation, and definition re-derive use).
+    // Client-rendered VALUES tuple (the shape reverse propagation and
+    // definition re-derive use).
     append_on_new_connection(db.dsn(), &[recompute("orders", "same-key")]).await;
 
     let client = db.pool.get().await.expect("acquire connection");
@@ -210,8 +210,8 @@ async fn row_txid_is_the_writers_real_top_level_xid() {
 /// across every row of one source transaction, so nothing but `change_id`
 /// can tell an INSERT from a later UPDATE of the same key committed in that
 /// transaction. Appends an insert then an update for the same key via a
-/// single `append` call (mirroring how intake buffers one transaction and
-/// stages it in one shot) and checks `change_id` alone records that order.
+/// single `append` call (mirroring how capture stages one statement's rows
+/// in one shot) and checks `change_id` alone records that order.
 /// Fails on the pre-#31 schema, which has no `change_id` column at all.
 #[tokio::test]
 async fn change_id_records_intra_transaction_append_order() {
@@ -322,25 +322,6 @@ async fn append_chunks_batches_past_the_bind_parameter_limit() {
 }
 
 #[tokio::test]
-async fn a_session_with_synchronous_commit_off_is_refused() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-
-    // Bake `synchronous_commit=off` into the connection string itself, so
-    // it is the session's effective setting from the moment it connects —
-    // exactly what the guard is checking.
-    let dsn = format!("{} options='-c synchronous_commit=off'", db.dsn());
-
-    let err = trellis::staging::ProducerSession::connect(&dsn, DEFAULT_SCHEMA)
-        .await
-        .expect_err("a synchronous_commit=off session must be refused");
-    match err {
-        StagingError::SynchronousCommitOff => {}
-        other => panic!("expected SynchronousCommitOff, got {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn a_second_producer_cannot_acquire_the_singleton_while_the_first_holds_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -399,7 +380,8 @@ async fn singleton_held(client: &Client, key: i64) -> bool {
 
 /// `release` frees the singleton before it returns, unlike a drop, whose
 /// release waits on the backend noticing the closed socket. Client startup
-/// hands the singleton from its setup session straight to intake's, so that
+/// hands the singleton from its setup session straight to the staging
+/// worker's, so that
 /// handoff must succeed on the very next attempt, with no polling.
 #[tokio::test]
 async fn a_released_producer_session_frees_the_singleton_immediately() {

@@ -13,10 +13,6 @@
 //! unqualified references to Trellis's own objects to keep resolving
 //! correctly).
 //!
-//! This hook is also the seam intake will extend: it's the one place that
-//! runs exactly once per physical connection, before it's ever handed to a
-//! caller, which is where `synchronous_commit = on` will need to be enforced
-//! for the staging ring to make its durability guarantees.
 //! Beyond `search_path`, the hook also pins the output GUCs that make a
 //! value's text rendering depend on the value alone rather than on the
 //! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]), and turns on
@@ -226,62 +222,22 @@ impl Pool {
 /// family in epic #123 hits this same wall and should extend this one
 /// constant** rather than pinning a GUC at its own call site. Keeping them
 /// in a single list is also what lets the non-pooled connect sites below,
-/// and — since issue #246 — the walsender's own startup `options` (see
-/// [`deterministic_text_output_options`]), stay in step with the pooled
-/// connection: every one of them derives from or interpolates this same
-/// text, so a sixth GUC added here is automatically pinned everywhere else
-/// too, with nothing to remember to update in a second place.
+/// and every capture function's `SET` clauses
+/// ([`crate::capture::sql::pinned_output_settings`]), stay in step with the
+/// pooled connection: every one of them derives from or interpolates this
+/// same text, so a GUC added here is pinned everywhere else too, with
+/// nothing to remember to update in a second place.
 ///
-/// # `TimeZone` joined this constant once the walsender could be pinned (issue #246)
+/// # `TimeZone` (issue #246)
 ///
 /// `timestamptz_out` renders in the session's `TimeZone`, so pinning it to
-/// `'UTC'` is the obvious way to give `timestamptz` the same text-stability
-/// `DateStyle` gave `date`/`timestamp` — and issue #113 confirmed that
-/// alone would work (Trellis owns every connection it opens, so "blast
-/// radius on other sessions" was never the objection). It nonetheless
-/// declined the pin, for a reason that survives that argument:
-///
-/// **Trellis renders `timestamptz` on two backends, and issue #113 could
-/// only control one.** The CDC half of a value's life is rendered by the
-/// type's output function running in the **walsender**, under the
-/// walsender's GUCs — verified live by peeking one slot from two sessions
-/// with different `timezone` settings and getting two different wall
-/// clocks for one instant, on a server whose own default was a third zone.
-/// `pgwire_replication::ReplicationConfig` v0.4 offered no way to send
-/// startup runtime parameters or to `SET` on the replication connection, so
-/// the walsender kept the server/database/role default no matter what this
-/// constant said, and pinning `'UTC'` here alone would have traded the two
-/// renderers' *accidental* agreement (both falling back to the same server
-/// default) for a *guaranteed* disagreement on every server whose default
-/// is not UTC — strictly worse than the status quo.
-///
-/// Issue #246 closed that gap: `pgwire-replication` 0.4.1 added
-/// `ReplicationConfig::with_options`, which sends the same startup
-/// `options` parameter `libpq`'s `options`/`PGOPTIONS` already send on a
-/// normal connection, and PostgreSQL honors it on a replication connection
-/// too. [`crate::intake::IntakeConfig::replication_config`] now passes
-/// [`deterministic_text_output_options`] — this same constant, reparsed
-/// into the `-c name=value` shape `options` expects — so the walsender pins
-/// every one of these GUCs exactly like the pool does, and `TimeZone` can
-/// finally join them without introducing the asymmetry #113 declined.
+/// `'UTC'` gives `timestamptz` the same text-stability `DateStyle` gives
+/// `date`/`timestamp`. Trellis renders a value in two places: on its own
+/// connections, and in a capture function running inside the application's
+/// session. Both pin this constant, so they agree whatever the server,
+/// database or role default is.
 /// [`crate::temporal::is_bijective_under_text`]/
-/// [`crate::temporal::is_render_consistent`] pick the story up from here —
-/// `timestamptz` is admitted to the key/`MIN`/`MAX` roles as of this issue.
-///
-/// The same asymmetry was latent for the four pinned before `TimeZone`, and
-/// the reason it did not bite is worth restating because it *was* the rule
-/// for adding a fifth, back when only the pool could be pinned: each
-/// pinned value was **output-identical to a stock server's default** (`ISO`
-/// output, `hex`, shortest-round-trip floats, `postgres` interval style),
-/// so the unpinned walsender agreed with the pinned pool unless an operator
-/// had deliberately reconfigured the server — `TimeZone` was the one value
-/// here with no such stock default to lean on, which is exactly why it
-/// waited for the walsender to become pinnable too rather than joining
-/// under that older, weaker rule. Now that the walsender is genuinely
-/// pinned rather than merely agreeing by accident, that rule is retired:
-/// any future GUC extending this constant is pinned symmetrically on both
-/// backends by construction, and does not need to pass an
-/// output-identical-to-stock-defaults test first.
+/// [`crate::temporal::is_render_consistent`] pick the story up from here.
 ///
 /// `extra_float_digits` deserves a word, because `1` is already Postgres
 /// 12+'s default and pinning a default can look like a no-op. It isn't: the
@@ -307,12 +263,10 @@ impl Pool {
 /// specifically, which is both Postgres's default and what an interval
 /// `SUM` has to write back.
 ///
-/// `TimeZone` joined the other four for issue #246, once the walsender
-/// could be pinned too (see the "`TimeZone` joined this constant" section
-/// above) — `timestamptz_out` renders in `'UTC'` on every connection
-/// Trellis opens, pool and walsender alike, making it a bijection on the
-/// instant exactly the way `DateStyle` makes `date_out` a bijection on the
-/// day number.
+/// `TimeZone` joined the other four for issue #246 (see the "`TimeZone`"
+/// section above): `timestamptz_out` renders in `'UTC'` everywhere Trellis
+/// renders a value, making it a bijection on the instant exactly the way
+/// `DateStyle` makes `date_out` a bijection on the day number.
 ///
 /// `lc_monetary` joined for issue #672. `cash_out` spells a `money` value
 /// in the session's monetary locale: `1234.56::money` is `$1,234.56` under
@@ -345,14 +299,15 @@ impl Pool {
 /// has been the server default since Postgres 9.1, but an operator's
 /// `ALTER DATABASE ... SET standard_conforming_strings = off` still reaches
 /// every session that doesn't set it. It sits in this constant (issue #672)
-/// because this is the one list every Trellis session applies; on the
-/// walsender, which parses no SQL literal Trellis writes, it is harmless.
+/// because this is the one list every Trellis session applies. A capture
+/// function pins it too, where it is harmless: its body's literals never
+/// contain a backslash.
 ///
 /// # Output settings deliberately *not* pinned
 ///
 /// The rest of Postgres's locale and formatting settings were audited for
 /// issue #672. None of them changes what a type's output function (the
-/// `::text` cast, `pgoutput`'s decoding, `to_jsonb`) prints:
+/// `::text` cast, capture's `format('%s', col)`, `to_jsonb`) prints:
 ///
 /// * `lc_numeric` and `lc_time` only feed `to_char`'s locale patterns (`D`,
 ///   `G`, `L`, the `TM` prefix). `numeric_out`, `float8out` and the
@@ -370,72 +325,9 @@ impl Pool {
 ///   Trellis writes depends on them.
 /// * `escape_string_warning` and `backslash_quote` only matter when
 ///   `standard_conforming_strings` is `off`, which it never is here.
-///
-/// [`deterministic_text_output_options`] parses this string back into the
-/// `-c name=value` shape `pgwire_replication::ReplicationConfig::with_options`
-/// expects, so both forms come from one source of truth — see that
-/// function's own doc comment for why it parses rather than hand-duplicating
-/// a second `-c`-shaped list here.
 pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, YMD'; \
      set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'; \
      set timezone to 'UTC'; set lc_monetary to 'C'; set standard_conforming_strings to 'on'";
-
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], reparsed into the Postgres startup
-/// `options` parameter's `-c name=value -c name2=value2 ...` shape —
-/// exactly what `libpq`'s own `options` connection parameter (or
-/// `PGOPTIONS`) sends, and what PostgreSQL honors on a **replication**
-/// connection too, not just a normal one.
-///
-/// This exists so [`crate::intake::IntakeConfig::replication_config`] can
-/// pin the walsender to the same GUCs [`session_bootstrap`] pins the pool
-/// to, **without hand-duplicating the GUC list into a second hardcoded
-/// place** — issue #246 is precisely the bug that a second, independently
-/// maintained list invites: add a GUC to one, forget the other, and the
-/// pool/walsender renderings silently diverge again. Parsing
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]'s own `set X to 'Y'; ...` text instead
-/// means a GUC added to that constant is automatically pinned on the
-/// walsender the next time this function runs — there is no second list to
-/// forget.
-///
-/// Each `set <guc> to <value>;` clause becomes one `-c <guc>=<value>` token.
-/// Postgres's own `options` parser (`pg_split_opts`) splits on whitespace
-/// and treats a backslash as an escape for the following character, so any
-/// space *within* a value (`'ISO, YMD'`'s) is backslash-escaped rather than
-/// passed through raw — a bare space there would otherwise be read as a
-/// second, malformed `-c` token instead of part of this one's value.
-/// [`with_options_matches_a_hand_written_expectation`] pins the exact
-/// output for the constant as it stands today, so a future edit to
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] that doesn't parse the way this
-/// function expects fails loudly in CI instead of silently shipping a
-/// walsender that pins something other than what it meant to.
-///
-/// Escaping here only covers spaces (`' '` -> `'\ '`); it does not escape a
-/// literal backslash in a value, so a future GUC value containing one would
-/// be mangled by `pg_split_opts`'s own backslash-as-escape-character rule.
-/// None of today's values contain a backslash, so this is a latent gap, not
-/// a live bug — worth fixing if that ever changes.
-// Only intake used this; C8 deletes it (issue #622).
-#[allow(dead_code)]
-pub(crate) fn deterministic_text_output_options() -> String {
-    DETERMINISTIC_TEXT_OUTPUT_GUCS
-        .split(';')
-        .map(str::trim)
-        .filter(|clause| !clause.is_empty())
-        .map(|clause| {
-            let rest = clause.strip_prefix("set ").unwrap_or_else(|| {
-                panic!(
-                    "DETERMINISTIC_TEXT_OUTPUT_GUCS clause {clause:?} does not start with \"set \""
-                )
-            });
-            let (name, value) = rest.split_once(" to ").unwrap_or_else(|| {
-                panic!("DETERMINISTIC_TEXT_OUTPUT_GUCS clause {clause:?} has no \" to \"")
-            });
-            let value = value.trim().trim_matches('\'');
-            format!("-c {name}={}", value.replace(' ', "\\ "))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
@@ -449,8 +341,7 @@ pub(crate) fn deterministic_text_output_options() -> String {
 /// server-side TCP keepalives ([`tcp_keepalive_gucs`], without the user
 /// timeout: see [`DeadPeerDetection::KeepalivesOnly`]) and the session's
 /// `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`], ADR-0002
-/// I7). Beyond those, this
-/// is the seam intake will use to enforce `synchronous_commit = on`.
+/// I7).
 async fn session_bootstrap(
     client: &mut tokio_postgres::Client,
     schema: &str,
@@ -482,29 +373,23 @@ async fn session_bootstrap(
 /// notices at once. A network partition closes nothing: the backend sits
 /// idle on a socket whose peer can no longer answer until the kernel gives
 /// up on it, which with Linux defaults (`tcp_keepalive_time` 7200s, then 9
-/// probes 75s apart) is about 2h11m. The replication slot doesn't have
-/// this problem, because `wal_sender_timeout` (60s by default) ends the
-/// walsender on its own clock.
+/// probes 75s apart) is about 2h11m.
 ///
-/// The producer session is where this hurt (issue #364): its backend holds
-/// the instance's producer-singleton advisory lock
-/// ([`crate::staging::session::producer_singleton_lock_key`]), so a
-/// partitioned producer kept every restart refused with
-/// `ProducerAlreadyRunning` for the whole two hours, staging nothing. But
-/// any connection partitioned mid-transaction pins its row and advisory
-/// locks the same way, so the pool and every dedicated connection get the
-/// keepalives too. Only the dedicated ones also get [`TCP_USER_TIMEOUT`];
-/// see [`DeadPeerDetection`] for why the pool doesn't.
+/// The producer session is where this hurt (issue #364): its backend holds the
+/// instance's producer-singleton advisory lock
+/// ([`crate::staging::session::producer_singleton_lock_key`]), so a partitioned
+/// producer kept every restart refused with `ProducerAlreadyRunning` for the
+/// whole two hours. But any connection partitioned mid-transaction pins its row
+/// and advisory locks the same way, so the pool and every dedicated connection
+/// get the keepalives too. Only the dedicated ones also get
+/// [`TCP_USER_TIMEOUT`]; see [`DeadPeerDetection`] for why the pool doesn't.
 ///
-/// Idle 10s, then up to 3 probes 5s apart, is a dead peer declared about
-/// 25s after it last answered ([`TCP_USER_TIMEOUT`] matches that). That's
-/// inside `wal_sender_timeout`'s default 60s, so after a partition the
-/// producer lock is free before the slot is, and a restarting intake waits
-/// on the slot rather than on the lock. The cost is one probe per idle
-/// connection per 10s, and a connection is only given up on after it has
-/// missed three probes in a row. A live peer's kernel answers probes even
-/// when its application is busy or stalled, so keepalives never end a
-/// healthy connection.
+/// Idle 10s, then up to 3 probes 5s apart, is a dead peer declared about 25s
+/// after it last answered ([`TCP_USER_TIMEOUT`] matches that). The cost is one
+/// probe per idle connection per 10s, and a connection is only given up on
+/// after it has missed three probes in a row. A live peer's kernel answers
+/// probes even when its application is busy or stalled, so keepalives never end
+/// a healthy connection.
 ///
 /// # Explicit settings win
 ///
@@ -632,9 +517,9 @@ pub(crate) fn tcp_keepalive_gucs(detection: DeadPeerDetection) -> String {
 /// Freeing the server's locks doesn't need this, but noticing the partition
 /// does. A client waiting on a reply from a partitioned server sees nothing
 /// arrive and, without its own probes, keeps waiting for the same two
-/// hours. On the producer that's intake stuck mid-append instead of
-/// failing, so the supervisor never restarts it. With these, the wait
-/// fails after about 25s and the restart path takes over.
+/// hours. On the producer session that's the maintenance loop stuck
+/// mid-step instead of failing, so it never reconnects. With these, the wait
+/// fails after about 25s and the reconnect path takes over.
 ///
 /// `tokio_postgres` sets the user timeout on Linux only and ignores it
 /// elsewhere; the keepalive options work on Linux, macOS and Windows.
@@ -818,43 +703,6 @@ mod tests {
     fn quote_literal_escapes_embedded_quotes() {
         assert_eq!(quote_literal("created_at"), "'created_at'");
         assert_eq!(quote_literal("weird'column"), "'weird''column'");
-    }
-
-    /// Pins the exact `-c ...` string [`deterministic_text_output_options`]
-    /// produces from today's [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] — a change to
-    /// either one that the parser doesn't expect (a new clause shape, a
-    /// value containing a character the space-escaping doesn't handle) fails
-    /// this test loudly instead of shipping a walsender silently pinned to
-    /// something other than what [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] says.
-    #[test]
-    fn with_options_matches_a_hand_written_expectation() {
-        assert_eq!(
-            deterministic_text_output_options(),
-            "-c datestyle=ISO,\\ YMD -c bytea_output=hex -c extra_float_digits=1 \
-             -c intervalstyle=postgres -c timezone=UTC -c lc_monetary=C \
-             -c standard_conforming_strings=on"
-        );
-    }
-
-    /// The two representations can never silently drift apart: this walks
-    /// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]'s own clause count and asserts
-    /// [`deterministic_text_output_options`] produced exactly one `-c` token
-    /// per clause — a change that adds a sixth GUC to the SQL string but
-    /// breaks the parser (rather than merely producing the wrong value,
-    /// which the test above would already catch) still fails here.
-    #[test]
-    fn every_pinned_guc_produces_exactly_one_option_token() {
-        let clause_count = DETERMINISTIC_TEXT_OUTPUT_GUCS
-            .split(';')
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .count();
-        let token_count = deterministic_text_output_options().split(" -c ").count();
-        assert_eq!(clause_count, token_count);
-        assert_eq!(
-            clause_count, 7,
-            "expected seven pinned GUCs as of issue #672"
-        );
     }
 
     #[test]

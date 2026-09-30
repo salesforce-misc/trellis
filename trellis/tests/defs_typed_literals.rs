@@ -153,7 +153,7 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "typed_literal_test_backfill_worker";

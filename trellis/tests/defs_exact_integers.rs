@@ -58,8 +58,7 @@ const SOURCE_DDL: &str = "create table s ( \
      n numeric, \
      txt text, \
      o oid \
-   ); \
-   alter table s replica identity full";
+   )";
 
 fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -93,7 +92,7 @@ async fn connect_raw(dsn: &str) -> Client {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "exact_integer_test_backfill_worker";
@@ -726,7 +725,7 @@ async fn integer_text_rendering_is_byte_identical_to_postgres() {
 /// `numeric`, so its `SUM` targets stay `numeric` too.
 ///
 /// Run through the public `Trellis` facade against the full live pipeline
-/// (real logical-replication intake, real ring, real drain workers), with
+/// (real capture triggers, real ring, real drain workers), with
 /// convergence awaited via `watermark_token`/`await_converged` rather than
 /// slept for. The comparison at the end is a symmetric difference against a
 /// hand-written `GROUP BY`, per ADR-0013.
@@ -855,13 +854,7 @@ async fn oid_and_the_integer_widths_are_accepted_as_relationship_join_keys() {
              create table child ( \
                  id bigint primary key, \
                  f2 smallint, f4 integer, f8 bigint, f_oid oid, f_num numeric \
-             ); \
-             alter table child replica identity full; \
-             alter table parent2 replica identity full; \
-             alter table parent4 replica identity full; \
-             alter table parent8 replica identity full; \
-             alter table parent_oid replica identity full; \
-             alter table parent_num replica identity full",
+             )",
         )
         .await
         .expect("create relationship tables");

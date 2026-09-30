@@ -107,7 +107,7 @@ async fn stage_cdc(
 /// is what makes this file's gen-bump assertions meaningful.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -211,10 +211,8 @@ async fn forward_to_one_resolves_from_the_projection_not_live_parent_state() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
-             create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full",
+             create table articles (id integer primary key, category_id integer)",
         )
         .await
         .expect("create + seed tables");
@@ -302,10 +300,8 @@ async fn forward_apply_bumps_gen_once_per_touched_parent_even_with_two_touching_
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
-             create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full",
+             create table articles (id integer primary key, category_id integer)",
         )
         .await
         .expect("create + seed tables");
@@ -407,10 +403,8 @@ async fn forward_apply_re_point_bumps_gen_for_both_old_and_new_parent() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full; \
              insert into articles (id, category_id) values (1, 10)",
         )
         .await
@@ -520,8 +514,7 @@ async fn to_many_relationship_context_has_no_projection_and_stays_live() {
     client
         .batch_execute(
             "create table articles (id integer primary key, title text); \
-             create table comments (id integer primary key, article_id integer, word_count integer); \
-             alter table comments replica identity full",
+             create table comments (id integer primary key, article_id integer, word_count integer)",
         )
         .await
         .expect("create tables");
@@ -674,14 +667,10 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
             "create schema blog; create schema shop; \
              create table writers (id integer primary key, name text); \
              create table vendors (id integer primary key, name text); \
-             alter table writers replica identity full; \
-             alter table vendors replica identity full; \
              insert into writers (id, name) values (1, 'writer-1'); \
              insert into vendors (id, name) values (1, 'vendor-1'); \
              create table blog.posts (id integer primary key, author_id integer); \
              create table shop.posts (id integer primary key, author_id integer); \
-             alter table blog.posts replica identity full; \
-             alter table shop.posts replica identity full; \
              insert into blog.posts (id, author_id) values (1, 1); \
              insert into shop.posts (id, author_id) values (1, 1);",
         )
@@ -739,7 +728,7 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
     // definition falls back to the ring's enumeration of its existing rows,
     // which the backfill discharge stages (`install_definition`'s
     // `Unsupported` arm, ADR-0016); run it, then drain.
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("discharge the registration");
     drain_to_quiescence(&db.pool, &mut client).await;

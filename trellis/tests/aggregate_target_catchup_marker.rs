@@ -29,7 +29,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, chunk_queue, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::{has_pending, retire_drained_segments};
 
 const TEST_NAME: &str = "aggregate_target_catchup_marker_test";
@@ -37,7 +37,7 @@ const TEST_NAME: &str = "aggregate_target_catchup_marker_test";
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     loop {
@@ -141,8 +141,8 @@ async fn install_sku_totals(pool: &trellis::Pool, client: &mut Client) {
     install_definition(pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the aggregate");
-    publication::settle_registrations(pool).await;
-    publication::run_pending_backfills(
+    markers::settle_registrations(pool).await;
+    markers::run_pending_backfills(
         client,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -161,7 +161,6 @@ async fn create_schema(client: &Client) {
             "create table sales ( \
                  id integer primary key, sku text, amount integer \
              ); \
-             alter table sales replica identity full; \
              insert into sales (id, sku, amount) values \
                (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), (4, null, 6)",
         )
@@ -235,7 +234,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
         .await
         .expect("update sku_totals");
 
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -247,7 +246,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
         pending_markers(&client).await.is_empty(),
         "the discharged marker is deleted, not left to wedge the next pass"
     );
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),
@@ -277,10 +276,6 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
     create_schema(&client).await;
 
     install_sku_totals(&db.pool, &mut client).await;
-    client
-        .batch_execute("alter table sku_totals replica identity full")
-        .await
-        .expect("an aggregate's source needs replica identity full");
     install_definition(
         &db.pool,
         "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku SELECT sum(total) AS total2",
@@ -320,7 +315,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
         .await
         .expect("update sku_totals");
 
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "wake",
         &trellis::staging::StagedWatermark::saturated(),

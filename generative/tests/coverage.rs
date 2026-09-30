@@ -1272,8 +1272,8 @@ fn trivial_program_sometimes_declares_a_relationship() {
 /// Both cardinalities must appear. They are not two spellings of one
 /// feature: a to-one relationship resolves through a unique to-side column
 /// and reverse-propagates off the to-side's own key, while a to-many one
-/// folds many related rows and requires `REPLICA IDENTITY FULL` on the
-/// to-side for its non-PK join key (ADR-0006). A run that drew only to-one
+/// folds many related rows over the to-side's non-PK join key (ADR-0006).
+/// A run that drew only to-one
 /// relationships would leave the whole to-many path untested while still
 /// reporting relationship coverage.
 #[test]

@@ -237,9 +237,7 @@ async fn cidr_macaddr_macaddr8_join_keys_and_primary_keys_are_admitted() {
         client
             .batch_execute(&format!(
                 "create table {parent} (k {pg_type} primary key); \
-                 create table {child} (id bigint primary key, k {pg_type}); \
-                 alter table {child} replica identity full; \
-                 alter table {parent} replica identity full"
+                 create table {child} (id bigint primary key, k {pg_type})"
             ))
             .await
             .unwrap_or_else(|e| panic!("create relationship tables for {pg_type}: {e}"));
@@ -273,9 +271,7 @@ async fn inet_is_refused_as_a_relationship_join_key_and_primary_key() {
     client
         .batch_execute(
             "create table parent (k inet primary key); \
-             create table child (id bigint primary key, k inet); \
-             alter table child replica identity full; \
-             alter table parent replica identity full",
+             create table child (id bigint primary key, k inet)",
         )
         .await
         .expect("create relationship tables");
@@ -560,7 +556,7 @@ async fn to_jsonb_agrees_with_text_except_for_inet() {
 
 /// An `inet` `GROUP BY` group touched once through an ordinary image-bearing
 /// CDC change (staged with `inet_out`'s host-elided spelling, exactly what
-/// real logical decoding produces) and once through a bare, image-less live
+/// a real capture trigger renders) and once through a bare, image-less live
 /// refetch (`row_as_text_jsonb_sql`'s `<col>::text` cast, `network_show`'s
 /// always-explicit spelling) must still land as **one** target row, not
 /// two — the same shape `defs_boolean.rs`'s
@@ -578,8 +574,7 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp inet, amount numeric); \
-             alter table events replica identity full",
+               id integer primary key, grp inet, amount numeric)",
         )
         .await
         .expect("create source table");

@@ -7,8 +7,8 @@
 //! exactly one database, so nothing it does can ever observe a resource one
 //! instance was supposed to own privately but actually shares with another —
 //! a hardcoded object name that isn't really schema-qualified, an advisory
-//! lock keyed by a global constant rather than by the instance, a replication
-//! slot or publication whose name collides, a global registry that isn't
+//! lock keyed by a global constant rather than by the instance, a capture
+//! trigger whose name collides, a global registry that isn't
 //! instance-scoped. A run with one instance in it has nothing to interfere
 //! with, so it is green by construction on every one of those.
 //!
@@ -242,7 +242,7 @@ pub async fn run_two_instance_convergence<A: Backend, B: Backend>(
     // runs against a cluster where *both* engines are live. This is also the
     // first point a shared-resource collision can surface at all: if the two
     // instances contend for something neither is supposed to own globally
-    // (a slot name, a publication, an advisory lock), B's install is where
+    // (a trigger name, an advisory lock), B's install is where
     // that shows up — and in fact is exactly where both of the bugs #234
     // found did show up.
     a.backend

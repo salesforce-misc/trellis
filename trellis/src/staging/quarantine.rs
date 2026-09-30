@@ -2268,7 +2268,7 @@ pub async fn resume_column(
         .await?;
         // Issue #476: until that discharge, the definition reports
         // `catching_up` (it keeps applying).
-        crate::intake::publication::park_catch_up(
+        crate::intake::markers::park_catch_up(
             &*txn,
             &[def.id],
             std::slice::from_ref(&def.source_table),
@@ -2343,10 +2343,10 @@ pub async fn resume_column(
 /// This function itself only schedules that reconciliation. It drops the
 /// definition to [`TransformStatus::WaitingToBackfill`] and re-parks a fresh
 /// `pending_backfill` marker for its source table
-/// ([`crate::intake::publication::park_marker`], which every marker goes
+/// ([`crate::intake::markers::park_marker`], which every marker goes
 /// through). The target is left exactly as
 /// the freeze left it until that marker's discharge
-/// ([`crate::intake::publication::run_pending_backfills`]) runs, which in one
+/// ([`crate::intake::markers::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
 /// #330, `intake::resume_orphans`) and dispatches the rebuild by shape
 /// (ADR-0016): chunks or a direct-build job that drain threads run, or, for
@@ -2478,19 +2478,13 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    crate::intake::publication::park_marker(&*txn, &source_table).await?;
-    // Issue #310: a transform paused by a lost replication slot stops being
-    // reported as such the moment it is resumed.
-    txn.execute(
-        "delete from slot_loss_pauses where transform_id = $1",
-        &[&id],
-    )
-    .await?;
-    // #622 C6: likewise a transform paused by a schema change. Its columns
-    // count for capture again from here, so the next reconcile widens the
-    // source's capture to them before the discharge may dispatch the
-    // rebuild, or, if a column is still missing, pauses it again with the
-    // reason (`staging::schema_change::pause_readers_of_missing`).
+    crate::intake::markers::park_marker(&*txn, &source_table).await?;
+    // #622 C6: a transform paused by a schema change stops being reported as
+    // such the moment it is resumed. Its columns count for capture again from
+    // here, so the next reconcile widens the source's capture to them before
+    // the discharge may dispatch the rebuild, or, if a column is still
+    // missing, pauses it again with the reason
+    // (`staging::schema_change::pause_readers_of_missing`).
     txn.execute(
         "delete from capture_failures where transform_id = $1",
         &[&id],
@@ -3398,7 +3392,7 @@ mod unit_tests {
     }
 
     fn event_field<'a>(
-        event: &'a crate::client::intake_supervisor_tests::CapturedEvent,
+        event: &'a crate::client::log_capture::CapturedEvent,
         name: &str,
     ) -> &'a str {
         event
@@ -3417,7 +3411,7 @@ mod unit_tests {
     /// [`MAX_ISOLATION_PROBES`], and says so.
     #[tokio::test]
     async fn isolation_logs_its_start_and_end_and_stops_on_a_transient_storm() {
-        let (_guard, captured) = crate::client::intake_supervisor_tests::install_capture();
+        let (_guard, captured) = crate::client::log_capture::install_capture();
         let pool = unreachable_pool();
         let folded: Vec<FoldedChange> = (1..=64).map(|k| folded_key(&k.to_string())).collect();
 
@@ -3483,7 +3477,7 @@ mod unit_tests {
     /// charged; one that stopped on an error is `warn` with the error.
     #[test]
     fn isolation_end_log_counts_pinned_keys_and_reports_errors() {
-        let (_guard, captured) = crate::client::intake_supervisor_tests::install_capture();
+        let (_guard, captured) = crate::client::log_capture::install_capture();
         let complete = IsolationStats {
             probes: 20,
             stopped: None,

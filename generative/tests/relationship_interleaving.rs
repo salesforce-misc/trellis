@@ -53,7 +53,7 @@
 //!
 //! `docs/relationship-propagation.md` (issue #173 phases 1-3) is the prose
 //! obligation table: seven propagation paths as columns (the seventh, the
-//! seam-fed endpoint target, since #403), six recurring edge inputs as rows, each cell either a code site + pinning test, a structural
+//! seam-fed endpoint target, since #403), five recurring edge inputs as rows, each cell either a code site + pinning test, a structural
 //! **N/A**, or a named **GAP**. That table is hand-maintained prose, so a
 //! genuinely missing cell reads the same as one nobody has checked yet.
 //! `obligation_matrix` below is the same table turned into code: `Path` and
@@ -347,15 +347,18 @@ mod obligation_matrix {
         AggregateIncremental,
         Backfill,
         /// Issue #375's direction 1 (#403): a relationship endpoint that is
-        /// one of this instance's own targets is never published, and the
+        /// one of this instance's own targets is never captured, and the
         /// target-mutation seam (`staging::target_mutations`) is its only
         /// change feed, staging each write CDC-shaped. Every other path's
-        /// input for such an endpoint comes from here instead of intake.
+        /// input for such an endpoint comes from here instead of the capture
+        /// triggers.
         SeamFedEndpoint,
     }
 
-    /// The six recurring edge inputs the doc names as rows — issue #173's
-    /// own "the recurring inputs are" list, verbatim.
+    /// The recurring edge inputs the doc names as rows — issue #173's own
+    /// "the recurring inputs are" list, less the source lacking an old image,
+    /// which trigger capture retired (#622): a trigger sees every column of
+    /// both images.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum EdgeInput {
         /// TRUNCATE's key-less, whole-keyspace sentinel.
@@ -366,8 +369,6 @@ mod obligation_matrix {
         CompositePrimaryKey,
         /// A missing/nonexistent parent row, or an FK re-point to one.
         MissingOrRepointedParent,
-        /// A source lacking the REPLICA IDENTITY the path needs.
-        MissingReplicaIdentity,
         /// A shared from-table reachable via two relationships.
         SharedFromTableTwoRelationships,
     }
@@ -382,12 +383,11 @@ mod obligation_matrix {
         Path::SeamFedEndpoint,
     ];
 
-    pub(super) const ALL_EDGE_INPUTS: [EdgeInput; 6] = [
+    pub(super) const ALL_EDGE_INPUTS: [EdgeInput; 5] = [
         EdgeInput::TruncateWholeKeyspace,
         EdgeInput::NullJoinKey,
         EdgeInput::CompositePrimaryKey,
         EdgeInput::MissingOrRepointedParent,
-        EdgeInput::MissingReplicaIdentity,
         EdgeInput::SharedFromTableTwoRelationships,
     ];
 
@@ -413,7 +413,7 @@ mod obligation_matrix {
     pub(super) fn cell(path: Path, input: EdgeInput) -> Cell {
         use Cell::{Handled, NotApplicable};
         use EdgeInput::{
-            CompositePrimaryKey, MissingOrRepointedParent, MissingReplicaIdentity, NullJoinKey,
+            CompositePrimaryKey, MissingOrRepointedParent, NullJoinKey,
             SharedFromTableTwoRelationships, TruncateWholeKeyspace,
         };
         use Path::{
@@ -560,36 +560,6 @@ mod obligation_matrix {
                  trellis/tests/defs_backfill_relationship.rs::relationship_build_matches_oracle_including_no_match_and_multi_child",
             ]),
 
-            // --- A source lacking the needed REPLICA IDENTITY (#41, #47, #158) ---
-            (ForwardRead, MissingReplicaIdentity) => NotApplicable(
-                "rejected earlier, at create_relationship/create_definition time, before apply \
-                 ever runs",
-            ),
-            (ReverseDelta, MissingReplicaIdentity) => {
-                NotApplicable("same declare-time rejection as ForwardRead x MissingReplicaIdentity")
-            }
-            (ReverseFallback, MissingReplicaIdentity) => {
-                NotApplicable("same declare-time rejection as ForwardRead x MissingReplicaIdentity")
-            }
-            (TruncateClear, MissingReplicaIdentity) => NotApplicable(
-                "a TRUNCATE carries no image, so replica identity is irrelevant to it",
-            ),
-            (AggregateIncremental, MissingReplicaIdentity) => NotApplicable(
-                "rejected by assert_replica_identity_supports_aggregate -> \
-                 intake::require_replica_identity_full, inside create_definition_inner, \
-                 pinned by trellis/tests/defs_catalog.rs::an_aggregate_transform_against_default_replica_identity_is_rejected",
-            ),
-            (Backfill, MissingReplicaIdentity) => NotApplicable(
-                "backfill reads a live full-table snapshot, not a CDC image; the later \
-                 incremental drain is what the declare-time gate protects",
-            ),
-            (SeamFedEndpoint, MissingReplicaIdentity) => Handled(&[
-                "an endpoint target is never published, so its replica identity is never \
-                 read: the seam captures each prior image under its own row lock. Pinned by \
-                 trellis/tests/relationship_target_endpoints.rs::a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished \
-                 and ::a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through_the_seam_alone",
-            ]),
-
             // --- A shared from-table reachable via two relationships (#79) ---
             (ForwardRead, SharedFromTableTwoRelationships) => Handled(&[
                 "trellis/tests/defs_aggregate_relationship.rs::two_relationships_sharing_a_to_side_column_name_resolve_independently",
@@ -623,7 +593,7 @@ mod obligation_matrix {
         }
     }
 
-    /// The structural check itself: walk every cell of the 7x6 matrix and
+    /// The structural check itself: walk every cell of the 7x5 matrix and
     /// assert it was actually classified with non-empty content. This can
     /// never catch a *wrong* classification (that's what the tests each
     /// cell names are for) — it only catches a cell nobody has looked at,

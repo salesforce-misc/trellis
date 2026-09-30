@@ -471,7 +471,7 @@ impl super::Backend for SubprocessBackend {
             self.defs.push(def.clone());
         }
 
-        // The staging worker publishes whatever the definitions just
+        // The staging worker captures whatever the definitions just
         // registered read, straight from the catalog (issue #427).
         if !program.tables.is_empty() && self.child.is_none() {
             self.spawn_engine(true).await?;

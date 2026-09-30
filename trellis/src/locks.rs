@@ -17,21 +17,14 @@
 //! **I6: never block an application writer.** DDL on a user table runs in
 //! its own short transactions, each under a per-attempt `lock_timeout`, retried
 //! once per [`USER_TABLE_DDL_RETRY_INTERVAL`] until it lands ([`DdlRetry`]).
-//! The per-attempt timeout depends on the lock the DDL takes:
-//!
-//! - **A lock that conflicts with `ROW EXCLUSIVE`** (`CREATE`/`DROP TRIGGER`'s
-//!   `SHARE ROW EXCLUSIVE`, #622): a DDL statement queued for it makes every
-//!   later writer queue behind it, so the queue must be short and keep
-//!   emptying: [`USER_TABLE_DDL_LOCK_TIMEOUT`]. [#565 E7]: a bare `CREATE
-//!   TRIGGER` stalled every writer for 25 s behind one open transaction; a
-//!   50 ms `lock_timeout` retried every 200 ms held the worst writer wait to
-//!   52 ms.
-//! - **`SHARE UPDATE EXCLUSIVE`** (ALTER PUBLICATION): writers don't queue
-//!   behind it, so it needs no such bound, only I7's.
-//!   [`share_update_exclusive_ddl_timeout`] waits past `deadlock_timeout`
-//!   instead, because that is when Postgres cancels an autovacuum holding
-//!   the lock the waiter wants. Under a 50 ms timeout it never cancels one,
-//!   and the DDL waits out the whole vacuum, hours on a large table.
+//! That DDL is `CREATE`/`DROP TRIGGER` (#622), whose `SHARE ROW EXCLUSIVE`
+//! conflicts with writers' `ROW EXCLUSIVE`: a DDL statement queued for it
+//! makes every later writer queue behind it, so the queue must be short and
+//! keep emptying: [`USER_TABLE_DDL_LOCK_TIMEOUT`]. [#565 E7]: a bare `CREATE
+//! TRIGGER` stalled every writer for 25 s behind one open transaction; a
+//! 50 ms `lock_timeout` retried every 200 ms held the worst writer wait to
+//! 52 ms. An autovacuum holding the table is waited out, never cancelled
+//! (#622 plan, Q1).
 //!
 //! [#565 E7]: https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119
 
@@ -63,62 +56,6 @@ pub const LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 /// conflicts with writers' `ROW EXCLUSIVE` (I6): `CREATE`/`DROP TRIGGER`
 /// (#622). See [`DdlRetry`].
 pub const USER_TABLE_DDL_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
-
-/// The least [`share_update_exclusive_ddl_timeout`] returns.
-// Only the publication's reconcile used this; C8 deletes it (issue #622).
-#[allow(dead_code)]
-const SHARE_UPDATE_EXCLUSIVE_DDL_FLOOR: Duration = Duration::from_secs(2);
-
-/// The per-attempt `lock_timeout` for DDL on a user table that takes `SHARE
-/// UPDATE EXCLUSIVE` (ALTER PUBLICATION), given the waiting session's
-/// `deadlock_timeout`: twice it, at least
-/// [`SHARE_UPDATE_EXCLUSIVE_DDL_FLOOR`], at most [`LOCK_TIMEOUT`].
-///
-/// A waiter runs the deadlock check once it has waited `deadlock_timeout`
-/// (1 s by default), and that check is what cancels an autovacuum worker
-/// holding the lock. A `lock_timeout` below `deadlock_timeout` gives up
-/// before the check runs, so the DDL waits out the whole vacuum, however long
-/// it takes. Twice `deadlock_timeout` leaves the cancelled worker as long
-/// again to abort and release the lock. The floor covers a server whose
-/// `deadlock_timeout` is tuned so low that its double would leave the worker
-/// only a few milliseconds. The cap keeps I7's bound. The cap only binds past
-/// a 60 s `deadlock_timeout`, and it still lets the check run until
-/// `deadlock_timeout` reaches the cap itself.
-///
-/// Waiting this long costs no application writer anything: `ROW EXCLUSIVE`
-/// doesn't conflict with `SHARE UPDATE EXCLUSIVE`, so writers don't queue
-/// behind the waiting DDL. What does queue is other `SHARE UPDATE EXCLUSIVE`
-/// or stronger requests (a manual `VACUUM`, `CREATE INDEX`, other DDL), for
-/// at most this long. An anti-wraparound autovacuum is never cancelled; the
-/// retry waits that one out.
-// Only the publication's reconcile used this; C8 deletes it (issue #622).
-#[allow(dead_code)]
-pub fn share_update_exclusive_ddl_timeout(deadlock_timeout: Duration) -> Duration {
-    deadlock_timeout
-        .saturating_mul(2)
-        .max(SHARE_UPDATE_EXCLUSIVE_DDL_FLOOR)
-        .min(LOCK_TIMEOUT)
-}
-
-/// [`share_update_exclusive_ddl_timeout`] for `client`'s session, reading its
-/// `deadlock_timeout`: the deadlock check runs in the waiting backend, on that
-/// backend's own setting.
-// Only the publication's reconcile used this; C8 deletes it (issue #622).
-#[allow(dead_code)]
-pub async fn read_share_update_exclusive_ddl_timeout(
-    client: &impl tokio_postgres::GenericClient,
-) -> Result<Duration, tokio_postgres::Error> {
-    let ms: i64 = client
-        .query_one(
-            "select setting::bigint from pg_settings where name = 'deadlock_timeout'",
-            &[],
-        )
-        .await?
-        .get(0);
-    Ok(share_update_exclusive_ddl_timeout(Duration::from_millis(
-        u64::try_from(ms).unwrap_or(0),
-    )))
-}
 
 /// How long [`DdlRetry`] waits between two attempts at DDL on a user table.
 pub const USER_TABLE_DDL_RETRY_INTERVAL: Duration = Duration::from_millis(200);
@@ -152,39 +89,6 @@ pub async fn set_local_lock_timeout(
         .await
 }
 
-/// Starts a stretch of user-table DDL inside `txn` (I6): sets the
-/// transaction's `lock_timeout` to `timeout` (the attempt's, from
-/// [`DdlRetry::lock_timeout`]) and returns the setting it replaced, for
-/// [`end_user_table_ddl`] to put back. Only the DDL runs under the attempt's
-/// timeout, so the rest of the transaction (catalog rows another Trellis
-/// transaction may hold for a moment) keeps the session's.
-// Only the publication's reconcile used this; C8 deletes it (issue #622).
-#[allow(dead_code)]
-pub async fn begin_user_table_ddl(
-    txn: &impl tokio_postgres::GenericClient,
-    timeout: Duration,
-) -> Result<String, tokio_postgres::Error> {
-    let previous: String = txn
-        .query_one("select current_setting('lock_timeout')", &[])
-        .await?
-        .get(0);
-    set_local_lock_timeout(txn, timeout).await?;
-    Ok(previous)
-}
-
-/// Ends the stretch [`begin_user_table_ddl`] started, restoring `previous`
-/// for the rest of the transaction.
-// Only the publication's reconcile used this; C8 deletes it (issue #622).
-#[allow(dead_code)]
-pub async fn end_user_table_ddl(
-    txn: &impl tokio_postgres::GenericClient,
-    previous: &str,
-) -> Result<(), tokio_postgres::Error> {
-    txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
-        .await?;
-    Ok(())
-}
-
 /// Whether `err`, or any error on its [`std::error::Error::source`] chain, is
 /// Postgres's `55P03` (`lock_not_available`): a `lock_timeout` firing or a
 /// `NOWAIT` lock refused. The first `tokio_postgres::Error` on the chain
@@ -201,15 +105,10 @@ pub fn is_lock_not_available(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// The retry loop for DDL on a user table (I6), shared by ALTER PUBLICATION
-/// today and `CREATE`/`DROP TRIGGER` from #622. The caller picks the
-/// per-attempt `lock_timeout` by the lock its DDL takes (the module doc):
-/// [`USER_TABLE_DDL_LOCK_TIMEOUT`] for one writers queue behind,
-/// [`share_update_exclusive_ddl_timeout`] for ALTER PUBLICATION. Each attempt
-/// is its own transaction that runs its DDL between [`begin_user_table_ddl`]
-/// and [`end_user_table_ddl`] (or under
-/// `set_local_lock_timeout(txn, retry.lock_timeout())` when the DDL is all it
-/// does); the caller loops:
+/// The retry loop for DDL on a user table (I6): `CREATE`/`DROP TRIGGER`
+/// (#622), under [`USER_TABLE_DDL_LOCK_TIMEOUT`] per attempt (the module
+/// doc). Each attempt is its own transaction that runs its DDL under
+/// `set_local_lock_timeout(txn, retry.lock_timeout())`; the caller loops:
 ///
 /// ```ignore
 /// let mut retry = DdlRetry::new("create trigger", USER_TABLE_DDL_LOCK_TIMEOUT, None);
@@ -261,9 +160,6 @@ impl DdlRetry {
     }
 
     /// The `lock_timeout` each attempt runs its DDL under.
-    // For an attempt that is only its DDL (#622's triggers, the tests);
-    // `reconcile_publication` passes its timeout along itself.
-    #[allow(dead_code)]
     pub fn lock_timeout(&self) -> Duration {
         self.lock_timeout
     }
@@ -408,25 +304,6 @@ mod tests {
         assert_eq!(shown, cap_ms());
     }
 
-    /// Only the DDL stretch runs under the short timeout; the rest of the
-    /// transaction gets the session's back.
-    #[tokio::test]
-    async fn a_user_table_ddl_stretch_restores_the_session_timeout() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = db.pool.get().await.expect("connect");
-        let txn = client.transaction().await.expect("begin");
-        let show = async |txn: &tokio_postgres::Transaction<'_>| -> String {
-            txn.query_one(SETTING_MS, &[]).await.expect("show").get(0)
-        };
-        let previous = begin_user_table_ddl(&*txn, USER_TABLE_DDL_LOCK_TIMEOUT)
-            .await
-            .expect("begin ddl");
-        assert_eq!(show(&txn).await, "50");
-        end_user_table_ddl(&*txn, &previous).await.expect("end ddl");
-        assert_eq!(show(&txn).await, cap_ms());
-    }
-
     #[tokio::test]
     async fn ddl_retry_gives_up_on_anything_but_a_lock_timeout() {
         let err = "port=not-a-port"
@@ -435,69 +312,6 @@ mod tests {
         let mut retry = DdlRetry::new("test", USER_TABLE_DDL_LOCK_TIMEOUT, None);
         assert!(!retry.again(&err).await);
         assert_eq!(retry.attempts, 0);
-    }
-
-    /// ALTER PUBLICATION's attempts wait past `deadlock_timeout`, so the
-    /// deadlock check runs and cancels an autovacuum holding the table.
-    #[test]
-    fn a_share_update_exclusive_attempt_outwaits_the_deadlock_check() {
-        let ms = Duration::from_millis;
-        for deadlock_timeout in [ms(1), ms(10), ms(100), ms(1000), ms(5000), ms(59_000)] {
-            let timeout = share_update_exclusive_ddl_timeout(deadlock_timeout);
-            assert!(
-                timeout >= deadlock_timeout * 2 && timeout >= SHARE_UPDATE_EXCLUSIVE_DDL_FLOOR,
-                "{deadlock_timeout:?} -> {timeout:?}"
-            );
-            assert!(timeout <= LOCK_TIMEOUT);
-        }
-        assert_eq!(share_update_exclusive_ddl_timeout(ms(1000)), ms(2000));
-        assert_eq!(share_update_exclusive_ddl_timeout(ms(5000)), ms(10_000));
-        // Past half the cap, I7's bound wins, and still outwaits the check
-        // until `deadlock_timeout` reaches the cap itself.
-        assert_eq!(share_update_exclusive_ddl_timeout(ms(90_000)), LOCK_TIMEOUT);
-        assert!(share_update_exclusive_ddl_timeout(ms(90_000)) > ms(90_000));
-        assert_eq!(
-            share_update_exclusive_ddl_timeout(Duration::from_secs(3600)),
-            LOCK_TIMEOUT
-        );
-    }
-
-    /// The timeout reads the session's own `deadlock_timeout`: the server
-    /// default, and a session's override.
-    #[tokio::test]
-    async fn the_share_update_exclusive_timeout_reads_the_sessions_deadlock_timeout() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let client = db.pool.get().await.expect("connect");
-        let server: String = client
-            .query_one(
-                "select setting from pg_settings where name = 'deadlock_timeout'",
-                &[],
-            )
-            .await
-            .expect("show")
-            .get(0);
-        let server = Duration::from_millis(server.parse().expect("ms"));
-        let timeout = read_share_update_exclusive_ddl_timeout(&**client)
-            .await
-            .expect("read");
-        assert_eq!(timeout, share_update_exclusive_ddl_timeout(server));
-        assert!(timeout > server, "{timeout:?} must outwait {server:?}");
-
-        client
-            .batch_execute("set deadlock_timeout = '7s'")
-            .await
-            .expect("set deadlock_timeout");
-        assert_eq!(
-            read_share_update_exclusive_ddl_timeout(&**client)
-                .await
-                .expect("read"),
-            Duration::from_secs(14)
-        );
-        client
-            .batch_execute("reset deadlock_timeout")
-            .await
-            .expect("reset");
     }
 
     /// A deadline stops the retries once the next attempt, timeout

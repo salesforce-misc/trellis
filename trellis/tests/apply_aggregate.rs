@@ -93,7 +93,7 @@ async fn insert_cdc_row(
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // Issue #132: a throwaway, always-caught-up watermark — no live
-    // `Intake` runs in this test file, and it isn't exercising guard (a).
+    // capture runs in this test file, and it isn't exercising guard (a).
     apply::drain_once(
         pool,
         seg_seq,
@@ -193,7 +193,7 @@ async fn drain_matches_the_oracle_for_aggregate_insert_update_delete_and_grain_m
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -412,8 +412,7 @@ async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantin
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
-             alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -580,7 +579,7 @@ async fn independent_aggregate_batches_deltas_commute_under_out_of_order_drain()
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -643,7 +642,7 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -746,7 +745,7 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -828,7 +827,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
              create table widgets (id integer primary key, cost numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
@@ -919,7 +918,7 @@ async fn two_overlapping_group_writers_serialize_via_ascending_lock_order_not_de
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 1.00), (2, 20, 1.00)",
         )
         .await
@@ -1065,7 +1064,7 @@ async fn image_less_recompute_trigger_still_probes_a_stale_sum_field() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -1161,7 +1160,6 @@ async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same
              insert into public.order_items (id, order_id, amount) values (1, 10, 999.00), (2, 10, 888.00); \
              create schema custom; \
              create table custom.order_items (id integer primary key, order_id integer, amount numeric); \
-             alter table custom.order_items replica identity full; \
              insert into custom.order_items (id, order_id, amount) values (1, 10, 5.00);",
         )
         .await
@@ -1274,8 +1272,7 @@ async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
     client
         .batch_execute(
             "create schema custom; \
-             create table order_items (id integer primary key, order_id integer, amount numeric); \
-             alter table order_items replica identity full",
+             create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("seed source table and the custom schema");
@@ -1292,7 +1289,7 @@ async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
         .expect("create aggregate definition against the explicitly-qualified target");
 
     // Seed group 10's physical row and its matching CDC insert — mirroring
-    // real replication, where the physical write and its CDC event both
+    // real capture, where the physical write and its CDC event both
     // reflect the same post-image.
     client
         .execute(
@@ -1391,7 +1388,7 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00), (2, 10, NULL)",
         )
         .await
@@ -1488,8 +1485,7 @@ async fn a_brand_new_null_only_group_still_gets_a_target_row_and_is_removed_when
 
     client
         .batch_execute(
-            "create table null_seed_items (id integer primary key, grp integer, amount numeric); \
-             alter table null_seed_items replica identity full",
+            "create table null_seed_items (id integer primary key, grp integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -1635,7 +1631,7 @@ async fn avg_maintenance_matches_the_oracle_across_three_single_row_drains_into_
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -1769,8 +1765,7 @@ async fn aggregate_columns_over_different_arguments_maintain_independent_counts_
         .batch_execute(
             "create table posts_calc (
                  id integer primary key, author integer, word_count numeric, byte_size numeric
-             ); \
-             alter table posts_calc replica identity full",
+             )",
         )
         .await
         .expect("create source table");
@@ -1942,7 +1937,7 @@ async fn count_star_composes_with_avg_across_insert_update_delete_and_grain_migr
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -2112,7 +2107,7 @@ async fn count_star_image_less_recompute_trigger_probes_a_stale_count() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full; \
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
              insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
         )
         .await
@@ -2190,7 +2185,7 @@ async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_sca
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -2336,7 +2331,7 @@ async fn backfilling_a_multi_column_group_by_matches_the_oracle() {
     client
         .batch_execute(
             "create table sales \
-             (id integer primary key, region text, order_id integer, amount numeric); alter table sales replica identity full",
+             (id integer primary key, region text, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -2404,7 +2399,7 @@ async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -2502,7 +2497,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_aggregate_apply_pass(
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -2782,8 +2777,7 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
 
     client
         .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
-             alter table order_items replica identity full",
+            "create table order_items (id integer primary key, order_id integer, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -2908,8 +2902,7 @@ async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misrea
         .batch_execute(
             "create table order_items (\
                  id integer primary key, order_id uuid, amount numeric\
-             ); \
-             alter table order_items replica identity full",
+             )",
         )
         .await
         .expect("create source table");
@@ -2947,7 +2940,7 @@ async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misrea
     // DISTINCT` constraint rather than a real Postgres `PRIMARY KEY` (see
     // `create_aggregate_target_table`'s doc comment) — a deliberate,
     // separate design choice so a NULL grouping value stays representable.
-    // `intake::publication::enumerate_and_append`'s own primary-key lookup
+    // `intake::markers::enumerate_and_append`'s own primary-key lookup
     // (unlike `ddl::source_primary_key`'s unique-index fallback this
     // test's `#103` fix cares about) requires a real `indisprimary` row and
     // has no such fallback, so a definition-creation backfill enumeration
@@ -3064,7 +3057,6 @@ async fn setup_sku_totals(db: &testkit::TestDatabase, client: &mut Client, rows:
     client
         .batch_execute(&format!(
             "create table sales (id integer primary key, sku text, amount numeric); \
-             alter table sales replica identity full; \
              insert into sales (id, sku, amount) values {rows}"
         ))
         .await

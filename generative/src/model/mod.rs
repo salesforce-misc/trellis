@@ -565,8 +565,8 @@ pub enum BackupKind {
     /// server is stopped. Capture carries on from the restored point with no
     /// pause.
     ColdCopy,
-    // TODO(#558): `BaseBackup`, a `pg_basebackup` restore. With no
-    // replication slot to lose (#622), it should behave like `ColdCopy`.
+    // TODO(#558): `BaseBackup`, a `pg_basebackup` restore. Capture state
+    // lives in ordinary tables (#622), so it should behave like `ColdCopy`.
 }
 
 /// A backup-and-restore schedule for one program run (issue #236), driven by

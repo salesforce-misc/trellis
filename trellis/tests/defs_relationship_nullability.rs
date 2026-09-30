@@ -94,7 +94,7 @@ async fn stage_cdc(
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -215,18 +215,11 @@ async fn to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappear
     let mut client = connect_raw(db.dsn()).await;
 
     // Article 1 points at category 10, which does not exist yet — the FK is
-    // unresolved from the very first build, not merely orphaned later. The
-    // to-side's own join-key-only needs would be satisfied by Postgres's
-    // DEFAULT replica identity (a to-one's join key *is* the to-side primary
-    // key), but issue #129's settled parent projection needs `REPLICA
-    // IDENTITY FULL` unconditionally regardless — see
-    // `assert_replica_identity_supports_projection`.
+    // unresolved from the very first build, not merely orphaned later.
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full; \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
         .await
@@ -247,7 +240,7 @@ async fn to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappear
     install_definition(&db.pool, ARTICLE_CAT, &source_columns, "public")
         .await
         .expect("install the to-one enrichment definition through the front door");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge enumerates the source (ADR-0016)");
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -425,13 +418,12 @@ async fn to_many_aggregate_returns_the_empty_set_when_the_last_related_row_goes(
     let mut client = connect_raw(db.dsn()).await;
 
     // A to-many's join column (`comments.article_id`) is a non-PK column on the
-    // to-side, so DELETE pre-images need `REPLICA IDENTITY FULL` to carry it —
-    // exactly what makes the "last child deleted" case resolvable at all.
+    // to-side; the DELETE's old image carries it, which is exactly what makes
+    // the "last child deleted" case resolvable at all.
     client
         .batch_execute(
             "create table articles (id integer primary key, title text); \
              create table comments (id integer primary key, article_id integer, word_count integer); \
-             alter table comments replica identity full; \
              insert into articles (id, title) values (1, 'a1'); \
              insert into comments (id, article_id, word_count) values \
                (100, 1, 5), (101, 1, 7)",
@@ -450,7 +442,7 @@ async fn to_many_aggregate_returns_the_empty_set_when_the_last_related_row_goes(
     install_definition(&db.pool, ARTICLE_STATS, &source_columns, "public")
         .await
         .expect("install the to-many enrichment definition through the front door");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(

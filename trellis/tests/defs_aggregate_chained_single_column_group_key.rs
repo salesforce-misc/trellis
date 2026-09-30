@@ -160,18 +160,14 @@ const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT su
 const SKU_TOTALS_V2: &str =
     "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku SELECT sum(total) AS total2";
 
-/// `sales` needs `REPLICA IDENTITY FULL` because it's an aggregate source
-/// (the delta path needs the old image to locate the group a changed row is
-/// leaving); `sku_totals` needs it for the same reason once `sku_totals_v2`
-/// chains onto it, and can only be widened after `install_definition` has
-/// created it.
+/// `sales` is an aggregate source, and `sku_totals` becomes one once
+/// `sku_totals_v2` chains onto it.
 async fn create_schema(client: &Client) {
     client
         .batch_execute(
             "create table sales ( \
                  id integer primary key, sku text, amount integer \
              ); \
-             alter table sales replica identity full; \
              insert into sales (id, sku, amount) values \
                (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), (4, 'c', 11)",
         )
@@ -207,18 +203,13 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the single-column GROUP BY aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
-
-    client
-        .batch_execute("alter table sku_totals replica identity full")
-        .await
-        .expect("widen sku_totals's replica identity");
 
     install_definition(&db.pool, SKU_TOTALS_V2, &sku_totals_columns(), "public")
         .await
         .expect("install the chained aggregate reading sku_totals");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     // Both backfills: a=12 (5+7), b=2, c=11; identity re-aggregation carries

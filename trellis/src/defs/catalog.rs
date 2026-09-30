@@ -25,7 +25,7 @@
 //! resolved to their `schema.table` identity exactly once, at
 //! definition-acceptance time (`create_definition_inner`'s
 //! [`resolve_source_schema_in_txn`] call for the source side,
-//! `Config::target_schema`/`intake::publication::qualify` for the target
+//! `Config::target_schema`/`intake::markers::qualify` for the target
 //! side), never the bare spelling the grammar parsed. Every read of any of
 //! these columns downstream must treat the value as already-qualified and
 //! must not re-resolve it — see [`resolve_source_schema_in_txn`]'s own doc
@@ -141,14 +141,13 @@ pub enum CatalogError {
     /// `create_definition_inner`, the only writer, which only ever encodes
     /// [`ValueType`]'s variants.
     UnknownValueType { column: String, text: String },
-    /// An intake-side step failed: resolving a qualified table name, parking
+    /// A marker-side step failed: resolving a qualified table name, parking
     /// a catch-up marker, or checking that a source is change-keyed.
     Backfill(crate::intake::IntakeError),
     /// `def.source` doesn't resolve to any schema on this connection's
     /// search path (see [`resolve_source_schema_in_txn`]) — the table was
     /// dropped, renamed, or never existed under that bare name. Also a table
-    /// dropped between resolving it and a later check that reads it
-    /// ([`check_source_guarantees`]).
+    /// dropped between resolving it and a later check that reads it.
     SourceTableNotFound(String),
     /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
     /// shares a bare table-name suffix with a *different* qualified target
@@ -229,17 +228,6 @@ pub enum CatalogError {
         /// The qualified `schema.table` spelling that already exists.
         table: String,
     },
-    /// An aggregate (`GROUP BY`) definition (issue #47) was rejected because
-    /// its source table's replica identity doesn't guarantee the old row
-    /// image the delta-maintenance path (`apply_aggregate.rs`) needs on
-    /// delete/update/re-parent. Wraps [`crate::intake::IntakeError`] — the
-    /// same [`crate::intake::require_replica_identity_full`] check
-    /// [`assert_replica_identity_supports_to_many`] mirrors for relationships
-    /// (#41) — rather than [`CatalogError::Backfill`]'s blanket
-    /// `From<IntakeError>`, since that variant's message ("failed to
-    /// backfill...") would misdescribe a definition-time rejection as a
-    /// backfill failure.
-    ReplicaIdentityRequired(crate::intake::IntakeError),
     /// Issue #376: the definition's source would be captured by triggers,
     /// but they can't key that table's changes (see [`change_keyed`]): it
     /// has no primary key, or isn't a plain table (a partitioned table, say).
@@ -250,7 +238,7 @@ pub enum CatalogError {
     SourceNotChangeKeyed { source_table: String },
     /// Issue #375: a relationship endpoint that isn't one of this instance's
     /// targets fails [`change_keyed`]. The relationship walk in
-    /// [`all_source_tables`] publishes it, so it is held to the same rule as a
+    /// [`all_source_tables`] captures it, so it is held to the same rule as a
     /// definition's source ([`CatalogError::SourceNotChangeKeyed`]); the case
     /// that motivated it is another instance's aggregate target.
     RelationshipEndpointNotChangeKeyed {
@@ -279,7 +267,7 @@ pub enum CatalogError {
     Ddl(DdlError),
     /// A direct-build step failed with something other than
     /// [`BackfillError::Unsupported`]: the backfill discharge's shape check
-    /// (`intake::publication`), or an `ALTER TRANSFORM`'s added-column build.
+    /// (`intake::markers`), or an `ALTER TRANSFORM`'s added-column build.
     /// An `Unsupported` shape gets the ring enumeration instead of surfacing
     /// here.
     DirectBackfill(BackfillError),
@@ -392,8 +380,7 @@ impl CatalogError {
     /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to the wrapped error's own `code()` wherever
     /// one nests here ([`CatalogError::Parse`], [`CatalogError::Validate`],
-    /// [`CatalogError::Pool`], [`CatalogError::Backfill`],
-    /// [`CatalogError::ReplicaIdentityRequired`], [`CatalogError::Ddl`],
+    /// [`CatalogError::Pool`], [`CatalogError::Backfill`], [`CatalogError::Ddl`],
     /// [`CatalogError::DirectBackfill`]) rather than hardcoding one category
     /// for a whole variant — so, for instance, a
     /// [`CatalogError::Validate`]`(`[`ValidationError::DuplicateRelationshipName`]`)`
@@ -415,7 +402,6 @@ impl CatalogError {
             // `ValidationError::DuplicateRelationshipName` reports.
             CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
             CatalogError::TargetTableExists { .. } => ErrorCode::Conflict,
-            CatalogError::ReplicaIdentityRequired(err) => err.code(),
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RelationshipEndpointUnsupportedKey { .. } => ErrorCode::Validation,
@@ -491,7 +477,6 @@ impl fmt::Display for CatalogError {
                  it creates, so choose a different target name or drop or rename the existing \
                  relation"
             ),
-            CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
             CatalogError::SourceNotChangeKeyed { source_table } => write!(
                 f,
                 "Trellis can't capture source table \"{source_table}\"'s changes: it must be a \
@@ -603,7 +588,6 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceTableNotFound(_) => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
-            CatalogError::ReplicaIdentityRequired(err) => Some(err),
             CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => None,
             CatalogError::RelationshipEndpointUnsupportedKey { .. } => None,
@@ -654,15 +638,15 @@ impl From<crate::intake::IntakeError> for CatalogError {
 /// Test fixture: registers a definition exactly as [`install_definition`]
 /// registers every one (`waiting_to_backfill`, no source read), then stands
 /// in for the backfill discharge's ring fallback
-/// (`intake::publication::run_pending_backfills`, ADR-0016) in-call: it
+/// (`intake::markers::run_pending_backfills`, ADR-0016) in-call: it
 /// enumerates the source into the ring as image-less `Recompute` rows and
 /// flips the definition `live` in one transaction. `source_columns` maps the
 /// source table's known columns to their [`ValueType`] (see
 /// [`super::validate::validate`]).
 ///
 /// No production path calls this: registration never reads the source (issue
-/// #418). It skips everything the discharge waits on (the marker's fence and
-/// intake's progress), so the caller must be the only writer of the source.
+/// #418). It skips everything the discharge waits on (the marker's fence),
+/// so the caller must be the only writer of the source.
 /// The target table must already exist (see this module's doc comment).
 ///
 /// `pool.target_schema()`, not a parameter of this function's own (issue
@@ -686,7 +670,7 @@ pub async fn create_definition(
     .await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    crate::intake::publication::enumerate_and_append(&txn, &definition.source_table).await?;
+    crate::intake::markers::enumerate_and_append(&txn, &definition.source_table).await?;
     txn.execute(
         "update transform_definitions set status = $1 where id = $2",
         &[&TransformStatus::Live.as_str(), &definition.id],
@@ -695,12 +679,12 @@ pub async fn create_definition(
     txn.commit().await?;
     definition.status = TransformStatus::Live;
     // Issue #315: a source that is another definition's target is never
-    // published, and its writer's target-mutation seam only reached this
+    // captured, and its writer's target-mutation seam only reached this
     // definition once it was applying. The discharge fences the marker when
     // it reads it (issue #431), after this commit, so the fence waits out
     // every such writer, and flips the definition `live` (issue #476).
     if is_definition_target(&**client, &definition.source_table).await? {
-        crate::intake::publication::park_catch_up(
+        crate::intake::markers::park_catch_up(
             &**client,
             &[definition.id],
             std::slice::from_ref(&definition.source_table),
@@ -753,9 +737,9 @@ pub async fn create_definition_without_backfill(
 /// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
 /// returns, so its latency doesn't depend on the size of any table the
 /// definition reads. Its build runs in the background: the staging worker's
-/// reconcile pass parks a `pending_backfill` marker on its source (joining
-/// the source to the publication first if it has to; see
-/// [`crate::intake::publication::reconcile_publication`]), and that marker's
+/// reconcile pass parks a `pending_backfill` marker on its source (installing
+/// or widening the source's capture first if it has to; see
+/// [`crate::capture::reconcile`]), and that marker's
 /// discharge dispatches the build by shape once the marker's fence has
 /// settled. A plain 1-1 definition gets `backfill_chunks`, an aggregate or
 /// relationship-enriched 1-1 definition one direct-build job
@@ -1011,7 +995,7 @@ async fn catch_up_if_backfilling(
 ///
 /// The parked marker (reusing the exact `pending_backfill` mechanism the
 /// ring-fallback path already relies on — see
-/// [`crate::intake::publication::park_catch_up`]) is what makes excluding a
+/// [`crate::intake::markers::park_catch_up`]) is what makes excluding a
 /// definition still being built from [`dependents_of`]/[`transforms_for_source`]
 /// safe rather than lossy: any CDC delta for this source table that arrived
 /// while this definition sat `backfilling` was never folded into its target
@@ -1022,7 +1006,7 @@ async fn catch_up_if_backfilling(
 /// may be missing those deltas, and a watermark token wouldn't wait for
 /// them, so the definition reports `catching_up`: applied exactly as a
 /// `live` one is, flipped `live` by the discharge of its last catch-up
-/// (`intake::publication::go_live_caught_up`). ADR-0016, "What `live`
+/// (`intake::markers::go_live_caught_up`). ADR-0016, "What `live`
 /// promises".
 ///
 /// Completes every build that runs through `backfill_chunks`: a plain 1-1
@@ -1065,13 +1049,13 @@ pub(crate) async fn complete_direct_backfill(
     if status == TransformStatus::CatchingUp {
         // Issue #315: the chunks wrote this target outside the seam; a
         // reader already attached to it (a resumed upstream's) re-derives.
-        crate::intake::publication::park_target_catchup_if_read(txn, definition_id).await?;
+        crate::intake::markers::park_target_catchup_if_read(txn, definition_id).await?;
     }
     if status.is_frozen() {
         return Ok(status);
     }
     let tables = definition_tables_read(txn, definition_id).await?;
-    crate::intake::publication::park_catch_up(txn, &[definition_id], &tables).await?;
+    crate::intake::markers::park_catch_up(txn, &[definition_id], &tables).await?;
     // The park moves a `live` definition (one a leftover chunk wrote under)
     // to `catching_up` too.
     Ok(if status.is_applying() {
@@ -1100,7 +1084,7 @@ async fn definition_tables_read(
 /// Every `catching_up` definition that reads `table`, locked `for update`,
 /// with every table it reads ([`tables_read_by`]): the definitions whose
 /// go-live catch-up the discharge of `table`'s marker may be the last of
-/// (`intake::publication::go_live_caught_up`, issue #476). The definitions
+/// (`intake::markers::go_live_caught_up`, issue #476). The definitions
 /// are read unlocked first ([`catching_up_readers_unlocked`]) and only the
 /// ones reading `table` are locked, in id order; one that left `catching_up`
 /// while this waited for its lock is dropped.
@@ -1156,7 +1140,7 @@ pub(crate) async fn catching_up_readers_unlocked(
 /// directly as its source or through a relationship whose to-side it is
 /// ([`tables_read_by`]), in id order: the readers a rewrite of `table`
 /// outside the target-mutation seam has to catch up (issue #507,
-/// `intake::publication::park_target_catchup_if_read`). A relationship
+/// `intake::markers::park_target_catchup_if_read`). A relationship
 /// consumer counts only if one of its fields reads through the relationship,
 /// the same rule the catch-up discharge's go-live check applies
 /// ([`catching_up_readers`]).
@@ -1494,7 +1478,7 @@ pub(crate) async fn is_definition_target(
 /// marker's discharge clears them once the installed capture images every
 /// column the definition reads, and it waits for the widen's capture gate
 /// first, so every row the old function staged has drained through the
-/// paused field by then (`intake::publication`'s
+/// paused field by then (`intake::markers`'s
 /// `release_columns_awaiting_capture`). The enumeration the same discharge
 /// stages re-derives every row with the field unpaused. An edit that reads
 /// only columns the definition already read unpauses at once, as before:
@@ -1915,7 +1899,7 @@ pub async fn alter_transform(
         // Issue #476: the target is missing the changes this marker's
         // discharge folds in, so the definition reports `catching_up` until
         // then (it keeps applying).
-        crate::intake::publication::park_catch_up(
+        crate::intake::markers::park_catch_up(
             &*txn,
             &[current.id],
             std::slice::from_ref(&current.source_table),
@@ -2185,17 +2169,6 @@ async fn create_definition_inner(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    // Issue #47: an aggregate (`GROUP BY`) definition's delta-maintenance
-    // path needs the source row's *old* image on delete/update/re-parent
-    // (`apply_aggregate.rs`'s `accumulate_changes`) to find which group to
-    // decrement — reject up front, before any of this transaction's other
-    // side effects, if the source table's replica identity can't guarantee
-    // one. Checked first (ahead of node/edge work below) so a
-    // doomed-to-fail aggregate definition never touches the schema graph.
-    if let KeySpace::Aggregate { .. } = &def.key_space {
-        assert_replica_identity_supports_aggregate(&txn, &def).await?;
-    }
-
     // Issue #72 / #76, ADR-0007: resolve `def.source` — always a bare table
     // name (see [`super::ast::TransformDef`]'s own doc comment for why the
     // dotted spelling never lands in this field) — to its fully-qualified
@@ -2239,7 +2212,7 @@ async fn create_definition_inner(
                 }
                 .into());
             }
-            crate::intake::publication::qualify(schema, &def.source)?
+            crate::intake::markers::qualify(schema, &def.source)?
         }
         None => resolve_graph_identity_in_txn(&txn, &def.source).await?,
     };
@@ -2264,7 +2237,7 @@ async fn create_definition_inner(
     // trusting the parameter alone, so the existence check runs regardless of
     // which entry point got here.
     //
-    // Built via the same `intake::publication::qualify` helper as
+    // Built via the same `intake::markers::qualify` helper as
     // `qualified_source`, not `ddl::qualified_target_table` directly: the two
     // produce different shapes for different jobs — `qualify` returns the
     // plain, unquoted `"schema.table"` this whole module's qualified-identity
@@ -2281,8 +2254,7 @@ async fn create_definition_inner(
     // there was never an ordering hazard here to begin with; this always ran
     // (and still runs) ahead of the node/cycle checks below.
     let resolved_target_schema = effective_target_schema(&def, target_schema);
-    let qualified_target =
-        crate::intake::publication::qualify(resolved_target_schema, &def.target)?;
+    let qualified_target = crate::intake::markers::qualify(resolved_target_schema, &def.target)?;
     // The test-fixture entry points (`target_ddl` is `None`) register against
     // a target their caller already created; `install_definition` creates it
     // below, after every check on the definition itself (issue #440).
@@ -2708,19 +2680,19 @@ pub async fn create_relationship(
     // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
     // this resolution used to run *after* this function's own pg_catalog
     // introspection (`column_type_in_txn`/`to_col_cardinality_in_txn`/
-    // `has_usable_fk_index_in_txn`/`assert_replica_identity_supports_to_many`,
-    // below), which resolve `def.from_table`/`def.to_table` bare via
-    // `pg_catalog.to_regclass` — a plain `search_path` walk with no
-    // fallback, unlike this call. So a relationship endpoint that bare-names
-    // another definition's target explicitly qualified into a non-default
-    // schema (issue #76) never reached this resolution at all: it failed
-    // first, in one of those four checks, as a false "does not exist" (e.g.
-    // `to_col_cardinality_in_txn`'s `to_regclass($1)` resolving to `NULL`
-    // reads as "no such index", not "wrong schema"). Moved up here, before
-    // any of them, and threaded through via [`resolve_relationship_endpoint_in_txn`]
-    // — a thin wrapper around this exact function, not a second fallback
-    // implementation — so every pg_catalog lookup below gets the same
-    // two-step resolution `create_definition_inner` already relies on.
+    // `has_usable_fk_index_in_txn`, below), which resolve
+    // `def.from_table`/`def.to_table` bare via `pg_catalog.to_regclass` — a
+    // plain `search_path` walk with no fallback, unlike this call. So a
+    // relationship endpoint that bare-names another definition's target
+    // explicitly qualified into a non-default schema (issue #76) never reached
+    // this resolution at all: it failed first, in one of those three checks, as
+    // a false "does not exist" (e.g. `to_col_cardinality_in_txn`'s
+    // `to_regclass($1)` resolving to `NULL` reads as "no such index", not
+    // "wrong schema"). Moved up here, before any of them, and threaded through
+    // via [`resolve_relationship_endpoint_in_txn`] — a thin wrapper around this
+    // exact function, not a second fallback implementation — so every
+    // pg_catalog lookup below gets the same two-step resolution
+    // `create_definition_inner` already relies on.
     let qualified_from = resolve_relationship_endpoint_in_txn(&txn, &def.from_table).await?;
     let qualified_to = resolve_relationship_endpoint_in_txn(&txn, &def.to_table).await?;
 
@@ -2737,13 +2709,13 @@ pub async fn create_relationship(
     // to-side is often really a transform target: the flag is additive/OR'd
     // (a later `create_definition` call can still set `is_target` on the
     // same node), and no consumer reads `schema_nodes.is_source` directly —
-    // [`all_source_tables`] (the publication feeder) walks `schema_edges`
+    // [`all_source_tables`] (what capture covers) walks `schema_edges`
     // `Relationship` edges from `transform_definitions.source_table` anchors
     // instead (issue #75), never the `is_source` flag itself: that flag is
     // set on *every* relationship endpoint regardless of whether it's
     // actually reachable from a registered transform, so reading it directly
-    // would leak an orphaned relationship's tables into the publication
-    // (issue #65's test case 4). If a future `is_source` consumer reads
+    // would leak an orphaned relationship's tables into capture (issue #65's
+    // test case 4). If a future `is_source` consumer reads
     // `schema_nodes` directly, re-check this call.
     let to_node = resolve_node_in_txn(&txn, &qualified_to, NodeKind::Source).await?;
 
@@ -2844,7 +2816,7 @@ struct ValidatedRelationship {
 ///    reported as a mismatch whose advice ("alter one column to match the
 ///    other") could steer the user onto it.
 /// 2. **Each endpoint**, from-side then to-side
-///    ([`validate_relationship_endpoint`]): intake can key it, its key's
+///    ([`validate_relationship_endpoint`]): capture can key it, its key's
 ///    types are on the key allowlist and its key's collations are
 ///    deterministic, and it is `live` if it is one of this instance's
 ///    targets.
@@ -2853,14 +2825,9 @@ struct ValidatedRelationship {
 ///    of the rule `relationship_definitions_from_schema_from_table_name_key`
 ///    backstops).
 /// 4. **No table cycle** ([`reject_if_table_cycle`]).
-/// 5. **Replica identity**, by cardinality ([`to_col_cardinality_in_txn`]):
-///    a to-many to-side must carry `to_col` in its pre-images
-///    ([`assert_replica_identity_supports_to_many`], #41); a to-one needs
-///    `REPLICA IDENTITY FULL` on both endpoints for its settled parent
-///    projection ([`assert_replica_identity_supports_projection`], #129,
-///    #158). An endpoint that is one of this instance's targets is exempt
-///    from both: it is never published, and the seam's rows carry its full
-///    prior image (#403).
+/// 5. **Cardinality** ([`to_col_cardinality_in_txn`]): to-one when `to_col`
+///    has a unique index, to-many otherwise. Neither asks anything more of
+///    the endpoints: capture triggers image the whole old row (issue #622).
 ///
 /// A from-side join column with no usable index is a performance warning
 /// ([`RelationshipWarning::MissingFkIndex`]), not a requirement.
@@ -2930,21 +2897,6 @@ async fn validate_relationship(
     reject_if_table_cycle(txn, qualified_to, qualified_from).await?;
 
     let cardinality = to_col_cardinality_in_txn(txn, qualified_to, &def.to_col).await?;
-    if cardinality == RelationshipCardinality::ToMany {
-        if !is_definition_target(txn, qualified_to).await? {
-            assert_replica_identity_supports_to_many(txn, def, qualified_to).await?;
-        }
-    } else {
-        assert_replica_identity_supports_projection(
-            txn,
-            &def.to_table,
-            qualified_to,
-            &def.from_table,
-            qualified_from,
-        )
-        .await?;
-    }
-
     let mut warnings = Vec::new();
     if !has_usable_fk_index_in_txn(txn, qualified_from, &def.from_col).await? {
         warnings.push(RelationshipWarning::MissingFkIndex {
@@ -2965,8 +2917,8 @@ async fn validate_relationship(
 /// [`validate_relationship`]'s per-endpoint requirements, run once for each
 /// side. Each names `side` in its rejection.
 ///
-/// - **Keyable by intake** ([`reject_unkeyed_relationship_endpoint`], #375):
-///   an endpoint this instance doesn't own is published, so its changes must
+/// - **Keyable by capture** ([`reject_unkeyed_relationship_endpoint`], #375):
+///   an endpoint this instance doesn't own is captured, so its changes must
 ///   carry a key.
 /// - **Key types on the allowlist** ([`ddl::source_primary_key_in_txn`],
 ///   #429): every change the relationship propagates is keyed by the
@@ -3023,9 +2975,9 @@ async fn validate_relationship_endpoint(
             });
         }
         // Not reachable while `reject_unkeyed_relationship_endpoint` above
-        // holds: it passes only a table with a primary key or a live
-        // replica-identity index (which qualifies as an identity index), or
-        // one of this instance's targets, which always carry a key. Should
+        // holds: it passes only a plain table with a primary key
+        // ([`change_keyed`]), or one of this instance's targets, which
+        // always carry a key. Should
         // that drift, it is the same keying failure, so it gets that error
         // rather than `CatalogError::Ddl`, whose message is about creating a
         // target table.
@@ -3252,27 +3204,11 @@ pub async fn relationships_to_table(
 
 /// Every relationship declared on the qualified from-table
 /// `from_schema.from_table` — the outbound mirror of
-/// [`relationships_to_table`]. Issue #133 (epic #127) uses this to build
-/// intake's `src_table -> from_col` cache: the columns a from-side row's own
-/// CDC images must be read to populate the ring's `group_key` column (the
-/// union of join-key values that row's change touched). Schema-scoped (issue
-/// #288) so a same-named table in another schema doesn't contribute its own
-/// relationships' `from_col`s.
-// Only intake used this; C8 deletes it (issue #622).
-#[allow(dead_code)]
-pub async fn relationships_from_table(
-    pool: &Pool,
-    from_schema: &str,
-    from_table: &str,
-) -> Result<Vec<RelationshipDefinition>, CatalogError> {
-    let client = pool.get().await?;
-    relationships_from_table_in(&**client, from_schema, from_table).await
-}
-
-/// [`relationships_from_table`] on a caller-supplied client, for a caller
+/// [`relationships_to_table`] — on a caller-supplied client, for a caller
 /// already inside a transaction (`staging::target_mutations`, which resolves
 /// a from-side endpoint target's join-key columns in the writing
-/// transaction).
+/// transaction). Schema-scoped (issue #288) so a same-named table in another
+/// schema doesn't contribute its own relationships.
 pub(crate) async fn relationships_from_table_in(
     client: &impl GenericClient,
     from_schema: &str,
@@ -3524,7 +3460,7 @@ async fn resolve_graph_identity_in_txn(
     table: &str,
 ) -> Result<String, CatalogError> {
     match resolve_source_schema_in_txn(txn, table).await {
-        Ok(schema) => Ok(crate::intake::publication::qualify(&schema, table)?),
+        Ok(schema) => Ok(crate::intake::markers::qualify(&schema, table)?),
         Err(CatalogError::SourceTableNotFound(_)) => {
             let row = txn
                 .query_opt(
@@ -3546,14 +3482,14 @@ async fn resolve_graph_identity_in_txn(
 /// Best-effort counterpart to [`resolve_graph_identity_in_txn`], for
 /// [`create_relationship`]'s own pg_catalog introspection
 /// (`column_type_in_txn`/`to_col_cardinality_in_txn`/
-/// `has_usable_fk_index_in_txn`/`assert_replica_identity_supports_to_many`) —
-/// reviewer follow-up to issue #74 (epic #78's own whole-branch review). Those
-/// four resolve `def.from_table`/`def.to_table` via `pg_catalog.to_regclass`,
-/// which — like [`resolve_source_schema_in_txn`]'s own walk — only ever
-/// considers *this connection's* `search_path`, so a relationship endpoint
-/// that bare-names another definition's target explicitly qualified into a
-/// non-default schema (issue #76) needs the exact same bare-target-suffix
-/// fallback `create_definition_inner`'s `qualified_source` already gets.
+/// `has_usable_fk_index_in_txn`) — reviewer follow-up to issue #74 (epic #78's
+/// own whole-branch review). Those three resolve
+/// `def.from_table`/`def.to_table` via `pg_catalog.to_regclass`, which — like
+/// [`resolve_source_schema_in_txn`]'s own walk — only ever considers *this
+/// connection's* `search_path`, so a relationship endpoint that bare-names
+/// another definition's target explicitly qualified into a non-default schema
+/// (issue #76) needs the exact same bare-target-suffix fallback
+/// `create_definition_inner`'s `qualified_source` already gets.
 ///
 /// Unlike [`resolve_graph_identity_in_txn`] itself, a *total* miss (neither a
 /// physical table nor a live definition's target) is not an error here — it
@@ -3561,7 +3497,7 @@ async fn resolve_graph_identity_in_txn(
 /// nonexistent endpoint: `column_type_in_txn` et al. below still run their
 /// own `to_regclass`-based lookup against the same bare name Postgres itself
 /// would have tried, so they still report their own precise
-/// [`ValidationError::UnknownRelationshipColumn`]/[`ValidationError::RelationshipToManyRequiresReplicaIdentity`]
+/// [`ValidationError::UnknownRelationshipColumn`]
 /// — naming the actual missing column/table exactly as before this fix —
 /// rather than this function's own less specific
 /// [`CatalogError::SourceTableNotFound`], which existing callers (e.g.
@@ -3625,7 +3561,7 @@ pub(crate) async fn resolve_graph_identity(
     table: &str,
 ) -> Result<String, CatalogError> {
     match resolve_source_schema(pool, table).await {
-        Ok(schema) => Ok(crate::intake::publication::qualify(&schema, table)?),
+        Ok(schema) => Ok(crate::intake::markers::qualify(&schema, table)?),
         Err(CatalogError::SourceTableNotFound(_)) => {
             let client = pool.get().await?;
             let row = client
@@ -3749,7 +3685,7 @@ pub(crate) async fn resolve_source_for_install(
     def: &TransformDef,
 ) -> Result<String, CatalogError> {
     match &def.explicit_source_schema {
-        Some(schema) => Ok(crate::intake::publication::qualify(schema, &def.source)?),
+        Some(schema) => Ok(crate::intake::markers::qualify(schema, &def.source)?),
         None => resolve_graph_identity(pool, &def.source).await,
     }
 }
@@ -4227,10 +4163,10 @@ fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// case-insensitivity native to the type but not its `::text` form),
 /// `interval` (issue #113 admitted `timestamp` alongside `date`/`time`/
 /// `timetz` once issue #248 fixed its render-consistency defect, and
-/// `timestamptz` joined them too once issue #246 fixed the *walsender's*
-/// own render-consistency gap; see the temporal block below for why
-/// `interval` alone stays off), `boolean`, `json`/`jsonb`, or any unknown
-/// type — is rejected as a join key.
+/// `timestamptz` joined them too once issue #246 pinned `TimeZone` on every
+/// renderer; see the temporal block below for why `interval` alone stays
+/// off), `boolean`, `json`/`jsonb`, or any unknown type — is rejected as a
+/// join key.
 ///
 /// `bytea` (issue #114) joins the list below on the same "text-stability is
 /// a property of the rendering" reasoning `oid` and four of the six temporal
@@ -4315,23 +4251,17 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "time with time zone",
     "timestamp without time zone",
     // Issue #246: `timestamp with time zone` joins the four above.
-    // `timestamptz_out` renders the stored instant in the session's
-    // `TimeZone`, so it needed two independent fixes before it could be
-    // text-stable — issue #248's `to_jsonb`/`::text` reconciliation (which
-    // it shares with `timestamp`) and, separately, `TimeZone` itself being
-    // pinned identically on *every* connection Trellis opens, including the
-    // walsender. `pgwire-replication` 0.4 had no way to send startup
-    // parameters on a replication connection, so before #246 pinning
-    // `TimeZone` on the pool alone would have guaranteed a pool/walsender
-    // disagreement on any non-UTC server — worse than the accidental
-    // agreement the two renderers had by both falling back to the server
-    // default. `pgwire-replication` 0.4.1's `ReplicationConfig::with_options`
-    // closes that: `crate::intake::IntakeConfig::replication_config` now
-    // pins the walsender to `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`
-    // (which now includes `TimeZone = 'UTC'`) the same way the pool always
-    // has, so `timestamptz_out` is a genuine bijection on the instant on
-    // both backends. See `crate::temporal::is_bijective_under_text`/
-    // `is_render_consistent` for the per-family verdict this list mirrors.
+    // `timestamptz_out` renders the stored instant in the session's `TimeZone`,
+    // so it needed two independent fixes before it could be text-stable — issue
+    // #248's `to_jsonb`/`::text` reconciliation (which it shares with
+    // `timestamp`) and, separately, `TimeZone` itself being pinned identically
+    // everywhere Trellis renders a value. The pool pins
+    // `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` (which includes `TimeZone =
+    // 'UTC'`) on every connection, and each capture function pins the same
+    // settings as `SET` clauses (`crate::capture::sql`), so `timestamptz_out`
+    // is a bijection on the instant in both. See
+    // `crate::temporal::is_bijective_under_text`/ `is_render_consistent` for
+    // the per-family verdict this list mirrors.
     "timestamp with time zone",
     // Issue #114: `byteaout` under the pinned `bytea_output = 'hex'` is a
     // bijection on its values — see the doc comment above for the live
@@ -4356,8 +4286,8 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // never omits the netmask (a `cidr` value's whole point is that the
     // network prefix matters), so `cidr_out(v)::text = v::text` holds for
     // every value — verified live across a v4/v6 grid including the
-    // host-bits-zero-only values `cidr_in` accepts. `inet_out` — what
-    // CDC/`pgoutput` decodes, what `intake::extract_key` stores verbatim —
+    // host-bits-zero-only values `cidr_in` accepts. `inet_out` — what a
+    // capture trigger images, and what it builds a staged `key` from —
     // *does* diverge from `network_show`: it omits the `/prefixlen` suffix
     // exactly when the stored netmask covers the whole address
     // (`'192.168.1.5'::inet::text` via `inet_out` is `192.168.1.5`; via the
@@ -4374,8 +4304,8 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "macaddr8",
     // Issue #119: `boolean` is deliberately *not* here, and the reason is
     // new — every other admission/refusal on this list turns on whether
-    // `<type>_out` (the type's own output function, what CDC/`pgoutput`
-    // sends and what `<col>::text` normally reduces to) is a bijection.
+    // `<type>_out` (the type's own output function, what capture images and
+    // what `<col>::text` normally reduces to) is a bijection.
     // `boolout` *is* one (`'t'`/`'f'`, nothing else). The problem is that
     // `<col>::text` does not call `boolout` at all: `select castfunc::regproc
     // from pg_cast where castsource = 'boolean'::regtype and casttarget =
@@ -4391,11 +4321,9 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // independent renderer, and it is silent: nothing here fails to type
     // or parse, two spellings of one value just stop comparing equal.
     //
-    // That is live-load-bearing, not theoretical: `intake::pgoutput`'s
-    // tuple decoder stores a CDC-decoded column's wire text *verbatim*
-    // (`ColumnValue::Text`, straight off the server's `boolout` call), and
-    // `intake::extract_key` builds a relationship/primary-key's staged
-    // `key` text directly from that — `'t'`/`'f'`. Every *bulk* key lookup
+    // That is live-load-bearing, not theoretical: a capture trigger images a
+    // column with `format('%s', col)`, which calls `boolout`, and builds a
+    // relationship/primary-key's staged `key` text from that — `'t'`/`'f'`. Every *bulk* key lookup
     // in `staging::apply` (`key_array_filter`, issue #125) casts the
     // *bound parameter* to the column's native type
     // (`col = any($1::text[]::boolean[])`), which calls `boolin` — an
@@ -4715,80 +4643,11 @@ async fn to_col_cardinality_in_txn(
     })
 }
 
-/// Rejects a *to-many* relationship (issue #41) whose to-side lacks a replica
-/// identity that carries the join column (`to_col`) in row pre-images. For
-/// to-many the join key is a *non-PK* column, and the staging reverse-recompute
-/// resolver reads it from a DELETE/UPDATE pre-image to find which from-side
-/// rows to re-derive. Under the default replica identity (`d`, the primary
-/// key) — or none (`n`) — that non-PK column is absent from the pre-image, so
-/// a delete or re-parent would silently under-recompute and diverge from the
-/// Postgres oracle. Correct only when the to-side has:
-/// * `REPLICA IDENTITY FULL` (`relreplident = 'f'`) — every column is in the
-///   pre-image; or
-/// * `REPLICA IDENTITY USING INDEX` (`relreplident = 'i'`) whose index — the
-///   one flagged `pg_index.indisreplident` — includes `to_col` among its
-///   columns (`indkey` maps to the attnum of `to_col`).
-///
-/// Callers invoke this only for [`RelationshipCardinality::ToMany`]; to-one
-/// carries the FK in the from-side's own row image and needs no extra replica
-/// identity (see ADR-0006). Assumes `to_table`/`to_col` already resolved.
-///
-/// `to_table` — [`create_relationship`]'s own [`resolve_relationship_endpoint_in_txn`]
-/// result, not `def.to_table` directly (reviewer follow-up to issue #74,
-/// epic #78's own whole-branch review) — is what `to_regclass` below
-/// actually queries, so a to-side explicitly qualified into a non-default
-/// schema resolves here exactly as it does in every other pg_catalog check
-/// this function's caller runs. The reported
-/// [`ValidationError::RelationshipToManyRequiresReplicaIdentity`] still names
-/// `def.to_table` (bare), matching this file's convention elsewhere
-/// (`assert_joinable_as_is`/`assert_join_key_type_supported`) of reporting
-/// the relationship's own source text, not an internally-resolved identity.
-async fn assert_replica_identity_supports_to_many(
-    txn: &tokio_postgres::Transaction<'_>,
-    def: &RelationshipDef,
-    to_table: &str,
-) -> Result<(), CatalogError> {
-    let adequate: bool = txn
-        .query_one(
-            "select
-                c.relreplident = 'f'
-                or (
-                    c.relreplident = 'i'
-                    and exists (
-                        select 1
-                        from pg_index i
-                        join pg_attribute a
-                          on a.attrelid = i.indrelid and a.attname = $2
-                        where i.indrelid = c.oid
-                          and i.indisreplident
-                          and a.attnum = any(i.indkey::int2[])
-                    )
-                )
-             from pg_class c
-             where c.oid = pg_catalog.to_regclass($1)",
-            &[&ddl::regclass_arg(to_table), &def.to_col],
-        )
-        .await?
-        .get(0);
-
-    if adequate {
-        Ok(())
-    } else {
-        Err(ValidationError::RelationshipToManyRequiresReplicaIdentity {
-            name: def.name.clone(),
-            to_table: def.to_table.clone(),
-            to_col: def.to_col.clone(),
-        }
-        .into())
-    }
-}
-
 /// Whether trigger capture can key `schema.table`'s changes (issue #622 C5):
 /// it is a plain table (`relkind = 'r'`) with a primary key. Every ring row a
 /// capture trigger writes is keyed by the primary key, so a table without
-/// one can't be captured, whatever its replica identity: `REPLICA IDENTITY
-/// USING INDEX` without a primary key is refused too, which also rules out
-/// #589's key mismatch between the index and the primary key.
+/// one can't be captured, whatever unique index it has. That also rules out
+/// #589's key mismatch between a unique index and the primary key.
 ///
 /// A partitioned table (`relkind = 'p'`) is refused as well. Statement
 /// triggers on the parent miss writes aimed at a partition directly, and a
@@ -4856,15 +4715,15 @@ async fn reject_unkeyed_source(
 /// by triggers when they can't key its changes ([`change_keyed`]).
 ///
 /// - This instance's own targets, aggregate targets included, are exempt,
-///   for the reason [`reject_unkeyed_source`] gives: they are never published
-///   ([`publication_tables`]), and the target-mutation seam stages their
+///   for the reason [`reject_unkeyed_source`] gives: they are never captured
+///   ([`tables_to_capture`]), and the target-mutation seam stages their
 ///   changes, CDC-shaped for an endpoint, keyed by the code that wrote them
 ///   (#375's direction 1, #403).
 /// - Anything else, including another instance's aggregate target, must
 ///   pass [`change_keyed`]
 ///   ([`CatalogError::RelationshipEndpointNotChangeKeyed`]), the rule
 ///   [`reject_unkeyed_source`] holds a definition's source to:
-///   [`all_source_tables`]' relationship walk publishes it.
+///   [`all_source_tables`]' relationship walk captures it.
 async fn reject_unkeyed_relationship_endpoint(
     client: &impl GenericClient,
     side: RelationshipSide,
@@ -4884,232 +4743,6 @@ async fn reject_unkeyed_relationship_endpoint(
         side,
         endpoint: qualified_endpoint.to_string(),
     })
-}
-
-/// Checks every guarantee [`crate::intake::required_source_guarantees`]
-/// derives for `plan` against the live catalog, in order, returning the
-/// first violation — issue #173 phase 2's single checker. Before this, each
-/// of [`assert_replica_identity_supports_aggregate`] and
-/// [`assert_replica_identity_supports_projection`] ran its own ad hoc
-/// `pg_class.relreplident` query; this is the one place that both (a) walks
-/// the derived [`crate::intake::SourceGuarantee`] list and (b) turns each
-/// one into a database round trip, so a future [`crate::intake::SourceGuarantee`]
-/// variant only needs a new match arm here, not a fourth hand-rolled
-/// assertion function.
-///
-/// `SourceGuarantee::ReplicaIdentityFull`'s `qualified_table` (not `table`)
-/// is what's actually queried — see that variant's own doc comment for why
-/// a bare name can't be trusted with a plain `to_regclass` `search_path`
-/// walk — while `table` is what the resulting error names, matching every
-/// existing replica-identity error message's convention of reporting the
-/// relationship/definition's own source text.
-///
-/// A guarantee on one of this instance's own targets always holds (issues
-/// #315, #403). Such a table is never published ([`publication_tables`]),
-/// so no CDC image of it is ever read: the target-mutation seam captures
-/// each changed row's prior image under its own row lock, whatever the
-/// table's replica identity. That covers an aggregate over a target and a
-/// to-one relationship with a target endpoint alike.
-async fn check_source_guarantees(
-    txn: &tokio_postgres::Transaction<'_>,
-    plan: &crate::intake::ResolvedPlan<'_>,
-) -> Result<(), CatalogError> {
-    for guarantee in crate::intake::required_source_guarantees(plan) {
-        match guarantee {
-            crate::intake::SourceGuarantee::ReplicaIdentityFull {
-                table,
-                qualified_table,
-            } => {
-                if is_definition_target(txn, &qualified_table).await? {
-                    continue;
-                }
-                // `query_opt`: a table dropped since its endpoint resolved
-                // has no `pg_class` row, which is a not-found, not a
-                // row-count error (issue #561).
-                let is_full: bool = txn
-                    .query_opt(
-                        "select relreplident = 'f' from pg_class where oid = \
-                         pg_catalog.to_regclass($1)",
-                        &[&ddl::regclass_arg(&qualified_table)],
-                    )
-                    .await?
-                    .ok_or_else(|| CatalogError::SourceTableNotFound(qualified_table.clone()))?
-                    .get(0);
-
-                crate::intake::require_replica_identity_full(&table, !is_full)
-                    .map_err(CatalogError::ReplicaIdentityRequired)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Rejects an aggregate (`GROUP BY`) definition (issue #47) whose source
-/// table's replica identity doesn't guarantee an old row image on
-/// delete/update. Unlike [`assert_replica_identity_supports_to_many`]'s
-/// to-many relationship check — which only needs one non-PK join column
-/// (`to_col`) present in the pre-image, and so accepts a covering
-/// `REPLICA IDENTITY USING INDEX` — an aggregate's delta maintenance
-/// (`apply_aggregate.rs`'s `accumulate_changes`) needs the *entire* old row:
-/// every `GROUP BY` column (to find which group a deleted/re-parented row
-/// was decrementing) and every column any `SUM`/`AVG`/`MIN`/`MAX` field
-/// reads (to subtract its old contribution). Only `REPLICA IDENTITY FULL`
-/// (`relreplident = 'f'`) guarantees that for an arbitrary set of columns, so
-/// this doesn't attempt the narrower per-column index check the to-many path
-/// does.
-///
-/// Issue #173 phase 2: delegates both "does this plan need a guarantee?"
-/// and "does the table already have it?" to the shared, single-derivation
-/// path — [`crate::intake::required_source_guarantees`] over a
-/// [`crate::intake::ResolvedPlan::Transform`], checked by
-/// [`check_source_guarantees`] — rather than re-deriving either step here.
-/// Kept as a thin, named wrapper (rather than inlining its callers into
-/// [`check_source_guarantees`] directly) so `create_definition_inner`'s own
-/// call site, and this function's pre-existing doc history below, don't
-/// have to change.
-///
-/// Delegates the actual rejection to
-/// [`crate::intake::require_replica_identity_full`] (issue #7's scaffolding,
-/// previously unwired — see its module doc) so the error text — including
-/// the exact `ALTER TABLE ... REPLICA IDENTITY FULL;` statement — comes from
-/// one place rather than being duplicated here. That function's own
-/// `needs_old_image` parameter is unconditional (it rejects whenever passed
-/// `true`, regardless of the table's actual replica identity), so it is not
-/// enough on its own — the key-space rule behind
-/// [`crate::intake::required_source_guarantees`] always yields "needs the old
-/// image" for [`KeySpace::Aggregate`], which would reject every aggregate
-/// definition forever, even after an operator runs the suggested `ALTER
-/// TABLE`. [`check_source_guarantees`] closes that gap by querying
-/// `pg_class.relreplident` itself first and only passing `true` through
-/// when the source table is actually inadequate today.
-async fn assert_replica_identity_supports_aggregate(
-    txn: &tokio_postgres::Transaction<'_>,
-    def: &TransformDef,
-) -> Result<(), CatalogError> {
-    // Issue #76 follow-up: this runs *before* `create_definition_inner`
-    // resolves `qualified_source` (this function is called right at the top
-    // of that function, deliberately, per this function's own doc comment —
-    // ahead of any side effect, so a doomed aggregate never touches the
-    // schema graph), so it can't just reuse that value — it has to redo the
-    // same explicit-vs-bare branch here. An explicit `FROM <schema>.<source>`
-    // ([`TransformDef::explicit_source_schema`]) must be checked against
-    // *that* schema specifically: passing bare `def.source` to
-    // `to_regclass` instead would resolve it via this connection's pinned
-    // `search_path` (`pool::session_bootstrap`), which can silently name a
-    // same-suffixed decoy table in an earlier search-path schema instead of
-    // the real, explicitly-qualified source — either wrongly rejecting a
-    // fully-qualified source that has `REPLICA IDENTITY FULL` (if the decoy
-    // lacks it), or worse, wrongly accepting one that doesn't (if the decoy
-    // has it), reintroducing issue #47's aggregate-corruption bug through
-    // this issue's own new grammar. `to_regclass` accepts a qualified
-    // `"schema.table"` string directly, so no other logic changes.
-    //
-    // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
-    // the bare (`None`) branch used to pass `def.source` straight through
-    // unresolved — a plain `to_regclass` `search_path` walk with no
-    // fallback — even though `create_definition_inner`'s own resolution of
-    // the identical bare `def.source` (`qualified_source`, below) has
-    // carried issue #74's bare-target-suffix fallback
-    // ([`resolve_graph_identity_in_txn`]) since that issue landed. Since
-    // this check runs first, ahead of that resolution, a bare aggregate
-    // source chained off another definition's target explicitly qualified
-    // into a non-default schema (issue #76) never reached
-    // `qualified_source` at all: `to_regclass` returned `NULL` for the
-    // unqualified name, and the `query_one` below then found zero matching
-    // `pg_class` rows — an opaque `Db(Error{kind: RowCount})`, not a clean
-    // rejection. Switched to [`resolve_graph_identity_in_txn`] itself here
-    // too, rather than re-implementing the fallback a third time; a
-    // genuinely nonexistent source now surfaces as that function's own
-    // [`CatalogError::SourceTableNotFound`] instead of the same `RowCount`
-    // confusion, which is strictly clearer even though it's not this
-    // gap's main target.
-    let qualified_source = match &def.explicit_source_schema {
-        Some(schema) => crate::intake::publication::qualify(schema, &def.source)?,
-        None => resolve_graph_identity_in_txn(txn, &def.source).await?,
-    };
-
-    // A source that is one of this instance's targets passes whatever its
-    // replica identity (issue #315): see `check_source_guarantees`.
-    check_source_guarantees(
-        txn,
-        &crate::intake::ResolvedPlan::Transform {
-            source_table: &def.source,
-            qualified_source_table: &qualified_source,
-            key_space: &def.key_space,
-        },
-    )
-    .await
-}
-
-/// Rejects a to-one relationship (issue #129, epic #127) whose to-side or
-/// from-side table's replica identity can't guarantee an old row image.
-/// Every to-one relationship gets a settled parent projection
-/// unconditionally — see [`create_relationship`]'s own call site — and the
-/// projection's reverse-applied advance (#131) needs the to-side row's
-/// *entire* old image to detect and apply a parent update/delete/re-key, the
-/// same requirement [`assert_replica_identity_supports_aggregate`] already
-/// enforces for an aggregate's source; see that function's doc comment for
-/// why only `REPLICA IDENTITY FULL` — not the narrower `USING INDEX` a
-/// single-column `to_col` check ([`assert_replica_identity_supports_to_many`])
-/// would accept — is enough for an old image of unpredictably-many columns.
-///
-/// **Issue #158: the from-side (child) table needs this too, not just the
-/// to-side.** A to-one relationship's `from_col` is an ordinary non-key
-/// column on `from_table` (the foreign key), so under that table's *default*
-/// replica identity (primary key only) an `UPDATE` that re-points the FK —
-/// changes `from_col` without touching the PK — ships `old_image = None`
-/// from `pgoutput`: no pre-image at all, not merely one missing the changed
-/// column. That breaks anything reading a from-side row's prior state off a
-/// replication message, including the `group_key` union mechanism (issue
-/// #133) that recovers a row's true prior parent. The to-side's own gate
-/// can't catch this — it only ever inspects `to_table`, and a from-side
-/// re-point doesn't touch the to-side row at all.
-///
-/// Issue #173 phase 2: both endpoints used to be checked via two separate
-/// calls to this function (one per table); now it takes both endpoints at
-/// once and routes them through a single
-/// [`crate::intake::ResolvedPlan::ToOneRelationship`] plan, checked by
-/// [`check_source_guarantees`] — one derivation call per relationship
-/// installed, not one ad hoc `pg_class` query per endpoint. Order is
-/// preserved (to-side checked before from-side, matching
-/// [`crate::intake::required_source_guarantees`]'s own ordering for this
-/// variant), so an operator whose relationship fails both still sees the
-/// same first error they always did.
-///
-/// **Gated on cardinality alone, not on whether the relationship has a
-/// consumer yet.** A relationship must be declared before anything can
-/// reference it (a [`super::ast::Expr::RelationshipPath`]'s `rel` head
-/// resolves via [`relationship_by_name`], which only ever finds an
-/// already-persisted row), so at the point this runs — inside
-/// [`create_relationship`], before that row is even committed — no consumer
-/// can exist yet. Gating on "has a consumer today" would therefore never
-/// fire: it would silently accept a to-one relationship whose to-side (or
-/// from-side) can never actually satisfy a projection some *later*
-/// definition needs, discovered only when that later definition's widen
-/// ([`ensure_relationship_projection_in_txn`]) fails partway through
-/// *its* transaction — a confusing place to first learn the real problem is
-/// this relationship's declaration. Rejecting here instead matches
-/// [`assert_replica_identity_supports_to_many`]'s own unconditional,
-/// cardinality-only gate, and is consistent with this epic's Phase 1 design
-/// (`issue-102-PLAN-DRAFT.md` §7): the projection is built alongside the
-/// relationship itself, not deferred until first use.
-async fn assert_replica_identity_supports_projection(
-    txn: &tokio_postgres::Transaction<'_>,
-    to_table: &str,
-    qualified_to_table: &str,
-    from_table: &str,
-    qualified_from_table: &str,
-) -> Result<(), CatalogError> {
-    check_source_guarantees(
-        txn,
-        &crate::intake::ResolvedPlan::ToOneRelationship {
-            to_table,
-            qualified_to_table,
-            from_table,
-            qualified_from_table,
-        },
-    )
-    .await
 }
 
 /// A to-one relationship's settled parent projection (issue #129, epic
@@ -5190,7 +4823,7 @@ pub async fn relationship_projection(
 /// table yet — that's the forward/reverse paths, #130/#131, neither of which
 /// exists. Between this relationship's declaration and whenever a consumer
 /// first triggers a widen, the to-side table keeps taking ordinary
-/// replicated writes, including plain `INSERT`s of new rows the projection
+/// captured writes, including plain `INSERT`s of new rows the projection
 /// has never seen. A widen that only `ALTER TABLE`s and then `UPDATE ...
 /// FROM`s the columns of rows *already in the projection* silently skips
 /// every such row forever — there is no later resync to catch it, since
@@ -5211,9 +4844,7 @@ pub async fn relationship_projection(
 /// * [`create_relationship`] calls this with `needed_columns: &[]` right
 ///   after inserting the relationship's own row — so every to-one
 ///   relationship gets a (bookkeeping-columns-only) projection
-///   unconditionally, before any consumer exists to read it (see
-///   [`assert_replica_identity_supports_projection`]'s doc comment for why
-///   that ordering is unavoidable).
+///   unconditionally, before any consumer exists to read it.
 /// * [`create_definition_inner`] calls this once per to-one relationship a
 ///   newly-created definition's fields read through
 ///   ([`widen_relationship_projections_for_definition_in_txn`]), with that
@@ -5421,9 +5052,9 @@ async fn ensure_relationship_projection_in_txn(
 ///
 /// The catch-up discharge runs this for a marker parked because a rebuild
 /// rewrote a definition's target (`pending_backfill.refresh_projections`,
-/// `intake::publication::discharge_marker`), or because a source to-side is
+/// `intake::markers::discharge_marker`), or because a source to-side is
 /// re-read for changes whose CDC may never have reached its projection
-/// (issue #522, `intake::publication::park_table_catch_ups`). It diffs the
+/// (issue #522, `intake::markers::park_table_catch_ups`). It diffs the
 /// whole table, about 0.7 s for a 1M-row target whose projection is already
 /// current, so no other marker asks for it. Every write to a target
 /// reaches its projection through the target-mutation seam's CDC-shaped rows,
@@ -6082,7 +5713,7 @@ struct PendingDefinition {
 /// those rows here means the apply path simply never attempts them, and the
 /// skipped delta itself is dropped. What it changed is recovered from state
 /// instead, by the discharge of the go-live catch-up
-/// ([`crate::intake::publication::run_pending_backfills`]; the same
+/// ([`crate::intake::markers::run_pending_backfills`]; the same
 /// `pending_backfill` marker the ring-fallback path relies on, parked when a
 /// build finishes and the definition moves to [`TransformStatus::CatchingUp`]:
 /// by [`complete_direct_backfill`] for a chunked build or a direct-build job,
@@ -6177,8 +5808,7 @@ pub async fn dependents_of(
     Ok(result)
 }
 
-/// The transform definitions currently subscribed to `source_table` — the
-/// mapping intake (#7/#8) will use to decide what to subscribe to. A thin
+/// The transform definitions currently subscribed to `source_table`. A thin
 /// wrapper over [`dependents_of`] filtered to [`EdgeKind::Source`], the only
 /// edge kind persisted today. `source_table` must already be fully-qualified
 /// (issue #74, ADR-0007) — see [`dependents_of`]'s doc comment.
@@ -6197,7 +5827,7 @@ pub async fn transforms_for_source(
 /// field on a transform anchored at `from_table` can read a relationship
 /// path into `to_table` (and, through a chained relationship declared with
 /// `to_table` as its own `from_table`, into a table beyond that), so
-/// `to_table` must be in the CDC publication too, even though no transform
+/// `to_table` must be captured too, even though no transform
 /// is anchored there directly — see the issue for the silently-dropped-write
 /// bug this closes.
 ///
@@ -6216,8 +5846,8 @@ pub async fn transforms_for_source(
 ///
 /// Issue #14: a running [`crate::Client`]'s maintenance loop polls this to
 /// notice a transform (or now, a relationship reachable from one) registered
-/// against a table it hasn't seen before, so it can add that table to the
-/// publication and discharge its backfill without waiting for a restart.
+/// against a table it hasn't seen before, so it can install that table's
+/// capture and discharge its backfill without waiting for a restart.
 ///
 /// Returns **fully-qualified** `"schema.table"` names (issue #75, ADR-0007)
 /// — a change from this function's pre-#75 contract, which returned bare
@@ -6282,7 +5912,7 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
 /// Whether any registered definition other than `excluding` reads
 /// `qualified_table`, in any status: as its anchor source, or through a
 /// relationship path ([`all_source_tables`]'s set). The backfill discharge
-/// ([`crate::intake::publication::run_pending_backfills`]) skips enumerating
+/// ([`crate::intake::markers::run_pending_backfills`]) skips enumerating
 /// a table this says `false` for (issue #417), since nothing would consume the
 /// `Recompute` rows; it excludes the definitions it just dispatched to chunked
 /// builds, which read the table themselves (issue #418).
@@ -6303,29 +5933,26 @@ pub(crate) async fn table_has_reader(
         .get(0))
 }
 
-/// The tables this instance's CDC publication should hold: every table
-/// [`all_source_tables`] reaches, minus the targets of this instance's own
-/// definitions (issue #315).
+/// The tables this instance's capture triggers should cover (issue #622):
+/// every table [`all_source_tables`] reaches, minus the targets of this
+/// instance's own definitions (issue #315).
 ///
 /// A chained definition reads another definition's target, but that target
-/// never needs CDC: every write to it goes through the target-mutation seam
-/// (`staging::target_mutations`), which stages each changed key for its
-/// readers in the writing transaction. Publishing it as well would stage each
-/// change twice (the double-apply class #312 patched with an intake-side
-/// filter), and an aggregate target's CDC can't even be decoded:
-/// `intake::extract_key` has no primary key to read, and without `REPLICA
-/// IDENTITY FULL` Postgres refuses the target's own updates once it is
-/// published.
+/// never needs capturing: every write to it goes through the target-mutation
+/// seam (`staging::target_mutations`), which stages each changed key for its
+/// readers in the writing transaction. Capturing it as well would stage each
+/// change twice, and an aggregate target has no primary key to key its
+/// captured changes by.
 ///
 /// That includes a target that is a relationship endpoint (issue #375's
 /// direction 1, #403). A to-one relationship's settled parent projection and
 /// reverse deltas (issues #129-#136), and a from-side's `group_key` (#133),
-/// need image-bearing, LSN-ordered changes, and the seam stages exactly that
+/// need image-bearing, ordered changes, and the seam stages exactly that
 /// shape for an endpoint target (`staging::target_mutations`, "Standing in
 /// for a relationship endpoint's CDC"), so the seam is the one change feed
 /// for every target this instance owns. Another instance's target is just a
-/// table here, and is published like one.
-pub async fn publication_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
+/// table here, and is captured like one. G (#626) captures targets too.
+pub async fn tables_to_capture(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let tables = all_source_tables(pool).await?;
     let client = pool.get().await?;
     let own = own_targets(&**client, &tables).await?;
@@ -6334,7 +5961,7 @@ pub async fn publication_tables(pool: &Pool) -> Result<Vec<String>, CatalogError
 
 /// Which of `tables` are the target of some definition in this instance
 /// (issue #315): tables whose changes reach their readers only through the
-/// target-mutation seam, never CDC. See [`publication_tables`].
+/// target-mutation seam, never CDC. See [`tables_to_capture`].
 async fn own_targets(
     client: &impl GenericClient,
     tables: &[String],

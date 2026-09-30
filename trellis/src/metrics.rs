@@ -65,7 +65,7 @@ pub const LATENCY_BUCKETS: &[f64] = &[
 const TRANSFORM_LATENCY_METRIC: &str = "trellis_transform_latency_seconds";
 
 /// Staged ring rows each transform folded and applied (issue #409): one
-/// change per row intake staged from logical replication, or per row an
+/// change per row a capture trigger staged, or per row an
 /// upstream hop's target write staged for this one. Counted in rows, not
 /// folded changes, so the number doesn't depend on how the rows happened to
 /// be batched and can be compared with the source's own write rate. Not the
@@ -117,28 +117,6 @@ const RELATIONSHIP_REVERSE_DEFERRED_METRIC: &str = "trellis_relationship_reverse
 /// question.
 const RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC: &str =
     "trellis_relationship_reverse_fairness_escalated_total";
-
-/// Issue #325: count of times the client's CDC intake stopped and was
-/// restarted, labeled `outcome` (`error`: `run()` returned an error, or a
-/// restart's reconnect failed; `stream_ended`: the replication stream closed;
-/// `producer_lock_held`: a restart found another producer session holding the
-/// staging producer lock, issue #341). A sustained non-zero `error` or
-/// `stream_ended` rate means this client isn't staging source changes. The
-/// matching log line carries the actual error.
-const INTAKE_RESTARTS_METRIC: &str = "trellis_intake_restarts_total";
-
-/// Issue #342: how many times in a row this client's CDC intake has stopped
-/// without an attempt staying up for the supervisor's healthy window (the
-/// restart backoff's 60s cap), labeled `slot`. `0` means intake is running
-/// normally; it drops back to `0` as soon as a running attempt passes the
-/// healthy window, not only when the next one fails. Unlike the lifetime
-/// [`INTAKE_RESTARTS_METRIC`], this tells an occasional blip (1, then back to
-/// 0) from a stuck restart loop (climbing), so alerts can key off "N failures
-/// in a row". A `producer_lock_held` restart counts too: intake isn't running
-/// during one, and the lock's holder may be this client's own dead session
-/// (see `client::supervise_intake`). Labeled by slot because a gauge, unlike
-/// a counter, can't be summed across two clients in one process.
-const INTAKE_CONSECUTIVE_FAILURES_METRIC: &str = "trellis_intake_consecutive_failures";
 
 /// The process-wide recorder handle, built and installed on first use. See
 /// the module doc comment's "Recorder installation" section.
@@ -210,17 +188,6 @@ fn describe_metrics() {
         "Count of to-one relationship reverse transitions that exhausted their guard-gated \
          retry budget and were resolved via the fairness-escalation fallback instead of \
          deferring again."
-    );
-    metrics::describe_counter!(
-        INTAKE_RESTARTS_METRIC,
-        "Count of times CDC intake stopped and was restarted, labeled by outcome \
-         (error/stream_ended/producer_lock_held). Source changes are not staged while intake \
-         is down."
-    );
-    metrics::describe_gauge!(
-        INTAKE_CONSECUTIVE_FAILURES_METRIC,
-        "Consecutive CDC intake failures since intake last stayed up for 60s, labeled by \
-         slot. 0 when intake is healthy; a climbing value means it is stuck restarting."
     );
 }
 
@@ -316,21 +283,6 @@ pub fn increment_relationship_reverse_deferred(guard: &str) {
 pub fn increment_relationship_reverse_fairness_escalated() {
     ensure_installed();
     metrics::counter!(RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC).increment(1);
-}
-
-/// Increments [`INTAKE_RESTARTS_METRIC`] by one for `outcome` (issue #325).
-/// Called from `client::supervise_intake` each time intake stops.
-pub fn increment_intake_restarts(outcome: &str) {
-    ensure_installed();
-    metrics::counter!(INTAKE_RESTARTS_METRIC, "outcome" => outcome.to_string()).increment(1);
-}
-
-/// Sets [`INTAKE_CONSECUTIVE_FAILURES_METRIC`] for `slot` (issue #342).
-/// Called from `client::supervise_intake`.
-pub fn set_intake_consecutive_failures(slot: &str, failures: u64) {
-    ensure_installed();
-    metrics::gauge!(INTAKE_CONSECUTIVE_FAILURES_METRIC, "slot" => slot.to_string())
-        .set(failures as f64);
 }
 
 /// A handle onto this process's in-process metrics registry — the public,
@@ -455,12 +407,12 @@ mod tests {
         );
     }
 
-    /// A thread with a local recorder set (the intake supervisor tests' own
-    /// registry) can be the first to build the global one. Its descriptions
+    /// A thread with a local recorder set (a test's own registry) can be the
+    /// first to build the global one. Its descriptions
     /// must still land on the global recorder: they used to follow the
     /// local one, and every `# HELP` line was missing from the process's
-    /// scrape (which failed the test below whenever the supervisor test ran
-    /// first).
+    /// scrape (which failed the test below whenever a test with a local
+    /// recorder ran first).
     #[test]
     fn a_local_recorder_does_not_take_the_descriptions() {
         let local = PrometheusBuilder::new().build_recorder();

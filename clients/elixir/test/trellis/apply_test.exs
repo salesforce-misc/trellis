@@ -42,10 +42,6 @@ defmodule Trellis.ApplyTest do
       []
     )
 
-    # A relationship re-derives from each side's old row images.
-    Postgrex.query!(pg, "alter table owners replica identity full", [])
-    Postgrex.query!(pg, "alter table pets replica identity full", [])
-
     Postgrex.query!(pg, "insert into pets (id, owner_id, weight) values (1, 1, 4)", [])
 
     # Keyed on each kind's `trellis::StatementKind` name, so a statement form

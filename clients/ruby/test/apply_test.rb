@@ -22,9 +22,6 @@ class ApplyTest < Minitest::Test
   def test_every_statement_form_round_trips_through_apply
     @pg.exec("create table owners (id integer primary key, name text)")
     @pg.exec("create table pets (id integer primary key, owner_id integer, weight integer)")
-    # A relationship re-derives from each side's old row images.
-    @pg.exec("alter table owners replica identity full")
-    @pg.exec("alter table pets replica identity full")
     @pg.exec("insert into pets (id, owner_id, weight) values (1, 1, 4)")
 
     # Keyed on each kind's `trellis::StatementKind` name, so a statement form

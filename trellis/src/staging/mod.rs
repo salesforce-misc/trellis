@@ -4,8 +4,7 @@
 //! stages) reads out of.
 //!
 //! - [`append`] is the blind append path plus the `RingFull` predicate.
-//! - [`session`] is the session guards (`synchronous_commit`, the producer
-//!   singleton) a producer must hold before it may append.
+//! - [`session`] is the producer singleton the staging worker must hold.
 //! - [`state`] is the segment lifecycle's one legal-transition graph.
 //! - [`seal`] is stage 03 (issue #9): the fence, the two-phase seal, the
 //!   guards, seal-on-demand, and age-gated crash recovery.
@@ -33,8 +32,9 @@
 //!   later healthy changes, operator-driven release, and the one sanctioned
 //!   exception to immutability (a dropped source table's purge).
 //! - [`watermark`] is issue #132's in-process "staged-through" LSN (guard
-//!   (a), "the watermark barrier") — a small, injectable handle intake
-//!   advances and the reverse-delta apply path (`apply`) reads.
+//!   (a), "the watermark barrier") — a small, injectable handle the
+//!   reverse-delta apply path (`apply`) reads. Always caught up under
+//!   trigger capture.
 //! - [`worker_registry`] is issue #144's worker-level liveness registry:
 //!   one row per live drain worker, independent of whether it currently
 //!   holds a claim — the read behind `Trellis::has_live_drain_workers`.
@@ -45,8 +45,8 @@
 //! - [`error`] is this module's error type.
 //!
 //! What this module does *not* do: delta arithmetic for aggregate
-//! transforms (blocked on aggregate transform-defs), or intake's
-//! replication-slot machinery (stage 01) — see
+//! transforms (blocked on aggregate transform-defs), or capture (stage 01,
+//! [`crate::capture`]) — see
 //! docs/staging-and-claiming/02-the-staging-ring.md,
 //! docs/staging-and-claiming/03-sealing-and-the-fence.md,
 //! docs/staging-and-claiming/04-claiming-and-the-fold.md, and
@@ -83,8 +83,7 @@ pub mod worker_registry;
 // those gates, which is what keeps a plain `cargo build` free of
 // `unused_imports` rather than an `allow`.
 #[cfg(any(test, feature = "internals"))]
-pub use append::append;
-pub use append::{CdcOp, StagedChange};
+pub use append::{CdcOp, StagedChange, append};
 #[cfg(any(test, feature = "internals"))]
 pub use apply::drain_many;
 pub use apply::{

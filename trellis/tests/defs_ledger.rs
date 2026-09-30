@@ -51,7 +51,6 @@ async fn the_aggregate_build_writes_one_ledger_entry_per_source_row_and_the_grou
     let txn = client.transaction().await.unwrap();
     txn.batch_execute(
         "create table s (id bigint primary key, g bigint, a numeric, label text); \
-         alter table s replica identity full; \
          insert into s select i, case when i % 997 = 0 then null else i % 12000 end, \
              case when i % 5 = 0 then null else i end, 'l' || (i % 7) \
          from generate_series(1, 30000) i",
@@ -194,7 +193,6 @@ async fn a_rebuild_replaces_the_ledger() {
     client
         .batch_execute(
             "create table s (id bigint primary key, g bigint, a numeric); \
-             alter table s replica identity full; \
              insert into s select i, i % 3, i from generate_series(1, 30) i",
         )
         .await
@@ -255,7 +253,6 @@ async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_
     client
         .batch_execute(
             "create table s (id bigint primary key, g bigint, a numeric); \
-             alter table s replica identity full; \
              insert into s select i, i % 3, i from generate_series(1, 30) i",
         )
         .await
@@ -324,7 +321,6 @@ async fn a_text_contribution_keeps_its_arguments_collation() {
     client
         .batch_execute(
             "create table s (id bigint primary key, g bigint, label text collate \"C\"); \
-             alter table s replica identity full; \
              insert into s values (1, 1, 'a'), (2, 1, 'B')",
         )
         .await
@@ -370,7 +366,6 @@ async fn a_fixed_length_bit_contribution_holds_its_full_width() {
     client
         .batch_execute(
             "create table s (id bigint primary key, g bigint, b bit(3)); \
-             alter table s replica identity full; \
              insert into s values (1, 1, B'101'), (2, 1, B'111'), (3, 2, null)",
         )
         .await

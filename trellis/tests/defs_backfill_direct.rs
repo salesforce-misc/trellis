@@ -242,7 +242,6 @@ async fn aggregate_build_matches_oracle_across_group_key_chunks() {
     client
         .batch_execute(
             "create table s (id bigint primary key, author numeric, sz numeric); \
-             alter table s replica identity full; \
              insert into s (id, author, sz) \
              select g, g % 25000, g from generate_series(1, 50000) g",
         )
@@ -277,7 +276,6 @@ async fn aggregate_build_handles_null_group_keys() {
     client
         .batch_execute(
             "create table s (id bigint primary key, author numeric, sz numeric); \
-             alter table s replica identity full; \
              insert into s (id, author, sz) values \
                (1, 1, 10), (2, 1, 20), (3, null, 30), (4, null, 40), (5, 2, 50)",
         )
@@ -338,7 +336,6 @@ async fn aggregate_build_computes_min_max_avg() {
     client
         .batch_execute(
             "create table s (id bigint primary key, author numeric, sz numeric); \
-             alter table s replica identity full; \
              insert into s (id, author, sz) values \
                (1, 1, 10), (2, 1, 30), (3, 1, 20), (4, 2, 5)",
         )
@@ -405,7 +402,6 @@ async fn aggregate_build_is_idempotent_on_rerun() {
     client
         .batch_execute(
             "create table s (id bigint primary key, author numeric, sz numeric); \
-             alter table s replica identity full; \
              insert into s (id, author, sz) \
              select g, g % 50, g from generate_series(1, 5000) g",
         )
@@ -455,7 +451,6 @@ async fn aggregate_build_scans_source_once_not_per_chunk() {
     client
         .batch_execute(
             "create table s (id bigint primary key, author numeric, sz numeric); \
-             alter table s replica identity full; \
              insert into s (id, author, sz) \
              select g, g, g from generate_series(1, 30000) g",
         )

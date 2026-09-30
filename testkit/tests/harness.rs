@@ -175,94 +175,15 @@ async fn test_databases_default_to_the_icu_en_us_collation() {
     assert_eq!(order, ["a", "B"]);
 }
 
-/// `dropdb --force` refuses a database whose logical slot is still being
-/// streamed from, which is what a case whose client hasn't finished shutting
-/// down leaves. Dropping the handle must still remove the database and the
-/// slot, or the slot pins the cluster's WAL for the rest of the run.
-#[tokio::test]
-async fn dropping_a_database_with_an_actively_streamed_slot_removes_it_and_the_slot() {
-    let cluster = TestCluster::start();
-    let admin = cluster.create_empty_database().await;
-    let db = cluster.create_empty_database().await;
-    let name = db.name().to_string();
-
-    let recvlogical = |extra: &[&str]| {
-        let mut cmd = Command::new("pg_recvlogical");
-        cmd.arg("-h")
-            .arg(db.socket_dir())
-            .arg("-p")
-            .arg(db.port().to_string())
-            .arg("-U")
-            .arg("postgres")
-            .arg("-d")
-            .arg(&name)
-            .arg("--slot")
-            .arg("held_slot")
-            .args(extra)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        cmd
-    };
-    let created = recvlogical(&["--create-slot"])
-        .status()
-        .expect("run pg_recvlogical --create-slot");
-    assert!(created.success(), "create the slot");
-    let mut consumer = recvlogical(&["--start", "-f", "/dev/null"])
-        .spawn()
-        .expect("spawn pg_recvlogical --start");
-
-    let admin_client = admin.pool.get().await.expect("acquire connection");
-    let active = async {
-        loop {
-            let row = admin_client
-                .query_one(
-                    "select count(*) from pg_replication_slots \
-                     where slot_name = 'held_slot' and active",
-                    &[],
-                )
-                .await
-                .expect("read pg_replication_slots");
-            if row.get::<_, i64>(0) == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(10), active)
-        .await
-        .expect("the consumer should make the slot active");
-
-    drop(db);
-
-    let databases: i64 = admin_client
-        .query_one(
-            "select count(*) from pg_database where datname = $1",
-            &[&name],
-        )
-        .await
-        .expect("read pg_database")
-        .get(0);
-    let slots: i64 = admin_client
-        .query_one("select count(*) from pg_replication_slots", &[])
-        .await
-        .expect("read pg_replication_slots")
-        .get(0);
-    let _ = consumer.kill();
-    let _ = consumer.wait();
-    assert_eq!(databases, 0, "the database should be dropped");
-    assert_eq!(slots, 0, "the slot should be dropped with it");
-}
-
 /// Issue #236: `restart` in either mode brings the same cluster back — a new
-/// server process, every existing connection severed, and the data (tables
-/// and replication slots alike) intact.
+/// server process, every existing connection severed, and the data intact.
 ///
 /// Multi-threaded so each pooled connection's driver task observes the
 /// server closing it while `restart` blocks this thread: a pooled
 /// connection whose close nobody has observed yet looks healthy to the
 /// pool's recycle check and fails its first query.
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_severs_connections_and_keeps_data_and_slots() {
+async fn restart_severs_connections_and_keeps_data() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     fixtures::create_source_table(&db.pool, "widgets").await;
@@ -274,12 +195,9 @@ async fn restart_severs_connections_and_keeps_data_and_slots() {
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    raw.query_one(
-        "select pg_create_logical_replication_slot('restart_slot', 'pgoutput')",
-        &[],
-    )
-    .await
-    .expect("create a slot");
+    raw.query_one("select 1", &[])
+        .await
+        .expect("the connection works before the restart");
 
     for mode in [StopMode::Fast, StopMode::Immediate] {
         let pid = cluster.server_pid();
@@ -301,48 +219,18 @@ async fn restart_severs_connections_and_keeps_data_and_slots() {
             (3, "after".to_string()),
         ]
     );
-    let slots: i64 = db
-        .pool
-        .get()
-        .await
-        .expect("acquire connection")
-        .query_one(
-            "select count(*) from pg_replication_slots where slot_name = 'restart_slot'",
-            &[],
-        )
-        .await
-        .expect("count slots")
-        .get(0);
-    assert_eq!(slots, 1, "a replication slot survives both restarts");
-    db.pool
-        .get()
-        .await
-        .expect("acquire connection")
-        .execute("select pg_drop_replication_slot('restart_slot')", &[])
-        .await
-        .expect("drop the slot");
 }
 
 /// Issue #236: a cold backup restores into an independent cluster holding
-/// the data and the replication slots exactly as they were at the backup,
+/// the data exactly as it was at the backup,
 /// and later writes to either cluster don't reach the other. Both the
 /// backup's and the restored cluster's temp directories go on drop.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cold_backup_restores_data_and_slots_as_of_the_backup() {
+async fn a_cold_backup_restores_data_as_of_the_backup() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     fixtures::create_source_table(&db.pool, "widgets").await;
     fixtures::insert_row(&db.pool, "widgets", 1, "before").await;
-    db.pool
-        .get()
-        .await
-        .expect("acquire connection")
-        .query_one(
-            "select pg_create_logical_replication_slot('backup_slot', 'pgoutput')",
-            &[],
-        )
-        .await
-        .expect("create a slot");
 
     let backup = cluster.cold_backup();
     let backup_root = backup.root().to_path_buf();
@@ -375,31 +263,10 @@ async fn a_cold_backup_restores_data_and_slots_as_of_the_backup() {
         "a write to the restore doesn't reach the original"
     );
 
-    let restored_slots: i64 = restored_pool
-        .get()
-        .await
-        .expect("acquire connection")
-        .query_one(
-            "select count(*) from pg_replication_slots where slot_name = 'backup_slot'",
-            &[],
-        )
-        .await
-        .expect("count slots")
-        .get(0);
-    assert_eq!(restored_slots, 1, "a cold copy carries the slot");
-
     drop(restored_pool);
     drop(restored);
     assert!(
         !restored_root.exists(),
         "the restored cluster's dir is deleted on drop"
     );
-
-    db.pool
-        .get()
-        .await
-        .expect("acquire connection")
-        .execute("select pg_drop_replication_slot('backup_slot')", &[])
-        .await
-        .expect("drop the slot");
 }

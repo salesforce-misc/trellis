@@ -105,7 +105,7 @@ async fn stage_cdc(
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — see
     // `defs_aggregate_relationship.rs`'s identical helper for why this is
-    // safe for a hand-staged-CDC test file with no live `Intake` running.
+    // safe for a hand-staged-CDC test file with no live capture running.
     let watermark = trellis::staging::StagedWatermark::saturated();
     let watermark = &watermark;
     for _ in 0..16 {
@@ -152,12 +152,8 @@ const AUTHOR_TAG_TOTALS: &str = "TRANSFORM author_tag_totals FROM post_tags GROU
 
 /// The running schema for this file: `posts.author` is the relationship
 /// group-key column — `post_tags` itself never carries an `author` column at
-/// all. Both tables need `REPLICA IDENTITY FULL` for the same two reasons
-/// `defs_aggregate_relationship.rs`'s `create_schema` documents: `post_tags`
-/// is an *aggregate* source (the delta/recompute path needs the old image to
-/// locate the group a changed row is leaving), and `posts` is the to-side of
-/// a to-one relationship (the settled parent projection requires it
-/// unconditionally, issue #129).
+/// all. `post_tags` is an *aggregate* source, and `posts` is the to-side of
+/// a to-one relationship.
 ///
 /// Seed data deliberately covers the same nullability corners issue #94's
 /// own fixture does: tag `rust` includes a row whose FK (`post = 999`)
@@ -171,8 +167,6 @@ async fn create_schema(client: &Client) {
         .batch_execute(
             "create table posts (id integer primary key, author text, word_count integer); \
              create table post_tags (id integer primary key, post integer, tag text); \
-             alter table post_tags replica identity full; \
-             alter table posts replica identity full; \
              create index on post_tags (post); \
              insert into posts (id, author, word_count) values \
                (1, 'alice', 100), (2, 'bob', 250), (3, 'alice', null); \
@@ -323,7 +317,7 @@ async fn aggregate_over_a_relationship_group_by_key_backfills_to_the_oracle() {
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     drain_to_quiescence(&db.pool, &mut client).await;
 
@@ -404,7 +398,7 @@ async fn inserting_a_from_side_row_lands_in_the_relationship_group_by_keys_group
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -464,7 +458,7 @@ async fn updating_a_to_side_rows_group_by_column_moves_affected_rows_to_the_new_
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let totals_before = target_totals(&client).await;
@@ -547,7 +541,7 @@ async fn updating_a_to_side_rows_group_by_column_moves_affected_rows_to_the_new_
 /// on `main`, independently of #137, because
 /// `apply_aggregate::derive_group_key`'s then length-prefixed composite-key
 /// encoding leaked into the downstream `Recompute` marker's `key` field,
-/// which the live re-fetch path (`intake::extract_key`'s U+001F-joined
+/// which the live re-fetch path (`ddl::join_pk_key`'s U+001F-joined
 /// convention) then failed to parse (`DdlError::MalformedCompositeKey`).
 /// Issue #103 had only ever fixed that encoding's *single*-column case (see
 /// `chaining_onto_a_single_group_by_column_aggregate_target_does_not_misread_the_group_key`
@@ -574,7 +568,7 @@ async fn chaining_a_further_aggregate_onto_the_relationship_group_by_target_conv
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Drive both of this issue's interesting mechanics directly against
@@ -627,18 +621,8 @@ async fn chaining_a_further_aggregate_onto_the_relationship_group_by_target_conv
     );
 
     // `author_tag_totals` becomes an *aggregate source* for `tag_totals2`
-    // below, which needs the old image to locate the group a changed row is
-    // leaving — same requirement `create_schema`'s own tables have, just
-    // applied after the fact since `author_tag_totals` didn't exist before
-    // `install_definition` created it. `tag_totals2` never actually sees a
-    // *live* change to `author_tag_totals` in this test (see the doc
-    // comment above), but the install-time replica-identity check
-    // (`assert_replica_identity_supports_aggregate`) still requires it
-    // unconditionally for any aggregate source.
-    client
-        .batch_execute("alter table author_tag_totals replica identity full")
-        .await
-        .expect("widen author_tag_totals's replica identity");
+    // below. `tag_totals2` never actually sees a *live* change to
+    // `author_tag_totals` in this test (see the doc comment above).
 
     const TAG_TOTALS_2: &str = "TRANSFORM tag_totals2 FROM author_tag_totals GROUP BY tag \
          SELECT sum(post_count) AS post_count, sum(total_words) AS total_words";
@@ -651,7 +635,7 @@ async fn chaining_a_further_aggregate_onto_the_relationship_group_by_target_conv
     install_definition(&db.pool, TAG_TOTALS_2, &author_tag_totals_columns, "public")
         .await
         .expect("install the chained plain-column aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let tag_totals_2: HashMap<String, (String, Option<String>)> = client
@@ -699,9 +683,7 @@ async fn a_to_many_relationship_path_as_a_group_by_key_is_rejected() {
     client
         .batch_execute(
             "create table posts2 (id integer primary key, tag text); \
-             create table comments2 (id integer primary key, post_id integer, author text); \
-             alter table posts2 replica identity full; \
-             alter table comments2 replica identity full",
+             create table comments2 (id integer primary key, post_id integer, author text)",
         )
         .await
         .expect("create tables");
@@ -808,7 +790,7 @@ async fn updating_a_to_sides_row_with_a_passthrough_field_for_the_group_by_key_s
     )
     .await
     .expect("install the passthrough-field definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client

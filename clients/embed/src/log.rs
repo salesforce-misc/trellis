@@ -23,10 +23,10 @@
 //!   [`LOG_QUEUE_CAPACITY`] records. A full queue drops the record and counts
 //!   it, and [`LogBridge::take`] reports that count, so the host can log that
 //!   lines were lost.
-//! - **Events only.** Spans are disabled. The engine opens a span per source
-//!   transaction (`intake.commit_transaction`), and recording those for a
-//!   logger that never prints them would put a registry allocation on the
-//!   capture hot path. An event's own fields carry its context.
+//! - **Events only.** Spans are disabled. The engine opens a span per drained
+//!   batch (`staging.drain_once`), and recording those for a logger that
+//!   never prints them would put a registry allocation on the drain hot
+//!   path. An event's own fields carry its context.
 //! - **Filtered at the callsite.** [`LogBridge::set_max_level`] sets the most
 //!   verbose level forwarded and rebuilds `tracing`'s interest cache, so an
 //!   event above that level costs what it costs with no subscriber at all.
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn events_inside_a_span_still_cross_and_the_span_is_not_recorded() {
         let bridge = with_bridge("trace", || {
-            let span = tracing::info_span!("intake.commit_transaction", xid = 7);
+            let span = tracing::info_span!("staging.drain_once", seg_seq = 7);
             let _entered = span.enter();
             assert!(span.is_disabled(), "the bridge never enables a span");
             tracing::info!("inside");

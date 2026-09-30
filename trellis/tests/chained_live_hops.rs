@@ -4,8 +4,8 @@
 //!
 //! A chain's intermediate hop (`h1` in `src -> h1 -> h2`) is two things at
 //! once: the *target* of the upstream definition and a *source* of the
-//! downstream one. Issue #267 found that, while `h1` sat in the CDC
-//! publication, a write to it was staged twice under two spellings of the
+//! downstream one. Issue #267 found that, while `h1` was itself captured, a
+//! write to it was staged twice under two spellings of the
 //! table — once by the applying transaction's own downstream propagation and
 //! once by intake — which live-locked the downstream apply. Issue #315 then
 //! took intermediate hops out of the captured set altogether: every write to
@@ -63,7 +63,7 @@ async fn install_chain(
         install_definition(&db.pool, text, columns, "public")
             .await
             .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
-        trellis::intake::publication::settle_registrations(&db.pool).await;
+        trellis::intake::markers::settle_registrations(&db.pool).await;
     }
 }
 
@@ -71,7 +71,7 @@ async fn install_chain(
 /// insert, then an update and a delete of the same row, so every CDC op for
 /// the root reaches `h2` through the middle hop.
 #[tokio::test]
-async fn a_two_hop_one_to_one_chain_converges_without_publishing_the_middle_hop() {
+async fn a_two_hop_one_to_one_chain_converges_without_capturing_the_middle_hop() {
     let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute("create table public.src (id integer primary key, val numeric)")
         .await
@@ -125,8 +125,8 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
     raw.batch_execute("create table public.src (id integer primary key, val numeric)")
         .await
         .expect("create src");
-    // No `REPLICA IDENTITY FULL` on `h2`: an aggregate over a target never
-    // reads that target's CDC (issue #315).
+    // An aggregate over a target never reads that target's capture: the
+    // target-mutation seam feeds it (issue #315).
     install_chain(
         &db,
         &[
@@ -166,7 +166,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
 }
 
 /// Issue #315's original report: an aggregate target feeding another
-/// transform. While the aggregate target was published, its first CDC change
+/// transform. While the aggregate target was captured, its first CDC change
 /// killed intake (no primary key to decode a key from), so nothing
 /// downstream ever converged again. `hist` counts `agg`'s groups by their
 /// size, so moving a source row between `agg` groups also moves `agg` rows
@@ -177,12 +177,9 @@ async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_grou
     let (cluster, db, raw) = trigger_pipeline::database().await;
     // A text group key: a transform chained off an aggregate target reads
     // its group column as a primary key, which can't be `numeric`.
-    raw.batch_execute(
-        "create table public.src (id integer primary key, val text); \
-         alter table public.src replica identity full",
-    )
-    .await
-    .expect("create src");
+    raw.batch_execute("create table public.src (id integer primary key, val text)")
+        .await
+        .expect("create src");
     install_chain(
         &db,
         &["TRANSFORM agg FROM public.src GROUP BY val SELECT COUNT(*) AS n"],

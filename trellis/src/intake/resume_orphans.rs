@@ -1,7 +1,7 @@
 //! Issues #330, #485 and #436: the target rows a definition must drop because
 //! its source no longer has them.
 //!
-//! A backfill marker's discharge ([`super::publication::run_pending_backfills`])
+//! A backfill marker's discharge ([`super::markers::run_pending_backfills`])
 //! re-reads a table by enumerating its *current* keys as image-less
 //! `Recompute`s, and a chunked or direct build copies the rows it reads.
 //! Neither can reach a target row the source stopped backing while the
@@ -35,10 +35,10 @@
 //!
 //! The anti-joins are branches of the discharge's read: the one cursor that
 //! also enumerates the marker's table
-//! (`publication::declare_read`). One statement reads one snapshot, so a
+//! (`markers::declare_read`). One statement reads one snapshot, so a
 //! row is judged unbacked on exactly the snapshot, call it *S*, whose keys
 //! the enumeration stages. The cursor returns each unbacked row's key, and
-//! [`Sweep::delete`] deletes by key after the intake wait, when the read is
+//! [`Sweep::delete`] deletes by key after the watermark wait, when the read is
 //! fetched.
 //!
 //! Every commit visible to *S* is in both halves of the read. Every commit
@@ -66,7 +66,7 @@
 //! before *S* and refilled after it, was neither deleted nor enumerated. It
 //! kept its stale value, and the CDC for the emptying and the refill folded
 //! onto it as deltas (#391 measured 103 where the source said 100). Moving
-//! that `DELETE` after the intake wait instead (as #330's spike did) opens
+//! that `DELETE` after the watermark wait instead (as #330's spike did) opens
 //! the mirror race: a group empty at *S* and refilled before the `DELETE`
 //! survives at its stale value, since nothing enumerates it. Judging on *S*
 //! and deleting later has neither.
@@ -80,10 +80,10 @@
 //!
 //! # Why the delete comes last (issue #503)
 //!
-//! The delete runs as the read is fetched, after the intake wait, and the
+//! The delete runs as the read is fetched, after the watermark wait, and the
 //! enumeration branch comes first, so it runs at the end of the fetch. A
 //! target row the sweep deletes stays locked only from there to the
-//! discharge's commit, not across the intake wait, where a drain of an
+//! discharge's commit, not across the watermark wait, where a drain of an
 //! already-sealed segment that touched it used to wait for the discharge.
 //!
 //! That tail can still deadlock with such a drain: the sweep locks its rows
@@ -96,7 +96,7 @@
 //! leaves anything stuck or wrong.
 //!
 //! Each delete also re-checks the definition's status, which by then is
-//! after the intake wait: a pause that landed since the discharge read it
+//! after the watermark wait: a pause that landed since the discharge read it
 //! (#331) leaves the target as the pause found it, and its own resume comes
 //! back here. The dispatch and the flips that move a swept definition out of
 //! the status it was read in come after the fetch.
@@ -139,7 +139,7 @@
 //!
 //! A discharge with nothing to enumerate (only background builds read the
 //! table) still declares the read over its sweep's branches alone, and
-//! fetches it at once: there is no intake wait to hold it.
+//! fetches it at once: there is no watermark wait to hold it.
 //!
 //! ## The go-live sweep (issue #485)
 //!
@@ -573,7 +573,7 @@ impl Sweep {
 /// empty. See "Pending deltas on a deleted group" in the module doc. The
 /// discharge calls it last, just before it commits, so it takes each
 /// horizon row's lock only for the transaction's final statements rather
-/// than across the intake wait; a later position is still at or above every
+/// than across the watermark wait; a later position is still at or above every
 /// commit the sweep saw.
 pub(super) async fn raise_extinct_horizons(
     txn: &Transaction<'_>,
@@ -940,11 +940,11 @@ mod db_tests {
             .add(txn, ids, TransformStatus::CatchingUp)
             .await
             .expect("plan the sweep");
-        if super::super::publication::declare_read(txn, None, &sweep)
+        if super::super::markers::declare_read(txn, None, &sweep)
             .await
             .expect("declare the read")
         {
-            super::super::publication::fetch_read(txn, "", &mut sweep)
+            super::super::markers::fetch_read(txn, "", &mut sweep)
                 .await
                 .expect("fetch the read");
         }
@@ -978,7 +978,6 @@ mod db_tests {
         let (pool, mut raw) = connect(&db).await;
         raw.batch_execute(
             "create table public.orders (id bigint primary key, g text, a numeric); \
-             alter table public.orders replica identity full; \
              insert into public.orders \
                select n, 'g' || (n % 100), n from generate_series(1, 20000) n",
         )
@@ -997,7 +996,7 @@ mod db_tests {
                 .await
                 .expect("register");
         }
-        crate::intake::publication::settle_builds(&pool).await;
+        crate::intake::markers::settle_builds(&pool).await;
         raw.batch_execute("analyze public.orders, public.orders_copy, public.orders_by_g")
             .await
             .expect("analyze");
@@ -1098,7 +1097,6 @@ mod db_tests {
         let (pool, mut raw) = connect(&db).await;
         raw.batch_execute(
             "create table public.orders (id bigint primary key, g text, a numeric); \
-             alter table public.orders replica identity full; \
              insert into public.orders values (1, 'a', 1), (2, 'b', 2), (3, 'b', 3)",
         )
         .await
@@ -1116,7 +1114,7 @@ mod db_tests {
         )
         .await
         .expect("register");
-        crate::intake::publication::settle_builds(&pool).await;
+        crate::intake::markers::settle_builds(&pool).await;
         let ids = catching_up(&raw).await;
         raw.batch_execute("delete from public.orders where g = 'a'")
             .await
@@ -1135,7 +1133,7 @@ mod db_tests {
             .await
             .expect("plant a NULL group");
         assert!(
-            super::super::publication::declare_read(&txn, None, &sweep)
+            super::super::markers::declare_read(&txn, None, &sweep)
                 .await
                 .expect("declare the read")
         );
@@ -1146,7 +1144,7 @@ mod db_tests {
             )
             .await
             .expect("refill group a and empty group b");
-        super::super::publication::fetch_read(&txn, "", &mut sweep)
+        super::super::markers::fetch_read(&txn, "", &mut sweep)
             .await
             .expect("fetch the read");
         let swept = sweep.finish(&txn).await.expect("flush the sweep");
@@ -1211,7 +1209,6 @@ mod db_tests {
         let (pool, mut raw) = connect(&db).await;
         raw.batch_execute(
             "create table public.orders (id bigint primary key, g text, a numeric); \
-             alter table public.orders replica identity full; \
              insert into public.orders values (1, 'a', 1)",
         )
         .await
@@ -1229,7 +1226,7 @@ mod db_tests {
         )
         .await
         .expect("register");
-        crate::intake::publication::settle_builds(&pool).await;
+        crate::intake::markers::settle_builds(&pool).await;
         let ids = catching_up(&raw).await;
         raw.batch_execute(
             "do $$ declare c text; begin \
@@ -1266,8 +1263,6 @@ mod db_tests {
         raw.batch_execute(
             "create table public.posts (id integer primary key, author text); \
              create table public.post_tags (id integer primary key, post integer, tag text); \
-             alter table public.posts replica identity full; \
-             alter table public.post_tags replica identity full; \
              create index on public.post_tags (post); \
              insert into public.posts values (1, 'alice'); \
              insert into public.post_tags values (10, 1, 'rust')",
@@ -1294,7 +1289,7 @@ mod db_tests {
         )
         .await
         .expect("register");
-        crate::intake::publication::settle_builds(&pool).await;
+        crate::intake::markers::settle_builds(&pool).await;
         let ids = catching_up(&raw).await;
         assert_eq!(ids.len(), 1, "the build finished");
 

@@ -152,7 +152,7 @@ async fn stage_cdc_with_src_changed(
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — no live
-    // `Intake` runs in this test, and this file isn't exercising guard (a).
+    // capture runs in this test, and this file isn't exercising guard (a).
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
@@ -298,28 +298,13 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    // The image-less reverse-recompute path this test exercises (staging a
+    // The image-less reverse-recompute path this test exercises stages a
     // `Recompute` marker per affected from-side row, re-reading the *current*
-    // parent row rather than comparing against an old image) itself needs no
-    // `REPLICA IDENTITY FULL` on the to-side — a to-one's `to_col` already
-    // *is* the primary key, which the DEFAULT identity always carries. But
-    // issue #129 (epic #127's settled parent projection) added an
-    // unconditional `REPLICA IDENTITY FULL` requirement at
-    // `create_relationship` time for every to-one relationship regardless of
-    // which apply mechanism ends up consuming it — the projection's own
-    // future reverse-applied advance (#131) needs the to-side row's *entire*
-    // old image, not just its key — so this table needs it set too, even
-    // though nothing in this specific test's own code path reads it yet.
-    // Issue #158 extends that same unconditional requirement to the
-    // from-side (`articles`): its `category_id` is an ordinary non-PK
-    // column, so under the default (PK-only) replica identity a re-pointing
-    // `UPDATE` would ship no old image at all.
+    // parent row rather than comparing against an old image.
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full",
+             create table articles (id integer primary key, category_id integer, title text)",
         )
         .await
         .expect("create tables");
@@ -464,7 +449,7 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     // Step 4 — re-parent the category's own key 10 -> 20: article 1 (still
     // pointing at 10) is orphaned; article 2 (pointing at 20) now matches.
     // The OLD key (10) rides in the update's pre-image, the NEW key (20) in the
-    // post-image — both from the default replica identity.
+    // post-image.
     client
         .execute("update categories set id = 20 where id = 10", &[])
         .await
@@ -539,7 +524,7 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
 /// `from_table` is accepted bare, for callers' readability, and qualified
 /// through [`qualify_fixture_table`] before the probe — issue #267: reverse
 /// recompute now stages its `src_table` under the same qualified identity CDC
-/// intake uses (`relationship_definitions.from_table` is bare, so `compute`
+/// capture uses (`relationship_definitions.from_table` is bare, so `compute`
 /// canonicalizes it at the staging boundary), so a bare probe here matches
 /// nothing at all rather than reporting the rows that really were staged.
 async fn staged_from_side_recomputes(client: &Client, from_table: &str) -> Vec<String> {
@@ -590,18 +575,14 @@ async fn reverse_recompute_to_many_stages_from_side_recomputes() {
     let mut client = connect_raw(db.dsn()).await;
 
     // A to-many's join column (`comments.article_id`) is NOT the to-side primary
-    // key, so it is absent from a delete/re-parent's DEFAULT replica-identity
-    // pre-image. REPLICA IDENTITY FULL puts it in the old image — the same
-    // requirement issue #7 already imposes on aggregate sources whose old image
-    // a derivation needs. (A to-*one*'s join column IS the primary key, which is
-    // why the to-one test above needs no FULL.) The from-side needs only live
+    // key; the capture trigger still carries it in a delete/re-parent's old
+    // image, since it sees the whole old row. The from-side needs only live
     // rows: the reverse resolver stages recomputes off the relationship graph,
     // independent of whether a from-side transform exists yet.
     client
         .batch_execute(
             "create table articles (id integer primary key, title text); \
              create table comments (id integer primary key, article_id integer, word_count integer); \
-             alter table comments replica identity full; \
              insert into articles (id, title) values (1, 'a1'), (2, 'a2')",
         )
         .await
@@ -737,8 +718,6 @@ async fn reverse_recompute_dedupes_across_relationships_sharing_from_table() {
             "create table articles (id integer primary key, title text); \
              create table comments (id integer primary key, article_id integer, word_count integer); \
              create table likes (id integer primary key, article_id integer); \
-             alter table comments replica identity full; \
-             alter table likes replica identity full; \
              insert into articles (id, title) values (1, 'a1')",
         )
         .await
@@ -843,8 +822,6 @@ async fn reverse_recompute_dedupes_a_truncate_against_a_relationship_sharing_the
             "create table articles (id integer primary key, title text); \
              create table comments (id integer primary key, article_id integer, word_count integer); \
              create table likes (id integer primary key, article_id integer); \
-             alter table comments replica identity full; \
-             alter table likes replica identity full; \
              insert into articles (id, title) values (1, 'a1')",
         )
         .await
@@ -978,7 +955,6 @@ async fn reverse_recompute_fan_in_keeps_the_earliest_src_changed() {
         .batch_execute(
             "create table articles (id integer primary key, title text); \
              create table comments (id integer primary key, article_id integer, word_count integer); \
-             alter table comments replica identity full; \
              insert into articles (id, title) values (1, 'a1')",
         )
         .await
@@ -1085,8 +1061,6 @@ async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'Sci')",
         )
         .await
@@ -1272,9 +1246,6 @@ async fn a_to_many_enrichment_reads_the_to_side_it_was_declared_against() {
              create table shop.users (id integer primary key, name text); \
              create table shop.orders (id integer primary key, user_id integer, amount integer); \
              create table other.orders (id integer primary key, user_id integer, amount integer); \
-             alter table shop.users replica identity full; \
-             alter table shop.orders replica identity full; \
-             alter table other.orders replica identity full; \
              insert into shop.users values (1, 'a'); \
              insert into shop.orders values (10, 1, 5), (11, 1, 7); \
              insert into other.orders values (90, 1, 1000);",
@@ -1298,7 +1269,7 @@ async fn a_to_many_enrichment_reads_the_to_side_it_was_declared_against() {
     )
     .await
     .expect("install user_spend through other's search_path");
-    trellis::intake::publication::settle_registrations(&other_pool).await;
+    trellis::intake::markers::settle_registrations(&other_pool).await;
     assert_eq!(
         text_pairs(
             &client,
@@ -1350,9 +1321,6 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
              create table shop.users (id integer primary key, name text); \
              create table shop.orders (id integer primary key, user_id integer, amount integer); \
              create table other.users (id integer primary key, name text); \
-             alter table shop.users replica identity full; \
-             alter table shop.orders replica identity full; \
-             alter table other.users replica identity full; \
              insert into shop.users values (1, 'a'), (2, 'b'); \
              insert into shop.orders values (10, 1, 5), (11, 2, 7); \
              insert into other.users values (1, 'wrong'), (2, 'wrong');",
@@ -1381,7 +1349,7 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
     )
     .await
     .expect("install spend_by_name through other's search_path");
-    trellis::intake::publication::settle_registrations(&other_pool).await;
+    trellis::intake::markers::settle_registrations(&other_pool).await;
     drain_to_quiescence(&other_pool, &mut client).await;
     let expected = |a: &str, b: &str| {
         vec![
@@ -1463,8 +1431,6 @@ async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
         .batch_execute(
             "create table users (id integer primary key, name text); \
              create table orders (id integer primary key, user_id integer, amount integer); \
-             alter table users replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, 'a'), (2, 'b'); \
              insert into orders values (10, 1, 5), (11, 2, 7);",
         )
@@ -1488,7 +1454,7 @@ async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
     )
     .await
     .expect("install spend_by_name");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -1687,8 +1653,6 @@ async fn to_side_change_scenario(case: &AggregateCase, change: ToSideChange, pat
             "create table users (id integer primary key, name text); \
              create table orders (id integer primary key, user_id integer, region text, \
                                   amount integer, paid boolean); \
-             alter table users replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, 'a'), (2, 'b'); \
              insert into orders values (10, 1, 'eu', 5, true), (11, 2, 'eu', 7, false), \
                                        (13, 1, 'us', 3, true), (14, 3, 'eu', 9, false);",
@@ -1722,7 +1686,7 @@ async fn to_side_change_scenario(case: &AggregateCase, change: ToSideChange, pat
     )
     .await
     .unwrap_or_else(|e| panic!("{label}: install: {e}"));
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     if path == ReversePath::Fallback {
@@ -1888,8 +1852,6 @@ async fn a_to_side_rename_regroups_an_aggregate_chained_off_a_relationship_targe
         .batch_execute(
             "create table users (id integer primary key, name text); \
              create table orders (id integer primary key, user_id integer, amount integer); \
-             alter table users replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, 'a'), (2, 'b'); \
              insert into orders values (10, 1, 5), (11, 2, 7), (12, 1, 100);",
         )
@@ -1913,7 +1875,7 @@ async fn a_to_side_rename_regroups_an_aggregate_chained_off_a_relationship_targe
     )
     .await
     .expect("install order_buyer");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     install_definition(
         &db.pool,
@@ -1927,7 +1889,7 @@ async fn a_to_side_rename_regroups_an_aggregate_chained_off_a_relationship_targe
     )
     .await
     .expect("install spend_by_bname");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let totals = "select bname, total::text from spend_by_bname";
     assert_eq!(
@@ -1976,9 +1938,6 @@ async fn a_to_side_rename_regroups_an_aggregate_grouped_by_two_relationships() {
              create table shops (id integer primary key, title text); \
              create table orders (id integer primary key, user_id integer, shop_id integer, \
                                   amount integer); \
-             alter table users replica identity full; \
-             alter table shops replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, 'a'), (2, 'b'); \
              insert into shops values (1, 's'), (2, 't'); \
              insert into orders values (10, 1, 1, 5), (11, 2, 1, 7), (12, 1, 2, 100);",
@@ -2007,7 +1966,7 @@ async fn a_to_side_rename_regroups_an_aggregate_grouped_by_two_relationships() {
     )
     .await
     .expect("install spend_by_pair");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let totals = "select concat_ws('|', name, title), total::text from spend_by_pair";
     let oracle = "select concat_ws('|', u.name, s.title), sum(o.amount)::text from orders o \
@@ -2064,9 +2023,6 @@ async fn both_relationships_change_in_one_batch(aggregates: &[TwoRelationshipAgg
              create table shops (id integer primary key, title text); \
              create table orders (id integer primary key, user_id integer, shop_id integer, \
                                   amount integer); \
-             alter table users replica identity full; \
-             alter table shops replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, 'a'), (2, 'b'); \
              insert into shops values (1, 's'), (2, 't'); \
              insert into orders values (10, 1, 1, 5), (11, 2, 2, 7);",
@@ -2096,7 +2052,7 @@ async fn both_relationships_change_in_one_batch(aggregates: &[TwoRelationshipAgg
         .await
         .unwrap_or_else(|e| panic!("install {}: {e}", aggregate.definition));
     }
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     for aggregate in aggregates {
         assert_eq!(
@@ -2287,9 +2243,6 @@ async fn truncate_scenario(label: &str, steps: &[Step]) {
              create table shops (id integer primary key, title text); \
              create table orders (id integer primary key, user_id integer, shop_id integer, \
                                   region text, amount integer); \
-             alter table users replica identity full; \
-             alter table shops replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, 'a'), (2, 'b'), (3, 'c'); \
              insert into shops values (1, 's'), (2, 't'); \
              insert into orders values (10, 1, 1, 'eu', 5), (11, 2, 2, 'eu', 7), \
@@ -2322,7 +2275,7 @@ async fn truncate_scenario(label: &str, steps: &[Step]) {
         .await
         .unwrap_or_else(|e| panic!("install {}: {e}", aggregate.definition));
     }
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     for aggregate in TRUNCATE_AGGREGATES {
         assert_eq!(
@@ -2655,9 +2608,6 @@ async fn two_relationship_columns_with_the_same_joined_name_group_apart() {
              create table shops (id integer primary key, y_z text); \
              create table orders (id integer primary key, user_id integer, shop_id integer, \
                                   amount integer); \
-             alter table users replica identity full; \
-             alter table shops replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, 'u1'), (2, 'u2'); \
              insert into shops values (1, 's1'), (2, 's2'); \
              insert into orders values (10, 1, 2, 5);",
@@ -2685,7 +2635,7 @@ async fn two_relationship_columns_with_the_same_joined_name_group_apart() {
     )
     .await
     .expect("install by_pair");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let target = "select z || '|' || y_z, v::text from by_pair";
     let oracle = "select u.z || '|' || s.y_z, sum(o.amount)::text from orders o \
@@ -2731,8 +2681,6 @@ async fn a_source_column_named_like_a_reverse_synthetic_column_is_read_as_itself
             "create table users (id integer primary key, name text); \
              create table orders (id integer primary key, user_id integer, \
                                   __trellis_rev_name integer); \
-             alter table users replica identity full; \
-             alter table orders replica identity full; \
              insert into users values (1, '1000'), (2, '2000'); \
              insert into orders values (10, 1, 5), (11, 2, 7), (12, 1, 100);",
         )
@@ -2757,7 +2705,7 @@ async fn a_source_column_named_like_a_reverse_synthetic_column_is_read_as_itself
     )
     .await
     .expect("install by_buyer");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let target = "select name, v::text from by_buyer";
     let oracle = "select u.name, sum(o.__trellis_rev_name)::text from orders o \

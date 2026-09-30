@@ -244,10 +244,7 @@ fn columns() -> HashMap<String, ValueType> {
 
 async fn create_schema_and_definition(pool: &trellis::Pool, client: &Client) {
     client
-        .batch_execute(
-            "create table events (id integer primary key, grp integer, amount numeric); \
-             alter table events replica identity full",
-        )
+        .batch_execute("create table events (id integer primary key, grp integer, amount numeric)")
         .await
         .expect("create source table");
 

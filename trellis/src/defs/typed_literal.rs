@@ -164,7 +164,7 @@ pub struct TypedLiteralSpec {
 ///   plus that canonicalizer.
 /// * **`timestamptz`** (#113, #246) — value comparison is immutable, and
 ///   *text rendering* now is too: issue #246 pins `TimeZone = 'UTC'` on
-///   every connection Trellis opens, pool and walsender alike (see
+///   every connection Trellis opens and in every capture function (see
 ///   [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]), which is what let
 ///   `timestamptz` join the join/`GROUP BY`/primary-key and `MIN`/`MAX`
 ///   roles (`crate::temporal::is_bijective_under_text`/

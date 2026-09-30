@@ -114,8 +114,8 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
         h.coverage.borrow_mut().record_program(program);
 
         h.runtime.block_on(async {
-            // C2: per-case isolated-database provisioning (schema, slot,
-            // publication) inside the shared cluster. See the cluster-startup
+            // C2: per-case isolated-database provisioning inside the shared
+            // cluster. See the cluster-startup
             // timing above for the env-var convention.
             let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
             let start = timing_enabled.then(std::time::Instant::now);
@@ -506,7 +506,7 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
 /// Row 1 carries plain, unremarkable values for all three new columns. Row 2
 /// carries the U+001F ("unit separator") awkward text literal specifically
 /// (design doc §3 / the module doc comment's B1 scope-cut note): it's the
-/// same byte `intake::extract_key`'s composite-key encoding treats
+/// same byte `defs::ddl::join_pk_key`'s composite-key encoding treats
 /// specially, so proving *this* value round-trips correctly through a plain
 /// `Text` column — SQL binding, the `::text` cast on both insert and every
 /// read-back, this harness's own snapshot diffing — is the most direct way

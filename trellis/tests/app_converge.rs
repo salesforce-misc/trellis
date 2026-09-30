@@ -16,7 +16,7 @@
 //! None of them runs a live `Client` (issue #301). They manipulate the ring
 //! directly, the style `trellis/tests/converge.rs` established, so every
 //! ordering they assert on is controlled by the test rather than raced
-//! against real intake/apply timing under a wall-clock budget.
+//! against real capture/apply timing under a wall-clock budget.
 //! `await_converged_waits_for_a_sealed_write_until_it_is_applied` stages a
 //! real write's CDC row by hand and drains it through the engine's own apply
 //! path, so the target value it reads back is one the engine computed.
@@ -82,7 +82,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// Drains every bucket of the sealed segment `seg_seq` through the engine's
 /// own apply path.
 async fn drain_segment(pool: &trellis::Pool, seg_seq: i64) {
-    // No live `Intake` stages anything here, so there is no real staged
+    // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     let watermark = StagedWatermark::saturated();
     while apply::drain_once(
@@ -149,7 +149,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
         .expect("define over an empty source");
     // Stand in for the staging worker's discharge (ADR-0016), which takes a
     // definition over an empty source straight to `live`.
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the build");
 
@@ -176,7 +176,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
     .expect("stage the insert's CDC row");
 
     // Per `Trellis::watermark_token`'s contract: taken after the write's own
-    // commit has returned. Intake has confirmed through it; only the ring
+    // commit has returned. Its CDC row is already staged; only the ring
     // stands between the token and convergence.
     let token = trellis.watermark_token().await.expect("watermark_token");
     // Sealed but not drained, as a staging-only pipeline would leave it.
@@ -226,7 +226,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
 /// but through the facade and its own error type. Uses direct ring
 /// manipulation (no live CDC/drain workers at all) so the "never converges"
 /// half of this test is deterministic rather than a race against real
-/// intake/apply timing.
+/// capture/apply timing.
 #[tokio::test]
 async fn await_converged_times_out_with_a_named_staging_error() {
     let cluster = TestCluster::start();
@@ -240,8 +240,7 @@ async fn await_converged_times_out_with_a_named_staging_error() {
     let token = trellis.watermark_token().await.expect("watermark_token");
 
     let raw = connect_raw(db.dsn()).await;
-    // Condition 1 (replication progress) satisfied exactly at `token`;
-    // conditions 2/3 never will be — a pending row in the active slot,
+    // Conditions 2/3 never will be satisfied — a pending row in the active slot,
     // deliberately never sealed or drained.
     insert_pending_row(&raw, "k1", PgLsn::from(0)).await;
 

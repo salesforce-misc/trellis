@@ -4,7 +4,7 @@
 //!
 //! Mirrors `apply.rs`'s conventions: source/target tables and definitions
 //! built by hand, changes staged directly into the ring, drains run via
-//! `apply::drain_once` (intake is out of scope here, same as `apply.rs`).
+//! `apply::drain_once` (capture is out of scope here, same as `apply.rs`).
 //! `apply.rs`'s `a_change_propagates_two_hops_downstream_then_stops` is the
 //! DAG-shape fixture these tests crib from — that test already proves
 //! propagation stops at a transform with no downstream reader; these tests
@@ -87,7 +87,7 @@ async fn insert_cdc_row(
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // Issue #132: a throwaway, always-caught-up watermark — no live
-    // `Intake` runs in this test, and this file isn't exercising guard (a).
+    // capture runs in this test, and this file isn't exercising guard (a).
     let watermark = trellis::staging::StagedWatermark::saturated();
     apply::drain_once(
         pool,

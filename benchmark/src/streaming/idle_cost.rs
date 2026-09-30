@@ -1,7 +1,7 @@
 //! Idle cost — epic #269's **V-IDLE** (issue #268's X6): what a fully idle
 //! install costs the database. A staging worker plus N drain workers, a
-//! published source table that is never written to, the one 1-1 transform
-//! that makes the staging worker publish it (issue #427), and nothing else —
+//! captured source table that is never written to, the one 1-1 transform
+//! that makes the staging worker capture it (issue #427), and nothing else —
 //! sampled for transactions/sec, WAL bytes/sec and seals/sec.
 //!
 //! All three come **from Postgres directly**, not from new engine metrics:

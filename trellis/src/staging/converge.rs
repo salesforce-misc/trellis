@@ -69,12 +69,10 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// doc's "The predicate" section for why splitting this into separate
 /// queries reintroduces the race it's built to close.
 ///
-/// - **No condition 1 any more** (issue #622 C5). Intake's confirmed
-///   position (`replication_progress.confirmed_lsn >= token`) was the first
-///   condition while a replication stream staged the ring. Trigger capture
-///   writes a change's ring rows in the writer's own transaction, so every
-///   commit at or below `token` already has its rows in the ring, with an
-///   `origin_lsn` below its commit, and conditions 2–4 see them.
+/// - **No condition 1** (issue #622 C5). Trigger capture writes a change's
+///   ring rows in the writer's own transaction, so every commit at or below
+///   `token` already has its rows in the ring, with an `origin_lsn` below its
+///   commit, and conditions 2–4 see them.
 /// - **Condition 2** — the active batch's ring table holds no row with
 ///   `origin_lsn <= token`. The active `ring_slot` is resolved from
 ///   `segment_pointer` in this same statement (so a concurrent seal can't
@@ -107,15 +105,14 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// logic would otherwise let quietly vanish from a `WHERE` filter or an
 /// aggregate instead of gating the row.
 ///
-/// Which rows carry an origin (issue #469): intake stamps every CDC and
-/// truncate row with its commit's position, and every row a drain derives
-/// for a downstream transform inherits the earliest origin of the changes
-/// that produced it (unknown if any was). Rows of genuinely unknown origin
-/// stay `NULL`: a backfill enumeration's `Recompute`s (ADR-0016's "What
-/// `live` promises" relies on them gating every token) and the propagation
-/// of a write made outside a drain. A missing origin can only make a wait
-/// longer, never let it return early; before #469 every row was missing one,
-/// so a busy stream gated every token on work committed after it.
+/// Which rows carry an origin (issue #469): a capture trigger stamps every row
+/// it writes with `pg_current_wal_insert_lsn()`, and every row a drain derives
+/// for a downstream transform inherits the earliest origin of the changes that
+/// produced it (unknown if any was). Rows of genuinely unknown origin stay
+/// `NULL`: a backfill enumeration's `Recompute`s (ADR-0016's "What `live`
+/// promises" relies on them gating every token) and the propagation of a write
+/// made outside a drain. A missing origin can only make a wait longer, never
+/// let it return early.
 ///
 /// The engine itself only polls through [`await_converged`], which inlines
 /// [`converged_sql`] into its bounded poll; this typed, unbounded form is
@@ -347,12 +344,6 @@ pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, Stagi
     let row = client.query_one("select pg_current_wal_lsn()", &[]).await?;
     Ok(row.get(0))
 }
-
-/// The prefix of the logical decoding message intake confirmed through at
-/// once (issue #452). Nothing writes it since trigger capture replaced intake
-/// (issue #622 C5); C8 deletes it with intake.
-#[allow(dead_code)]
-pub(crate) const CONVERGE_MESSAGE_PREFIX: &str = "trellis.converge";
 
 /// Polls [`converged_through`] until it reports `true` or `timeout` is
 /// exhausted. Backoff starts at 5ms and doubles to a 250ms ceiling

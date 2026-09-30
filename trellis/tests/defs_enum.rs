@@ -208,9 +208,7 @@ async fn enum_join_key_and_primary_key_are_admitted() {
         .batch_execute(
             "create type priority_enum as enum ('low', 'medium', 'high'); \
              create table parent (k priority_enum primary key); \
-             create table child (id bigint primary key, k priority_enum); \
-             alter table child replica identity full; \
-             alter table parent replica identity full",
+             create table child (id bigint primary key, k priority_enum)",
         )
         .await
         .expect("create relationship tables");
@@ -243,9 +241,7 @@ async fn two_distinct_enum_types_are_not_comparable_as_a_relationship_join() {
             "create type priority_enum as enum ('low', 'medium', 'high'); \
              create type status_enum as enum ('open', 'closed'); \
              create table parent (k status_enum primary key); \
-             create table child (id bigint primary key, k priority_enum); \
-             alter table child replica identity full; \
-             alter table parent replica identity full",
+             create table child (id bigint primary key, k priority_enum)",
         )
         .await
         .expect("create relationship tables");
@@ -295,8 +291,7 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
         .batch_execute(
             "create type public.priority_enum as enum ('low', 'medium', 'high'); \
              create table events ( \
-               id integer primary key, grp priority_enum, amount numeric); \
-             alter table events replica identity full",
+               id integer primary key, grp priority_enum, amount numeric)",
         )
         .await
         .expect("create source table");
@@ -478,8 +473,7 @@ async fn enum_group_by_min_max_matches_a_server_side_recompute() {
     client
         .batch_execute(
             "create type public.flip_enum as enum ('charlie', 'bravo', 'alpha'); \
-             create table events (id integer primary key, grp integer, p flip_enum); \
-             alter table events replica identity full",
+             create table events (id integer primary key, grp integer, p flip_enum)",
         )
         .await
         .expect("create source table");
@@ -623,8 +617,7 @@ async fn alter_type_add_value_is_reflected_on_the_next_recompute_with_nothing_ca
     client
         .batch_execute(
             "create type public.flip_enum as enum ('bravo', 'alpha'); \
-             create table events (id integer primary key, grp integer, p flip_enum); \
-             alter table events replica identity full",
+             create table events (id integer primary key, grp integer, p flip_enum)",
         )
         .await
         .expect("create source table");

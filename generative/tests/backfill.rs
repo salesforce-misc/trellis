@@ -14,13 +14,13 @@
 //!
 //! **Why the target can only come from the build.** Phase 1's `install`
 //! starts the engine client, but no definition reads the source yet, so the
-//! staging worker doesn't publish it (it publishes exactly what registered
-//! definitions read, issue #427): the seed inserts are never streamed, and no
-//! CDC fold can stand in for the build. The table joins the publication only
-//! once phase 2's definition registers, and the discharge of its join marker
+//! staging worker doesn't capture it (it captures exactly what registered
+//! definitions read, issue #427): the seed inserts are never staged, and no
+//! CDC fold can stand in for the build. The table is captured only once
+//! phase 2's definition registers, and the discharge of its join marker
 //! dispatches the build. So the build is the *only* thing that can populate
 //! the target: no-op it and this test fails. The mid-test `quiesce` is kept
-//! so that stays true should an unread table ever be streamed again.
+//! so that stays true should an unread table ever be captured again.
 
 use std::time::{Duration, Instant};
 

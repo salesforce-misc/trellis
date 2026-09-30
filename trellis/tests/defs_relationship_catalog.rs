@@ -20,21 +20,12 @@ const SCHEMA: &str = "trellis";
 
 /// A bare table with an integer primary key named `pk_col` — good enough to
 /// stand in as a relationship's to-side when the test wants a `UNIQUE`/`PK`
-/// column present (cardinality `ToOne`). Carries `REPLICA IDENTITY FULL`
-/// unconditionally (issue #129, epic #127): every to-one relationship's
-/// to-side now needs it for `create_relationship` to accept the
-/// relationship at all (its settled parent projection reads old images —
-/// see `assert_replica_identity_supports_projection`), and this helper is
-/// overwhelmingly used to build a to-one relationship's to-side across this
-/// file's tests. Harmless for the handful of from-side uses too — `REPLICA
-/// IDENTITY FULL` only ever widens what a pre-image carries, never rejects
-/// anything on the from-side.
+/// column present (cardinality `ToOne`).
 async fn create_table_with_pk(pool: &trellis::pool::Pool, name: &str, pk_col: &str) {
     let client = pool.get().await.expect("get connection");
     client
         .batch_execute(&format!(
-            "create table {name} ({pk_col} serial primary key); \
-             alter table {name} replica identity full"
+            "create table {name} ({pk_col} serial primary key)"
         ))
         .await
         .expect("create table with pk");
@@ -54,14 +45,12 @@ async fn create_table_with_plain_column(pool: &trellis::pool::Pool, name: &str, 
 }
 
 /// A table with a plain-`UNIQUE` (not primary-key) integer column — the
-/// other route to cardinality `ToOne` per ADR-0006. `REPLICA IDENTITY FULL`
-/// for the same reason [`create_table_with_pk`] carries it now (issue #129).
+/// other route to cardinality `ToOne` per ADR-0006.
 async fn create_table_with_unique_column(pool: &trellis::pool::Pool, name: &str, col: &str) {
     let client = pool.get().await.expect("get connection");
     client
         .batch_execute(&format!(
-            "create table {name} (row_id serial primary key, {col} integer unique, other_col integer); \
-             alter table {name} replica identity full"
+            "create table {name} (row_id serial primary key, {col} integer unique, other_col integer)"
         ))
         .await
         .expect("create table with unique column");
@@ -99,29 +88,11 @@ async fn create_table_with_typed_column(
         .expect("create table with typed column");
 }
 
-/// Sets `REPLICA IDENTITY FULL` on `name` — the to-side prerequisite (#41)
-/// for a to-many relationship, whose non-PK join key must appear in
-/// delete/re-parent pre-images for reverse recompute; also the from-side
-/// prerequisite (issue #158) for a to-one relationship, whose `from_col` is
-/// itself an ordinary non-PK column and so needs the same guarantee for a
-/// re-pointing `UPDATE` to carry an old image at all.
-async fn set_replica_identity_full(pool: &trellis::pool::Pool, name: &str) {
-    let client = pool.get().await.expect("get connection");
-    client
-        .batch_execute(&format!("alter table {name} replica identity full"))
-        .await
-        .expect("set replica identity full");
-}
-
 #[tokio::test]
 async fn a_relationship_round_trips_through_the_catalog() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    // Issue #158: a to-one relationship's from-side needs `REPLICA IDENTITY
-    // FULL` too — see `assert_replica_identity_supports_projection`'s doc
-    // comment.
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     let created = create_relationship(
@@ -179,7 +150,6 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "posts", "author_id").await;
-    set_replica_identity_full(&db.pool, "posts").await;
     create_table_with_pk(&db.pool, "users", "id").await;
 
     create_relationship(
@@ -231,8 +201,7 @@ async fn a_duplicate_name_on_the_same_from_table_is_rejected() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table posts (id serial primary key, author_id integer, editor_id integer); \
-             alter table posts replica identity full",
+            "create table posts (id serial primary key, author_id integer, editor_id integer)",
         )
         .await
         .expect("create posts");
@@ -272,9 +241,7 @@ async fn the_same_relationship_name_is_allowed_on_different_from_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "posts", "owner_id").await;
-    set_replica_identity_full(&db.pool, "posts").await;
     create_table_with_plain_column(&db.pool, "comments", "owner_id").await;
-    set_replica_identity_full(&db.pool, "comments").await;
     create_table_with_pk(&db.pool, "users", "id").await;
 
     create_relationship(
@@ -311,7 +278,6 @@ async fn creating_a_relationship_issues_no_ddl_against_the_source_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     create_relationship(
@@ -477,11 +443,11 @@ async fn a_character_n_join_key_is_rejected() {
 /// `timestamptz` used to be this test's rejection example, a companion to
 /// `a_character_n_join_key_is_rejected`: `timestamptz_out` renders under the
 /// session's `TimeZone`, and until issue #246 pinned `TimeZone` identically
-/// on every connection Trellis opens (including the walsender) its `::text`
+/// on every connection Trellis opens its `::text`
 /// was not text-stable. It is a text-stable join key now
 /// (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), so this asserts the opposite —
 /// acceptance, mirroring `join_columns_of_one_type_modifier_and_collation_are_accepted`'s setup
-/// (a real primary key plus `REPLICA IDENTITY FULL` on both sides).
+/// (a real primary key on the to-side).
 #[tokio::test]
 async fn a_timestamptz_join_key_is_accepted() {
     let cluster = TestCluster::start();
@@ -493,13 +459,9 @@ async fn a_timestamptz_join_key_is_accepted() {
         "timestamp with time zone",
     )
     .await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute(
-            "create table products (id timestamptz primary key); \
-             alter table products replica identity full",
-        )
+        .batch_execute("create table products (id timestamptz primary key)")
         .await
         .expect("create products with a timestamptz pk");
     drop(client);
@@ -517,60 +479,29 @@ async fn a_timestamptz_join_key_is_accepted() {
     assert!(found.is_some());
 }
 
-/// Issue #41: a to-many relationship whose to-side has only the default (PK)
-/// replica identity is rejected at define time — the non-PK join key would be
-/// absent from delete/re-parent pre-images, so reverse recompute would
-/// silently under-recompute. (`products.id` is a plain non-unique column, so
-/// cardinality is `ToMany`, and the table's default replica identity omits it
-/// from pre-images.)
+/// Issue #41: a to-many relationship over a plain table (`products.id` is a
+/// non-unique column, so cardinality is `ToMany`) is accepted. Its capture
+/// trigger sees the non-PK join key in every delete/re-parent old image.
 #[tokio::test]
-async fn a_to_many_to_side_with_default_replica_identity_is_rejected() {
+async fn a_to_many_relationship_over_a_plain_to_side_is_accepted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
     create_table_with_plain_column(&db.pool, "products", "id").await;
-
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        &err,
-        CatalogError::Validate(ValidationError::RelationshipToManyRequiresReplicaIdentity { .. })
-    ));
-
-    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
-        .await
-        .expect("read query");
-    assert!(missing.is_none());
-}
-
-/// Issue #41: the same to-many relationship is accepted once the to-side has
-/// `REPLICA IDENTITY FULL`, which puts the non-PK join key into pre-images.
-#[tokio::test]
-async fn a_to_many_to_side_with_replica_identity_full_is_accepted() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    create_table_with_plain_column(&db.pool, "products", "id").await;
-    set_replica_identity_full(&db.pool, "products").await;
 
     let created = create_relationship(
         &db.pool,
         "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
     )
     .await
-    .expect("to-many with REPLICA IDENTITY FULL should be accepted");
+    .expect("a to-many relationship over a plain to-side should be accepted");
 
     assert_eq!(created.cardinality, RelationshipCardinality::ToMany);
 }
 
 /// Issue #590: creates `order_line_items(product_id <from_decl>)` and
-/// `products(id <to_decl> primary key)`, both `REPLICA IDENTITY FULL` so the
-/// to-one relationship between them can fail only on its join columns, runs
+/// `products(id <to_decl> primary key)`, so the to-one relationship between
+/// them can fail only on its join columns, runs
 /// `setup` first (for a domain or collation the declarations name), and
 /// declares the relationship.
 async fn declare_over_join_columns(
@@ -584,9 +515,7 @@ async fn declare_over_join_columns(
         .batch_execute(&format!(
             "{setup}
              create table order_line_items (row_id serial primary key, product_id {from_decl});
-             alter table order_line_items replica identity full;
-             create table products (id {to_decl} primary key);
-             alter table products replica identity full"
+             create table products (id {to_decl} primary key);"
         ))
         .await
         .expect("create the endpoint tables");
@@ -842,7 +771,6 @@ async fn a_primary_key_to_column_determines_to_one_cardinality() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     let created = create_relationship(
@@ -867,7 +795,6 @@ async fn a_plain_unique_to_column_determines_to_one_cardinality() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "accounts", "profile_code").await;
-    set_replica_identity_full(&db.pool, "accounts").await;
     create_table_with_unique_column(&db.pool, "profiles", "code").await;
 
     let created = create_relationship(
@@ -893,8 +820,6 @@ async fn a_non_unique_to_column_determines_to_many_cardinality() {
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
     create_table_with_plain_column(&db.pool, "products", "id").await;
-    // To-many requires a replica identity carrying the non-PK join key (#41).
-    set_replica_identity_full(&db.pool, "products").await;
 
     let created = create_relationship(
         &db.pool,
@@ -925,8 +850,6 @@ async fn a_to_column_in_a_composite_unique_index_is_still_to_many() {
         .await
         .expect("create products with composite pk");
     drop(client);
-    // To-many requires a replica identity carrying the non-PK join key (#41).
-    set_replica_identity_full(&db.pool, "products").await;
 
     let created = create_relationship(
         &db.pool,
@@ -949,7 +872,6 @@ async fn a_missing_from_side_index_surfaces_a_performance_warning() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
 
     let created = create_relationship(
@@ -994,7 +916,6 @@ async fn a_usable_from_side_index_suppresses_the_performance_warning() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     create_table_with_pk(&db.pool, "products", "id").await;
     let client = db.pool.get().await.expect("get connection");
     client
@@ -1042,8 +963,7 @@ async fn an_index_where_the_join_column_is_not_leading_still_warns() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table order_line_items (id serial primary key, other_col integer, product_id integer); \
-             alter table order_line_items replica identity full",
+            "create table order_line_items (id serial primary key, other_col integer, product_id integer)",
         )
         .await
         .expect("create from-table");
@@ -1081,8 +1001,7 @@ async fn a_composite_index_led_by_the_join_column_suppresses_the_warning() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table order_line_items (id serial primary key, product_id integer, other_col integer); \
-             alter table order_line_items replica identity full",
+            "create table order_line_items (id serial primary key, product_id integer, other_col integer)",
         )
         .await
         .expect("create from-table");
@@ -1114,8 +1033,7 @@ async fn a_partial_index_on_the_join_column_still_warns() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table order_line_items (id serial primary key, product_id integer, active boolean); \
-             alter table order_line_items replica identity full",
+            "create table order_line_items (id serial primary key, product_id integer, active boolean)",
         )
         .await
         .expect("create from-table");
@@ -1150,7 +1068,6 @@ async fn an_expression_index_on_the_join_column_still_warns() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute("create index on order_line_items ((product_id + 0))")
@@ -1183,7 +1100,6 @@ async fn a_hash_index_on_the_join_column_still_warns() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute("create index on order_line_items using hash (product_id)")
@@ -1220,9 +1136,7 @@ async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
     client
         .batch_execute(
             "create table a (id serial primary key, b_id integer);
-             create table b (id serial primary key, a_id integer);
-             alter table a replica identity full;
-             alter table b replica identity full",
+             create table b (id serial primary key, a_id integer);",
         )
         .await
         .expect("create a and b");
@@ -1289,10 +1203,7 @@ async fn a_relationship_from_a_transform_target_back_to_its_own_source_is_accept
 
     let client = db.pool.get().await.expect("get connection");
     client
-        .batch_execute(
-            "alter table order_totals add column order_ref integer; \
-             alter table order_totals replica identity full",
-        )
+        .batch_execute("alter table order_totals add column order_ref integer")
         .await
         .expect("add fk-shaped column to target table");
     drop(client);
@@ -1349,11 +1260,6 @@ async fn an_integer_passthrough_on_a_calculated_table_is_a_valid_join_key() {
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize calculated target table");
-
-    // `posts_calc.author` is the to-many join key (a non-unique column), so
-    // the to-side needs a replica identity carrying it (#41) — orthogonal to
-    // the #45 join-key-type fix under test.
-    set_replica_identity_full(&db.pool, "posts_calc").await;
 
     // The exact repro from the issue: relate `authors.id` to the calculated
     // table's passthrough column. This is what previously failed.
@@ -1440,8 +1346,8 @@ async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join
 
 /// Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
 /// `create_relationship`'s own pg_catalog introspection
-/// (`column_type_in_txn`/`to_col_cardinality_in_txn`/`has_usable_fk_index_in_txn`/
-/// `assert_replica_identity_supports_to_many`) resolved `def.from_table`/
+/// (`column_type_in_txn`/`to_col_cardinality_in_txn`/`has_usable_fk_index_in_txn`)
+/// resolved `def.from_table`/
 /// `def.to_table` bare via `pg_catalog.to_regclass`'s own `search_path` walk,
 /// with no fallback — unlike this same function's later
 /// `resolve_graph_identity_in_txn` calls, which already had issue #74's
@@ -1459,8 +1365,7 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
         .batch_execute(
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
-             create table order_line_items (id integer primary key, t2_id bigint); \
-             alter table order_line_items replica identity full",
+             create table order_line_items (id integer primary key, t2_id bigint)",
         )
         .await
         .expect("seed tables and the custom schema");
@@ -1480,9 +1385,8 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
     .expect("def A installs with an explicit non-default target schema");
     // `s` starts empty, so def A's discharge takes it `live` at once: a
     // target not yet `live` can't be made a relationship endpoint (issue
-    // #403). No replica identity is needed on it either, since an endpoint
-    // that is this instance's own target is never published.
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    // #403).
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     // The relationship's bare `TO t2.id` must still resolve to def A's
     // `custom.t2` — a plain `search_path` walk alone (what `to_regclass`
@@ -1535,7 +1439,6 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
              create table order_line_items (id integer primary key, t2_id bigint); \
-             alter table order_line_items replica identity full; \
              insert into order_line_items (id, t2_id) values (1, 1), (2, 2)",
         )
         .await
@@ -1556,9 +1459,8 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
     .expect("def A installs with an explicit non-default target schema");
     // `s` starts empty, so def A's discharge takes it `live` at once: a
     // target not yet `live` can't be made a relationship endpoint (issue
-    // #403). No replica identity is needed on it either, since an endpoint
-    // that is this instance's own target is never published.
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    // #403).
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     // The relationship's bare `TO t2.id` must resolve to def A's `custom.t2`
     // (already covered by the test above; needed here as this test's own
@@ -1633,11 +1535,7 @@ async fn same_named_relationships_on_same_named_tables_in_different_schemas_coex
                  create table blog.users (id integer primary key); \
                  create table shop.users (id integer primary key); \
                  create table blog.posts (id integer primary key, author_id integer); \
-                 create table shop.posts (id integer primary key, author_id integer); \
-                 alter table blog.users replica identity full; \
-                 alter table shop.users replica identity full; \
-                 alter table blog.posts replica identity full; \
-                 alter table shop.posts replica identity full;",
+                 create table shop.posts (id integer primary key, author_id integer)",
             )
             .await
             .expect("seed blog and shop");
@@ -1756,10 +1654,7 @@ async fn a_relationship_to_side_is_read_from_the_schema_it_was_declared_in() {
                 "create schema shop; create schema other; \
                  create table shop.users (id integer primary key, name text); \
                  create table shop.orders (id integer primary key, user_id integer); \
-                 create table other.users (id integer primary key); \
-                 alter table shop.users replica identity full; \
-                 alter table shop.orders replica identity full; \
-                 alter table other.users replica identity full;",
+                 create table other.users (id integer primary key)",
             )
             .await
             .expect("seed shop and other");
@@ -1851,9 +1746,7 @@ async fn a_relationship_between_mixed_case_tables_is_accepted() {
         .batch_execute(
             "create table \"OrderItems\" (id integer primary key, product_id integer); \
              create index on \"OrderItems\" (product_id); \
-             alter table \"OrderItems\" replica identity full; \
-             create table \"Products\" (id integer primary key, category_id integer); \
-             alter table \"Products\" replica identity full",
+             create table \"Products\" (id integer primary key, category_id integer)",
         )
         .await
         .expect("seed mixed-case tables");
@@ -1872,8 +1765,8 @@ async fn a_relationship_between_mixed_case_tables_is_accepted() {
     // `has_usable_fk_index_in_txn` found `"OrderItems"`' index.
     assert_eq!(created.warnings, Vec::new());
 
-    // To-many against a mixed-case to-side: cardinality and the replica
-    // identity check read `"Products"`, not a folded `products`.
+    // To-many against a mixed-case to-side: cardinality reads `"Products"`,
+    // not a folded `products`.
     let many = create_relationship(
         &db.pool,
         "RELATIONSHIP category FROM OrderItems.product_id TO Products.category_id",
@@ -1904,10 +1797,8 @@ async fn a_relationship_resolves_endpoints_in_a_mixed_case_schema() {
             "create schema \"Custom\"; \
              create table s (id bigint primary key, a numeric); \
              create table items (id bigint primary key, totals_id bigint); \
-             alter table items replica identity full; \
              insert into items (id, totals_id) values (1, 1), (2, 2); \
-             create table \"Products\" (id bigint primary key); \
-             alter table \"Products\" replica identity full",
+             create table \"Products\" (id bigint primary key)",
         )
         .await
         .expect("seed tables and the mixed-case schema");
@@ -1922,7 +1813,7 @@ async fn a_relationship_resolves_endpoints_in_a_mixed_case_schema() {
     )
     .await
     .expect("def A installs into the mixed-case schema");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     // To-side in the mixed-case schema.
     let created = create_relationship(
@@ -2034,9 +1925,7 @@ async fn a_from_side_with_an_unsupported_primary_key_type_is_rejected() {
     client
         .batch_execute(
             "create table orders (id numeric primary key, cust integer); \
-             alter table orders replica identity full; \
-             create table customers (id integer primary key, name text); \
-             alter table customers replica identity full",
+             create table customers (id integer primary key, name text)",
         )
         .await
         .expect("create tables");
@@ -2065,10 +1954,8 @@ async fn a_to_side_with_an_unsupported_primary_key_type_is_rejected() {
     client
         .batch_execute(
             "create table orders (id integer primary key, cust integer); \
-             alter table orders replica identity full; \
              create table customers (id numeric primary key, code integer unique not null, \
-                                     name text); \
-             alter table customers replica identity full",
+                                     name text)",
         )
         .await
         .expect("create tables");
@@ -2094,10 +1981,8 @@ async fn a_composite_key_with_one_unsupported_column_is_rejected() {
     client
         .batch_execute(
             "create table orders (id integer primary key, cust integer); \
-             alter table orders replica identity full; \
              create table customers (region integer, seq interval, code integer unique not null, \
-                                     primary key (region, seq)); \
-             alter table customers replica identity full",
+                                     primary key (region, seq))",
         )
         .await
         .expect("create tables");
@@ -2126,9 +2011,7 @@ async fn endpoints_with_supported_non_integer_primary_keys_are_accepted() {
         .batch_execute(
             "create type tier as enum ('gold', 'silver'); \
              create table orders (tenant uuid, ref text, cust integer, primary key (tenant, ref)); \
-             alter table orders replica identity full; \
-             create table customers (id tier primary key, code integer unique not null); \
-             alter table customers replica identity full",
+             create table customers (id tier primary key, code integer unique not null)",
         )
         .await
         .expect("create tables");
@@ -2182,9 +2065,9 @@ async fn a_to_side_join_key_outside_the_allowlist_is_rejected() {
 /// Issue #429 review: every check runs before any catalog write, and the
 /// transaction rolls back on a rejection, so a refused relationship leaves no
 /// `schema_nodes`, `schema_edges`, `relationship_definitions` or
-/// `relationship_projections` rows behind. Rejected here by the to-one
-/// replica-identity check, which used to run after the node writes. The same
-/// pair then succeeds once fixed, so the empty counts aren't vacuous.
+/// `relationship_projections` rows behind. Rejected here for naming a
+/// to-side column that doesn't exist. The same pair then succeeds over the
+/// right column, so the empty counts aren't vacuous.
 #[tokio::test]
 async fn a_rejected_relationship_leaves_no_catalog_rows() {
     let cluster = TestCluster::start();
@@ -2208,19 +2091,27 @@ async fn a_rejected_relationship_leaves_no_catalog_rows() {
         }
         out
     };
-    let text = "RELATIONSHIP customer FROM orders.cust TO customers.id";
-
-    let err = create_relationship(&db.pool, text).await.unwrap_err();
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.cust TO customers.missing",
+    )
+    .await
+    .unwrap_err();
     assert!(
-        matches!(err, CatalogError::ReplicaIdentityRequired(_)),
+        matches!(
+            err,
+            CatalogError::Validate(ValidationError::UnknownRelationshipColumn { .. })
+        ),
         "{err:?}"
     );
     assert_eq!(counts().await, vec![0, 0, 0, 0], "a rejection left rows");
 
-    set_replica_identity_full(&db.pool, "orders").await;
-    create_relationship(&db.pool, text)
-        .await
-        .expect("accepted once orders is REPLICA IDENTITY FULL");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.cust TO customers.id",
+    )
+    .await
+    .expect("accepted over an existing to-side column");
     let after = counts().await;
     assert!(
         after[0] == 2 && after[1] == 1 && after[2] == 1,
@@ -2230,9 +2121,9 @@ async fn a_rejected_relationship_leaves_no_catalog_rows() {
 
 /// Issues #375/#429, restated for trigger capture (issue #622 C5): capture
 /// keys every ring row by the primary key, so an endpoint without one is
-/// rejected as unkeyed on its side, whatever its replica identity (here a
-/// `USING INDEX` identity, and one whose index was since dropped), and
-/// whatever the relationship's cardinality.
+/// rejected as unkeyed on its side, even with a unique index on its key
+/// columns (or one that was since dropped), and whatever the relationship's
+/// cardinality.
 #[tokio::test]
 async fn an_endpoint_without_a_primary_key_is_rejected_as_unkeyed() {
     let cluster = TestCluster::start();
@@ -2242,11 +2133,9 @@ async fn an_endpoint_without_a_primary_key_is_rejected_as_unkeyed() {
         .batch_execute(
             "create table orders (id integer not null, cust integer); \
              create unique index orders_id on orders (id); \
-             alter table orders replica identity using index orders_id; \
              drop index orders_id; \
              create table customers (id integer not null, code integer not null); \
              create unique index customers_id on customers (id); \
-             alter table customers replica identity using index customers_id; \
              create table regions (id integer primary key); \
              create table visits (id integer primary key, customer integer)",
         )

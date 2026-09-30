@@ -22,7 +22,7 @@ use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, Progress};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
     ApplyError, ApplyOutcome, StagedChange, StagedWatermark, append, apply, has_pending,
@@ -95,7 +95,7 @@ impl Driver {
                 Progress::Waiting(wait) => panic!("an unbounded install waited: {wait}"),
             }
         }
-        publication::settle_registrations(&db.pool).await;
+        markers::settle_registrations(&db.pool).await;
         let mut driver = Driver {
             cluster,
             db,

@@ -227,9 +227,7 @@ async fn jsonb_is_refused_as_a_relationship_join_key_and_primary_key() {
     client
         .batch_execute(
             "create table parent (k jsonb primary key); \
-             create table child (id bigint primary key, k jsonb); \
-             alter table child replica identity full; \
-             alter table parent replica identity full",
+             create table child (id bigint primary key, k jsonb)",
         )
         .await
         .expect("create relationship tables");
@@ -550,10 +548,7 @@ async fn a_cdc_apply_produces_a_jsonb_agg_matching_the_live_elements() {
     let mut client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute(
-            "create table events (id integer primary key, grp integer, payload jsonb); \
-             alter table events replica identity full",
-        )
+        .batch_execute("create table events (id integer primary key, grp integer, payload jsonb)")
         .await
         .expect("create source table");
 

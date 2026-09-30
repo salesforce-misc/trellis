@@ -1,7 +1,7 @@
 //! Issues #402/#403 (#375's direction 1): the target-mutation seam is the
 //! only change feed for a target that is a relationship endpoint, standing in
 //! for the CDC such a target no longer gets (endpoint targets are never
-//! published). No test here runs intake at all: the seam alone has to drive
+//! captured). No test here runs capture at all: the seam alone has to drive
 //! the relationship machinery.
 //!
 //! Drains run by hand (seal, drain, retire), so nothing waits on convergence
@@ -141,7 +141,7 @@ async fn projection_table(pool: &trellis::Pool, relationship: &RelationshipDefin
         .qualified_table()
 }
 
-/// A hand-staged source change, standing in for intake.
+/// A hand-staged source change, standing in for capture.
 async fn stage_source_update(raw: &mut Client, src_table: &str, key: &str, old: &str, new: &str) {
     let txn = raw.transaction().await.expect("begin");
     append(
@@ -178,9 +178,7 @@ async fn a_seam_row_on_a_target_to_side_advances_its_to_one_projection() {
          create table public.report_view (id integer primary key, doubled integer); \
          insert into public.src values (1, 5), (2, 7); \
          create table public.reports (id integer primary key, oid integer); \
-         insert into public.reports values (10, 1), (11, 2); \
-         alter table public.src replica identity full; \
-         alter table public.reports replica identity full",
+         insert into public.reports values (10, 1), (11, 2)",
     )
     .await
     .expect("create sources");
@@ -285,9 +283,7 @@ async fn a_seam_row_on_a_target_to_side_drives_an_aggregates_reverse_delta() {
          insert into public.posts_src values (1, 100), (2, 250); \
          create table public.post_tags (id integer primary key, post integer, tag text); \
          create index on public.post_tags (post); \
-         insert into public.post_tags values (10, 1, 'rust'), (11, 2, 'rust'), (12, 1, 'db'); \
-         alter table public.posts_src replica identity full; \
-         alter table public.post_tags replica identity full",
+         insert into public.post_tags values (10, 1, 'rust'), (11, 2, 'rust'), (12, 1, 'db')",
     )
     .await
     .expect("create sources");
@@ -316,7 +312,7 @@ async fn a_seam_row_on_a_target_to_side_drives_an_aggregates_reverse_delta() {
     )
     .await
     .expect("install tag_totals");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select tag, total_words::text from public.tag_totals").await,
@@ -374,9 +370,7 @@ async fn a_from_side_targets_seam_group_key_bumps_an_erased_parents_gen() {
          create table public.child_view (id integer primary key, pname text); \
          insert into public.children_src values (100, 1); \
          create table public.parents (id integer primary key, name text); \
-         insert into public.parents values (1, 'A'), (2, 'B'), (3, 'C'); \
-         alter table public.children_src replica identity full; \
-         alter table public.parents replica identity full",
+         insert into public.parents values (1, 'A'), (2, 'B'), (3, 'C')",
     )
     .await
     .expect("create sources");
@@ -541,7 +535,7 @@ async fn seam_write(raw: &mut Client, key: &str, lock_prior: bool, writes: &[&st
     txn.commit().await.expect("commit the writer");
 }
 
-/// A hand-staged source insert, standing in for intake.
+/// A hand-staged source insert, standing in for capture.
 async fn stage_source_insert(raw: &mut Client, src_table: &str, key: &str, new: &str) {
     let txn = raw.transaction().await.expect("begin");
     append(
@@ -578,9 +572,7 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
          insert into public.sales values (1, 1, 10), (2, null, 5); \
          create table public.stores (id integer primary key, region integer); \
          create table public.store_view (id integer primary key, total integer); \
-         insert into public.stores values (100, 1), (101, null), (102, 2); \
-         alter table public.sales replica identity full; \
-         alter table public.stores replica identity full",
+         insert into public.stores values (100, 1), (101, null), (102, 2)",
     )
     .await
     .expect("create sources");
@@ -593,7 +585,7 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
     )
     .await
     .expect("install region_totals");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     let relationship = create_relationship(
         &db.pool,
@@ -719,9 +711,7 @@ async fn a_truncate_clear_of_an_endpoint_target_stages_per_key_deletes() {
          create table public.report_view (id integer primary key, doubled integer); \
          insert into public.src values (1, 5), (2, 7); \
          create table public.reports (id integer primary key, oid integer); \
-         insert into public.reports values (10, 1), (11, 2); \
-         alter table public.src replica identity full; \
-         alter table public.reports replica identity full",
+         insert into public.reports values (10, 1), (11, 2)",
     )
     .await
     .expect("create sources");
@@ -793,7 +783,7 @@ async fn a_truncate_clear_of_an_endpoint_target_stages_per_key_deletes() {
 
 /// A 1-1 target that is the from-side of two relationships: each seam row's
 /// `group_key` unions both relationships' `from_col` values, across both
-/// images, as intake's `touched_group_key` does for a decoded change.
+/// images, as capture does for a source change.
 #[tokio::test]
 async fn a_from_side_target_of_two_relationships_unions_both_join_keys() {
     let (_cluster, db, mut raw) = setup().await;
@@ -804,10 +794,7 @@ async fn a_from_side_target_of_two_relationships_unions_both_join_keys() {
                                     owner_id integer); \
          insert into public.items_src values (1, 10, 20); \
          create table public.parents (id integer primary key); \
-         create table public.owners (id integer primary key); \
-         alter table public.items_src replica identity full; \
-         alter table public.parents replica identity full; \
-         alter table public.owners replica identity full",
+         create table public.owners (id integer primary key)",
     )
     .await
     .expect("create sources");
@@ -910,9 +897,7 @@ async fn an_avg_target_endpoints_prior_images_carry_its_old_means() {
         "create table public.sales (id integer primary key, region integer, amount integer); \
          insert into public.sales values (1, 1, 10), (2, 1, 20), (3, 2, 5); \
          create table public.stores (id integer primary key, region integer, kind text); \
-         insert into public.stores values (100, 1, 'a'), (101, 2, 'a'), (102, 1, 'b'); \
-         alter table public.sales replica identity full; \
-         alter table public.stores replica identity full",
+         insert into public.stores values (100, 1, 'a'), (101, 2, 'a'), (102, 1, 'b')",
     )
     .await
     .expect("create sources");
@@ -925,7 +910,7 @@ async fn an_avg_target_endpoints_prior_images_carry_its_old_means() {
     )
     .await
     .expect("install region_avgs");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     create_relationship(
         &db.pool,
@@ -944,7 +929,7 @@ async fn an_avg_target_endpoints_prior_images_carry_its_old_means() {
     )
     .await
     .expect("install kind_means");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     let totals = "select kind, trim_scale(total)::text from public.kind_means";
     assert_eq!(

@@ -5,7 +5,7 @@
 //! token.
 //!
 //! Driven by hand through the engine's own seal, fold and apply path, with no
-//! live intake: `orders -> hop_a -> hop_b -> hop_c`, all 1-1.
+//! live capture: `orders -> hop_a -> hop_b -> hop_c`, all 1-1.
 
 use std::collections::HashMap;
 
@@ -55,10 +55,10 @@ async fn drain(pool: &trellis::Pool, seg_seq: i64) {
     {}
 }
 
-/// Stages one CDC insert for `orders` key `key`, as intake would, with
+/// Stages one CDC insert for `orders` key `key`, as capture would, with
 /// `origin_lsn` as given (`None` standing in for a row of unknown origin).
 ///
-/// Stages at a made-up LSN on purpose (issue #512): intake stamps a change's
+/// Stages at a made-up LSN on purpose (issue #512): capture stamps a change's
 /// `origin_lsn` with its own commit LSN, and these tests assert on exact
 /// origins, so the ring `lsn` follows the chosen origin. Only 1-1 targets
 /// read these rows, and nothing here compares them with a recompute horizon.

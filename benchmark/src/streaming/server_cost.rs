@@ -6,7 +6,7 @@
 //!
 //! - **Server CPU** ([`cluster_cpu_ticks`]): user + system CPU of the whole
 //!   cluster's process tree, read from `/proc`: the postmaster, every live
-//!   child (backends, walsenders, autovacuum, checkpointer, ...), and, through
+//!   child (backends, autovacuum, checkpointer, ...), and, through
 //!   the postmaster's `cutime`/`cstime`, every child it reaped in the window.
 //!   That includes the load generator's own backends. They cost the same
 //!   per row before and after a change to the drain, so a before/after delta

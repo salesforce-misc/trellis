@@ -11,7 +11,7 @@
 //! grows its own catalog/state tables there. The target table never lands
 //! back onto the source table either way (`docs/data-flow.md`'s
 //! "calculated columns live on a neighbor table" rule: writing them onto the
-//! replicated source row would feed our own WAL into ingestion). No extra
+//! captured source row would feed our own writes back into capture). No extra
 //! prefix/suffix is added to `def.target` because `transform_definitions.target_table`
 //! is already `unique` (see `V2__transform_catalog.sql`), so collisions
 //! across definitions are already ruled out at the catalog layer; deriving
@@ -26,7 +26,7 @@
 //! key (name and type, introspected live from `pg_catalog` — the one piece
 //! of schema introspection this issue needs, distinct from the general
 //! "introspect the whole source schema" question the catalog module (#23)
-//! left to intake), at whatever arity the source declares it: a composite
+//! left open), at whatever arity the source declares it: a composite
 //! (multi-column) source primary key mirrors onto the target as a real,
 //! composite `primary key (...)` table constraint (issue #121) — every
 //! consumer of a 1-1 target's own key (this DDL, `defs::backfill`'s
@@ -48,9 +48,8 @@
 //! later (issue #107). `bytea` and `timestamptz` used to be other examples
 //! here; issue #114 found `bytea`'s `::text` rendering is in fact a
 //! bijection once `bytea_output` is pinned, and issue #246 pinned
-//! `timestamptz`'s `TimeZone` on the walsender the same way `DateStyle` was
-//! already pinned on the pool, so both are on the allowlist now rather than
-//! off it.
+//! `timestamptz`'s `TimeZone` everywhere `DateStyle` was already pinned, so
+//! both are on the allowlist now rather than off it.
 //!
 //! Every calculated field is typed per its inferred
 //! [`super::ast::ValueType`] (issue #63 widened this from a blanket
@@ -170,14 +169,13 @@ pub enum DdlError {
     /// The source table has no primary key at all.
     NoPrimaryKey { source_table: String },
     /// A composite primary-key identity string (U+001F-joined, matching
-    /// [`crate::intake::extract_key`]'s own composite-key encoding) split
-    /// into a different number of parts than the source table's current
-    /// primary key has columns — either stale staged data from before a
-    /// primary-key shape change, or a real bug in whatever produced the
-    /// string. Not a definition-time validation failure like this enum's
-    /// other variants, but the same typed-error posture: surfaced rather
-    /// than panicking on staged data this module doesn't fully control the
-    /// provenance of.
+    /// `join_pk_key`'s composite-key encoding) split into a different number
+    /// of parts than the source table's current primary key has columns —
+    /// either stale staged data from before a primary-key shape change, or a
+    /// real bug in whatever produced the string. Not a definition-time
+    /// validation failure like this enum's other variants, but the same
+    /// typed-error posture: surfaced rather than panicking on staged data this
+    /// module doesn't fully control the provenance of.
     MalformedCompositeKey {
         source_table: String,
         key: String,
@@ -384,7 +382,7 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 /// either — [`DdlError::NoPrimaryKey`]); a composite (multi-column) primary
 /// key is returned in full, in the key's own declared column order
 /// (`array_position(i.indkey, a.attnum)`, the same ordinal-position
-/// convention [`crate::intake::primary_key_columns`] already uses for the
+/// convention the capture trigger's key expression follows for the
 /// identical reason) — issue #126 lifted this function's own blanket
 /// rejection of an arity greater than one, and issue #121 removed the last
 /// caller (the 1-1 target-DDL slice) that still narrowed it back down to one
@@ -465,7 +463,7 @@ pub(crate) async fn source_primary_key_in_txn(
 /// with its nullability. Empty when `table` has no such index; no key-type
 /// gate. `table` is an unquoted `schema.table` identity ([`regclass_arg`]).
 ///
-/// Split out for `intake::publication::enumerate_and_append` (issue #308),
+/// Split out for `intake::markers::enumerate_and_append` (issue #308),
 /// which must enumerate every table a catch-up marker can name — aggregate
 /// targets included — under exactly the key [`pk_key_sql_expr`] renders for
 /// that table everywhere else. It has never type-gated the tables it
@@ -527,27 +525,25 @@ pub(crate) async fn identity_key_columns(
 }
 
 /// The separator a composite primary-key identity string joins its column
-/// values on, matching [`crate::intake::extract_key`]'s own composite-key
-/// encoding exactly (see that function's doc comment, and
-/// `staging::append::TRUNCATE_SENTINEL_KEY`'s, for the same U+001F choice —
-/// but, unlike those whole-key sentinels, a *component's own value* is not
-/// simply assumed never to contain it: Postgres `text`/`varchar` happily
-/// stores U+001F, so [`join_pk_key`]/[`pk_key_sql_expr`] escape a genuine
-/// occurrence in a *multi-column* key (issue #200) rather than assuming it
-/// away — a single-column key needs no escape and deliberately gets none,
+/// values on, the one the capture trigger's key expression (`capture::sql`)
+/// uses too (see `staging::append::TRUNCATE_SENTINEL_KEY`'s doc comment for the
+/// same U+001F choice — but, unlike that whole-key sentinel, a *component's own
+/// value* is not simply assumed never to contain it: Postgres `text`/`varchar`
+/// happily stores U+001F, so [`join_pk_key`]/[`pk_key_sql_expr`] escape a
+/// genuine occurrence in a *multi-column* key (issue #200) rather than assuming
+/// it away — a single-column key needs no escape and deliberately gets none,
 /// see [`push_escaped_composite_key_part`]'s "why arity 1 is exempt". See
 /// [`KEY_PART_ESCAPE`] for the escape itself, and [`split_pk_key`]'s doc
 /// comment for what happened pre-#200, when a real separator collided
 /// unescaped: a loud [`DdlError::MalformedCompositeKey`] arity mismatch, not
 /// silent corruption — still worth closing, just lower urgency than issue
-/// #110's silent-NULL-collision counterpart ([`NULL_KEY_SENTINEL`]).
-/// Reusing the identical separator here (not a
-/// second one) is what lets a from-side row's composite key, however it
-/// entered the ring — real CDC intake, or a synthetic
-/// [`crate::staging::append::StagedChange::Recompute`] this crate's own
-/// reverse-relationship path stages — decode identically wherever it's later
-/// read back (`staging::apply::read_live_rows_batch`'s live re-fetch, most
-/// notably): both producers, and every consumer, agree on one shape.
+/// #110's silent-NULL-collision counterpart ([`NULL_KEY_SENTINEL`]). Reusing
+/// the identical separator here (not a second one) is what lets a from-side
+/// row's composite key, however it entered the ring — a capture trigger, or a
+/// synthetic [`crate::staging::append::StagedChange::Recompute`] this crate's
+/// own reverse-relationship path stages — decode identically wherever it's
+/// later read back (`staging::apply::read_live_rows_batch`'s live re-fetch,
+/// most notably): both producers, and every consumer, agree on one shape.
 ///
 /// # How this composes with [`NULL_KEY_SENTINEL`]
 ///
@@ -830,9 +826,7 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// that changes a real value's text therefore makes those paths disagree,
 /// duplicating or orphaning the target row for exactly the values it
 /// rewrites — empirically reproduced for a `text` primary key holding a
-/// literal U+0001 (see `intake::tests`'
-/// `extract_key_keeps_a_control_character_in_a_key_value_verbatim` and
-/// `trellis/tests/one_to_one_control_char_pk.rs`). Since a not-null key can
+/// literal U+0001 (see `trellis/tests/one_to_one_control_char_pk.rs`). Since a not-null key can
 /// never *need* the `NULL` substitution, the only safe encoding for it is
 /// the identity one.
 pub(crate) fn encode_key_part(value: Option<&str>) -> Cow<'_, str> {
@@ -903,10 +897,9 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 ///
 /// Every producer and consumer must agree on this one order:
 /// [`pk_key_sql_expr`] and [`join_pk_key`] (producers),
-/// [`split_pk_key`] (consumer), and
-/// [`crate::intake::extract_key`] (a producer that reaches the key through
-/// `pgoutput`'s physical column order and so has to normalize back onto this
-/// one — see its own doc comment).
+/// [`split_pk_key`] (consumer), and the capture trigger's key expression
+/// (`capture::sql`, a producer that reads the key columns from the
+/// transition tables and so has to follow this order explicitly).
 pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> String {
     // The *outer* escape layer (issue #200) runs only where a real delimiter
     // is actually emitted. Decided once, from the key's arity, and applied
@@ -999,14 +992,15 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 ///
 /// Every producer of an encoded key this crate has goes through either this
 /// or [`pk_key_sql_expr`] (whichever side of the wire it's on):
-/// [`crate::intake::extract_key`] for a row arriving over real CDC,
+/// the capture trigger's key expression (`capture::sql`, built on
+/// [`composite_key_escape_sql`]) for a captured row,
 /// `staging::apply_aggregate::derive_group_key` for an aggregate group's
 /// downstream-propagated identity (issue #171), and the SQL form for
 /// everything computed in the database — including
-/// `intake::publication::enumerate_and_append`'s backfill enumeration, which
-/// selects its keys through [`pk_key_sql_expr`] (issue #308). Keeping them one function each —
-/// rather than a hand-rolled `join` per site — is what makes the
-/// "producers and consumers agree on one shape" claim in
+/// `intake::markers::enumerate_and_append`'s backfill enumeration, which
+/// selects its keys through [`pk_key_sql_expr`] (issue #308). Keeping them one
+/// function each — rather than a hand-rolled `join` per site — is what makes
+/// the "producers and consumers agree on one shape" claim in
 /// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment checkable by grep.
 pub(crate) fn join_pk_key<S: AsRef<str>>(parts: impl IntoIterator<Item = S>) -> String {
     let parts: Vec<S> = parts.into_iter().collect();
@@ -1081,9 +1075,8 @@ fn split_composite_key(key: &str) -> Vec<Cow<'_, str>> {
 }
 
 /// Splits a composite primary-key identity string (built by
-/// [`pk_key_sql_expr`]/[`join_pk_key`], or by [`crate::intake::extract_key`]
-/// for a row that
-/// arrived via real CDC) back into its per-column parts, in the same
+/// [`pk_key_sql_expr`]/[`join_pk_key`], or by a capture trigger for a
+/// captured row) back into its per-column parts, in the same
 /// declared order — the read-side counterpart used once a set of already-
 /// identified rows' keys need to be matched back against `pk`'s live
 /// columns (`staging::apply::read_live_rows_batch`). Returns
@@ -1200,7 +1193,7 @@ async fn source_column_pg_types(
 /// [`qualified_target_table`] actually creates it under. Note this is *not*
 /// the same string `transform_definitions.target_table` persists as of issue
 /// #73: the catalog's own identity column holds the fully-qualified
-/// `schema.table` form (built via `intake::publication::qualify`, at
+/// `schema.table` form (built via `intake::markers::qualify`, at
 /// definition-acceptance time — see `catalog::create_definition_inner`), not
 /// this bare name. Callers that need a live connection (whose `search_path`
 /// already resolves this bare name to the right physical table —
@@ -1218,7 +1211,7 @@ pub fn neighbor_table_name(def: &TransformDef) -> &str {
 /// interpolation into DDL text, not as a persisted-identity string: this
 /// quotes each component separately, whereas `transform_definitions.target_table`
 /// (issue #73) is the plain, unquoted `"schema.table"` form
-/// `intake::publication::qualify` builds — the two are never byte-for-byte
+/// `intake::markers::qualify` builds — the two are never byte-for-byte
 /// equal, so don't compare or persist this function's output as if it were
 /// that identity.
 pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String {
@@ -1375,7 +1368,7 @@ pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
 /// `Config::target_schema`/`"public"`) — exactly the bug class ADR-0007
 /// exists to close.
 ///
-/// Splits on the first `.`, matching `intake::publication::qualify`'s sole
+/// Splits on the first `.`, matching `intake::markers::qualify`'s sole
 /// construction site for this shape (which rejects a `.` inside either
 /// component, so the first `.` here is always the real separator). Falls
 /// back to quoting `qualified` whole when it carries no `.` at all — not a
@@ -1413,7 +1406,7 @@ pub(crate) fn qualified_target_table_ident(qualified: &str) -> String {
 /// a table's unquoted `schema.table` identity (issue #561).
 ///
 /// That unquoted identity is the one name every catalog lookup in this crate
-/// takes: it is what [`crate::intake::publication::qualify`] builds, what
+/// takes: it is what [`crate::intake::markers::qualify`] builds, what
 /// `StagedChange::src_table` and `transform_definitions.source_table`/
 /// `target_table` hold, and what `qualified_from_table()`/
 /// `qualified_to_table()` return. A quoted form exists only for splicing

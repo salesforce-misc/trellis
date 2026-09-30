@@ -4,7 +4,7 @@
 -- durable as the `ALTER PUBLICATION` that requires it. See
 -- docs/staging-and-claiming/01-intake-and-lsn-confirmation.md ("Adding a
 -- table to the publication needs a durable follow-up") and
--- `trellis::intake::publication`.
+-- `trellis::intake::markers`.
 --
 -- `fence_snapshot` is a transaction fence, captured in the same transaction
 -- as the `ALTER`: backfill enumeration must wait until every transaction in

@@ -5,11 +5,11 @@
 //! against the restored database. The restore must be consistent with
 //! itself: its source is exactly what the original's was at *k*, its targets
 //! converge at *k* and after every replayed op, and no transform ever
-//! pauses, since a cold copy brings the replication slot back with
-//! everything else. See `generative::run::run_convergence_with_restore`.
+//! pauses, since a cold copy brings the capture triggers and the staging
+//! ring back with everything else. See
+//! `generative::run::run_convergence_with_restore`.
 //!
-//! The `pg_basebackup` variant (no slot after the restore, so issue #310's
-//! pause, a resume and a fresh backfill) is held for #558.
+//! The `pg_basebackup` variant is held for #558.
 //!
 //! Every hand-built pin owns its cluster. The property shares one per thread
 //! like the other properties; the backup stops it, which is harmless to
@@ -185,10 +185,10 @@ fn pin(backup_op: usize) {
 }
 
 /// Backed up right after the first update, usually with it still in flight
-/// (in the WAL ahead of the slot, or staged but not yet applied), then the
-/// delete and the last update replay against the restore. The restored
-/// engine finishes the update from wherever the backup caught it, streams
-/// the replayed ops from the restored slot, and pauses nothing.
+/// (staged but not yet applied), then the delete and the last update replay
+/// against the restore. The restored engine finishes the update from
+/// wherever the backup caught it, captures the replayed ops through the
+/// restored triggers, and pauses nothing.
 #[test]
 fn a_restore_from_mid_program_replays_the_rest_and_converges() {
     pin(3);

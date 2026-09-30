@@ -21,7 +21,6 @@ use trigger_pipeline::Pipeline;
 
 const SOURCE_DDL: &str = "create schema \"Shop\"; \
      create table \"Shop\".\"OrderItems\" (id bigint primary key, order_id bigint, qty integer); \
-     alter table \"Shop\".\"OrderItems\" replica identity full; \
      insert into \"Shop\".\"OrderItems\" (id, order_id, qty) values (1, 10, 2), (2, 10, 3), (3, 20, 5)";
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
@@ -46,7 +45,7 @@ async fn install_over(db: &testkit::TestDatabase, text: &str, source_columns: &[
     install_definition(&db.pool, text, &numeric_columns(source_columns), "public")
         .await
         .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 }
 
 /// A 1-1 transform from `"Shop"."OrderItems"` into a mixed-case target in
@@ -137,10 +136,8 @@ async fn a_relationship_between_mixed_case_tables_backfills_and_applies_cdc() {
     let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.\"Products\" (id bigint primary key, price numeric); \
-         alter table public.\"Products\" replica identity full; \
          create table public.\"OrderItems\" (id bigint primary key, product_id bigint); \
          create index on public.\"OrderItems\" (product_id); \
-         alter table public.\"OrderItems\" replica identity full; \
          insert into public.\"Products\" (id, price) values (1, 10), (2, 20); \
          insert into public.\"OrderItems\" (id, product_id) values (1, 1), (2, 2)",
     )
@@ -201,10 +198,8 @@ async fn a_relationship_to_a_mixed_case_target_applies_cdc_through_the_seam() {
     raw.batch_execute(
         "create schema \"Shop\"; \
          create table public.products (id bigint primary key, price numeric); \
-         alter table public.products replica identity full; \
          create table public.\"OrderItems\" (id bigint primary key, product_id bigint); \
-         create index on public.\"OrderItems\" (product_id); \
-         alter table public.\"OrderItems\" replica identity full",
+         create index on public.\"OrderItems\" (product_id)",
     )
     .await
     .expect("seed the tables");

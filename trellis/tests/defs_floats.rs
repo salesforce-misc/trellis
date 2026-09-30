@@ -68,8 +68,7 @@ const SOURCE_DDL: &str = "create table s ( \
      f8 double precision, \
      n numeric, \
      i integer \
-   ); \
-   alter table s replica identity full";
+   )";
 
 fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -98,7 +97,7 @@ async fn connect_raw(dsn: &str) -> Client {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "float_test_backfill_worker";
@@ -1002,11 +1001,7 @@ async fn a_float_relationship_join_key_is_rejected_by_name() {
             "create table parent4 (k real primary key); \
              create table parent8 (k double precision primary key); \
              create table parent_ok (k bigint primary key); \
-             create table child (id bigint primary key, f4 real, f8 double precision, ok bigint); \
-             alter table child replica identity full; \
-             alter table parent4 replica identity full; \
-             alter table parent8 replica identity full; \
-             alter table parent_ok replica identity full",
+             create table child (id bigint primary key, f4 real, f8 double precision, ok bigint)",
         )
         .await
         .expect("create relationship tables");

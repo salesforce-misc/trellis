@@ -4,10 +4,7 @@
 //! [`TestCluster`] owns one `postgres` server process listening on a unix
 //! socket in a throwaway temp directory (and on loopback TCP only when
 //! started with [`TestCluster::start_with_tcp`]); both are cleaned up when
-//! it's dropped. It's started with `wal_level=logical` (and matching
-//! `max_replication_slots`/`max_wal_senders`) so intake's replication-slot
-//! machinery can be exercised against it.
-//! [`TestCluster::create_isolated_database`] then hands out a fresh,
+//! it's dropped. [`TestCluster::create_isolated_database`] then hands out a fresh,
 //! migrated database per logical test scenario, so several scenarios can
 //! share one running instance — avoiding a repeated `initdb` per test —
 //! without bleeding state into each other.
@@ -213,8 +210,7 @@ impl Drop for ClusterPermit {
 }
 
 /// One ephemeral Postgres server, reachable over a unix socket (and, when
-/// started with [`TestCluster::start_with_tcp`], over loopback TCP too),
-/// configured for logical replication.
+/// started with [`TestCluster::start_with_tcp`], over loopback TCP too).
 pub struct TestCluster {
     root: PathBuf,
     data_dir: PathBuf,
@@ -233,9 +229,9 @@ pub struct TestCluster {
 }
 
 impl TestCluster {
-    /// Initializes and starts a fresh, empty Postgres instance with
-    /// `wal_level=logical` (and matching replication slot/sender limits),
-    /// waiting until it accepts connections. Panics on any setup failure —
+    /// Initializes and starts a fresh, empty Postgres instance, waiting until
+    /// it accepts connections. It runs at the default `wal_level`
+    /// (`replica`), as a user's server would: Trellis needs nothing more. Panics on any setup failure —
     /// this is test-only scaffolding, not a place to build resilient error
     /// handling.
     pub fn start() -> Self {
@@ -388,7 +384,7 @@ impl TestCluster {
     /// Stops the server and starts it again on the same data directory,
     /// socket and port, waiting until it accepts connections. Every open
     /// connection is severed, the way a real Postgres restart severs them;
-    /// data, replication slots and configuration survive.
+    /// data and configuration survive.
     ///
     /// [`StopMode::Fast`] is an orderly shutdown (a shutdown checkpoint, then
     /// exit). [`StopMode::Immediate`] skips the checkpoint, so the next start
@@ -405,12 +401,6 @@ impl TestCluster {
     /// cluster, shutdown checkpoint and all), copies the whole data
     /// directory, and starts the server again on the original. Every open
     /// connection is severed, as with [`TestCluster::restart`].
-    ///
-    /// The copy carries everything in the data directory, replication slots
-    /// (`pg_replslot/`) included, so a cluster restored from it with
-    /// [`TestCluster::from_backup`] has each slot exactly where it stood at
-    /// the shutdown. That is the difference from a `pg_basebackup`, which
-    /// leaves `pg_replslot/` out.
     ///
     /// The backup lives in its own temp directory until the returned
     /// [`ClusterBackup`] is dropped. It is a full copy of the cluster, WAL
@@ -603,14 +593,9 @@ impl Drop for TestCluster {
         // SIGKILL only on timeout.
         //
         // `immediate`, not `fast`: the data directory is deleted right after
-        // this, so the shutdown checkpoint `fast` writes buys nothing. And
-        // `fast` waits for every walsender to finish streaming and for its
-        // client to confirm it. A test that leaves a replication consumer
-        // attached at teardown (an `Intake` spawned onto the runtime, say)
-        // never sends that confirmation, so `fast` sat out the whole `-t`
-        // timeout and then SIGKILLed anyway, about 10s per test. `immediate`
-        // still goes through the postmaster, which releases the SysV segment
-        // before it exits.
+        // this, so the shutdown checkpoint `fast` writes buys nothing.
+        // `immediate` still goes through the postmaster, which releases the
+        // SysV segment before it exits.
         let stopped_via_pg_ctl = Command::new("pg_ctl")
             .arg("stop")
             .arg("-D")
@@ -709,20 +694,6 @@ impl TestDatabase {
     pub fn name(&self) -> &str {
         &self.name
     }
-
-    /// The cluster's Unix socket directory, for callers that need to build
-    /// a connection [`Self::dsn`] doesn't cover — e.g. intake's replication
-    /// transport, which speaks a different wire protocol
-    /// (`pgwire_replication::ReplicationConfig::unix` wants the socket
-    /// directory and port separately, not a libpq keyword/value string).
-    pub fn socket_dir(&self) -> &Path {
-        &self.socket_dir
-    }
-
-    /// The cluster's port. See [`Self::socket_dir`].
-    pub fn port(&self) -> u16 {
-        self.port
-    }
 }
 
 /// How many times [`TestDatabase`]'s `Drop` tries `dropdb` before giving up,
@@ -734,16 +705,7 @@ impl Drop for TestDatabase {
     fn drop(&mut self) {
         // `--force` (PG 13+) disconnects any backends still attached before
         // dropping, so teardown doesn't race connections just released to
-        // `pool`. It does not cover a logical slot that is still *active*:
-        // `dropdb` refuses that outright, before `--force` terminates
-        // anything. A `trellis::Client` whose best-effort shutdown hasn't
-        // finished leaves exactly that. Were the failure ignored, the
-        // database and its slot would leak, and the slot, inactive a moment
-        // later, would pin the cluster's WAL from then on. A deep nightly
-        // run puts hundreds of cases on one cluster, so that retained WAL
-        // grew to gigabytes and filled the tmpfs quota. So end the slot's
-        // walsender and retry; once the slot is inactive, `dropdb` drops it
-        // along with the database.
+        // `pool`. Retried in case a backend is still being torn down.
         for _ in 0..DROP_ATTEMPTS {
             let dropped = Command::new("dropdb")
                 .arg("-h")
@@ -762,29 +724,11 @@ impl Drop for TestDatabase {
             if dropped {
                 return;
             }
-            let _ = Command::new("psql")
-                .arg("-h")
-                .arg(&self.socket_dir)
-                .arg("-p")
-                .arg(self.port.to_string())
-                .arg("-U")
-                .arg("postgres")
-                .arg("-d")
-                .arg("postgres")
-                .arg("-c")
-                .arg(format!(
-                    "select pg_terminate_backend(active_pid) from pg_replication_slots \
-                     where database = '{}' and active_pid is not null",
-                    self.name
-                ))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
             std::thread::sleep(DROP_RETRY_DELAY);
         }
         eprintln!(
             "testkit: could not drop database {} after {DROP_ATTEMPTS} attempts; \
-             it and any replication slot on it are leaked",
+             it is leaked",
             self.name
         );
     }
@@ -844,22 +788,6 @@ fn spawn_server(
         .arg(socket_dir)
         .arg("-p")
         .arg(port.to_string())
-        .arg("-c")
-        .arg("wal_level=logical")
-        // Headroom, not a tuning knob: issue #188 gives every
-        // shared-cluster generative case its own slot *name*, so any slot
-        // a case does leave behind (a `TestDatabase` drop that gave up, see
-        // its `Drop`) accumulates rather than reusing one name, and a deep
-        // nightly run puts hundreds of cases on one cluster. 10 left only
-        // a handful of leaks' worth of room before
-        // `pg_create_logical_replication_slot` would start failing with
-        // "all replication slots are in use"; 50 is still trivial shared
-        // memory (a slot is a small fixed struct) and takes that off the
-        // table.
-        .arg("-c")
-        .arg("max_replication_slots=50")
-        .arg("-c")
-        .arg("max_wal_senders=50")
         // The default (`posix`) puts dynamic shared memory segments in
         // `/dev/shm`, outside the cluster's temp dir. A postgres that is
         // SIGKILLed (the teardown fallback, or a killed test binary) never

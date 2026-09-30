@@ -109,11 +109,10 @@ async fn stage_cdc_at_lsn(
 }
 
 /// Issue #133's own staging helper: [`stage_cdc_at_lsn`] plus an explicit
-/// `group_key` — standing in for what real intake's `cdc_change`/
-/// `touched_group_key` would have populated from the row's own old/new
-/// images for its outbound relationship's `from_col`, since these tests
-/// stage directly into the ring rather than running a real replication
-/// stream.
+/// `group_key` — standing in for what real capture would have populated from
+/// the row's own old/new images for its outbound relationship's `from_col`,
+/// since these tests stage directly into the ring rather than running the
+/// capture triggers.
 // 8 args, all independently meaningful test-staging inputs (mirrors
 // `stage_cdc_at_lsn`'s own shape plus `group_key`) — a struct wrapper would
 // just move the same fields into another type call sites still have to fill
@@ -205,8 +204,6 @@ async fn create_schema(client: &Client) {
         .batch_execute(
             "create table posts (id integer primary key, word_count integer); \
              create table post_tags (id integer primary key, post integer, tag text); \
-             alter table post_tags replica identity full; \
-             alter table posts replica identity full; \
              create index on post_tags (post); \
              insert into posts (id, word_count) values (1, 100), (2, 250), (3, null); \
              insert into post_tags (id, post, tag) values \
@@ -424,7 +421,7 @@ async fn to_side_update_advances_the_projection_lsn_via_the_delta_path() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -484,7 +481,7 @@ async fn a_parent_recompute_folded_with_its_update_still_rederives_the_from_side
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -554,7 +551,7 @@ async fn two_parent_changes_in_one_batch_fold_to_one_record() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -625,7 +622,7 @@ async fn parent_insert_is_picked_up_by_the_reverse_path() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -685,7 +682,7 @@ async fn parent_delete_is_picked_up_by_the_reverse_path() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -757,7 +754,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -898,7 +895,7 @@ async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // First parent change: 100 -> 400, its own segment.
@@ -1005,12 +1002,12 @@ async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
 /// Guard (a) (plan doc §2; ablation 125/3000, and the precondition that
 /// makes guard (c) trustworthy at all): a reverse record whose captured
 /// watermark `X` (the source's write frontier as of Phase 2) is still ahead
-/// of what intake has *staged* must not apply — even though nothing else
+/// of what capture has *staged* must not apply — even though nothing else
 /// about the record looks wrong (no concurrent forward apply, no sibling
 /// reverse, no in-flight child). Driven with a [`StagedWatermark`]
 /// constructed fresh (starts at LSN 0 — see its own doc comment) and never
-/// advanced: no live `intake::Intake` runs in this test at all, so a
-/// watermark that never moves is exactly "intake hasn't caught up yet."
+/// advanced: no live capture runs in this test at all, so a
+/// watermark that never moves is exactly "capture hasn't caught up yet."
 #[tokio::test]
 async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
     let cluster = TestCluster::start();
@@ -1027,7 +1024,7 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1134,7 +1131,7 @@ async fn a_deferred_parent_delete_retries_as_a_delete() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1238,7 +1235,7 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1373,9 +1370,7 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
              create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full; \
              insert into categories (id, name) values (1, 'A'), (2, 'B'), (3, 'C')",
         )
         .await
@@ -1461,7 +1456,7 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
     // The erasing batch: `articles` row 200 inserted pointing at category
     // 3, then re-pointed to category 2 — both within the *same*,
     // still-active segment. `group_key` is set explicitly on each raw row
-    // (standing in for what real intake's `touched_group_key` would have
+    // (standing in for what real capture would have
     // read off these same old/new images), exactly as issue #133 populates
     // it: the insert's own touched value (3), then the update's own
     // touched values (3 and 2).
@@ -1634,7 +1629,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1774,7 +1769,7 @@ async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1867,7 +1862,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
 
@@ -2049,10 +2044,8 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full; \
              insert into articles (id, category_id) values (1, 10)",
         )
         .await
@@ -2162,7 +2155,7 @@ async fn deferring_past_the_fairness_threshold_escalates_instead_of_spinning_for
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -2330,7 +2323,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -2540,7 +2533,7 @@ async fn fairness_escalation_increments_its_own_metric() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     client
         .execute("update posts set word_count = 400 where id = 1", &[])
@@ -2634,7 +2627,7 @@ async fn a_deferred_reverse_lands_in_the_active_segment_never_the_draining_one()
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -2789,7 +2782,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
-        trellis::intake::publication::settle_registrations(&db.pool).await;
+        trellis::intake::markers::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
         client
             .execute("update posts set word_count = 400 where id = 1", &[])
@@ -2847,7 +2840,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
-        trellis::intake::publication::settle_registrations(&db.pool).await;
+        trellis::intake::markers::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
         let projection_table = projection_table_for(&db.pool, relationship.id).await;
         client
@@ -2915,7 +2908,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
-        trellis::intake::publication::settle_registrations(&db.pool).await;
+        trellis::intake::markers::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
         client
             .execute("update posts set word_count = 400 where id = 1", &[])
@@ -2990,7 +2983,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
-        trellis::intake::publication::settle_registrations(&db.pool).await;
+        trellis::intake::markers::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
 
         client
@@ -3126,7 +3119,7 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // This test's own lsns must be real, monotonically-increasing WAL
@@ -3321,7 +3314,7 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
 // ---------------------------------------------------------------------
 
 /// Stages one image-less `recompute` trigger into the active ring segment
-/// — the exact row shape `intake::publication::enumerate_and_append` (a
+/// — the exact row shape `intake::markers::enumerate_and_append` (a
 /// definition's ring backfill), forward propagation's chained-target hop,
 /// and the reverse/TRUNCATE-clear fallbacks all append: no images, no
 /// `lsn`, only "this key exists as of now".
@@ -3362,7 +3355,7 @@ async fn tag_totals_oracle(client: &Client) -> Totals {
 /// **Issue #244.** An image-less `StagedChange::Recompute` staged against a
 /// relationship's *to-side* table asserts nothing about that row's state —
 /// it only says "this key exists as of now" (see
-/// `intake::publication::enumerate_and_append`'s doc comment). It is what a
+/// `intake::markers::enumerate_and_append`'s doc comment). It is what a
 /// definition's ring backfill enumeration stages for its own source table,
 /// what forward propagation stages for a chained target, and what
 /// TRUNCATE-clear/reverse-fallback stage for a from-side row — and that
@@ -3400,7 +3393,7 @@ async fn an_image_less_recompute_on_the_to_side_table_is_not_a_parent_insert() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let settled = target_totals(&client).await;
@@ -3449,8 +3442,6 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
             "create table accounts (id integer primary key, code integer unique, \
                                     credit integer); \
              create table orders (id integer primary key, acct_code integer); \
-             alter table accounts replica identity full; \
-             alter table orders replica identity full; \
              insert into accounts values (1, 5, 100), (2, 6, 200); \
              insert into orders values (10, 5), (11, 6)",
         )
@@ -3474,7 +3465,7 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
     .await
     .expect("a reader through the relationship");
     // The discharge dispatches the build as a background job (ADR-0016, #419).
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
     async fn codes(client: &Client, projection_table: &str) -> Vec<i32> {

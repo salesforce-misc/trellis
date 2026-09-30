@@ -131,7 +131,6 @@ async fn create_schema(client: &Client) {
             "create table sales ( \
                  id integer primary key, sku text, amount integer \
              ); \
-             alter table sales replica identity full; \
              insert into sales (id, sku, amount) values \
                (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), (4, null, 6)",
         )
@@ -181,13 +180,13 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     install_definition(&db.pool, SKU_TOTALS_ECHO, &sku_totals_columns(), "public")
         .await
         .expect("install the 1-1 chained onto the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Sanity checks, matching #205's already-fixed behavior: the upstream

@@ -30,7 +30,7 @@ async fn create_table_with_fk_column(pool: &trellis::pool::Pool, name: &str, fk_
 }
 
 /// Issue #83 WI3: `defs::all_source_tables` (which the staging worker's
-/// publication set is built from, at startup and on every reconcile pass)
+/// capture set is built from, at startup and on every reconcile pass)
 /// must seed the
 /// full transitive closure of source tables, not just each definition's
 /// direct anchor. A definition anchored on
@@ -38,22 +38,13 @@ async fn create_table_with_fk_column(pool: &trellis::pool::Pool, name: &str, fk_
 /// `count(posts.id)`-style calculated field on `authors` reads through) must
 /// seed both `authors` and `posts`, schema-qualified — otherwise a live write
 /// to `posts` before the maintenance-reconcile loop catches up wouldn't be
-/// captured by the CDC publication.
+/// captured.
 #[tokio::test]
 async fn includes_relationship_to_tables_not_just_direct_anchors() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_pk(&db.pool, "authors").await;
     create_table_with_fk_column(&db.pool, "posts", "author").await;
-    // To-many to-side prerequisite (#41): the join key must survive into
-    // delete/re-parent pre-images.
-    db.pool
-        .get()
-        .await
-        .expect("get connection")
-        .batch_execute("alter table posts replica identity full")
-        .await
-        .expect("set replica identity full");
 
     create_definition(
         &db.pool,
@@ -262,9 +253,7 @@ async fn an_unrecognized_to_side_enrichment_column_still_lands_as_text() {
         .expect("get connection")
         .batch_execute(
             "create table authors (id integer primary key, m integer[] not null);
-             create table posts (id integer primary key, author_id integer);
-             alter table authors replica identity full;
-             alter table posts replica identity full;",
+             create table posts (id integer primary key, author_id integer);",
         )
         .await
         .expect("seed tables");
@@ -320,9 +309,7 @@ async fn an_enum_to_side_enrichment_column_keeps_its_own_type() {
         .batch_execute(
             "create type mood as enum ('sad', 'ok', 'happy');
              create table authors (id integer primary key, m mood not null);
-             create table posts (id integer primary key, author_id integer);
-             alter table authors replica identity full;
-             alter table posts replica identity full;",
+             create table posts (id integer primary key, author_id integer);",
         )
         .await
         .expect("seed tables");
@@ -373,7 +360,7 @@ async fn an_enum_to_side_enrichment_column_keeps_its_own_type() {
 /// re-resolved a `Config` from the environment — so a `Trellis` built with
 /// `Config::with_schema(dsn, "…")` read its catalog and answered
 /// `await_converged` out of its configured instance while its staging
-/// worker, intake and drain workers all ran against a *different* instance's
+/// worker and drain workers all ran against a *different* instance's
 /// ring. `Client::start_with_config` fixes it; this is the regression pin.
 ///
 /// The database is an *isolated* (already-migrated) one, so `DEFAULT_SCHEMA`
@@ -462,9 +449,8 @@ async fn the_background_client_runs_in_the_configured_schema_not_the_process_def
 
 /// Issues #311/#367 review: `request_backfill` parks through the shared
 /// `park_marker` upsert now, and a database failure there must still surface
-/// as a plain [`trellis::TrellisError::Db`]. It briefly surfaced as
-/// `TrellisError::Publication`, whose message claims a definition was just
-/// dropped.
+/// as a plain [`trellis::TrellisError::Db`]. It briefly surfaced as an error
+/// whose message claimed a definition was just dropped.
 #[tokio::test]
 async fn request_backfill_parks_a_marker_and_reports_a_park_failure_as_db() {
     let cluster = TestCluster::start();
@@ -518,8 +504,7 @@ async fn request_backfill_parks_a_marker_and_reports_a_park_failure_as_db() {
 
 /// Issue #622 C5: `request_backfill` accepts a table the staging worker
 /// captures (some registered definition reads it), and refuses any other
-/// table with `TableNotCaptured`, the way it refused a table outside the
-/// publication before.
+/// table with `TableNotCaptured`.
 #[tokio::test]
 async fn request_backfill_refuses_a_table_that_isnt_captured() {
     let cluster = TestCluster::start();
@@ -563,8 +548,7 @@ async fn request_backfill_refuses_a_table_that_isnt_captured() {
 /// Issue #622 C5: a staging connection's setup runs one capture reconcile
 /// pass, so a table a registered definition reads carries its capture
 /// triggers by the time `connect` returns, with no convergence wait, and the
-/// handle's own `request_backfill` accepts it. (Before C5 this checked the
-/// publication a staging connection reconciled, #641.)
+/// handle's own `request_backfill` accepts it (#641).
 #[tokio::test]
 async fn a_staging_connection_installs_capture_before_connect_returns() {
     let cluster = TestCluster::start();
@@ -617,7 +601,7 @@ async fn a_staging_connection_installs_capture_before_connect_returns() {
 /// Issue #427: the staging worker reads what to capture from the catalog
 /// itself, so it no longer needs a definition registered before it can start
 /// (this used to fail with `TrellisError::NoDefinitions`). It starts with
-/// nothing captured and no replication slot (issue #622), ready to pick up
+/// nothing captured (issue #622), ready to pick up
 /// whatever is applied later.
 #[tokio::test]
 async fn a_staging_connection_starts_with_no_definitions_registered() {

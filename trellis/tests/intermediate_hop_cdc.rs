@@ -6,7 +6,7 @@
 //! `h1 -> h3`. Since issue #315 a target table is never captured: the drain
 //! that writes `h1` stages its own downstream `Recompute` for `h3` inside the
 //! writing transaction (`staging::target_mutations`), and that is the only
-//! copy. Before, `h1` was published too, and intake decoded the same write a
+//! copy. Before, `h1` was captured too, and intake decoded the same write a
 //! second time; when the two copies landed in different batches the
 //! aggregate re-derived the group from live state (which already held the
 //! write) and then added the CDC delta on top of it.
@@ -56,9 +56,9 @@ async fn start() -> Pipeline {
     )
     .await
     .expect("install h1");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
-    // No `REPLICA IDENTITY FULL` on `h1`: an aggregate over a target
-    // never reads its CDC, so it has no old-image requirement (#315).
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    // An aggregate over a target never reads its capture: the
+    // target-mutation seam feeds it (#315).
     install_definition(
         &db.pool,
         "TRANSFORM h3 FROM public.h1 GROUP BY val SELECT COUNT(*) AS n",
@@ -67,7 +67,7 @@ async fn start() -> Pipeline {
     )
     .await
     .expect("install h3");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     Pipeline::attach(cluster, db, raw, &["public.src"]).await
 }
 

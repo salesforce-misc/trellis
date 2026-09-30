@@ -1,6 +1,7 @@
-//! The blind append: the one write path all four producers (CDC intake,
-//! reverse propagation, definition re-derive, and — server-side — backfill)
-//! use to stage a change. See
+//! The blind append: the write path the Rust-side producers (the
+//! target-mutation seam, reverse propagation, definition re-derive, and —
+//! server-side — backfill) use to stage a change. Capture triggers write the
+//! same row shape in SQL (`capture::sql`). See
 //! docs/staging-and-claiming/02-the-staging-ring.md.
 //!
 //! [`StagedChange`] makes the image-bearing/image-less distinction the
@@ -46,19 +47,17 @@ impl CdcOp {
 }
 
 /// The sentinel key every [`StagedChange::Truncate`] row carries — a
-/// truncate is whole-keyspace, not keyed to any one row, but the ring's
-/// schema requires a `key` on every row (`V3__staging_ring.sql`'s `not
-/// null`), and the fold groups by `(src_table, key)`. Prefixed with U+001F
-/// (INFORMATION SEPARATOR ONE) — not a NUL byte: Postgres `text` cannot
-/// store an embedded NUL at all (it's a null-terminated C string
-/// internally; the wire protocol rejects it outright), which a real
-/// truncate sentinel value would need to survive an actual round trip
-/// through the ring. U+001F is exactly the separator
-/// `intake::extract_key`/`defs::ddl::join_pk_key` themselves join
-/// composite-key parts on, and this sentinel — unlike a real key — never
-/// passes through that encoding at all: it is one fixed literal, compared
-/// (and grouped by the fold) as an opaque whole string, not split back into
-/// parts.
+/// truncate is whole-keyspace, not keyed to any one row, but the ring's schema
+/// requires a `key` on every row (`V3__staging_ring.sql`'s `not null`), and the
+/// fold groups by `(src_table, key)`. Prefixed with U+001F (INFORMATION
+/// SEPARATOR ONE) — not a NUL byte: Postgres `text` cannot store an embedded
+/// NUL at all (it's a null-terminated C string internally; the wire protocol
+/// rejects it outright), which a real truncate sentinel value would need to
+/// survive an actual round trip through the ring. U+001F is exactly the
+/// separator a capture trigger and `defs::ddl::join_pk_key` join composite-key
+/// parts on, and this sentinel — unlike a real key — never passes through that
+/// encoding at all: it is one fixed literal, compared (and grouped by the fold)
+/// as an opaque whole string, not split back into parts.
 ///
 /// This is a *different* question from the one issue #200 closed in
 /// `defs::ddl` (a real, in-value U+001F no longer misparses as a field
@@ -100,13 +99,13 @@ pub const SCHEMA_CHANGED_SENTINEL_KEY: &str = "\u{1f}trellis-schema-changed";
 /// reaches Postgres.
 #[derive(Debug, Clone)]
 pub enum StagedChange {
-    /// CDC intake's shape: an image-bearing decoded change. The
+    /// A capture trigger's shape: an image-bearing change. The
     /// target-mutation seam stages this shape too, for a relationship-endpoint
     /// target it feeds (issue #402, `staging::target_mutations`): `lsn` is
-    /// then the writer's pre-commit write token, not a commit `end_lsn`, and
-    /// `origin_lsn` is the origin of the change that produced the write
-    /// (issue #469; see [`StagedChange::Recompute::origin_lsn`]). Intake
-    /// stamps `origin_lsn` with the commit's own position.
+    /// then the writer's pre-commit write token, and `origin_lsn` is the
+    /// origin of the change that produced the write (issue #469; see
+    /// [`StagedChange::Recompute::origin_lsn`]). A capture trigger stamps
+    /// both with `pg_current_wal_insert_lsn()`.
     Cdc {
         src_table: String,
         key: String,
@@ -120,12 +119,14 @@ pub enum StagedChange {
         /// Issue #133: the union of every join-key value this row's own
         /// change touched — every column that is some relationship's
         /// `from_col`, read from `old_image` (if present) and `new_image`
-        /// (if present). Populated by intake (`intake::mod::Intake`'s
-        /// `handle_xlog_data`, using a cached outbound-relationship column
-        /// map), backfill's replay of a spilled/parked change, or the
-        /// target-mutation seam for a from-side endpoint target; `None`
-        /// when this row's `src_table` has no outbound relationship at all,
-        /// or (rare, transient) the catalog cache hasn't observed one yet.
+        /// (if present). Populated by a capture trigger (from the columns
+        /// its spec names, `capture::sql`) or the target-mutation seam for a
+        /// from-side endpoint target; `None` when this row's `src_table` has
+        /// no outbound relationship at all. A row staged by capture
+        /// functions older than a relationship (before the reconcile pass
+        /// widened them to its `from_col`) lacks that column's values; a
+        /// definition reading through the relationship isn't dispatched
+        /// until the widen lands (`capture::reconcile`).
         /// See `staging::fold`'s doc comment for the union merge rule this
         /// feeds, and `staging::apply::RelationshipGenBump` for why this
         /// (not the folded old/new image endpoints alone) is what guard
@@ -144,7 +145,7 @@ pub enum StagedChange {
     /// quarantine replay (all of which inherit it from the triggering
     /// change), `None` for backfill's cursor-enumerated pre-existing rows
     /// (there is no meaningful origin for a row nothing ever "changed" —
-    /// see `intake::publication`'s backfill enumeration). Without this, an
+    /// see `intake::markers`'s backfill enumeration). Without this, an
     /// automatically-propagated hop-to-hop chain (transform A's output
     /// feeding transform B as B's input, entirely through `Recompute` rows)
     /// would carry no origin at all past the first hop, leaving both the
@@ -183,13 +184,10 @@ pub enum StagedChange {
     /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
     /// relation, key-less (see [`TRUNCATE_SENTINEL_KEY`]) and image-less —
     /// it asserts nothing about any one row's state, only "every row this
-    /// source ever produced is gone as of this position." `lsn`/`src_changed`
-    /// are stamped at commit exactly like [`StagedChange::Cdc`]'s, by
-    /// `intake::stamp_commit_metadata`, which also stamps `origin_lsn` with the
-    /// commit's position, matching [`StagedChange::Cdc`] — a truncate always
-    /// originates directly from the source, it is never a re-propagated
-    /// downstream change.
-    // Only intake used this; C8 deletes it (issue #622).
+    /// source ever produced is gone as of this position." A truncate always
+    /// originates directly from the source, never from a re-propagated
+    /// downstream change. The capture trigger writes this row itself
+    /// (`capture::sql`); only tests stage one through here.
     #[allow(dead_code)]
     Truncate {
         src_table: String,
@@ -269,22 +267,6 @@ pub enum StagedChange {
         /// migration/doc comment for why retrying must never touch it.
         retry_count: i32,
     },
-}
-
-impl StagedChange {
-    /// The source table this change targets, regardless of variant — used by
-    /// intake's hard-cap error (issue #8) to name which tables an oversized
-    /// transaction touched.
-    // Only intake used this; C8 deletes it (issue #622).
-    #[allow(dead_code)]
-    pub fn src_table(&self) -> &str {
-        match self {
-            StagedChange::Cdc { src_table, .. } => src_table,
-            StagedChange::Recompute { src_table, .. } => src_table,
-            StagedChange::Truncate { src_table, .. } => src_table,
-            StagedChange::RelationshipReverseDeferred { src_table, .. } => src_table,
-        }
-    }
 }
 
 /// Borrowed, column-shaped view of a [`StagedChange`], built once per

@@ -16,7 +16,7 @@
 //! | [`narrow`] | the table images columns no reader needs any more | none | none |
 //! | [`uninstall`] | nothing reads the table any more | `ACCESS EXCLUSIVE` (`DROP TRIGGER`'s) | none |
 //!
-//! [`park_table_catch_ups`]: crate::intake::publication::park_table_catch_ups
+//! [`park_table_catch_ups`]: crate::intake::markers::park_table_catch_ups
 //!
 //! # Never blocking a writer (ADR-0002 I6)
 //!
@@ -73,7 +73,7 @@
 //! An install parks the table's join marker in the transaction that creates
 //! the triggers, so the marker commits exactly when capture starts. The
 //! discharge takes the marker's fence only after reading it committed (issue
-//! #431, [`crate::intake::publication::park_marker`]), so the fence postdates
+//! #431, [`crate::intake::markers::park_marker`]), so the fence postdates
 //! the install, and a writer still open then is behind it. A write committed
 //! before the install is in the enumeration; one after it runs the trigger.
 //! The table lock makes that split exact: no writer of the table is in
@@ -142,7 +142,7 @@
 //! [`crate::staging::converge::table_changes_pending_through`] counts the
 //! deferred reverses whose relationship's to-side is `T`. A to-side widen's
 //! marker also refreshes `T`'s settled projections
-//! (`intake::publication::park_widen_marker`).
+//! (`intake::markers::park_widen_marker`).
 //!
 //! Why not the alternatives:
 //!
@@ -669,9 +669,9 @@ async fn attempt(
         .get(0);
     match op {
         Op::Install(_) => {
-            crate::intake::publication::park_table_catch_ups(&txn, &[table.to_string()]).await?
+            crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()]).await?
         }
-        Op::Widen(_) => crate::intake::publication::park_widen_marker(&txn, table).await?,
+        Op::Widen(_) => crate::intake::markers::park_widen_marker(&txn, table).await?,
         Op::Uninstall(_) => {}
     }
     let statements = match op {

@@ -10,7 +10,7 @@
 //! improvement-plan task D4) against a real, already-migrated Postgres
 //! database, reached only over raw source DML (never an application-level
 //! notify API), matching the production ingestion path
-//! (`docs/data-flow.md#ingestion-via-logical-replication`).
+//! (`docs/data-flow.md#capture-by-triggers`).
 //!
 //! **D4's "second runtime" is this same type, just started with more than one
 //! application worker** — not a separate `ConcurrentBackend` type. Nothing in
@@ -618,7 +618,7 @@ impl ManualBackend {
 
     /// Delegates to the shared [`sql::create_source_table`] — see that
     /// function's doc comment for the exact DDL shape (`crate::model::PRIMARY_KEY_VALUE_TYPE`
-    /// pk, per-column `UNIQUE`, unconditional `REPLICA IDENTITY FULL`).
+    /// pk, per-column `UNIQUE`).
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
         Ok(sql::create_source_table(&self.raw, table).await?)
     }
@@ -651,13 +651,11 @@ impl ManualBackend {
     }
 
     /// Creates a table with the exact same DDL shape [`ManualBackend::install`]
-    /// gives a real source table (task E1: untracked-object noise) —
-    /// including the same unconditional `replica identity full` (harmless,
-    /// and keeps this table indistinguishable from a real one at the DDL
-    /// level) — but never registers it in `self.tables`, and no definition
-    /// reads it, so the engine never publishes it (the staging worker
-    /// publishes exactly the tables registered definitions read, issue
-    /// #427). Those are the only ways a table is "tracked" by this backend
+    /// gives a real source table (task E1: untracked-object noise), so it is
+    /// indistinguishable from a real one at the DDL level, but never
+    /// registers it in `self.tables`, and no definition reads it, so the
+    /// engine never captures it (the engine captures exactly the tables
+    /// registered definitions read, issue #427). Those are the only ways a table is "tracked" by this backend
     /// or watched by the engine (see [`ManualBackend::install`]/
     /// [`ManualBackend::snapshot`]), and `run::check_program`'s oracle never
     /// looks at "every table in the schema" either — it only ever resolves a
@@ -869,7 +867,7 @@ impl super::Backend for ManualBackend {
             self.defs.push(def.clone());
         }
 
-        // The staging worker publishes whatever the definitions just
+        // The staging worker captures whatever the definitions just
         // registered read, straight from the catalog (issue #427).
         if !program.tables.is_empty() && self.engine_client.is_none() {
             let options = ClientOptions {

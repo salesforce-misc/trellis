@@ -4,7 +4,7 @@
 //! [`app::Trellis`] is the embedder's entry point — one facade covering the
 //! whole lifecycle: apply migrations, register relationships and transform
 //! definitions, list them, request backfills, and run the live pipeline
-//! (CDC intake, ring maintenance, and N application workers). It composes
+//! (capture, ring maintenance, and N application workers). It composes
 //! everything below into one interface so callers never stitch the
 //! primitives together themselves; [`client::Client`] is the runtime it
 //! starts, still public for embedders that want to drive it directly.
@@ -38,7 +38,7 @@
 //! - Logs/traces (issue #56, epic #49) flow through the plain `tracing`
 //!   facade — spans modeling the propagation path (source commit → hop →
 //!   hop → apply, ADR-0009 decision 3) and events at operationally
-//!   meaningful points, in `intake` and `staging` directly, not a
+//!   meaningful points, in `capture` and `staging` directly, not a
 //!   separate module of their own. `otel` (behind the optional `otlp`
 //!   Cargo feature, off by default) is the OTLP export layer an embedder can
 //!   add to their own subscriber; with the feature off, or with no
@@ -46,8 +46,9 @@
 //!   near-zero no-subscriber overhead.
 //!
 //! Tier 3 is the engine — `defs` (parses, validates, and catalogs transform
-//! definitions), `intake` (streams committed source-table changes off a
-//! logical replication slot into the durable staging ring), and `staging`
+//! definitions), `capture` (the triggers that stage each source-table change
+//! into the durable staging ring in its writer's transaction), `intake` (the
+//! backfill markers and their discharge, until #625), and `staging`
 //! (the ring, sealing, claim-time fold, and the exactly-once apply path) —
 //! together with everything beneath them. They are `pub(crate)`: machinery
 //! the facade composes, not names an embedder can write. See
@@ -163,11 +164,6 @@ pub use app::{
 };
 pub use blocking::BlockingTrellis;
 pub use client::{Client, ClientError, ClientOptions};
-/// Re-exported at the crate root regardless of the `internals` feature —
-/// `ClientOptions::group_commit` (issue #274) names this type in a public
-/// field, so it must be nameable by every embedder, not just
-/// internals-feature tooling.
-pub use intake::GroupCommitConfig;
 
 // --- Tier 2: composable primitives ----------------------------------------
 pub use config::Config;

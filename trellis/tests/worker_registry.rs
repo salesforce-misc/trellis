@@ -170,8 +170,8 @@ async fn has_live_staging_worker_needs_a_staging_connection_not_just_drain_worke
         "drain workers alone must not pass as a staging worker (issue #428)"
     );
 
-    // `Trellis::connect` returns only after intake has connected, and intake
-    // holds the producer singleton from then on, so no wait is needed.
+    // `Trellis::connect` returns only after the staging worker has started,
+    // and it holds the producer singleton from then on, so no wait is needed.
     let staging = Trellis::connect(
         Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
         TrellisOptions {
@@ -202,7 +202,7 @@ async fn has_live_staging_worker_needs_a_staging_connection_not_just_drain_worke
 }
 
 /// The other half of the "does drain_threads matter" contract: a connection
-/// that runs the staging worker (CDC intake + ring maintenance) but zero
+/// that runs the staging worker (capture + ring maintenance) but zero
 /// drain threads must not count as a live drain worker — `seg_claims`-style
 /// liveness inference would get this right by accident (nothing to claim
 /// without drain workers either), but this asserts the *registry* itself

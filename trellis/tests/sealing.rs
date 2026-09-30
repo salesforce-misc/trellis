@@ -1035,8 +1035,7 @@ async fn a_truncate_bearing_batch_seals_single_bucket_with_has_truncate_set() {
     );
 }
 
-/// A truncate row, as `trellis::staging::append` would stage one from
-/// intake.
+/// A truncate row, as capture would stage one.
 fn truncate_change() -> StagedChange {
     StagedChange::Truncate {
         src_table: "orders".to_string(),

@@ -13,16 +13,16 @@
 //! Two independent knobs, per the constructor contract:
 //!
 //! - `staging_worker: bool` — whether this client also owns capture
-//!   installation and ring maintenance. Exactly one client in a fleet should set this; every
-//!   other client (any number of them, across any number of processes) sets
-//!   only `application_threads`.
+//!   installation and ring maintenance. Exactly one client in a fleet should
+//!   set this; every other client (any number of them, across any number of
+//!   processes) sets only `application_threads`.
 //! - `application_threads: usize` — how many app-worker tasks this client
 //!   runs, each independently claiming and draining sealed batches. Zero is
 //!   legal: a staging-only client stages and seals but drains nothing.
 //!
 //! **Which tables to capture** (issue #427, ADR-0016, issue #622): the
 //! staging worker derives them from the catalog alone
-//! ([`defs::publication_tables`]), at startup and on every reconcile pass
+//! ([`defs::tables_to_capture`]), at startup and on every reconcile pass
 //! ([`capture::reconcile`]). There is no caller-supplied list: a table's
 //! capture triggers are installed once a registered definition reads it and
 //! uninstalled once none does, and the staging worker is the only process
@@ -32,8 +32,8 @@
 //! nothing reads the WAL.
 //!
 //! **Wake channel**: [`ClientOptions::wake_channel`] is the one Postgres
-//! `LISTEN/NOTIFY` channel intake's linchpin (`stage_and_advance`), the
-//! backfill discharge (`run_pending_backfills`), a seal actually completing
+//! `LISTEN/NOTIFY` channel the backfill discharge (`run_pending_backfills`),
+//! a seal actually completing
 //! (`staging::seal_if_active_nonempty`/`staging::recover_stuck_seals`, issue
 //! #271 — the transition that makes a batch claimable, as opposed to the
 //! others in this list, which fire when rows merely land in the *active*
@@ -46,14 +46,13 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tokio_postgres::config::Host;
 
 use crate::capture::{self, CaptureError};
 use crate::config::Config;
 use crate::defs::chunk_queue;
 use crate::defs::{self, CatalogError};
 use crate::error_code::{self, ErrorCode};
-use crate::intake::{self, IntakeConfig, IntakeError};
+use crate::intake::{self, IntakeError};
 use crate::pool::{Pool, quote_ident};
 use crate::staging::{
     self, ApplyError, HeartbeatDaemon, HeartbeatDaemonConfig, ProducerSession, SealConfig,
@@ -78,15 +77,9 @@ pub struct ClientOptions {
     /// How many independent application-worker tasks this client runs.
     /// Zero is legal — a staging-only client.
     pub application_threads: usize,
-    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
-    /// removes it.
-    pub slot: String,
-    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
-    /// removes it.
-    pub publication: String,
-    /// The `LISTEN/NOTIFY` channel shared by intake's linchpin, backfill
-    /// discharge, apply's downstream propagation, and every idle app-worker
-    /// task's `LISTEN`.
+    /// The `LISTEN/NOTIFY` channel shared by the backfill discharge, seals,
+    /// apply's downstream propagation, and every idle app-worker task's
+    /// `LISTEN`.
     pub wake_channel: String,
     /// How long a claim may sit unrefreshed before it's taken back: ring
     /// segment claims by [`staging::reclaim_stale`] (the maintenance loop,
@@ -104,27 +97,21 @@ pub struct ClientOptions {
     /// How often the maintenance loop (seal/recover/reclaim) ticks.
     pub maintenance_interval: Duration,
     /// How often the maintenance loop re-derives the desired source-table
-    /// set from the catalog (issue #14) and re-runs
-    /// [`intake::publication::reconcile_publication`] /
-    /// [`intake::publication::run_pending_backfills`] against it — so a
-    /// transform registered while the client runs gets published and
+    /// set from the catalog (issue #14) and re-runs the capture reconcile
+    /// ([`capture::reconcile`]) and
+    /// [`intake::markers::run_pending_backfills`] against it — so a
+    /// transform registered while the client runs gets captured and
     /// backfilled without a restart, and a table whose last reader was
-    /// dropped leaves the publication (issue #427). Coarser than
+    /// dropped loses its capture triggers (issue #427). Coarser than
     /// `maintenance_interval` by default: unlike seal/reclaim, this does a
-    /// catalog query and (when a table is newly added) an `ALTER
-    /// PUBLICATION`, neither of which needs sub-second freshness. A freshly
+    /// catalog query and (when a table is newly read) a `CREATE TRIGGER`,
+    /// neither of which needs sub-second freshness. A freshly
     /// parked backfill marker doesn't wait for it: the maintenance loop runs
     /// the pass early when it sees one (issue #476).
     pub reconcile_interval: Duration,
     /// The window [`staging::count_live_drainers`] uses to size a claim's
     /// share of a batch's buckets.
     pub drainer_window: Duration,
-    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
-    /// removes it.
-    pub spill_threshold: usize,
-    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
-    /// removes it.
-    pub hard_cap: usize,
     /// The out-of-band heartbeat daemon's tick interval and idle-exit
     /// timeout, one per app-worker task. The same interval also paces each
     /// in-flight backfill chunk's claim refresh. Its `interval` must be at
@@ -135,9 +122,6 @@ pub struct ClientOptions {
     /// delivery, and the only wake source while the listener connection is
     /// down: the worker reopens it in the background with backoff).
     pub poll_interval: Duration,
-    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
-    /// removes it.
-    pub group_commit: Option<intake::GroupCommitConfig>,
     /// The most folded records one drain batch holds at once (issue #620,
     /// ADR-0002): a segment share larger than this drains in pages of at most
     /// this many, each its own compute-and-apply transaction, so a worker's
@@ -163,18 +147,13 @@ impl Default for ClientOptions {
         Self {
             staging_worker: false,
             application_threads: 0,
-            slot: "trellis_slot".to_string(),
-            publication: "trellis_pub".to_string(),
             wake_channel: "trellis_wake".to_string(),
             reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,
             maintenance_interval: Duration::from_millis(300),
             reconcile_interval: Duration::from_secs(5),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
-            spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
-            hard_cap: intake::spill::DEFAULT_HARD_CAP,
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
-            group_commit: Some(intake::GroupCommitConfig::default()),
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         }
     }
@@ -226,14 +205,13 @@ pub enum ClientError {
     /// A connection/config-layer failure (see [`crate::error::Error`]).
     Config(crate::error::Error),
     /// A direct Postgres protocol/query error, for statements this module
-    /// runs itself (publication existence check/creation, the
-    /// `replication_progress` existence check).
+    /// runs itself.
     Db(tokio_postgres::Error),
-    /// Reading the catalog for the tables to publish at startup failed.
+    /// Reading the catalog for the tables to capture at startup failed.
     Catalog(CatalogError),
     /// A failure from the staging ring (session guards, seal, liveness).
     Staging(StagingError),
-    /// A failure from CDC intake (connect, publication/slot setup, run).
+    /// A failure from a backfill marker's park or discharge.
     Intake(IntakeError),
     /// A failure from apply (drain_once).
     Apply(ApplyError),
@@ -368,8 +346,9 @@ pub struct Client {
 
 impl Client {
     /// Starts a client against `dsn`. Blocks (synchronously) until the
-    /// background thread has finished setup (publication and slot, if
-    /// `staging_worker`) and every worker task is spawned, or
+    /// background thread has finished setup (the staging-worker singleton and
+    /// the first capture pass, if `staging_worker`) and every worker task is
+    /// spawned, or
     /// until setup fails.
     ///
     /// The instance schema is resolved from the process environment
@@ -457,10 +436,8 @@ impl Client {
     }
 
     /// Signals shutdown and waits for the background thread to exit
-    /// cleanly: the intake task (if any) is aborted (it's crash-safe and
-    /// resumable — see the module doc comment), and the maintenance loop
-    /// and every app-worker task are joined after cooperatively exiting at
-    /// their next loop boundary.
+    /// cleanly: the maintenance loop and every app-worker task are joined
+    /// after cooperatively exiting at their next loop boundary.
     pub async fn shutdown(mut self) -> Result<(), ClientError> {
         let _ = self.shutdown_tx.send(true);
         if let Some(thread) = self.thread.take() {
@@ -561,7 +538,7 @@ async fn run(
     // own `claimed_by`): the question `Trellis::has_live_drain_workers`
     // answers is "does a live process exist to drain work," not "how many
     // worker tasks does it run." Only when `application_threads > 0` — a
-    // staging-only client (CDC intake + ring maintenance, no app workers)
+    // staging-only client (capture + ring maintenance, no app workers)
     // does no draining, so it must not register as though it did.
     if options.application_threads > 0
         && let Ok(conn) = pool.get().await
@@ -627,208 +604,6 @@ async fn run(
     }
 }
 
-/// [`supervise_intake`]'s production backoff: 1s doubling to a 60s cap.
-// Intake no longer runs (issue #622 C5); C8 deletes this with it.
-#[allow(dead_code)]
-const INTAKE_RESTART_BACKOFF: RestartBackoff =
-    RestartBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
-
-/// Exponential delay between intake restarts, capped at `max`. An attempt
-/// that stayed up for at least `max` counts as healthy, so the streak (and
-/// the delay) resets: a transient blip hours after the last one retries
-/// after `initial`, not after whatever a long-past streak escalated to.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-struct RestartBackoff {
-    initial: Duration,
-    max: Duration,
-    current: Duration,
-}
-
-#[allow(dead_code)]
-impl RestartBackoff {
-    const fn new(initial: Duration, max: Duration) -> Self {
-        Self {
-            initial,
-            max,
-            current: initial,
-        }
-    }
-
-    /// How long an attempt must stay up to count as healthy, ending any
-    /// failure streak before it.
-    fn healthy_after(&self) -> Duration {
-        self.max
-    }
-
-    /// The delay before the next restart, given how long the attempt that
-    /// just ended ran for.
-    fn next_delay(&mut self, ran_for: Duration) -> Duration {
-        if ran_for >= self.healthy_after() {
-            self.current = self.initial;
-        }
-        let delay = self.current;
-        self.current = (self.current * 2).min(self.max);
-        delay
-    }
-}
-
-/// Issue #325: runs CDC intake for the client's whole lifetime, restarting
-/// it whenever it stops. Never returns; the client stops it by aborting
-/// the task (see [`run`]).
-///
-/// `attempt` is one full intake lifetime: connect (the client passes its
-/// already-connected `Intake` to the first attempt, so a setup failure still
-/// fails [`Client::start`]) then `run()`. Intake's future used to be spawned
-/// as `let _ = intake.run().await`, so any terminal error ended the task with
-/// nothing logged: the process kept running maintenance and looked healthy
-/// while it had stopped consuming CDC for good.
-///
-/// Every stop is now logged at `error!`, counted in
-/// `trellis_intake_restarts_total`, and followed by a restart after a
-/// [`RestartBackoff`] delay. That includes `run()` returning `Ok(())`: with
-/// the pinned `pgwire-replication`, the stream only ends cleanly on a
-/// configured stop LSN or a client-side `stop()`, and the client does
-/// neither. A server-side close (walsender terminated, Postgres shutting
-/// down) surfaces as an `Err`, so a clean end is unexpected, and intake is
-/// just as stopped either way. Restarting is
-/// safe for the same reason aborting on shutdown is: acked LSNs are durable
-/// and `Intake::connect` resumes from the last confirmed position, and a
-/// failed attempt's staging transaction never committed (dropping the
-/// attempt's `Intake` closes its producer connection, which rolls it back).
-/// That `Intake` (its producer session and replication connection) is
-/// dropped before the backoff sleep, so the restart doesn't race its own
-/// predecessor for the producer lock or the slot. If the server still holds
-/// either briefly, the restart fails (`ProducerAlreadyRunning` from
-/// `connect`, or "replication slot is active" from the new stream's first
-/// `recv`), which is logged and retried like any other failure.
-///
-/// A deterministic error (one the same WAL will reproduce on every replay)
-/// retries forever at the capped delay, logging every time. That's
-/// deliberate: it's the loud, actionable signal the issue asks for, and
-/// the same log-and-retry-next-tick stance [`maintenance_loop`] takes.
-///
-/// The exception is a restart refused with `ProducerAlreadyRunning` (issue
-/// #341): some producer session holds the staging producer lock, and this
-/// client keeps retrying so it takes over once that session goes away. The
-/// first refusal in a row logs at `info!` and repeats at `debug!`, rather
-/// than `error!` every 60s forever. The `producer_lock_held` restart outcome
-/// still counts every one.
-///
-/// Alongside the lifetime restart counter, `trellis_intake_consecutive_failures`
-/// (issue #342) tracks the current streak: attempts in a row that ended
-/// without staying up for [`RestartBackoff::healthy_after`], the same
-/// window that resets the backoff. It's cleared as soon as a running attempt
-/// passes that window, so a recovered intake reads `0` rather than whatever
-/// its last streak reached.
-///
-/// Lock refusals count toward that streak, because this client's intake
-/// isn't running during them, and the lock's holder may be nobody live. The
-/// first attempt reuses the connection [`Client::start`] made, and that start
-/// fails outright if the lock is held, so a refusal here always follows this
-/// client's own intake stopping. The usual holder is then this client's own
-/// previous producer session, which the server hasn't yet noticed is gone.
-/// After a network partition, that lasts until the server's TCP keepalive
-/// gives up on it, about 25s (issue #364; `crate::pool::TCP_KEEPALIVE_IDLE`
-/// has the numbers), and all staging is down meanwhile. A second
-/// `staging_worker` client that took the lock over is the other
-/// possibility; it reads `0` while this one climbs, so a fleet that
-/// deliberately runs one aggregates with `min by (slot)`.
-#[allow(dead_code)]
-async fn supervise_intake<A, Fut>(slot: &str, mut backoff: RestartBackoff, mut attempt: A)
-where
-    A: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), IntakeError>>,
-{
-    let mut restarts: u64 = 0;
-    let mut consecutive_failures: u64 = 0;
-    let mut standing_by = false;
-    crate::metrics::set_intake_consecutive_failures(slot, 0);
-    loop {
-        // Tokio's clock, not `std`'s: they agree in production, and a test
-        // with paused time controls it, so an attempt's uptime is exactly
-        // the time it spent waiting, never scheduler noise.
-        let started = tokio::time::Instant::now();
-        let run = attempt();
-        tokio::pin!(run);
-        let outcome = tokio::select! {
-            outcome = &mut run => outcome,
-            () = tokio::time::sleep(backoff.healthy_after()) => {
-                consecutive_failures = 0;
-                crate::metrics::set_intake_consecutive_failures(slot, 0);
-                run.await
-            }
-        };
-        let ran_for = started.elapsed();
-        if ran_for >= backoff.healthy_after() {
-            consecutive_failures = 0;
-        }
-        let retry_in = backoff.next_delay(ran_for);
-        restarts += 1;
-        let lock_held = matches!(
-            outcome,
-            Err(IntakeError::Staging(StagingError::ProducerAlreadyRunning))
-        );
-        consecutive_failures += 1;
-        crate::metrics::set_intake_consecutive_failures(slot, consecutive_failures);
-        match outcome {
-            Err(_) if lock_held => {
-                if standing_by {
-                    tracing::debug!(
-                        slot = %slot,
-                        retry_in = ?retry_in,
-                        restarts,
-                        consecutive_failures,
-                        "CDC intake still standing by: another producer session holds the \
-                         staging producer lock"
-                    );
-                } else {
-                    tracing::info!(
-                        slot = %slot,
-                        retry_in = ?retry_in,
-                        restarts,
-                        consecutive_failures,
-                        "CDC intake standing by: another producer session holds the staging \
-                         producer lock, so this client isn't staging source changes; it will \
-                         keep retrying and take over once that session ends. The holder may be \
-                         another staging worker, or this client's own previous session that \
-                         the server hasn't yet noticed is gone"
-                    );
-                }
-                crate::metrics::increment_intake_restarts("producer_lock_held");
-            }
-            Err(err) => {
-                tracing::error!(
-                    slot = %slot,
-                    error = %err,
-                    code = ?err.code(),
-                    ran_for = ?ran_for,
-                    retry_in = ?retry_in,
-                    restarts,
-                    consecutive_failures,
-                    "CDC intake stopped with an error; source changes are not being staged \
-                     until it restarts"
-                );
-                crate::metrics::increment_intake_restarts("error");
-            }
-            Ok(()) => {
-                tracing::error!(
-                    slot = %slot,
-                    ran_for = ?ran_for,
-                    retry_in = ?retry_in,
-                    restarts,
-                    consecutive_failures,
-                    "CDC intake's replication stream ended unexpectedly; source changes are \
-                     not being staged until it restarts"
-                );
-                crate::metrics::increment_intake_restarts("stream_ended");
-            }
-        }
-        standing_by = lock_held;
-        tokio::time::sleep(retry_in).await;
-    }
-}
-
 /// A cheap, process-local uniqueness token for `claimed_by` prefixes — not a
 /// UUID (no such dependency here), just enough entropy that two clients in
 /// the same process (as in a test) don't collide. `thread::current().id()`
@@ -865,13 +640,13 @@ async fn setup_staging(
     pool: &Pool,
 ) -> Result<ProducerSession, ClientError> {
     let mut session = ProducerSession::connect(dsn, config.schema()).await?;
-    let tables = defs::publication_tables(pool).await?;
+    let tables = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let outcome =
         capture::reconcile::reconcile(session.client_mut(), config.schema(), &tables, deadline)
             .await
             .map_err(capture_pass_error)?;
-    intake::publication::park_ready_registration_markers(session.client(), &outcome.ready).await?;
+    intake::markers::park_ready_registration_markers(session.client(), &outcome.ready).await?;
     Ok(session)
 }
 
@@ -885,54 +660,6 @@ fn capture_pass_error(err: CaptureError) -> ClientError {
         // Not raised by a pass as a whole.
         other => ClientError::Config(crate::error::Error::Config(other.to_string())),
     }
-}
-
-// Intake no longer runs (issue #622 C5); C8 deletes this with it.
-#[allow(dead_code)]
-/// Decomposes `dsn` into the discrete host/port/user/password/database
-/// fields [`IntakeConfig`] needs for its *replication* connection (the
-/// `pgwire_replication` transport takes these fields directly, not a DSN
-/// string).
-fn build_intake_config(
-    dsn: &str,
-    config: &Config,
-    options: &ClientOptions,
-) -> Result<IntakeConfig, ClientError> {
-    let pg_config = crate::config::parse_dsn(dsn).map_err(ClientError::Config)?;
-
-    let host = match pg_config.get_hosts().first() {
-        Some(Host::Tcp(host)) => host.clone(),
-        #[cfg(unix)]
-        Some(Host::Unix(path)) => path.display().to_string(),
-        None => {
-            return Err(ClientError::Config(crate::error::Error::Config(
-                "dsn has no host".to_string(),
-            )));
-        }
-    };
-    let port = pg_config.get_ports().first().copied().unwrap_or(5432);
-    let user = pg_config.get_user().unwrap_or("postgres").to_string();
-    let password = pg_config
-        .get_password()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-        .unwrap_or_default();
-    let database = pg_config.get_dbname().unwrap_or(&user).to_string();
-
-    Ok(IntakeConfig {
-        dsn: dsn.to_string(),
-        schema: config.schema().to_string(),
-        host,
-        port,
-        user,
-        password,
-        database,
-        slot: options.slot.clone(),
-        publication: options.publication.clone(),
-        wake_channel: options.wake_channel.clone(),
-        spill_threshold: options.spill_threshold,
-        hard_cap: options.hard_cap,
-        group_commit: options.group_commit,
-    })
 }
 
 // ---------------------------------------------------------------------
@@ -963,7 +690,7 @@ struct MaintenanceConfig {
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
 /// drained-segment retirement (stage 06, issue #13/#58), and — on its own,
-/// coarser cadence — publication/backfill re-reconciliation (issue #14) on a
+/// coarser cadence — capture/backfill re-reconciliation (issue #14) on a
 /// fixed tick until shutdown. Rides only with the staging worker (see the
 /// module doc comment) — application-only clients never run this, since
 /// sealing/recovery/reclaim/retirement/reconciliation are ring-wide
@@ -1077,7 +804,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // Issue #476: a marker nothing has fenced yet (a finished
                 // build's go-live catch-up, say) is discharged on this tick,
                 // not a whole `reconcile_interval` later.
-                let wanted = intake::publication::discharge_wanted(&*c).await;
+                let wanted = intake::markers::discharge_wanted(&*c).await;
                 match failures.check("discharge_wanted", wanted) {
                     Ok(true) => next_reconcile = Instant::now(),
                     Ok(false) => {}
@@ -1175,14 +902,14 @@ async fn release_singleton(session: Option<ProducerSession>) {
 const RECONCILE_DDL_BUDGET: Duration = Duration::from_secs(1);
 
 /// Whether [`maintenance_loop`] may run its next reconcile pass early, as
-/// soon as `intake::publication::discharge_wanted` finds a fresh marker
+/// soon as `intake::markers::discharge_wanted` finds a fresh marker
 /// (issue #476), given how long its last pass took.
 ///
-/// A pass that took a whole `catch_up_timeout` spent it waiting: on a fresh
-/// fence that a long transaction elsewhere in the cluster holds open, or on
-/// intake. The loop is the only sealer, so it seals nothing meanwhile.
-/// Issue #431 bounds that stall to one timeout per pass, and passes used to
-/// come one `reconcile_interval` apart. Early passes don't, so markers
+/// A pass that took a whole `catch_up_timeout` spent it waiting on a fresh
+/// fence that a long transaction elsewhere in the cluster holds open. The
+/// loop is the only sealer, so it seals nothing meanwhile. Issue #431 bounds
+/// that stall to one timeout per pass, and passes used to come one
+/// `reconcile_interval` apart. Early passes don't, so markers
 /// parked one after another (a batch of builds finishing) behind such a
 /// transaction would each start a pass that waits it out, back to back, and
 /// sealing would all but stop. After a pass like that, the next one waits
@@ -1437,13 +1164,12 @@ impl From<IntakeError> for ReconcileError {
 /// (issue #431) before leaving their markers for a later pass. It runs this
 /// long only while a long transaction is open elsewhere in the cluster. The
 /// maintenance loop does no sealing meanwhile, so this is also the longest
-/// seal stall one pass can add. (It also bounds the discharge's wait for
-/// intake, issue #312, which trigger capture makes a no-op, issue #622 C5.)
-/// The value is a judgement call, not a measured bound.
+/// seal stall one pass can add. The value is a judgement call, not a
+/// measured bound.
 const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Issue #14: re-derives the desired source-table set from the catalog
-/// ([`defs::publication_tables`]), brings every table's capture triggers to
+/// ([`defs::tables_to_capture`]), brings every table's capture triggers to
 /// it ([`capture::reconcile::reconcile`], issue #622 C5), parks a marker for
 /// every newly registered definition whose capture is now current, and
 /// discharges the pending markers. Re-run periodically, so a transform
@@ -1461,7 +1187,7 @@ const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The pass gives locked tables [`RECONCILE_DDL_BUDGET`] in all, then leaves
 /// them for the next pass, which comes one `reconcile_interval` later. The
-/// discharge's wait for intake is a no-op (`watermark` is always caught up
+/// discharge's watermark wait is a no-op (`watermark` is always caught up
 /// under trigger capture); its fence wait stays, because a marker on a
 /// seam-fed table still needs it (#622 plan finding 1).
 async fn reconcile_source_tables(
@@ -1473,14 +1199,14 @@ async fn reconcile_source_tables(
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), ReconcileError> {
-    let desired = defs::publication_tables(pool).await?;
+    let desired = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
-    intake::publication::park_ready_registration_markers(&*client, &outcome.ready).await?;
+    intake::markers::park_ready_registration_markers(&*client, &outcome.ready).await?;
     // The markers whose discharge failed are already logged and backed off on
     // their own rows (issue #407). Only a failure of the pass itself errors,
     // and costs this connection a reconnect.
-    intake::publication::run_pending_backfills_for(
+    intake::markers::run_pending_backfills_for(
         client,
         wake_channel,
         watermark,
@@ -1542,18 +1268,16 @@ struct AppWorkerConfig {
     /// How often this app-worker task sweeps `backfill_chunks` for a stale
     /// claim (see [`sweep_stale_chunks_if_due`]) — independent of
     /// `ClientOptions::staging_worker`, since a stale backfill-chunk claim
-    /// isn't a CDC-intake/ring concern the way segment maintenance is (see
+    /// isn't a capture/ring concern the way segment maintenance is (see
     /// this field's own call site's doc comment). Reuses
     /// `ClientOptions::maintenance_interval`'s cadence rather than inventing
     /// a third interval knob.
     chunk_reclaim_interval: Duration,
     /// Issue #132, epic #127, guard (a): this fleet's shared in-process
-    /// "staged-through" watermark — the same `Arc` `run()` constructs and
-    /// clones into `intake::Intake::connect` (when this client also runs
-    /// `staging_worker: true`), threaded here so [`staging::drain_many`]'s
-    /// own Phase 3 apply can check guard (a) for any relationship reverse
-    /// record it drains. See `run()`'s own doc comment on this field for
-    /// the multi-process-fleet caveat.
+    /// "staged-through" watermark — the one `run()` constructs, always
+    /// caught up under trigger capture — threaded here so
+    /// [`staging::drain_many`]'s own Phase 3 apply can check guard (a) for
+    /// any relationship reverse record it drains.
     watermark: staging::StagedWatermark,
     /// [`ClientOptions::drain_batch_cap`]: bounds both how many segments one
     /// drain coalesces and how many folded records one page holds.
@@ -1776,8 +1500,8 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
 /// self-healing for a crashed drain worker's claimed chunk: it would sit
 /// stuck at `Backfilling` forever unless some *other* client instance in the
 /// fleet happened to also run with `staging_worker: true`. Unlike segment
-/// maintenance (legitimately tied to owning the replication slot), reclaiming
-/// a stale backfill-chunk claim has nothing to do with CDC intake, so it's
+/// maintenance (legitimately tied to the staging-worker singleton), reclaiming
+/// a stale backfill-chunk claim has nothing to do with capture, so it's
 /// wired here instead — into the one loop every client with
 /// `application_threads > 0` runs regardless of `staging_worker`.
 async fn sweep_stale_chunks_if_due(
@@ -2221,19 +1945,15 @@ mod wake_listener_tests {
 }
 
 #[cfg(test)]
-pub(crate) mod intake_supervisor_tests {
-    //! Issue #325: intake's terminal outcome must never vanish silently.
-    //! These drive [`supervise_intake`] with a fake attempt closure (no
-    //! Postgres), capturing `tracing` events on the test thread.
+pub(crate) mod log_capture {
+    //! Captures `tracing` events on the test thread, for the tests that
+    //! assert what a failure logs (issues #325, #408).
 
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex};
 
     use tracing::field::{Field, Visit};
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-
-    use super::*;
 
     #[derive(Debug, Clone)]
     pub(crate) struct CapturedEvent {
@@ -2285,29 +2005,9 @@ pub(crate) mod intake_supervisor_tests {
         (tracing::subscriber::set_default(subscriber), captured)
     }
 
-    /// A Prometheus recorder for one test's own metrics. Installed with
-    /// [`::metrics::set_default_local_recorder`], it takes this thread's
-    /// recordings in place of the process-global registry, so a test on the
-    /// current-thread runtime asserts on exactly what its own code recorded,
-    /// not on what another test in the same process happened to count.
-    pub(super) fn local_metrics() -> metrics_exporter_prometheus::PrometheusRecorder {
-        metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder()
-    }
-
-    /// The value of the series `series` (name plus labels, exactly as
-    /// rendered) in `rendered`, if it exists.
-    pub(super) fn series_value(rendered: &str, series: &str) -> Option<f64> {
-        let prefix = format!("{series} ");
-        rendered
-            .lines()
-            .find_map(|line| line.strip_prefix(&prefix))
-            .map(|value| value.parse().expect("numeric series value"))
-    }
-
-    /// The flake behind `failed_run_is_logged_at_error_and_restarted`: a
-    /// thread with no subscriber is first to hit a callsite while this
-    /// test's capture is live. The capture must still see this thread's
-    /// event through that callsite.
+    /// A thread with no subscriber is first to hit a callsite while this
+    /// test's capture is live.
+    /// The capture must still see this thread's event through that callsite.
     #[test]
     fn a_callsite_first_hit_on_an_uncaptured_thread_still_reaches_the_capture() {
         fn log() {
@@ -2321,359 +2021,19 @@ pub(crate) mod intake_supervisor_tests {
         let events = captured.0.lock().unwrap().len();
         assert_eq!(events, 1, "the capture missed its own thread's event");
     }
-
-    /// Every supervisor test runs with tokio's clock paused
-    /// (`start_paused`), so time only moves when the whole runtime is
-    /// waiting on a timer. An attempt that fails without awaiting a timer
-    /// ran for exactly zero, however long a loaded box takes to run it, and
-    /// one that sleeps ran for exactly its sleep. That makes the healthy
-    /// window below a deterministic boundary rather than a race against the
-    /// scheduler (issue #365), and all the backoff sleeps cost no wall-clock
-    /// time. The tests' 10s `timeout` guards are virtual too: a supervisor
-    /// that stopped restarting leaves the runtime idle, so the clock jumps
-    /// straight to the guard and the test fails at once instead of hanging.
-    const FAST: RestartBackoff =
-        RestartBackoff::new(Duration::from_millis(1), Duration::from_millis(4));
-
-    /// The regression: a failing intake run used to end the task with the
-    /// error discarded (`let _ = intake.run().await`) — no log, no retry.
-    /// Now every failure is logged at `error!` with the error text and slot,
-    /// and intake is restarted rather than left dead.
-    #[tokio::test(start_paused = true)]
-    async fn failed_run_is_logged_at_error_and_restarted() {
-        let (_guard, captured) = install_capture();
-        let metrics = local_metrics();
-        let _metrics_guard = ::metrics::set_default_local_recorder(&metrics);
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut resumed_tx = Some(resumed_tx);
-
-        let counter = attempts.clone();
-        let supervisor = supervise_intake("slot_325", FAST, move || {
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let resumed = if n == 2 { resumed_tx.take() } else { None };
-            async move {
-                if let Some(tx) = resumed {
-                    // Third attempt: a healthy, long-running consumer.
-                    let _ = tx.send(());
-                    std::future::pending::<()>().await;
-                }
-                Err(IntakeError::MissingProgressRow {
-                    slot: format!("slot_325_attempt_{n}"),
-                })
-            }
-        });
-
-        tokio::select! {
-            _ = supervisor => panic!("supervise_intake must never return"),
-            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
-                got.expect("intake was never restarted after failing")
-                    .expect("sender dropped");
-            }
-        }
-
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-        let events = captured.0.lock().unwrap().clone();
-        let errors: Vec<_> = events
-            .iter()
-            .filter(|e| e.level == tracing::Level::ERROR)
-            .collect();
-        assert_eq!(errors.len(), 2, "one error! per failed attempt: {events:?}");
-        for (i, event) in errors.iter().enumerate() {
-            assert_eq!(
-                event.fields.get("slot").map(String::as_str),
-                Some("slot_325")
-            );
-            let error = event.fields.get("error").expect("error field");
-            assert!(
-                error.contains(&format!("slot_325_attempt_{i}")),
-                "error field must carry the intake error's text, got {error:?}"
-            );
-        }
-
-        let rendered = metrics.handle().render();
-        assert_eq!(
-            series_value(
-                &rendered,
-                "trellis_intake_restarts_total{outcome=\"error\"}"
-            ),
-            Some(2.0),
-            "one restart per failed attempt, in this test's own registry:\n{rendered}"
-        );
-    }
-
-    /// A clean `Ok(())` from `run()` means the replication stream ended —
-    /// the client never configures a stop LSN, so that's just as dead as an
-    /// error and must be surfaced and restarted too.
-    #[tokio::test(start_paused = true)]
-    async fn stream_end_is_logged_and_restarted() {
-        let (_guard, captured) = install_capture();
-        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut resumed_tx = Some(resumed_tx);
-        let mut first = true;
-
-        let supervisor = supervise_intake("slot_325_eos", FAST, move || {
-            let resumed = if first { None } else { resumed_tx.take() };
-            first = false;
-            async move {
-                if let Some(tx) = resumed {
-                    let _ = tx.send(());
-                    std::future::pending::<()>().await;
-                }
-                Ok(())
-            }
-        });
-
-        tokio::select! {
-            _ = supervisor => panic!("supervise_intake must never return"),
-            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
-                got.expect("intake was never restarted after its stream ended")
-                    .expect("sender dropped");
-            }
-        }
-
-        let events = captured.0.lock().unwrap().clone();
-        assert!(
-            events.iter().any(|e| e.level == tracing::Level::ERROR
-                && e.fields.get("slot").map(String::as_str) == Some("slot_325_eos")),
-            "a stream end must be logged at error: {events:?}"
-        );
-    }
-
-    /// The supervisor must feed each attempt's real uptime into the backoff:
-    /// two quick failures escalate the delay, then a failure after an attempt
-    /// that stayed up at least `max` restarts from `initial` again, and
-    /// starts a new failure streak rather than extending the old one.
-    #[tokio::test(start_paused = true)]
-    async fn supervisor_resets_backoff_after_a_long_running_attempt() {
-        let (_guard, captured) = install_capture();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut resumed_tx = Some(resumed_tx);
-
-        let counter = attempts.clone();
-        let supervisor = supervise_intake("slot_325_reset", FAST, move || {
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let resumed = if n == 3 { resumed_tx.take() } else { None };
-            async move {
-                if let Some(tx) = resumed {
-                    let _ = tx.send(());
-                    std::future::pending::<()>().await;
-                }
-                if n == 2 {
-                    // Stays up longer than FAST's 4ms cap before failing.
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(IntakeError::MissingProgressRow {
-                    slot: "slot_325_reset".to_string(),
-                })
-            }
-        });
-
-        tokio::select! {
-            _ = supervisor => panic!("supervise_intake must never return"),
-            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
-                got.expect("intake was never restarted").expect("sender dropped");
-            }
-        }
-
-        let events = captured.0.lock().unwrap().clone();
-        let errors: Vec<_> = events
-            .iter()
-            .filter(|e| e.level == tracing::Level::ERROR)
-            .collect();
-        let field = |name: &str| -> Vec<String> {
-            errors
-                .iter()
-                .map(|e| e.fields.get(name).cloned().expect(name))
-                .collect()
-        };
-        assert_eq!(field("retry_in"), ["1ms", "2ms", "1ms"], "{events:?}");
-        assert_eq!(
-            field("consecutive_failures"),
-            ["1", "2", "1"],
-            "the healthy run's own failure starts a new streak: {events:?}"
-        );
-    }
-
-    #[test]
-    fn backoff_doubles_to_the_cap_and_resets_after_a_healthy_run() {
-        let mut backoff = RestartBackoff::new(Duration::from_secs(1), Duration::from_secs(8));
-        let short = Duration::from_millis(10);
-        let delays: Vec<_> = (0..5).map(|_| backoff.next_delay(short)).collect();
-        assert_eq!(
-            delays,
-            [1, 2, 4, 8, 8].map(Duration::from_secs).to_vec(),
-            "exponential, capped at max"
-        );
-        // An attempt that stayed up at least `max` counts as healthy: the
-        // next failure is treated as a fresh one, not the tail of a streak.
-        assert_eq!(
-            backoff.next_delay(Duration::from_secs(8)),
-            Duration::from_secs(1)
-        );
-        assert_eq!(backoff.next_delay(short), Duration::from_secs(2));
-    }
-
-    fn lock_held() -> IntakeError {
-        IntakeError::Staging(StagingError::ProducerAlreadyRunning)
-    }
-
-    /// `slot`'s current `trellis_intake_consecutive_failures` value, if the
-    /// series exists yet.
-    fn consecutive_failures(slot: &str) -> Option<f64> {
-        let rendered = crate::metrics::Metrics::new().render_prometheus();
-        series_value(
-            &rendered,
-            &format!("trellis_intake_consecutive_failures{{slot=\"{slot}\"}}"),
-        )
-    }
-
-    /// Issue #341: another producer session holding the staging producer
-    /// lock must not log `error!` on every retry. The first refusal of a run
-    /// is `info!` (visible at the default level, marking the transition),
-    /// repeats are `debug!`, and the restart counter records them under their
-    /// own outcome. Intake still isn't running, so the streak gauge counts
-    /// them.
-    #[tokio::test(start_paused = true)]
-    async fn producer_lock_contention_logs_below_error() {
-        let (_guard, captured) = install_capture();
-        let metrics = local_metrics();
-        let _metrics_guard = ::metrics::set_default_local_recorder(&metrics);
-        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut resumed_tx = Some(resumed_tx);
-        let mut n = 0;
-
-        let supervisor = supervise_intake("slot_341", FAST, move || {
-            n += 1;
-            let resumed = if n == 4 { resumed_tx.take() } else { None };
-            async move {
-                if let Some(tx) = resumed {
-                    let _ = tx.send(());
-                    std::future::pending::<()>().await;
-                }
-                Err(lock_held())
-            }
-        });
-
-        tokio::select! {
-            _ = supervisor => panic!("supervise_intake must never return"),
-            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
-                got.expect("intake was never restarted").expect("sender dropped");
-            }
-        }
-
-        let events = captured.0.lock().unwrap().clone();
-        let levels: Vec<_> = events
-            .iter()
-            .filter(|e| e.fields.get("slot").map(String::as_str) == Some("slot_341"))
-            .map(|e| e.level)
-            .collect();
-        assert_eq!(
-            levels,
-            [
-                tracing::Level::INFO,
-                tracing::Level::DEBUG,
-                tracing::Level::DEBUG
-            ],
-            "{events:?}"
-        );
-
-        let rendered = metrics.handle().render();
-        assert_eq!(
-            series_value(
-                &rendered,
-                "trellis_intake_restarts_total{outcome=\"producer_lock_held\"}"
-            ),
-            Some(3.0),
-            "lock-held restarts must stay countable:\n{rendered}"
-        );
-        assert_eq!(
-            series_value(
-                &rendered,
-                "trellis_intake_consecutive_failures{slot=\"slot_341\"}"
-            ),
-            Some(3.0),
-            "the lock's holder may be this client's own dead session, so refusals must stay \
-             visible to a streak alert"
-        );
-    }
-
-    /// Issue #342: the consecutive-failures gauge climbs with each attempt in
-    /// a row that ends (error, stream end or lock refusal), and drops back to
-    /// 0 once a running attempt passes the healthy window, without waiting
-    /// for that attempt to end.
-    #[tokio::test(start_paused = true)]
-    async fn consecutive_failures_tracks_the_streak_and_clears_while_healthy() {
-        const SLOT: &str = "slot_342";
-        let seen_at_attempt_start = Arc::new(Mutex::new(Vec::new()));
-        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut resumed_tx = Some(resumed_tx);
-        let mut n = 0;
-
-        let seen = seen_at_attempt_start.clone();
-        let supervisor = supervise_intake(SLOT, FAST, move || {
-            seen.lock().unwrap().push(consecutive_failures(SLOT));
-            n += 1;
-            let resumed = if n == 6 { resumed_tx.take() } else { None };
-            async move {
-                match n {
-                    1 | 2 | 5 => Err(IntakeError::MissingProgressRow {
-                        slot: SLOT.to_string(),
-                    }),
-                    3 => Ok(()),
-                    4 => Err(lock_held()),
-                    _ => {
-                        let _ = resumed.expect("sixth attempt").send(());
-                        std::future::pending().await
-                    }
-                }
-            }
-        });
-
-        tokio::select! {
-            // Polled first, so by the time the second branch's sleep (past
-            // the healthy window) completes, the supervisor has already been
-            // woken for its own, earlier healthy-window timer.
-            biased;
-            _ = supervisor => panic!("supervise_intake must never return"),
-            got = tokio::time::timeout(Duration::from_secs(10), async {
-                resumed_rx.await.expect("sender dropped");
-                tokio::time::sleep(FAST.healthy_after() * 2).await;
-            }) => got.expect("intake was never restarted"),
-        }
-
-        assert_eq!(
-            *seen_at_attempt_start.lock().unwrap(),
-            [
-                Some(0.0),
-                Some(1.0),
-                Some(2.0),
-                Some(3.0),
-                Some(4.0),
-                Some(5.0)
-            ],
-            "errors, stream ends and lock refusals all extend the streak"
-        );
-        assert_eq!(
-            consecutive_failures(SLOT),
-            Some(0.0),
-            "an attempt that stays up past the healthy window clears the streak"
-        );
-    }
 }
 
 #[cfg(test)]
 mod maintenance_failure_tests {
     //! Issue #408: [`maintenance_loop`] used to drop every step's error.
 
-    use super::intake_supervisor_tests::{CapturedEvent, install_capture};
+    use super::log_capture::{CapturedEvent, install_capture};
     use super::*;
 
     /// Issue #476: a pass that ran out a whole catch-up timeout (a fence a
-    /// long transaction holds, or intake behind) sends the next one back to
-    /// the regular interval, so fresh markers can't start waiting passes back
-    /// to back while the loop seals nothing.
+    /// long transaction holds) sends the next one back to the regular
+    /// interval, so fresh markers can't start waiting passes back to back
+    /// while the loop seals nothing.
     #[test]
     fn a_pass_that_ran_out_its_timeout_suspends_early_passes() {
         let timeout = Duration::from_secs(5);
@@ -2820,7 +2180,7 @@ mod drain_failure_tests {
     //! Issue #660: [`app_worker_loop`] used to release and retry a failed
     //! drain without logging it.
 
-    use super::intake_supervisor_tests::{CapturedEvent, install_capture};
+    use super::log_capture::{CapturedEvent, install_capture};
     use super::*;
 
     fn field<'a>(event: &'a CapturedEvent, name: &str) -> &'a str {
@@ -3069,20 +2429,6 @@ mod error_code_tests {
         assert_eq!(wrapped.code(), expected);
         assert_eq!(wrapped.code(), ErrorCode::Conflict);
     }
-
-    /// Issue #608: intake's replication settings come from its own parse of
-    /// the DSN, whose failure must not echo part of the password.
-    #[test]
-    fn intake_config_dsn_error_carries_no_password_fragment() {
-        for dsn in crate::config::malformed_dsn_fixtures::DSNS {
-            let config = Config::from_dsn(dsn).expect("schema is valid; only the DSN is bogus");
-            let err = build_intake_config(dsn, &config, &ClientOptions::default())
-                .map(|_| ())
-                .expect_err("the DSN doesn't parse");
-            assert_eq!(err.code(), ErrorCode::Validation, "{err:?}");
-            crate::config::malformed_dsn_fixtures::assert_no_password_fragment(dsn, &err);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3208,7 +2554,7 @@ mod backfill_chunk_claim_tests {
         .await
         .expect("install_definition");
         // Registration only records it; the discharge plans the chunks.
-        crate::intake::publication::discharge_registrations(&pool)
+        crate::intake::markers::discharge_registrations(&pool)
             .await
             .expect("dispatch the build");
         let chunk_count: i64 = raw

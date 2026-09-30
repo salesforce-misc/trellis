@@ -5,7 +5,7 @@
 //!
 //! A from-scratch backfill used to run entirely through the staging ring:
 //! [`super::catalog::create_definition`] enumerates every source row as a
-//! `Recompute` marker (`intake::publication::enumerate_and_append`), which the
+//! `Recompute` marker (`intake::markers::enumerate_and_append`), which the
 //! ring then folds and applies. That stages one marker per source row, folds
 //! the whole table in a single ring segment, and applies it as one giant
 //! transaction — the cost M0's benchmark measured and M1/M2 chipped at.
@@ -40,8 +40,8 @@
 //!    already relies on: live CDC isn't applied to the definition until the
 //!    build has finished and flipped it `live`, and any genuine post-build
 //!    delta the ring later applies lands on a fully-built row. The build runs
-//!    as a background job after its source joined the publication (ADR-0016,
-//!    issue #419), so a commit it read can also be streamed and drain after
+//!    as a background job after its source's capture was installed (ADR-0016,
+//!    issue #419), so a commit it read can also be captured and drain after
 //!    the flip; for an aggregate, the recompute horizon each built group row
 //!    records makes such a delta re-derive the group instead of counting the
 //!    commit twice (see [`backfill_aggregate`]). This is deliberately *not* the
@@ -663,7 +663,7 @@ pub(crate) async fn backfill_altered_columns(
     // Issue #315: unlike a first build, this rewrites a live target that
     // other definitions may already read, so each chunk's changed rows go
     // through the target-mutation seam in the chunk's own transaction.
-    let qualified_target = crate::intake::publication::qualify(target_schema, &def.target)
+    let qualified_target = crate::intake::markers::qualify(target_schema, &def.target)
         .map_err(|err| BackfillError::Unsupported(err.to_string()))?;
     for (lo, hi) in discover_pk_ranges(&**client, &source, &pk).await? {
         let txn = client.transaction().await?;
@@ -896,7 +896,7 @@ async fn write_one_to_one_range(
 /// `backfill_one_to_one` would (same [`substitute_all_fields`] call), then
 /// returns the same `(lo, hi]` PK-range boundaries its loop would have
 /// walked — without writing a single row of the target. The backfill
-/// discharge (`intake::publication::run_pending_backfills`, ADR-0016) calls
+/// discharge (`intake::markers::run_pending_backfills`, ADR-0016) calls
 /// this for a plain (non-relationship) 1-1 definition once its capture point
 /// has passed, and persists the boundaries as durable `backfill_chunks` work
 /// items that drain threads execute.
@@ -917,7 +917,7 @@ pub(crate) async fn plan_one_to_one_chunks(
     // `backfill_chunks.lo`/`.hi` (V20__backfill_chunks.sql) are each a single
     // `text` column — issue #121 reuses this crate's existing composite-key
     // identity text ([`ddl::join_pk_key`], the same encoding
-    // `crate::intake::extract_key`/`ddl::pk_key_sql_expr` already use
+    // a capture trigger and `ddl::pk_key_sql_expr` already use
     // everywhere else) to fold a multi-column bound into that one column
     // rather than widening the schema, and degenerates to the bound's own
     // single value, verbatim, at arity 1 (byte-identical to before this
@@ -1554,7 +1554,7 @@ async fn backfill_aggregate(
     // Issue #419: the build is a live read of the source, so each group row
     // records its recompute horizon exactly as the forced path's re-derivation
     // does (issue #321, [`ddl::RECOMPUTE_LSN_COLUMN`]). The build runs after
-    // its source joined the publication, so a commit it read is streamed too,
+    // its source's capture was installed, so a commit it read is captured too,
     // and that commit's delta can drain after the definition goes live. The
     // position is read in the ledger statement, after its snapshot is taken,
     // so every commit that statement saw ends at or below it, and such a delta

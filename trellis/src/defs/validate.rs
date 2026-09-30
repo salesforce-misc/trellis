@@ -117,7 +117,8 @@ pub enum ValidationError {
     TableCycle { cycle: Vec<String> },
     /// The target table is the same as the source table. Calculated columns
     /// must live on a separate neighbor table — writing them back onto the
-    /// source would feed our own WAL into ingestion (see `docs/data-flow.md`).
+    /// source would feed our own writes back into capture (see
+    /// `docs/data-flow.md`).
     TargetEqualsSource { table: String },
     /// The target's name ends with [`super::ledger::LEDGER_SUFFIX`], which
     /// names every target's ledger table (#623 D2): this target would be
@@ -394,22 +395,6 @@ pub enum ValidationError {
     /// exact text, so the engine and Postgres would disagree. Refused at
     /// define time, as #590 decided for join and key columns.
     NondeterministicCollationTextFunction(Box<NondeterministicCollationTextFunction>),
-    /// A *to-many* relationship's to-side (issue #41) lacks a replica identity
-    /// that carries the join column in row pre-images. For to-many, the join
-    /// key (`to_col`) is a *non-PK* column on the to-side, and the staging
-    /// reverse-recompute resolver reads it from the DELETE/UPDATE pre-image to
-    /// find which from-side rows to re-derive. Under the default replica
-    /// identity (primary key), that non-PK column is absent from the
-    /// pre-image, so a delete or a re-parent (UPDATE of the join column) would
-    /// silently under-recompute and diverge from the Postgres oracle with no
-    /// error. Accepted only when the to-side has `REPLICA IDENTITY FULL` or a
-    /// replica-identity index covering `to_col`; rejected at definition time
-    /// (ADR-0006, a correctness prerequisite → hard reject per ADR-0005).
-    RelationshipToManyRequiresReplicaIdentity {
-        name: String,
-        to_table: String,
-        to_col: String,
-    },
     /// An explicitly-qualified `FROM <schema>.<table>` source reference
     /// (issue #76, ADR-0007 grammar clause 4) named a schema that does not
     /// actually contain a table by that name, as introspected live against
@@ -956,19 +941,6 @@ impl fmt::Display for ValidationError {
                      the exact text, so the column needs a deterministic collation"
                 )
             }
-            ValidationError::RelationshipToManyRequiresReplicaIdentity {
-                name,
-                to_table,
-                to_col,
-            } => write!(
-                f,
-                "relationship '{name}' is to-many (its join key {to_table}.{to_col} is not \
-                 unique), so the to-side needs a replica identity that carries {to_col} in \
-                 delete/re-parent pre-images — otherwise reverse recompute can't find the \
-                 from-side rows to re-derive and silently diverges from the Postgres oracle; \
-                 run `ALTER TABLE {to_table} REPLICA IDENTITY FULL;` (or use a replica-identity \
-                 index that covers {to_col})"
-            ),
             ValidationError::QualifiedSourceTableNotFound { schema, table } => write!(
                 f,
                 "FROM names '{schema}.{table}' explicitly, but schema '{schema}' has no table \
@@ -1052,8 +1024,8 @@ impl std::error::Error for RelationshipWarning {}
 
 /// Validates `def` against the 1-1 subset. `source_columns` maps each
 /// column name known to exist on `def.source` to its [`ValueType`];
-/// resolving it against a real Postgres schema is intake's job (out of
-/// scope here — see issue #23's report), so callers supply it explicitly.
+/// resolving it against a real Postgres schema is out of scope here (see
+/// issue #23's report), so callers supply it explicitly.
 pub fn validate(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
@@ -1589,8 +1561,8 @@ fn reject_unsupported_group_by_key_type(
         //
         // `boolean` is the only type with a `pg_cast`-registered `::text`
         // function distinct from its output function (`pg_catalog.text
-        // (boolean)` renders `'true'`/`'false'`; `boolout` — what CDC
-        // decodes and what `intake::extract_key` stores verbatim — renders
+        // (boolean)` renders `'true'`/`'false'`; `boolout` — what a capture
+        // trigger's `format('%s', col)` writes into the ring — renders
         // `'t'`/`'f'`), so a `GROUP BY` key genuinely does have two
         // possible spellings depending on which code path produced it. See
         // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment for the live
@@ -1673,10 +1645,9 @@ fn reject_unsupported_group_by_key_type(
         // arm for real once issue #248 fixed its render-consistency defect
         // (it used to fall through to the reject arm below despite being
         // named here); `timestamptz` needed both #248's fix *and* #246's —
-        // its rendering is `TimeZone`-dependent, and half of it used to be
-        // produced by a walsender Trellis could not pin
-        // (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`) until issue #246
-        // wired `pgwire_replication::ReplicationConfig::with_options`.
+        // its rendering is `TimeZone`-dependent, so every renderer must pin
+        // the same `TimeZone` (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`,
+        // pinned on the pool and in every capture function).
         //
         // `interval` is the one temporal family still rejected here, for a
         // reason no GUC or renderer reconciliation touches: it has no
@@ -1694,8 +1665,8 @@ fn reject_unsupported_group_by_key_type(
         // `catalog::TEXT_STABLE_JOIN_KEY_TYPES` — the same split issue #119
         // gave `boolean`, for the same mechanical reason.
         //
-        // `inet_out` (what CDC decodes, what `intake::extract_key` stores
-        // verbatim) and `network_show` (`<col>::text` — what this engine's
+        // `inet_out` (what a capture trigger's `format('%s', col)` writes
+        // into the ring) and `network_show` (`<col>::text` — what this engine's
         // own live reads use, post-#248) disagree on a bare-host `inet`
         // value's spelling (`192.168.1.5` vs `192.168.1.5/32` — see
         // `crate::netaddr`'s module doc for the live grid), the identical
@@ -2692,9 +2663,9 @@ mod tests {
         // refusal list even though `PgType::VarBit` right next to it is
         // admitted — see this function's own `VarBit` arm for the DDL-only
         // reason (not a text-rendering one) the two split. `PgType::TimestampTz`
-        // used to be here too, until issue #246 pinned `TimeZone` on the
-        // walsender the way `DateStyle` was already pinned on the pool —
-        // see `defs_temporal.rs`'s live coverage for its new admitted status.
+        // used to be here too, until issue #246 pinned `TimeZone` everywhere
+        // `DateStyle` was already pinned — see `defs_temporal.rs`'s live
+        // coverage for its new admitted status.
         for pg_type in [
             PgType::Interval,
             PgType::Json,

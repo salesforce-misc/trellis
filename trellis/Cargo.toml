@@ -39,19 +39,6 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
     "registry",
 ] }
-# Intake's (#7) replication transport: a pgwire-protocol logical replication
-# client (START_REPLICATION + pgoutput framing). `default-features = false`
-# drops the `scram`/`md5` auth and `tls-rustls` features — fine against
-# testkit's trust-auth clusters and any authed production Postgres that
-# only needs plain TCP/TLS-terminated-elsewhere connectivity today; SCRAM
-# and rustls-TLS can be re-enabled via features (`scram`, `tls-rustls`) once
-# an authed production target needs them.
-# `0.4.1` (not just `0.4`) is a load-bearing floor, not a style nit: issue
-# #246, `ReplicationConfig::with_options` (the startup `options` parameter
-# pin `IntakeConfig::replication_config` below relies on) does not exist in
-# `0.4.0` at all, so a resolver that picked the older patch would fail to
-# compile here rather than silently missing the pin.
-pgwire-replication = { version = "0.4.1", default-features = false }
 refinery = { version = "0.9.2", default-features = false, features = ["tokio-postgres"] }
 regex = "1.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -124,10 +111,6 @@ internals = ["test-util"]
 
 [dev-dependencies]
 testkit = { path = "../testkit" }
-# `tests/intermediate_hop_cdc.rs` builds `pgwire_replication` events by hand,
-# and their payloads are `bytes::Bytes`. Already in the tree via
-# `pgwire-replication` itself.
-bytes = "1"
 # Turns on `internals` (see above) for this crate's own test targets only —
 # `tests/*.rs` are separate compilation units and cannot otherwise see the
 # tier-3 engine modules ADR-0012 made `pub(crate)`. Exactly the self

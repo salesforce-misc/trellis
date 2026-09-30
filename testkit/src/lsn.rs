@@ -1,8 +1,8 @@
 //! The LSN a test stages a CDC ring row at (issue #512).
 //!
-//! Intake stages each change at its commit's `end_lsn`, which is always
-//! below the WAL insert position read after the commit and above any
-//! position read before it. Aggregate apply compares that LSN with a group's
+//! A capture trigger stages each change at the WAL insert position it reads
+//! as the statement runs, which is below the position read after the commit
+//! and above any position read before the statement. Aggregate apply compares that LSN with a group's
 //! recompute horizon (issue #321's `delta_may_be_absorbed`, the extinct
 //! horizon, a build's stamped horizon): at or below, the group is re-derived
 //! from the source; above, the delta applies. A test that stages at a made-up
@@ -11,7 +11,7 @@
 //!
 //! [`wal_insert_lsn`] is the default for staging: read it right after the
 //! source write the staged change stands for, and the change lands where
-//! intake would have put it relative to every horizon the test set up. A
+//! capture would have put it relative to every horizon the test set up. A
 //! test that genuinely needs a specific LSN (fold ordering, a hand-built
 //! horizon comparison) passes its own and says why at the call site.
 

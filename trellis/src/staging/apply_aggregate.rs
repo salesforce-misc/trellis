@@ -674,7 +674,7 @@ impl AggregateTargetPlan {
 ///
 /// For a **composite** (multi-column) `GROUP BY`, the key is every column's
 /// text value joined on [`ddl::COMPOSITE_KEY_SEPARATOR`] (U+001F) — exactly
-/// [`ddl::pk_key_sql_expr`]'s/[`crate::intake::extract_key`]'s own composite
+/// [`ddl::pk_key_sql_expr`]'s/[`ddl::join_pk_key`]'s own composite
 /// primary-key identity encoding, in the same `GROUP BY` order
 /// [`ddl::create_aggregate_target_table`] declares the target's `UNIQUE
 /// NULLS NOT DISTINCT` grouping-column constraint in (and therefore the
@@ -791,9 +791,9 @@ impl AggregateTargetPlan {
 ///
 /// This is *not* the same hazard [`ddl::encode_key_part`] handles just above
 /// (a `NULL`/empty-string ambiguity in the *encoding*) — it is two different
-/// non-`NULL` **strings for one value**: `boolout` (what CDC/`pgoutput`
-/// decodes, verbatim, into `Row` — see `intake::pgoutput`'s tuple decoder)
-/// spells a boolean `'t'`/`'f'`; `staging::apply::row_as_text_jsonb_sql`'s
+/// non-`NULL` **strings for one value**: `boolout` (what a capture trigger
+/// images, and so what a ring row's image decodes into `Row` as) spells a
+/// boolean `'t'`/`'f'`; `staging::apply::row_as_text_jsonb_sql`'s
 /// `<col>::text` — what a bare, image-less recompute's live refetch decodes
 /// into the very same `Row` shape — calls a *different*, dedicated Postgres
 /// cast function (`pg_catalog.text(boolean)`, `catalog::

@@ -159,12 +159,9 @@ const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT su
 const SKU_TOTALS_ECHO: &str =
     "TRANSFORM sku_totals_echo FROM sku_totals SELECT total AS echo_total";
 
-/// `sales` needs `REPLICA IDENTITY FULL` because it's an aggregate source
-/// (`sku_totals`' own delta path needs the old row image to find which group
-/// to decrement). `sku_totals_echo` is a plain (non-aggregate)
-/// [`KeySpace::OneToOne`], so its own source (`sku_totals`) needs no replica
-/// identity widening — `catalog::assert_replica_identity_supports_aggregate`
-/// only gates a `GROUP BY` definition's own source.
+/// `sales` is an aggregate source (`sku_totals`' own delta path needs the old
+/// row image to find which group to decrement). `sku_totals_echo` is a plain
+/// (non-aggregate) [`KeySpace::OneToOne`] over `sku_totals`.
 ///
 /// Deliberately seeded with no `NULL`-`sku` row yet: the `NULL` group arrives
 /// later, purely as a live incremental change, so it exercises
@@ -180,7 +177,6 @@ async fn create_schema(client: &Client) {
             "create table sales ( \
                  id integer primary key, sku text, amount integer \
              ); \
-             alter table sales replica identity full; \
              insert into sales (id, sku, amount) values \
                (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
         )
@@ -220,13 +216,13 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     install_definition(&db.pool, SKU_TOTALS_ECHO, &sku_totals_columns(), "public")
         .await
         .expect("install the 1-1 chained onto the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     assert_eq!(

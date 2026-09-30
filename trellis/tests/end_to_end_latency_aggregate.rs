@@ -19,8 +19,7 @@
 //! itself also an aggregate) is reached purely through the aggregate-write
 //! path's own automatic downstream propagation (`apply.rs`'s "3b" step),
 //! not the 1-1 propagation path #51/#52 already covered. Schema/helper
-//! conventions (`qualify_fixture_table`, `replica identity full`,
-//! `active_seg_table`) are cribbed from
+//! conventions (`qualify_fixture_table`, `active_seg_table`) are cribbed from
 //! `defs_aggregate_chained_single_column_group_key.rs`, the front-door
 //! aggregate-chaining fixture issue #103's fix already exercises.
 
@@ -218,28 +217,20 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
     let mut client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute(
-            "create table sales (id integer primary key, sku text, amount numeric); \
-             alter table sales replica identity full",
-        )
+        .batch_execute("create table sales (id integer primary key, sku text, amount numeric)")
         .await
         .expect("create the aggregate source table");
 
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the upstream aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
-
-    client
-        .batch_execute("alter table e2e_latency_agg_sku_totals replica identity full")
-        .await
-        .expect("widen the upstream aggregate target's replica identity");
 
     install_definition(&db.pool, SKU_TOTALS_V2, &sku_totals_columns(), "public")
         .await
         .expect("install the aggregate chained onto the upstream aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // The one source-committed change this whole test traces: a brand-new

@@ -2,7 +2,7 @@
 //! definitions chained off it through one seam (`staging::target_mutations`),
 //! never through CDC. One regression test per writer that used to bypass it,
 //! plus the catalog rules that keep the seam the only path: a seam-only
-//! target is never published, and nothing can chain off a target that isn't
+//! target is never captured, and nothing can chain off a target that isn't
 //! live yet.
 //!
 //! Drains run by hand (seal, drain, retire until quiescent) rather than
@@ -18,9 +18,9 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{
     CatalogError, Statement, TransformStatus, alter_transform, create_definition,
-    create_relationship, install_definition, parse_statement, publication_tables,
+    create_relationship, install_definition, parse_statement, tables_to_capture,
 };
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::integer::IntWidth;
 use trellis::staging::quarantine;
 use trellis::staging::{
@@ -106,10 +106,10 @@ async fn rows(raw: &Client, sql: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Stages one CDC change as intake would, at the current WAL insert
+/// Stages one CDC change as capture would, at the current WAL insert
 /// position: a real commit LSN, above every horizon the test set up before
 /// it (issue #512), rather than a fake one below them all. `group_key` is
-/// what intake stamps on a relationship from-side's change: the `from_col`
+/// what capture stamps on a relationship from-side's change: the `from_col`
 /// values its images carry.
 async fn stage_cdc(
     raw: &mut Client,
@@ -188,18 +188,15 @@ async fn setup() -> (TestCluster, TestDatabase, Client) {
     (cluster, db, raw)
 }
 
-/// A target is never in the publication, even while another definition
-/// reads it: its readers hear about it through the seam. Since #403 that
+/// A target is never captured, even while another definition reads it: its readers hear about it through the seam. Since #403 that
 /// includes a target that is a relationship endpoint, whose settled parent
 /// projection the seam's CDC-shaped rows drive.
 #[tokio::test]
-async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
+async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
     let (_cluster, db, raw) = setup().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, k integer, v numeric); \
-         alter table public.src replica identity full; \
-         create table public.reports (id integer primary key, oid integer); \
-         alter table public.reports replica identity full",
+         create table public.reports (id integer primary key, oid integer)",
     )
     .await
     .expect("create sources");
@@ -215,9 +212,8 @@ async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
     )
     .await
     .expect("install the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
-    // No `REPLICA IDENTITY FULL` on `agg`: an aggregate over a seam-only
-    // target never reads its CDC, so it has no old-image requirement.
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    // An aggregate over a seam-only target never reads its capture.
     install_definition(
         &db.pool,
         "TRANSFORM public.hist FROM public.agg GROUP BY n SELECT COUNT(*) AS groups",
@@ -228,18 +224,19 @@ async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
         "public",
     )
     .await
-    .expect("an aggregate chained off an aggregate target needs no replica identity");
+    .expect("an aggregate chained off an aggregate target");
 
-    let mut published = publication_tables(&db.pool).await.expect("publication");
-    published.sort();
+    let mut captured = tables_to_capture(&db.pool)
+        .await
+        .expect("tables_to_capture");
+    captured.sort();
     assert_eq!(
-        published,
+        captured,
         vec!["public.src".to_string()],
-        "agg is hist's source, but a seam-only target is never published"
+        "agg is hist's source, but a seam-only target is never captured"
     );
 
-    // A relationship endpoint is no exception. `t` is a plain 1-1 target, on
-    // its default replica identity.
+    // A relationship endpoint is no exception. `t` is a plain 1-1 target.
     raw.batch_execute("create table public.t (id integer primary key, doubled numeric)")
         .await
         .expect("create t");
@@ -263,12 +260,14 @@ async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
     )
     .await
     .expect("define a reader through the relationship");
-    let mut published = publication_tables(&db.pool).await.expect("publication");
-    published.sort();
+    let mut captured = tables_to_capture(&db.pool)
+        .await
+        .expect("tables_to_capture");
+    captured.sort();
     assert_eq!(
-        published,
+        captured,
         vec!["public.reports".to_string(), "public.src".to_string()],
-        "only true sources are published, not the endpoint target t"
+        "only true sources are captured, not the endpoint target t"
     );
 }
 
@@ -294,7 +293,7 @@ async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused(
     .await
     .expect("install h1");
     assert_eq!(h1.status.as_str(), "waiting_to_backfill");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch h1's chunks");
 
@@ -329,7 +328,6 @@ async fn resuming_an_aggregate_column_succeeds() {
     let (_cluster, db, raw) = setup().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, k integer, v numeric); \
-         alter table public.src replica identity full; \
          insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 5)",
     )
     .await
@@ -342,7 +340,7 @@ async fn resuming_an_aggregate_column_succeeds() {
     )
     .await
     .expect("install agg");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     raw.batch_execute(
         "insert into column_status (transform_table, column_name, last_error, local_fuse) \
          values ('agg', 'total', 'synthetic pause', true)",
@@ -436,7 +434,6 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, k text, v numeric); \
-         alter table public.src replica identity full; \
          insert into public.src values (1, 'a', 10), (2, 'a', 20), (3, 'b', 5)",
     )
     .await
@@ -453,7 +450,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     )
     .await
     .expect("install agg");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     install_definition(
         &db.pool,
         "TRANSFORM public.d FROM public.agg GROUP BY total SELECT COUNT(*) AS n",
@@ -465,7 +462,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     )
     .await
     .expect("install d");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select total::text, n::text from public.d").await,
@@ -518,7 +515,6 @@ async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, p numeric, q integer); \
-         alter table public.src replica identity full; \
          insert into public.src values (1, 1.5, 10), (2, 1.5, 20), (3, 2, 5)",
     )
     .await
@@ -531,7 +527,7 @@ async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
     )
     .await
     .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select p::text, t::text from public.agg").await,
@@ -626,8 +622,6 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
     raw.batch_execute(
         "create table public.posts (id integer primary key, word_count integer); \
          create table public.post_tags (id integer primary key, post integer, tag text); \
-         alter table public.post_tags replica identity full; \
-         alter table public.posts replica identity full; \
          create index on public.post_tags (post); \
          insert into public.posts values (1, 100), (2, 250); \
          insert into public.post_tags values (10, 1, 'rust'), (11, 2, 'rust'), (12, 1, 'db')",
@@ -653,7 +647,7 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
     )
     .await
     .expect("install tag_totals");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     install_definition(
         &db.pool,
         "TRANSFORM public.tag_view FROM public.tag_totals GROUP BY tag \
@@ -666,7 +660,7 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
     )
     .await
     .expect("install tag_view");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     raw.execute("update public.posts set word_count = 400 where id = 1", &[])
@@ -751,7 +745,7 @@ async fn a_target_write_racing_a_chained_definitions_creation_is_caught_up() {
     racing.commit().await.expect("commit the racing write");
 
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         WAKE,
         &StagedWatermark::saturated(),
@@ -855,11 +849,9 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, a numeric); \
-         alter table public.orders replica identity full; \
          insert into public.orders values (1, 1), (2, 2); \
          create table public.order_doubles (id integer primary key, x numeric); \
          create table public.reports (id integer primary key, oid integer); \
-         alter table public.reports replica identity full; \
          insert into public.reports values (1, 1); \
          create table public.report_view (id integer primary key, x numeric)",
     )
@@ -873,7 +865,7 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     create_relationship(
         &db.pool,
         "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
@@ -888,7 +880,7 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
     .await
     .expect("define a consumer through the relationship");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select id::text, x::text from public.report_view").await,
@@ -917,7 +909,7 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
         "it keeps applying"
     );
 
-    // A source change while the target is paused, staged as intake would. Its
+    // A source change while the target is paused, staged as capture would. Its
     // apply skips the frozen target, and the rebuild picks it up.
     raw.execute("update public.orders set a = 100 where id = 1", &[])
         .await
@@ -935,9 +927,9 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
         .apply("RESUME TRANSFORM order_doubles")
         .await
         .expect("resume the target");
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     let status: String = raw
@@ -985,11 +977,9 @@ async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, a numeric); \
-         alter table public.orders replica identity full; \
          insert into public.orders values (1, 1), (2, 2); \
          create table public.order_doubles (id integer primary key, x numeric); \
          create table public.reports (id integer primary key, oid integer); \
-         alter table public.reports replica identity full; \
          insert into public.reports values (1, 1), (2, 2); \
          create table public.report_view (id integer primary key, x numeric)",
     )
@@ -1003,7 +993,7 @@ async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     create_relationship(
         &db.pool,
         "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
@@ -1018,7 +1008,7 @@ async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
     .await
     .expect("define a consumer through the relationship");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     let projection: String = raw
         .query_one("select projection_table from relationship_projections", &[])
@@ -1089,9 +1079,9 @@ async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
         .apply("RESUME TRANSFORM order_doubles")
         .await
         .expect("resume the target");
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
@@ -1162,7 +1152,7 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client) {
     .await
     .expect("define d");
     drain_to_quiescence(&db.pool, raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, raw).await;
     assert_eq!(stored(raw, "t").await, "live", "precondition");
     assert_eq!(stored(raw, "d").await, "live", "precondition");
@@ -1234,12 +1224,12 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
 
     // The rebuild finishes: both are catching up, `t` on its own go-live
     // catch-up and `d` on the one the rebuild parked for its readers.
-    publication::settle_builds(&db.pool).await;
+    markers::settle_builds(&db.pool).await;
     assert_eq!(stored(&raw, "t").await, "catching_up");
     assert_eq!(stored(&raw, "d").await, "catching_up");
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
 
-    publication::discharge_registrations(&db.pool)
+    markers::discharge_registrations(&db.pool)
         .await
         .expect("discharge the catch-ups");
     drain_to_quiescence(&db.pool, &mut raw).await;
@@ -1282,7 +1272,7 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_catches_up() {
     assert_eq!(stored(&raw, "d").await, "live", "nothing was parked for d");
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
 
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut raw,
         WAKE,
         &StagedWatermark::saturated(),
@@ -1339,11 +1329,9 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, a numeric); \
-         alter table public.orders replica identity full; \
          insert into public.orders values (1, 1), (2, 2); \
          create table public.order_doubles (id integer primary key, x numeric); \
          create table public.reports (id integer primary key, oid integer, grp integer); \
-         alter table public.reports replica identity full; \
          insert into public.reports values (1, 1, 1), (2, 2, 1)",
     )
     .await
@@ -1356,7 +1344,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     create_relationship(
         &db.pool,
         "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
@@ -1382,7 +1370,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
     .await
     .expect("define a consumer through the relationship");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     let projection: String = raw
         .query_one("select projection_table from relationship_projections", &[])
@@ -1503,7 +1491,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
         .apply("RESUME TRANSFORM order_doubles")
         .await
         .expect("resume the target");
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     let rebuilt = BTreeMap::from([
         ("1".to_string(), "14".to_string()),
         ("2".to_string(), "16".to_string()),
@@ -1522,7 +1510,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
     // The pre-pause seam rows drain now, after the refresh.
     if stale_last {
         drain_to_quiescence(&db.pool, &mut raw).await;
-        publication::settle_registrations(&db.pool).await;
+        markers::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut raw).await;
         assert_eq!(
             rows(&raw, consumer_rows).await,
@@ -1536,7 +1524,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
         txn.commit().await.expect("commit");
     }
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, &projection_rows).await,
@@ -1581,8 +1569,7 @@ async fn only_a_rewrites_catch_up_refreshes_the_projection() {
         "create table public.orders (id integer primary key, a numeric); \
          insert into public.orders values (1, 1); \
          create table public.order_doubles (id integer primary key, x numeric); \
-         create table public.reports (id integer primary key, oid integer); \
-         alter table public.reports replica identity full",
+         create table public.reports (id integer primary key, oid integer)",
     )
     .await
     .expect("create tables");
@@ -1594,7 +1581,7 @@ async fn only_a_rewrites_catch_up_refreshes_the_projection() {
     .await
     .expect("define order_doubles");
     drain_to_quiescence(&db.pool, &mut raw).await;
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     create_relationship(
         &db.pool,
         "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
@@ -1623,7 +1610,7 @@ async fn only_a_rewrites_catch_up_refreshes_the_projection() {
         )
         .await
         .expect("park a marker on the target");
-        publication::run_pending_backfills(
+        markers::run_pending_backfills(
             &mut raw,
             WAKE,
             &StagedWatermark::saturated(),

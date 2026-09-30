@@ -173,7 +173,7 @@ impl RelationshipContext {
 /// passthrough and equality comparison.
 ///
 /// [`Value::Other`] (issue #108) is [`ValueType::Other`]'s value-level twin:
-/// a [`PgType`]-tagged column's CDC-decoded text, carried verbatim exactly
+/// a [`PgType`]-tagged column's captured text, carried verbatim exactly
 /// like `Uuid`/`Text` — this is the "typed CDC round-trip" the issue asks
 /// for, a value now remembers its real Postgres type family all the way
 /// through [`parse_value`] instead of arriving pre-flattened to `Text`.
@@ -924,7 +924,7 @@ fn eval_expr(
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
         // Issue #109: a typed literal evaluates to its own family-tagged
         // value, carrying the literal source text verbatim exactly as
-        // `Value::Other` does for a CDC-decoded column. That is only sound
+        // `Value::Other` does for a captured column. That is only sound
         // because `validate` has already required the text to be in the
         // family's canonical Postgres spelling — see `super::typed_literal`.
         Expr::TypedLiteral { value_type, text } => {
@@ -1334,7 +1334,7 @@ fn eval_aggregate_expr(
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
         // Issue #109: a typed literal evaluates to its own family-tagged
         // value, carrying the literal source text verbatim exactly as
-        // `Value::Other` does for a CDC-decoded column. That is only sound
+        // `Value::Other` does for a captured column. That is only sound
         // because `validate` has already required the text to be in the
         // family's canonical Postgres spelling — see `super::typed_literal`.
         Expr::TypedLiteral { value_type, text } => {
@@ -2933,7 +2933,7 @@ mod tests {
     /// Issue #108's typed CDC round-trip: a column classified as
     /// [`ValueType::Other`] (a recognized-but-not-first-class-yet PG type
     /// family, e.g. `jsonb`) still passes through `parse_value` tagged with
-    /// its real [`PgType`], carrying the CDC-decoded text verbatim exactly
+    /// its real [`PgType`], carrying the captured text verbatim exactly
     /// like [`Value::Uuid`]/[`Value::Text`] above — not silently
     /// mislabeled/misrouted as `Text` the way it collapsed pre-#108.
     #[test]
@@ -3406,7 +3406,7 @@ mod tests {
 
     #[test]
     fn parse_boolean_accepts_both_the_terse_and_sql_standard_spellings() {
-        // Issue #119's live finding: `boolout` (what CDC/`pgoutput` decodes,
+        // Issue #119's live finding: `boolout` (what capture images,
         // and what a bare column fetch renders) spells a boolean `'t'`/`'f'`,
         // while `<col>::text` — a *different*, dedicated Postgres cast
         // function only `boolean` has — spells it `'true'`/`'false'`. The

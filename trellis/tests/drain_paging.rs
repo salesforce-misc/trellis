@@ -66,10 +66,7 @@ async fn claim_committed(
 /// `items` plus the SUM/COUNT aggregate over it.
 async fn setup_aggregate(db: &testkit::TestDatabase, client: &Client) {
     client
-        .batch_execute(
-            "create table items (id integer primary key, grp integer, amount numeric); \
-             alter table items replica identity full",
-        )
+        .batch_execute("create table items (id integer primary key, grp integer, amount numeric)")
         .await
         .expect("create items");
     let def = parse(GROUP_TOTALS).expect("parse");
@@ -84,10 +81,7 @@ async fn setup_aggregate(db: &testkit::TestDatabase, client: &Client) {
 /// `items` plus a 1-1 copy of it.
 async fn setup_copy(db: &testkit::TestDatabase, client: &Client) {
     client
-        .batch_execute(
-            "create table items (id integer primary key, grp integer, amount numeric); \
-             alter table items replica identity full",
-        )
+        .batch_execute("create table items (id integer primary key, grp integer, amount numeric)")
         .await
         .expect("create items");
     let def = parse(ITEM_COPY).expect("parse");

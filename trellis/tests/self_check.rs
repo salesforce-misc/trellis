@@ -81,7 +81,7 @@ const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// running `Client`'s drain workers that `defs_backfill_chunk_queue.rs`
 /// uses.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    // No live `Intake` here (rows are staged by hand below), so there is no
+    // No live capture here (rows are staged by hand below), so there is no
     // real staged watermark to hold apply back. A saturated one never does.
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
@@ -145,7 +145,7 @@ async fn converged_fixture(
     trellis.apply(transform).await.expect("define");
     // No staging worker runs here: stand in for its discharge, which takes
     // a definition over an empty source straight to `live`.
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the build");
     let status: String = raw
@@ -786,10 +786,7 @@ async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
         .get()
         .await
         .expect("connection")
-        .batch_execute(
-            "create table orders (id integer primary key, region text); \
-             alter table orders replica identity full",
-        )
+        .batch_execute("create table orders (id integer primary key, region text)")
         .await
         .expect("create source table");
 

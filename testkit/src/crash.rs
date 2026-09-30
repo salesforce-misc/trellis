@@ -1,5 +1,5 @@
 //! Seams for durability tests that need to kill a process mid-operation
-//! (intake's kill-9 durability tests) or hold a transaction open across a
+//! (the generative suite's subprocess engine) or hold a transaction open across a
 //! concurrent operation (the "straddler"/phase-gap tests). This module
 //! provides the mechanism; the actual crash points and assertions belong to
 //! those test suites.

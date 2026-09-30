@@ -102,8 +102,8 @@ fn qualify_fixture_table(name: &str) -> String {
 }
 
 /// A composite primary-key identity string, U+001F-joined in the key's own
-/// declared column order — the same encoding `intake::extract_key` (real
-/// CDC) and `intake::publication::enumerate_and_append` (ring-based
+/// declared column order — the same encoding the capture trigger (real
+/// CDC) and `intake::markers::enumerate_and_append` (ring-based
 /// backfill) both already produce, and the one `ddl::pk_key_sql_expr`/
 /// `ddl::split_pk_key` on the apply side now agree with (issue #126). Every
 /// `post_tags` fixture below declares its primary key `(post, tag)` in that
@@ -183,19 +183,12 @@ const TAG_TOTALS: &str = "TRANSFORM tag_totals FROM post_tags GROUP BY tag \
 
 /// Issue #94's schema, minus its surrogate `id` column: `post_tags`' own
 /// primary key is the composite `(post, tag)` pair — the shape issue #126's
-/// report names explicitly (`post_tags (post, tag)`). `REPLICA IDENTITY
-/// FULL` on both tables for the same reasons as
-/// `defs_aggregate_relationship.rs`'s `create_schema`: `post_tags` is an
-/// aggregate source (the delta/recompute path needs the old image to locate
-/// a changed row's leaving group), and `posts` is the to-side of a to-one
-/// relationship whose settled parent projection requires it unconditionally.
+/// report names explicitly (`post_tags (post, tag)`).
 async fn create_schema(client: &Client) {
     client
         .batch_execute(
             "create table posts (id integer primary key, word_count integer); \
              create table post_tags (post integer, tag text, primary key (post, tag)); \
-             alter table post_tags replica identity full; \
-             alter table posts replica identity full; \
              insert into posts (id, word_count) values (1, 100), (2, 250), (3, null); \
              insert into post_tags (post, tag) values \
                (1, 'rust'), (2, 'rust'), (1, 'db'), \
@@ -249,7 +242,7 @@ async fn aggregate_over_a_to_one_relationship_with_composite_pk_backfills_to_the
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition against a composite-pk source");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     drain_to_quiescence(&db.pool, &mut client).await;
 
@@ -291,7 +284,7 @@ async fn forward_insert_of_a_composite_pk_from_side_row_updates_its_group_total(
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -354,7 +347,7 @@ async fn reverse_update_of_the_to_side_row_updates_every_dependent_group() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -408,7 +401,6 @@ async fn plain_aggregate_over_a_composite_pk_source_drains_with_no_relationship_
                  order_id integer, line_no integer, category text, amount numeric, \
                  primary key (order_id, line_no) \
              ); \
-             alter table order_lines replica identity full; \
              insert into order_lines (order_id, line_no, category, amount) values \
                (1, 1, 'books', 10), (1, 2, 'books', 5), (2, 1, 'toys', 20)",
         )
@@ -429,7 +421,7 @@ async fn plain_aggregate_over_a_composite_pk_source_drains_with_no_relationship_
     )
     .await
     .expect("install a plain aggregate over a composite-pk source");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let read_totals = async |client: &Client| -> Totals {

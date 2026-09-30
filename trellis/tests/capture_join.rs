@@ -57,7 +57,7 @@ async fn definer(dsn: &str) -> Trellis {
 /// The capture half of one pass, over the tables the catalog says to
 /// capture, with `budget` for locked tables.
 async fn capture_pass(raw: &mut Client, pool: &trellis::Pool, budget: Duration) -> PassOutcome {
-    let desired = trellis::defs::publication_tables(pool)
+    let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
     reconcile::reconcile(raw, SCHEMA, &desired, Instant::now() + budget)
@@ -423,9 +423,7 @@ async fn a_reader_of_a_widened_to_side_waits_for_the_to_sides_gate() {
     let mut raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.p (id int primary key, name text, tier text); \
-         create table public.c (id int primary key, pid int, amount int); \
-         alter table public.p replica identity full; \
-         alter table public.c replica identity full;",
+         create table public.c (id int primary key, pid int, amount int)",
     )
     .await
     .expect("seed");
@@ -509,7 +507,7 @@ async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
         .apply("TRANSFORM tu FROM public.u SELECT a AS a")
         .await
         .expect("define tu");
-    let desired = trellis::defs::publication_tables(&db.pool)
+    let desired = trellis::defs::tables_to_capture(&db.pool)
         .await
         .expect("read the tables to capture");
     trellis
@@ -784,8 +782,6 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
         "create table public.p (id int primary key, name text); \
          create table public.c (id int primary key, \
              pid int references public.p (id) on delete cascade, amount int); \
-         alter table public.p replica identity full; \
-         alter table public.c replica identity full; \
          insert into public.p select g, 'p' || g from generate_series(1, 10) g; \
          insert into public.c select g, 1 + g % 10, g from generate_series(1, 100) g;",
     )
@@ -885,7 +881,6 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
     let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.s (id int primary key, grp text); \
-         alter table public.s replica identity full; \
          insert into public.s values (1, 'g0'); \
          create function public.promote() returns trigger language plpgsql as $$ \
          begin \

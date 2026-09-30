@@ -20,7 +20,7 @@
 //!
 //! **This file's restart property found a real engine bug, and fixed the
 //! majority of it.** The replication intake Trellis ran before #622 resumed
-//! a fresh connection from the replication slot's server-tracked position
+//! a fresh connection from its slot's server-tracked position
 //! rather than its own durably persisted watermark, so Postgres redelivered
 //! already-applied transactions, silently double-counting an `Aggregate`
 //! target's `SUM`/`COUNT`. That intake is gone.

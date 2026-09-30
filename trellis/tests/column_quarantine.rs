@@ -10,8 +10,8 @@
 //! Postgres instance per test (`testkit::TestCluster`), and "reach past the
 //! mechanism, insert directly" for whichever half of a scenario the
 //! mechanism under test doesn't itself produce (staging a malformed CDC
-//! image directly into the ring, rather than routing through a live
-//! replication slot).
+//! image directly into the ring, rather than routing through the capture
+//! triggers).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -619,7 +619,7 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
             .get(0)
     };
     assert_eq!(status_of(&client).await, "catching_up");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("discharge the resume's catch-up");
     assert_eq!(status_of(&client).await, "live");
@@ -1074,7 +1074,7 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
         TransformStatus::WaitingToBackfill,
         "registration only records the definition (ADR-0016)"
     );
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     assert_eq!(
@@ -1183,10 +1183,6 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
     let mut client = connect_raw(db.dsn()).await;
 
     seed_order_totals(&db, &client).await;
-    client
-        .batch_execute("alter table order_totals replica identity full")
-        .await
-        .expect("set replica identity full (an aggregate source needs full pre-images)");
 
     // A downstream aggregate transform reading `order_totals.total` — the
     // scope-cut this fix enforces: column-level pause/cascade/resume never
@@ -1764,7 +1760,7 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
     .await
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     assert_eq!(
@@ -1904,7 +1900,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     .await
     .expect("install_definition records the definition and returns");
     assert_eq!(summary_def.status, TransformStatus::WaitingToBackfill);
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     assert_eq!(
@@ -1986,10 +1982,8 @@ async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_li
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full; \
              insert into articles (id, category_id) values (1, 10)",
         )
         .await
@@ -2377,7 +2371,7 @@ async fn pausing_a_column_that_does_not_exist_is_refused_before_anything_is_writ
 /// asserts the catch-up the resume parked repairs it.
 #[tokio::test]
 async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute() {
-    use trellis::intake::publication;
+    use trellis::intake::markers;
     use trellis::staging::{has_pending, retire_drained_segments};
 
     let cluster = TestCluster::start();
@@ -2444,7 +2438,7 @@ async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute
     // drain the enumeration it stages.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        publication::run_pending_backfills(
+        markers::run_pending_backfills(
             &mut client,
             "trellis_column_quarantine_test",
             &StagedWatermark::saturated(),

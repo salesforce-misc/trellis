@@ -203,7 +203,7 @@
 //! Same shared-cluster-per-thread, isolated-database-per-case `Harness`
 //! pattern as `tests/convergence.rs` (see that file's module doc comment for
 //! why); this file's `HARNESS` is its own, independent `thread_local`, so the
-//! two test binaries never share a cluster or a slot/publication.
+//! two test binaries never share a cluster or a database.
 
 use generative::backend::{Backend, ConcurrentBackend, ManualBackend, SPLIT_THRESHOLD_ROWS};
 use generative::generate::{
@@ -838,8 +838,8 @@ async fn every_mid_burst_action_runs_while_its_burst_writes_the_source() {
     )
     .await
     .expect("connect concurrent backend");
-    // Non-default names, as the properties use: `request_backfill` has to
-    // check the backend's own publication, not the default one (#641).
+    // `request_backfill` has to find the table among the ones this backend
+    // captures (#641).
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
     let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
         .await

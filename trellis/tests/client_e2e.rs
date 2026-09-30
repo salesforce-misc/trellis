@@ -45,9 +45,8 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Polls `predicate` on `interval` until it returns `true`, or panics with
 /// `message` once `timeout` elapses. Every wait in this file goes through
-/// here rather than a bare `sleep` — real logical-replication intake can
-/// take a few seconds to first-stage a change, but no wait here is
-/// unbounded.
+/// here rather than a bare `sleep` — the engine can take a few seconds to
+/// apply a change, but no wait here is unbounded.
 async fn poll_until<F>(timeout: Duration, interval: Duration, message: &str, mut predicate: F)
 where
     F: AsyncFnMut() -> bool,
@@ -92,10 +91,8 @@ fn totals_def() -> TransformDef {
     }
 }
 
-/// Creates `orders` plus `totals`'s definition and target table. `orders`
-/// keeps Postgres's default replica identity (its primary key) rather than
-/// `REPLICA IDENTITY FULL`: this scalar sum never needs an old image, and
-/// capture keys a row by its primary key whatever the identity. Returns the
+/// Creates `orders` plus `totals`'s definition and target table. Capture
+/// keys a row by its primary key. Returns the
 /// primary key column the caller needs for both the target DDL and the
 /// oracle recompute.
 async fn setup_source_and_target(
@@ -278,9 +275,9 @@ async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle()
 /// current (post-truncate) contents, with no trace of the truncated rows.
 /// Also covers the ordering case directly: a row inserted in the very same
 /// transaction as the `TRUNCATE` (so it shares one commit `lsn` with it,
-/// distinguishable only by intake's append order) must survive, proving the
+/// distinguishable only by capture's append order) must survive, proving the
 /// fold's `change_id` tie-break (not just `lsn`) governs the void filter
-/// through the real intake path, not just the hand-staged fold tests.
+/// through the real capture path, not just the hand-staged fold tests.
 #[tokio::test]
 async fn a_truncate_clears_the_target_then_post_truncate_inserts_converge_to_the_oracle() {
     let cluster = TestCluster::start();
@@ -318,7 +315,7 @@ async fn a_truncate_clears_the_target_then_post_truncate_inserts_converge_to_the
 
     // The truncate itself, plus a same-transaction post-truncate insert
     // (id 4) — both commit under one `lsn`, so surviving this correctly
-    // depends on intake's append order (`change_id`), not `lsn` alone. A
+    // depends on capture's append order (`change_id`), not `lsn` alone. A
     // separate, later transaction adds id 5, exercising the ordinary
     // cross-transaction case too.
     let mut txn_conn = connect_raw(db.dsn()).await;
@@ -497,24 +494,24 @@ fn comments_calc_custom_schema_def() -> TransformDef {
 
 /// Issue #75, ADR-0007's regression case: `client::reconcile_source_tables`
 /// (the same issue #14 periodic re-derivation the test above exercises) must
-/// reconcile the publication against each newly-registered source's own
+/// reconcile capture against each newly-registered source's own
 /// *actual* persisted qualified name — not a bare suffix re-guessed against
 /// `Config::target_schema` (`"public"` by default). Before the fix,
 /// `defs::all_source_tables` returned only `comments`'s bare suffix, and
 /// `reconcile_source_tables` re-qualified it as `public.comments` regardless
-/// of where the real table lived — silently publishing/backfilling a
+/// of where the real table lived — silently capturing/backfilling a
 /// same-named decoy in `public` instead (or failing loudly if none existed).
 ///
 /// Proven with exactly that shape: a same-named, same-shaped decoy sits in
 /// `public` — the schema the old bug guessed — while the real, registered
 /// source lives in `custom`, named explicitly via issue #76's `FROM
 /// custom.comments` grammar, registered *after* the client is already
-/// running (so the startup publication never named it — discovering it is exactly the periodic-reconcile job under test). A
+/// running (so the startup reconcile never named it — discovering it is exactly the periodic-reconcile job under test). A
 /// row inserted into `custom.comments` after registration must still reach
 /// `comments_calc`: that requires the periodic reconcile to have added
-/// `custom.comments` (not `public.comments`) to the publication, so CDC
-/// actually streams it. If the old bug were still present, `custom.comments`
-/// would never join the publication and this insert would simply never
+/// `custom.comments` (not `public.comments`) to capture, so its triggers
+/// actually stage it. If the old bug were still present, `custom.comments`
+/// would never be captured and this insert would simply never
 /// propagate, timing the `poll_until` below out.
 #[tokio::test]
 async fn a_transform_registered_against_an_explicitly_qualified_non_default_schema_source_reconciles_correctly()
@@ -536,7 +533,7 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
     // The decoy: same bare name and shape, sitting in `public` — the schema
     // the old bug's `reconcile_source_tables` would have (wrongly) assumed
     // every newly-discovered source table lived under. Left empty: if the
-    // bug is present, this is the table that (wrongly) joins the publication
+    // bug is present, this is the table that is (wrongly) captured
     // instead of `custom.comments`, so `custom.comments`'s own writes simply
     // never propagate — no row here should ever need to be read.
     raw.batch_execute(
@@ -581,7 +578,7 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
 
     // Proves the direct-enumeration initial backfill (unaffected by this
     // bug, since it enumerates synchronously at registration time rather
-    // than through the publication).
+    // than through capture).
     poll_until(
         Duration::from_secs(20),
         Duration::from_millis(200),
@@ -603,7 +600,7 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
     // The part that actually depends on the fix: a write to `custom.comments`
     // *after* registration only reaches `comments_calc` if the periodic
     // reconcile added the correct (`custom.comments`, not `public.comments`)
-    // table to the publication.
+    // table to capture.
     raw.batch_execute("insert into custom.comments (id, x, y) values (3, 10.00, 5.00)")
         .await
         .expect("insert a post-registration row into custom.comments");
@@ -612,7 +609,7 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
         Duration::from_secs(20),
         Duration::from_millis(200),
         "a post-registration write to custom.comments never reached comments_calc — \
-         the periodic reconcile must have published the wrong table",
+         the periodic reconcile must have captured the wrong table",
         async || {
             let target: HashMap<String, Option<String>> = raw
                 .query("select id::text, total::text from comments_calc", &[])
@@ -658,7 +655,7 @@ async fn staging_and_application_threads_are_independent_knobs() {
 
     setup_source_and_target(&db.pool, &raw).await;
 
-    // No app workers: staging (intake + sealing) must still run, but nothing
+    // No app workers: staging (capture + sealing) must still run, but nothing
     // drains the sealed batch into the target.
     let options = ClientOptions {
         staging_worker: true,
@@ -759,7 +756,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     // retries a fence pinned by another transaction for only a few seconds
     // and then returns without dispatching, so check that it did: a missing
     // chunk would otherwise surface as the wait below timing out.
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the chunked build");
     let chunks: i64 = raw
@@ -865,7 +862,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // discharge, which dispatches the chunked build (ADR-0016, #418).
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the chunked build");
 
@@ -1004,7 +1001,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // discharge, which dispatches the chunked build (ADR-0016, #418).
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the chunked build");
 

@@ -4,7 +4,7 @@
 //! Unlike `define`, this command can't just call `.migrate()` right after
 //! connecting: [`trellis::Trellis::connect`] with `staging: true` starts the
 //! staging worker *during* connect, and the worker reads the catalog for the
-//! tables to publish before this module gets a chance to run anything. On a
+//! tables to capture before this module gets a chance to run anything. On a
 //! genuinely fresh database (no Trellis tables at all) that read would fail
 //! with a raw "relation does not exist" error. So this module opens a
 //! short-lived, no-options connection first, migrates on it, and shuts it
@@ -13,7 +13,7 @@
 //! separate `migrate` step any more than `define` does.
 //!
 //! No definitions need to be registered yet (issue #427): the staging worker
-//! publishes nothing until `trellis apply` registers something, then picks
+//! captures nothing until `trellis apply` registers something, then picks
 //! it up on its next reconcile pass without a restart.
 //!
 //! ## `--prometheus-bind`
@@ -52,8 +52,9 @@ interrupted with Ctrl-C. Migrates the database first if needed. Definitions
 registered later (via `trellis apply`) are picked up without a restart.
 
 Options:
-  --staging                  Run the CDC/staging worker. Default.
-  --no-staging               Don't run the CDC/staging worker. Mutually
+  --staging                  Run the staging worker: installs capture triggers
+                             and seals the ring. Default.
+  --no-staging               Don't run the staging worker. Mutually
                              exclusive with --staging.
   --drain-threads <N>        Number of drain (application) worker threads to
                              run. Must be a non-negative integer. Default: 2.

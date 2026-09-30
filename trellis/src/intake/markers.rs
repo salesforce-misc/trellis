@@ -1,21 +1,16 @@
-//! Publication and slot lifecycle (issue #8) — see "Adjacent invariants
-//! that are easy to miss" and "Failure modes" in
-//! docs/staging-and-claiming/01-intake-and-lsn-confirmation.md:
+//! Backfill markers and their discharge (ADR-0016): see
+//! docs/staging-and-claiming/01-capture-by-triggers.md.
 //!
-//! - [`reconcile_publication`] changes a publication's table set in place
-//!   (`ALTER PUBLICATION ... ADD/DROP TABLE`), never by dropping and
-//!   recreating it.
-//! - [`run_pending_backfills`] discharges the `pending_backfill` markers
-//!   [`reconcile_publication`] leaves behind: a newly-added table's
-//!   pre-existing rows, staged by enumeration once the marker's transaction
-//!   fence (taken by the first pass to see the marker, issue #431) has
-//!   settled and intake has staged everything the enumeration's snapshot
-//!   sees (issue #312).
-//! - [`create_slot_and_park_markers`] creates a fresh install's slot and
-//!   parks a marker on every watched table, so the discharge captures each
-//!   one after the slot's consistent point. It reads no rows itself.
-//! - [`require_slot_healthy`] is the loud startup check for slot
-//!   invalidation/loss, including a slot recreated under the same name.
+//! - [`park_marker`] and its callers park a `pending_backfill` marker on a
+//!   table: when its capture triggers are installed or widened
+//!   (`capture::install`), when a registration is ready to build, or as a
+//!   go-live catch-up.
+//! - [`run_pending_backfills`] discharges the markers: once a marker's
+//!   transaction fence (taken by the first pass to see it, issue #431) has
+//!   settled, it dispatches the table's waiting definitions and, where a
+//!   reader needs it, enumerates the table's rows into the ring.
+//!
+//! F (#625) deletes the fences, the markers and the discharge.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -27,11 +22,10 @@ use super::error::IntakeError;
 use crate::defs::model::TransformStatus;
 use crate::pool::quote_ident;
 use crate::staging::append::{self, StagedChange};
-use crate::staging::session::ProducerSession;
 use crate::staging::watermark::StagedWatermark;
 
 /// Joins `schema` and `table` into the `"schema.table"` shape
-/// [`StagedChange::src_table`] uses throughout this crate — the *only* place
+/// a ring row's `src_table` uses throughout this crate — the *only* place
 /// that string is built. Enforces by construction the invariant
 /// [`split_qualified`] depends on: neither component may itself contain a
 /// `.`. A schema or table literally named `a.b` is legal Postgres (quoted),
@@ -53,7 +47,7 @@ pub(crate) fn qualify(schema: &str, table: &str) -> Result<String, IntakeError> 
     Ok(format!("{schema}.{table}"))
 }
 
-/// Splits a `"schema.table"` name (the shape [`StagedChange::src_table`]
+/// Splits a `"schema.table"` name (the shape a ring row's `src_table`
 /// uses throughout this crate) into its parts, for building DDL/enumeration
 /// SQL that needs them quoted separately. Unambiguous for every name this
 /// crate can actually produce: [`qualify`] is the sole construction site for
@@ -65,170 +59,20 @@ fn split_qualified(name: &str) -> Result<(&str, &str), IntakeError> {
         .ok_or_else(|| IntakeError::InvalidTableName(name.to_string()))
 }
 
-async fn current_publication_tables(
-    client: &impl GenericClient,
-    publication: &str,
-) -> Result<BTreeSet<String>, IntakeError> {
-    let rows = client
-        .query(
-            "select schemaname, tablename from pg_publication_tables where pubname = $1",
-            &[&publication],
-        )
-        .await?;
-    rows.into_iter()
-        .map(|r| qualify(&r.get::<_, String>(0), &r.get::<_, String>(1)))
-        .collect()
-}
-
-/// Reconciles `publication`'s table set to exactly `desired_tables`, in
-/// place — **never** by dropping and recreating the publication, which would
-/// orphan the slot's retention and lose rows written in the gap. Adding a
-/// table commits the `ALTER` and a `pending_backfill` marker in one
-/// transaction, so the follow-up enumeration ([`run_pending_backfills`]) is
-/// exactly as durable as the schema change that requires it. Idempotent:
-/// safe to call on every setup pass, and (issue #14) on every periodic
-/// re-reconciliation pass a running client's maintenance loop makes.
-///
-/// **Parks every registration's marker (ADR-0016, issue #418).** Registration
-/// reads no source rows and parks nothing: a `waiting_to_backfill` definition
-/// is captured by its source's marker's discharge, and this is where that
-/// marker comes from. In the same transaction as the `ALTER`s,
-/// [`park_registration_markers`] parks one on every source of a
-/// `waiting_to_backfill` definition that has none, provided the source needs
-/// no further publication change: it is in `desired_tables` (so published
-/// once this commits) or is another definition's target (never published,
-/// fed by the target-mutation seam). A source this pass just added already
-/// has its join marker.
-///
-/// Takes a plain `&mut tokio_postgres::Client` rather than a
-/// [`crate::staging::session::ProducerSession`]: nothing here needs that
-/// session's guards (`synchronous_commit`, the producer singleton advisory
-/// lock) — only its `transaction()`/`client()` shape, which a plain
-/// `Client` has too. That matters for a running client's maintenance loop,
-/// whose own connection is never a `ProducerSession`: the one already-live
-/// `ProducerSession` for the whole client lifetime is intake's own (held for
-/// as long as [`super::Intake`] runs), and the singleton lock it holds is
-/// session-scoped — a second `ProducerSession::connect` call while intake is
-/// running would simply fail to acquire it.
-///
-/// **User-table DDL (ADR-0002 I6, issue #621).** `ALTER PUBLICATION` locks
-/// each table it adds or drops (`SHARE UPDATE EXCLUSIVE`), so each attempt
-/// runs in its own transaction under
-/// [`crate::locks::share_update_exclusive_ddl_timeout`] (past the session's
-/// `deadlock_timeout`, so a blocking autovacuum is cancelled rather than
-/// waited out) and is retried by [`crate::locks::DdlRetry`] until it lands;
-/// see [`reconcile_publication_until`] for a caller that can't wait that
-/// long.
-pub async fn reconcile_publication(
-    client: &mut tokio_postgres::Client,
-    publication: &str,
-    desired_tables: &[String],
-) -> Result<(), IntakeError> {
-    reconcile_publication_until(client, publication, desired_tables, None).await
-}
-
-/// [`reconcile_publication`], retrying a lock timeout only while the next
-/// attempt could end by `deadline` (`None`: until it lands; the first attempt
-/// always runs). Past the deadline it returns the last attempt's
-/// `lock_not_available` error, having changed nothing
-/// ([`crate::locks::is_lock_not_available`] tells it apart): the maintenance
-/// loop, the only sealer, gives up on the pass rather than stop sealing.
-pub async fn reconcile_publication_until(
-    client: &mut tokio_postgres::Client,
-    publication: &str,
-    desired_tables: &[String],
-    deadline: Option<std::time::Instant>,
-) -> Result<(), IntakeError> {
-    let lock_timeout = crate::locks::read_share_update_exclusive_ddl_timeout(&*client).await?;
-    let mut retry = crate::locks::DdlRetry::new("alter publication", lock_timeout, deadline);
-    loop {
-        match reconcile_publication_once(client, publication, desired_tables, lock_timeout).await {
-            Err(err) if retry.again(&err).await => continue,
-            other => return other,
-        }
-    }
-}
-
-/// One attempt of [`reconcile_publication`]: one transaction, its `ALTER`s
-/// under `lock_timeout`.
-async fn reconcile_publication_once(
-    client: &mut tokio_postgres::Client,
-    publication: &str,
-    desired_tables: &[String],
-    lock_timeout: std::time::Duration,
-) -> Result<(), IntakeError> {
-    let current = current_publication_tables(client, publication).await?;
-    let desired: BTreeSet<&String> = desired_tables.iter().collect();
-
-    let to_add: Vec<&String> = desired_tables
-        .iter()
-        .filter(|t| !current.contains(*t))
-        .collect();
-    let to_drop: Vec<&String> = current.iter().filter(|t| !desired.contains(t)).collect();
-
-    let txn = client.transaction().await?;
-    let session_lock_timeout = crate::locks::begin_user_table_ddl(&txn, lock_timeout).await?;
-    for table in &to_drop {
-        let (schema, name) = split_qualified(table)?;
-        txn.execute(
-            &format!(
-                "alter publication {} drop table {}.{}",
-                quote_ident(publication),
-                quote_ident(schema),
-                quote_ident(name)
-            ),
-            &[],
-        )
-        .await?;
-    }
-    for table in &to_add {
-        let (schema, name) = split_qualified(table)?;
-        txn.execute(
-            &format!(
-                "alter publication {} add table {}.{}",
-                quote_ident(publication),
-                quote_ident(schema),
-                quote_ident(name)
-            ),
-            &[],
-        )
-        .await?;
-    }
-    crate::locks::end_user_table_ddl(&txn, &session_lock_timeout).await?;
-    // In the *same* transaction as the ADDs, so each marker is exactly as
-    // durable as its join. Its fence is taken later, by the discharge that
-    // first reads the committed marker (issue #431, [`park_marker`]). A table
-    // normally joins with nothing applying from it yet. One that left the
-    // publication while something did (an operator dropped it) has missed
-    // everything written meanwhile, so its readers catch up (issue #522).
-    let joined: Vec<String> = to_add.iter().map(|t| t.to_string()).collect();
-    park_table_catch_ups(&txn, &joined).await?;
-    park_registration_markers(&txn, desired_tables).await?;
-    txn.commit().await?;
-    Ok(())
-}
-
 /// Parks a `pending_backfill` marker on every source of a
-/// `waiting_to_backfill` definition that has no marker yet and needs no
-/// publication change: it is in `published`, or it is another definition's
-/// target (ADR-0016's "Who parks the marker"). See [`reconcile_publication`].
-///
-/// A source that is in neither is left for the pass that publishes it, whose
-/// join marker commits with the `ALTER`: a marker parked on it any earlier
-/// could discharge before the table joined the stream, and a
-/// commit between that read and the join would be neither read nor streamed.
+/// `waiting_to_backfill` definition that has no marker yet, provided the
+/// source is in `captured` or is another definition's target (ADR-0016's
+/// "Who parks the marker"). Test harness only: it stands in for the staging
+/// worker's [`park_ready_registration_markers`] in a test that captures
+/// nothing by triggers, where every source is taken as captured
+/// ([`discharge_registrations`]).
 ///
 /// A source that already has a marker is skipped: that marker's discharge
-/// dispatches every `waiting_to_backfill` definition on the table. If the
-/// marker is mid-discharge and that discharge read the table's definitions
-/// before this one registered, it deletes the marker without dispatching
-/// this one. The definition is then left without a marker only until the
-/// staging worker's next pass, which parks one here. The staging worker
-/// runs this every reconcile pass, right before its discharge, and is the
-/// only process that does (issue #427).
+/// dispatches every `waiting_to_backfill` definition on the table.
+#[cfg(any(test, feature = "internals"))]
 pub(crate) async fn park_registration_markers(
     client: &impl GenericClient,
-    published: &[String],
+    captured: &[String],
 ) -> Result<(), IntakeError> {
     let tables: Vec<String> = client
         .query(
@@ -241,7 +85,7 @@ pub(crate) async fn park_registration_markers(
                    select 1 from pending_backfill pb where pb.table_name = d.source_table \
                ) \
              order by 1",
-            &[&TransformStatus::WaitingToBackfill.as_str(), &published],
+            &[&TransformStatus::WaitingToBackfill.as_str(), &captured],
         )
         .await?
         .into_iter()
@@ -255,8 +99,7 @@ pub(crate) async fn park_registration_markers(
 
 /// Parks a `pending_backfill` marker on the source of every definition in
 /// `ready` that is still `waiting_to_backfill` and whose source has no marker
-/// yet: the trigger-capture form of [`park_registration_markers`] (issue
-/// #622 C5). `ready` is what the staging worker's reconcile pass found
+/// yet (issue #622 C5). `ready` is what the staging worker's reconcile pass found
 /// dispatchable ([`crate::capture::reconcile`]): every table the definition
 /// reads is captured by triggers that image the columns it needs, or is
 /// another definition's target, fed by the target-mutation seam. A
@@ -351,11 +194,9 @@ pub(crate) async fn park_target_catchup_if_read(
 
 /// Parks a marker on each of `tables` that re-reads it for definitions
 /// already applying from it, which may be missing changes to it that never
-/// reached them: a fresh install's slot ([`create_slot_and_park_markers`]),
-/// a table joining the publication ([`reconcile_publication`]), an
-/// explicit re-backfill ([`crate::Trellis::request_backfill`], issue #522)
-/// and a lost slot's recreation, for its to-sides
-/// ([`super::slot_loss::pause_if_slot_lost`], issue #533).
+/// reached them: a table whose capture triggers are installed
+/// (`capture::install`), and an explicit re-backfill
+/// ([`crate::Trellis::request_backfill`], issue #522).
 ///
 /// Each marker is a go-live catch-up ([`park_catch_up`]) for every applying
 /// definition that reads its table, directly or through a relationship
@@ -518,17 +359,19 @@ pub(crate) async fn park_catch_up(
 ///
 /// # Why the parking transaction's snapshot can't be the fence (issue #431)
 ///
-/// The join marker is parked inside the `ALTER PUBLICATION`'s own
-/// transaction ([`reconcile_publication`]), and any snapshot taken there
-/// predates the join's commit. A writer that gets its transaction id after
-/// that snapshot and writes the table before the `ALTER` commits is neither
-/// waited out by such a fence nor streamed (its write precedes the join). If
-/// it is still open when the discharge reads, its row is lost on both sides.
-/// The marker commits exactly when the `ALTER` does, so a fence taken after
-/// reading the committed marker postdates the join, and every such writer
-/// still open is behind it. That holds with no window to recover from after
-/// a crash. Every marker is fenced this way, including those parked where no
-/// `ALTER` happened (ADR-0016, "The join fence").
+/// A marker is parked inside the transaction that starts feeding its table,
+/// and any snapshot taken there predates that transaction's commit. A writer
+/// that gets its transaction id after that snapshot and writes the table
+/// before the park commits is neither waited out by such a fence nor fed to
+/// the ring (its write precedes the feed). If it is still open when the
+/// discharge reads, its row is lost on both sides. A capture install's
+/// `CREATE TRIGGER` rules that writer out by its table lock, but a go-live
+/// catch-up on a seam-fed table (another definition's target) has no such
+/// lock (#622 plan, finding 1). The marker commits exactly when the feed
+/// does, so a fence taken after reading the committed marker postdates it,
+/// and every such writer still open is behind it. That holds with no window
+/// to recover from after a crash. Every marker is fenced this way (ADR-0016,
+/// "The join fence").
 ///
 /// # A repeat park
 ///
@@ -581,7 +424,7 @@ pub(crate) async fn park_marker(
 /// nothing else to tell the staging worker. Each fresh marker triggers at
 /// most one early pass: the pass that sees it fences it
 /// ([`confirm_fence`]), after which this no longer counts it. A marker whose
-/// fence doesn't settle in that pass, or whose enumeration defers on intake,
+/// fence doesn't settle in that pass, or whose enumeration defers on the watermark,
 /// waits for the regular interval, as before. And after a pass that ran out
 /// a whole catch-up timeout, the loop stops asking until its next regular
 /// pass, so fresh markers parked behind a long transaction can't chain
@@ -711,7 +554,7 @@ struct PendingBackfill {
 }
 
 /// Reads every marker, in the order they were parked (issue #457): a pass
-/// that has to stop early (an enumeration deferred on intake) stops behind
+/// that has to stop early (an enumeration deferred on the watermark) stops behind
 /// the oldest park, the same one every time.
 async fn fetch_pending_backfills(
     client: &impl GenericClient,
@@ -823,11 +666,10 @@ pub(crate) async fn park_failed_build(
 }
 
 /// Page size for [`enumerate_and_append`]'s server-side cursor. Bounds one
-/// backfill enumeration pass to O(page) memory rather than O(table) — the
-/// same class of fix issue #8 gave the CDC stream path via [`super::spill`],
-/// applied here to the enumeration path that used to `SELECT` an entire
-/// source table into one `Vec`. 10k rows keeps each `FETCH` round-trip cheap
-/// while staying a trivial allocation even for a table with wide keys.
+/// backfill enumeration pass to O(page) memory rather than O(table): the
+/// enumeration path used to `SELECT` an entire source table into one `Vec`. 10k
+/// rows keeps each `FETCH` round-trip cheap while staying a trivial allocation
+/// even for a table with wide keys.
 const BACKFILL_PAGE_ROWS: i64 = 10_000;
 
 /// The fixed cursor name [`enumerate_and_append`] declares. A literal, not
@@ -844,8 +686,7 @@ const BACKFILL_CURSOR: &str = "trellis_backfill_cursor";
 /// Streams via a server-side `DECLARE ... CURSOR` rather than one `SELECT`
 /// of the whole table: the earlier version bought a `Vec<StagedChange>` the
 /// same size as the source table, unbounded memory for a backfill of any
-/// real size (the same class of bug issue #8 fixed for the stream path via
-/// spill). A cursor only lives for the transaction that declares it, which
+/// real size. A cursor only lives for the transaction that declares it, which
 /// is exactly the scope `txn` already has here — so paging changes nothing
 /// about the one-transaction durability guarantee.
 ///
@@ -871,7 +712,7 @@ pub(crate) async fn enumerate_and_append(
 ///
 /// Split out for issue #312: the cursor's snapshot is fixed here, at
 /// `DECLARE`, so [`run_pending_backfills`] can capture the WAL position that
-/// bounds everything that snapshot sees, and wait for intake to stage up to
+/// bounds everything that snapshot sees, and wait on the watermark to stage up to
 /// it, *before* [`fetch_read`] writes a single `Recompute` row or deletes a
 /// single target row.
 ///
@@ -917,11 +758,11 @@ async fn enumeration_branch(txn: &Transaction<'_>, src_table: &str) -> Result<St
     // `PRIMARY KEY`, or, for an aggregate target (which has none), the
     // `UNIQUE NULLS NOT DISTINCT` grouping columns. Looking only for a
     // primary key used to fail every catch-up marker parked on an aggregate
-    // target with `MissingKeyValue`, which left the marker in place to fail
-    // every later pass the same way.
+    // target, which left the marker in place to fail every later pass the
+    // same way.
     let key_cols = crate::defs::ddl::identity_key_columns(txn, src_table).await?;
     if key_cols.is_empty() {
-        return Err(IntakeError::MissingKeyValue {
+        return Err(IntakeError::NoIdentityKey {
             table: src_table.to_string(),
         });
     }
@@ -1026,7 +867,7 @@ pub(super) async fn fetch_read(
 /// `catch_up_timeout`, for the transactions open at it to end
 /// ([`fresh_fences_settled`]), so the marker normally settles in that same
 /// pass. That is one wait for all the markers the pass fences, and if it runs
-/// out (a long transaction anywhere in the cluster), the pass's intake waits
+/// out (a long transaction anywhere in the cluster), the pass's watermark waits
 /// below get no timeout: a pass stalls the maintenance loop for at most one
 /// `catch_up_timeout`. Later passes check the recorded fence without waiting.
 /// A park since the read leaves the marker unfenced for the next pass.
@@ -1071,9 +912,7 @@ pub(super) async fn fetch_read(
 /// background-built definitions (chunks or a direct-build job, which read the
 /// table themselves) reads the table (a catch-up for applying readers). A
 /// marker on a table only background-built definitions read, or nothing
-/// reads at all (issue #417: a fresh install parks a marker on every table
-/// the catalog publishes, [`create_slot_and_park_markers`]), is discharged
-/// without enumerating.
+/// reads at all (issue #417), is discharged without enumerating.
 ///
 /// A go-live catch-up always enumerates. An earlier optimization let a
 /// direct build's catch-up skip a table that looked unchanged since the
@@ -1081,28 +920,15 @@ pub(super) async fn fetch_read(
 /// inserted and deleted again during the build nets out on both, although
 /// the build counted it (issue #468). So it was removed.
 ///
-/// # Waiting for intake before staging (issue #312)
+/// # Waiting on the watermark before staging (issue #312)
 ///
-/// A marker's table is already in the publication when its enumeration runs,
-/// so a change committed between the `ALTER` and the enumeration reaches the
-/// ring twice: once as its own CDC delta, and once inside the enumeration's
-/// image-less `Recompute`, which an aggregate turns into a full re-derive of
-/// the group from live state. That is harmless only if the delta lands in
-/// the same batch as the recompute, or an earlier one. If the recompute's
-/// batch seals first, the aggregate re-derives a value that already includes
-/// the change, and the delta arriving in a later batch adds it a second time.
-/// Intake lags the source, so without a gate the recompute rows routinely
-/// reach the ring ahead of the CDC for changes the enumeration already saw.
+/// The enumeration does not append until `watermark` reaches
+/// `pg_current_wal_insert_lsn()` read right after its cursor's `DECLARE`.
+/// Trigger capture stages every change in its writer's transaction, so the
+/// staging worker passes [`StagedWatermark::saturated`] and this wait is a
+/// no-op (issue #622 C5); F (#625) deletes it.
 ///
-/// So the enumeration does not append until intake has staged everything
-/// its cursor can see. The cursor's snapshot is fixed at `DECLARE`; every
-/// commit visible to it ends before `pg_current_wal_insert_lsn()` read right
-/// after. Once `watermark` (intake's in-process staged-through position)
-/// reaches that LSN, those commits' CDC rows are committed in the ring, so
-/// the `Recompute` rows appended afterward resolve the ring pointer later
-/// and commit later: they land in the same batch as that CDC or a later one.
-///
-/// If intake doesn't get there within `catch_up_timeout`, the whole
+/// If the watermark doesn't get there within `catch_up_timeout`, the whole
 /// discharge rolls back — no chunk is enqueued and no status moves — and the
 /// marker stays, so the next pass retries cleanly. The pass then stops rather
 /// than waiting again on the remaining markers: each later horizon is at
@@ -1128,9 +954,8 @@ pub(super) async fn fetch_read(
 /// that expect one; [`run_pending_backfills_until`] returns them all without
 /// failing the pass.
 ///
-/// A caller with no intake running yet must not call this at all (see
-/// `client::setup_staging`); tests with no CDC stream pass
-/// [`crate::staging::StagedWatermark::saturated`].
+/// Callers pass [`crate::staging::StagedWatermark::saturated`]; only tests
+/// that exercise the wait pass another.
 ///
 /// # Dropping what the source no longer backs (issues #330, #485, #436)
 ///
@@ -1147,7 +972,7 @@ pub(super) async fn fetch_read(
 ///
 /// The sweep's anti-joins are branches of the same cursor as the enumeration
 /// ([`declare_read`]), so both are judged on one snapshot, and the deletes
-/// run as that cursor is fetched, after the intake wait ([`fetch_read`]).
+/// run as that cursor is fetched, after the watermark wait ([`fetch_read`]).
 /// Judging the two on different snapshots left an aggregate group stale
 /// whichever order they ran in (issue #436). The `resume_orphans` module doc
 /// has the full argument.
@@ -1182,7 +1007,7 @@ pub(crate) struct FailedDischarge {
 }
 
 /// [`run_pending_backfills`], with `stop` checked while an enumeration waits
-/// for intake. When `stop` returns `true` the wait gives up early, through
+/// on the watermark. When `stop` returns `true` the wait gives up early, through
 /// the same rollback as a timeout, so the maintenance loop shuts down
 /// promptly with nothing half-dispatched.
 ///
@@ -1377,10 +1202,11 @@ pub(crate) async fn run_pending_backfills_for(
 /// transaction elsewhere in the cluster holds the fence past `timeout`, and
 /// the marker then waits for a later pass, as any unsettled fence does.
 ///
-/// The bound is the intake wait's ([`run_pending_backfills`]'s "Waiting for
-/// intake before staging"), and the pass lets at most one of these waits run
-/// out: when this one does, the pass's intake waits get no timeout, so an
-/// enumeration intake hasn't already caught up with defers at once. The
+/// The bound is the watermark wait's ([`run_pending_backfills`]'s "Waiting on
+/// the watermark before staging"), and the pass lets at most one of these
+/// waits run out: when this one does, the pass's watermark waits get no
+/// timeout, so an enumeration the watermark hasn't already reached defers at
+/// once. The
 /// maintenance loop, the only sealer, stalls no more than one timeout per
 /// pass, however many markers the pass fenced.
 async fn fresh_fences_settled(
@@ -1399,11 +1225,11 @@ async fn fresh_fences_settled(
     }
 }
 
-/// How long the pass's intake waits may run after its fence wait
+/// How long the pass's watermark waits may run after its fence wait
 /// ([`fresh_fences_settled`]): the full `catch_up_timeout` if the fences
 /// settled, and nothing if the wait ran out (or `stop` ended it). A fence wait
-/// that ran out has spent the pass's one timeout, so an enumeration that
-/// intake hasn't already caught up with defers at once instead of stalling
+/// that ran out has spent the pass's one timeout, so an enumeration the
+/// watermark hasn't already reached defers at once instead of stalling
 /// the maintenance loop for a second timeout.
 fn intake_wait_after_fence_wait(fences_settled: bool, catch_up_timeout: Duration) -> Duration {
     if fences_settled {
@@ -1418,7 +1244,7 @@ enum Discharge {
     /// The dispatches, the enumeration (if the table needed one) and the
     /// marker's delete committed together.
     Committed,
-    /// Intake had not staged through `horizon` in time, so the transaction
+    /// The watermark had not reached `horizon` in time, so the transaction
     /// rolled back and the marker stays.
     Deferred { horizon: PgLsn },
     /// An `ALTER TRANSFORM` field on the table is still paused awaiting a
@@ -1769,8 +1595,8 @@ async fn discharge_marker(
 const CATCH_UP_POLL: Duration = Duration::from_millis(5);
 
 /// Waits until `watermark` reaches `horizon`, `timeout` elapses, or `stop`
-/// returns `true`. Returns whether intake got there — see
-/// [`run_pending_backfills`]'s "Waiting for intake before staging".
+/// returns `true`. Returns whether the watermark got there — see
+/// [`run_pending_backfills`]'s "Waiting on the watermark before staging".
 async fn intake_caught_up(
     watermark: &StagedWatermark,
     horizon: PgLsn,
@@ -1812,15 +1638,15 @@ async fn intake_caught_up(
 /// - A flipped definition's target that some applying definition reads (see
 ///   [`park_target_catchup_if_read`]): its readers re-derive from the
 ///   rebuilt target, and are `catching_up` until they have.
-/// - A flipped definition's source that is another definition's target: it
-///   was enumerated while the definition wasn't applying, which the
-///   target-mutation seam skips, and that target is never in the
-///   publication. A write to it between the enumeration and the flip reached
-///   nobody. Its writers are drain workers, which don't wait for a seal, so
-///   the only-sealer argument above doesn't cover them: the definition
-///   applies from this flip on, and reports `live` only once this catch-up
-///   has run ([`go_live_caught_up`]). The next discharge flips nothing out of
-///   `waiting_to_backfill`, so this doesn't loop.
+/// - A flipped definition's source that is another definition's target: it was
+///   enumerated while the definition wasn't applying, which the target-mutation
+///   seam skips, and that target is never captured. A write to it between the
+///   enumeration and the flip reached nobody. Its writers are drain workers,
+///   which don't wait for a seal, so the only-sealer argument above doesn't
+///   cover them: the definition applies from this flip on, and reports `live`
+///   only once this catch-up has run ([`go_live_caught_up`]). The next
+///   discharge flips nothing out of `waiting_to_backfill`, so this doesn't
+///   loop.
 ///
 /// Parking inside the transaction is enough for both. The discharge takes a
 /// marker's fence only after reading it committed ([`confirm_fence`]), so the
@@ -2018,14 +1844,13 @@ pub async fn settle_builds(pool: &crate::pool::Pool) {
 }
 
 /// Test stand-in for the staging worker's maintenance pass over newly
-/// registered definitions (ADR-0016), for a test with no staging worker and
-/// no publication: parks the marker [`reconcile_publication`] would on every
-/// `waiting_to_backfill` definition's source (treating every source as
-/// published), then discharges every settled marker with intake taken as
-/// caught up. That includes the go-live catch-up of every `catching_up`
-/// definition, which takes it `live` (issue #476). Retries for a few seconds
-/// while a fence is still pinned by some other transaction in the cluster
-/// (other tests share it), and returns once no definition is left
+/// registered definitions (ADR-0016), for a test with no staging worker and no
+/// capture triggers: parks a marker on every `waiting_to_backfill` definition's
+/// source (treating every source as captured), then discharges every settled
+/// marker with the watermark saturated. That includes the go-live catch-up of
+/// every `catching_up` definition, which takes it `live` (issue #476). Retries
+/// for a few seconds while a fence is still pinned by some other transaction in
+/// the cluster (other tests share it), and returns once no definition is left
 /// `waiting_to_backfill` or `catching_up`, or the retries run out. Chunks it
 /// enqueues still need a drain worker (or a test's own chunk loop):
 /// [`settle_registrations`] runs them.
@@ -2068,458 +1893,32 @@ pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), Int
     Ok(())
 }
 
-/// Fresh-install slot setup: creates `slot`, seeds its `replication_progress`
-/// row at the slot's consistent point, and parks a `pending_backfill` marker
-/// on every one of `tables`, all in one transaction. It reads no source rows.
-/// Each table's existing rows are captured by the first discharge of its
-/// marker ([`run_pending_backfills`]), the one capture path every definition
-/// backfill goes through (ADR-0016).
-///
-/// # Why it doesn't read the tables itself (issue #393)
-///
-/// `pg_create_logical_replication_slot` exports no snapshot. A read in this
-/// transaction would use a snapshot taken before slot creation waits out the
-/// transactions in flight and reaches its consistent point, so a transaction
-/// committing in that wait would be neither read nor streamed. The discharge
-/// takes each marker's fence only after reading it committed
-/// ([`confirm_fence`]), so the fence and the read after it both come after
-/// the consistent point: every commit that read misses is after the
-/// consistent point, and the slot streams it. A table `reconcile_publication`
-/// just added already has a join marker, which the park here merges into
-/// ([`park_marker`]).
-///
-/// Every table in `tables` gets a marker, not only the newly published ones
-/// or those with a `waiting_to_backfill` definition (which the worker's
-/// reconcile pass would park anyway, [`park_registration_markers`]). A slot
-/// is fresh whenever this `replication_progress` row is missing, so the
-/// catalog can already hold applying definitions: it outlived the slot it
-/// was built under (setup pointed at a new slot name, say; a slot lost under
-/// the same name is `slot_loss`'s case instead). Such a definition has missed
-/// whatever committed before this slot's consistent point, and only this
-/// marker's discharge repairs it. So the markers are go-live catch-ups
-/// ([`park_table_catch_ups`]) for every applying reader of the tables: each
-/// reader reports `catching_up` until the discharge has re-read the table,
-/// which re-derives the rows it still has, and swept the reader's target for
-/// rows it no longer backs, which a re-read can't reach (issue #393's
-/// regression tests, `a_row_committed_during_fresh_slot_creation_reaches_the_target`
-/// and `a_delete_committed_during_fresh_slot_creation_reaches_a_live_target`).
-/// A relationship's to-side has its settled projections refreshed too
-/// (issue #522). On a first install nothing reads the tables yet, so this parks plain
-/// markers, and the discharge skips a table no definition reads
-/// ([`run_pending_backfills`]'s "When the table is enumerated").
-///
-/// **Not one atomic unit.** `pg_create_logical_replication_slot` persists the
-/// slot to disk the moment it returns, independent of the surrounding
-/// transaction. Only the markers and the `replication_progress` INSERT that
-/// follow are undone by a rollback or a crash before `commit()`. A crash in
-/// that window leaves the slot on disk with no progress row: the orphaned
-/// state [`slot_is_orphaned`] below detects and [`IntakeError::OrphanedSlot`]
-/// names, rather than dying on "slot already exists" if this function were
-/// just retried.
-///
-/// Callers on a fresh install run this once, before ever calling
-/// [`super::Intake::connect`]; an existing install with a `replication_progress`
-/// row for `slot` never calls this again. Recovery from losing that slot is
-/// not a re-run of this function:
-/// [`super::slot_loss::pause_if_slot_lost`] pauses every transform the slot
-/// fed and recreates the slot, and each transform is rebuilt by its own
-/// fresh backfill when an operator resumes it (issue #310).
-///
-/// The progress row is "whatever first uses the slot's name" that
-/// `V4__replication_progress.sql` says is responsible for the row's one
-/// INSERT. The linchpin (`trellis::intake::stage_and_advance`) only ever
-/// UPDATEs it; without this seed the row never exists, so
-/// [`super::Intake::connect`]'s precondition check (issue #31, finding 2)
-/// would reject every fresh slot.
-pub async fn create_slot_and_park_markers(
-    session: &mut ProducerSession,
-    slot: &str,
-    tables: &[String],
-) -> Result<(), IntakeError> {
-    if slot_is_orphaned(session.client(), slot).await? {
-        return Err(IntakeError::OrphanedSlot {
-            slot: slot.to_string(),
-        });
-    }
-    let txn = session.transaction().await?;
-    // Slot creation must come before any write in this transaction (Postgres
-    // refuses to create a logical slot in a transaction that has written).
-    // The markers below carry no fence: the discharge takes each one after
-    // reading it committed, so after slot creation returned (issue #431).
-    let slot_row = txn
-        .query_one(
-            "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
-        )
-        .await?;
-    let consistent_point: PgLsn = slot_row.get(0);
-    park_table_catch_ups(&txn, tables).await?;
-    txn.execute(
-        "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
-        &[&slot, &consistent_point],
-    )
-    .await?;
-    txn.commit().await?;
-    Ok(())
-}
-
-/// Whether `slot` exists in `pg_replication_slots` **and belongs to the
-/// current database** but has no `replication_progress` row — the orphaned
-/// state a crash between `pg_create_logical_replication_slot` (which
-/// persists immediately, see [`create_slot_and_park_markers`]'s doc comment)
-/// and that same function's commit leaves behind. A slot that exists *with*
-/// a progress row is a different situation (re-running setup against an
-/// already-initialized slot) and is left to the existing "slot already
-/// exists" error path.
-///
-/// `pg_replication_slots` is a cluster-wide system view, not scoped to the
-/// connected database, but a logical slot only ever belongs to the database
-/// it was created against — so this must filter on `database =
-/// current_database()` (issue #188). Without that filter, a slot-name
-/// collision with a *different* database on the same Postgres cluster (e.g.
-/// another Trellis install sharing the cluster, or — as
-/// `generative/tests/convergence.rs`'s shared-cluster harness discovered — a
-/// still-live prior test case's database) is indistinguishable from this
-/// database's own orphan: `slot_exists` comes back true (the name exists
-/// somewhere) and `has_progress_row` comes back false (this database never
-/// wrote that row, since the slot was never really this database's own), so
-/// an unfiltered check calls it "orphaned" — a misdiagnosis that hides the
-/// real condition (a slot name that isn't actually free) behind a
-/// plausible-looking crash-recovery story. Scoping the check surfaces that
-/// case correctly instead: `slot_is_orphaned` returns `false` (this
-/// database has no slot by that name), and the
-/// `pg_create_logical_replication_slot` call just below fails loudly with
-/// Postgres's own "replication slot already exists" error, naming the
-/// actual condition.
-async fn slot_is_orphaned(client: &impl GenericClient, slot: &str) -> Result<bool, IntakeError> {
-    let slot_exists: bool = client
-        .query_one(
-            "select exists(select 1 from pg_replication_slots where slot_name = $1 and \
-             database = current_database())",
-            &[&slot],
-        )
-        .await?
-        .get(0);
-    if !slot_exists {
-        return Ok(false);
-    }
-    let has_progress_row: bool = client
-        .query_one(
-            "select exists(select 1 from replication_progress where slot_name = $1)",
-            &[&slot],
-        )
-        .await?
-        .get(0);
-    Ok(!has_progress_row)
-}
-
-/// The slot's observed health, per `pg_replication_slots`' invalidation
-/// columns and its `confirmed_flush_lsn` against this instance's last
-/// confirmed position.
-#[derive(Debug, PartialEq, Eq)]
-enum SlotHealth {
-    Healthy,
-    Missing,
-    /// Postgres invalidated the slot; see [`SlotRow::is_invalidated`].
-    Invalidated,
-    /// Present and not invalidated, but its `confirmed_flush_lsn` is past the
-    /// position this instance last confirmed, or not set yet because another
-    /// session is still creating it (issue #406). See [`slot_health`] for why
-    /// either means the slot isn't the one this instance was acknowledging.
-    Recreated,
-}
-
-/// Scoped to `database = current_database()` for the same reason
-/// [`slot_is_orphaned`] is (issue #188): `pg_replication_slots` is a
-/// cluster-wide view, but a logical slot only ever belongs to the database it
-/// was created against. Here the unscoped version fails in the *unsafe*
-/// direction — a same-named slot owned by a different database on the same
-/// cluster would make this database's own missing-or-invalidated slot look
-/// `Healthy`, defeating [`require_slot_healthy`]'s whole purpose (refusing to
-/// resume into an unrecoverable WAL gap) on the strength of a slot that isn't
-/// ours and that intake could never actually stream from.
-///
-/// **A slot recreated under the same name (issue #406).** Existence and
-/// `wal_status` can't tell a slot that was dropped and recreated while
-/// Trellis was down from the one it was streaming from, and every change
-/// committed between the drop and the recreate is gone. Postgres gives a slot
-/// no creation identity, but its position is enough: the slot's
-/// `confirmed_flush_lsn` moves only when a consumer acknowledges a position,
-/// and intake acknowledges only positions it has already persisted to
-/// `replication_progress` (the linchpin commits first, and
-/// [`super::Intake::connect`] relies on the same invariant to resume from
-/// `last_confirmed`). So the slot this instance has been feeding never sits
-/// past `last_confirmed`. It can sit behind it, in the window between
-/// persisting a position and the acknowledgment reaching the server. A
-/// freshly created slot starts at the WAL position of its creation, which is
-/// past anything this instance could have confirmed before the drop. The
-/// check is conservative. A slot dropped and recreated with nothing
-/// committed in between is still reported, as is a slot some other consumer
-/// advanced (`pg_replication_slot_advance`, `pg_logical_slot_get_changes`),
-/// but that consumer took changes this instance never saw, so it's a real
-/// gap too.
-async fn slot_health(
-    client: &impl GenericClient,
-    slot: &str,
-    last_confirmed_lsn: PgLsn,
-) -> Result<SlotHealth, IntakeError> {
-    // `invalidation_reason` (PG17+) and `conflicting` (PG16+) are read
-    // through `to_jsonb` so one query runs on every supported server: a
-    // column the server's view doesn't have reads as NULL instead of failing
-    // the query.
-    let row = client
-        .query_opt(
-            "select s.wal_status, s.confirmed_flush_lsn, \
-                    to_jsonb(s) ->> $2::text, \
-                    (to_jsonb(s) ->> $3::text)::boolean \
-             from pg_replication_slots s \
-             where s.slot_name = $1 and s.database = current_database()",
-            &[&slot, &INVALIDATION_REASON_COLUMN, &CONFLICTING_COLUMN],
-        )
-        .await?;
-    Ok(classify_slot(
-        row.map(|row| SlotRow {
-            wal_status: row.get(0),
-            confirmed_flush: row.get(1),
-            invalidation_reason: row.get(2),
-            conflicting: row.get(3),
-        }),
-        last_confirmed_lsn,
-    ))
-}
-
-/// The `pg_replication_slots` columns [`slot_health`] reads by name through
-/// `to_jsonb`, where a misspelt name reads as NULL just like a server
-/// without the column; `slot_health_reads_a_real_slot` pins both names.
-const INVALIDATION_REASON_COLUMN: &str = "invalidation_reason";
-const CONFLICTING_COLUMN: &str = "conflicting";
-
-/// The `pg_replication_slots` columns [`slot_health`] reads for one slot.
-struct SlotRow {
-    wal_status: Option<String>,
-    confirmed_flush: Option<PgLsn>,
-    /// PG17+; NULL on older servers and for a slot that is still valid.
-    invalidation_reason: Option<String>,
-    /// PG16+; NULL on older servers.
-    conflicting: Option<bool>,
-}
-
-impl SlotRow {
-    /// Issue #413: `wal_status = 'lost'` covers only invalidation by the
-    /// retention cap (`max_slot_wal_keep_size`). A logical slot can also be
-    /// invalidated on a standby by a recovery conflict (`rows_removed`,
-    /// `wal_level_insufficient`, PG16+) or, on PG18, by
-    /// `idle_replication_slot_timeout` (`idle_timeout`), and none of those
-    /// set `wal_status` to `lost`. PG17+ names every reason in
-    /// `invalidation_reason`; PG16 has only `conflicting`, which is true for
-    /// exactly the two recovery-conflict reasons. Streaming from any
-    /// invalidated slot fails, so each of these is as unrecoverable as `lost`.
-    fn is_invalidated(&self) -> bool {
-        self.wal_status.as_deref() == Some("lost")
-            || self.invalidation_reason.is_some()
-            || self.conflicting == Some(true)
-    }
-}
-
-/// [`slot_health`]'s decision over the row it read, if any.
-fn classify_slot(row: Option<SlotRow>, last_confirmed_lsn: PgLsn) -> SlotHealth {
-    let Some(row) = row else {
-        return SlotHealth::Missing;
-    };
-    if row.is_invalidated() {
-        return SlotHealth::Invalidated;
-    }
-    // NULL only for a physical slot (filtered out by the `database` scope) or
-    // a logical slot another session is still creating, which Postgres gives
-    // a position once it reaches its consistent point. The slot this instance
-    // acknowledged had one from the moment its creation returned, so a NULL
-    // one is a recreate in progress; called healthy, intake could start
-    // streaming from it, past the gap, as soon as the creation finished.
-    match row.confirmed_flush {
-        Some(position) if position <= last_confirmed_lsn => SlotHealth::Healthy,
-        _ => SlotHealth::Recreated,
-    }
-}
-
-/// Checked at [`super::Intake::connect`] whenever `last_confirmed_lsn` shows
-/// this instance has confirmed work against `slot` before: the slot must
-/// still exist, not be invalidated, and not have been recreated under the
-/// same name, which shows up as a position past `last_confirmed_lsn` (issue
-/// #406, see [`slot_health`]). Invalidation (retention cap exceeded, a
-/// standby's recovery conflict, PG18's idle timeout), loss on
-/// failover (pre-PG17 doesn't preserve slots across a promotion) and a
-/// drop-and-recreate all mean everything between `last_confirmed_lsn` and the
-/// new slot's start position is unrecoverable by streaming — so this errors
-/// rather than let intake silently resume into a gap. It is also the detector
-/// [`super::slot_loss::pause_if_slot_lost`] runs during a staging worker's
-/// setup, which turns the error into pausing every transform the slot fed
-/// (issue #310).
-pub async fn require_slot_healthy(
-    client: &impl GenericClient,
-    slot: &str,
-    last_confirmed_lsn: PgLsn,
-) -> Result<(), IntakeError> {
-    match slot_health(client, slot, last_confirmed_lsn).await? {
-        SlotHealth::Healthy => Ok(()),
-        SlotHealth::Missing | SlotHealth::Invalidated | SlotHealth::Recreated => {
-            Err(IntakeError::SlotLost {
-                slot: slot.to_string(),
-                last_confirmed_lsn: u64::from(last_confirmed_lsn),
-            })
-        }
-    }
-}
-
+/// Test stand-in for the staging worker's capture pass (the maintenance
+/// loop's reconcile, minus its discharge): installs `tables`' capture
+/// triggers, which parks each newly captured table's join marker in the
+/// install's own transaction, and parks a marker for every waiting
+/// definition the pass finds ready ([`park_ready_registration_markers`]).
+/// Panics unless every table's capture landed.
 #[cfg(test)]
-mod slot_health_tests {
-    use super::*;
-
-    fn last_confirmed() -> PgLsn {
-        PgLsn::from(0x1000)
-    }
-
-    fn valid_slot() -> SlotRow {
-        SlotRow {
-            wal_status: Some("reserved".to_string()),
-            confirmed_flush: Some(PgLsn::from(0x0800)),
-            invalidation_reason: None,
-            conflicting: Some(false),
-        }
-    }
-
-    #[test]
-    fn a_valid_slot_behind_the_last_confirmed_position_is_healthy() {
-        assert_eq!(
-            classify_slot(Some(valid_slot()), last_confirmed()),
-            SlotHealth::Healthy
-        );
-    }
-
-    #[test]
-    fn a_missing_slot_is_missing() {
-        assert_eq!(classify_slot(None, last_confirmed()), SlotHealth::Missing);
-    }
-
-    #[test]
-    fn a_lost_slot_is_invalidated() {
-        let row = SlotRow {
-            wal_status: Some("lost".to_string()),
-            invalidation_reason: Some("wal_removed".to_string()),
-            ..valid_slot()
-        };
-        assert_eq!(
-            classify_slot(Some(row), last_confirmed()),
-            SlotHealth::Invalidated
-        );
-    }
-
-    /// Issue #413: PG17+ names the reason even when `wal_status` isn't
-    /// `lost` — a standby's recovery conflicts, and PG18's idle timeout.
-    #[test]
-    fn every_invalidation_reason_is_invalidated_whatever_wal_status_says() {
-        for reason in ["rows_removed", "wal_level_insufficient", "idle_timeout"] {
-            let row = SlotRow {
-                invalidation_reason: Some(reason.to_string()),
-                ..valid_slot()
-            };
-            assert_eq!(
-                classify_slot(Some(row), last_confirmed()),
-                SlotHealth::Invalidated,
-                "invalidation_reason = {reason}"
-            );
-        }
-    }
-
-    /// Issue #413: PG16 has no `invalidation_reason`, only `conflicting`.
-    #[test]
-    fn a_conflicting_slot_without_a_reason_column_is_invalidated() {
-        let row = SlotRow {
-            conflicting: Some(true),
-            ..valid_slot()
-        };
-        assert_eq!(
-            classify_slot(Some(row), last_confirmed()),
-            SlotHealth::Invalidated
-        );
-    }
-
-    /// Pre-PG16 servers report neither column: `wal_status` alone decides.
-    #[test]
-    fn a_server_without_either_column_still_reads_healthy() {
-        let row = SlotRow {
-            invalidation_reason: None,
-            conflicting: None,
-            ..valid_slot()
-        };
-        assert_eq!(
-            classify_slot(Some(row), last_confirmed()),
-            SlotHealth::Healthy
-        );
-    }
-
-    #[test]
-    fn a_slot_past_the_last_confirmed_position_is_recreated() {
-        let row = SlotRow {
-            confirmed_flush: Some(PgLsn::from(0x2000)),
-            ..valid_slot()
-        };
-        assert_eq!(
-            classify_slot(Some(row), last_confirmed()),
-            SlotHealth::Recreated
-        );
-    }
-
-    /// The query itself, against this box's real server: the `to_jsonb`
-    /// reads must parse and return a valid slot as healthy.
-    #[tokio::test]
-    async fn slot_health_reads_a_real_slot() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let client = db.pool.get().await.expect("acquire connection");
-        let lsn: PgLsn = client
-            .query_one(
-                "select lsn from pg_create_logical_replication_slot('slot_413', 'pgoutput')",
-                &[],
-            )
-            .await
-            .expect("create a slot")
-            .get(0);
-        let health = slot_health(&**client, "slot_413", lsn).await;
-        // A misspelt column name would read as NULL, the same as a server
-        // without the column, and every other check here would still pass;
-        // so pin the names `slot_health` reads to the versions that have them.
-        let columns = client
-            .query_one(
-                "select current_setting('server_version_num')::int, \
-                        to_jsonb(s) ? $1, to_jsonb(s) ? $2 \
-                 from pg_replication_slots s where s.slot_name = 'slot_413'",
-                &[&INVALIDATION_REASON_COLUMN, &CONFLICTING_COLUMN],
-            )
-            .await;
-        client
-            .execute("select pg_drop_replication_slot('slot_413')", &[])
-            .await
-            .expect("drop the slot");
-        let columns = columns.expect("read the slot's columns");
-        let version: i32 = columns.get(0);
-        assert_eq!(
-            columns.get::<_, bool>(1),
-            version >= 170000,
-            "invalidation_reason on {version}"
-        );
-        assert_eq!(
-            columns.get::<_, bool>(2),
-            version >= 160000,
-            "conflicting on {version}"
-        );
-        assert_eq!(health.expect("slot_health"), SlotHealth::Healthy);
-        assert_eq!(
-            slot_health(&**client, "slot_413", lsn)
-                .await
-                .expect("slot_health"),
-            SlotHealth::Missing
-        );
-    }
+pub(crate) async fn capture_for_test(client: &mut tokio_postgres::Client, tables: &[&str]) {
+    let desired: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+    let outcome = crate::capture::reconcile::reconcile(
+        client,
+        crate::config::DEFAULT_SCHEMA,
+        &desired,
+        std::time::Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .expect("capture pass");
+    assert!(
+        outcome.failed.is_empty() && outcome.waiting.is_empty(),
+        "every table's capture must land: failed {:?}, waiting {:?}",
+        outcome.failed,
+        outcome.waiting
+    );
+    park_ready_registration_markers(&*client, &outcome.ready)
+        .await
+        .expect("park the ready registrations' markers");
 }
 
 #[cfg(test)]
@@ -2535,7 +1934,7 @@ mod tests {
 
     /// Issue #315: a definition reading another definition's target was
     /// enumerated while it wasn't `live`, when the target-mutation seam skips
-    /// it, and the target is never published. Going live must park a fresh
+    /// it, and the target is never captured. Going live must park a fresh
     /// catch-up on that target, or a write landing between the enumeration
     /// and the flip reaches nobody.
     #[tokio::test]
@@ -2592,7 +1991,7 @@ mod tests {
     }
 
     /// Issue #431 review: a pass lets at most one wait run out, so a fence
-    /// wait that ran out leaves the intake waits nothing.
+    /// wait that ran out leaves the watermark waits nothing.
     #[test]
     fn a_fence_wait_that_ran_out_leaves_the_intake_waits_no_time() {
         let timeout = Duration::from_secs(5);
@@ -2727,7 +2126,7 @@ mod catch_up_tests {
 
     use super::*;
 
-    /// Issue #312 review: once one enumeration gives up waiting for intake,
+    /// Issue #312 review: once one enumeration gives up waiting on the watermark,
     /// the pass ends instead of waiting again on each remaining marker. The
     /// maintenance loop seals nothing while a pass waits, so waiting per
     /// marker would multiply that stall by the number of pending markers.
@@ -2749,21 +2148,14 @@ mod catch_up_tests {
                  create table public.a (id bigint primary key); \
                  create table public.b (id bigint primary key); \
                  insert into public.a values (1); \
-                 insert into public.b values (1); \
-                 create publication test_pub;",
+                 insert into public.b values (1);",
                 crate::config::DEFAULT_SCHEMA
             ))
             .await
             .expect("seed two source tables");
         register_reader(&db, "public.a", "a_reader").await;
         register_reader(&db, "public.b", "b_reader").await;
-        reconcile_publication(
-            &mut client,
-            "test_pub",
-            &["public.a".to_string(), "public.b".to_string()],
-        )
-        .await
-        .expect("reconcile leaves two settled markers");
+        capture_for_test(&mut client, &["public.a", "public.b"]).await;
 
         let waits = AtomicUsize::new(0);
         let give_up = || {
@@ -2824,7 +2216,7 @@ mod catch_up_tests {
         client
     }
 
-    /// One source table, `public.t`, in the publication with a settled
+    /// One source table, `public.t`, captured by triggers, with a settled
     /// marker waiting to be discharged. Returns the discharging client and a
     /// second connection for the racing park.
     async fn one_settled_marker(
@@ -2834,15 +2226,12 @@ mod catch_up_tests {
         discharger
             .batch_execute(
                 "create table public.t (id bigint primary key); \
-                 insert into public.t values (1); \
-                 create publication test_pub;",
+                 insert into public.t values (1);",
             )
             .await
             .expect("seed source table");
         register_reader(db, "public.t", "t_reader").await;
-        reconcile_publication(&mut discharger, "test_pub", &["public.t".to_string()])
-            .await
-            .expect("reconcile parks a marker");
+        capture_for_test(&mut discharger, &["public.t"]).await;
         (discharger, connect(db).await)
     }
 
@@ -2857,8 +2246,8 @@ mod catch_up_tests {
             .map(|r| r.get(0))
     }
 
-    /// Runs one discharge pass on `discharger`, holding it at the wait for
-    /// intake (after its enumeration snapshot is fixed, before it deletes the
+    /// Runs one discharge pass on `discharger`, holding it at the watermark
+    /// wait (after its enumeration snapshot is fixed, before it deletes the
     /// marker) while `race` runs. This forces the #311 window by hand instead
     /// of timing it. `race` sends on `go` to let the discharge finish, and
     /// `done` fires once the discharge has committed.
@@ -2871,7 +2260,7 @@ mod catch_up_tests {
         let waiting = tokio::sync::Notify::new();
         let (go_tx, go_rx) = oneshot::channel::<()>();
         let (done_tx, done_rx) = oneshot::channel::<()>();
-        // `stop` is polled only while the enumeration waits for intake.
+        // `stop` is polled only while the enumeration waits on the watermark.
         let stop = || {
             waiting.notify_one();
             false
@@ -2957,8 +2346,9 @@ mod catch_up_tests {
     }
 
     /// Issue #387: a discharge that fails partway (here planning the plain
-    /// 1-1 definition's chunks, since `public.nokey` has no identity key)
-    /// must leave its definitions `waiting_to_backfill`. A later pass only
+    /// 1-1 definition's chunks, since `public.nokey` lost its primary key
+    /// after its capture was installed) must leave its definitions
+    /// `waiting_to_backfill`. A later pass only
     /// dispatches definitions still waiting, so one left in `backfilling`
     /// would never go live. The marker must survive too, so the retry has
     /// something to run.
@@ -2969,17 +2359,18 @@ mod catch_up_tests {
         let mut client = connect(&db).await;
         client
             .batch_execute(
-                "create table public.nokey (id bigint not null); \
+                "create table public.nokey (id bigint primary key); \
                  insert into public.nokey values (1); \
-                 create publication test_pub; \
                  insert into source_table_versions (source_table, version) \
                  values ('public.nokey', 1);",
             )
             .await
-            .expect("seed a source table with no identity key");
-        reconcile_publication(&mut client, "test_pub", &["public.nokey".to_string()])
+            .expect("seed a source table");
+        capture_for_test(&mut client, &["public.nokey"]).await;
+        client
+            .batch_execute("alter table public.nokey drop constraint nokey_pkey")
             .await
-            .expect("reconcile parks a marker");
+            .expect("drop the captured table's primary key");
         let id: i64 = client
             .query_one(
                 "insert into transform_definitions \
@@ -3089,19 +2480,16 @@ mod catch_up_tests {
         let mut client = connect(&db).await;
         client
             .batch_execute(
-                "create table public.nokey (id bigint not null); \
+                "create table public.nokey (id bigint primary key); \
                  insert into public.nokey values (1); \
                  create table public.t (id bigint primary key); \
                  insert into public.t values (1); \
-                 create publication test_pub; \
                  insert into source_table_versions (source_table, version) \
                  values ('public.nokey', 1);",
             )
             .await
-            .expect("seed a broken and a healthy source table");
-        reconcile_publication(&mut client, "test_pub", &["public.nokey".to_string()])
-            .await
-            .expect("reconcile parks the broken table's marker");
+            .expect("seed two source tables");
+        capture_for_test(&mut client, &["public.nokey"]).await;
         client
             .execute(
                 "insert into transform_definitions \
@@ -3112,13 +2500,11 @@ mod catch_up_tests {
             .await
             .expect("seed the broken table's deferred definition");
         register_reader(&db, "public.t", "t_reader").await;
-        reconcile_publication(
-            &mut client,
-            "test_pub",
-            &["public.nokey".to_string(), "public.t".to_string()],
-        )
-        .await
-        .expect("reconcile parks the healthy table's marker");
+        capture_for_test(&mut client, &["public.nokey", "public.t"]).await;
+        client
+            .batch_execute("alter table public.nokey drop constraint nokey_pkey")
+            .await
+            .expect("break the captured table: drop its primary key");
 
         async fn pass(client: &mut tokio_postgres::Client) -> Vec<FailedDischarge> {
             run_pending_backfills_until(
@@ -3214,15 +2600,12 @@ mod catch_up_tests {
             .batch_execute(
                 "create table public.t (id bigint primary key); \
                  insert into public.t values (1); \
-                 create publication test_pub; \
                  insert into source_table_versions (source_table, version) \
                  values ('public.t', 1);",
             )
             .await
             .expect("seed the source table");
-        reconcile_publication(&mut client, "test_pub", &["public.t".to_string()])
-            .await
-            .expect("reconcile parks a marker");
+        capture_for_test(&mut client, &["public.t"]).await;
         client
             .execute(
                 "insert into transform_definitions \
@@ -3318,7 +2701,7 @@ mod catch_up_tests {
     /// discharge transaction (forced here by a trigger), which leaves that
     /// transaction aborted, and rolling it back must leave every definition
     /// where it was. Meanwhile an operator pauses one waiting definition and
-    /// quarantines another while the discharge waits for intake: their
+    /// quarantines another while the discharge waits on the watermark: their
     /// freezes stand, and the other stays `waiting_to_backfill`.
     #[tokio::test]
     async fn a_failed_discharge_after_an_operator_freeze_leaves_every_definition_where_it_was() {
@@ -3356,7 +2739,7 @@ mod catch_up_tests {
 
         let watermark = StagedWatermark::new();
         let waiting = tokio::sync::Notify::new();
-        // `stop` is polled only while the enumeration waits for intake.
+        // `stop` is polled only while the enumeration waits on the watermark.
         let stop = || {
             waiting.notify_one();
             false
@@ -3430,9 +2813,8 @@ mod catch_up_tests {
         );
     }
 
-    /// `public.t`, empty and not yet published, read by a `live` 1-1
-    /// definition with its target created; `test_pub` exists. Returns a pool
-    /// and a client on the database.
+    /// `public.t`, empty and not captured, read by a `live` 1-1 definition
+    /// with its target created. Returns a pool and a client on the database.
     async fn live_reader_on_t(
         db: &testkit::TestDatabase,
     ) -> (crate::pool::Pool, tokio_postgres::Client) {
@@ -3440,10 +2822,7 @@ mod catch_up_tests {
         let pool = crate::pool::Pool::new(&config).expect("build a same-crate pool");
         let client = connect(db).await;
         client
-            .batch_execute(
-                "create table public.t (id bigint primary key); \
-                 create publication test_pub;",
-            )
+            .batch_execute("create table public.t (id bigint primary key)")
             .await
             .expect("seed the source table");
         let columns: std::collections::HashMap<String, crate::defs::ValueType> =
@@ -3472,24 +2851,22 @@ mod catch_up_tests {
     }
 
     /// Issue #431, the join fence's gap, forced by holding each transaction
-    /// open by hand. The `ALTER` and its marker are parked in one open
-    /// transaction; a writer then gets its xid (one past the park's snapshot,
+    /// open by hand. The marker is parked in an open transaction that takes
+    /// no lock on the table, as a seam-fed table's catch-up is (#622 plan,
+    /// finding 1); a writer then gets its xid (one past the park's snapshot,
     /// with another xid burned in between, as in the issue's reproduction)
-    /// and inserts before the `ALTER` commits, so its write isn't streamed. It
-    /// is still open through the first discharge pass. That pass must wait
-    /// for it, so the row reaches the target through the read.
+    /// and inserts before the park commits, so nothing feeds its write to the
+    /// ring. It is still open through the first discharge pass. That pass
+    /// must wait for it, so the row reaches the target through the read.
     #[tokio::test]
     async fn a_writer_inside_the_joins_window_reaches_the_target() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (pool, mut client) = live_reader_on_t(&db).await;
 
-        // The join, as `reconcile_publication` runs it, held open.
+        // The join, held open.
         let mut joiner = connect(&db).await;
         let join = joiner.transaction().await.expect("begin the join");
-        join.batch_execute("alter publication test_pub add table public.t")
-            .await
-            .expect("add the table to the publication");
         park_marker(&join, "public.t")
             .await
             .expect("park the join marker");
@@ -3540,7 +2917,7 @@ mod catch_up_tests {
     /// so the fence's snapshot reads `t:t:`. Once `t` ends, a snapshot's
     /// `xmin` is `w`, past that `xmax`, while `w` is still open. The fence
     /// must still hold the marker for `w`, or the discharge reads the table
-    /// without `w`'s row and the stream never carries it.
+    /// without `w`'s row and nothing else feeds it to the ring.
     #[tokio::test]
     async fn a_fence_holds_a_writer_whose_xid_is_past_its_xmax() {
         let cluster = testkit::TestCluster::start();
@@ -3549,9 +2926,6 @@ mod catch_up_tests {
 
         let mut joiner = connect(&db).await;
         let join = joiner.transaction().await.expect("begin the join");
-        join.batch_execute("alter publication test_pub add table public.t")
-            .await
-            .expect("add the table to the publication");
         park_marker(&join, "public.t")
             .await
             .expect("park the join marker");
@@ -3737,7 +3111,7 @@ mod catch_up_tests {
 
     /// Issue #315, now covered by #431's fence: a definition reading another
     /// definition's target starts applying in a discharge's transaction,
-    /// which parks a catch-up on that target (never published, so only the
+    /// which parks a catch-up on that target (never captured, so only the
     /// target-mutation seam reaches the new reader). A seam writer that
     /// checked for applying readers before the flip committed reached nobody.
     /// If it is still open when the discharge first reads the catch-up, the
@@ -3809,7 +3183,7 @@ mod catch_up_tests {
     }
 
     /// Issue #431: the pass that takes a fence waits for it to settle, and
-    /// that wait gives up on `stop` like the intake wait does, leaving the
+    /// that wait gives up on `stop` like the watermark wait does, leaving the
     /// marker fenced for the next pass. Deterministic: the transaction stays
     /// open throughout, so only `stop` can end the wait.
     #[tokio::test]
@@ -3848,7 +3222,7 @@ mod catch_up_tests {
 
     /// Issue #431 review, wired end to end: a long transaction holds a fresh
     /// fence, `stop` ends that wait (its first call), and an older marker
-    /// that has settled needs an enumeration intake never catches up with.
+    /// that has settled needs an enumeration the watermark never reaches.
     /// That enumeration must defer at once, consulting `stop` once, rather
     /// than wait out the 600s timeout. No wall-clock bound: the outer
     /// timeout only turns the bug into a failure instead of a hang.
@@ -3862,20 +3236,13 @@ mod catch_up_tests {
                 "create table public.a (id bigint primary key); \
                  create table public.b (id bigint primary key); \
                  insert into public.a values (1); \
-                 insert into public.b values (1); \
-                 create publication test_pub;",
+                 insert into public.b values (1);",
             )
             .await
             .expect("seed two source tables");
         register_reader(&db, "public.a", "a_reader").await;
         register_reader(&db, "public.b", "b_reader").await;
-        reconcile_publication(
-            &mut client,
-            "test_pub",
-            &["public.a".to_string(), "public.b".to_string()],
-        )
-        .await
-        .expect("reconcile parks two markers");
+        capture_for_test(&mut client, &["public.a", "public.b"]).await;
         let generation: i64 = client
             .query_one(
                 "select generation from pending_backfill where table_name = 'public.a'",
@@ -4045,7 +3412,6 @@ mod catch_up_tests {
         client
             .batch_execute(
                 "create table public.orders (id bigint primary key, g bigint, a numeric); \
-                 alter table public.orders replica identity full; \
                  insert into public.orders select s, s % 2, s from generate_series(1, 6) s;",
             )
             .await
@@ -4078,7 +3444,7 @@ mod catch_up_tests {
         (pool, client)
     }
 
-    /// Stages one CDC change on `public.orders` the way intake would.
+    /// Stages one CDC change on `public.orders` the way a capture trigger would.
     async fn stage_order_cdc(
         client: &mut tokio_postgres::Client,
         key: &str,
@@ -4123,7 +3489,7 @@ mod catch_up_tests {
     /// Issue #330's orphan delete, on a resumed aggregate's direct-build
     /// rebuild (issue #419). The discharge deletes the target rows no source
     /// row backs and dispatches the job; `race` then writes the source before
-    /// the job reads it, staging that write's CDC the way intake would. The
+    /// the job reads it, staging that write's CDC the way a capture trigger would. The
     /// job runs and finishes, and the CDC drains once the definition is
     /// `live`.
     async fn rebuild_racing(
@@ -4275,7 +3641,7 @@ mod catch_up_tests {
         );
     }
 
-    /// One change to `public.orders` to stage as intake would: its key, op,
+    /// One change to `public.orders` to stage as a capture trigger would: its key, op,
     /// and old and new images.
     type OrderCdc<'a> = (
         &'a str,
@@ -4284,7 +3650,7 @@ mod catch_up_tests {
         Option<&'a str>,
     );
 
-    /// Runs `sql` on `writer`, then stages `cdc` for it the way intake would,
+    /// Runs `sql` on `writer`, then stages `cdc` for it the way a capture trigger would,
     /// at a real LSN past the write's commit: an apply that compares it with
     /// a recompute horizon must see it as the later commit it is.
     async fn write_orders(writer: &mut tokio_postgres::Client, sql: &str, cdc: &[OrderCdc<'_>]) {
@@ -4362,8 +3728,8 @@ mod catch_up_tests {
     /// `public.order_copy` `ACCESS EXCLUSIVE`, a target the discharge reads
     /// after `public.order_rollup`'s. Once the discharge blocks on that lock,
     /// `gap` empties a group and the lock is released. Once the discharge
-    /// has fixed its read's snapshot and waits for intake, `refill` puts new
-    /// rows in the group, and intake is let through.
+    /// has fixed its read's snapshot and waits on the watermark, `refill` puts new
+    /// rows in the group, and the watermark is let through.
     ///
     /// Before #436 the orphan sweep ran one anti-join per target, each on its
     /// own snapshot, ahead of the read's `DECLARE`. The rollup's ran before
@@ -4383,7 +3749,7 @@ mod catch_up_tests {
             .get(0);
         let watermark = StagedWatermark::new();
         let waiting = tokio::sync::Notify::new();
-        // `stop` is polled only while the enumeration waits for intake.
+        // `stop` is polled only while the enumeration waits on the watermark.
         let stop = || {
             waiting.notify_one();
             false
@@ -4432,7 +3798,6 @@ mod catch_up_tests {
         client
             .batch_execute(
                 "create table public.orders (id bigint primary key, g bigint, a numeric); \
-                 alter table public.orders replica identity full; \
                  insert into public.orders select s, s % 2, s from generate_series(1, 6) s;",
             )
             .await
@@ -4711,8 +4076,8 @@ mod catch_up_tests {
         assert_eq!(copy_ids(&discharger).await, vec![2, 4, 6, 10]);
     }
 
-    /// Issue #503: the sweep takes its target row locks only after the intake
-    /// wait. While the go-live discharge waits for intake, a writer that
+    /// Issue #503: the sweep takes its target row locks only after the
+    /// watermark wait. While the go-live discharge waits on the watermark, a writer that
     /// touches the row the sweep will delete (a drain applying an earlier
     /// sealed segment, say) doesn't wait on the discharge.
     #[tokio::test]
@@ -4773,15 +4138,13 @@ mod dispatch_tests {
         client
     }
 
-    /// `public.orders` with three rows (in two groups of `g`), a publication
-    /// that doesn't hold it yet, and its version row.
+    /// `public.orders` with three rows (in two groups of `g`), not captured
+    /// yet, and its version row.
     async fn seed(client: &tokio_postgres::Client) {
         client
             .batch_execute(
                 "create table public.orders (id bigint primary key, g int, a numeric); \
-                 alter table public.orders replica identity full; \
                  insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 30); \
-                 create publication test_pub; \
                  insert into source_table_versions (source_table, version) \
                  values ('public.orders', 1)",
             )
@@ -4851,13 +4214,10 @@ mod dispatch_tests {
     }
 
     async fn reconcile(client: &mut tokio_postgres::Client, desired: &[&str]) {
-        let desired: Vec<String> = desired.iter().map(|t| t.to_string()).collect();
-        reconcile_publication(client, "test_pub", &desired)
-            .await
-            .expect("reconcile");
+        capture_for_test(client, desired).await;
     }
 
-    /// Runs one discharge pass with intake taken as caught up.
+    /// Runs one discharge pass with the watermark saturated.
     async fn discharge(client: &mut tokio_postgres::Client) {
         run_pending_backfills(
             client,
@@ -4870,11 +4230,11 @@ mod dispatch_tests {
     }
 
     /// ADR-0016's "Who parks the marker": a waiting definition's source gets
-    /// its marker from the reconcile pass that publishes it (the join
-    /// marker), from a later pass once it is already published, or at once
+    /// its marker from the reconcile pass that installs its capture (the join
+    /// marker), from a later pass once it is already captured, or at once
     /// when it is another definition's target. A source this pass doesn't
-    /// publish gets none, since a marker could then discharge before the
-    /// table joined the stream.
+    /// capture gets none, since a marker could then discharge before the
+    /// table's writes were captured.
     #[tokio::test]
     async fn the_reconcile_pass_parks_every_registrations_marker() {
         let cluster = testkit::TestCluster::start();
@@ -4894,7 +4254,7 @@ mod dispatch_tests {
         reconcile(&mut client, &[]).await;
         assert!(
             markers(&client).await.is_empty(),
-            "an unpublished source waits for the pass that publishes it"
+            "an uncaptured source waits for the pass that captures it"
         );
 
         reconcile(&mut client, &["public.orders"]).await;
@@ -4905,8 +4265,8 @@ mod dispatch_tests {
             "precondition: discharged"
         );
 
-        // A second registration on the now-published source, and one chained
-        // off `public.d` (another definition's target, never published).
+        // A second registration on the now-captured source, and one chained
+        // off `public.d` (another definition's target, never captured).
         client
             .batch_execute(
                 "insert into source_table_versions (source_table, version) \
@@ -4934,7 +4294,7 @@ mod dispatch_tests {
         assert_eq!(
             markers(&client).await,
             ["public.d", "public.orders"],
-            "an already-published source and a definition's target both get a marker"
+            "an already-captured source and a definition's target both get a marker"
         );
     }
 

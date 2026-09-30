@@ -1,30 +1,29 @@
 //! The one seam every write to a Trellis-owned target table goes through
 //! (issue #315).
 //!
-//! # Why a seam, not a publication
+//! # Why a seam, not capture
 //!
-//! A target table is never a member of this instance's CDC publication (see
-//! `defs::catalog::publication_tables`). A definition that reads another
+//! A target table is never captured by this instance's triggers (see
+//! `defs::catalog::tables_to_capture`). A definition that reads another
 //! definition's target (a chained hop) learns about that target's changes
 //! only from the rows the writer stages here, inside the same transaction as
 //! the write itself: image-less `Recompute` rows, or CDC-shaped rows for a
-//! relationship endpoint (see the last section). That gives three properties
-//! CDC could not:
+//! relationship endpoint (see the last section). That gives properties
+//! capture would not:
 //!
 //! - **The key is correct by construction.** Each staged key is the target's
 //!   own row identity (`ddl::pk_key_sql_expr`, or the aggregate
 //!   `derive_group_key` text that matches it), produced by the code that
-//!   wrote the row. Nothing reconstructs a NULL-safe group key from raw
-//!   `pgoutput` bytes, which `intake::extract_key` cannot do correctly for an
-//!   aggregate target.
-//! - **No replica-identity cost.** A target needs no `REPLICA IDENTITY FULL`,
-//!   so its updates add no old-row images to WAL and no pressure on the slot.
+//!   wrote the row. Nothing reconstructs a NULL-safe group key from a
+//!   captured image, which can't be done correctly for an aggregate target:
+//!   it has no primary key to capture by.
 //! - **Crash safety.** The staged rows commit or roll back with the write, so
 //!   there is no window where a target changed but its downstream signal was
 //!   lost, and no window where the signal exists without the change.
 //!
 //! It also closes the double-apply class #312 patched: a target change now
-//! reaches the ring exactly once, not once from the apply and again from CDC.
+//! reaches the ring exactly once, not once from the apply and again from
+//! capture.
 //!
 //! # Why it is structural
 //!
@@ -52,7 +51,7 @@
 //! re-derive from its rebuilt state (and report `catching_up` until then):
 //! every reader, including one reading it through a relationship, whose
 //! settled projection that catch-up's discharge also refreshes (#507,
-//! `intake::publication::park_target_catchup_if_read`).
+//! `intake::markers::park_target_catchup_if_read`).
 //! A chunk a worker held across a resume can't write once the rebuild has
 //! made the target applying again: its claim fences every write it makes
 //! (`defs::chunk_queue::ClaimFence`, #434).
@@ -61,7 +60,7 @@
 //! writer checks, so a *new* reader parks a catch-up on its source target
 //! once it starts applying, whichever way it was built (`defs::catalog::install_definition`,
 //! `create_definition_inner`, `complete_direct_backfill`, or
-//! `intake::publication`'s deferred-backfill flip). A write that raced the
+//! `intake::markers`'s deferred-backfill flip). A write that raced the
 //! reader's build reaches it through that catch-up: its fence is captured
 //! after the reader is visibly applying, so it waits out every writer that
 //! checked before then.
@@ -101,10 +100,10 @@
 //! [`TargetMutations::into_staged`] also reads the transaction's **write
 //! token**, `pg_current_wal_insert_lsn()`, into [`Propagation::write_token`]
 //! (issue #401, step 1 of #375's direction 1). It orders one key's writes in
-//! the same WAL space as CDC's commit LSNs, which is what lets the seam stand
-//! in as a CDC-shaped feed for a target (steps 2 and 3, #402/#403): an
-//! endpoint target's CDC-shaped seam rows carry it as their `lsn` (see the
-//! last section).
+//! the same WAL space as a capture trigger's `lsn`, which is what lets the seam
+//! stand in as a CDC-shaped feed for a target (steps 2 and 3, #402/#403): an
+//! endpoint target's CDC-shaped seam rows carry it as their `lsn` (see the last
+//! section).
 //!
 //! Where it is read is the whole point. Two writers of one key serialize on
 //! that key's row lock: the second acquires it only after the first commits,
@@ -118,14 +117,13 @@
 //!
 //! The token is **pre-commit**: it is below the writer's own commit LSN, so it
 //! is not a commit `end_lsn`. A consumer may rely on "token above a position
-//! read by another transaction means the writer committed after that read",
-//! and on per-key order, but never on "a token at or below X means the writer
-//! had committed by X": the gap to the commit can be long (a rebuild's orphan
-//! delete, `intake::resume_orphans`, waits on intake before committing). It
-//! is never an `origin_lsn` either: a seam row's
-//! origin stays the conservative "unknown" `await_converged` already gates on
-//! (see `staging::converge::converged_through`).
-//!
+//! read by another transaction means the writer committed after that read", and
+//! on per-key order, but never on "a token at or below X means the writer had
+//! committed by X": the gap to the commit can be long (a rebuild's orphan
+//! delete, `intake::resume_orphans`, commits only when its whole discharge
+//! does). It is never an `origin_lsn` either: a seam row's origin stays the
+//! conservative "unknown" `await_converged` already gates on (see
+//! `staging::converge::converged_through`).
 //! It is read only when this transaction stages something (some key of a
 //! target an applying definition reads, or that the seam feeds as an
 //! endpoint), so a terminal target pays no extra round trip.
@@ -136,7 +134,7 @@
 //! from-side's `group_key` (issues #129-#136) are driven by image-bearing,
 //! LSN-ordered changes. A plain source endpoint gets those from CDC. A
 //! target that is a relationship endpoint gets them from the seam alone
-//! (#375's direction 1): endpoint targets are unpublished like every other
+//! (#375's direction 1): endpoint targets are uncaptured like every other
 //! target. For such a target ([`TargetInfo::endpoint_feed`], any relationship
 //! naming it on either side, whether or not an applying definition reads through
 //! it yet), each changed key is staged as a [`StagedChange::Cdc`] row rather
@@ -154,8 +152,8 @@
 //!   #321's `min_image_lsn` order one key's seam rows by the order their
 //!   writers committed.
 //! - **`group_key`** is the union of the target's outbound relationships'
-//!   `from_col` values across both images, the same rule intake applies to
-//!   a decoded change (`intake::touched_group_key`).
+//!   `from_col` values across both images, the same rule a capture trigger
+//!   applies to a changed row (`capture::sql`).
 //! - **`origin_lsn`** stays `None`, as for a `Recompute` (see "The write
 //!   token").
 //!
@@ -167,16 +165,8 @@
 //!
 //! **One feed per target.** A seam row and a CDC row for the same write
 //! would be two deltas, applied twice when they land in different batches,
-//! which is why the seam only took this over once endpoint targets left the
-//! publication (#403). The one place both can still exist is the upgrade
-//! that unpublished them: an endpoint target's CDC already in the slot
-//! before intake's `ALTER PUBLICATION ... DROP TABLE` still arrives. A write
-//! staged by the previous binary reached the ring as a `Recompute` plus that
-//! CDC, which #321's recompute horizon absorbs for an aggregate reader not
-//! on the ledger, and the ledger's basis check for one on it (#623 D3). A
-//! write this
-//! binary made before the drop committed would reach it as two deltas;
-//! pre-release, that window is accepted rather than migrated.
+//! which is why the seam only took this over once endpoint targets were no
+//! longer captured (#403). G (#626) captures targets and deletes this seam.
 //!
 //! **A target becoming an endpoint.** [`TargetInfo`] is resolved once per
 //! transaction, so a writer that resolved it before a `create_relationship`
@@ -189,10 +179,7 @@
 //! (`catalog::ensure_relationship_projection_in_txn`). What that catch-up
 //! can't undo (it only adds rows) is a projection row for a to-side row the
 //! writer deleted or re-keyed. That is the drift a plain source to-side's
-//! projection already accumulates before any consumer publishes the table,
-//! and narrower than the published-endpoint design it replaces, where every
-//! write between the relationship's commit and intake's `ADD TABLE` was
-//! missed the same way.
+//! projection already accumulates before its capture is installed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -480,8 +467,7 @@ impl TargetMutations {
     /// drain's Phase 3, `quarantine::recompute_column` and
     /// `defs::backfill::backfill_altered_columns` just before commit, and
     /// `intake::resume_orphans` at the start of a discharge that then writes
-    /// the ring and catalog (no target) and may wait on intake before it
-    /// commits.
+    /// the ring and catalog (no target) before it commits.
     pub(crate) async fn into_staged(
         mut self,
         txn: &Transaction<'_>,

@@ -315,8 +315,7 @@ pub async fn run_probe(
 
     raw.batch_execute(&format!(
         "create table public.{SOURCE_TABLE} \
-             (id bigint primary key, {GROUP_COLUMN} bigint not null, val numeric); \
-         alter table public.{SOURCE_TABLE} replica identity full;"
+             (id bigint primary key, {GROUP_COLUMN} bigint not null, val numeric)"
     ))
     .await
     .expect("create aggregate source table");

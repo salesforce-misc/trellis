@@ -1,9 +1,9 @@
 //! Issue #522: a marker that re-reads a table because its applying readers
 //! may have missed changes to it is a go-live catch-up for every one of them
 //! (issue #476, ADR-0016's "What `live` promises"): an explicit
-//! `Trellis::request_backfill`, a fresh install's slot, a table rejoining
-//! the publication, and a lost slot's to-sides (issue #533)
-//! (`intake::publication::park_table_catch_ups`).
+//! `Trellis::request_backfill` and a table whose capture triggers are
+//! installed (issue #533)
+//! (`intake::markers::park_table_catch_ups`).
 //!
 //! Someone asks for a re-backfill because a target may have drifted from its
 //! source, a delete that never reached it being the case a re-read alone
@@ -27,7 +27,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, create_relationship, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
 use trellis::{Config, Trellis, TrellisOptions};
@@ -80,7 +80,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// Builds every registered definition and discharges its go-live catch-up.
 async fn bring_live(pool: &trellis::Pool, client: &mut Client) {
-    publication::settle_registrations(pool).await;
+    markers::settle_registrations(pool).await;
     drain_to_quiescence(pool, client).await;
     let not_live: i64 = client
         .query_one(
@@ -127,7 +127,7 @@ async fn uninstall(client: &mut Client, table: &str) {
 /// staged. Asserts the pass discharged every marker, so a deferral shows up
 /// here rather than as a wrong target further on.
 async fn discharge_markers(pool: &trellis::Pool, client: &mut Client) {
-    publication::run_pending_backfills(client, WAKE, &StagedWatermark::saturated(), Duration::ZERO)
+    markers::run_pending_backfills(client, WAKE, &StagedWatermark::saturated(), Duration::ZERO)
         .await
         .expect("run_pending_backfills");
     let markers: i64 = client
@@ -151,7 +151,7 @@ async fn status_of(client: &Client, target: &str) -> String {
 }
 
 /// Commits `sql` and stages `change` (built from the write's LSN) in one
-/// transaction, as intake would stage it.
+/// transaction, as capture would stage it.
 async fn commit_and_stage(client: &mut Client, sql: &str, change: impl Fn(PgLsn) -> StagedChange) {
     let txn = client.transaction().await.expect("begin source write");
     txn.batch_execute(sql).await.expect("source write");
@@ -195,7 +195,6 @@ async fn seed_sales(client: &Client) {
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
-             alter table public.sales replica identity full; \
              insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), \
                                              (4, 'a', 1000)",
         )
@@ -322,8 +321,6 @@ async fn live_relationship_consumer(
         .batch_execute(
             "create table public.customers (id integer primary key, name text); \
              create table public.orders (id integer primary key, customer_id integer); \
-             alter table public.customers replica identity full; \
-             alter table public.orders replica identity full; \
              insert into public.customers values (1, 'ann'), (2, 'bob'); \
              insert into public.orders values (10, 1), (11, 2), (12, 1)",
         )
@@ -500,7 +497,7 @@ async fn pending_older_to_side_cdc_does_not_undo_a_rejoins_projection_refresh() 
         .await
         .expect("rename a customer while customers isn't captured");
     capture(&mut client, &["public.customers", "public.orders"]).await;
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         WAKE,
         &StagedWatermark::saturated(),
@@ -798,7 +795,7 @@ async fn an_escalated_older_reverse_does_not_undo_a_projection_refresh() {
         .request_backfill("customers")
         .await
         .expect("request a re-backfill of the to-side");
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         WAKE,
         &StagedWatermark::saturated(),

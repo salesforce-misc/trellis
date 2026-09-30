@@ -63,9 +63,6 @@ async fn seed(raw: &Client) {
         "create table authors (id bigint primary key, name text); \
          create table posts (id bigint primary key, author bigint); \
          create table orders (id bigint primary key, g bigint, a numeric); \
-         alter table authors replica identity full; \
-         alter table posts replica identity full; \
-         alter table orders replica identity full; \
          insert into authors (id, name) values (1, 'a'), (2, 'b'); \
          insert into posts (id, author) values (1, 1), (2, 1), (3, 2); \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
@@ -286,7 +283,6 @@ async fn a_relationship_is_not_dropped_by_a_same_named_table_in_another_schema()
     raw.batch_execute(
         "create schema shop; \
          create table shop.authors (id bigint primary key, name text, rank bigint); \
-         alter table shop.authors replica identity full; \
          insert into shop.authors (id, name, rank) values (1, 'z', 7);",
     )
     .await

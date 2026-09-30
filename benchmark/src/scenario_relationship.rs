@@ -83,15 +83,6 @@ pub async fn run(
     generate::create_authors_table(&db.pool).await;
     generate::create_posts_table(&db.pool).await;
     generate::create_comments_table(&db.pool).await;
-    // A to-many relationship's to-side table needs a way to identify a row
-    // being deleted/updated in its CDC stream (`RelationshipToManyRequiresReplicaIdentity`);
-    // full replica identity satisfies that, matching the fixture tables in
-    // `trellis/tests/defs_backfill_relationship.rs`.
-    raw.batch_execute(
-        "alter table posts replica identity full; alter table comments replica identity full",
-    )
-    .await
-    .expect("set replica identity on relationship to-side tables");
 
     let authors_load = generate::load_authors(&db.pool, authors).await;
     // `_with_holdout`, not the plain loaders: deliberately leaves every

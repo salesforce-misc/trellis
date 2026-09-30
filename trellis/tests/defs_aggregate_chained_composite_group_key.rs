@@ -170,18 +170,13 @@ const STOCK_TOTALS: &str = "TRANSFORM stock_totals FROM inventory GROUP BY wareh
 const STOCK_TOTALS_V2: &str = "TRANSFORM stock_totals_v2 FROM stock_totals GROUP BY warehouse \
      SELECT sum(total_qty) AS total_qty";
 
-/// The issue's own schema. `inventory` needs `REPLICA IDENTITY FULL` because
-/// it's an aggregate source (the delta path needs the old image to locate the
-/// group a changed row is leaving); `stock_totals` needs it for the same
-/// reason once `stock_totals_v2` chains onto it, and can only be widened
-/// after `install_definition` has created it.
+/// The issue's own schema.
 async fn create_schema(client: &Client) {
     client
         .batch_execute(
             "create table inventory ( \
                  id integer primary key, warehouse text, sku text, qty integer \
              ); \
-             alter table inventory replica identity full; \
              insert into inventory (id, warehouse, sku, qty) values \
                (1, 'w1', 'a', 5), (2, 'w1', 'a', 7), (3, 'w1', 'b', 2), \
                (4, 'w2', 'a', 11)",
@@ -224,18 +219,13 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, STOCK_TOTALS, &inventory_columns(), "public")
         .await
         .expect("install the multi-column GROUP BY aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
-
-    client
-        .batch_execute("alter table stock_totals replica identity full")
-        .await
-        .expect("widen stock_totals's replica identity");
 
     install_definition(&db.pool, STOCK_TOTALS_V2, &stock_totals_columns(), "public")
         .await
         .expect("install the chained aggregate reading stock_totals");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     // Both backfills: (w1,a)=12, (w1,b)=2, (w2,a)=11; w1=14, w2=11.

@@ -1,17 +1,17 @@
-//! Integration tests for the settled parent projection's catalog, DDL,
-//! backfill, and replica-identity gate (issue #129, epic #127's "relationship
+//! Integration tests for the settled parent projection's catalog, DDL, and
+//! backfill (issue #129, epic #127's "relationship
 //! delta" — see `trellis/tests/spikes/issue-102-PLAN-DRAFT.md` §2 for the full
 //! mechanism). This is foundation-only: nothing here exercises a forward read
 //! from the projection (#130) or a reverse-applied advance (#131) — those
 //! don't exist yet. These tests only check that the projection table itself
-//! is correctly shaped, created, kept in step with its to-side table by
-//! backfill, and gated by replica identity.
+//! is correctly shaped, created, and kept in step with its to-side table by
+//! backfill.
 
 use std::collections::HashMap;
 
 use testkit::TestCluster;
 use trellis::defs::{
-    CatalogError, RelationshipCardinality, ValueType, create_definition, create_relationship,
+    RelationshipCardinality, ValueType, create_definition, create_relationship,
     relationship_projection,
 };
 
@@ -65,9 +65,7 @@ async fn projection_table_is_created_for_a_to_one_relationship_with_bookkeeping_
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
-             create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full",
+             create table articles (id integer primary key, category_id integer)",
         )
         .await
         .expect("create tables");
@@ -147,10 +145,8 @@ async fn projection_column_set_widens_to_cover_each_consumers_reads() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text, rank integer); \
-             alter table categories replica identity full; \
              insert into categories (id, name, rank) values (10, 'Tech', 1), (20, 'News', 2); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table articles replica identity full; \
              insert into articles (id, category_id, title) values (1, 10, 'a1'), (2, 20, 'a2')",
         )
         .await
@@ -246,10 +242,8 @@ async fn projection_widen_catches_up_a_to_side_row_inserted_before_the_widen() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table articles replica identity full; \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
         .await
@@ -350,11 +344,9 @@ async fn projection_backfill_excludes_null_to_side_keys() {
         .batch_execute(
             "create table categories (row_id integer primary key, code integer unique, \
              name text); \
-             alter table categories replica identity full; \
              insert into categories (row_id, code, name) values \
              (1, 10, 'Tech'), (2, null, 'Orphaned'), (3, 30, 'News'); \
-             create table articles (id integer primary key, category_code integer); \
-             alter table articles replica identity full",
+             create table articles (id integer primary key, category_code integer)",
         )
         .await
         .expect("create + seed tables");
@@ -392,12 +384,12 @@ async fn projection_backfill_excludes_null_to_side_keys() {
     assert_eq!(codes, vec![10, 30]);
 }
 
-/// A to-one relationship's to-side without `REPLICA IDENTITY FULL` is
-/// rejected at `create_relationship` time, with the exact `ALTER TABLE ...
-/// REPLICA IDENTITY FULL;` text an operator can copy verbatim — and no
-/// relationship row (and therefore no projection) is left behind.
+/// Issues #129/#158: a to-one relationship between two plain tables is
+/// accepted. A re-pointing `UPDATE` of the from-side's `from_col` still
+/// yields its true prior parent, because the capture trigger sees every
+/// column of the old row.
 #[tokio::test]
-async fn creating_a_to_one_relationship_without_replica_identity_full_is_rejected() {
+async fn creating_a_to_one_relationship_between_plain_tables_is_accepted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
@@ -405,105 +397,6 @@ async fn creating_a_to_one_relationship_without_replica_identity_full_is_rejecte
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer)",
-        )
-        .await
-        .expect("create tables");
-    drop(client);
-
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP category FROM articles.category_id TO categories.id",
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(
-        err.to_string(),
-        "table categories needs its old row image for a derivation that requires it; run \
-         this against the source database first: ALTER TABLE categories REPLICA IDENTITY \
-         FULL;"
-    );
-    assert!(matches!(err, CatalogError::ReplicaIdentityRequired(_)));
-
-    let count: i64 = db
-        .pool
-        .get()
-        .await
-        .expect("get connection")
-        .query_one("select count(*) from relationship_definitions", &[])
-        .await
-        .expect("count relationship rows")
-        .get(0);
-    assert_eq!(count, 0, "the rejected relationship must leave no row");
-}
-
-/// Issue #158: a to-one relationship's *from*-side (child) table also needs
-/// `REPLICA IDENTITY FULL`, not just its to-side — `from_col` is an ordinary
-/// non-PK column, so under the from-side's default (PK-only) replica
-/// identity a re-pointing `UPDATE` ships no old image at all (`old_image =
-/// None` from `pgoutput`), which breaks anything (e.g. the `group_key` union
-/// mechanism, issue #133) that needs to recover a row's true prior parent
-/// from the replication message. The to-side here already carries `REPLICA
-/// IDENTITY FULL` (satisfying the check `creating_a_to_one_relationship_without_replica_identity_full_is_rejected`
-/// covers), isolating this rejection to the from-side gate alone; the exact
-/// `ALTER TABLE ... REPLICA IDENTITY FULL;` text still names the from-side
-/// table specifically, so an operator can copy it verbatim.
-#[tokio::test]
-async fn creating_a_to_one_relationship_without_from_side_replica_identity_full_is_rejected() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
-             create table articles (id integer primary key, category_id integer)",
-        )
-        .await
-        .expect("create tables");
-    drop(client);
-
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP category FROM articles.category_id TO categories.id",
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(
-        err.to_string(),
-        "table articles needs its old row image for a derivation that requires it; run \
-         this against the source database first: ALTER TABLE articles REPLICA IDENTITY \
-         FULL;"
-    );
-    assert!(matches!(err, CatalogError::ReplicaIdentityRequired(_)));
-
-    let count: i64 = db
-        .pool
-        .get()
-        .await
-        .expect("get connection")
-        .query_one("select count(*) from relationship_definitions", &[])
-        .await
-        .expect("count relationship rows")
-        .get(0);
-    assert_eq!(count, 0, "the rejected relationship must leave no row");
-}
-
-/// Issue #158's positive counterpart: once *both* endpoints of a to-one
-/// relationship carry `REPLICA IDENTITY FULL` — the to-side (issue #129) and
-/// the from-side (issue #158) — `create_relationship` accepts it.
-#[tokio::test]
-async fn creating_a_to_one_relationship_with_both_sides_replica_identity_full_is_accepted() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create table categories (id integer primary key, name text); \
-             alter table categories replica identity full; \
-             create table articles (id integer primary key, category_id integer); \
-             alter table articles replica identity full",
         )
         .await
         .expect("create tables");
@@ -514,7 +407,7 @@ async fn creating_a_to_one_relationship_with_both_sides_replica_identity_full_is
         "RELATIONSHIP category FROM articles.category_id TO categories.id",
     )
     .await
-    .expect("both endpoints carry REPLICA IDENTITY FULL, so this must be accepted");
+    .expect("a to-one relationship between plain tables must be accepted");
     assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
 }
 
@@ -530,9 +423,7 @@ async fn a_to_many_relationship_gets_no_projection() {
     client
         .batch_execute(
             "create table posts (id integer primary key, word_count integer); \
-             alter table posts replica identity full; \
-             create table comments (id integer primary key, post_id integer); \
-             alter table comments replica identity full",
+             create table comments (id integer primary key, post_id integer)",
         )
         .await
         .expect("create tables");
@@ -576,14 +467,10 @@ async fn two_instances_sharing_a_target_schema_keep_independent_projections() {
     client
         .batch_execute(
             "create table public.categories (id integer primary key, name text); \
-             alter table public.categories replica identity full; \
              create table public.articles (id integer primary key, category_id integer); \
-             alter table public.articles replica identity full; \
              insert into public.categories (id, name) values (1, 'news'), (2, 'sport'); \
              create table public.brands (id integer primary key, name text); \
-             alter table public.brands replica identity full; \
              create table public.products (id integer primary key, brand_id integer); \
-             alter table public.products replica identity full; \
              insert into public.brands (id, name) values (10, 'acme'), (20, 'globex')",
         )
         .await

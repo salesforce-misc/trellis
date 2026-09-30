@@ -40,7 +40,7 @@ use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::sql::{CaptureSpec, install_statements};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
-use trellis::defs::{create_relationship, install_definition, publication_tables};
+use trellis::defs::{create_relationship, install_definition, tables_to_capture};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -269,11 +269,7 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
          create table public.fam (id integer primary key, fk2 integer, fk integer, {}); \
          create table public.comp (tag text, post integer, weight numeric, note text, \
                                    primary key (post, tag)); \
-         create table public.ctl (k text primary key, v text, l integer, ts text); \
-         alter table public.parent replica identity full; \
-         alter table public.fam replica identity full; \
-         alter table public.comp replica identity full; \
-         alter table public.ctl replica identity full",
+         create table public.ctl (k text primary key, v text, l integer, ts text)",
         fam_columns.join(", ")
     ))
     .await
@@ -314,14 +310,14 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         install_definition(&db.pool, text, &columns, "public")
             .await
             .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
-        trellis::intake::publication::settle_registrations(&db.pool).await;
+        trellis::intake::markers::settle_registrations(&db.pool).await;
     }
 
     // The capture specs, from the catalog.
-    let published = publication_tables(&db.pool)
+    let captured = tables_to_capture(&db.pool)
         .await
-        .expect("publication_tables");
-    let mut sorted = published.clone();
+        .expect("tables_to_capture");
+    let mut sorted = captured.clone();
     sorted.sort();
     assert_eq!(
         sorted,

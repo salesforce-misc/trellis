@@ -418,7 +418,6 @@ fn connect(
             staging,
             drain_threads,
             worker_threads: Some(worker_threads),
-            ..Default::default()
         };
         // Can't fail after `check` passed (a process's answer never
         // changes), but if it did, it's still an error rather than a hang.

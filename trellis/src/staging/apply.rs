@@ -193,7 +193,7 @@ pub enum ApplyError {
     /// resume until the definition's build has finished closes the window
     /// instead of racing it.
     DefinitionNotLive { transform: String },
-    /// A failure from [`crate::intake::publication`]'s backfill-marker
+    /// A failure from [`crate::intake::markers`]'s backfill-marker
     /// machinery (issue #55: [`super::quarantine::resume_transform`]
     /// re-parking a catch-up marker, or clearing/qualifying its source
     /// table).
@@ -581,10 +581,10 @@ impl DecodedImages {
 /// treats as a delete, matching `read_live_row`'s old `None` case exactly.
 ///
 /// `pk` may be a composite (multi-column) primary key (issue #126): `keys`
-/// are each [`ddl::pk_key_sql_expr`]'s U+001F-joined text — the same
-/// [`crate::intake::extract_key`] shape every [`FoldedChange::key`] already
-/// carries for a composite-PK source, whether staged by real CDC intake or
-/// by this crate's own reverse-relationship path
+/// are each [`ddl::pk_key_sql_expr`]'s U+001F-joined text — the same shape
+/// every [`FoldedChange::key`] already carries for a composite-PK source,
+/// whether staged by a capture trigger or by this crate's own
+/// reverse-relationship path
 /// ([`from_side_rows_for_trigger_txn`]/`from_side_keys`'s callers) —
 /// so the two agree on one row identity regardless of which produced it.
 /// The batch match itself is a keyset join, one bind-parameter array per
@@ -1047,9 +1047,9 @@ async fn accumulate_from_side_recomputes(
     let join_keys: Vec<String> = key_hops.keys().cloned().collect();
     // Issue #267: this accumulator's entries become staged `src_table`s
     // verbatim ([`apply_and_mark_drained_many`]'s step 4), so they carry the
-    // from-table's qualified identity — the spelling CDC intake stages for
-    // this same from-side table (which, being a genuine source table, is
-    // normally a publication member), and the spelling the Phase 3
+    // from-table's qualified identity — the spelling capture stages for this
+    // same from-side table (which, being a genuine source table, is normally
+    // captured), and the spelling the Phase 3
     // `relationship_reverse_fallback` twin of this path has always used
     // (`ReverseRelationshipShape::from_table` is already qualified). Two
     // spellings of one table fold as two unrelated `(src_table, key)` groups,
@@ -1298,10 +1298,10 @@ pub(crate) async fn build_relationship_context(
                         join_keys.iter().cloned().collect();
                     if let Some(old_rows) = old_rows {
                         for old_row in old_rows.iter().flatten() {
-                            // Issue #677: a to-one's from-side carries
-                            // `REPLICA IDENTITY FULL` (#158), so an old
-                            // image missing `from_col` is `MissingColumn`,
-                            // not a parent silently left un-bumped.
+                            // Issue #677: a to-one's from-side images
+                            // `from_col` (it is in its capture set), so an
+                            // old image missing it is `MissingColumn`, not a
+                            // parent silently left un-bumped.
                             if let Some(text) =
                                 apply_aggregate::required_column(old_row, &from_col, &rel_name)?
                             {
@@ -1665,8 +1665,9 @@ pub(crate) struct RelationshipReverseRecord {
     /// Issue #132 guard (a): `X`, "the source's write frontier," captured in
     /// the same Phase 2 statement as `prev_lsn`/`prev_gen` above (via
     /// `pg_current_wal_lsn()` against the same connection). Phase 3 must not
-    /// apply this record until [`StagedWatermark::get`] reports intake has
-    /// staged everything committed at or before this value — see
+    /// apply this record until [`StagedWatermark::get`] reports everything
+    /// committed at or before this value is staged (always, under trigger
+    /// capture) — see
     /// `check_reverse_guards`'s guard (a) arm and this module's "Issue #131,
     /// #132" doc section for why a lower/earlier capture is always safe (it
     /// only makes the barrier easier, never wrongly permissive) while a
@@ -2123,11 +2124,9 @@ async fn group_by_snapshot_source(
 /// missing `to_col` entirely is [`EvalError::MissingColumn`] against
 /// relationship `rel_name` (issue #677, see
 /// [`apply_aggregate::required_column`]): `row` is the to-side change's own
-/// image, and the join key is always part of it. A to-one's to-side carries
-/// `REPLICA IDENTITY FULL`, a to-many's carries `FULL` or a replica-identity
-/// index covering `to_col` (under trigger capture, `to_col` is in its
-/// capture set), and intake fills an unchanged TOASTed `to_col` in from the
-/// old tuple.
+/// image, and the join key is always part of it: `to_col` is in the
+/// to-side's capture set, and a capture trigger images the whole row, an
+/// unchanged TOASTed value included.
 fn relationship_key_text(
     row: &Option<Row>,
     to_col: &str,
@@ -2366,7 +2365,7 @@ async fn from_side_rows_for_trigger_txn(
 /// re-parsing a log message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReverseGuardFailure {
-    /// Guard (a): intake has not yet staged everything committed at or
+    /// Guard (a): the ring does not yet hold everything committed at or
     /// before this record's captured watermark `X`.
     Watermark,
     /// Guard (b): the projection row's `__trellis_gen` moved since Phase 2's
@@ -2447,20 +2446,19 @@ impl ReverseGuardFailure {
 /// **Seam rows (issue #402).** A from-side that is one of this instance's
 /// targets can reach the ring as the target-mutation seam's CDC-shaped rows,
 /// whose `lsn` is the writer's pre-commit write token, not its commit. Guard
-/// (a)'s premise, "once intake has staged through `X`, every change at or
-/// below `X` is in the ring", does not hold for them: a row with a token at
+/// (a)'s premise, "once the ring holds everything through `X`, every change at
+/// or below `X` is in the ring", does not hold for them: a row with a token at
 /// or below `X` can belong to a writer that has not committed, so this scan
 /// can't see it. The check is still no weaker than it is against the same
-/// writes' CDC. A token is below its writer's commit, so a write whose CDC
-/// row would be at or below `X` has a seam row at or below `X` too, and a
-/// writer that committed before this scan committed its seam row with it
-/// (no intake lag to wait out). A seam row this scan can't see belongs to a
-/// writer that commits after the scan, so after `X` was captured: its CDC
-/// row would be above `X` and excluded as well. The argument only uses
-/// "token below commit", so it does not matter that `X` is a WAL *write*
-/// position while the token is an *insert* position. What does change is
-/// that a seam row can match here although its writer committed after `X`,
-/// which only defers more.
+/// writes' CDC. A token is below its writer's commit, so a write whose CDC row
+/// would be at or below `X` has a seam row at or below `X` too, and a writer
+/// that committed before this scan committed its seam row with it. A seam row
+/// this scan can't see belongs to a writer that commits after the scan, so
+/// after `X` was captured: its CDC row would be above `X` and excluded as well.
+/// The argument only uses "token below commit", so it does not matter that `X`
+/// is a WAL *write* position while the token is an *insert* position. What does
+/// change is that a seam row can match here although its writer committed after
+/// `X`, which only defers more.
 async fn from_side_change_in_flight(
     txn: &Transaction<'_>,
     from_table: &str,
@@ -3457,9 +3455,9 @@ fn truncate_overtaken_by_refresh(lsn: Option<PgLsn>, stamp: Option<PgLsn>) -> bo
 /// staged before that refresh but drained after it would put an older image
 /// back with nothing after it to correct it. For a target to-side (fed by
 /// the target-mutation seam) that is a resumed definition's rebuild, which
-/// bypasses the seam. For a source to-side it is a change whose CDC was lost
-/// after the pending record's (a table out of the publication, or a lost
-/// slot), which the refresh read and no record carries. So a record whose
+/// bypasses the seam. For a source to-side it is a change no ring row
+/// carries (one written while the table's capture was uninstalled), which
+/// the refresh read. So a record whose
 /// images the live row contradicts writes the projection from the live row
 /// ([`apply_projection_from_live`]) and re-derives its from-side rows with
 /// the image-less fallback, never a delta from images that no longer hold. A
@@ -4193,7 +4191,7 @@ mod tests {
         {
             corpus.push(r.get(0));
         }
-        // The CDC shape, hand-encoded by intake's own `json_string`.
+        // The CDC shape, hand-encoded by `crate::intake::json_string`.
         let values_sql = format!(
             "select {} from corpus t order by id",
             columns
@@ -4623,7 +4621,7 @@ mod tests {
         // counter — and so the fold has several rows to collapse.
         let image = r#"{"price":"10.00","tax":"1.50"}"#.to_string();
         // Issue #512: ordered offsets above the real WAL insert position, as
-        // intake would stage three successive commits.
+        // three successive captured commits would carry.
         let base = u64::from(testkit::wal_insert_lsn(&client).await);
         for (op, lsn, old_image) in [
             ("insert", 1u64, None),
@@ -5476,7 +5474,7 @@ mod tests {
     /// reached: isolation's first step would be its start log line.
     #[tokio::test]
     async fn classify_and_retry_never_isolates_a_wrapped_lost_claim() {
-        let (_guard, captured) = crate::client::intake_supervisor_tests::install_capture();
+        let (_guard, captured) = crate::client::log_capture::install_capture();
         let pool = crate::pool::Pool::new(
             &crate::config::Config::from_dsn(
                 "host=/nonexistent/trellis-issue-670 port=1 user=nobody dbname=nothing".to_string(),
@@ -5937,20 +5935,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // *to-side*. A change to a related row must re-derive every from-side
         // row whose enrichment reads it. For each relationship pointing at
         // this table, collect the join-key text of every to-side row this
-        // batch touched — the related row's `to_col`. For a to-one this is a
-        // PRIMARY KEY/UNIQUE column, so it rides in the default replica
-        // identity of every image, including a delete's pre-image. For a
-        // to-many, `to_col` is the *foreign* side (non-key), so it only rides
-        // in the pre-image when the to-side carries an adequate replica
-        // identity — which is exactly why issue #41 gates that at
-        // `create_relationship` (define) time: `REPLICA IDENTITY FULL` or a
-        // covering replica-identity index. That gate is creation-time only and
-        // not re-validated per batch, and relaxing it later is *not* caught
-        // here: `pgoutput`'s key-only pre-image still sends every column,
-        // with the non-key ones as placeholder `NULL`s, so `to_col` reads as
-        // a genuine `NULL` ("no key") and the reverse recompute is silently
-        // skipped. What is caught (issue #677) is an image with no `to_col`
-        // at all, which is `MissingColumn` below.
+        // batch touched — the related row's `to_col`. A capture trigger
+        // images `to_col` in every image, a delete's pre-image included,
+        // since it is in the to-side's capture set (issue #622), whether it
+        // is the to-side's key (a to-one) or not (a to-many). An image with
+        // no `to_col` at all is `MissingColumn` below (issue #677).
         // Then resolve, with one live lookup, the from-side keys whose
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
@@ -6099,7 +6088,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // transition, and must never become a reverse **delta**.
             //
             // Such a trigger asserts only "this key exists as of now" (see
-            // `intake::publication::enumerate_and_append`'s doc comment); it
+            // `intake::markers::enumerate_and_append`'s doc comment); it
             // carries no images at all, and it is staged in quantity by
             // paths that have nothing to do with the parent changing: a
             // definition's ring backfill enumeration of its own source
@@ -7056,12 +7045,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // reader question is answered, and Phase 3 stages it verbatim as the
         // propagated row's `src_table`. Reusing the identity this lookup
         // already computed is what makes the emitted spelling agree, by
-        // construction, with the one CDC intake independently stages for the
-        // same physical table (`publication::qualify` of the WAL relation's
-        // own namespace) — `resolve_graph_identity`'s first step is a
+        // construction, with the one a capture trigger independently stages
+        // for the same physical table (its spec's `markers::qualify`
+        // spelling) — `resolve_graph_identity`'s first step is a
         // `search_path` lookup of the real relation, which a target table
         // satisfies, and both sides then format the schema it finds through
-        // that same `publication::qualify`, so the two strings are equal by
+        // that same `markers::qualify`, so the two strings are equal by
         // construction rather than by coincidence. (Strictly, step 1 returns
         // the *first* `current_schemas(false)` match, so an unrelated relation
         // of the same bare name in an earlier schema on the pinned path would
@@ -7355,8 +7344,8 @@ fn evaluated_values(
 
 /// A [`Row`] as a JSON object of column text (`null` for SQL NULL) — the
 /// shape [`TargetWrite::basis`] carries, compared in Phase 3 against the
-/// source's current row with jsonb containment. Hand-built, like intake's
-/// images, since this crate has no JSON dependency.
+/// source's current row with jsonb containment. Hand-built, since this
+/// crate has no JSON dependency.
 fn row_to_json_text(row: &Row) -> String {
     let mut fields: Vec<String> = row
         .iter()

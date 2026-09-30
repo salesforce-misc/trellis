@@ -1,13 +1,13 @@
-//! Issue #452: `Trellis::await_converged` on a quiet stream must not wait for
-//! intake's next keepalive.
+//! Issue #452: `Trellis::await_converged` on a quiet stream must return as
+//! soon as the write is applied.
 //!
-//! The token is `pg_current_wal_lsn()`, so any WAL between the caller's commit
-//! and its token read that carries no published change (a write to an
-//! unpublished table, the engine's own staging and draining of the write)
-//! leaves intake nothing to confirm past the token with. It used to wait for a
-//! keepalive-driven persist, throttled to once per 10s, and these waits took
-//! ~9s every time. Now the waiter writes a `trellis.converge` logical message
-//! that intake confirms through as soon as it decodes it.
+//! The token is `pg_current_wal_lsn()`, so WAL between the caller's commit
+//! and its token read can carry no captured change (a write to an uncaptured
+//! table, the engine's own staging and draining of the write). Under the
+//! replication intake Trellis ran before #622 that left nothing to confirm
+//! past the token with, and these waits took ~9s every time, waiting for a
+//! keepalive-driven persist. Trigger capture stages a change in the writer's
+//! own transaction, so there is nothing to wait for but the drain.
 //!
 //! Each wait gets a 5s budget: ample for a pipeline that converges in well
 //! under a second, and short of the ~9s the keepalive path took.
@@ -21,7 +21,7 @@ use trellis::{Config, Trellis, TrellisOptions};
 const BUDGET: Duration = Duration::from_secs(5);
 
 /// A running staging instance with one live 1-1 transform over `widgets`,
-/// plus an unpublished `audit_log` table.
+/// plus an uncaptured `audit_log` table.
 async fn running_instance(db: &testkit::TestDatabase) -> (Trellis, deadpool_postgres::Object) {
     let config = Config::with_schema(db.dsn().to_string(), "trellis").expect("valid schema");
     let pool = trellis::Pool::new(&config).expect("pool");
@@ -74,7 +74,7 @@ async fn price(conn: &deadpool_postgres::Object, id: i32) -> Option<i32> {
 }
 
 #[tokio::test]
-async fn an_unpublished_write_before_the_token_does_not_stall_the_wait() {
+async fn an_uncaptured_write_before_the_token_does_not_stall_the_wait() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let (trellis, conn) = running_instance(&db).await;
@@ -109,8 +109,8 @@ async fn a_token_taken_after_the_engine_staged_the_write_does_not_stall_the_wait
         conn.execute("insert into widgets values ($1, $1)", &[&id])
             .await
             .expect("insert source row");
-        // Long enough for intake to stage (and the engine to start draining)
-        // the write, so its own WAL lands before the token.
+        // Long enough for the engine to start draining the write, so its own
+        // WAL lands before the token.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let token = trellis.watermark_token().await.expect("watermark_token");
         trellis

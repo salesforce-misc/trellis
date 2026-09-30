@@ -31,7 +31,7 @@ async fn migrate_up_is_idempotent() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
-            50, 51, 53, 54, 55, 56, 57, 58
+            50, 51, 53, 54, 55, 56, 57, 58, 59
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -88,7 +88,7 @@ async fn migrate_up_is_idempotent() {
         // .definition_version` — the monotonic per-definition edit counter
         // `ALTER TRANSFORM` bumps; `source_table_versions.version` remains
         // the value the version fence itself reads). Issue #310 added V36
-        // (`slot_loss_pauses`, which transforms a lost replication slot paused).
+        // (`slot_loss_pauses`, which transforms a lost slot paused).
         // Issue #315 added V37 (a `recompute` ring row may carry a prior-image
         // hint in `old_image`). Issue #288 added V38 (`relationship_definitions`'
         // uniqueness key widened to the schema-qualified `(from_schema,
@@ -121,8 +121,9 @@ async fn migrate_up_is_idempotent() {
         // paused until the capture images the columns it reads). Issue #623
         // D3 added V57 (`ledger_truncate_floor`, a ledger target's truncate
         // floor). #622 C6 added V58 (the `schema_changed` ring op,
-        // `segments.has_schema_change` and `capture_failures`).
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V58 to be applied"
+        // `segments.has_schema_change` and `capture_failures`), and C8 V59
+        // (drops `replication_progress` and `slot_loss_pauses`).
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V59 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.
@@ -186,7 +187,7 @@ async fn unreachable_dsn_surfaces_a_typed_error_without_panicking() {
 }
 
 /// Issue #340: a connection killed server-side (`pg_terminate_backend`, the
-/// same fault a chaos test injects into intake's producer connection) must
+/// same fault a chaos test injects into the producer connection) must
 /// classify as `Connectivity`, the same as a transport-level drop. The
 /// server reports it as a real `DbError` with SQLSTATE `57P01`
 /// (admin_shutdown), which `classify_pg_error` used to fold into `Internal`.

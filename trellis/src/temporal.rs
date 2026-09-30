@@ -134,66 +134,23 @@
 //! `timestamptz` needed a second, independent fix on top of this one — see
 //! below.
 //!
-//! Note the shape of this defect was issue #246's, one layer in: one value,
-//! two renderers, no arbiter. There it is the pool versus the walsender; here
-//! it was `::text` versus `to_jsonb` inside a single process. Closing #248
-//! did not touch #246 at all — they are different renderer pairs — which is
-//! exactly why `timestamptz` needed #246 separately, addressed next.
+//! Note the shape of this defect: one value, two renderers, no arbiter.
+//! `timestamptz` had a second such pair, addressed next.
 //!
 //! ## Why `timestamptz` needed issue #246, separately
 //!
 //! `timestamptz_out` renders the stored instant as wall-clock text in the
-//! session's `TimeZone`, so the obvious move is to pin `TimeZone` to
-//! `'UTC'` in [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`] the same way
-//! `DateStyle` is pinned, and that *would* make the rendering a bijection
-//! on the instant. Issue #113 investigated it and found it did not work
-//! *yet*, for a reason that had nothing to do with blast radius on
-//! application sessions (Trellis owns its own connections —
-//! `pool::session_bootstrap` runs on every one):
-//!
-//! **Trellis renders `timestamptz` on two different backends, and issue
-//! #113 could only control one of them.** Logical-decoding output is
-//! produced by the type's own output function running *in the walsender
-//! backend*, under the walsender's GUCs — verified live: the same slot
-//! peeked from a session with `timezone='UTC'` yielded `2024-01-01
-//! 12:00:00+00` and from one with `timezone='Asia/Tokyo'` yielded the Tokyo
-//! wall clock, on a server whose own default was `America/New_York`.
-//! `pgwire_replication`'s `ReplicationConfig` v0.4 exposed no way to send
-//! startup runtime parameters or to issue a `SET` on the replication
-//! connection, so the walsender kept the server/database/role default no
-//! matter what the pool pinned.
-//!
-//! At the time, those two renderers *agreed* only by accident: both the
-//! pool and the walsender fell back to the same server default. Pinning
-//! `TimeZone` on the pool alone would have replaced that accidental
-//! symmetry with a guaranteed asymmetry on every server whose default is
-//! not UTC — the CDC-decoded text of an instant and a target-table read of
-//! the same instant would disagree. That was strictly worse than the
-//! status quo, so #113 declined the pin and named the unlock: a
-//! replication transport that can pin session GUCs, after which `TimeZone`
-//! joins the constant and `timestamptz` becomes stable exactly like `date`
-//! did.
-//!
-//! **Issue #246 is that unlock.** `pgwire-replication` 0.4.1 added
-//! `ReplicationConfig::with_options`, and
-//! `crate::intake::IntakeConfig::replication_config` now calls it with
-//! [`crate::pool::deterministic_text_output_options`] — the same
-//! [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`] the pool pins, reparsed
-//! into the startup `options` shape. The walsender now genuinely pins
-//! `TimeZone = 'UTC'`, not merely agrees with it by coincidence, so
-//! `timestamptz` clears both halves the same way `timestamp` does and joins
-//! it in [`is_bijective_under_text`]/[`is_render_consistent`] below.
-//!
-//! Note the same asymmetry was a pre-existing, latent hazard for
-//! `DateStyle` and `bytea_output` even before #246 — it did not bite there
-//! because the pinned values (`ISO` output, `hex`) are output-identical to
-//! a stock server's defaults, so the walsender agreed with the pool unless
-//! an operator had deliberately reconfigured the server. `TimeZone` had no
-//! such stock value to lean on, which is exactly why #113 pinned
-//! `IntervalStyle` (`postgres` is output-identical to stock) but not
-//! `TimeZone`, and why closing #246 — pinning the walsender for real,
-//! rather than finding a fifth output-identical-to-stock value — was the
-//! only way to close this one out.
+//! session's `TimeZone`, so it is a bijection on the instant only when every
+//! renderer pins the same `TimeZone`. Trellis renders a value in two places:
+//! on its own connections (`pool::session_bootstrap` runs on every one), and
+//! in a capture function running inside the application's session, whose
+//! `TimeZone` Trellis doesn't control. Issue #246 pinned `TimeZone = 'UTC'`
+//! in [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`], and every capture
+//! function pins that same constant as `SET` clauses
+//! (`crate::capture::sql::pinned_output_settings`), so both renderers agree
+//! whatever the server, database, role or session default is. That is why
+//! `timestamptz` joins `timestamp` in [`is_bijective_under_text`]/
+//! [`is_render_consistent`] below.
 //!
 //! # `MIN`/`MAX`, and why `interval` is excluded from them
 //!
@@ -262,7 +219,7 @@ const DAYS_PER_MONTH: i64 = 30;
 /// A failure to parse Postgres's canonical output text for a temporal type.
 ///
 /// Carries no detail beyond the family, deliberately: every caller in this
-/// crate is parsing text Postgres itself produced (a CDC-decoded value, a
+/// crate is parsing text Postgres itself produced (a captured value, a
 /// target-table read, or a literal `crate::defs::typed_literal` already
 /// checked), so a parse failure means the engine's own invariants are
 /// broken, not that a user typed something wrong.
@@ -322,9 +279,8 @@ pub const fn is_temporal(pg_type: PgType) -> bool {
 /// turns a column into text produces *that same* string — is what
 /// `timestamp` used to fail, before issue #248 made every internal renderer
 /// agree, and what `timestamptz` used to fail for a second, independent
-/// reason on top of that (issue #246: the pool and the walsender pinned
-/// different GUCs, or — before #246 — the walsender couldn't be pinned at
-/// all). Both issues are now closed, which is why `timestamptz` joins
+/// reason on top of that (issue #246: its renderers didn't all pin
+/// `TimeZone`). Both issues are now closed, which is why `timestamptz` joins
 /// `date`/`time`/`timetz`/`timestamp` below.
 ///
 /// See "Two renderers, and `timestamp`'s issue #248 fix" in this module's
@@ -347,13 +303,11 @@ pub const fn is_text_stable(pg_type: PgType) -> bool {
 /// than "one value, two spellings" — which is why, back when nothing pinned
 /// `TimeZone` at all, it was recorded on [`is_render_consistent`] instead of
 /// here. Issue #246 pins `TimeZone = 'UTC'` on every connection Trellis
-/// opens (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`, now including the
-/// walsender via `with_options` — see that constant's doc comment), which
-/// closes the cross-session gap: `timestamptz_out` under a fixed `TimeZone`
-/// is a bijection on the stored instant, exactly the argument issue #113
-/// made for pinning it and declined only because the walsender couldn't be
-/// pinned along with the pool. `timestamptz` joins the admitted list below
-/// as of issue #246.
+/// opens and in every capture function
+/// (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` — see that constant's doc
+/// comment), which closes the cross-session gap: `timestamptz_out` under a
+/// fixed `TimeZone` is a bijection on the stored instant. `timestamptz`
+/// joins the admitted list below as of issue #246.
 const fn is_bijective_under_text(pg_type: PgType) -> bool {
     matches!(
         pg_type,
@@ -394,17 +348,16 @@ const fn is_bijective_under_text(pg_type: PgType) -> bool {
 /// key roles, not just the key roles.
 ///
 /// This is the same *shape* of defect issue #246 fixed one layer out
-/// (deterministic-output GUCs pinned on the pool but not the walsender):
-/// one value, two renderers, no arbiter. **Issue #248 reconciled the
-/// `to_jsonb` sites with `::text`** (`staging::apply::row_as_text_jsonb_sql`,
-/// an explicit per-column `jsonb_build_object` in place of `to_jsonb(t.*)`),
-/// which is why `timestamp` was admitted here first. `timestamptz` used to
-/// fail this predicate *twice over* — `to_jsonb` vs. `::text` (closed by
-/// #248, same as `timestamp`) and pool vs. walsender (closed by #246: the
-/// walsender now pins `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` via
-/// `pgwire_replication::ReplicationConfig::with_options`, so it renders
-/// `timestamptz_out` under the same `TimeZone = 'UTC'` the pool does). Both
-/// closed, so `timestamptz` now joins `date`/`time`/`timetz`/`timestamp`.
+/// (`TimeZone` not pinned on every renderer): one value, two renderers, no
+/// arbiter. **Issue #248 reconciled the `to_jsonb` sites with `::text`**
+/// (`staging::apply::row_as_text_jsonb_sql`, an explicit per-column
+/// `jsonb_build_object` in place of `to_jsonb(t.*)`), which is why `timestamp`
+/// was admitted here first. `timestamptz` used to fail this predicate *twice
+/// over* — `to_jsonb` vs. `::text` (closed by #248, same as `timestamp`) and an
+/// unpinned `TimeZone` (closed by #246: the pool and every capture function pin
+/// `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`, so both render
+/// `timestamptz_out` under `TimeZone = 'UTC'`). Both closed, so `timestamptz`
+/// now joins `date`/`time`/`timetz`/`timestamp`.
 pub const fn is_render_consistent(pg_type: PgType) -> bool {
     matches!(
         pg_type,
@@ -433,8 +386,8 @@ pub const fn is_render_consistent(pg_type: PgType) -> bool {
 /// used to spell an ISO-8601 `T` no server-side `min()` ever emits.
 /// `timestamp`'s fix was issue #248 (every internal renderer now agrees
 /// with `::text`). `timestamptz` needed that fix too, *and* a second one on
-/// top of it: its rendering still moved between the pool and the walsender
-/// even after #248, until issue #246 pinned `TimeZone` on both. Both are
+/// top of it: its rendering still moved with the session's `TimeZone` even
+/// after #248, until issue #246 pinned `TimeZone` on every renderer. Both are
 /// closed now, so `timestamptz` joins `date`/`time`/`timetz`/`timestamp`
 /// here.
 pub const fn supports_min_max(pg_type: PgType) -> bool {
@@ -1304,8 +1257,8 @@ mod tests {
 
         // `timestamptz` used to fail both halves, for two different
         // reasons — `to_jsonb` (closed by #248, same as `timestamp`) and
-        // pool-vs-walsender `TimeZone` (closed by #246, pinning the
-        // walsender via `pgwire_replication::ReplicationConfig::with_options`).
+        // an unpinned `TimeZone` (closed by #246, pinning it on the pool and
+        // in every capture function).
         // Both closed, so it now clears both halves too.
         assert!(is_bijective_under_text(PgType::TimestampTz));
         assert!(is_render_consistent(PgType::TimestampTz));

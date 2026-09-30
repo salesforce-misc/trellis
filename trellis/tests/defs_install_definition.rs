@@ -48,7 +48,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "install_def_test_backfill_worker";
@@ -61,7 +61,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
         if claimed.is_empty() {
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
-            trellis::intake::publication::discharge_registrations(pool)
+            trellis::intake::markers::discharge_registrations(pool)
                 .await
                 .expect("discharge the go-live catch-ups");
             return;
@@ -170,7 +170,7 @@ async fn stage_cdc(
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -246,7 +246,7 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     // completion the way a running `application_threads` drain worker would
     // before asserting on the target's contents. Only the build: its go-live
     // catch-up (#476) re-reads the source into the ring by design.
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     let mismatches: i64 = client
         .query_one(
@@ -333,7 +333,7 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // ADR-0016 (#418): the discharge plans and enqueues the chunks.
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the build");
 
@@ -652,8 +652,6 @@ async fn install_definition_ring_fallback_ends_up_live() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full; \
              insert into categories (id, name) values (10, 'Tech'); \
              insert into articles (id, category_id, title) values (1, 10, 'a1')",
         )
@@ -690,7 +688,7 @@ async fn install_definition_ring_fallback_ends_up_live() {
         TransformStatus::WaitingToBackfill,
         "the ring-fallback path waits for the discharge too (ADR-0016, #418)"
     );
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge enumerates the source and takes it live");
 
@@ -754,7 +752,7 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
     // in-call — drive it to completion before reading the target.
     // Only the build: its go-live catch-up (#476) re-reads the source into
     // the ring by design.
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     // The direct build populates the target and stages nothing in the ring
     // — the fast-path signature (see the sibling fast-path test).
@@ -807,7 +805,6 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
         .batch_execute(
             "create table order_items \
              (id bigint primary key, order_id bigint, amount numeric); \
-             alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, 3)",
         )
@@ -835,7 +832,7 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     // The direct build populates the target synchronously and stages nothing
     // in the ring — the fast-path signature (see the sibling fast-path tests).
@@ -890,7 +887,6 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
         .batch_execute(
             "create table order_items \
              (id bigint primary key, order_id bigint, amount numeric); \
-             alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, 3)",
         )
@@ -914,7 +910,7 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String, String)> = client
         .query(
@@ -960,7 +956,6 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
         .batch_execute(
             "create table order_items \
              (id bigint primary key, order_id bigint, amount numeric); \
-             alter table order_items replica identity full; \
              insert into order_items (id, order_id, amount) values \
              (1, 10, 5), (2, 10, 7), (3, 20, null)",
         )
@@ -985,7 +980,7 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     // (order_id, total, grand_total, super_total)
     type Row = (String, Option<String>, Option<String>, Option<String>);
@@ -1101,8 +1096,6 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              insert into articles (id, category_id, title) values \
              (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
@@ -1138,7 +1131,7 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
     )
     .await
     .expect("install_definition falls back to the ring path for a relationship-enriched shape");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge enumerates the source");
 
@@ -1217,8 +1210,6 @@ async fn install_definition_fast_path_builds_a_relationship_cross_field_alias_ch
             "create table authors (id integer primary key, name text); \
              create table posts (id integer primary key, author_id integer); \
              create table comments (id integer primary key, author_id integer); \
-             alter table posts replica identity full; \
-             alter table comments replica identity full; \
              insert into authors (id, name) values (1, 'a'), (2, 'b'); \
              insert into posts (id, author_id) values (100, 1), (101, 1); \
              insert into comments (id, author_id) values (200, 1), (201, 1), (202, 1)",
@@ -1257,7 +1248,7 @@ async fn install_definition_fast_path_builds_a_relationship_cross_field_alias_ch
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     // Direct build: target populated synchronously, nothing staged in the ring.
     let mut rows: Vec<(String, String, String, String)> = client
@@ -1315,7 +1306,6 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
         .batch_execute(
             "create table authors (id integer primary key, name text); \
              create table posts (id integer primary key, author_id integer, word_count integer); \
-             alter table posts replica identity full; \
              insert into authors (id, name) values (1, 'a'), (2, 'b'); \
              insert into posts (id, author_id, word_count) values \
              (100, 1, 10), (101, 1, 20)",
@@ -1346,7 +1336,7 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String)> = client
         .query(
@@ -1396,8 +1386,6 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
             "create table authors (id integer primary key, name text); \
              create table posts (id integer primary key, author_id integer, word_count integer); \
              create table comments (id integer primary key, author_id integer, word_count integer); \
-             alter table posts replica identity full; \
-             alter table comments replica identity full; \
              insert into authors (id, name) values (1, 'a'), (2, 'b'); \
              insert into posts (id, author_id, word_count) values (100, 1, 10), (101, 1, 20); \
              insert into comments (id, author_id, word_count) values (200, 1, 3), (201, 1, 4)",
@@ -1436,7 +1424,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String, String, String)> = client
         .query(
@@ -1576,9 +1564,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
 
 /// Relationship-enriched-1-1 repro: the same resolution for a shape
 /// `backfill::uses_relationships` keeps off the plain-1-1 chunked build, as
-/// an Aggregate would be, but without also exercising `create_definition_inner`'s separate
-/// `assert_replica_identity_supports_aggregate` check (irrelevant to a
-/// to-one-enriched 1-1, and out of this fix's scope). `def C`'s own source
+/// an Aggregate would be. `def C`'s own source
 /// is the chained, non-default-schema target — `tagrel`'s to-side
 /// (`tags`) is an ordinary, already-on-`search_path` table, so only the
 /// `bare_table == def.source` branch this fix touches is under test here.
@@ -1604,7 +1590,6 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
              create table s (id bigint primary key, a numeric); \
              insert into s (id, a) select g, g from generate_series(1, 50) g; \
              create table tags (id bigserial primary key, label text); \
-             alter table tags replica identity full; \
              insert into tags (id, label) select g, 'tagged' from generate_series(1, 50) g",
         )
         .await
@@ -1624,16 +1609,7 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
     // this relationship's `from_table` is itself the chained, non-default-
     // schema target under test, so declaring it also exercises this same
     // fix's `create_relationship`-side gap (see `defs_relationship_catalog.rs`'s
-    // own regression test). Issue #158: the from-side needs `REPLICA IDENTITY
-    // FULL` unconditionally too, same as the to-side, regardless of whether
-    // its join column happens to be the primary key.
-    db.pool
-        .get()
-        .await
-        .expect("get connection")
-        .batch_execute("alter table custom.t replica identity full")
-        .await
-        .expect("set replica identity full on custom.t");
+    // own regression test).
     create_relationship(&db.pool, "RELATIONSHIP tagrel FROM t.id TO tags.id")
         .await
         .expect("relationship's bare FROM must resolve to custom.t");
@@ -1658,7 +1634,7 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
     // target starts empty and only converges once the discharge has
     // enumerated the source and the ring is drained, exactly like
     // `install_definition_falls_back_to_ring_for_relationship_enriched_definition`.
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge enumerates the source");
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -1727,7 +1703,7 @@ async fn registration_reads_no_source_rows() {
         .batch_execute("commit")
         .await
         .expect("release the lock");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("discharge the registrations");
     let ring_rows: i64 = client
@@ -1785,8 +1761,6 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .batch_execute(
             "create table s (id bigint primary key, g bigint, a numeric); \
              create table p (id bigint primary key, s_id bigint); \
-             alter table s replica identity full; \
-             alter table p replica identity full; \
              insert into s (id, g, a) select i, i % 5, i from generate_series(1, 50) i; \
              insert into p (id, s_id) select i, i % 10 + 1 from generate_series(1, 30) i",
         )
@@ -1825,7 +1799,7 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .batch_execute("commit")
         .await
         .expect("release the lock");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("discharge the registrations");
     let statuses: Vec<String> = client
@@ -2235,7 +2209,7 @@ async fn install_definition_accepts_a_primary_key_column_under_another_name() {
     )
     .await
     .expect("a renamed primary key column installs");
-    trellis::intake::publication::settle_builds(&db.pool).await;
+    trellis::intake::markers::settle_builds(&db.pool).await;
     let mismatches: i64 = client
         .query_one(
             "select count(*) from s full join t on t.id = s.id \

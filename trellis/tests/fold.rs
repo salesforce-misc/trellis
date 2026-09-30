@@ -869,7 +869,7 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
 
 /// The ordering hazard within a single source transaction: an insert and a
 /// truncate sharing one commit `lsn` are only distinguishable by
-/// `change_id` (intake's append order = execution order). A pre-truncate
+/// `change_id` (capture's append order = execution order). A pre-truncate
 /// insert in the same transaction (lower `change_id`) must be voided; a
 /// post-truncate insert in the same transaction (higher `change_id`) must
 /// survive — `lsn` alone cannot tell these apart.
@@ -1313,7 +1313,7 @@ async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
 
 /// Issue #581: the group-key union goes through `jsonb` (`jsonb_agg`, then a
 /// jsonpath flatten, then `#>> '{}'` back to text), so it must hand back
-/// exactly the texts intake staged, not whatever jsonb makes of them. Values
+/// exactly the texts capture staged, not whatever jsonb makes of them. Values
 /// that look like JSON literals, numbers that jsonb would normalize, quotes,
 /// backslashes, control characters, non-ASCII and a long string all survive
 /// byte for byte, the empty string and the string `null` are real values,

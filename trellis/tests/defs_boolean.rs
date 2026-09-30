@@ -24,7 +24,7 @@
 //!    `boolean` is the only type on the epic's board with a second renderer
 //!    at all.
 //! 2. **That divergence is real, not theoretical, for the join/primary-key
-//!    role**: `intake::extract_key` stores a CDC-decoded key's `boolout`
+//!    role**: capture stores a key's `boolout`
 //!    spelling verbatim, and several of `staging::apply`'s scalar key
 //!    lookups compare it against a live column's `{col}::text` rendering —
 //!    two different strings for one value, silently never matching. This is
@@ -227,9 +227,7 @@ async fn boolean_is_refused_as_a_relationship_join_key_and_primary_key() {
     client
         .batch_execute(
             "create table parent (k boolean primary key); \
-             create table child (id bigint primary key, k boolean); \
-             alter table child replica identity full; \
-             alter table parent replica identity full",
+             create table child (id bigint primary key, k boolean)",
         )
         .await
         .expect("create relationship tables");
@@ -432,7 +430,7 @@ async fn bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone() {
 
 /// A `boolean` `GROUP BY` group touched once through an ordinary
 /// image-bearing CDC change (whose staged image text carries `boolout`'s
-/// `'t'`/`'f'` spelling, exactly as real logical decoding would produce)
+/// `'t'`/`'f'` spelling, exactly as a real capture trigger renders it)
 /// and once through a bare, image-less live refetch (whose text comes from
 /// `staging::apply::row_as_text_jsonb_sql`'s `<col>::text` cast, `'true'`/
 /// `'false'`) must still land as **one** target row, not two — proving the
@@ -457,8 +455,7 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
     client
         .batch_execute(
             "create table events ( \
-               id integer primary key, grp boolean, amount numeric); \
-             alter table events replica identity full",
+               id integer primary key, grp boolean, amount numeric)",
         )
         .await
         .expect("create source table");

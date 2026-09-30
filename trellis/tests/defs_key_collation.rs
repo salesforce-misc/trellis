@@ -126,8 +126,7 @@ async fn a_group_by_column_with_a_nondeterministic_collation_is_refused() {
     batch(
         &db.pool,
         "create table sales (id bigint primary key, region text collate case_insensitive, \
-                             amount numeric); \
-         alter table sales replica identity full",
+                             amount numeric)",
     )
     .await;
     let err = install_definition(
@@ -157,9 +156,7 @@ async fn a_group_by_relationship_path_with_a_nondeterministic_collation_is_refus
     batch(
         &db.pool,
         "create table posts (id bigint primary key, author text collate case_insensitive); \
-         create table post_tags (id bigint primary key, post bigint, tag text); \
-         alter table posts replica identity full; \
-         alter table post_tags replica identity full",
+         create table post_tags (id bigint primary key, post bigint, tag text)",
     )
     .await;
     create_relationship(
@@ -196,8 +193,7 @@ async fn a_relationship_endpoint_key_with_a_nondeterministic_collation_is_refuse
         &db.pool,
         "create table order_line_items \
              (code text collate case_insensitive primary key, product_id bigint); \
-         create table products (id bigint primary key); \
-         alter table products replica identity full",
+         create table products (id bigint primary key)",
     )
     .await;
     let err = create_relationship(
@@ -229,9 +225,7 @@ async fn deterministic_non_default_key_collations_pass() {
         &db.pool,
         r#"create table posts (id bigint primary key, author text collate "C");
            create table post_tags
-               (id text collate "C" primary key, post bigint, tag text collate "C");
-           alter table posts replica identity full;
-           alter table post_tags replica identity full"#,
+               (id text collate "C" primary key, post bigint, tag text collate "C");"#,
     )
     .await;
     create_relationship(
@@ -303,9 +297,7 @@ async fn substring_and_regex_functions_on_a_nondeterministic_column_are_refused(
         &db.pool,
         "create table posts (id bigint primary key, author text collate case_insensitive); \
          create table notes (id bigint primary key, title text collate case_insensitive, \
-                             body text, post bigint); \
-         alter table posts replica identity full; \
-         alter table notes replica identity full",
+                             body text, post bigint)",
     )
     .await;
     create_relationship(&db.pool, "RELATIONSHIP post FROM notes.post TO posts.id")

@@ -120,7 +120,7 @@ async fn start(flavour: Flavour, rows: &[(i32, i32, i32)]) -> Driver {
     Driver::start(
         &format!(
             "create table public.src (id integer primary key, g integer, v numeric); \
-             alter table public.src replica identity full; {seed}"
+             {seed}"
         ),
         &[
             ("id", ValueType::Numeric),
@@ -973,7 +973,6 @@ async fn a_chained_reader_follows_groups_emptied_and_refilled_in_one_page() {
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v numeric); \
-         alter table public.src replica identity full; \
          insert into public.src values (1, 1, 10), (3, 1, 7), (5, 2, 1), (6, 3, 4)",
         &[("id", int4), ("g", int4), ("v", ValueType::Numeric)],
         &[Flavour::Aggregate.definition()],
@@ -995,7 +994,7 @@ async fn a_chained_reader_follows_groups_emptied_and_refilled_in_one_page() {
     )
     .await
     .expect("install the chained reader");
-    trellis::intake::publication::settle_registrations(d.pool()).await;
+    trellis::intake::markers::settle_registrations(d.pool()).await;
     d.settle().await;
     write(
         &d,
@@ -1054,7 +1053,6 @@ async fn a_group_emptied_through_another_spelling_of_its_key_is_deleted() {
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g numeric, v numeric); \
-         alter table public.src replica identity full; \
          insert into public.src values (1, 1.5, 10)",
         &[
             ("id", int4),
@@ -1085,7 +1083,6 @@ async fn the_minimum_integer_contribution_leaves_its_group() {
     let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, v integer); \
-         alter table public.src replica identity full; \
          insert into public.src values (1, 1, -2147483648), (2, 1, 5)",
         &[("id", int4), ("g", int4), ("v", int4)],
         &[Flavour::Aggregate.definition()],
@@ -1184,7 +1181,6 @@ async fn avg_equals_postgres_avg_over_integer_bigint_and_numeric() {
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, a integer, b bigint, \
                                   c numeric, name text); \
-         alter table public.src replica identity full; \
          insert into public.src values \
              (1, 1, -2147483648, 9223372036854775807, 1.5, 'x'), \
              (2, 1, 7, 9223372036854775806, 2.125, null), \

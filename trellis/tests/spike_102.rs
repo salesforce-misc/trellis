@@ -62,15 +62,13 @@ where
     }
 }
 
-/// Issue #102's schema. `posts` is `REPLICA IDENTITY FULL` so its pre-image
-/// carries `author` — the whole premise of Spike A. `post_tags`' primary key
+/// Issue #102's schema. `posts`'s old image carries `author` — the whole
+/// premise of Spike A. `post_tags`' primary key
 /// is the natural composite `(post, tag)` pair — issue #102's own example,
 /// and (post #126) no longer an unconditional blocker to draining.
 const SCHEMA: &str = "\
     create table posts (id integer primary key, author text, word_count integer); \
-    alter table posts replica identity full; \
     create table post_tags (post integer not null, tag text not null, primary key (post, tag)); \
-    alter table post_tags replica identity full; \
     create index on post_tags (post);";
 
 /// The same schema with a surrogate single-column primary key on `post_tags`
@@ -78,9 +76,7 @@ const SCHEMA: &str = "\
 /// keeps the simpler single-column key out of its own way.
 const SCHEMA_SURROGATE: &str = "\
     create table posts (id integer primary key, author text, word_count integer); \
-    alter table posts replica identity full; \
     create table post_tags (id integer primary key, post integer not null, tag text not null); \
-    alter table post_tags replica identity full; \
     create index on post_tags (post);";
 
 fn post_tags_columns() -> HashMap<String, ValueType> {
@@ -100,7 +96,7 @@ fn post_tags_columns_surrogate() -> HashMap<String, ValueType> {
 
 /// A composite primary-key identity string, U+001F-joined in the key's own
 /// declared column order (`post` then `tag`, matching `SCHEMA`'s `primary
-/// key (post, tag)`) — the same encoding `intake::extract_key` (real CDC) and
+/// key (post, tag)`) — the same encoding the capture trigger (real CDC) and
 /// `defs_relationship_composite_pk.rs`'s own `composite_key` helper use.
 fn composite_key(parts: &[&str]) -> String {
     parts.join("\u{1f}")
@@ -143,7 +139,7 @@ async fn install_with_transform(
     install_definition(pool, transform, columns, "public")
         .await
         .expect("install tag_totals");
-    trellis::intake::publication::settle_registrations(pool).await;
+    trellis::intake::markers::settle_registrations(pool).await;
 }
 
 /// Every row currently sitting in any ring segment, as
@@ -182,7 +178,7 @@ async fn ring_rows(
 
 // =====================================================================
 // SPIKE A — the linchpin: are old + new parent images actually available
-// on the real logical-replication stream?
+// in the real change feed?
 // =====================================================================
 
 #[tokio::test]
@@ -475,8 +471,7 @@ async fn spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work() {
 /// from-side relationship reverse path. This spike now asserts that a
 /// composite-PK from-side row actually drains and its dependent aggregate
 /// updates correctly, reusing that file's schema/fixture conventions (the
-/// U+001F composite-key encoding, `REPLICA IDENTITY FULL` on both tables)
-/// rather than reinventing them.
+/// U+001F composite-key encoding) rather than reinventing them.
 #[tokio::test]
 async fn spike_a3_a_composite_pk_from_side_now_drains_successfully() {
     let cluster = TestCluster::start();

@@ -59,7 +59,7 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 // and the backfill discharge are driven by hand in place of a running
 // pipeline (issue #301); see the module doc.
 use trellis::defs::chunk_queue;
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions};
 
@@ -123,7 +123,7 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "pause_and_drop_test_backfill_worker";
@@ -136,7 +136,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
         if claimed.is_empty() {
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
-            trellis::intake::publication::discharge_registrations(pool)
+            trellis::intake::markers::discharge_registrations(pool)
                 .await
                 .expect("discharge the go-live catch-ups");
             return;
@@ -158,7 +158,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
     }
 }
 
-/// Stages the CDC row intake would stage for `insert into orders (id, g, a)
+/// Stages the CDC row capture would stage for `insert into orders (id, g, a)
 /// values (id, g, a)`, into the active ring segment.
 async fn stage_orders_insert(raw: &Client, id: i64, g: i64, a: i64) {
     let active: i16 = raw
@@ -187,7 +187,7 @@ async fn stage_orders_insert(raw: &Client, id: i64, g: i64, a: i64) {
 /// pending anywhere in the ring: the hand-driven stand-in for a running
 /// `Client`'s maintenance loop and drain workers.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    // No live `Intake` stages anything here, so there is no real staged
+    // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
@@ -226,7 +226,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 async fn discharge_pending_backfills(client: &mut Client) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        publication::run_pending_backfills(
+        markers::run_pending_backfills(
             client,
             "trellis_pause_and_drop_test",
             &StagedWatermark::saturated(),
@@ -245,17 +245,14 @@ async fn discharge_pending_backfills(client: &mut Client) {
     }
 }
 
-/// Seeds a source table carrying `REPLICA IDENTITY FULL`, which both the
-/// aggregate shape (`assert_replica_identity_supports_aggregate`) and the
-/// reverse-recompute machinery require. Aggregates are this file's default
+/// Seeds a source table. Aggregates are this file's default
 /// transform shape. Registration only records one as `waiting_to_backfill`
 /// (issue #419); a test that needs it `live` settles it with
-/// [`publication::settle_registrations`], which dispatches and runs its one
+/// [`markers::settle_registrations`], which dispatches and runs its one
 /// direct-build job in place of the staging worker and a drain thread.
 async fn seed_source(raw: &Client, table: &str, rows: i64) {
     raw.batch_execute(&format!(
         "create table {table} (id bigint primary key, g bigint, a numeric); \
-         alter table {table} replica identity full; \
          insert into {table} (id, g, a) select s, s % 2, s from generate_series(1, {rows}) s;"
     ))
     .await
@@ -294,7 +291,7 @@ async fn pausing_twice_is_a_no_op_success() {
         TransformStatus::WaitingToBackfill,
         "registration only records an aggregate; its build is dispatched by the backfill discharge (#419)"
     );
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "order_rollup").await.as_deref(),
         Some("live"),
@@ -399,7 +396,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         .expect("define a sibling over the same source");
     // Registration only records the two aggregates (#419); their direct-build
     // jobs take both live before one is paused.
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -412,7 +409,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     let active_seq_before = count(&raw, "select active_seq from segment_pointer").await;
 
     // Changes that arrive while `order_rollup` is paused, each mirrored by the
-    // CDC row intake would stage for it. Its share of these is drained for
+    // CDC row capture would stage for it. Its share of these is drained for
     // `order_echo` and is not recoverable by replay.
     raw.batch_execute(
         "insert into orders (id, g, a) select s, s % 2, s from generate_series(5, 12) s",
@@ -564,7 +561,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     assert!(
         table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup").await,
         "precondition: the target table exists"
@@ -778,17 +775,12 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's direct-build
     // job takes it there (#419).
-    publication::settle_registrations(&db.pool).await;
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_rollup replica identity full"
-    ))
-    .await
-    .expect("a chained aggregate's source needs a full replica identity");
+    markers::settle_registrations(&db.pool).await;
     trellis
         .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
         .await
         .expect("define a transform chained off the first one's target");
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "grand_total").await.as_deref(),
         Some("live"),
@@ -876,12 +868,7 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's direct-build
     // job takes it there (#419).
-    publication::settle_registrations(&db.pool).await;
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_rollup replica identity full"
-    ))
-    .await
-    .expect("a chained aggregate's source needs a full replica identity");
+    markers::settle_registrations(&db.pool).await;
     trellis
         .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
         .await
@@ -1004,7 +991,7 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
 
     let err = trellis
         .apply("DROP TRANSFORM order_rollup")
@@ -1188,7 +1175,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a chunked 1-1 transform");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     assert!(
@@ -1271,7 +1258,7 @@ async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a chunked 1-1 transform");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     assert_eq!(
@@ -1364,14 +1351,14 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
         .await
         .expect("define a chunked 1-1 transform");
     // Dispatched one at a time, so `order_doubles`' chunks get the lower ids.
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     trellis
         .apply("TRANSFORM item_doubles FROM items SELECT a + a AS x")
         .await
         .expect("define a sibling chunked 1-1 transform");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     assert_eq!(
@@ -1447,8 +1434,8 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
 // Capture
 // ---------------------------------------------------------------------
 
-/// ADR-0014, "The publication shrinks by reconciliation", as ADR-0016 amends
-/// it (issue #427) and #622 C5 restates it for trigger capture: a drop only
+/// ADR-0014's capture set shrinks by reconciliation, as ADR-0016 amends it
+/// (issue #427) and #622 C5 restates it for trigger capture: a drop only
 /// removes catalog rows and never touches the source's capture triggers, so
 /// the process applying it needs no privilege on the source. The staging
 /// worker's next reconcile pass uninstalls them from the catalog;
@@ -1465,7 +1452,7 @@ async fn dropping_leaves_capture_to_the_staging_worker() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
-    let desired = trellis::defs::publication_tables(&db.pool)
+    let desired = trellis::defs::tables_to_capture(&db.pool)
         .await
         .expect("the tables to capture");
     trellis::capture::reconcile::reconcile(
@@ -1508,7 +1495,7 @@ async fn dropping_leaves_capture_to_the_staging_worker() {
 /// Dropping anyway used to succeed, leaving the reader deriving from a
 /// vanished table — and because the surviving `relationship` edge keeps the
 /// target's `schema_nodes` row alive, `all_source_tables` kept naming the
-/// dropped table, so every later publication reconcile (including the
+/// dropped table, so every later capture reconcile (including the
 /// running client's own periodic one) failed `42P01`.
 #[tokio::test]
 async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationship() {
@@ -1518,7 +1505,6 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
     seed_source(&raw, "orders", 9).await;
     raw.batch_execute(
         "create table reports (id bigint primary key, oid bigint); \
-         alter table reports replica identity full; \
          insert into reports (id, oid) values (1, 1), (2, 2), (3, 3);",
     )
     .await
@@ -1539,11 +1525,6 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
         Some("live"),
         "the chunked 1-1 target must have finished its backfill"
     );
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_doubles replica identity full"
-    ))
-    .await
-    .expect("replica identity");
 
     trellis
         .apply("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
@@ -1613,7 +1594,6 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
     seed_source(&raw, "orders", 9).await;
     raw.batch_execute(
         "create table reports (id bigint primary key, oid bigint); \
-         alter table reports replica identity full; \
          insert into reports (id, oid) values (1, 1), (2, 2), (3, 3);",
     )
     .await
@@ -1634,11 +1614,6 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
         Some("live"),
         "the chunked 1-1 target must have finished its backfill"
     );
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_doubles replica identity full"
-    ))
-    .await
-    .expect("replica identity");
 
     // Declared, and then deliberately left unread: nothing anywhere selects
     // `rollup.<column>`. This is the whole point — the old guard only looked
@@ -1719,7 +1694,7 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
 /// Issue #375: a relationship whose **from**-side is the target blocks the
 /// drop as well. Surviving it, the relationship would keep the target's name
 /// a relationship endpoint, so a definition re-creating that target (as an
-/// aggregate, say) would be published as an endpoint without ever passing
+/// aggregate, say) would be captured as an endpoint without ever passing
 /// `create_relationship`'s endpoint guards.
 #[tokio::test]
 async fn dropping_is_refused_by_a_relationship_declared_from_the_target() {
@@ -1727,12 +1702,9 @@ async fn dropping_is_refused_by_a_relationship_declared_from_the_target() {
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 9).await;
-    raw.batch_execute(
-        "create table categories (id bigint primary key, oid bigint); \
-         alter table categories replica identity full;",
-    )
-    .await
-    .expect("seed the relationship's to-side");
+    raw.batch_execute("create table categories (id bigint primary key, oid bigint)")
+        .await
+        .expect("seed the relationship's to-side");
 
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -1795,8 +1767,6 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
     raw.batch_execute(
         "create table authors (id bigint primary key, name text); \
          create table posts (id bigint primary key, author bigint); \
-         alter table authors replica identity full; \
-         alter table posts replica identity full; \
          insert into authors (id, name) values (1, 'a'), (2, 'b'); \
          insert into posts (id, author) values (1, 1), (2, 1), (3, 2);",
     )
@@ -1813,7 +1783,7 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
         .await
         .expect("define a transform that reads it");
     // Registration only records it (#419); its direct-build job takes it live.
-    publication::settle_registrations(&db.pool).await;
+    markers::settle_registrations(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "author_stats").await.as_deref(),
         Some("live"),
@@ -1877,7 +1847,7 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
 /// this was refused, that chunk's rows reached neither the relationship's
 /// projection (seeded before they landed) nor the ring, and a `RESUME`
 /// rebuild re-deriving them to the same values stages nothing either. So a
-/// reader through the relationship never saw them, where the published
+/// reader through the relationship never saw them, where the captured
 /// endpoint this replaced got them over CDC.
 #[tokio::test]
 async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
@@ -1885,18 +1855,15 @@ async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 3).await;
-    raw.batch_execute(
-        "create table reports (id bigint primary key, oid bigint); \
-         alter table reports replica identity full",
-    )
-    .await
-    .expect("seed the relationship's from-side");
+    raw.batch_execute("create table reports (id bigint primary key, oid bigint)")
+        .await
+        .expect("seed the relationship's from-side");
     let trellis = define_only(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
         .await
         .expect("define the upstream target");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("the discharge dispatches the chunked build");
     let client = db.pool.get().await.expect("acquire connection");
@@ -1936,9 +1903,7 @@ async fn dropping_a_relationship_drops_its_projection_from_the_catalog_schema() 
     raw.batch_execute(
         "create schema elsewhere; \
          create table authors (id bigint primary key, name text); \
-         create table posts (id bigint primary key, author bigint); \
-         alter table authors replica identity full; \
-         alter table posts replica identity full;",
+         create table posts (id bigint primary key, author bigint)",
     )
     .await
     .expect("seed a from/to pair and a second target schema");

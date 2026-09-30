@@ -89,7 +89,7 @@ async fn stage_cdc(
 /// segment as it drains, so convergence takes more than one seal.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -209,8 +209,6 @@ async fn frontdoor_to_one_enrichment_converges_to_oracle() {
         .batch_execute(
             "create table categories (id integer primary key, name text); \
              create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full; \
              insert into categories (id, name) values (10, 'Tech'), (20, 'News'); \
              insert into articles (id, category_id, title) values \
              (1, 10, 'a1'), (2, 20, 'a2'), (3, 99, 'a3')",
@@ -401,13 +399,12 @@ async fn frontdoor_to_many_aggregate_enrichment_converges_to_oracle() {
     let mut client = connect_raw(db.dsn()).await;
 
     // A to-many's join column (`comments.article_id`) is a non-PK column on the
-    // to-side, so the reverse resolver needs it in DELETE/UPDATE pre-images:
-    // REPLICA IDENTITY FULL (issue #41; `create_relationship` enforces it).
+    // to-side; the reverse resolver finds it in the DELETE/UPDATE old images
+    // the capture trigger stages (issue #41).
     client
         .batch_execute(
             "create table articles (id integer primary key, title text); \
              create table comments (id integer primary key, article_id integer, word_count integer); \
-             alter table comments replica identity full; \
              insert into articles (id, title) values (1, 'a1'), (2, 'a2'); \
              insert into comments (id, article_id, word_count) values \
              (100, 1, 5), (101, 1, 7)",
@@ -490,8 +487,7 @@ async fn frontdoor_rejects_bare_to_many_path() {
     client
         .batch_execute(
             "create table articles (id integer primary key, title text); \
-             create table comments (id integer primary key, article_id integer, word_count integer); \
-             alter table comments replica identity full",
+             create table comments (id integer primary key, article_id integer, word_count integer)",
         )
         .await
         .expect("create tables");
@@ -533,9 +529,7 @@ async fn frontdoor_rejects_aggregate_over_to_one_path() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full",
+             create table articles (id integer primary key, category_id integer, title text)",
         )
         .await
         .expect("create tables");
@@ -582,9 +576,7 @@ async fn frontdoor_rejects_unknown_to_side_column() {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
-             create table articles (id integer primary key, category_id integer, title text); \
-             alter table categories replica identity full; \
-             alter table articles replica identity full",
+             create table articles (id integer primary key, category_id integer, title text)",
         )
         .await
         .expect("create tables");

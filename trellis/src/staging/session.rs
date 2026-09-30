@@ -1,16 +1,9 @@
-//! Session guards a producer must hold before it may append.
-//!
-//! Two guards, both enforced once, at connect time, rather than on every
-//! append:
-//!
-//! - **`synchronous_commit`** must not be `off` — a correctness
-//!   requirement (see [`StagingError::SynchronousCommitOff`]), not
-//!   tuning.
-//! - **The producer singleton**: exactly one CDC intake producer **per
-//!   Trellis instance** may run at a time, enforced by a session-scoped
-//!   `pg_try_advisory_lock` that releases the instant the holding connection
-//!   closes. "Per instance" — not per database — is load-bearing and was a
-//!   real bug until issue #234; see [`producer_singleton_lock_key`].
+//! The producer singleton, enforced once, at connect time: exactly one
+//! staging worker **per Trellis instance** may run at a time, enforced by a
+//! session-scoped `pg_try_advisory_lock` that releases the instant the
+//! holding connection closes. "Per instance" — not per database — is
+//! load-bearing and was a real bug until issue #234; see
+//! [`producer_singleton_lock_key`].
 //!
 //! [`ProducerSession`] owns a standalone `tokio_postgres` connection rather
 //! than a pooled `deadpool_postgres::Client`: the pool's `Fast` recycling
@@ -19,7 +12,7 @@
 //! session-scoped advisory lock. The singleton lock must be pinned to one
 //! connection for its whole lifetime, so this opens one directly.
 
-use tokio_postgres::{Client, GenericClient, Transaction};
+use tokio_postgres::{Client, GenericClient};
 
 use super::error::StagingError;
 
@@ -38,7 +31,7 @@ const PRODUCER_SINGLETON_LOCK_NAMESPACE: u64 = 0x7247_4c53_5453_4747; // "trelli
 /// Postgres advisory locks are keyed by `(database, key)`. The schema a
 /// session's `search_path` happens to be pinned to does not enter into the
 /// lock tag at all. So while this lock was a single global constant, "exactly
-/// one CDC intake producer may run at a time" was in fact enforced **per
+/// one producer may run at a time" was in fact enforced **per
 /// database**, not per Trellis instance — and `docs/instance-identity.md`
 /// promises that "several Trellis instances can coexist in one cluster — even
 /// one database — each isolated within its own schema."
@@ -94,7 +87,8 @@ pub fn producer_singleton_lock_key(schema: &str) -> i64 {
     (hash ^ PRODUCER_SINGLETON_LOCK_NAMESPACE) as i64
 }
 
-/// A guarded connection held for the lifetime of one producer (CDC intake).
+/// A guarded connection held for the lifetime of one producer (the staging
+/// worker's maintenance loop).
 /// Acquiring one enforces both session guards. Session-scoped rather than a
 /// TTL lease, so a producer whose process dies frees the lock as soon as
 /// Postgres notices the connection is gone.
@@ -121,9 +115,7 @@ impl std::fmt::Debug for ProducerSession {
 impl ProducerSession {
     /// Opens a dedicated connection to `dsn`, pins its `search_path` to
     /// `schema` (this connection bypasses [`crate::pool::Pool`], so nothing
-    /// else does), and enforces both guards in order: `synchronous_commit`
-    /// first, so a session that fails the durability check never briefly
-    /// holds the singleton lock, then the lock itself.
+    /// else does), and takes the singleton lock.
     ///
     /// TCP keepalives are on at both ends before the lock is taken (issue
     /// #364), so a partitioned producer's lock frees in about 25s rather
@@ -139,7 +131,6 @@ impl ProducerSession {
             .batch_execute(&crate::pool::dedicated_session_setup(schema))
             .await?;
 
-        require_synchronous_commit_on(&client).await?;
         // Issue #234: scoped to this instance's own schema, not a global
         // constant — see `producer_singleton_lock_key`.
         acquire_singleton(&client, schema).await?;
@@ -165,15 +156,6 @@ impl ProducerSession {
         Ok(())
     }
 
-    /// Starts a transaction on this session's connection, for callers that
-    /// need to compose [`super::append::append`] with other statements
-    /// atomically.
-    // Only intake used this; C8 deletes it (issue #622).
-    #[allow(dead_code)]
-    pub async fn transaction(&mut self) -> Result<Transaction<'_>, StagingError> {
-        Ok(self.client.transaction().await?)
-    }
-
     /// The underlying connection, for callers that need it directly (e.g.
     /// to check `pg_backend_pid()` in a test).
     pub fn client(&self) -> &Client {
@@ -181,26 +163,12 @@ impl ProducerSession {
     }
 
     /// A mutable handle to the underlying connection, for callers (e.g.
-    /// [`crate::intake::publication::reconcile_publication`]) that take a
-    /// plain `&mut Client` rather than a whole `ProducerSession`, so the
-    /// same function also works against a non-producer connection (see
-    /// that function's doc comment).
+    /// [`crate::capture::reconcile::reconcile`]) that take a plain
+    /// `&mut Client` rather than a whole `ProducerSession`, so the same
+    /// function also works against a non-producer connection.
     pub fn client_mut(&mut self) -> &mut Client {
         &mut self.client
     }
-}
-
-/// `SHOW synchronous_commit` rather than `pg_settings`: this is the session's
-/// *effective* setting — whatever a role/database default, `ALTER SYSTEM`, or
-/// the connection string resolved to — which is what decides whether this
-/// connection's commits are durable-before-ack.
-async fn require_synchronous_commit_on(client: &Client) -> Result<(), StagingError> {
-    let row = client.query_one("show synchronous_commit", &[]).await?;
-    let value: String = row.get(0);
-    if value.eq_ignore_ascii_case("off") {
-        return Err(StagingError::SynchronousCommitOff);
-    }
-    Ok(())
 }
 
 /// `pg_try_advisory_lock` (non-blocking) rather than `pg_advisory_lock`: a
@@ -225,11 +193,11 @@ async fn acquire_singleton(client: &Client, schema: &str) -> Result<(), StagingE
 
 /// Issue #428: whether some session holds `schema`'s producer singleton
 /// right now — that is, whether this instance's staging worker is running.
-/// Intake holds the lock on its own connection for as long as it streams,
-/// and the staging worker's setup holds it before that, so this is true
-/// from before [`crate::client::Client::start`] returns until intake stops.
-/// It goes false while a failed intake waits to restart, which is also a
-/// window in which nothing is captured.
+/// The staging worker takes the lock in its setup, before
+/// [`crate::client::Client::start`] returns, and its maintenance loop holds
+/// it on its own connection for as long as it runs. It goes false while the
+/// loop reconnects after a failed step; triggers still capture meanwhile,
+/// but nothing seals.
 ///
 /// Like the lock, this needs no heartbeat: a crashed worker's connection
 /// closes, and Postgres frees the lock with it.

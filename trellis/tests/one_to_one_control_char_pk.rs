@@ -3,13 +3,11 @@
 //! text.
 //!
 //! No live `Client` (issue #301): each source change is mirrored by the CDC
-//! row intake would stage for it, staged by hand and drained through the
+//! row capture would stage for it, staged by hand and drained through the
 //! engine's own apply path, so nothing here waits on a pipeline under a
 //! wall-clock budget. The staged key is the raw key text, which is what
-//! intake stages for a not-null primary key. That half, intake's own key
-//! encoding, is pinned directly by `intake::tests`'
-//! `extract_key_keeps_a_control_character_in_a_key_value_verbatim`
-//! (`trellis/src/intake/mod.rs`). This file covers the apply half: the live
+//! capture stages for a not-null primary key. This file covers the apply
+//! half: the live
 //! re-fetch, the target write, and the update/delete lookups all have to
 //! agree on that raw text.
 
@@ -36,7 +34,7 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 /// Stages one CDC change for `orders` into the active ring segment, shaped
-/// the way intake stages it: the raw key text, and text-valued JSON images.
+/// the way capture stages it: the raw key text, and text-valued JSON images.
 async fn stage_cdc(
     client: &Client,
     key: &str,
@@ -71,7 +69,7 @@ async fn stage_cdc(
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending: the hand-driven stand-in for a running `Client`'s drain workers.
 async fn drain_to_quiescence(pool: &Pool, client: &mut Client) {
-    // No live `Intake` stages anything here, so there is no real staged
+    // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {

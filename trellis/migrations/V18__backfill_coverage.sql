@@ -18,7 +18,7 @@
 -- A row here records that, as of `fence_snapshot`, `table_name`'s contents were
 -- fully folded into an already-built target by a direct backfill, and that the
 -- table held exactly `covered_row_count` rows at that instant. `coverage_covers`
--- (in `trellis::intake::publication`) consults this before enumerating a
+-- (in `trellis::intake::markers`) consults this before enumerating a
 -- pending_backfill and, when the table provably has not changed since the
 -- fence, skips the enumeration entirely. See that module for the fence /
 -- change-detection reasoning (a whole-snapshot fence comparison alone cannot

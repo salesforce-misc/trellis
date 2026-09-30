@@ -56,11 +56,11 @@
 //! answer for itself — "did the pause land?", "is it already gone?" — both
 //! resolve to success.
 //!
-//! **A drop never touches the publication.** It only removes catalog rows.
-//! The staging worker's reconcile pass shrinks the publication from the
-//! catalog, its only source of truth for what to publish (ADR-0014, "The
-//! publication shrinks by reconciliation"; ADR-0016, issue #427), so a
-//! process that drops a transform needs no publication privileges.
+//! **A drop never touches a source table.** It only removes catalog rows.
+//! The staging worker's reconcile pass uninstalls capture from the catalog,
+//! its only source of truth for what to capture (ADR-0016, issue #427), so
+//! a process that drops a transform needs no privileges on the source
+//! tables.
 
 use tokio_postgres::Transaction;
 
@@ -388,7 +388,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     )
     .await?;
 
-    // This keys a *qualified table name* to pending intake work, and an
+    // This keys a *qualified table name* to pending backfill work, and an
     // enumeration marker naming a table that no longer exists would fail
     // the next `run_pending_backfills` discharge with a live `42P01`.
     txn.execute(
@@ -575,9 +575,8 @@ async fn dependency_blockers(
     //    `drop_relationship` reaps them), so a relationship surviving its
     //    to-side keeps the target's `schema_nodes` row alive with nothing
     //    left to explain it. [`super::all_source_tables`] then keeps naming
-    //    a table that no longer exists, and every later
-    //    `reconcile_publication` — including the running client's own
-    //    periodic one — fails `42P01`, wedging intake fleet-wide. Refusing
+    //    a table that no longer exists, and every later capture reconcile
+    //    pass would keep trying to capture it. Refusing
     //    is what keeps that unreachable; the reader check below never did,
     //    because the damage is edge-scoped and that check is reader-scoped.
     //
@@ -699,9 +698,8 @@ async fn source_edge_dependents(
 /// has no reader to strand, but surviving the drop would leave the name a
 /// relationship endpoint with no definition behind it. A later definition
 /// re-creating that target would inherit the endpoint, and with it a place
-/// in the CDC publication, without passing `create_relationship`'s endpoint
-/// guards: an aggregate target endpoint, or a 1-1 one without `REPLICA
-/// IDENTITY FULL`.
+/// in capture, without passing `create_relationship`'s endpoint guards: an
+/// aggregate target endpoint, which has no primary key to capture by.
 async fn relationships_naming(
     txn: &Transaction<'_>,
     qualified_target: &str,

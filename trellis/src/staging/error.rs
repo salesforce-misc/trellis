@@ -14,8 +14,7 @@ use tokio_postgres::types::PgLsn;
 use crate::error_code::{self, ErrorCode};
 
 /// Failure modes specific to the staging ring (issue #6): resolving the
-/// active ring slot, appending, and the session guards a producer must
-/// hold before it may append.
+/// active ring slot, appending, and the producer singleton.
 #[derive(Debug)]
 pub enum StagingError {
     /// `segment_pointer` or its `ring_slot_mirror` sequence named a
@@ -23,11 +22,6 @@ pub enum StagingError {
     /// Should never happen — only this module writes either — but resolving
     /// it into a table name is checked and typed rather than assumed.
     InvalidRingSlot(i16),
-    /// A [`super::session::ProducerSession`] was refused because the
-    /// connection's effective `synchronous_commit` was `off`. A correctness
-    /// requirement, not tuning: intake's durability guarantee assumes the
-    /// commit that stages a change waited for its WAL to be flushed.
-    SynchronousCommitOff,
     /// A second producer session tried to start while another holds the
     /// singleton lock. Two concurrent producers would double-append every
     /// change.
@@ -85,10 +79,6 @@ impl StagingError {
     pub fn code(&self) -> ErrorCode {
         match self {
             StagingError::ProducerAlreadyRunning => ErrorCode::Conflict,
-            // A misconfigured connection's `synchronous_commit` setting is
-            // an environment precondition not met, same category as other
-            // config-rejection errors.
-            StagingError::SynchronousCommitOff => ErrorCode::Validation,
             StagingError::InvalidRingSlot(_)
             | StagingError::RingFull { .. }
             | StagingError::SealGateBlocked
@@ -107,11 +97,6 @@ impl fmt::Display for StagingError {
             StagingError::InvalidRingSlot(slot) => {
                 write!(f, "ring slot {slot} is outside the valid range")
             }
-            StagingError::SynchronousCommitOff => write!(
-                f,
-                "refusing a producer session: synchronous_commit is off, which breaks the \
-                 staging ring's durability guarantee"
-            ),
             StagingError::ProducerAlreadyRunning => write!(
                 f,
                 "another producer session already holds the singleton advisory lock"

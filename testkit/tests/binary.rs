@@ -74,7 +74,8 @@ impl Spawned {
 
 /// Connects with the printed `dsn`, and again from the separate
 /// `host`/`port`/`user`/`dbname` fields (how Postgrex is configured), and
-/// checks both land in the named database on a logical-replication cluster.
+/// checks both land in the named database, on a cluster at the default
+/// `wal_level` (`replica`): Trellis needs no logical decoding.
 async fn connect_and_check(spawned: &Spawned) -> tokio_postgres::Client {
     let (client, connection) = tokio_postgres::connect(spawned.str_field("dsn"), NoTls)
         .await
@@ -88,7 +89,7 @@ async fn connect_and_check(spawned: &Spawned) -> tokio_postgres::Client {
         .await
         .expect("query the database");
     assert_eq!(row.get::<_, String>(0), spawned.str_field("dbname"));
-    assert_eq!(row.get::<_, String>(1), "logical");
+    assert_eq!(row.get::<_, String>(1), "replica");
 
     let mut config = tokio_postgres::Config::new();
     config

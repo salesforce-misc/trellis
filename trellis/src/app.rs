@@ -114,7 +114,7 @@ use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registr
 /// Options a client sets when it [`connect`](Trellis::connect)s.
 ///
 /// `staging`/`drain_threads` mirror [`ClientOptions`]'s core contract (see
-/// its doc comment): whether this connection owns CDC intake + ring
+/// its doc comment): whether this connection owns capture + ring
 /// maintenance, and how many drain (application) workers it runs. A
 /// connection that only defines transforms leaves both at their defaults
 /// (nothing background starts); a connection that runs the live pipeline
@@ -122,12 +122,13 @@ use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registr
 /// unrelated to either — see its own doc comment.
 #[derive(Debug, Clone, Default)]
 pub struct TrellisOptions {
-    /// Whether this connection runs the CDC subscriber and ring maintenance
-    /// (the staging worker). Exactly one connection in a fleet should set
-    /// this. When set, the staging worker publishes whatever tables the
-    /// registered definitions read, straight from the catalog, and picks up
-    /// definitions registered later on its next reconcile pass; none need be
-    /// registered before it starts (issue #427).
+    /// Whether this connection runs capture reconciliation and ring
+    /// maintenance (the staging worker). Exactly one connection in a fleet
+    /// should set this. When set, the staging worker installs capture
+    /// triggers on whatever tables the registered definitions read, straight
+    /// from the catalog, and picks up definitions registered later on its
+    /// next reconcile pass; none need be registered before it starts (issue
+    /// #427).
     pub staging: bool,
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none.
@@ -151,9 +152,6 @@ pub struct TrellisOptions {
     /// [`TrellisError::BlockingSpawn`], since a runtime with no worker
     /// threads couldn't run anything anyway.
     pub worker_threads: Option<usize>,
-    /// Ignored: the staging worker captures changes by triggers, not through
-    /// a publication (issue #622). C8 removes it.
-    pub publication: Option<String>,
 }
 
 /// A connected Trellis instance — see the [module docs](self).
@@ -316,8 +314,9 @@ impl Trellis {
     /// table is dropped unconditionally; source tables are untouched),
     /// **refuses rather than cascades** if a still-registered definition
     /// chains off the subject ([`CatalogError::DependentsBlockDrop`], naming
-    /// the blockers, so a chain is retired from the leaves inward), shrinks the
-    /// replication publication by reconciliation once it commits, and is
+    /// the blockers, so a chain is retired from the leaves inward), lets the
+    /// staging worker's next reconcile uninstall capture nothing reads any
+    /// more once it commits, and is
     /// **idempotent** — dropping something already gone succeeds.
     ///
     /// # Pause and resume are transform-only
@@ -430,9 +429,10 @@ impl Trellis {
 
     /// [`Statement::Drop`](defs::Statement::Drop)'s half of
     /// [`apply`](Trellis::apply). Only removes catalog rows: it never touches
-    /// the publication (issue #427, ADR-0016). The staging worker's next
-    /// reconcile pass drops a table nothing reads any more, so the process
-    /// applying a `DROP` needs no publication privileges.
+    /// a source table (issue #427, ADR-0016). The staging worker's next
+    /// reconcile pass uninstalls the capture triggers of a table nothing reads
+    /// any more, so the process applying a `DROP` needs no privileges on the
+    /// source tables.
     async fn apply_drop(&self, reference: defs::DefinitionRef) -> Result<Applied, TrellisError> {
         match reference {
             defs::DefinitionRef::Transform(target) => {
@@ -727,7 +727,7 @@ impl Trellis {
             .get(0);
         let qualified = format!("{schema}.{source_table}");
 
-        let captured = crate::defs::publication_tables(&self.pool)
+        let captured = crate::defs::tables_to_capture(&self.pool)
             .await?
             .contains(&qualified);
         if !captured {
@@ -736,7 +736,7 @@ impl Trellis {
 
         // A failure to park is a plain `Db` error.
         let txn = client.transaction().await?;
-        crate::intake::publication::park_table_catch_ups(&*txn, std::slice::from_ref(&qualified))
+        crate::intake::markers::park_table_catch_ups(&*txn, std::slice::from_ref(&qualified))
             .await
             .map_err(|err| match err {
                 IntakeError::Db(err) => TrellisError::Db(err),
@@ -1284,8 +1284,9 @@ impl Trellis {
         explicit_source_schema: Option<&str>,
     ) -> Result<HashMap<String, ValueType>, TrellisError> {
         let qualified = match explicit_source_schema {
-            Some(schema) => crate::intake::publication::qualify(schema, source_table)
-                .map_err(CatalogError::from)?,
+            Some(schema) => {
+                crate::intake::markers::qualify(schema, source_table).map_err(CatalogError::from)?
+            }
             None => defs::catalog::resolve_graph_identity(&self.pool, source_table).await?,
         };
         debug_assert!(

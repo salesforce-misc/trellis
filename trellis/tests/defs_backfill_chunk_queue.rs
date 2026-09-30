@@ -16,7 +16,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{TransformStatus, ValueType, chunk_queue, install_definition};
-use trellis::intake::publication;
+use trellis::intake::markers;
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -31,7 +31,7 @@ async fn install_and_dispatch(
     target_schema: &str,
 ) -> Result<trellis::defs::Definition, trellis::defs::CatalogError> {
     let mut def = install_definition(pool, text, cols, target_schema).await?;
-    publication::discharge_registrations(pool)
+    markers::discharge_registrations(pool)
         .await
         .expect("dispatch the build");
     let status: String = pool
@@ -103,7 +103,7 @@ async fn stage_cdc(
 
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     // Issue #132: a throwaway, always-caught-up watermark — this helper
-    // has no live `Intake` running (these tests stage CDC rows by hand),
+    // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     let watermark = trellis::staging::StagedWatermark::saturated();
@@ -758,7 +758,6 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
     client
         .batch_execute(
             "create table s (id bigint primary key, a numeric); \
-             alter table s replica identity full; \
              insert into s (id, a) values (1, 10)",
         )
         .await
@@ -922,7 +921,7 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
     // Discharge the parked marker (the same `run_pending_backfills` event
     // the ring-fallback path already relies on) and drain the resulting
     // enumeration through the ring.
-    publication::run_pending_backfills(
+    markers::run_pending_backfills(
         &mut client,
         "trellis_chunk_queue_test",
         &trellis::staging::StagedWatermark::saturated(),
@@ -973,7 +972,7 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
 async fn discharge_pending_backfills(pool: &trellis::Pool, client: &mut Client) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        publication::run_pending_backfills(
+        markers::run_pending_backfills(
             client,
             "trellis_chunk_queue_test",
             &trellis::staging::StagedWatermark::saturated(),
@@ -1024,7 +1023,6 @@ async fn alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_bac
     client
         .batch_execute(
             "create table s (id bigint primary key, a numeric); \
-             alter table s replica identity full; \
              insert into s (id, a) values (1, 10), (2, 20)",
         )
         .await

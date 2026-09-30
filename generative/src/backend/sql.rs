@@ -212,10 +212,7 @@ pub(super) fn assignment(
 /// Creates `table` as a source table: one column per [`Column`], the primary
 /// key declared from its own [`crate::model::PRIMARY_KEY_VALUE_TYPE`]
 /// (`bigint`), a single-column `UNIQUE` constraint
-/// on every column named in `table.unique_cols`, and (unconditionally, issue
-/// #34/task B4) `REPLICA IDENTITY FULL` — see `ManualBackend`'s former doc
-/// comment (git history) for why every table gets full replica identity
-/// rather than only ones an `Aggregate` def happens to source from.
+/// on every column named in `table.unique_cols`.
 pub(super) async fn create_source_table(
     raw: &tokio_postgres::Client,
     table: &Table,
@@ -239,12 +236,6 @@ pub(super) async fn create_source_table(
     }
     sql.push(')');
     raw.batch_execute(&sql).await?;
-
-    raw.batch_execute(&format!(
-        "alter table {} replica identity full",
-        quote_ident(&table.name)
-    ))
-    .await?;
     Ok(())
 }
 

@@ -349,16 +349,16 @@ impl std::fmt::Display for RelationshipSide {
     }
 }
 
-/// Which role [`super::catalog::resolve_node`] is being asked to establish
-/// for a table: a **source** table is one Trellis reads over logical
-/// replication and never issues DDL against (ADR-0005); a **target** table
-/// is one a transform declares and creates. These aren't mutually
-/// exclusive on a table over its lifetime — a transform's target is a
-/// completely ordinary table a *later* transform can subscribe to as its
-/// source (chained/multi-hop transforms, exercised by
-/// `trellis/tests/apply.rs`'s two-hop propagation tests), so the same
-/// physical table ends up resolved under both roles. [`SchemaNode`] tracks
-/// that as two independent flags rather than one exclusive kind.
+/// Which role [`super::catalog::resolve_node`] is being asked to establish for
+/// a table: a **source** table is one Trellis captures changes from, and
+/// beyond installing its capture triggers (ADR-0002) issues no DDL against
+/// (ADR-0005); a **target** table is one a transform declares and creates. These aren't mutually exclusive on a
+/// table over its lifetime — a transform's target is a completely ordinary
+/// table a *later* transform can subscribe to as its source (chained/multi-hop
+/// transforms, exercised by `trellis/tests/apply.rs`'s two-hop propagation
+/// tests), so the same physical table ends up resolved under both roles.
+/// [`SchemaNode`] tracks that as two independent flags rather than one
+/// exclusive kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Source,

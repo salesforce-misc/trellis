@@ -57,8 +57,8 @@
 //! the two types it is:
 //!
 //! * **`inet` diverges, live and reachable — the exact `boolean` shape.**
-//!   `inet_out` (what CDC/`pgoutput` decodes, and what `intake::extract_key`
-//!   stores verbatim) omits the `/prefixlen` suffix exactly when the stored
+//!   `inet_out` (what capture images, and what a staged `key` is built from)
+//!   omits the `/prefixlen` suffix exactly when the stored
 //!   netmask covers the whole address (`'192.168.1.5'::inet::text` via
 //!   `inet_out` is `192.168.1.5`), while `network_show` (the cast, what
 //!   `<col>::text` and hence `staging::apply::row_as_text_jsonb_sql`'s live

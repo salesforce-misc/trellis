@@ -149,7 +149,7 @@ pub enum PgType {
 const ENUM_TOKEN_PREFIX: &str = "enum:";
 
 /// Interns `qualified_name` (a `"schema.typname"` string with no embedded
-/// `.` in either component — see [`intake::publication::qualify`]) as this
+/// `.` in either component — see [`intake::markers::qualify`]) as this
 /// process's single, shared `&'static str` for that enum type's persisted
 /// token, deduplicating repeat classifications of the same type so this
 /// process never leaks more than one string per *distinct* enum type it
@@ -463,7 +463,7 @@ pub async fn value_type_for_oid(
 }
 
 /// Looks up `type_oid` in `pg_catalog` and returns its schema-qualified name
-/// (`"schema.typname"`, [`intake::publication::qualify`]'s joining
+/// (`"schema.typname"`, [`intake::markers::qualify`]'s joining
 /// convention) iff it names a live enum type (`pg_type.typtype = 'e'`) —
 /// `None` for anything else (a non-enum type, or an OID pointing at nothing
 /// live at all, e.g. a since-`DROP TYPE`'d one).
@@ -472,7 +472,7 @@ pub async fn value_type_for_oid(
 /// stores an embedded `.` in either an identifier's raw (unquoted) name —
 /// unlike a value, a Postgres identifier component is inherently `.`-free
 /// (a literal `.` in one requires double-quoting *and* is vanishingly rare
-/// in practice); [`intake::publication::qualify`]'s own dot-rejection guard
+/// in practice); [`intake::markers::qualify`]'s own dot-rejection guard
 /// exists for exactly this same class of identifier and is reused here
 /// rather than hand-joining with `format!("{schema}.{typname}")`, so this
 /// stays the single place that decides what "qualified" means. A
@@ -495,7 +495,7 @@ async fn lookup_enum_qualified_name(
     Ok(row.and_then(|row| {
         let schema: String = row.get(0);
         let typname: String = row.get(1);
-        crate::intake::publication::qualify(&schema, &typname).ok()
+        crate::intake::markers::qualify(&schema, &typname).ok()
     }))
 }
 

@@ -4,7 +4,7 @@
 //! triggers to what the catalog needs, one table at a time, before the
 //! backfill discharge runs:
 //!
-//! - a table some definition reads ([`crate::defs::publication_tables`]) is
+//! - a table some definition reads ([`crate::defs::tables_to_capture`]) is
 //!   installed, widened or narrowed to its [`super::columns::capture_spec`]
 //!   ([`super::install::reconcile`]);
 //! - a table this instance captures that nothing reads any more is
@@ -50,12 +50,12 @@
 //! widen has drained, deferred reverses included
 //! ([`crate::staging::converge::table_changes_pending_through`]). That
 //! marker also refreshes `T`'s settled projections when `T` is a to-side
-//! (`intake::publication::park_widen_marker`), which repairs the projection
+//! (`intake::markers::park_widen_marker`), which repairs the projection
 //! columns the old images wrote as `NULL`.
 //!
 //! The staging worker only parks registration markers for ready definitions
 //! and the discharge only dispatches ready ones
-//! (`intake::publication::run_pending_backfills_for`). A definition that
+//! (`intake::markers::run_pending_backfills_for`). A definition that
 //! registered after the pass read the catalog is in neither list, so it
 //! waits for the next pass.
 
@@ -89,7 +89,7 @@ pub struct PassOutcome {
 }
 
 /// One pass: brings every table in `desired` (the tables some definition
-/// reads, as [`crate::defs::publication_tables`] lists them) to its capture
+/// reads, as [`crate::defs::tables_to_capture`] lists them) to its capture
 /// spec, uninstalls this instance's capture from every other table, and
 /// works out which waiting definitions are ready. `deadline` bounds the
 /// retries on locked tables, shared by the whole pass.

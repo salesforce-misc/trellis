@@ -220,8 +220,7 @@ mod tests {
     }
 
     /// Issue #340: the server reporting a dead or unavailable connection is
-    /// connectivity, whichever connection it happened to (a producer
-    /// session's `57P01` must match the walsender's transport-level drop).
+    /// connectivity, whichever connection it happened to.
     #[test]
     fn connection_loss_sqlstates_classify_as_connectivity() {
         for code in [

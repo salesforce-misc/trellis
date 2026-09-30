@@ -51,7 +51,7 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 /// Stages one CDC change for `order_lines` into the active ring segment,
-/// shaped the way intake stages it: `key` is the composite key joined with
+/// shaped the way capture stages it: `key` is the composite key joined with
 /// U+001F in declared order, and the images are text-valued JSON.
 async fn stage_cdc(
     client: &Client,
@@ -87,7 +87,7 @@ async fn stage_cdc(
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending: the hand-driven stand-in for a running `Client`'s drain workers.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    // No live `Intake` stages anything here, so there is no real staged
+    // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
@@ -304,8 +304,7 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
     );
 
     // Delete one composite-keyed row — must remove exactly that row, again
-    // leaving its same-order_id and same-line_no siblings alone. Under the
-    // default replica identity a delete's old image carries only the key.
+    // leaving its same-order_id and same-line_no siblings alone.
     raw.execute(
         "delete from order_lines where order_id = 1 and line_no = 1",
         &[],

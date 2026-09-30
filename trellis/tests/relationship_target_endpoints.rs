@@ -2,12 +2,10 @@
 //! this instance's own targets is never captured. The target-mutation seam
 //! is its only change feed, staging each write CDC-shaped (prior and new
 //! image, write token as `lsn`), so `create_relationship` asks nothing of the
-//! target's replica identity or key, and an aggregate target may be an
-//! endpoint like a 1-1 one.
+//! target's key, and an aggregate target may be an endpoint like a 1-1 one.
 //!
-//! This replaces #375's interim guards (#400), which kept the endpoint
-//! published: the target was put on `REPLICA IDENTITY FULL` by the
-//! relationship itself, and an aggregate target was refused as an endpoint.
+//! This replaces #375's interim guards (#400), which kept the endpoint in
+//! the change stream and refused an aggregate target as an endpoint.
 //! The permanent half of that guard, for an endpoint this instance doesn't
 //! own, lives in `cross_instance_target_source.rs`.
 //!
@@ -15,10 +13,9 @@
 
 use std::collections::HashMap;
 
-use tokio_postgres::Client;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{
-    CatalogError, RelationshipSide, create_relationship, install_definition, publication_tables,
+    CatalogError, RelationshipSide, create_relationship, install_definition, tables_to_capture,
 };
 use trellis::integer::IntWidth;
 
@@ -41,28 +38,14 @@ fn rows(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
         .collect()
 }
 
-async fn replica_identity(raw: &Client, qualified: &str) -> String {
-    raw.query_one(
-        "select relreplident::text from pg_class where oid = to_regclass($1)",
-        &[&qualified],
-    )
-    .await
-    .expect("read relreplident")
-    .get(0)
-}
-
-/// A target is accepted as a to-one and a to-many to-side on its default
-/// replica identity, which the relationship leaves alone, and it stays out of
-/// the publication. A plain source endpoint is still held to the identity its
-/// CDC needs (ADR-0005: checked, never altered).
+/// A target is accepted as a to-one and a to-many to-side, and it stays
+/// uncaptured: `tables_to_capture` doesn't list it.
 #[tokio::test]
-async fn a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished() {
+async fn a_target_endpoint_stays_uncaptured() {
     let (_cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, val numeric, grp integer); \
-         create table public.reports (id integer primary key, oid integer); \
-         alter table public.reports replica identity full; \
-         create table public.notes (id integer primary key, oid integer)",
+         create table public.reports (id integer primary key, oid integer)",
     )
     .await
     .expect("create sources");
@@ -78,17 +61,7 @@ async fn a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished() {
     )
     .await
     .expect("install h1");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
-    assert_eq!(replica_identity(&raw, "public.h1").await, "d");
-
-    let err = create_relationship(&db.pool, "RELATIONSHIP noted FROM notes.oid TO h1.id")
-        .await
-        .expect_err("a plain from-side without FULL is still rejected");
-    assert!(
-        err.to_string().contains("notes"),
-        "the rejection names the plain source, not the target: {err}"
-    );
-    assert_eq!(replica_identity(&raw, "public.notes").await, "d");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     create_relationship(&db.pool, "RELATIONSHIP rollup FROM reports.oid TO h1.id")
         .await
@@ -96,24 +69,19 @@ async fn a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished() {
     create_relationship(&db.pool, "RELATIONSHIP by_grp FROM reports.oid TO h1.grp")
         .await
         .expect("a to-many relationship onto a target, whose to_col is no part of its key");
-    assert_eq!(
-        replica_identity(&raw, "public.h1").await,
-        "d",
-        "the relationship leaves the target's replica identity alone"
-    );
-    let published = publication_tables(&db.pool)
+    let captured = tables_to_capture(&db.pool)
         .await
-        .expect("publication_tables");
+        .expect("tables_to_capture");
     assert!(
-        !published.contains(&"public.h1".to_string()),
-        "an endpoint target is not published: {published:?}"
+        !captured.contains(&"public.h1".to_string()),
+        "an endpoint target is not captured: {captured:?}"
     );
 }
 
 /// Issue #375 point (c), the case guard 1 existed for: a 1-1 target read by
-/// an aggregate becomes a to-many relationship's from-side. It used to be
-/// published then, on whatever identity it had, so an update reached the
-/// aggregate as CDC with no old image, counted as an insert into the new
+/// an aggregate becomes a to-many relationship's from-side. It used to join
+/// the change stream then, so an update could reach the aggregate as CDC
+/// with no old image, counted as an insert into the new
 /// group without leaving the old one. Now it stays uncaptured (asserted by
 /// [`Pipeline::attach`]), and the aggregate sees each write once, through the
 /// seam, with the prior image the seam captured under its row lock.
@@ -122,9 +90,7 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
     let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, val numeric); \
-         alter table public.src replica identity full; \
-         create table public.categories (id integer primary key, hid integer); \
-         alter table public.categories replica identity full",
+         create table public.categories (id integer primary key, hid integer)",
     )
     .await
     .expect("create sources");
@@ -135,12 +101,11 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
         install_definition(&db.pool, text, &numeric_columns(&["id", "val"]), "public")
             .await
             .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
-        trellis::intake::publication::settle_registrations(&db.pool).await;
+        trellis::intake::markers::settle_registrations(&db.pool).await;
     }
     create_relationship(&db.pool, "RELATIONSHIP cats FROM h1.id TO categories.hid")
         .await
         .expect("a to-many relationship whose from-side is a target");
-    assert_eq!(replica_identity(&raw, "public.h1").await, "d");
 
     let mut chain = Pipeline::attach(cluster, db, raw, &["public.src", "public.categories"]).await;
     chain
@@ -169,8 +134,7 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
 }
 
 /// Guard 2's same-instance half is gone: an aggregate target is accepted as
-/// either endpoint, on its default identity (it has no primary key for one to
-/// name). The join key here is an integer grouping column, so nothing else
+/// either endpoint, though it has no primary key. The join key here is an integer grouping column, so nothing else
 /// would reject it. The seam feeding such an endpoint is pinned in
 /// `endpoint_seam_feed.rs`.
 #[tokio::test]
@@ -178,11 +142,8 @@ async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
     let (_cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.sales (id integer primary key, region integer, amount integer); \
-         alter table public.sales replica identity full; \
          create table public.stores (id integer primary key, region integer); \
-         alter table public.stores replica identity full; \
-         create table public.regions (id integer primary key, name text); \
-         alter table public.regions replica identity full",
+         create table public.regions (id integer primary key, name text)",
     )
     .await
     .expect("create sources");
@@ -198,7 +159,7 @@ async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
     )
     .await
     .expect("install the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     for text in [
         "RELATIONSHIP totals FROM stores.region TO region_totals.region",
@@ -208,13 +169,12 @@ async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
             .await
             .unwrap_or_else(|e| panic!("{text}: {e}"));
     }
-    assert_eq!(replica_identity(&raw, "public.region_totals").await, "d");
-    let published = publication_tables(&db.pool)
+    let captured = tables_to_capture(&db.pool)
         .await
-        .expect("publication_tables");
+        .expect("tables_to_capture");
     assert!(
-        !published.contains(&"public.region_totals".to_string()),
-        "an aggregate endpoint target is not published: {published:?}"
+        !captured.contains(&"public.region_totals".to_string()),
+        "an aggregate endpoint target is not captured: {captured:?}"
     );
 }
 
@@ -229,8 +189,7 @@ async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
     raw.batch_execute(
         "create table public.src (id integer primary key, val numeric); \
          insert into public.src values (1, 1), (2, 2); \
-         create table public.reports (id integer primary key, oid integer); \
-         alter table public.reports replica identity full",
+         create table public.reports (id integer primary key, oid integer)",
     )
     .await
     .expect("create sources");
@@ -243,7 +202,7 @@ async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
     .await
     .expect("install h1");
     assert_eq!(h1.status.as_str(), "waiting_to_backfill");
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch h1's chunks");
 
@@ -262,8 +221,8 @@ async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
     }
 }
 
-/// Issue #429: an own target is exempt from the intake-keying and
-/// replica-identity checks, but not from the key-type check. An aggregate
+/// Issue #429: an own target is exempt from the capture-keying check, but
+/// not from the key-type check. An aggregate
 /// target's key is its `GROUP BY` columns, and apply keys the endpoint's
 /// changes by it through the same type-gated lookup as any other endpoint's,
 /// so a `numeric` grouping column would halt the instance on the first
@@ -275,11 +234,8 @@ async fn an_aggregate_target_keyed_on_an_unsupported_type_is_refused_as_an_endpo
     raw.batch_execute(
         "create table public.sales (id integer primary key, region integer, tier numeric, \
                                     amount integer); \
-         alter table public.sales replica identity full; \
          create table public.stores (id integer primary key, region integer); \
-         alter table public.stores replica identity full; \
-         create table public.regions (id integer primary key, name text); \
-         alter table public.regions replica identity full",
+         create table public.regions (id integer primary key, name text)",
     )
     .await
     .expect("create sources");
@@ -296,7 +252,7 @@ async fn an_aggregate_target_keyed_on_an_unsupported_type_is_refused_as_an_endpo
     )
     .await
     .expect("install the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     for (text, side) in [
         (

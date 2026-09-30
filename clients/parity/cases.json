@@ -111,13 +111,10 @@
       "args": [
         "create table parity_owners (id integer primary key, name text)",
         "create table parity_items (id integer primary key, owner_id integer, price integer)",
-        "alter table parity_owners replica identity full",
-        "alter table parity_items replica identity full",
         "insert into parity_items (id, owner_id, price) values (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50)",
         "create table parity_ledger (id integer primary key, n integer)",
         "create table parity_gizmos (id integer primary key, price integer)",
         "create table parity_scratch_src (id integer primary key, price integer)",
-        "alter table parity_scratch_src replica identity full",
         "create role parity_reader login"
       ]
     },

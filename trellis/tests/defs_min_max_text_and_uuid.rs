@@ -208,10 +208,7 @@ async fn text_group_by_min_max_matches_a_server_side_recompute() {
     let mut client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute(
-            "create table events (id integer primary key, grp integer, label text); \
-             alter table events replica identity full",
-        )
+        .batch_execute("create table events (id integer primary key, grp integer, label text)")
         .await
         .expect("create source table");
 

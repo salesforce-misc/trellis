@@ -103,7 +103,7 @@ async fn define_only(dsn: &str) -> Trellis {
     .expect("connect a define-only Trellis")
 }
 
-/// The live pipeline: CDC intake, ring maintenance, and drain workers — what
+/// The live pipeline: capture, ring maintenance, and drain workers — what
 /// a plain (non-aggregate) 1-1 transform needs to actually reach `live`, and
 /// what keeps applying change events while a test's own `ALTER TRANSFORM`
 /// call runs concurrently.
@@ -161,7 +161,6 @@ async fn wait_for_live(raw: &Client, target: &str) {
 async fn seed_orders(raw: &Client, rows: i64) {
     raw.batch_execute(&format!(
         "create table orders (id bigint primary key, a numeric, b numeric); \
-         alter table orders replica identity full; \
          insert into orders (id, a, b) \
              select s, s::numeric, (s * 2)::numeric from generate_series(1, {rows}) s;"
     ))
@@ -583,7 +582,7 @@ async fn combined_add_drop_alter_in_one_statement() {
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
+    trellis::intake::markers::discharge_registrations(pool)
         .await
         .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "alter_transform_test_backfill_worker";
@@ -596,7 +595,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
         if claimed.is_empty() {
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
-            trellis::intake::publication::discharge_registrations(pool)
+            trellis::intake::markers::discharge_registrations(pool)
                 .await
                 .expect("discharge the go-live catch-ups");
             return;
@@ -750,9 +749,9 @@ async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Stages the CDC row intake would stage for `update orders set a = new_a
-/// where id = id` (`orders` has `replica identity full`, so both images are
-/// complete), into the active ring segment.
+/// Stages the CDC row the capture trigger would stage for `update orders set
+/// a = new_a where id = id` (both images complete), into the active ring
+/// segment.
 async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
     let active: i16 = raw
         .query_one("select ring_slot from segment_pointer", &[])
@@ -784,7 +783,7 @@ async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
 /// `Client`'s maintenance loop and drain workers (the same helper
 /// `pause_and_drop.rs` uses).
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    // No live `Intake` stages anything here, so there is no real staged
+    // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
@@ -1043,7 +1042,7 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
         Some("catching_up"),
         "an ALTER that added a column leaves its catch-up to run before `live`"
     );
-    trellis::intake::publication::discharge_registrations(&db.pool)
+    trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("discharge the ALTER's catch-up");
     assert_eq!(
@@ -1110,11 +1109,6 @@ async fn an_alter_leaves_a_pause_it_did_not_create_in_place() {
 
     let trellis = running(db.dsn()).await;
     wait_for_live(&raw, "order_calc").await;
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
-    ))
-    .await
-    .expect("a chained target's source needs a full replica identity");
     trellis
         .apply("TRANSFORM order_next FROM order_calc SELECT total AS t2, a AS a2")
         .await
@@ -1273,11 +1267,6 @@ async fn a_pause_landing_mid_alter_backfill_survives_the_alters_unpause() {
 
     let trellis = running(db.dsn()).await;
     wait_for_live(&raw, "order_calc").await;
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
-    ))
-    .await
-    .expect("a chained target's source needs a full replica identity");
     trellis
         .apply("TRANSFORM order_next FROM order_calc SELECT total AS t2, a AS a2")
         .await
@@ -1667,11 +1656,6 @@ async fn dropping_a_field_still_read_by_a_dependent_is_refused() {
 
     let trellis = running(db.dsn()).await;
     wait_for_live(&raw, "order_calc").await;
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
-    ))
-    .await
-    .expect("replica identity");
 
     trellis
         .apply("TRANSFORM order_calc_reader FROM order_calc SELECT a AS a_copy")
@@ -1734,11 +1718,6 @@ async fn dropping_a_transform_names_the_specific_column_a_dependent_reads() {
 
     let trellis = running(db.dsn()).await;
     wait_for_live(&raw, "order_calc").await;
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
-    ))
-    .await
-    .expect("replica identity");
 
     trellis
         .apply("TRANSFORM order_calc_reader FROM order_calc SELECT a AS a_copy")
@@ -1802,11 +1781,6 @@ async fn dropping_a_field_read_by_a_downstream_aggregates_group_by_key_is_refuse
 
     let trellis = running(db.dsn()).await;
     wait_for_live(&raw, "order_calc").await;
-    raw.batch_execute(&format!(
-        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
-    ))
-    .await
-    .expect("a chained aggregate's source needs a full replica identity");
 
     // `order_group` groups directly on `order_calc.a` — not a passthrough
     // `SELECT` field of its own — so the only edge from `order_group` back
@@ -1865,7 +1839,6 @@ async fn altering_an_aggregate_transform_is_unsupported() {
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
         "create table orders (id bigint primary key, g bigint, a numeric); \
-         alter table orders replica identity full; \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
     )
     .await
@@ -1878,7 +1851,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     let err = trellis
         .apply("ALTER TRANSFORM order_rollup ADD g AS g2")

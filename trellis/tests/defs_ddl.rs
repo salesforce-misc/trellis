@@ -1175,7 +1175,7 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
 ///
 /// `timestamptz` used to be this test's example — its `::text` rendering is
 /// session-`TimeZone`-dependent, and until issue #246 pinned `TimeZone`
-/// identically on every connection Trellis opens (including the walsender)
+/// identically on every connection Trellis opens
 /// that made it exactly as unsafe as `numeric`. It is a *safe* primary-key
 /// type now (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), which is what
 /// [`a_source_table_with_a_timestamptz_primary_key_is_accepted`] below

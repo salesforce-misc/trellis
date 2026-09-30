@@ -84,8 +84,8 @@ pub struct Coverage {
     /// `"to_one"` / `"to_many"`, tallied from each declared relationship's
     /// [`Cardinality`] (issue #34). Both cardinalities have materially
     /// different engine paths — a `LEFT JOIN`-shaped lookup versus an
-    /// aggregate over related rows, with different reverse-propagation and
-    /// replica-identity requirements — so a run that drew only one of them
+    /// aggregate over related rows, with different reverse-propagation
+    /// paths — so a run that drew only one of them
     /// is only half-covered.
     pub relationship_cardinalities: HashMap<&'static str, usize>,
     /// Which of the three engine-supported relationship *reference* shapes

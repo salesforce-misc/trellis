@@ -1,8 +1,9 @@
 //! Issue #677's review: an `UPDATE` that leaves an out-of-line TOASTed
 //! column unchanged, through capture.
 //!
-//! `pgoutput` doesn't resend such a column in the new tuple. Before intake
-//! filled it in from the old tuple, the new image simply lacked it, so:
+//! The change stream Trellis consumed before #622 didn't resend such a
+//! column in the new tuple. Before intake filled it in from the old tuple,
+//! the new image simply lacked it, so:
 //! - a 1:1 field reading a parent column through a to-one relationship went
 //!   silently stale (the reverse path read the absent column as `NULL`);
 //! - once #677 made relationship reads strict, an aggregate over the same
@@ -10,8 +11,8 @@
 //!   reverse recompute keyed by the TOASTed `to_col`, both failed the key
 //!   with `MissingColumn` instead.
 //!
-//! Every table here is `REPLICA IDENTITY FULL`, which relationships and
-//! aggregates require, so the old tuple always has the value.
+//! Capture triggers read the transition tables, which carry every column of
+//! both images detoasted, so each case here must converge.
 
 use std::time::{Duration, Instant};
 
@@ -60,15 +61,11 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
     raw.batch_execute(
         "create table posts (id bigint primary key, author text, word_count int); \
          alter table posts alter column author set storage external; \
-         alter table posts replica identity full; \
          create table post_tags (id bigint primary key, post_id bigint, tag text, weight int); \
-         alter table post_tags replica identity full; \
          create table articles (id bigint primary key, ref text unique, title text); \
          alter table articles alter column ref set storage external; \
-         alter table articles replica identity full; \
          create table comments (id bigint primary key, article_ref text, word_count int); \
-         alter table comments alter column article_ref set storage external; \
-         alter table comments replica identity full",
+         alter table comments alter column article_ref set storage external",
     )
     .await
     .expect("source tables");
@@ -181,14 +178,14 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #677's note for #622 C5: the case intake could never fix. A 1:1
-/// source *without* `REPLICA IDENTITY FULL` whose definition reads a TOASTed
-/// column: pgoutput left the unchanged column out of an `UPDATE`'s new tuple
-/// and there was no old tuple to fill it from, so the key was poisoned.
+/// Issue #677's note for #622 C5: the case intake could never fix. A plain
+/// 1:1 source whose definition reads a TOASTed column: the old change stream
+/// left the unchanged column out of an `UPDATE`'s new tuple and carried no
+/// old tuple to fill it from, so the key was poisoned.
 /// Trigger capture reads the transition table, which carries the whole row
 /// detoasted, so the update converges.
 #[tokio::test]
-async fn an_unchanged_toasted_column_of_a_default_identity_source_converges() {
+async fn an_unchanged_toasted_column_of_a_plain_one_to_one_source_converges() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

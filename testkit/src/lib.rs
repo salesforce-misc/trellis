@@ -1,11 +1,11 @@
 //! Reusable ephemeral-Postgres integration test harness for Trellis.
 //!
-//! - [`cluster`] spins up a throwaway, logical-replication-enabled Postgres
-//!   instance and hands out per-scenario isolated, migrated databases.
+//! - [`cluster`] spins up a throwaway Postgres instance and hands out
+//!   per-scenario isolated, migrated databases.
 //! - [`fixtures`] seeds the common source-table / derived-table shape most
 //!   staging/claiming test suites need.
-//! - [`crash`] provides the seams durability tests (intake's kill-9 tests,
-//!   the straddler/phase-gap tests) build their actual crash-point scenarios
+//! - [`crash`] provides the seams durability tests (the generative suite's
+//!   kill-9 subprocess engine, the straddler/phase-gap tests) build their actual crash-point scenarios
 //!   on.
 //! - [`lsn`] gives tests a realistic LSN to stage CDC ring rows at.
 //! - [`locale`] finds a locale that makes an unpinned `lc_monetary` show.

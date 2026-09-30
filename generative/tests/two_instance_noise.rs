@@ -25,14 +25,12 @@
 //!    separate `postgres` processes, separate WAL, separate catalogs,
 //!    separate lock managers — so a hardcoded, unscoped resource name is
 //!    *invisible* there, which is the opposite of what this property is
-//!    for. Two databases in one cluster share a little more (the
-//!    cluster-wide replication-slot namespace — already covered by issue
-//!    #188's per-case slot naming). Two schemas in one database share
-//!    everything a Postgres database has: the slot *and* publication
-//!    namespaces, the advisory-lock keyspace (Postgres advisory locks are
-//!    scoped to a database, **not** to a schema), one WAL and one logical
-//!    decoding stream feeding both instances' CDC, one catalog, one set of
-//!    background workers. That is the maximum-shared-surface configuration,
+//!    for. Two databases in one cluster share a little more (cluster-wide
+//!    objects such as roles). Two schemas in one database share everything
+//!    a Postgres database has: the source tables and the capture triggers
+//!    on them, the advisory-lock keyspace (Postgres advisory locks are
+//!    scoped to a database, **not** to a schema), one WAL, one catalog, one
+//!    set of background workers. That is the maximum-shared-surface configuration,
 //!    and therefore the one that can actually fail.
 //! 2. **It is the production topology the docs promise.**
 //!    `docs/instance-identity.md` says in as many words that "several
