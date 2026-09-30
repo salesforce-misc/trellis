@@ -46,8 +46,23 @@ class SelfCheckTest < Minitest::Test
     report = Trellis.self_check("audited_widget_totals", limit: 100, timeout_ms: TIMEOUT_MS)
     assert_equal :diverged, report.outcome
     assert_equal [Trellis::Divergence.new(kind: :cell, key: "1", column: "total",
-                                          persisted: "9999", recomputed: "11")],
+                                          persisted: "9999", recomputed: "11",
+                                          table: nil, detail: nil)],
                  report.divergences
+
+    # A source attached as a partition is no longer captured whole, which the
+    # capture audit reports before it compares anything. The staging worker
+    # doesn't undo an ATTACH, so the report is stable.
+    pg.exec("create table audited_widgets_all (id integer not null, price integer, tax integer) " \
+            "partition by range (id)")
+    pg.exec("alter table audited_widgets_all attach partition audited_widgets " \
+            "for values from (minvalue) to (maxvalue)")
+    report = Trellis.self_check("audited_widget_totals", limit: 100, timeout_ms: TIMEOUT_MS)
+    assert_equal [:diverged, 0], [report.outcome, report.rows_compared]
+    assert_equal [[:capture, "public.audited_widgets"]],
+                 report.divergences.map { |d| [d.kind, d.table] }
+    assert_match "partition of public.audited_widgets_all", report.divergences.first.detail
+    pg.exec("alter table audited_widgets_all detach partition audited_widgets")
   ensure
     pg&.close
   end

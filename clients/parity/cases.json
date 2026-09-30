@@ -95,7 +95,9 @@
       "key": {"nullable": "string"},
       "column": {"nullable": "string"},
       "persisted": {"nullable": "string"},
-      "recomputed": {"nullable": "string"}
+      "recomputed": {"nullable": "string"},
+      "table": {"nullable": "string"},
+      "detail": {"nullable": "string"}
     },
     "Config": {
       "schema": "string",

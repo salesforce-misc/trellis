@@ -199,9 +199,11 @@ What it does there is one append.
   ([open question 9](#open-questions)).
 - **Must:** the self-check audit
   ([ADR-0013](0013-self-check-production-recompute-audit.md)) verifies from
-  `pg_trigger` that every captured table's three triggers exist, are owned by
-  the Trellis role and are enabled, and reports a missing or disabled one
-  before any recompute comparison. Replica-mode sessions are covered by
+  `pg_trigger` that every captured table's triggers exist, are enabled
+  `ALWAYS` and call functions owned by the Trellis role, that the role still
+  holds the privileges the functions use, and that the table hasn't joined a
+  partition or inheritance hierarchy, and reports any fault before any
+  recompute comparison (as built in #622 C9: four triggers, one Trellis role). Replica-mode sessions are covered by
   `ENABLE ALWAYS`; an owner who disables or drops the trigger by name is
   documented as uncaptured until the audit runs. *Evidence:*
   [E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119).

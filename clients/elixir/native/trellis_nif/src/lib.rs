@@ -330,6 +330,8 @@ struct DivergenceTerm {
     column: Option<String>,
     persisted: Option<String>,
     recomputed: Option<String>,
+    table: Option<String>,
+    detail: Option<String>,
 }
 
 impl SelfCheckReportTerm {
@@ -357,6 +359,8 @@ impl DivergenceTerm {
             column: divergence.column,
             persisted: divergence.persisted,
             recomputed: divergence.recomputed,
+            table: divergence.table,
+            detail: divergence.detail,
         })
     }
 }

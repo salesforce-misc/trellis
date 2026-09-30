@@ -31,6 +31,20 @@
 //! suite's cross-check test (`generative/tests/self_check_cross_check.rs`)
 //! is what keeps the two from silently drifting apart.
 //!
+//! # The capture audit comes first
+//!
+//! Before it waits or compares anything, [`self_check`] checks from the
+//! catalog that every table the target is computed from is still captured
+//! as `capture::install` installed it: all four triggers present, `ENABLE
+//! ALWAYS` and calling their functions, the functions `SECURITY DEFINER` and
+//! owned by the Trellis role, that role still holding the privileges the
+//! functions use, and the table still outside any partition or inheritance
+//! hierarchy ([`super::capture_audit`], #622 C9). A fault there is reported
+//! as [`Divergence::Capture`], without a recompute comparison: the
+//! convergence wait can't see a broken capture (it is a predicate over ring
+//! rows, and the broken capture writes none), and the comparison would only
+//! show its symptom.
+//!
 //! # Quiescence: "diverged" vs "not yet caught up"
 //!
 //! A single snapshot is not sufficient under live load: a correctly-working
@@ -88,6 +102,7 @@ use crate::defs::typed_literal;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
+use super::capture_audit::{self, CaptureFault};
 use super::converge;
 use super::error::StagingError;
 
@@ -158,11 +173,15 @@ pub struct SelfCheckReport {
     /// The watermark token this report's [`SelfCheckOutcome`] was checked
     /// through — the LSN [`converge::await_converged`] confirmed the target
     /// had caught up to (or failed to, for [`SelfCheckOutcome::NotCaughtUp`]).
+    /// For a report of [`Divergence::Capture`] faults, which is made without
+    /// awaiting anything, it is the WAL position when the capture audit read
+    /// the catalog.
     pub checked_through: PgLsn,
     /// How many distinct keys this call actually compared — the union of
     /// every key seen on either side of the comparison, within `scope`'s
     /// page. Zero for a report whose outcome is
-    /// [`SelfCheckOutcome::NotCaughtUp`] (the comparison never ran).
+    /// [`SelfCheckOutcome::NotCaughtUp`], or that reports
+    /// [`Divergence::Capture`] faults (the comparison never ran).
     pub rows_compared: i64,
     /// The keyset cursor a following call should pass as
     /// [`SelfCheckScope::after`] to continue past this page — the key this
@@ -195,7 +214,8 @@ pub enum SelfCheckOutcome {
     Diverged(Vec<Divergence>),
 }
 
-/// One divergence [`self_check`] found, per ADR-0013's four kinds.
+/// One divergence [`self_check`] found: ADR-0013's four kinds, plus a
+/// broken capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Divergence {
     /// A row exists on both sides, but `column`'s value differs.
@@ -219,6 +239,15 @@ pub enum Divergence {
     /// The target table has this column, but the definition doesn't expect
     /// it — schema drift, not a per-row divergence.
     ExtraColumn { column: String },
+    /// A table the target is computed from isn't being captured as
+    /// installed: a trigger is missing, disabled or calls the wrong
+    /// function, a capture function is missing or has the wrong owner, the
+    /// role the functions run as lost a privilege, or the table joined a
+    /// partition or inheritance hierarchy (#622 C9, see
+    /// [`super::capture_audit`]). Its changes may not be reaching the
+    /// target at all, so [`self_check`] reports these before, and instead
+    /// of, a recompute comparison.
+    Capture(CaptureFault),
 }
 
 /// Why a [`self_check`] call failed outright (as opposed to reporting a
@@ -376,6 +405,33 @@ pub async fn self_check(
         });
     }
 
+    // #622 C9: a table whose capture is broken may not be feeding the target
+    // at all, so that is reported first, and alone. A recompute comparison
+    // would only show the symptom, and the convergence wait before it would
+    // pass, because convergence is a predicate over ring rows the broken
+    // capture never wrote. Nothing here is a race a re-check could resolve:
+    // it is one catalog read of installed state.
+    let capture = {
+        let client = pool.get().await?;
+        let faults = capture_audit::audit(&**client, pool.schema(), &def).await?;
+        if faults.is_empty() {
+            None
+        } else {
+            Some((faults, converge::watermark_token(&**client).await?))
+        }
+    };
+    if let Some((faults, read_at)) = capture {
+        return Ok(SelfCheckReport {
+            target: target_table.to_string(),
+            checked_through: read_at,
+            rows_compared: 0,
+            next_after: scope.after.clone(),
+            outcome: SelfCheckOutcome::Diverged(
+                faults.into_iter().map(Divergence::Capture).collect(),
+            ),
+        });
+    }
+
     // Issue #121: this audit now keys on the source's full (possibly
     // composite) primary key, through the shared key-contract text
     // (`ddl::pk_key_sql_expr`) rather than a single named column.
@@ -490,6 +546,7 @@ enum DivergenceIdentity {
     ExtraRow { key: String },
     MissingColumn { column: String },
     ExtraColumn { column: String },
+    Capture(CaptureFault),
 }
 
 impl DivergenceIdentity {
@@ -507,6 +564,7 @@ impl DivergenceIdentity {
             Divergence::ExtraColumn { column } => DivergenceIdentity::ExtraColumn {
                 column: column.clone(),
             },
+            Divergence::Capture(fault) => DivergenceIdentity::Capture(fault.clone()),
         }
     }
 }

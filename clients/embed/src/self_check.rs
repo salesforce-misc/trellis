@@ -18,12 +18,13 @@ use crate::{PlainError, encode_watermark};
 pub const SELF_CHECK_OUTCOMES: [&str; 3] = ["converged", "not_caught_up", "diverged"];
 
 /// Every word [`PlainDivergence::kind`] can be.
-pub const DIVERGENCE_KINDS: [&str; 5] = [
+pub const DIVERGENCE_KINDS: [&str; 6] = [
     "cell",
     "missing_row",
     "extra_row",
     "missing_column",
     "extra_column",
+    "capture",
 ];
 
 /// Every word [`self_check_mode`] accepts.
@@ -65,7 +66,8 @@ pub struct PlainSelfCheckReport {
 /// [`DIVERGENCE_KINDS`]; each other field is set only for the kinds that
 /// carry it (`key` for `cell`, `missing_row` and `extra_row`; `column` for
 /// `cell`, `missing_column` and `extra_column`; `persisted` and `recomputed`
-/// for `cell`, and even there `None` stands for SQL `NULL`).
+/// for `cell`, and even there `None` stands for SQL `NULL`; `detail` for
+/// `capture`, and `table` for a `capture` fault on one table).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlainDivergence {
     pub kind: &'static str,
@@ -75,6 +77,12 @@ pub struct PlainDivergence {
     pub persisted: Option<String>,
     /// The value the recompute produced, as text.
     pub recomputed: Option<String>,
+    /// The captured table (`schema.table`) a `capture` fault is on. `None`
+    /// for a missing privilege, which is about the Trellis role, not one
+    /// table.
+    pub table: Option<String>,
+    /// What is wrong with the capture, as one sentence.
+    pub detail: Option<String>,
 }
 
 impl From<&SelfCheckReport> for PlainSelfCheckReport {
@@ -112,6 +120,7 @@ impl From<&Divergence> for PlainDivergence {
                 column: Some(column.clone()),
                 persisted: persisted.clone(),
                 recomputed: recomputed.clone(),
+                ..PlainDivergence::default()
             },
             Divergence::MissingRow { key } => PlainDivergence {
                 kind: "missing_row",
@@ -133,13 +142,19 @@ impl From<&Divergence> for PlainDivergence {
                 column: Some(column.clone()),
                 ..PlainDivergence::default()
             },
+            Divergence::Capture(fault) => PlainDivergence {
+                kind: "capture",
+                table: fault.table().map(str::to_string),
+                detail: Some(fault.to_string()),
+                ..PlainDivergence::default()
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use trellis::PgLsn;
+    use trellis::{CaptureFault, PgLsn};
 
     use super::*;
     use crate::decode_watermark;
@@ -204,6 +219,15 @@ mod tests {
             Divergence::ExtraColumn {
                 column: "legacy".to_string(),
             },
+            Divergence::Capture(CaptureFault::MissingTrigger {
+                table: "public.orders".to_string(),
+                trigger: "trellis_capture_insert".to_string(),
+            }),
+            Divergence::Capture(CaptureFault::MissingPrivilege {
+                role: "trellis".to_string(),
+                privilege: "INSERT".to_string(),
+                object: "trellis.seg_0".to_string(),
+            }),
         ])));
 
         let key = |key: &str| Some(key.to_string());
@@ -217,6 +241,7 @@ mod tests {
                     column: key("total"),
                     persisted: key("3"),
                     recomputed: None,
+                    ..PlainDivergence::default()
                 },
                 PlainDivergence {
                     kind: "missing_row",
@@ -236,6 +261,22 @@ mod tests {
                 PlainDivergence {
                     kind: "extra_column",
                     column: key("legacy"),
+                    ..PlainDivergence::default()
+                },
+                PlainDivergence {
+                    kind: "capture",
+                    table: key("public.orders"),
+                    detail: key(
+                        "the capture trigger trellis_capture_insert on public.orders is missing"
+                    ),
+                    ..PlainDivergence::default()
+                },
+                PlainDivergence {
+                    kind: "capture",
+                    detail: key(
+                        "role trellis, which the capture functions run as, lacks INSERT on \
+                         trellis.seg_0"
+                    ),
                     ..PlainDivergence::default()
                 },
             ]

@@ -6,10 +6,17 @@
 //! Everything else "reaches past the mechanism, inserts directly", the way
 //! `trellis/tests/column_quarantine.rs` seeds its own scenarios: corrupting a
 //! target row, seeding `column_status`, and building the converged target in
-//! the first place. [`converged_fixture`] stages CDC rows by hand and drains
-//! them through the engine's own apply path instead of running a live
-//! `Client` and waiting for it to converge (issue #299). See that helper for
-//! why the wait was the expensive part.
+//! the first place. [`converged_fixture`] installs the source's capture
+//! triggers, lets them stage the rows it writes, and drains them through the
+//! engine's own apply path instead of running a live `Client` and waiting
+//! for it to converge (issue #299). See that helper for why the wait was
+//! the expensive part.
+//!
+//! The capture-audit tests at the end (#622 C9) break a converged target's
+//! capture from the catalog side: a disabled or dropped trigger, a function
+//! handed to another owner, a revoked privilege, a partition or inheritance
+//! hierarchy. No staging worker runs to repair any of it, so each report is
+//! read once, with nothing to wait for.
 //!
 //! Only
 //! `self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_lagging_target`
@@ -46,7 +53,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{
-    Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis, TrellisOptions,
+    CaptureFault, Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis,
+    TrellisOptions,
 };
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -111,17 +119,35 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
+/// Installs `table`'s capture triggers with one capture reconcile pass, the
+/// staging worker's, which also parks the table's join marker.
+async fn capture(client: &mut Client, table: &str) {
+    let outcome = trellis::capture::reconcile::reconcile(
+        client,
+        DEFAULT_SCHEMA,
+        &[table.to_string()],
+        std::time::Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .expect("capture pass");
+    assert!(
+        outcome.failed.is_empty() && outcome.waiting.is_empty(),
+        "{outcome:?}"
+    );
+}
+
 /// A converged 1-1 target, built with no live `Client` and no wall-clock
 /// wait.
 ///
 /// Creates `source` from `source_ddl`, defines `transform` over it (still
-/// empty, so the definition goes live immediately), then for each `(key,
-/// image)` pair inserts the source row and stages the matching CDC insert
-/// by hand, the same text-valued JSON image a capture trigger would stage
-/// for it. The ring is then drained through the engine's real apply path, so
-/// every target value is one the engine itself computed and wrote.
+/// empty, so the definition goes live immediately), installs the source's
+/// capture triggers, then inserts each `(key, image)` pair's source row,
+/// which the triggers stage. The ring is then drained through the engine's
+/// real apply path, so every target value is one the engine itself computed
+/// and wrote.
 ///
-/// What this skips is the live `Client`, so whether the target is caught up
+/// What this skips is the live `Client`, whose staging worker would also
+/// repair a trigger a test breaks, so whether the target is caught up
 /// rests on the ring alone. `self_check`'s own convergence await still runs
 /// its real predicate; it just finds nothing pending.
 async fn converged_fixture(
@@ -143,8 +169,11 @@ async fn converged_fixture(
     .await
     .expect("connect");
     trellis.apply(transform).await.expect("define");
-    // No staging worker runs here: stand in for its discharge, which takes
-    // a definition over an empty source straight to `live`.
+    // No staging worker runs here: stand in for its capture pass, which
+    // installs the source's capture triggers, and for its discharge, which
+    // takes a definition over an empty source straight to `live`.
+    let src_table = format!("{DEFAULT_SCHEMA}.{source}");
+    capture(&mut raw, &src_table).await;
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the build");
@@ -163,12 +192,7 @@ async fn converged_fixture(
          would exclude the CDC rows staged below"
     );
 
-    let active: i16 = raw
-        .query_one("select ring_slot from segment_pointer", &[])
-        .await
-        .expect("read segment pointer")
-        .get(0);
-    let src_table = format!("{DEFAULT_SCHEMA}.{source}");
+    // The capture triggers stage each insert.
     for (key, image) in rows {
         raw.execute(
             &format!("insert into {source} select * from jsonb_populate_record(null::{source}, $1::text::jsonb)"),
@@ -176,15 +200,6 @@ async fn converged_fixture(
         )
         .await
         .unwrap_or_else(|e| panic!("insert source row {key}: {e}"));
-        raw.execute(
-            &format!(
-                "insert into seg_{active} (src_table, key, op, lsn, new_image, hop_gen) \
-                 values ($1, $2, 'insert', $3, $4::text::jsonb, 0)"
-            ),
-            &[&src_table, key, &testkit::wal_insert_lsn(&raw).await, image],
-        )
-        .await
-        .unwrap_or_else(|e| panic!("stage cdc {key}: {e}"));
     }
     drain_to_quiescence(&db.pool, &mut raw).await;
 
@@ -817,6 +832,268 @@ async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
     assert!(
         err.to_string().contains("aggregate"),
         "expected a scope-specific message naming the aggregate shape, got {err}"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9: [`converged_fixture`]'s `widget_totals` over `widgets`, with its
+/// capture installed and nothing diverged.
+async fn widgets_fixture(db: &TestDatabase) -> (Trellis, Client) {
+    converged_fixture(
+        db,
+        "create table widgets (id integer primary key, price integer, tax integer)",
+        "widgets",
+        "TRANSFORM widget_totals FROM widgets SELECT price + tax AS total",
+        &[("1", r#"{"id":"1","price":"10","tax":"1"}"#)],
+    )
+    .await
+}
+
+/// Audits `widget_totals` once, under `Strict`: nothing writes, and no
+/// staging worker runs.
+async fn audit_widgets(trellis: &Trellis) -> trellis::SelfCheckReport {
+    trellis
+        .self_check(
+            "widget_totals",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Strict,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check")
+}
+
+/// The capture faults `report` carries, or a panic naming what it carried
+/// instead. A capture fault is reported before, and instead of, any
+/// comparison, so no row was compared.
+fn capture_faults(report: &trellis::SelfCheckReport) -> Vec<CaptureFault> {
+    let SelfCheckOutcome::Diverged(divergences) = &report.outcome else {
+        panic!("expected capture faults, got {:?}", report.outcome);
+    };
+    assert_eq!(report.rows_compared, 0, "{report:?}");
+    divergences
+        .iter()
+        .map(|d| match d {
+            Divergence::Capture(fault) => fault.clone(),
+            other => panic!("expected only capture faults, got {other:?} in {divergences:?}"),
+        })
+        .collect()
+}
+
+const WIDGETS: &str = "trellis.widgets";
+
+/// #622 C9 (acceptance A5): a capture trigger an operator disabled by name
+/// is reported, and so is one set to plain `ENABLE`, which stops firing in
+/// a `session_replication_role = replica` session. The target row is
+/// corrupted as well, to show the comparison that would find it never runs.
+#[tokio::test]
+async fn a_disabled_capture_trigger_is_reported_before_any_comparison() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = widgets_fixture(&db).await;
+    assert!(
+        matches!(
+            audit_widgets(&trellis).await.outcome,
+            SelfCheckOutcome::Converged
+        ),
+        "the fixture starts converged"
+    );
+
+    raw.batch_execute(
+        "alter table widgets disable trigger trellis_capture_update; \
+         alter table widgets enable trigger trellis_capture_delete; \
+         update widget_totals set total = 0",
+    )
+    .await
+    .expect("disable and re-enable capture triggers, and corrupt the target");
+
+    let report = audit_widgets(&trellis).await;
+    assert_eq!(
+        capture_faults(&report),
+        vec![
+            CaptureFault::TriggerNotAlways {
+                table: WIDGETS.to_string(),
+                trigger: "trellis_capture_update".to_string(),
+                enabled: "D".to_string(),
+            },
+            CaptureFault::TriggerNotAlways {
+                table: WIDGETS.to_string(),
+                trigger: "trellis_capture_delete".to_string(),
+                enabled: "O".to_string(),
+            },
+        ]
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9: a dropped capture trigger is reported.
+#[tokio::test]
+async fn a_dropped_capture_trigger_is_reported() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = widgets_fixture(&db).await;
+
+    raw.batch_execute("drop trigger trellis_capture_insert on widgets")
+        .await
+        .expect("drop a capture trigger");
+
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        vec![CaptureFault::MissingTrigger {
+            table: WIDGETS.to_string(),
+            trigger: "trellis_capture_insert".to_string(),
+        }]
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9 (acceptance A5): the Trellis role losing a privilege the capture
+/// functions use is reported.
+///
+/// The test cluster's Trellis role is a superuser, which holds every
+/// privilege whatever is revoked, so the test hands the instance schema to
+/// an ordinary role first. The functions still belong to the superuser
+/// then, which is reported as mis-owned. Once they belong to the new role
+/// too, and it holds exactly the grants the audit expects, the target
+/// converges; revoking `INSERT` on one ring segment is then reported.
+#[tokio::test]
+async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = widgets_fixture(&db).await;
+    let role = "self_check_capture_owner";
+    raw.batch_execute(&format!(
+        "do $$ begin create role {role}; \
+         exception when duplicate_object then null; end $$; \
+         alter schema trellis owner to {role}"
+    ))
+    .await
+    .expect("hand the instance schema to an ordinary role");
+
+    let functions: Vec<String> = trellis::capture::sql::CaptureEvent::ALL
+        .iter()
+        .map(|event| {
+            format!(
+                "trellis.{}",
+                trellis::capture::sql::function_name(WIDGETS, *event).expect("function name")
+            )
+        })
+        .collect();
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        functions
+            .iter()
+            .map(|function| CaptureFault::FunctionOwner {
+                table: WIDGETS.to_string(),
+                function: function.clone(),
+                owner: "postgres".to_string(),
+                expected: role.to_string(),
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    for function in &functions {
+        raw.batch_execute(&format!("alter function {function}() owner to {role}"))
+            .await
+            .expect("hand a capture function to the role");
+    }
+    raw.batch_execute(&format!(
+        "grant insert on all tables in schema trellis to {role}; \
+         grant usage on all sequences in schema trellis to {role}"
+    ))
+    .await
+    .expect("grant the role what the capture functions use");
+    let report = audit_widgets(&trellis).await;
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "with the functions owned by the schema's owner, and its grants, capture is whole: {:?}",
+        report.outcome
+    );
+
+    raw.batch_execute(&format!("revoke insert on trellis.seg_0 from {role}"))
+        .await
+        .expect("revoke insert on a ring segment");
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        vec![CaptureFault::MissingPrivilege {
+            role: role.to_string(),
+            privilege: "INSERT".to_string(),
+            object: "trellis.seg_0".to_string(),
+        }]
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9: a source attached as a partition after its definition was
+/// accepted is reported. A write through the partitioned parent fires the
+/// parent's statement triggers, not the source's.
+#[tokio::test]
+async fn a_source_attached_as_a_partition_is_reported() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = widgets_fixture(&db).await;
+
+    raw.batch_execute(
+        "create table widgets_all (id integer not null, price integer, tax integer) \
+             partition by range (id); \
+         alter table widgets_all attach partition widgets \
+             for values from (minvalue) to (maxvalue)",
+    )
+    .await
+    .expect("attach the source as a partition");
+
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        vec![CaptureFault::Partition {
+            table: WIDGETS.to_string(),
+            parent: "trellis.widgets_all".to_string(),
+        }]
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9: a source that joined an inheritance hierarchy after its
+/// definition was accepted is reported, as a child and as a parent.
+#[tokio::test]
+async fn a_source_in_an_inheritance_hierarchy_is_reported() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = widgets_fixture(&db).await;
+
+    raw.batch_execute(
+        "create table widgets_base (id integer, price integer, tax integer); \
+         alter table widgets inherit widgets_base",
+    )
+    .await
+    .expect("make the source an inheritance child");
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        vec![CaptureFault::InheritanceChild {
+            table: WIDGETS.to_string(),
+            parent: "trellis.widgets_base".to_string(),
+        }]
+    );
+
+    raw.batch_execute(
+        "alter table widgets no inherit widgets_base; \
+         create table widgets_more (extra text) inherits (widgets)",
+    )
+    .await
+    .expect("make the source an inheritance parent instead");
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        vec![CaptureFault::InheritanceParent {
+            table: WIDGETS.to_string(),
+            child: "trellis.widgets_more".to_string(),
+        }]
     );
 
     trellis.shutdown().await.expect("shutdown");

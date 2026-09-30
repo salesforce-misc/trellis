@@ -217,9 +217,16 @@ module Trellis
   #   doesn't have it.
   # - :extra_column: the target table has `column`, but the definition
   #   doesn't expect it.
+  # - :capture: a table the target is computed from isn't being captured as
+  #   Trellis installed it (a capture trigger missing, disabled or calling
+  #   the wrong function, a capture function missing or with the wrong
+  #   owner, the Trellis role missing a privilege, or the table joined a
+  #   partition or inheritance hierarchy). `detail` says what, and `table`
+  #   names the table (nil for a missing privilege). self_check reports these
+  #   before, and instead of, comparing any rows, so rows_compared is 0.
   #
   # Fields a kind doesn't carry are nil.
-  Divergence = Data.define(:kind, :key, :column, :persisted, :recomputed)
+  Divergence = Data.define(:kind, :key, :column, :persisted, :recomputed, :table, :detail)
 
   # The configuration this process's handle connected with, as Trellis.config
   # returns it: connect's schema and target_schema, and the connection pool's

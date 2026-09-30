@@ -42,6 +42,8 @@
 //!   (ADR-0013): a read-only, keyset-bounded comparison of a persisted 1-1
 //!   target against an independently-rendered Postgres recompute — see
 //!   [`crate::app::Trellis::self_check`] for the public facade.
+//!   [`capture_audit`] is the check of every captured table's triggers,
+//!   functions and privileges it runs first (#622 C9).
 //! - [`error`] is this module's error type.
 //!
 //! What this module does *not* do: delta arithmetic for aggregate
@@ -56,6 +58,7 @@
 pub mod append;
 pub mod apply;
 pub mod apply_aggregate;
+pub mod capture_audit;
 pub mod claim;
 pub mod converge;
 pub mod error;
@@ -107,6 +110,7 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // `staging::self_check::SelfCheckError`, matching `ApplyError`/
 // `StagingError`'s own error-type precedent, so this flat re-export would
 // be unused.
+pub use capture_audit::CaptureFault;
 pub use self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope,
 };

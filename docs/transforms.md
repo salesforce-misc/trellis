@@ -19,7 +19,10 @@ primary key, over a partitioned table, or over a table in a partition or
 inheritance hierarchy (a partition, or an inheritance parent or child), is
 rejected when it is defined, with an error naming the table. A statement
 trigger fires only for the table a statement names, so capture on any of those
-would miss writes made through the rest of the hierarchy. Trellis never adds the key itself: the source schema
+would miss writes made through the rest of the hierarchy. A source that joins
+such a hierarchy after its transform is defined (`ATTACH PARTITION`,
+`INHERIT`, or a table created `INHERITS` it) isn't refused by anything, but
+`self_check` reports it as a `capture` divergence. Trellis never adds the key itself: the source schema
 is the user's
 ([0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)).
 

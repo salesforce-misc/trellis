@@ -21,9 +21,45 @@ test suite can perform.
 ### `self_check` is a public method on `Trellis`
 
 It audits one target at a time, is read-only, and returns a `SelfCheckReport`
-describing any divergences (cell, missing row, extra row, missing/extra column), the
+describing any divergences (cell, missing row, extra row, missing/extra column, and,
+since #622, a broken capture), the
 LSN checked through, the rows compared, and whether the scan was bounded. Fleet-wide
 sweeps are a caller-side loop over `definitions()`, not a behaviour of the primitive.
+
+### The capture audit runs first
+
+*Added by #622 (C9), when capture moved to statement triggers
+([ADR-0002](0002-async-data-flow.md#capture-by-statement-triggers)).*
+
+A target is only as current as the capture feeding it, and a broken capture
+is invisible to the convergence wait: convergence is a predicate over ring
+rows, and a capture that has stopped writes none. So before it awaits or
+compares anything, `self_check` reads from the catalog (`pg_trigger`,
+`pg_proc`, `pg_inherits` and the `has_*_privilege` functions) that every table
+the target is computed from (its source and the to-side of each relationship
+it reads through, less any this instance's seam feeds) is still captured as
+the staging worker installed it:
+
+- all four capture triggers exist, are `ENABLE ALWAYS` (`tgenabled = 'A'`),
+  and call their event's function;
+- each function exists, is `SECURITY DEFINER`, and is owned by the role that
+  owns the instance schema (the one Trellis role that installs and owns
+  capture);
+- the role each function runs as still has `USAGE` on the schema, `INSERT` on
+  every ring segment, and `USAGE` on the change-id sequence and the ring slot
+  mirror;
+- the table is still outside any partition or inheritance hierarchy.
+  Acceptance refuses such a table, but nothing refuses a later `ATTACH
+  PARTITION` or `INHERIT`, and a statement trigger fires only for the table a
+  statement names.
+
+Any fault is reported as a `capture` divergence, and the report stops there:
+no recompute comparison runs, because it would only show the symptom. The
+audit applies once a definition's capture must be installed (`backfilling`,
+`catching_up`, `live`). A fault is a catalog fact, not a race, so it isn't
+re-checked. The staging worker's reconcile pass reinstalls a missing or
+disabled trigger, so those faults last only while no worker runs or its
+reconcile can't land; the others persist until an operator fixes them.
 
 ### Postgres is the oracle; the comparison is two-way
 

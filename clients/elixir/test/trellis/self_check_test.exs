@@ -94,6 +94,43 @@ defmodule Trellis.SelfCheckTest do
                limit: 100,
                timeout_ms: @timeout_ms
              )
+
+    # A source attached as a partition is no longer captured whole, which the
+    # capture audit reports before it compares anything. The staging worker
+    # doesn't undo an ATTACH, so the report is stable.
+    Postgrex.query!(
+      pg,
+      "create table audited_widgets_all (id integer not null, price integer, tax integer) " <>
+        "partition by range (id)",
+      []
+    )
+
+    Postgrex.query!(
+      pg,
+      "alter table audited_widgets_all attach partition audited_widgets " <>
+        "for values from (minvalue) to (maxvalue)",
+      []
+    )
+
+    on_exit(fn ->
+      pg = TestCluster.postgrex!()
+      Postgrex.query!(pg, "alter table audited_widgets_all detach partition audited_widgets", [])
+    end)
+
+    assert {:ok,
+            %SelfCheckReport{
+              outcome: :diverged,
+              rows_compared: 0,
+              divergences: [
+                %Divergence{kind: :capture, table: "public.audited_widgets", detail: detail}
+              ]
+            }} =
+             Trellis.self_check(trellis, "audited_widget_totals",
+               limit: 100,
+               timeout_ms: @timeout_ms
+             )
+
+    assert detail =~ "partition of public.audited_widgets_all"
   end
 
   test "an unknown target is :not_found, and bad options are :validation" do

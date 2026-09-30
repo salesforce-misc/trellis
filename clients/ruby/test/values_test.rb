@@ -102,7 +102,7 @@ class ValuesTest < Minitest::Test
                     unknown],
                  Trellis::Native.applied_kinds
     assert_equal %i[converged not_caught_up diverged], Trellis::Native.self_check_outcomes
-    assert_equal %i[cell missing_row extra_row missing_column extra_column],
+    assert_equal %i[cell missing_row extra_row missing_column extra_column capture],
                  Trellis::Native.divergence_kinds
   end
 end

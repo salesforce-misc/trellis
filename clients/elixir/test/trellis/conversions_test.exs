@@ -51,7 +51,7 @@ defmodule Trellis.ConversionsTest do
              {:ok, [:converged, :not_caught_up, :diverged]}
 
     assert Trellis.Native.divergence_kinds() ==
-             {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column]}
+             {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column, :capture]}
   end
 
   test "a self-check report's divergences become structs" do
@@ -63,8 +63,24 @@ defmodule Trellis.ConversionsTest do
         next_after: "2",
         outcome: :diverged,
         divergences: [
-          %{kind: :cell, key: "1", column: "total", persisted: "9999", recomputed: nil},
-          %{kind: :extra_column, key: nil, column: "legacy", persisted: nil, recomputed: nil}
+          %{
+            kind: :cell,
+            key: "1",
+            column: "total",
+            persisted: "9999",
+            recomputed: nil,
+            table: nil,
+            detail: nil
+          },
+          %{
+            kind: :capture,
+            key: nil,
+            column: nil,
+            persisted: nil,
+            recomputed: nil,
+            table: "public.orders",
+            detail: "the capture trigger trellis_capture_insert on public.orders is missing"
+          }
         ]
       })
 
@@ -80,14 +96,18 @@ defmodule Trellis.ConversionsTest do
                  key: "1",
                  column: "total",
                  persisted: "9999",
-                 recomputed: nil
+                 recomputed: nil,
+                 table: nil,
+                 detail: nil
                },
                %Trellis.Divergence{
-                 kind: :extra_column,
+                 kind: :capture,
                  key: nil,
-                 column: "legacy",
+                 column: nil,
                  persisted: nil,
-                 recomputed: nil
+                 recomputed: nil,
+                 table: "public.orders",
+                 detail: "the capture trigger trellis_capture_insert on public.orders is missing"
                }
              ]
            }

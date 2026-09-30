@@ -178,7 +178,9 @@ pub use numeric::Numeric;
 #[cfg(feature = "otlp")]
 pub use otel::OtelError;
 pub use pool::Pool;
-pub use staging::{Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope};
+pub use staging::{
+    CaptureFault, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope,
+};
 
 // --- Tier 2: the error types the public errors wrap -----------------------
 // Re-exported here even though they originate in `pub(crate)` modules: an

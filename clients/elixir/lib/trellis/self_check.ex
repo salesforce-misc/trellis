@@ -65,22 +65,32 @@ defmodule Trellis.Divergence do
     doesn't have it.
   - `:extra_column`: the target table has `column`, but the definition
     doesn't expect it.
+  - `:capture`: a table the target is computed from isn't being captured as
+    Trellis installed it (a capture trigger missing, disabled or calling the
+    wrong function, a capture function missing or with the wrong owner, the
+    Trellis role missing a privilege, or the table joined a partition or
+    inheritance hierarchy). `detail` says what, and `table` names the table
+    (`nil` for a missing privilege). `Trellis.self_check/3` reports these
+    before, and instead of, comparing any rows, so `rows_compared` is `0`.
 
   Fields a kind doesn't carry are `nil`.
   """
 
   @typedoc "What kind of divergence this is."
-  @type kind :: :cell | :missing_row | :extra_row | :missing_column | :extra_column
+  @type kind ::
+          :cell | :missing_row | :extra_row | :missing_column | :extra_column | :capture
 
   @type t :: %__MODULE__{
           kind: kind(),
           key: String.t() | nil,
           column: String.t() | nil,
           persisted: String.t() | nil,
-          recomputed: String.t() | nil
+          recomputed: String.t() | nil,
+          table: String.t() | nil,
+          detail: String.t() | nil
         }
 
-  @enforce_keys [:kind, :key, :column, :persisted, :recomputed]
+  @enforce_keys [:kind, :key, :column, :persisted, :recomputed, :table, :detail]
   defstruct @enforce_keys
 
   @doc false

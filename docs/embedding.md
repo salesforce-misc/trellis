@@ -94,7 +94,19 @@ So:
   owner may run.
 * **The role that owns the Trellis schema** owns the capture functions, which
   run `SECURITY DEFINER`, so application roles writing a source table need no
-  privilege on Trellis's schema.
+  privilege on Trellis's schema. That role must keep `USAGE` on the schema,
+  `INSERT` on the ring segments (`seg_0` to `seg_3`), and `USAGE` on the
+  `staging_change_id_seq` and `ring_slot_mirror` sequences. It has them as
+  their owner unless someone revokes them.
+* **Leave the capture triggers alone.** Each source table carries four
+  triggers named `<schema>_capture_<event>` (`trellis_capture_insert` and so
+  on for the default schema). Disabling or dropping one, handing a capture
+  function to another owner, revoking one of the privileges above, or making
+  the source a partition or part of an inheritance hierarchy stops some of its
+  changes reaching the target, with no error anywhere. The worker's next
+  reconcile pass reinstalls a missing or disabled trigger; it can't undo the
+  rest. `self_check` reports each of these as a `capture` divergence, naming
+  the table and what is wrong, before it compares any rows.
 * **Nothing cancels a lock holder.** Installing or widening a table's triggers
   needs a brief table lock. The worker tries it for at most 50 ms at a time, so
   your writers never queue behind it for longer, and retries every reconcile

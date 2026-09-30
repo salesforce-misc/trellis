@@ -893,6 +893,8 @@ fn divergence_hash(ruby: &Ruby, divergence: PlainDivergence) -> Result<RHash, Er
             ("column", ruby.into_value(divergence.column)),
             ("persisted", ruby.into_value(divergence.persisted)),
             ("recomputed", ruby.into_value(divergence.recomputed)),
+            ("table", ruby.into_value(divergence.table)),
+            ("detail", ruby.into_value(divergence.detail)),
         ],
     )
 }

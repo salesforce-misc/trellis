@@ -23,9 +23,13 @@ segment with one `INSERT … SELECT`:
 
 - **Keys.** Every ring row is keyed by the table's primary key, in declared
   order, joined with `\x1f` for a composite key. A table without a primary
-  key, or a partitioned table, is refused when a definition is applied. (A
-  statement trigger on a partitioned parent misses a write aimed at a
-  partition directly, and a partition attached later has no triggers.)
+  key, a partitioned table, or a table in a partition or inheritance
+  hierarchy, is refused when a definition is applied. (A statement trigger
+  fires only for the table a statement names: one on a partitioned parent
+  misses a write aimed at a partition directly, and one on a partition or an
+  inheritance child misses a write made through its parent.) `self_check`
+  reports a source that joins such a hierarchy later
+  (`staging::capture_audit`).
 - **Images.** `old_image` and `new_image` hold the primary key plus every
   column some reader of the table needs (`capture::columns`), rendered with
   `format('%s', col)` under the same five pinned output settings as every
