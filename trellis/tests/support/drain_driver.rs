@@ -25,8 +25,8 @@ use trellis::defs::{ValueType, install_definition};
 use trellis::intake::markers;
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
-    ApplyError, ApplyOutcome, StagedChange, StagedWatermark, append, apply, has_pending,
-    retire_drained_segments, seal,
+    ApplyError, ApplyOutcome, StagedChange, StagedWatermark, append, apply, collect_tombstones,
+    has_pending, retire_drained_segments, seal,
 };
 
 pub const WAKE: &str = "interleave_wake";
@@ -289,6 +289,7 @@ impl Driver {
             retire_drained_segments(&mut self.ctl)
                 .await
                 .expect("retire drained segments");
+            self.collect_tombstones().await;
             if !has_pending(&self.ctl).await.expect("has_pending") {
                 return;
             }
@@ -301,6 +302,14 @@ impl Driver {
         retire_drained_segments(&mut self.ctl)
             .await
             .expect("retire drained segments");
+    }
+
+    /// Collects the tombstones the drained prefix no longer needs (#623 D7),
+    /// returning how many went.
+    pub async fn collect_tombstones(&mut self) -> u64 {
+        collect_tombstones(&mut self.ctl)
+            .await
+            .expect("collect tombstones")
     }
 
     /// `sql`'s rows, each rendered as a row literal, `(1,25,2)`.

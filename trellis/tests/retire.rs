@@ -410,3 +410,62 @@ async fn ring_full_self_heals_once_the_oldest_segment_is_retirable() {
     assert_eq!(outcome.sealed_seg_seq, 4);
     assert_eq!(outcome.next_ring_slot, 0);
 }
+
+// -------------------------------------------------- tombstone GC (#623 D7)
+
+/// `collect_tombstones`' `LEDGER_TABLES_SQL` finds a ledger by
+/// `split_part`ting `transform_definitions.target_table` on `.` and joining
+/// back to `pg_catalog` by raw (unquoted) name — never by re-parsing quoted
+/// SQL text. A schema or table with mixed case or an embedded space is
+/// legal Postgres (quoted at creation) and must resolve the same way a
+/// plain-cased one does; catches a regression that instead builds the
+/// ledger's identifier by naively splicing/quoting the stored string.
+#[tokio::test]
+async fn collect_tombstones_finds_a_mixed_case_spaced_ledger() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            r#"
+            create schema "Weird Schema";
+            create table "Weird Schema"."Weird Target__ledger" (
+                "__from_key" text primary key,
+                "__applied_lsn" pg_lsn,
+                "__applied_seg" bigint,
+                "__basis" pg_snapshot,
+                "__tombstone" boolean not null default false
+            );
+            insert into "Weird Schema"."Weird Target__ledger"
+                ("__from_key", "__applied_seg", "__tombstone")
+            values ('k1', 1, true);
+
+            insert into source_table_versions (source_table, version)
+            values ('public.src', 1);
+            insert into transform_definitions
+                (target_table, source_table, source_version, definition_text)
+            values ('Weird Schema.Weird Target', 'public.src', 1, 'n/a');
+            "#,
+        )
+        .await
+        .expect("create the mixed-case, spaced ledger and its catalog row");
+
+    seal_and_fence(&mut client).await; // segment 1
+    mark_drained(&client, 1).await;
+
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 1);
+
+    let remaining: i64 = client
+        .query_one(
+            r#"select count(*) from "Weird Schema"."Weird Target__ledger""#,
+            &[],
+        )
+        .await
+        .expect("count remaining rows")
+        .get(0);
+    assert_eq!(remaining, 0);
+}

@@ -809,6 +809,10 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = failures.check("retire_drained_segments", retired).is_err();
             }
             if !failed {
+                let collected = staging::collect_tombstones(c).await;
+                failed = failures.check("collect_tombstones", collected).is_err();
+            }
+            if !failed {
                 // ADR-0009 decision 5's staging_segments{state} gauge: cheap
                 // to read here since maintenance_loop already ticks on this
                 // connection regardless, and a failed read just skips a

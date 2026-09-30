@@ -162,6 +162,7 @@ async fn pause_points_fire_in_page_order(flavour: Flavour) {
     write(&d, "insert into public.src values (3, 2, 7)").await;
     let batch = d.seal().await;
     let mut points = vec![
+        PausePoint::AfterPlaceholders,
         PausePoint::AfterEntryLock,
         PausePoint::AfterRederiveRead,
         PausePoint::AfterGroupUpsert,
@@ -169,6 +170,9 @@ async fn pause_points_fire_in_page_order(flavour: Flavour) {
     ];
     if matches!(flavour, Flavour::OneToOne) {
         points.retain(|p| *p != PausePoint::AfterGroupUpsert);
+    }
+    if !flavour.on_ledger() {
+        points.retain(|p| *p != PausePoint::AfterPlaceholders);
     }
     let armed: Vec<(PausePoint, &str)> = points.iter().map(|p| (*p, flavour.target())).collect();
     let mut drain = d.drain_frozen(batch, "a", &armed).await;
@@ -1240,9 +1244,16 @@ async fn avg_equals_postgres_avg_over_integer_bigint_and_numeric() {
             "select __from_key from public.agg__ledger where __applied_lsn is not null order by 1"
         )
         .await,
-        ["(2)", "(3)", "(4)", "(5)", "(6)"],
-        "the target is on the ledger: every key a change reached has an applied entry \
-         (key 1 was only re-derived)"
+        ["(3)", "(4)", "(5)", "(6)"],
+        "the target is on the ledger: every surviving key a change reached has an applied \
+         entry (key 1 was only re-derived)"
+    );
+    assert!(
+        d.rows("select 1 from public.agg__ledger where __from_key = '2'")
+            .await
+            .is_empty(),
+        "key 2's own delete tombstoned it, and every `settle` call runs GC (#623 D7): by \
+         now nothing lags behind it, so its entry is gone rather than merely applied"
     );
 }
 
@@ -1701,4 +1712,133 @@ async fn a_stalled_claim_does_not_reclaim_buckets_a_peer_drained_meanwhile() {
         .expect("drop the triggers");
     d.drain(batch, "c").await;
     assert_oracle(&mut d, flavour).await;
+}
+
+// ------------------------------------------------------ tombstone GC (D7)
+//
+// `trellis::staging::collect_tombstones` deletes the tombstones at or below
+// the contiguous drained prefix. Each scenario also fails under the
+// `early_tombstone_gc` plant, which collects through the highest drained
+// segment instead.
+
+/// The keys of `public.agg`'s ledger tombstones, as `(key)` rows.
+async fn tombstones(d: &Driver) -> Vec<String> {
+    d.rows("select __from_key from public.agg__ledger where __tombstone order by 1")
+        .await
+}
+
+/// Exp 2 scenario 9 with a GC between the delete and its older update: the
+/// update's batch lags, so the delete's tombstone must outlive the GC, or
+/// the update applies to a fresh entry and brings key 1 back.
+async fn exp2_9_gc_waits_for_the_older_update(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(&d, "update public.src set v = 15 where id = 1").await;
+    let b1 = d.seal().await;
+    write(&d, "delete from public.src where id = 1").await;
+    let b2 = d.seal().await;
+    d.drain(b2, "a").await;
+    assert_eq!(tombstones(&d).await, ["(1)"]);
+    assert_eq!(d.collect_tombstones().await, 0, "the update's batch lags");
+    assert_eq!(tombstones(&d).await, ["(1)"]);
+    d.drain(b1, "b").await;
+    assert_eq!(d.collect_tombstones().await, 1, "nothing lags any more");
+    assert!(tombstones(&d).await.is_empty());
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn exp2_9_gc_waits_for_the_older_update_aggregate() {
+    exp2_9_gc_waits_for_the_older_update(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn exp2_9_gc_waits_for_the_older_update_aggregate_min_max() {
+    exp2_9_gc_waits_for_the_older_update(Flavour::AggregateMinMax).await;
+}
+
+/// A batch drained out of order holds GC back at the batch below it: the
+/// tombstone of the first batch goes, the one above the lagging batch
+/// stays until the lagging batch has drained.
+async fn an_out_of_order_drain_holds_gc_back(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
+    write(&d, "delete from public.src where id = 3").await;
+    let b1 = d.seal().await;
+    d.drain(b1, "a").await;
+    write(&d, "update public.src set v = 15 where id = 1").await;
+    let b2 = d.seal().await;
+    write(&d, "delete from public.src where id = 1").await;
+    let b3 = d.seal().await;
+    d.drain(b3, "a").await;
+    assert_eq!(tombstones(&d).await, ["(1)", "(3)"]);
+    assert_eq!(
+        d.collect_tombstones().await,
+        1,
+        "only the batch below the lagging one is in the drained prefix"
+    );
+    assert_eq!(tombstones(&d).await, ["(1)"]);
+    d.drain(b2, "b").await;
+    assert_eq!(d.collect_tombstones().await, 1);
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn an_out_of_order_drain_holds_gc_back_aggregate() {
+    an_out_of_order_drain_holds_gc_back(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn an_out_of_order_drain_holds_gc_back_aggregate_min_max() {
+    an_out_of_order_drain_holds_gc_back(Flavour::AggregateMinMax).await;
+}
+
+/// GC under a concurrent re-insert of a deleted key: the re-insert's page is
+/// frozen after its placeholder insert, which found key 1's tombstone and
+/// so inserted nothing. The GC collects that tombstone before the page's
+/// entry lock, which then finds no entry for key 1 and must take the lock
+/// again, placeholders first, or the re-insert is lost. The same page holds
+/// an update of key 3 older than key 3's delete, drained in the batch above
+/// it, so key 3's tombstone must outlive the GC.
+async fn gc_under_a_concurrent_reinsert(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
+    write(&d, "delete from public.src where id = 1").await;
+    let b1 = d.seal().await;
+    d.drain(b1, "a").await;
+    write(
+        &d,
+        "insert into public.src values (1, 1, 30); update public.src set v = 6 where id = 3",
+    )
+    .await;
+    let b2 = d.seal().await;
+    write(&d, "delete from public.src where id = 3").await;
+    let b3 = d.seal().await;
+    d.drain(b3, "a").await;
+    assert_eq!(tombstones(&d).await, ["(1)", "(3)"]);
+    let mut reinsert = d
+        .drain_frozen(
+            b2,
+            "b",
+            &[(PausePoint::AfterPlaceholders, flavour.target())],
+        )
+        .await;
+    reinsert.reached(PausePoint::AfterPlaceholders).await;
+    assert_eq!(
+        d.collect_tombstones().await,
+        1,
+        "key 1's tombstone goes; key 3's is above the frozen batch"
+    );
+    assert_eq!(tombstones(&d).await, ["(3)"]);
+    d.release(&mut reinsert, PausePoint::AfterPlaceholders)
+        .await;
+    reinsert.finish().await;
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn gc_under_a_concurrent_reinsert_aggregate() {
+    gc_under_a_concurrent_reinsert(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn gc_under_a_concurrent_reinsert_aggregate_min_max() {
+    gc_under_a_concurrent_reinsert(Flavour::AggregateMinMax).await;
 }

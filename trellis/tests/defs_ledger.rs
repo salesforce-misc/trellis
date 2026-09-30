@@ -243,8 +243,8 @@ async fn a_rebuild_replaces_the_ledger() {
 
 /// A build that loaded the ledger but failed before its second transaction
 /// rebuilt the key and indexes leaves a ledger with neither. The next build
-/// loads that ledger and gives it back its key and its `GROUP BY` index, so
-/// it never has one without the other.
+/// loads that ledger and gives it back its key, its `GROUP BY` index and its
+/// tombstone index (#623 D7), so it never has one without the others.
 #[tokio::test]
 async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_the_keys() {
     let cluster = TestCluster::start();
@@ -263,22 +263,23 @@ async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_
         ("a".to_string(), ValueType::Numeric),
     ]);
     build(&db, src, &cols).await;
-    let indexes = "select string_agg(case when i.indisprimary then 'pkey' \
-                       else pg_get_expr(i.indpred, i.indrelid) end, ' | ' order by i.indisprimary desc) \
-                   from pg_index i where i.indrelid = 't__ledger'::regclass";
+    let indexes = "select string_agg(e, ' | ' order by p desc, e collate \"C\") \
+                   from (select i.indisprimary as p, case when i.indisprimary then 'pkey' \
+                         else pg_get_expr(i.indpred, i.indrelid) end as e \
+                         from pg_index i where i.indrelid = 't__ledger'::regclass) x";
     let built = rows(&client, indexes).await;
     assert_eq!(
         built,
         vec![vec![Some(
-            "pkey | (__member AND (NOT __tombstone))".to_string()
+            "pkey | (__member AND (NOT __tombstone)) | __tombstone".to_string()
         )]],
     );
 
     // What the load's transaction leaves when the rebuild after it never
-    // commits: every entry, and no key or index.
-    let group_index: String = client
+    // commits: every entry, and no key or indexes.
+    let secondary_indexes: String = client
         .query_one(
-            "select indexrelid::regclass::text from pg_index \
+            "select string_agg(indexrelid::regclass::text, ', ') from pg_index \
              where indrelid = 't__ledger'::regclass and not indisprimary",
             &[],
         )
@@ -287,11 +288,11 @@ async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_
         .get(0);
     client
         .batch_execute(&format!(
-            "alter table t__ledger drop constraint t__ledger_pkey; drop index {group_index}; \
+            "alter table t__ledger drop constraint t__ledger_pkey; drop index {secondary_indexes}; \
              update s set a = 0 where id = 1"
         ))
         .await
-        .expect("strip the ledger's key and index");
+        .expect("strip the ledger's key and indexes");
     let def = parse(src).expect("parse");
     backfill_definition(&db.pool, &def, "public", &def.source, &cols)
         .await

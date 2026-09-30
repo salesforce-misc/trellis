@@ -36,7 +36,9 @@
 //!
 //! 1. **Lock** (I1, I5): insert a non-member placeholder for every key of the
 //!    page that has no entry, then `select … for update` every entry, sorted
-//!    by key, in one statement.
+//!    by key, in one statement. A tombstone collected between the two
+//!    (`super::retire::collect_tombstones`, #623 D7) leaves its key with no
+//!    entry to lock, so the lock is retaken until it holds every key.
 //! 2. **Re-derive read**: a record staged as a `recompute` (or folded with
 //!    one) is a Re-derive, and so is one with no change identity. One
 //!    statement reads those keys' source rows *and* `pg_current_snapshot()`,
@@ -887,31 +889,51 @@ pub(crate) async fn apply_ledger_target(
     let key_col = quote_ident(schema::KEY_COLUMN);
 
     // 1. The entry lock (I1, I5): placeholders for new keys, then every
-    // entry, sorted, in one statement.
-    txn.execute(
-        &format!(
-            "insert into {ledger} ({key_col}, {}) \
-             select k, false from unnest($1::text[]) as k order by k \
-             on conflict do nothing",
-            quote_ident(schema::MEMBER_COLUMN)
-        ),
-        &[&keys],
-    )
-    .await?;
-    // Planted bug (#557): read without the entry lock. See `crate::plant`.
-    #[cfg(any(test, feature = "test-util"))]
-    let skip_lock = crate::plant::fires(crate::plant::Plant::SkipLedgerLock, true);
-    #[cfg(not(any(test, feature = "test-util")))]
-    let skip_lock = false;
-    if !skip_lock {
+    // entry, sorted. A tombstone the placeholder insert found can be
+    // collected (`super::retire::collect_tombstones`) before the lock
+    // reaches it, leaving its key with no entry: the lock is then taken
+    // again, placeholders first.
+    let mut distinct = keys.clone();
+    distinct.dedup();
+    loop {
         txn.execute(
             &format!(
-                "select 1 from {ledger} where {key_col} = any($1::text[]) \
-                 order by {key_col} for update"
+                "insert into {ledger} ({key_col}, {}) \
+                 select k, false from unnest($1::text[]) as k order by k \
+                 on conflict do nothing",
+                quote_ident(schema::MEMBER_COLUMN)
             ),
             &[&keys],
         )
         .await?;
+        // Test-only pause point (#623 D7). See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::AfterPlaceholders,
+            &plan.target,
+        )
+        .await?;
+        // Planted bug (#557): read without the entry lock. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let skip_lock = crate::plant::fires(crate::plant::Plant::SkipLedgerLock, true);
+        #[cfg(not(any(test, feature = "test-util")))]
+        let skip_lock = false;
+        if skip_lock {
+            break;
+        }
+        let locked = txn
+            .execute(
+                &format!(
+                    "select 1 from {ledger} where {key_col} = any($1::text[]) \
+                     order by {key_col} for update"
+                ),
+                &[&keys],
+            )
+            .await?;
+        if locked as usize == distinct.len() {
+            break;
+        }
     }
     // Test-only pause point (#623 D1). See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]

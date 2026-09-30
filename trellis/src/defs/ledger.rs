@@ -273,7 +273,8 @@ pub(crate) fn aggregate_ledger_ddl(
 
 /// An aggregate ledger's secondary indexes, as statements each prefixed with
 /// `; `: the `GROUP BY` index, partial on live members (the only entries a
-/// group is a sum of), and, on a target that reads a relationship (the only
+/// group is a sum of), the tombstones by `applied_seg` (what
+/// `staging::retire::collect_tombstones` reads, #623 D7), and, on a target that reads a relationship (the only
 /// kind whose entries carry a join key), the join-key index. `group_idents`
 /// are the quoted `GROUP BY` columns.
 ///
@@ -292,6 +293,11 @@ pub(crate) fn aggregate_ledger_index_ddl(
         quote_ident(MEMBER_COLUMN),
         quote_ident(TOMBSTONE_COLUMN),
     );
+    sql.push_str(&format!(
+        "; create index on {qualified_ledger} ({}) where {}",
+        quote_ident(APPLIED_SEG_COLUMN),
+        quote_ident(TOMBSTONE_COLUMN),
+    ));
     if reads_relationships {
         sql.push_str(&format!(
             "; create index on {qualified_ledger} using gin ({})",
@@ -458,7 +464,7 @@ mod tests {
         );
         assert_eq!(
             ddl,
-            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__join_key" text[], "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone""#
+            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__join_key" text[], "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
         );
         let with_join = aggregate_ledger_ddl(r#""public"."t__ledger""#, &[], &[], true);
         assert!(

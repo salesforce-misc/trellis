@@ -96,6 +96,12 @@ pub enum Plant {
     /// against the entry's Re-derive `basis` (`staging::ledger`). A change a
     /// Re-derive already read is then applied a second time.
     LsnOnlySkip,
+    /// ADR-0002 I4 (#623 D7): tombstone GC (`staging::retire::collect_tombstones`)
+    /// collects through the highest drained segment instead of the
+    /// contiguous drained prefix, so a tombstone goes while an older change
+    /// to its key is still in an undrained segment, which then applies to
+    /// the fresh entry and brings the deleted row back.
+    EarlyTombstoneGc,
 }
 
 impl Plant {
@@ -107,6 +113,7 @@ impl Plant {
         Plant::IgnoreRecomputeHorizon,
         Plant::SkipLedgerLock,
         Plant::LsnOnlySkip,
+        Plant::EarlyTombstoneGc,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -118,6 +125,7 @@ impl Plant {
             Plant::IgnoreRecomputeHorizon => "ignore_recompute_horizon",
             Plant::SkipLedgerLock => "skip_ledger_lock",
             Plant::LsnOnlySkip => "lsn_only_skip",
+            Plant::EarlyTombstoneGc => "early_tombstone_gc",
         }
     }
 

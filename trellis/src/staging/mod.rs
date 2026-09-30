@@ -97,7 +97,7 @@ pub use error::StagingError;
 pub use liveness::{
     DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release_segments,
 };
-pub use retire::retire_drained_segments;
+pub use retire::{collect_tombstones, retire_drained_segments};
 pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // `self_check`'s non-error types are reached through `lib.rs`'s own
 // crate-root re-export (`Divergence`/`SelfCheckMode`/etc. traffic in
