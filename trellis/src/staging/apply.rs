@@ -2541,12 +2541,8 @@ async fn from_side_change_in_flight(
 /// **What this checks, and its own limits.** Unlike guard (c) (scoped to
 /// rows still `state <> 'drained'`), this scans every physical ring row —
 /// staged, in-flight, *or already drained* — matching `keys` via
-/// `from_col`, with `lsn` in `(since_lsn, watermark_x]` (an *exclusive*
-/// lower bound: `since_lsn` is `record.prev_lsn`, the projection's
-/// already-known-good position as of Phase 2's capture — anything at or
-/// before it is already accounted for; `None` means "no prior projection
-/// row" — a parent INSERT — so *every* matching row counts, since there is
-/// no "before" era to bound against). This catches the same-batch and
+/// `from_col`, with `lsn <= watermark_x` and no lower bound (see "No lower
+/// bound" below). This catches the same-batch and
 /// recently-drained-but-not-yet-retired cases — the realistic shape of
 /// this hazard, and the only shape this module's own tests (this issue's
 /// retry scenarios, and every existing #131/#132/#133 positive-path test)
@@ -2580,24 +2576,22 @@ async fn from_side_change_in_flight(
 /// would need the same "bump gen from inside the bulk recompute" follow-up
 /// this comment used to describe for the pre-#136 case generally.
 ///
-/// **Seam rows (issues #402, #403).** The upper bound `lsn <= X` is no weaker
-/// for a from-side target's seam rows than for CDC, for the reason
-/// [`from_side_change_in_flight`] gives. The exclusive lower bound is the one
-/// comparison that goes the other way: a seam row's token can be at or below
-/// `since_lsn` while its writer committed after it, where the same write's
-/// CDC row would be above `since_lsn` and route to the fallback. A token
-/// says nothing about how long after it its writer committed, so no lower
-/// bound on it is sound: for a from-side that is one of this instance's
-/// targets (fed by the seam alone, `staging::target_mutations`) the scan
-/// drops the lower bound and counts every matching row the ring still holds
-/// at or below `X`. That only sends more records to the always-correct
-/// fallback, and only until the rows retire.
+/// **No lower bound (issues #402, #403, #622 C8).** The upper bound
+/// `lsn <= X` holds for every ring row, for the reason
+/// [`from_side_change_in_flight`] gives. A lower bound doesn't: every ring
+/// row's `lsn` is a pre-commit position (the capture trigger's
+/// `pg_current_wal_insert_lsn()`, or the seam's token for a from-side that
+/// is one of this instance's targets), and it says nothing about how long
+/// after it the writer committed. A row at or below the projection's own
+/// `lsn` (`record.prev_lsn`) can belong to a writer that committed after
+/// the projection moved there, so the scan counts every matching row the
+/// ring still holds at or below `X`. That only sends more records to the
+/// always-correct fallback, and only until the rows retire.
 async fn relationship_fast_path_precondition_holds(
     txn: &Transaction<'_>,
     from_table: &str,
     from_col: &str,
     keys: &[&str],
-    since_lsn: Option<PgLsn>,
     watermark_x: PgLsn,
 ) -> Result<bool, ApplyError> {
     if keys.is_empty() {
@@ -2609,22 +2603,13 @@ async fn relationship_fast_path_precondition_holds(
              where r.src_table = $1 \
                and r.op in ('insert', 'update', 'delete') \
                and r.lsn <= $2 \
-               and ($5::pg_lsn is null or r.lsn > $5 or (select seam_fed from from_side)) \
                and (r.old_image ->> $3 = any($4::text[]) \
                     or r.new_image ->> $3 = any($4::text[]))"
         )
     });
-    let sql = format!(
-        "with from_side as (select exists ( \
-             select 1 from transform_definitions d where d.target_table = $1 \
-         ) as seam_fed) \
-         select exists ({arms})"
-    );
+    let sql = format!("select exists ({arms})");
     let row = txn
-        .query_one(
-            &sql,
-            &[&from_table, &watermark_x, &from_col, &keys, &since_lsn],
-        )
+        .query_one(&sql, &[&from_table, &watermark_x, &from_col, &keys])
         .await?;
     let anything_found: bool = row.get(0);
     Ok(!anything_found)
@@ -5371,14 +5356,15 @@ mod tests {
         }
     }
 
-    /// Issue #403: [`relationship_fast_path_precondition_holds`]'s exclusive
-    /// lower bound (`lsn > since_lsn`) is only sound for a commit LSN. A
-    /// from-side that is one of this instance's targets is fed by the seam,
-    /// whose `lsn` is a pre-commit token, so a row of it at or below
-    /// `since_lsn` still counts. A plain source's CDC row at the same `lsn`
-    /// stays excluded.
+    /// Issues #403 and #622 C8: [`relationship_fast_path_precondition_holds`]
+    /// counts a matching ring row whatever its `lsn` below the watermark,
+    /// even at or below the projection's own `lsn`. Every ring row's `lsn`
+    /// is a pre-commit position: the seam's token for a from-side that is one
+    /// of this instance's targets, and the capture trigger's
+    /// `pg_current_wal_insert_lsn()` for a plain source. Either writer can
+    /// commit after the projection's position, so neither row is excluded.
     #[tokio::test]
-    async fn the_fast_path_precondition_ignores_since_lsn_for_a_seam_fed_from_side() {
+    async fn the_fast_path_precondition_counts_a_row_below_the_projections_lsn() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
@@ -5434,7 +5420,8 @@ mod tests {
         append::append(&txn, &[row("public.children"), row("public.plain")])
             .await
             .expect("stage one row per from-side");
-        let since = Some(PgLsn::from(200));
+        // The projection's own `lsn` (`record.prev_lsn`) would be 200 here,
+        // above both rows.
         let watermark = PgLsn::from(1000);
         assert!(
             !relationship_fast_path_precondition_holds(
@@ -5442,26 +5429,25 @@ mod tests {
                 "public.children",
                 "parent_id",
                 &["7"],
-                since,
                 watermark
             )
             .await
             .expect("check the seam-fed from-side"),
-            "a seam row's token at or below since_lsn may belong to a writer that committed \
+            "a seam row's token below the projection's lsn may belong to a writer that committed \
              after it, so it still sends the record to the fallback"
         );
         assert!(
-            relationship_fast_path_precondition_holds(
+            !relationship_fast_path_precondition_holds(
                 &txn,
                 "public.plain",
                 "parent_id",
                 &["7"],
-                since,
                 watermark
             )
             .await
-            .expect("check the CDC-fed from-side"),
-            "a CDC row at or below since_lsn committed at its lsn, so it stays excluded"
+            .expect("check the capture-fed from-side"),
+            "a captured row's lsn is its trigger's pre-commit insert position, so a row at or \
+             below the projection's lsn may also belong to a writer that committed after it"
         );
         txn.rollback().await.expect("rollback");
     }
@@ -8737,7 +8723,6 @@ pub(crate) async fn apply_page(
                 &shape.from_table,
                 &shape.from_col,
                 &fast_path_keys,
-                record.prev_lsn,
                 record.watermark,
             )
             .await?;
