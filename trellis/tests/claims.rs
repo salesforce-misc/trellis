@@ -17,6 +17,20 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{BucketFilter, SegmentState, claim, fold, seal};
 
+/// Claims in a transaction of its own and commits it. `claim::claim` takes a
+/// transaction: it holds the segment row's lock until commit (issue #690).
+async fn claim_committed(
+    client: &mut Client,
+    seg_seq: i64,
+    claimed_by: &str,
+    live_workers: i64,
+) -> Result<Vec<i16>, trellis::staging::StagingError> {
+    let txn = client.transaction().await?;
+    let won = claim::claim(&txn, seg_seq, claimed_by, live_workers).await?;
+    txn.commit().await?;
+    Ok(won)
+}
+
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `sealing.rs`/`fold.rs`'s convention.
 async fn connect_raw(dsn: &str) -> Client {
@@ -230,7 +244,7 @@ async fn the_flip_cte_actually_runs_even_when_this_calls_share_is_empty() {
         .expect("pre-claim bucket 0");
     assert_eq!(segment_state(&client, seg_seq).await, SegmentState::Sealed);
 
-    let won = claim::claim(&client, seg_seq, "me", 1)
+    let won = claim_committed(&mut client, seg_seq, "me", 1)
         .await
         .expect("claim");
     assert!(
@@ -260,7 +274,7 @@ async fn a_second_claim_of_an_already_draining_batch_still_succeeds() {
         .await
         .expect("widen bucket_count for this test");
 
-    let first = claim::claim(&client, seg_seq, "w1", 2)
+    let first = claim_committed(&mut client, seg_seq, "w1", 2)
         .await
         .expect("first claim");
     assert!(!first.is_empty(), "the first claim must win something");
@@ -272,7 +286,7 @@ async fn a_second_claim_of_an_already_draining_batch_still_succeeds() {
     // A second claim against the now-draining batch must not fail just
     // because the flip's own `WHERE state = 'sealed'` no longer matches —
     // the flip is idempotent, scoped to "on the first claim only."
-    let second = claim::claim(&client, seg_seq, "w2", 2)
+    let second = claim_committed(&mut client, seg_seq, "w2", 2)
         .await
         .expect("second claim against an already-draining batch must succeed");
     assert!(
@@ -286,7 +300,7 @@ async fn two_overlapping_workers_get_disjoint_buckets_no_bucket_claimed_twice() 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client_a = connect_raw(db.dsn()).await;
-    let client_b = connect_raw(db.dsn()).await;
+    let mut client_b = connect_raw(db.dsn()).await;
 
     insert_recompute(&client_a, "seg_0", "k").await;
     let seg_seq = seal_active_segment(&mut client_a).await;
@@ -301,8 +315,8 @@ async fn two_overlapping_workers_get_disjoint_buckets_no_bucket_claimed_twice() 
     // Both workers claim concurrently, each believing it can take half of
     // the (same) free set — the overlapping-shares case doc 04 calls out.
     let (won_a, won_b) = tokio::join!(
-        claim::claim(&client_a, seg_seq, "worker-a", 2),
-        claim::claim(&client_b, seg_seq, "worker-b", 2),
+        claim_committed(&mut client_a, seg_seq, "worker-a", 2),
+        claim_committed(&mut client_b, seg_seq, "worker-b", 2),
     );
     let won_a = won_a.expect("worker a claim");
     let won_b = won_b.expect("worker b claim");
@@ -353,7 +367,7 @@ async fn share_sizing_a_lone_worker_takes_everything_n_workers_take_about_a_nth(
         .await
         .expect("widen bucket_count");
 
-    let solo_share = claim::claim(&client, solo_seg, "solo-worker", 1)
+    let solo_share = claim_committed(&mut client, solo_seg, "solo-worker", 1)
         .await
         .expect("solo claim");
     assert_eq!(
@@ -372,7 +386,7 @@ async fn share_sizing_a_lone_worker_takes_everything_n_workers_take_about_a_nth(
         .await
         .expect("widen bucket_count");
 
-    let quad_share = claim::claim(&client, quad_seg, "one-of-four", 4)
+    let quad_share = claim_committed(&mut client, quad_seg, "one-of-four", 4)
         .await
         .expect("one-of-four claim");
     assert_eq!(
@@ -413,7 +427,7 @@ async fn bucket_count_is_fixed_at_seal_from_row_count_alone_and_never_moves() {
     );
 
     // Claiming the big batch (repeatedly) must never move its bucket_count.
-    let _ = claim::claim(&client, big_seg, "w1", 1)
+    let _ = claim_committed(&mut client, big_seg, "w1", 1)
         .await
         .expect("claim big batch");
     assert_eq!(
@@ -421,7 +435,7 @@ async fn bucket_count_is_fixed_at_seal_from_row_count_alone_and_never_moves() {
         claim::SEG_BUCKETS as i16,
         "bucket_count must not change across claims"
     );
-    let _ = claim::claim(&client, big_seg, "w2", 1)
+    let _ = claim_committed(&mut client, big_seg, "w2", 1)
         .await
         .expect("second claim against the same big batch");
     assert_eq!(
@@ -475,7 +489,7 @@ async fn held_share_reads_the_claims_table_rather_than_recomputing() {
         .await
         .expect("widen bucket_count");
 
-    let won = claim::claim(&client, seg_seq, "me", 2)
+    let won = claim_committed(&mut client, seg_seq, "me", 2)
         .await
         .expect("claim");
     assert!(!won.is_empty());

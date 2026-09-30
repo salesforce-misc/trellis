@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Transaction};
 
 use super::error::StagingError;
 use super::fold::BucketFilter;
@@ -90,7 +90,12 @@ pub async fn count_live_drainers(
     Ok(count.max(1))
 }
 
-/// One statement: compute `seg_seq`'s free buckets, take this call's share
+/// Locks `seg_seq`'s `segments` row for the rest of the claim's transaction.
+/// [`claim`] runs it before [`CLAIM_SQL`], as its own statement. See
+/// [`claim`] for why.
+const LOCK_SEGMENT_SQL: &str = "select 1 from segments where seg_seq = $1 for no key update";
+
+/// The claim statement: compute `seg_seq`'s free buckets, take this call's share
 /// of them, insert them (exclusivity via `ON CONFLICT (seg_seq, bucket) DO
 /// NOTHING`), and flip the batch `sealed -> draining` — all in one `WITH`,
 /// so the claim rows and the flip commit together (doc 04, "The claim is
@@ -160,8 +165,38 @@ const CLAIM_SQL: &str = "\
 /// an already-`draining` batch (a second or later claim of the same batch)
 /// still returns its share normally — the flip's `WHERE state = 'sealed'`
 /// just matches zero rows that time, which is not an error.
+///
+/// **Lock the segment row first, then read (issue #690).** Under `READ
+/// COMMITTED` a statement reads from the snapshot it took when it started. So
+/// [`CLAIM_SQL`] alone, racing a peer's claim of the same segment, computed
+/// its free buckets from before the peer's claim committed:
+///
+/// - It could claim buckets the peer had meanwhile drained and released, and
+///   drain them a second time.
+/// - Its flip, finding the row already changed, kept a row lock on it anyway,
+///   while its insert waited on the peer's uncommitted completion `delete`.
+///   The peer's completion then waited on that row lock: a deadlock.
+///
+/// So the claim first takes the segment row's lock in a statement of its own
+/// ([`LOCK_SEGMENT_SQL`]). [`CLAIM_SQL`] then starts after every earlier claim
+/// and completion of the segment has committed, and its snapshot sees them
+/// all. No peer claims or completes the segment until this transaction ends.
+/// That is why this takes a [`Transaction`]: in autocommit the lock would end
+/// with its own statement.
+///
+/// **Lock order.** A claim and a drain page's completion both take the
+/// segment's `segments` row lock *before* inserting or deleting its
+/// `seg_claims` rows: the claim here, the completion in `end_segment_step`
+/// (`super::apply`), which locks the row before deleting its claims. A
+/// transaction covering several segments takes them in the order the drain
+/// was given them (`next_claimable_segments`: ascending `seg_seq`), and the
+/// page's completion steps follow its claim's order. So a claim never meets a
+/// peer's uncommitted completion `delete` on a segment it holds, and the
+/// cycle above can't form. `super::liveness`'s reclaim and heartbeats don't
+/// take the row lock, but they skip locked rows or wait on nothing a claim
+/// holds.
 pub async fn claim(
-    client: &impl GenericClient,
+    txn: &Transaction<'_>,
     seg_seq: i64,
     claimed_by: &str,
     live_workers: i64,
@@ -171,7 +206,8 @@ pub async fn claim(
     // type as `float8` — an `i64` binding would then fail server-side type
     // checking (`WrongType`) rather than silently widening.
     let live_workers = (live_workers.max(1)) as f64;
-    let rows = client
+    txn.execute(LOCK_SEGMENT_SQL, &[&seg_seq]).await?;
+    let rows = txn
         .query(CLAIM_SQL, &[&seg_seq, &claimed_by, &live_workers])
         .await?;
     Ok(rows.into_iter().map(|row| row.get(0)).collect())

@@ -76,6 +76,15 @@ on a still-`sealed` batch, the completion guard `state = 'draining'` then matche
 nothing, and that worker can never complete a bucket it legitimately holds until
 the 30 s reclaim TTL.
 
+**The segment row is locked first (#690).** Before that statement, in the same
+transaction, the claim locks the batch's `segments` row (`for no key update`). A
+statement reads from the snapshot it started with, so without the lock a claim
+racing a peer's could compute its free buckets from before the peer's claim and
+completion committed: it re-claimed buckets the peer had already drained, or
+deadlocked with the peer's completion. A drain page's completion takes the same row
+lock before it deletes its claims, so both follow one order: the `segments` row,
+then its `seg_claims` rows.
+
 **Never claim an unfenced batch.** Seal phase 2 publishes the fence only on a batch
 still `sealed`, so a committed `sealed → draining` flip on a batch whose fence isn't
 out yet would leave it unfenced, and undrainable, for good. The fold used to share

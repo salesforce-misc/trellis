@@ -679,7 +679,7 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
 
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, "worker", 1)
+    claim::claim(&txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg_seq, "worker")
@@ -728,7 +728,7 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     let plan = apply::compute(&db.pool, &folded).await.expect("compute");
     let mut phase3_client = db.pool.get().await.expect("connection");
     let txn = phase3_client.transaction().await.expect("begin phase 3");
-    claim::claim(&*txn, seg_seq, "worker", 1)
+    claim::claim(&txn, seg_seq, "worker", 1)
         .await
         .expect("re-claim");
     let outcome = apply::apply_and_mark_drained(
@@ -782,7 +782,7 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
 
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, "worker", 1)
+    claim::claim(&txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg_seq, "worker")
@@ -873,7 +873,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
 
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, "worker", 1)
+    claim::claim(&txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg_seq, "worker")

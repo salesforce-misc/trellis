@@ -32,8 +32,10 @@
 mod drain_driver;
 
 use drain_driver::Driver;
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
+use trellis::staging::{StagedWatermark, apply, claim};
 
 const SRC: &str = "public.src";
 
@@ -1244,4 +1246,169 @@ async fn avg_equals_postgres_avg_over_integer_bigint_and_numeric() {
         "the target is on the ledger: every key a change reached has an applied entry \
          (key 1 was only re-derived)"
     );
+}
+
+// ------------------------------------------------------------ issue #690
+
+/// Issue #690: a claim whose statement stalls between its snapshot and its
+/// insert, while a peer claims, drains and completes the same segment, must
+/// not claim the buckets the peer drained, and nobody deadlocks.
+///
+/// Worker c holds one of the batch's 8 buckets first, so the segment is
+/// already `draining` and b's `sealed -> draining` flip locks nothing. A
+/// trigger on `seg_claims` stalls b's claim at its first insert, on an
+/// advisory lock the test holds, and logs every claim row that lands with
+/// whether its bucket was already drained. a then claims, and the test lets b
+/// go once a has either finished its drain or queued behind b.
+///
+/// Before the fix b computed its free buckets from its statement snapshot,
+/// taken before a claimed: a claimed, drained and released the other 7
+/// buckets, then b claimed all 7 again and re-drained them.
+#[tokio::test]
+async fn a_stalled_claim_does_not_reclaim_buckets_a_peer_drained_meanwhile() {
+    let flavour = Flavour::Aggregate;
+    let mut d = start(flavour, &[]).await;
+    let deadlocks_before = d.deadlocks_logged().len();
+    write(
+        &d,
+        "insert into public.src select i, i % 20 + 1, i from generate_series(1, 320) as i",
+    )
+    .await;
+    let batch = d.seal().await;
+    assert_eq!(
+        d.rows(&format!(
+            "select bucket_count from segments where seg_seq = {batch}"
+        ))
+        .await,
+        vec!["(8)"],
+        "the batch is split"
+    );
+
+    let mut c = d.user().await;
+    let txn = c.transaction().await.expect("begin c's claim");
+    let c_won = claim::claim(&txn, batch, "c", 8).await.expect("c claims");
+    txn.commit().await.expect("commit c's claim");
+    assert_eq!(c_won.len(), 1, "c holds one bucket: {c_won:?}");
+
+    d.ctl
+        .batch_execute(&format!(
+            "create table public.claim_log \
+                 (claimed_by text, bucket smallint, already_drained boolean); \
+             create function public.stall_b() returns trigger language plpgsql as $$ \
+             begin \
+                 if new.claimed_by = 'b' then \
+                     perform set_config('lock_timeout', '0', true); \
+                     perform pg_advisory_xact_lock_shared(690); \
+                 end if; \
+                 return new; \
+             end $$; \
+             create function public.log_claim() returns trigger language plpgsql as $$ \
+             begin \
+                 insert into public.claim_log \
+                 select new.claimed_by, new.bucket, \
+                        (s.drained_mask & (1::bigint << new.bucket)) <> 0 \
+                 from {DEFAULT_SCHEMA}.segments s where s.seg_seq = new.seg_seq; \
+                 return new; \
+             end $$; \
+             create trigger stall_b before insert on {DEFAULT_SCHEMA}.seg_claims \
+                 for each row execute function public.stall_b(); \
+             create trigger log_claim after insert on {DEFAULT_SCHEMA}.seg_claims \
+                 for each row execute function public.log_claim();"
+        ))
+        .await
+        .expect("install the stall and the claim log");
+
+    let gate = d.user().await;
+    gate.execute("select pg_advisory_lock(690)", &[])
+        .await
+        .expect("take the stall lock");
+    let gate_pid: i32 = gate
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("gate pid")
+        .get(0);
+
+    let drain = |worker: &'static str| {
+        let pool = d.pool().clone();
+        tokio::spawn(async move {
+            apply::drain_once(
+                &pool,
+                batch,
+                worker,
+                1,
+                drain_driver::WAKE,
+                &StagedWatermark::saturated(),
+            )
+            .await
+        })
+    };
+    let b = drain("b");
+    d.wait_blocked_behind(gate_pid).await;
+    let b_pid: i32 = d
+        .ctl
+        .query_one(
+            "select pid from pg_stat_activity where $1 = any(pg_blocking_pids(pid))",
+            &[&gate_pid],
+        )
+        .await
+        .expect("b's backend")
+        .get(0);
+
+    // a either runs to the end (b holds nothing it needs) or queues behind b.
+    let a = drain("a");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let a_waits_on_b: bool = d
+            .ctl
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where $1 = any(pg_blocking_pids(pid)))",
+                &[&b_pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if a.is_finished() || a_waits_on_b {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a neither finished nor queued behind b within 60 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    gate.execute("select pg_advisory_unlock(690)", &[])
+        .await
+        .expect("release b");
+    b.await.expect("b's task").expect("b's drain");
+    a.await.expect("a's task").expect("a's drain");
+
+    let re_claimed = d
+        .rows("select claimed_by, bucket from public.claim_log where already_drained order by 1, 2")
+        .await;
+    assert!(
+        re_claimed.is_empty(),
+        "claims of already-drained buckets: {re_claimed:?}"
+    );
+    let twice = d
+        .rows("select bucket, count(*) from public.claim_log group by bucket having count(*) > 1")
+        .await;
+    assert!(twice.is_empty(), "buckets claimed twice: {twice:?}");
+    let deadlocks = d.deadlocks_logged().split_off(deadlocks_before);
+    assert!(
+        deadlocks.is_empty(),
+        "deadlocks detected:\n{}",
+        deadlocks.join("\n--\n")
+    );
+
+    d.ctl
+        .batch_execute(&format!(
+            "drop trigger stall_b on {DEFAULT_SCHEMA}.seg_claims; \
+             drop trigger log_claim on {DEFAULT_SCHEMA}.seg_claims"
+        ))
+        .await
+        .expect("drop the triggers");
+    d.drain(batch, "c").await;
+    assert_oracle(&mut d, flavour).await;
 }

@@ -49,6 +49,20 @@ fn source_columns() -> HashMap<String, ValueType> {
         .collect()
 }
 
+/// Claims in a transaction of its own and commits it. `claim::claim` takes a
+/// transaction: it holds the segment row's lock until commit (issue #690).
+async fn claim_committed(
+    client: &mut Client,
+    seg_seq: i64,
+    claimed_by: &str,
+    live_workers: i64,
+) -> Result<Vec<i16>, trellis::staging::StagingError> {
+    let txn = client.transaction().await?;
+    let won = claim::claim(&txn, seg_seq, claimed_by, live_workers).await?;
+    txn.commit().await?;
+    Ok(won)
+}
+
 /// `items` plus the SUM/COUNT aggregate over it.
 async fn setup_aggregate(db: &testkit::TestDatabase, client: &Client) {
     client
@@ -519,7 +533,7 @@ async fn a_stale_claimants_page_rolls_back_as_claim_lost() {
     let after_two_pages = read_totals(&client).await;
 
     assert!(reclaim(&client, seg).await > 0);
-    let won = claim::claim(&client, seg, "worker-b", 1)
+    let won = claim_committed(&mut client, seg, "worker-b", 1)
         .await
         .expect("worker B claims");
     assert!(!won.is_empty(), "B takes the reclaimed buckets");
@@ -904,7 +918,7 @@ async fn reclaim_bucket(client: &Client, seg_seq: i64, bucket: i16) -> u64 {
 /// resume. Returns A's result.
 async fn lose_bucket_zero_before_page(
     db: &testkit::TestDatabase,
-    client: &Client,
+    client: &mut Client,
     seg_seq: i64,
     cap: usize,
     page: usize,
@@ -923,7 +937,7 @@ async fn lose_bucket_zero_before_page(
 
     assert_eq!(reclaim_bucket(client, seg_seq, 0).await, 1);
     assert_eq!(
-        claim::claim(client, seg_seq, "worker-b", 1)
+        claim_committed(client, seg_seq, "worker-b", 1)
             .await
             .expect("worker B claims"),
         vec![0],
@@ -985,7 +999,7 @@ async fn a_direct_drain_that_lost_one_of_its_buckets_commits_nothing() {
     insert_items(&client, &ids).await;
     let seg = seal(&mut client).await;
 
-    let result = lose_bucket_zero_before_page(&db, &client, seg, 1000, 1).await;
+    let result = lose_bucket_zero_before_page(&db, &mut client, seg, 1000, 1).await;
     assert!(
         matches!(result, Err(ApplyError::ClaimLost)),
         "A's completion must find every bucket it folded: {result:?}"
@@ -1010,7 +1024,7 @@ async fn a_page_whose_worker_lost_one_held_bucket_rolls_back() {
     insert_items(&client, &ids).await;
     let seg = seal(&mut client).await;
 
-    let result = lose_bucket_zero_before_page(&db, &client, seg, 40, 3).await;
+    let result = lose_bucket_zero_before_page(&db, &mut client, seg, 40, 3).await;
     assert!(
         matches!(result, Err(ApplyError::ClaimLost)),
         "A's page 3 must fail its claim check: {result:?}"
@@ -1200,8 +1214,8 @@ async fn stage_skewed(client: &Client, ids: &[i32]) {
 /// by `who` (which claims its share of whatever is free) holds exactly
 /// `buckets`. Claiming first flips the segment `sealed -> draining`, as a real
 /// claim does.
-async fn hold(client: &Client, seg_seq: i64, who: &str, buckets: &[i16]) {
-    claim::claim(client, seg_seq, "setup", 1)
+async fn hold(client: &mut Client, seg_seq: i64, who: &str, buckets: &[i16]) {
+    claim_committed(client, seg_seq, "setup", 1)
         .await
         .expect("claim every free bucket");
     client
@@ -1284,7 +1298,7 @@ async fn a_worker_paging_two_skewed_buckets_as_one_union_finishes_in_bounded_pag
     let seg = seal(&mut client).await;
     let cap = 5;
 
-    hold(&client, seg, "worker-y", &[0, 1]).await;
+    hold(&mut client, seg, "worker-y", &[0, 1]).await;
     let y = drain_within(
         &db.pool,
         seg,
@@ -1307,7 +1321,7 @@ async fn a_worker_paging_two_skewed_buckets_as_one_union_finishes_in_bounded_pag
         .expect("worker Y dies and is released");
 
     // Worker A takes both back (the parked buckets are still parked).
-    claim::claim(&client, seg, "worker-a", 1)
+    claim_committed(&mut client, seg, "worker-a", 1)
         .await
         .expect("worker A claims");
     let a = drain_within(&db.pool, seg, "worker-a", cap, &mut DrainHooks::default()).await;
@@ -1346,7 +1360,7 @@ async fn a_worker_resuming_skewed_buckets_at_different_cursors_finishes_in_bound
 
     // Worker Y pages buckets 0 and 1 as one union for two pages (10 keys),
     // which runs past all 3 of bucket 1's keys, then dies.
-    hold(&client, seg, "worker-y", &[0, 1]).await;
+    hold(&mut client, seg, "worker-y", &[0, 1]).await;
     let y = drain_within(
         &db.pool,
         seg,
@@ -1378,7 +1392,7 @@ async fn a_worker_resuming_skewed_buckets_at_different_cursors_finishes_in_bound
     release_all(&client, seg, &["worker-y"]).await;
 
     // Worker Z pages bucket 0 alone for one more page, then dies.
-    hold(&client, seg, "worker-z", &[0]).await;
+    hold(&mut client, seg, "worker-z", &[0]).await;
     let z = drain_within(
         &db.pool,
         seg,
@@ -1398,7 +1412,7 @@ async fn a_worker_resuming_skewed_buckets_at_different_cursors_finishes_in_bound
     release_all(&client, seg, &["worker-z"]).await;
 
     // Worker A holds buckets 0, 1 and 7: three cursor groups.
-    hold(&client, seg, "worker-a", &[0, 1, 7]).await;
+    hold(&mut client, seg, "worker-a", &[0, 1, 7]).await;
     let a = drain_within(&db.pool, seg, "worker-a", cap, &mut DrainHooks::default()).await;
     let heavy_left: usize = client
         .query_one(
@@ -1616,7 +1630,7 @@ async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
     });
     paused_rx.await.expect("worker B reaches its page 2");
     assert!(reclaim(&client, seg).await > 0);
-    let won = claim::claim(&client, seg, "worker-c", 1)
+    let won = claim_committed(&mut client, seg, "worker-c", 1)
         .await
         .expect("worker C claims");
     assert!(!won.is_empty());

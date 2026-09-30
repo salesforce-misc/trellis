@@ -260,7 +260,7 @@ async fn projection_lsn(client: &Client, projection_table: &str, id: i32) -> Opt
 async fn claim_fold_compute(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> ApplyPlan {
     let mut phase1 = pool.get().await.expect("connection");
     let txn = phase1.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, claimed_by, 1)
+    claim::claim(&txn, seg_seq, claimed_by, 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg_seq, claimed_by)

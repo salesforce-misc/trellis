@@ -4659,7 +4659,7 @@ mod tests {
 
         let mut phase1_client = pool.get().await.expect("connection");
         let txn = phase1_client.transaction().await.expect("begin phase 1");
-        claim::claim(&*txn, seg_seq, "worker", 1)
+        claim::claim(&txn, seg_seq, "worker", 1)
             .await
             .expect("claim");
         let share = claim::held_share(&*txn, seg_seq, "worker")
@@ -9256,9 +9256,13 @@ async fn end_segment_step(
         }
     }
 
+    // Lock the segment row before deleting any of its claims: the lock order
+    // `claim::claim` documents (issue #690). Deleting first, then waiting
+    // here on a claim that holds the row, deadlocked with that claim's
+    // insert waiting on this delete.
     let bucket_count: i16 = txn
         .query_one(
-            "select bucket_count from segments where seg_seq = $1",
+            "select bucket_count from segments where seg_seq = $1 for no key update",
             &[&seg_seq],
         )
         .await?
@@ -9776,7 +9780,7 @@ async fn drain_segments(
                 }
                 break;
             }
-            claim::claim(&*txn, seg_seq, claimed_by, live_workers).await?;
+            claim::claim(&txn, seg_seq, claimed_by, live_workers).await?;
             let share = held_share(&*txn, seg_seq, claimed_by).await?;
             if share.buckets.is_empty() {
                 continue;

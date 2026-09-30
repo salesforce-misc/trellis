@@ -733,7 +733,7 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     // `drain_once`'s opening block does.
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, "worker", 1)
+    claim::claim(&txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg_seq, "worker")
@@ -832,7 +832,7 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
 
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, "worker", 1)
+    claim::claim(&txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg_seq, "worker")
@@ -955,7 +955,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
 
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, "worker", 1)
+    claim::claim(&txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg_seq, "worker")
@@ -2636,9 +2636,7 @@ async fn out_of_order_fixture(seed: Option<&str>) -> (TestCluster, testkit::Test
 async fn claim_and_compute(pool: &trellis::Pool, seg_seq: i64, worker: &str) -> apply::ApplyPlan {
     let mut phase1_client = pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg_seq, worker, 1)
-        .await
-        .expect("claim");
+    claim::claim(&txn, seg_seq, worker, 1).await.expect("claim");
     let share = claim::held_share(&*txn, seg_seq, worker)
         .await
         .expect("held_share");

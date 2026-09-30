@@ -1154,7 +1154,7 @@ async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
     let seg1 = seal_active_segment(&mut client).await;
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
-    claim::claim(&*txn, seg1, "slow_worker", 1)
+    claim::claim(&txn, seg1, "slow_worker", 1)
         .await
         .expect("claim");
     let share = claim::held_share(&*txn, seg1, "slow_worker")

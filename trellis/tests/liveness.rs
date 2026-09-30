@@ -26,6 +26,20 @@ use trellis::staging::{
     HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, StagedWatermark, claim, liveness, seal,
 };
 
+/// Claims in a transaction of its own and commits it. `claim::claim` takes a
+/// transaction: it holds the segment row's lock until commit (issue #690).
+async fn claim_committed(
+    client: &mut Client,
+    seg_seq: i64,
+    claimed_by: &str,
+    live_workers: i64,
+) -> Result<Vec<i16>, trellis::staging::StagingError> {
+    let txn = client.transaction().await?;
+    let won = claim::claim(&txn, seg_seq, claimed_by, live_workers).await?;
+    txn.commit().await?;
+    Ok(won)
+}
+
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `claims.rs`/`sealing.rs`/`fold.rs`'s convention.
 async fn connect_raw(dsn: &str) -> Client {
@@ -130,7 +144,7 @@ async fn reclaim_frees_a_stale_claim_and_a_fresh_claim_picks_it_up() {
     let seg_seq = seal_one_bucket_batch(&mut client, "k").await;
     let ttl = Duration::from_millis(300);
 
-    let won = claim::claim(&client, seg_seq, "dead-worker", 1)
+    let won = claim_committed(&mut client, seg_seq, "dead-worker", 1)
         .await
         .expect("initial claim");
     assert!(!won.is_empty(), "the initial claim must win the one bucket");
@@ -156,7 +170,7 @@ async fn reclaim_frees_a_stale_claim_and_a_fresh_claim_picks_it_up() {
         segment_state(&client, seg_seq).await,
         SegmentState::Draining
     );
-    let re_won = claim::claim(&client, seg_seq, "fresh-worker", 1)
+    let re_won = claim_committed(&mut client, seg_seq, "fresh-worker", 1)
         .await
         .expect("re-claim");
     assert_eq!(
@@ -190,13 +204,13 @@ async fn a_daemon_heartbeat_survives_a_bulk_drain_that_outlives_the_ttl() {
         },
     );
 
-    let daemon_won = claim::claim(&client, daemon_seg, "bulk-worker", 1)
+    let daemon_won = claim_committed(&mut client, daemon_seg, "bulk-worker", 1)
         .await
         .expect("claim daemon-tracked batch");
     assert!(!daemon_won.is_empty());
     daemon.register(daemon_seg, "bulk-worker").await;
 
-    let plain_won = claim::claim(&client, plain_seg, "unwatched-worker", 1)
+    let plain_won = claim_committed(&mut client, plain_seg, "unwatched-worker", 1)
         .await
         .expect("claim plain batch");
     assert!(!plain_won.is_empty());
@@ -258,10 +272,10 @@ async fn release_is_scoped_to_claimed_by_and_leaves_other_workers_claims_alone()
         .await
         .expect("widen bucket_count so both workers can hold a bucket");
 
-    let won_a = claim::claim(&client, seg_seq, "worker-a", 2)
+    let won_a = claim_committed(&mut client, seg_seq, "worker-a", 2)
         .await
         .expect("worker a claim");
-    let won_b = claim::claim(&client, seg_seq, "worker-b", 2)
+    let won_b = claim_committed(&mut client, seg_seq, "worker-b", 2)
         .await
         .expect("worker b claim");
     assert!(!won_a.is_empty());
@@ -319,14 +333,14 @@ async fn release_segments_frees_and_reports_only_the_claimants_buckets() {
 
     let mut expected = Vec::new();
     for seg_seq in [first, second] {
-        let mut won = claim::claim(&client, seg_seq, "worker-a", 2)
+        let mut won = claim_committed(&mut client, seg_seq, "worker-a", 2)
             .await
             .expect("worker a claim");
         assert!(!won.is_empty());
         won.sort_unstable();
         expected.extend(won.into_iter().map(|bucket| (seg_seq, bucket)));
     }
-    let won_b = claim::claim(&client, first, "worker-b", 2)
+    let won_b = claim_committed(&mut client, first, "worker-b", 2)
         .await
         .expect("worker b claim");
     assert!(!won_b.is_empty());
@@ -388,7 +402,7 @@ async fn daemon_closes_its_connection_after_idle_timeout_with_no_registered_clai
     let mut client = connect_raw(db.dsn()).await;
 
     let seg_seq = seal_one_bucket_batch(&mut client, "k").await;
-    claim::claim(&client, seg_seq, "worker", 1)
+    claim_committed(&mut client, seg_seq, "worker", 1)
         .await
         .expect("claim");
 
@@ -592,7 +606,7 @@ async fn a_daemon_keeps_its_claimants_drainer_row_fresh_through_a_long_drain() {
 
     let seg_seq = seal_one_bucket_batch(&mut client, "k").await;
     assert!(
-        !claim::claim(&client, seg_seq, "busy-worker", 1)
+        !claim_committed(&mut client, seg_seq, "busy-worker", 1)
             .await
             .expect("claim")
             .is_empty()

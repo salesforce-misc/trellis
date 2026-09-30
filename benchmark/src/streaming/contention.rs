@@ -92,6 +92,10 @@ const PRELOCK_MARKER: &str = "for update of t";
 /// buckets with this.
 const CLAIM_MARKER: &str = "insert into seg_claims";
 
+/// The claim's first statement (`staging::claim`'s `LOCK_SEGMENT_SQL`, #690),
+/// where a claim now waits for the segment's other claims and completions.
+const CLAIM_LOCK_MARKER: &str = "select 1 from segments where seg_seq = $1 for no key update";
+
 /// Every ledger table's name ends in this (#623 D2).
 const LEDGER_MARKER: &str = "__ledger";
 
@@ -157,7 +161,7 @@ pub fn statement_class(query: &str, target: &str) -> StatementClass {
         StatementClass::LedgerLock
     } else if q.contains(PRELOCK_MARKER) {
         StatementClass::PreLock
-    } else if q.contains(CLAIM_MARKER) {
+    } else if q.contains(CLAIM_MARKER) || q.contains(CLAIM_LOCK_MARKER) {
         StatementClass::Claim
     } else if !target.is_empty()
         && q.contains(&target)
@@ -936,6 +940,10 @@ mod tests {
                  mine as ( insert into seg_claims (seg_seq, bucket, claimed_by) select 1 ) \
                  select mine.bucket from mine"
             ),
+            StatementClass::Claim
+        );
+        assert_eq!(
+            class("select 1 from segments where seg_seq = $1 for no key update"),
             StatementClass::Claim
         );
         assert_eq!(
