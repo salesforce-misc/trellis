@@ -89,8 +89,8 @@ const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// running `Client`'s drain workers that `defs_backfill_chunk_queue.rs`
 /// uses.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    // No live capture here (rows are staged by hand below), so there is no
-    // real staged watermark to hold apply back. A saturated one never does.
+    // Capture triggers stage in the writer's own transaction, so there is
+    // no staged watermark to hold apply back. A saturated one never does.
     let watermark = StagedWatermark::saturated();
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -122,10 +122,17 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// Installs `table`'s capture triggers with one capture reconcile pass, the
 /// staging worker's, which also parks the table's join marker.
 async fn capture(client: &mut Client, table: &str) {
+    capture_tables(client, &[table]).await;
+}
+
+/// [`capture`] for several tables in one pass. The pass reconciles to exactly
+/// the list it is given, so every table a test captures goes in one call.
+async fn capture_tables(client: &mut Client, tables: &[&str]) {
+    let tables: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
     let outcome = trellis::capture::reconcile::reconcile(
         client,
         DEFAULT_SCHEMA,
-        &[table.to_string()],
+        &tables,
         std::time::Instant::now() + Duration::from_secs(5),
     )
     .await
@@ -1094,6 +1101,188 @@ async fn a_source_in_an_inheritance_hierarchy_is_reported() {
             table: WIDGETS.to_string(),
             child: "trellis.widgets_more".to_string(),
         }]
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9 review: a capture trigger re-pointed at some other function, and
+/// a capture function switched to `SECURITY INVOKER`, are reported. The
+/// re-pointed trigger is set back to `ENABLE ALWAYS`, so the only thing wrong
+/// with it is the function it calls.
+#[tokio::test]
+async fn a_repointed_capture_trigger_and_an_invoker_capture_function_are_reported() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = widgets_fixture(&db).await;
+    let function = |event| {
+        format!(
+            "trellis.{}",
+            trellis::capture::sql::function_name(WIDGETS, event).expect("function name")
+        )
+    };
+    let update = function(trellis::capture::sql::CaptureEvent::Update);
+
+    raw.batch_execute(&format!(
+        "create function public.not_capture() returns trigger language plpgsql \
+             as $$ begin return null; end $$; \
+         create or replace trigger trellis_capture_insert after insert on widgets \
+             referencing new table as trellis_new \
+             for each statement execute function public.not_capture(); \
+         alter table widgets enable always trigger trellis_capture_insert; \
+         alter function {update}() security invoker"
+    ))
+    .await
+    .expect("re-point a capture trigger and make a capture function an invoker");
+
+    assert_eq!(
+        capture_faults(&audit_widgets(&trellis).await),
+        vec![
+            CaptureFault::WrongFunction {
+                table: WIDGETS.to_string(),
+                trigger: "trellis_capture_insert".to_string(),
+                function: function(trellis::capture::sql::CaptureEvent::Insert),
+            },
+            CaptureFault::NotSecurityDefiner {
+                table: WIDGETS.to_string(),
+                function: update,
+            },
+        ]
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9 review: the audit covers the to-side of a relationship the
+/// definition reads through, not only its source. `self_check` doesn't
+/// compare a relationship-enriched target yet, so a healthy capture ends in
+/// that refusal, and a broken to-side capture is reported ahead of it.
+#[tokio::test]
+async fn a_relationship_to_sides_capture_is_audited_too() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table makers (id integer primary key, name text); \
+         create table widgets (id integer primary key, maker_id integer)",
+    )
+    .await
+    .expect("create tables");
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis
+        .apply("RELATIONSHIP maker FROM widgets.maker_id TO makers.id")
+        .await
+        .expect("relationship");
+    trellis
+        .apply("TRANSFORM widget_makers FROM widgets SELECT maker.name AS maker_name")
+        .await
+        .expect("define");
+    capture_tables(&mut raw, &[WIDGETS, "trellis.makers"]).await;
+    trellis::intake::markers::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the build");
+    let self_check = || {
+        trellis.self_check(
+            "widget_makers",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Strict,
+            GENEROUS_TIMEOUT,
+        )
+    };
+    let healthy = self_check().await;
+    assert!(
+        healthy.as_ref().is_err_and(|e| e
+            .to_string()
+            .contains("doesn't audit a relationship-enriched target")),
+        "a healthy capture reaches the comparison, which refuses the relationship path: \
+         {healthy:?}"
+    );
+
+    raw.batch_execute("alter table makers disable trigger trellis_capture_update")
+        .await
+        .expect("disable the to-side's update capture");
+    assert_eq!(
+        capture_faults(&self_check().await.expect("self_check")),
+        vec![CaptureFault::TriggerNotAlways {
+            table: "trellis.makers".to_string(),
+            trigger: "trellis_capture_update".to_string(),
+            enabled: "D".to_string(),
+        }]
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// #622 C9 review: which definitions and tables the audit looks at. A
+/// definition sourced from this instance's own target is fed by the
+/// target-mutation seam, which installs no triggers, so its source isn't
+/// audited. A paused definition is frozen and reads nothing, so it isn't
+/// audited either, whatever its capture looks like.
+#[tokio::test]
+async fn a_seam_fed_source_and_a_paused_definition_are_not_audited() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = widgets_fixture(&db).await;
+    let audit = |target: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let def = trellis::defs::catalog::definition_by_target(&pool, target)
+                .await
+                .expect("read definition")
+                .expect("definition exists");
+            let client = pool.get().await.expect("connection");
+            let faults = trellis::staging::capture_audit::audit(&**client, DEFAULT_SCHEMA, &def)
+                .await
+                .expect("audit");
+            (def.status, faults)
+        }
+    };
+
+    trellis
+        .apply("TRANSFORM widget_totals_copy FROM widget_totals SELECT total AS total")
+        .await
+        .expect("define a reader of the target");
+    trellis::intake::markers::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the build");
+    let (status, faults) = audit("widget_totals_copy").await;
+    assert!(
+        !matches!(
+            status,
+            trellis::defs::model::TransformStatus::WaitingToBackfill
+        ),
+        "the reader of the target is dispatched, so it is audited: {status:?}"
+    );
+    assert_eq!(
+        faults,
+        vec![],
+        "its seam-fed source has no triggers to audit"
+    );
+
+    raw.batch_execute("drop trigger trellis_capture_insert on widgets")
+        .await
+        .expect("drop a capture trigger");
+    let missing = vec![CaptureFault::MissingTrigger {
+        table: WIDGETS.to_string(),
+        trigger: "trellis_capture_insert".to_string(),
+    }];
+    assert_eq!(audit("widget_totals").await.1, missing, "while it's live");
+    trellis
+        .apply("PAUSE TRANSFORM widget_totals")
+        .await
+        .expect("pause");
+    assert_eq!(
+        audit("widget_totals").await,
+        (trellis::defs::model::TransformStatus::Paused, vec![]),
+        "once it's paused"
     );
 
     trellis.shutdown().await.expect("shutdown");

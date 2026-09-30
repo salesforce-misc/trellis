@@ -2,15 +2,17 @@
 //! (#622 C9, acceptance A5; ADR-0013, "The capture audit").
 //!
 //! A captured table's changes reach the ring only through its four capture
-//! triggers ([`crate::capture`]). A trigger an operator disabled or dropped,
-//! a function handed to another owner, or a privilege revoked from the
-//! Trellis role breaks that silently: nothing errors, the ring just stops
-//! getting the table's changes, and the target goes stale. The table's
-//! capture is also wrong once the table joins a partition or inheritance
-//! hierarchy after its definition was accepted, because a statement trigger
-//! fires only for the table a statement names (`defs::catalog::change_keyed`
-//! refuses such a table at acceptance, but nothing refuses the later
-//! `ATTACH PARTITION` or `INHERIT`).
+//! triggers ([`crate::capture`]). A trigger an operator disabled, dropped or
+//! re-pointed breaks that silently: nothing errors, the ring just stops
+//! getting the table's changes, and the target goes stale. So does the
+//! table joining a partition or inheritance hierarchy after its definition
+//! was accepted, because a statement trigger fires only for the table a
+//! statement names (`defs::catalog::change_keyed` refuses such a table at
+//! acceptance, but nothing refuses the later `ATTACH PARTITION` or
+//! `INHERIT`). A function handed to a role without the privileges its body
+//! uses, a `SECURITY INVOKER` function, or a privilege revoked from the
+//! Trellis role is loud instead: every captured write to the table fails,
+//! naming the capture function. The audit names the cause either way.
 //!
 //! [`audit`] reads all of that from the catalog (`pg_trigger`, `pg_proc`,
 //! `pg_inherits` and the `has_*_privilege` functions) for every table a

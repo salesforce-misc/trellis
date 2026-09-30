@@ -100,13 +100,15 @@ So:
   their owner unless someone revokes them.
 * **Leave the capture triggers alone.** Each source table carries four
   triggers named `<schema>_capture_<event>` (`trellis_capture_insert` and so
-  on for the default schema). Disabling or dropping one, handing a capture
-  function to another owner, revoking one of the privileges above, or making
-  the source a partition or part of an inheritance hierarchy stops some of its
-  changes reaching the target, with no error anywhere. The worker's next
-  reconcile pass reinstalls a missing or disabled trigger; it can't undo the
-  rest. `self_check` reports each of these as a `capture` divergence, naming
-  the table and what is wrong, before it compares any rows.
+  on for the default schema). Disabling or dropping one, or making the
+  source a partition or part of an inheritance hierarchy, stops some of its
+  changes reaching the target, with no error anywhere. Handing a capture
+  function to another owner or revoking one of the privileges above is loud
+  instead: your writes to the table fail, naming the capture function. The
+  worker's next reconcile pass reinstalls a missing or disabled trigger; it
+  can't undo the rest. `self_check` reports each of these as a `capture`
+  divergence, naming the table and what is wrong, before it compares any
+  rows.
 * **Nothing cancels a lock holder.** Installing or widening a table's triggers
   needs a brief table lock. The worker tries it for at most 50 ms at a time, so
   your writers never queue behind it for longer, and retries every reconcile

@@ -203,7 +203,8 @@ What it does there is one append.
   `ALWAYS` and call functions owned by the Trellis role, that the role still
   holds the privileges the functions use, and that the table hasn't joined a
   partition or inheritance hierarchy, and reports any fault before any
-  recompute comparison (as built in #622 C9: four triggers, one Trellis role). Replica-mode sessions are covered by
+  recompute comparison (as built in #622 C9: four triggers, one Trellis
+  role). Replica-mode sessions are covered by
   `ENABLE ALWAYS`; an owner who disables or drops the trigger by name is
   documented as uncaptured until the audit runs. *Evidence:*
   [E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119).
