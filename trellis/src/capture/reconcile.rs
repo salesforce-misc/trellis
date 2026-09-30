@@ -10,6 +10,11 @@
 //! - a table this instance captures that nothing reads any more is
 //!   uninstalled.
 //!
+//! Before it regenerates a table's functions, the pass pauses every
+//! definition that reads a column the table no longer has (#622 C6,
+//! [`crate::staging::schema_change::pause_readers_of_missing`]) and leaves
+//! the table for the next pass.
+//!
 //! # Never waiting on `apply`'s path
 //!
 //! Defining a transform only registers it. Installing and widening take a
@@ -108,6 +113,29 @@ pub async fn reconcile(
     let mut outcome = PassOutcome::default();
 
     for table in desired {
+        // #622 C6: a definition that reads a column the table no longer has
+        // pauses before the table's functions are regenerated, whether or
+        // not a write has marked it yet. The next pass's catalog no longer
+        // counts it.
+        match crate::staging::schema_change::pause_readers_of_missing(
+            client,
+            schema,
+            &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                forget_lock_wait(instance, table);
+                continue;
+            }
+            Err(err) => {
+                forget_lock_wait(instance, table);
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
         let spec = match capture_spec(&*client, &snapshot.catalog, table).await {
             Ok(spec) => spec,
             Err(err) => {

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
+use trellis::capture::CaptureError;
 use trellis::capture::install::{Installed, LockingOperation, installed};
 use trellis::capture::reconcile::{self, PassOutcome};
 use trellis::defs::TransformStatus;
@@ -540,7 +541,9 @@ async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
 
 /// The in-memory lock wait `status().capture_wait` reports goes once the
 /// table stops waiting for its lock, including when its capture then fails
-/// for another reason (#622 C5 review): a read column dropped here.
+/// for another reason (#622 C5 review): its primary key dropped here. (A
+/// dropped read column no longer fails the pass: since C6 the pass pauses
+/// its reader instead.)
 #[tokio::test]
 async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
     let cluster = TestCluster::start();
@@ -569,11 +572,15 @@ async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
         .await
         .expect("end the holder");
 
-    raw.batch_execute("alter table public.u drop column a")
+    raw.batch_execute("alter table public.u drop constraint u_pkey")
         .await
-        .expect("drop the read column");
+        .expect("drop the primary key");
     let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
+    assert!(
+        matches!(outcome.failed[0].1, CaptureError::NoPrimaryKey { .. }),
+        "{outcome:?}"
+    );
     assert_eq!(
         reconcile::lock_wait(&database, SCHEMA, "public.u"),
         None,

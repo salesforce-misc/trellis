@@ -727,3 +727,288 @@ async fn the_partial_images_match_the_static_ones_for_the_columns_left() {
         .get(0);
     assert!(!partial.contains("\"gone\""), "{partial}");
 }
+
+/// Renaming a to-side column a definition reads through a relationship: the
+/// to-side's writes succeed, that reader pauses, and the definitions reading
+/// its other column through the same relationship (one 1-1, one grouped by
+/// it) keep converging with nothing poisoned. Once the column is back, the
+/// resumed reader rebuilds with the to-side rows written meanwhile, whose
+/// settled projection the partial images left without the column.
+#[tokio::test]
+async fn renaming_a_to_side_column_pauses_only_its_readers_through_the_relationship() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.p (id int primary key, name text, tier text); \
+         create table public.c (id int primary key, pid int, amount int); \
+         alter table public.p replica identity full; \
+         alter table public.c replica identity full; \
+         insert into public.p select i, 'n' || i, 't' || i from generate_series(1, 3) i; \
+         insert into public.c select i, 1 + i % 3, i from generate_series(1, 6) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+        "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+        "TRANSFORM c_tiered FROM public.c SELECT amount AS amount, parent.tier AS tier",
+        "TRANSFORM by_tier FROM public.c GROUP BY parent.tier \
+         SELECT parent.tier AS tier, COUNT(*) AS n",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    let targets = ["c_named", "c_tiered", "by_tier"];
+    bring_live(&mut raw, &db.pool, &targets).await;
+    let joined = |column: &str| {
+        format!(
+            "select c.id::text, p.{column} from public.c c \
+             left join public.p p on p.id = c.pid order by c.id"
+        )
+    };
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute(
+        "alter table public.p rename column name to name2; \
+         update public.p set name2 = name2 || 'x', tier = tier || 'y' where id = 1; \
+         insert into public.c values (7, 1, 7);",
+    )
+    .await
+    .expect("no write fails after the rename");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "c_named").await, TransformStatus::Paused);
+    for other in ["c_tiered", "by_tier"] {
+        assert_eq!(status(&raw, other).await, TransformStatus::Live, "{other}");
+    }
+    let poisoned: i64 = raw
+        .query_one("select count(*) from poison", &[])
+        .await
+        .expect("read poison")
+        .get(0);
+    assert_eq!(
+        poisoned, 0,
+        "no partial image reached a reader of the column"
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, tier from public.c_tiered order by id"
+        )
+        .await,
+        rows(&raw, &joined("tier")).await,
+    );
+
+    // Narrowed, then written while the column is still gone.
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    app.batch_execute("update public.p set name2 = name2 || 'z', tier = tier || 'w' where id = 2")
+        .await
+        .expect("a write after the narrow");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    raw.batch_execute("alter table public.p rename column name2 to name")
+        .await
+        .expect("rename back");
+    trellis
+        .apply("RESUME TRANSFORM c_named")
+        .await
+        .expect("resume");
+    bring_live(&mut raw, &db.pool, &targets).await;
+    app.batch_execute("insert into public.c values (8, 2, 8)")
+        .await
+        .expect("a write after the resume");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.c_named order by id"
+        )
+        .await,
+        rows(&raw, &joined("name")).await,
+        "the rebuilt reader sees the names written while the column was gone"
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, tier from public.c_tiered order by id"
+        )
+        .await,
+        rows(&raw, &joined("tier")).await,
+    );
+}
+
+/// A key column renamed while the table is quiet, so the staging worker's
+/// capture pass sees the rename before any write marks it. The pass pauses
+/// every reader instead of regenerating the functions keyed by the new name
+/// (after which no write would ever mark the change, and every drain would
+/// fail applying rows keyed by a column the definitions don't know).
+#[tokio::test]
+async fn a_key_rename_the_capture_pass_sees_first_pauses_every_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute("alter table public.u rename column id to uid")
+        .await
+        .expect("rename the key");
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    for target in ["ta", "tb", "tc", "tsum"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Paused,
+            "{target}"
+        );
+        let failure = trellis
+            .status(target)
+            .await
+            .expect("status")
+            .expect(target)
+            .capture_failure
+            .expect("the reason is reported");
+        assert_eq!(failure.columns, vec!["id".to_string()]);
+    }
+    assert_eq!(
+        captured(&raw, "public.u").await.0,
+        vec!["id".to_string()],
+        "the pass that pauses leaves the functions for the next one"
+    );
+
+    app.batch_execute(
+        "insert into public.u values (5, 1, 5, 50, 500, 0); \
+         update public.u set b = b + 1; \
+         delete from public.u where uid = 1;",
+    )
+    .await
+    .expect("no write fails");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert_eq!(
+        captured(&raw, "public.u").await,
+        (vec!["uid".to_string()], vec!["uid".to_string()])
+    );
+}
+
+/// Resuming a definition while the column it reads is still missing: the
+/// next capture pass pauses it again, with the reason on its status, rather
+/// than leaving it waiting to backfill and the table's capture failing every
+/// pass. The other readers of the table keep applying.
+#[tokio::test]
+async fn resuming_while_the_column_is_still_missing_pauses_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    app.batch_execute("alter table public.u rename column a to a2; update public.u set b = b + 1")
+        .await
+        .expect("writes after the rename");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "ta").await, TransformStatus::Paused);
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+    trellis.apply("RESUME TRANSFORM ta").await.expect("resume");
+    assert_eq!(status(&raw, "ta").await, TransformStatus::WaitingToBackfill);
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    let reported = trellis.status("ta").await.expect("status").expect("ta");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    assert_eq!(
+        reported.capture_failure.expect("the reason").columns,
+        vec!["a".to_string()]
+    );
+
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    app.batch_execute("update public.u set b = b + 1")
+        .await
+        .expect("a write");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    b_readers_converged(&raw).await;
+}
+
+/// The schema-changed branch's `format()` template and fragments keep odd
+/// identifiers intact: a schema, table, composite key and columns with
+/// mixed case, spaces, quotes, `%` and `%1$s`. The partial images, keys
+/// (a key move included) and group keys match the static ones.
+#[tokio::test]
+async fn the_partial_images_keep_odd_identifiers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        r#"create schema "Sch%e ma";
+           create table "Sch%e ma"."Od""d T%able" ("K%1" int, "k 2" text, "Mixed" text,
+               "a%s" int, "q""uote" text, "%1$s" text, gone int, primary key ("K%1", "k 2"));"#,
+    )
+    .await
+    .expect("seed");
+    let _migrated = definer(db.dsn()).await;
+    let spec = trellis::capture::sql::CaptureSpec::new(
+        "Sch%e ma.Od\"d T%able",
+        vec!["K%1".to_string(), "k 2".to_string()],
+        ["Mixed", "a%s", "q\"uote", "%1$s", "gone"]
+            .iter()
+            .map(|c| c.to_string()),
+        vec!["Mixed".to_string(), "a%s".to_string(), "gone".to_string()],
+    )
+    .expect("a valid spec");
+    trellis::capture::install::install(&mut raw, SCHEMA, &spec, None)
+        .await
+        .expect("install")
+        .done()
+        .expect("nothing holds the table");
+
+    let app = connect(db.dsn()).await;
+    let t = r#""Sch%e ma"."Od""d T%able""#;
+    let writes = format!(
+        "insert into {t} values (1, 'x' || chr(31) || 'y%s', 'M''x', 5, 'q\"', '%s%%'{{gone}}); \
+         update {t} set \"a%s\" = 6, \"K%1\" = 2 where \"K%1\" = 1; \
+         delete from {t};"
+    );
+    let since = high_water(&raw).await;
+    app.batch_execute(&writes.replace("{gone}", ", 7"))
+        .await
+        .expect("writes before the drop");
+    app.batch_execute(&format!("alter table {t} drop column gone"))
+        .await
+        .expect("drop");
+    app.batch_execute(&writes.replace("{gone}", ""))
+        .await
+        .expect("no write fails after the drop");
+
+    let images: Vec<ImageRow> = raw
+        .query(
+            &format!(
+                "select key, op, (old_image - 'gone')::text, (new_image - 'gone')::text, \
+                        array_remove(group_key, '7')::text \
+                 from ({}) r where change_id > $1 order by change_id",
+                ring(
+                    "key, op, old_image, new_image, group_key, change_id",
+                    "op <> 'schema_changed'"
+                )
+            ),
+            &[&since],
+        )
+        .await
+        .expect("read images")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+        .collect();
+    assert_eq!(images.len(), 8, "{images:#?}");
+    let (before, after) = images.split_at(4);
+    assert_eq!(before, after, "partial rows match the static ones");
+    assert!(
+        before[0]
+            .3
+            .as_deref()
+            .is_some_and(|i| i.contains("\"%1$s\": \"%s%%\"")),
+        "{before:?}"
+    );
+    assert_eq!(markers(&raw, since).await.len(), 3, "one per statement");
+}

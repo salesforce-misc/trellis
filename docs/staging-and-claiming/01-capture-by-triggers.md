@@ -188,9 +188,20 @@ reconcile pass narrows the functions to what the other readers need and the
 markers stop; a column only an unused relationship or a projection still
 names is left out the same way. `RESUME TRANSFORM` deletes the record and
 rebuilds: once the column is back, the pass widens capture again under the
-join fence before the rebuild is dispatched. If it is still missing, the
-pass reports the table's capture as failed and the definition stays
-`waiting_to_backfill`.
+join fence before the rebuild is dispatched.
+
+The reconcile pass doesn't wait for a marker either. Before it regenerates a
+table's functions, it pauses the same way every definition not yet paused
+that reads a column the table lacks: a column the installed functions image
+(what their next write's marker would name), or one an active definition
+reads. That covers two orderings no marker would. A pass that runs between a
+primary-key rename and the table's next write would otherwise regenerate the
+functions keyed by the new name, so no write would ever mark the change and
+every drain would fail on rows keyed by a column the definitions don't know.
+And a definition resumed (or registered) while its column is still missing
+would otherwise wait to backfill forever, with the table's capture failing
+every pass and nothing on its status; instead it pauses again with its
+`capture_failure`. A pass that pauses leaves the table for the next pass.
 
 Regenerating from an event trigger, inside the DDL's own transaction, is not
 built (#622 plan Q2(b)).

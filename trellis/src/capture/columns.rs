@@ -315,10 +315,11 @@ pub async fn capture_spec(
         .cloned()
         .collect();
     if !missing.is_empty() {
-        // #622 C6: a column some definition still reads is gone. The capture
-        // function marks it on the table's next write, and the drain pauses
-        // that definition, after which it no longer counts here. Until then
-        // the installed functions stay as they are.
+        // #622 C6: a column some definition still reads is gone. The
+        // reconcile pass pauses that definition before it gets here
+        // (`staging::schema_change::pause_readers_of_missing`), as the drain
+        // does on the table's next write's marker; after that it no longer
+        // counts here. Until then the installed functions stay as they are.
         let active = |id: &i64| {
             catalog
                 .definitions
