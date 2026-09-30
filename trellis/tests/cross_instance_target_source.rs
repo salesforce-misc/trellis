@@ -357,7 +357,12 @@ async fn a_relationship_endpoint_capture_cant_key_is_rejected() {
 /// row is keyed by the primary key, so a table without one is refused even
 /// with a unique constraint or unique index on its key columns, and so is a
 /// partitioned table, which statement triggers on its parent would capture
-/// only partially. A plain table with a primary key is keyed.
+/// only partially. So is every table in a partition or inheritance hierarchy,
+/// primary key or not: a statement trigger fires only for the table the
+/// statement names, so one on a partition misses writes routed through its
+/// parent, one on an inheritance child misses writes through its parent, and
+/// one on an inheritance parent would stage its children's rows under its own
+/// key. A plain table with a primary key is keyed.
 #[tokio::test]
 async fn a_plain_source_is_held_to_the_same_keying_rule() {
     let cluster = TestCluster::start();
@@ -370,13 +375,22 @@ async fn a_plain_source_is_held_to_the_same_keying_rule() {
          create unique index unique_index_code on public.unique_index (code); \
          create table public.parted (code text not null, amount integer, primary key (code)) \
              partition by list (code); \
-         create table public.parted_a partition of public.parted for values in ('a')",
+         create table public.parted_a partition of public.parted for values in ('a'); \
+         create table public.inh_parent (code text primary key, amount integer); \
+         create table public.inh_child (primary key (code)) inherits (public.inh_parent)",
     )
     .await
     .expect("create plain sources");
     let coded = columns(&[("code", ValueType::Text), ("amount", ValueType::Numeric)]);
 
-    for source in ["unique_no_pk", "unique_index", "parted"] {
+    for source in [
+        "unique_no_pk",
+        "unique_index",
+        "parted",
+        "parted_a",
+        "inh_parent",
+        "inh_child",
+    ] {
         let result = install_definition(
             &db.pool,
             &format!("TRANSFORM {source}_copy FROM {source} SELECT amount AS amount_copy"),

@@ -15,8 +15,11 @@ the README for fuller motivation).
 **Trellis requires every source table to be a plain table with a primary
 key.** A change a capture trigger stages is identified by its primary key, and
 a 1-1 target inherits that key as its own. A definition over a table with no
-primary key, or over a partitioned table, is rejected when it is defined, with
-an error naming the table. Trellis never adds the key itself: the source schema
+primary key, over a partitioned table, or over a table in a partition or
+inheritance hierarchy (a partition, or an inheritance parent or child), is
+rejected when it is defined, with an error naming the table. A statement
+trigger fires only for the table a statement names, so capture on any of those
+would miss writes made through the rest of the hierarchy. Trellis never adds the key itself: the source schema
 is the user's
 ([0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)).
 

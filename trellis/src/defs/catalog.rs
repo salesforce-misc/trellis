@@ -480,15 +480,17 @@ impl fmt::Display for CatalogError {
             CatalogError::SourceNotChangeKeyed { source_table } => write!(
                 f,
                 "Trellis can't capture source table \"{source_table}\"'s changes: it must be a \
-                 plain table (not partitioned) with a primary key. If it is another Trellis \
-                 instance's aggregate target, define this transform in that instance instead: \
+                 plain table (not partitioned, and not a partition or in an inheritance \
+                 hierarchy) with a primary key. If it is another Trellis instance's aggregate \
+                 target, define this transform in that instance instead: \
                  an instance propagates writes to its own targets without capturing them"
             ),
             CatalogError::RelationshipEndpointNotChangeKeyed { side, endpoint } => write!(
                 f,
                 "Trellis can't capture {side} relationship endpoint \"{endpoint}\"'s changes: it \
-                 must be a plain table (not partitioned) with a primary key. If it is another \
-                 Trellis instance's aggregate target, it can't be a relationship endpoint here"
+                 must be a plain table (not partitioned, and not a partition or in an \
+                 inheritance hierarchy) with a primary key. If it is another Trellis instance's \
+                 aggregate target, it can't be a relationship endpoint here"
             ),
             CatalogError::RelationshipEndpointUnsupportedKey {
                 name,
@@ -4652,8 +4654,16 @@ async fn to_col_cardinality_in_txn(
 /// A partitioned table (`relkind = 'p'`) is refused as well. Statement
 /// triggers on the parent miss writes aimed at a partition directly, and a
 /// partition attached later gets no triggers, so it could only be captured
-/// partially. A view, foreign table or anything else has no triggers of this
-/// kind at all. `false` for a table that doesn't exist.
+/// partially. So is a table in a partition or inheritance hierarchy (a
+/// partition, an inheritance parent or an inheritance child). A statement
+/// trigger fires only for the table a statement names, never for its
+/// partitions or children: one on a partition misses every write routed
+/// through its parent, and one on an inheritance child misses a write
+/// through its parent, while one on an inheritance parent sees the children's
+/// rows in its transition tables and would stage them under the parent,
+/// whose primary key doesn't span them. A view, foreign table or anything
+/// else that isn't a plain table is refused too. `false` for a table that
+/// doesn't exist.
 pub(crate) async fn change_keyed(
     client: &impl GenericClient,
     schema: &str,
@@ -4662,9 +4672,14 @@ pub(crate) async fn change_keyed(
     let regclass = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let keyed: Option<bool> = client
         .query_opt(
-            "select c.relkind = 'r' and exists ( \
-                 select 1 from pg_index i where i.indrelid = c.oid and i.indisprimary) \
-             from pg_class c where c.oid = pg_catalog.to_regclass($1)",
+            "select c.relkind = 'r' and not c.relispartition \
+                 and exists ( \
+                     select 1 from pg_catalog.pg_index i \
+                     where i.indrelid = c.oid and i.indisprimary) \
+                 and not exists ( \
+                     select 1 from pg_catalog.pg_inherits h \
+                     where h.inhrelid = c.oid or h.inhparent = c.oid) \
+             from pg_catalog.pg_class c where c.oid = pg_catalog.to_regclass($1)",
             &[&regclass],
         )
         .await?
