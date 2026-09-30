@@ -534,6 +534,42 @@ async fn pending_older_to_side_cdc_does_not_undo_a_rejoins_projection_refresh() 
     assert_eq!(order_names(&client).await, renamed());
 }
 
+/// Issue #531 through a requested re-backfill, which parks no capture gate:
+/// the refresh runs while the older rename is still in the ring, and the
+/// rename drains after it. The refresh stamped the relationship, so a record
+/// at or below the stamp writes the projection from the live row rather
+/// than putting its image back.
+#[tokio::test]
+async fn pending_older_to_side_cdc_does_not_undo_a_requested_projection_refresh() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann1' where id = 1",
+        |lsn| customer_update(lsn, 1, "ann", "ann1"),
+    )
+    .await;
+    client
+        .batch_execute("update public.customers set name = 'ann2' where id = 1")
+        .await
+        .expect("rename a customer, the CDC lost");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.order_names").await, "live");
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
+
 /// Issue #531's delete shape: the pending rename would re-insert the
 /// projection row the refresh removed for a customer whose delete was lost.
 #[tokio::test]

@@ -126,6 +126,7 @@ impl Pipeline {
             desired, expected_captured,
             "only tables this instance does not own are captured (issues #315, #375)"
         );
+        let mut markers = -1;
         for _ in 0..MAX_PASSES {
             trellis::client::reconcile_pass(
                 &mut raw,
@@ -136,15 +137,19 @@ impl Pipeline {
             )
             .await
             .expect("reconcile pass");
-            let markers: i64 = raw
+            markers = raw
                 .query_one("select count(*) from pending_backfill", &[])
                 .await
                 .expect("count pending markers")
-                .get(0);
+                .get::<_, i64>(0);
             if markers == 0 {
                 break;
             }
         }
+        assert_eq!(
+            markers, 0,
+            "every join marker must discharge within {MAX_PASSES} reconcile passes"
+        );
         let installed = trellis::capture::reconcile::installed_tables(&raw, DEFAULT_SCHEMA)
             .await
             .expect("read the installed capture");

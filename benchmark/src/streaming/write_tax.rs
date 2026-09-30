@@ -32,9 +32,10 @@
 //!   `INSERT … SELECT FROM generate_series` statement (E1's pgbench script).
 //! - `orm<s>x<w>`: `w` writers, each committing `s` single-row `INSERT`s per
 //!   transaction, one round trip each: what an ORM saving objects one at a
-//!   time sends. At more than 64 captured statements per transaction the
-//!   `trigger+exception` variant overflows the backend's subtransaction
-//!   cache (#622 plan finding 8), which this shape exists to show.
+//!   time sends. It was added to show C4's `trigger+exception` variant
+//!   overflowing the backend's subtransaction cache past 64 captured
+//!   statements per transaction (#622 plan finding 8). That variant is gone,
+//!   and the shape now checks the chosen `trigger` stays clear of it.
 //! - `copy`: one `COPY … FROM STDIN` of `--copy-rows` rows, one transaction.
 //! - A `+hold` suffix holds a transaction with an xid open on another
 //!   connection for the whole window: the long-running transaction under
