@@ -2940,13 +2940,10 @@ async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misrea
     // DISTINCT` constraint rather than a real Postgres `PRIMARY KEY` (see
     // `create_aggregate_target_table`'s doc comment) — a deliberate,
     // separate design choice so a NULL grouping value stays representable.
-    // `intake::markers::enumerate_and_append`'s own primary-key lookup
-    // (unlike `ddl::source_primary_key`'s unique-index fallback this
-    // test's `#103` fix cares about) requires a real `indisprimary` row and
-    // has no such fallback, so a definition-creation backfill enumeration
-    // of `order_summary` would fail with `MissingKeyValue` — an unrelated,
-    // pre-existing gap. Harmless to skip here regardless: `order_summary`
-    // is still empty at this point, so there's nothing to backfill.
+    // (Enumerating such a table used to fail for want of a primary key; it
+    // falls back to the grouping key since #308.) Skipping the backfill is
+    // harmless here: `order_summary` is still empty at this point, so
+    // there's nothing to backfill.
     create_definition_without_backfill(&db.pool, CHAINED_SOURCE, &summary_columns)
         .await
         .expect("create chained definition reading order_summary");
