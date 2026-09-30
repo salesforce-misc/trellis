@@ -11,8 +11,8 @@
 //! names, which must not clash with them.
 //!
 //! Every write runs in an application session whose `DateStyle`, `TimeZone`,
-//! `bytea_output`, `IntervalStyle` and `extra_float_digits` all differ from
-//! the settings Trellis pins. The generated triggers are installed by hand.
+//! `bytea_output`, `IntervalStyle`, `extra_float_digits` and `xmloption` all
+//! differ from the settings Trellis pins. The generated triggers are installed by hand.
 //! Every ring row a step stages must carry the writer's
 //! `pg_current_xact_id()` as its `row_txid`. The writer's role has no
 //! privilege on Trellis's schema, so the `SECURITY DEFINER` functions are
@@ -50,7 +50,7 @@ const FIXTURE: &str = concat!(
 /// The application session's settings: every one differs from Trellis's.
 const HOSTILE: &str = "set datestyle to 'SQL, DMY'; set bytea_output to 'escape'; \
      set extra_float_digits to 0; set intervalstyle to 'sql_standard'; \
-     set timezone to 'Asia/Kolkata'";
+     set timezone to 'Asia/Kolkata'; set xmloption to document";
 
 /// The role the application writes as.
 const APP_ROLE: &str = "capture_parity_app";

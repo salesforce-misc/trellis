@@ -303,6 +303,18 @@ impl Pool {
 /// function pins it too, where it is harmless: its body's literals never
 /// contain a backslash.
 ///
+/// # `xmloption`, an input setting a stored value's text depends on
+///
+/// `xml_in` parses under `xmloption`: `document` accepts only a
+/// well-formed document, `content` also accepts a fragment (`a<b/>`, plain
+/// text). An application can store a fragment under its own `content`
+/// session, and the ledger casts that value's text back into an `xml`
+/// contribution through `jsonb_populate_record` ([`crate::staging::ledger`]),
+/// so an operator's `ALTER DATABASE ... SET xmloption = document` used to
+/// fail every page carrying one. `content` accepts everything `document`
+/// does, so it is pinned (found in #623 D3b's review). A capture function
+/// pins it too, where it is harmless: `xml_out` ignores it.
+///
 /// # Output settings deliberately *not* pinned
 ///
 /// The rest of Postgres's locale and formatting settings were audited for
@@ -319,15 +331,16 @@ impl Pool {
 ///   session. Ordering is handled with explicit `collate "C"` and the
 ///   deterministic-collation checks on key columns (issues #590, #638).
 /// * `client_encoding` is fixed to `UTF8` by `tokio-postgres` itself.
-/// * `xmloption`, `xmlbinary` and `timezone_abbreviations` change how
-///   *input* is parsed (or, for `xmlbinary`, what the `xml*` constructor
-///   functions build), not how a stored value is rendered, and no SQL
-///   Trellis writes depends on them.
+/// * `xmlbinary` and `timezone_abbreviations` change how *input* is parsed
+///   (or, for `xmlbinary`, what the `xml*` constructor functions build),
+///   not how a stored value is rendered, and no SQL Trellis writes depends
+///   on them.
 /// * `escape_string_warning` and `backslash_quote` only matter when
 ///   `standard_conforming_strings` is `off`, which it never is here.
 pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, YMD'; \
      set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'; \
-     set timezone to 'UTC'; set lc_monetary to 'C'; set standard_conforming_strings to 'on'";
+     set timezone to 'UTC'; set lc_monetary to 'C'; set standard_conforming_strings to 'on'; \
+     set xmloption to 'content'";
 
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.

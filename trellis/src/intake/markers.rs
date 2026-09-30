@@ -1274,6 +1274,8 @@ enum Discharge {
 /// - or its installed functions are current and image every source column
 ///   each such definition reads.
 ///
+/// A definition paused by a schema change doesn't count (#705).
+///
 /// The pauses go only where the edit still owns them (issue #309's rule, as
 /// in `alter_transform`); every other one just stops waiting.
 async fn release_columns_awaiting_capture(
@@ -1294,12 +1296,20 @@ async fn release_columns_awaiting_capture(
     }
     // `column_status` names a transform as its definition does (the
     // definition's own `target`), not by the qualified `target_table`.
+    //
+    // A definition a schema change paused (a `capture_failures` row, #622
+    // C6) is left out, as it is from the capture column set
+    // (`capture::columns`): capture no longer images for it, so waiting on
+    // its columns would hold this marker for every other definition on the
+    // table until it is resumed (#705). Its pauses keep waiting; its resume
+    // parks a fresh marker whose discharge counts it again.
     let mut targets = Vec::new();
     let mut read = BTreeSet::new();
     for row in txn
         .query(
-            "select target_table, definition_text from transform_definitions \
-             where source_table = $1",
+            "select d.target_table, d.definition_text from transform_definitions d \
+             where d.source_table = $1 \
+               and not exists (select 1 from capture_failures f where f.transform_id = d.id)",
             &[&table],
         )
         .await?
