@@ -1022,3 +1022,59 @@ async fn a_change_the_rederive_read_is_not_applied_again_aggregate() {
     d.drain(c1, "b").await;
     assert_oracle(&mut d, flavour).await;
 }
+
+// --------------------------------------- group keys and increments (#623 D3)
+
+/// A `numeric` group key whose rows spell one value at two scales (`1.5`,
+/// `1.50`) is one group, whose row keeps the spelling that created it. The
+/// page that empties it through the other spelling must still delete it:
+/// matching the upserted row to its increments by text left it behind as
+/// `(1.5, NULL, 0)`.
+#[tokio::test]
+async fn a_group_emptied_through_another_spelling_of_its_key_is_deleted() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g numeric, v numeric); \
+         alter table public.src replica identity full; \
+         insert into public.src values (1, 1.5, 10)",
+        &[
+            ("id", int4),
+            ("g", ValueType::Numeric),
+            ("v", ValueType::Numeric),
+        ],
+        &[Flavour::Aggregate.definition()],
+        &[SRC],
+    )
+    .await;
+    write(&d, "insert into public.src values (2, 1.50, 20)").await;
+    let b = d.seal().await;
+    d.drain(b, "a").await;
+    write(&d, "delete from public.src where id = 1").await;
+    let b = d.seal().await;
+    d.drain(b, "b").await;
+    write(&d, "delete from public.src where id = 2").await;
+    let b = d.seal().await;
+    d.drain(b, "c").await;
+    assert_oracle(&mut d, Flavour::Aggregate).await;
+}
+
+/// An `integer` contribution of -2147483648 leaves its group. Negating it
+/// as an `integer` (`sum(-1 * v)`) failed the page with `integer out of
+/// range`.
+#[tokio::test]
+async fn the_minimum_integer_contribution_leaves_its_group() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v integer); \
+         alter table public.src replica identity full; \
+         insert into public.src values (1, 1, -2147483648), (2, 1, 5)",
+        &[("id", int4), ("g", int4), ("v", int4)],
+        &[Flavour::Aggregate.definition()],
+        &[SRC],
+    )
+    .await;
+    write(&d, "update public.src set g = 2 where id = 1").await;
+    let b = d.seal().await;
+    d.drain(b, "a").await;
+    assert_oracle(&mut d, Flavour::Aggregate).await;
+}

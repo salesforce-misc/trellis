@@ -340,11 +340,19 @@ fn ledger_statement(
     let mut deltas = vec!["sum(m.__sign) as __dm".to_string()];
     let mut nonzero = vec!["sum(m.__sign) <> 0".to_string()];
     for (i, a) in args.iter().enumerate() {
-        deltas.push(format!("coalesce(sum(m.__sign * m.{a}), 0) as __ds{i}"));
+        // Summed per sign and then subtracted, not `sum(__sign * a)`: the
+        // product is computed in the argument's own type, so negating an
+        // `integer`'s -2147483648 (or a `bigint`'s minimum) overflows it.
+        // `sum` widens first (`integer` to `bigint`, `bigint` to `numeric`).
+        let ds = format!(
+            "(coalesce(sum(m.{a}) filter (where m.__sign > 0), 0) \
+             - coalesce(sum(m.{a}) filter (where m.__sign < 0), 0))"
+        );
+        deltas.push(format!("{ds} as __ds{i}"));
         deltas.push(format!(
             "sum(case when m.{a} is null then 0 else m.__sign end) as __dc{i}"
         ));
-        nonzero.push(format!("coalesce(sum(m.__sign * m.{a}), 0) <> 0"));
+        nonzero.push(format!("{ds} <> 0"));
         nonzero.push(format!(
             "sum(case when m.{a} is null then 0 else m.__sign end) <> 0"
         ));
@@ -486,7 +494,7 @@ fn ledger_statement(
          ) \
          select up.__trellis_gk, up.__trellis_inserted, up.__trellis_ctid, \
                 up.{members}, d.__ks, {prior_image} \
-         from up join d on d.__gk = up.__trellis_gk",
+         from up join d on {up_d}",
         r_cols = cols("r"),
         l_cols = cols("l"),
         u_cols = cols("u"),
@@ -504,6 +512,17 @@ fn ledger_statement(
         group_cols = groups.join(", "),
         updates = updates.join(", "),
         t_gk = ddl::pk_key_sql_expr(&plan.identity, Some("t")),
+        // Each upserted group back to its increments by the group columns'
+        // own equality, not by their text: equal values can render
+        // differently (`numeric` `1.5` and `1.50`, `float` `0` and `-0`), and
+        // the target row keeps whichever spelling created it. A one-element
+        // array compares `NULL` equal to `NULL` (the `nulls not distinct`
+        // key) and still hashes.
+        up_d = groups
+            .iter()
+            .map(|c| format!("array[up.{c}] = array[d.{c}]"))
+            .collect::<Vec<_>>()
+            .join(" and "),
     )
 }
 
