@@ -964,11 +964,12 @@ async fn a_dropped_capture_trigger_is_reported() {
 /// functions use is reported.
 ///
 /// The test cluster's Trellis role is a superuser, which holds every
-/// privilege whatever is revoked, so the test hands the instance schema to
-/// an ordinary role first. The functions still belong to the superuser
-/// then, which is reported as mis-owned. Once they belong to the new role
-/// too, and it holds exactly the grants the audit expects, the target
-/// converges; revoking `INSERT` on one ring segment is then reported.
+/// privilege whatever is revoked, so the test hands the ring to an ordinary
+/// role first. The functions still belong to the superuser then, which is
+/// reported as mis-owned: they belong to the ring's owner (issue #701), and
+/// the schema's owner doesn't count. Once they belong to the new role too,
+/// and it holds exactly the grants the audit expects, the target converges;
+/// revoking `INSERT` on one ring segment is then reported.
 #[tokio::test]
 async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
     let cluster = TestCluster::start();
@@ -978,10 +979,15 @@ async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
     raw.batch_execute(&format!(
         "do $$ begin create role {role}; \
          exception when duplicate_object then null; end $$; \
-         alter schema trellis owner to {role}"
+         alter table trellis.seg_0 owner to {role}; \
+         alter table trellis.seg_1 owner to {role}; \
+         alter table trellis.seg_2 owner to {role}; \
+         alter table trellis.seg_3 owner to {role}; \
+         alter sequence trellis.staging_change_id_seq owner to {role}; \
+         alter sequence trellis.ring_slot_mirror owner to {role}"
     ))
     .await
-    .expect("hand the instance schema to an ordinary role");
+    .expect("hand the ring to an ordinary role");
 
     let functions: Vec<String> = trellis::capture::sql::CaptureEvent::ALL
         .iter()
@@ -1010,16 +1016,13 @@ async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
             .await
             .expect("hand a capture function to the role");
     }
-    raw.batch_execute(&format!(
-        "grant insert on all tables in schema trellis to {role}; \
-         grant usage on all sequences in schema trellis to {role}"
-    ))
-    .await
-    .expect("grant the role what the capture functions use");
+    raw.batch_execute(&format!("grant usage on schema trellis to {role}"))
+        .await
+        .expect("grant the role the schema, the one thing it doesn't own");
     let report = audit_widgets(&trellis).await;
     assert!(
         matches!(report.outcome, SelfCheckOutcome::Converged),
-        "with the functions owned by the schema's owner, and its grants, capture is whole: {:?}",
+        "with the functions owned by the ring's owner, and its grants, capture is whole: {:?}",
         report.outcome
     );
 

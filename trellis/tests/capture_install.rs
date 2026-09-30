@@ -866,6 +866,11 @@ async fn a_serializable_writer_is_captured_into_a_batch_that_claims_it() {
 /// too, or every captured write fails. A test cluster connects as a
 /// superuser, for whom every privilege check passes, so the setup uses real
 /// roles and the application writes as a third one.
+///
+/// `self_check`'s capture audit must agree that this install is whole: it
+/// expects the functions to belong to the ring's owner, as install hands
+/// them, and not to the schema's. It runs before the writes, while the ring
+/// is empty, so its convergence wait has nothing to wait for.
 #[tokio::test]
 async fn a_schema_pre_created_by_another_role_still_captures_writes() {
     let cluster = TestCluster::start();
@@ -919,6 +924,44 @@ async fn a_schema_pre_created_by_another_role_still_captures_writes() {
         assert_eq!(schema_owner, "cap701_schema_owner");
         assert_eq!(function_owner, "cap701_trellis", "the ring's owner");
     }
+
+    let trellis = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect as the login role");
+    trellis
+        .apply("TRANSFORM t_copy FROM public.t SELECT a AS a")
+        .await
+        .expect("define a reader of public.t");
+    markers::discharge_registrations(&pool)
+        .await
+        .expect("dispatch the build");
+    let def = trellis::defs::catalog::definition_by_target(&pool, "t_copy")
+        .await
+        .expect("read the definition")
+        .expect("the definition exists");
+    assert_eq!(
+        def.status,
+        TransformStatus::Live,
+        "so the capture audit runs"
+    );
+    let report = trellis
+        .self_check(
+            "t_copy",
+            trellis::SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            trellis::SelfCheckMode::Strict,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("self_check");
+    assert!(
+        matches!(report.outcome, trellis::SelfCheckOutcome::Converged),
+        "an install into a pre-created schema has no capture fault: {:?}",
+        report.outcome
+    );
+    trellis.shutdown().await.expect("shutdown");
 
     let app = connect(&as_role("cap701_app")).await;
     for statement in [

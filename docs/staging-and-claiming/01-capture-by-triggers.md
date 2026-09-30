@@ -56,10 +56,11 @@ segment with one `INSERT … SELECT`:
 
 The functions are `SECURITY DEFINER`, owned by the role that owns the ring (the
 role that ran the migrations), with `search_path` pinned. That need not be the
-schema's owner: a DBA can pre-create the schema as another role (issue #701). The application needs no privilege on
-Trellis's schema. The triggers are `ENABLE ALWAYS`, so a session in
-`session_replication_role = replica` is captured too. Nothing in the capture
-path issues `NOTIFY`, because `NOTIFY` takes a database-wide lock at commit.
+schema's owner: a DBA can pre-create the schema as another role (issue #701).
+The application needs no privilege on Trellis's schema. The triggers are
+`ENABLE ALWAYS`, so a session in `session_replication_role = replica` is
+captured too. Nothing in the capture path issues `NOTIFY`, because `NOTIFY`
+takes a database-wide lock at commit.
 
 What is installed lives only in Postgres's catalog: the triggers in
 `pg_trigger`, and each function's column set in its `COMMENT ON FUNCTION`.

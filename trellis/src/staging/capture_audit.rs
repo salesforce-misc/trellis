@@ -29,14 +29,18 @@
 //!   (`tgenabled = 'A'`) and calling its event's function.
 //! - **Four functions in the instance schema**, named by
 //!   [`crate::capture::sql::function_name`], each `SECURITY DEFINER` and
-//!   owned by the role that owns the instance schema.
+//!   owned by the role that owns the ring, the one `capture::install` hands
+//!   them to (its `RING_OWNER` query, which this audit shares). That is the
+//!   role that ran the migrations, and need not own the schema: a DBA can
+//!   pre-create the schema as another role (issue #701).
 //! - **The privileges a function's body uses, held by the role it runs
 //!   as** (its owner): `USAGE` on the instance schema, `INSERT` on every
 //!   ring segment, `USAGE` (or `UPDATE`) on `staging_change_id_seq`, which
 //!   the segments' `change_id` default draws from, and `USAGE` (or
 //!   `SELECT`) on `ring_slot_mirror`, which `pg_sequence_last_value` reads.
-//!   The owner of the schema and the ring holds them all unless someone
-//!   revokes them; a superuser always does.
+//!   The ring's owner holds them all (the schema's `USAGE` through a grant
+//!   or membership in the schema's owner, if it isn't that role) unless
+//!   someone revokes them; a superuser always does.
 //!
 //! # Which definitions and tables
 //!
@@ -68,6 +72,7 @@ use std::fmt;
 
 use tokio_postgres::GenericClient;
 
+use crate::capture::install::RING_OWNER;
 use crate::capture::sql::{CaptureEvent, function_name, trigger_name};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::model::{Definition, TransformStatus};
@@ -104,7 +109,7 @@ pub enum CaptureFault {
         function: String,
     },
     /// This capture function is owned by `owner`, not by `expected`, the role
-    /// that owns the instance schema. It runs as its owner.
+    /// that owns the instance's ring. It runs as its owner.
     FunctionOwner {
         table: String,
         function: String,
@@ -200,7 +205,7 @@ impl fmt::Display for CaptureFault {
             } => write!(
                 f,
                 "{table}'s capture function {function} is owned by {owner}, not by {expected}, \
-                 the owner of the Trellis schema"
+                 the owner of the Trellis ring"
             ),
             CaptureFault::NotSecurityDefiner { table, function } => write!(
                 f,
@@ -305,8 +310,9 @@ async fn captured_tables(
 /// One table's capture pieces, as the catalog has them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstalledCapture {
-    /// The role that owns the instance schema.
-    schema_owner: String,
+    /// The role that owns the instance's ring, which the functions should
+    /// belong to. `None` if the schema has no ring.
+    ring_owner: Option<String>,
     /// One per [`CaptureEvent::ALL`], in that order.
     events: Vec<EventCapture>,
 }
@@ -350,19 +356,20 @@ async fn read_installed(
         .collect();
     let rows = client
         .query(
-            "select pg_catalog.to_regclass($3) is not null, \
-                    pg_catalog.pg_get_userbyid(n.nspowner)::text, \
-                    t.tgenabled::text, t.tgfoid = p.oid, \
-                    pg_catalog.pg_get_userbyid(p.proowner)::text, p.prosecdef \
-             from unnest($2::text[], $4::text[]) with ordinality as e(function, trigger, ord) \
-             cross join (select oid, nspowner from pg_catalog.pg_namespace \
-                         where nspname = $1) n \
-             left join pg_catalog.pg_proc p \
-               on p.proname = e.function and p.pronargs = 0 and p.pronamespace = n.oid \
-             left join pg_catalog.pg_trigger t \
-               on t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = e.trigger \
-              and not t.tgisinternal \
-             order by e.ord",
+            &format!(
+                "select pg_catalog.to_regclass($3) is not null, \
+                        pg_catalog.pg_get_userbyid({RING_OWNER})::text, \
+                        t.tgenabled::text, t.tgfoid = p.oid, \
+                        pg_catalog.pg_get_userbyid(p.proowner)::text, p.prosecdef \
+                 from unnest($2::text[], $4::text[]) with ordinality as e(function, trigger, ord) \
+                 cross join (select oid from pg_catalog.pg_namespace where nspname = $1) n \
+                 left join pg_catalog.pg_proc p \
+                   on p.proname = e.function and p.pronargs = 0 and p.pronamespace = n.oid \
+                 left join pg_catalog.pg_trigger t \
+                   on t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = e.trigger \
+                  and not t.tgisinternal \
+                 order by e.ord"
+            ),
             &[
                 &schema,
                 &functions,
@@ -378,7 +385,7 @@ async fn read_installed(
     if !first.get::<_, bool>(0) {
         return Ok(None);
     }
-    let schema_owner: String = first.get(1);
+    let ring_owner: Option<String> = first.get(1);
     let events = rows
         .iter()
         .zip(functions)
@@ -392,10 +399,7 @@ async fn read_installed(
             security_definer: row.get::<_, Option<bool>>(5) == Some(true),
         })
         .collect();
-    Ok(Some(InstalledCapture {
-        schema_owner,
-        events,
-    }))
+    Ok(Some(InstalledCapture { ring_owner, events }))
 }
 
 /// The trigger and function faults of `installed`, one table's pieces: a
@@ -443,12 +447,14 @@ fn installed_faults(table: &str, installed: &InstalledCapture) -> Vec<CaptureFau
                 function: event.function.clone(),
             }),
             Some(owner) => {
-                if *owner != installed.schema_owner {
+                if let Some(expected) = &installed.ring_owner
+                    && owner != expected
+                {
                     faults.push(CaptureFault::FunctionOwner {
                         table: table.clone(),
                         function: event.function.clone(),
                         owner: owner.clone(),
-                        expected: installed.schema_owner.clone(),
+                        expected: expected.clone(),
                     });
                 }
                 if !event.security_definer {
@@ -568,7 +574,7 @@ mod tests {
 
     fn installed(events: Vec<EventCapture>) -> InstalledCapture {
         InstalledCapture {
-            schema_owner: "trellis_role".to_string(),
+            ring_owner: Some("trellis_role".to_string()),
             events,
         }
     }
