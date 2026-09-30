@@ -149,6 +149,15 @@ Plus `lsn` GREATEST (over *every* row, image-less included, so the watermark
 still covers them) and a hop-generation counter that resets to 0 on any source
 change.
 
+The `new_image` arg-extreme also carries the winning change's identity,
+`last_change`: its own `lsn` and its `row_txid`, the source transaction's id
+under trigger capture (#623 D3). A target on the ledger applies that change
+only if its transaction is not visible in the entry's basis and its `lsn` is
+newer than the entry's
+([05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-ledger)). A
+record with only `recompute` rows has no `last_change`. Across segments,
+`last_change` comes from whichever side supplied `new_image`.
+
 `change_id` (issue #31) is store-assigned from a shared `nextval` sequence,
 monotonic across the ring. It records the one order commit `lsn` can't: every row
 of a transaction shares its commit `lsn`, so ordering an INSERT before a later

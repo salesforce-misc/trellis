@@ -20,9 +20,12 @@
 //! that makes it pass; that part un-ignores it. The wrong value each one
 //! shows today is in its doc comment.
 //!
-//! "Re-derive" below is today's live re-read: an image-less `Recompute` for
-//! a key, which re-reads the 1-1 row, or re-derives the key's group from a
-//! live `GROUP BY` (the forced path).
+//! "Re-derive" below is an image-less `Recompute` for a key. The aggregate
+//! flavour is on the ledger since #623 D3, where it re-reads the key's row
+//! and snapshot in one statement and rewrites the key's entry
+//! (`trellis::staging::ledger`). The 1-1 flavour re-reads the row (#344)
+//! until D6, and the `MIN`/`MAX` flavour re-derives the key's group from a
+//! live `GROUP BY` (the forced path) until D4.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -318,14 +321,11 @@ async fn concurrent_group_writes(
 /// same 20 groups, every batch split across the 8 workers. The groups are
 /// right and no worker deadlocks.
 ///
-/// Ignored because it fails on `main` intermittently, not every run: about
-/// 1 run in 8 when 8 copies run in parallel,
-/// never in 15 runs alone (exp2_4 also hit it once in a full `verify`). The cycle is one drain's bulk group `update` against
-/// another's new-group `insert ... on conflict`, each waiting on the other's
-/// transaction. The engine retries, so the oracle still holds; the zero
-/// deadlocks D3 promises doesn't.
+/// Before the ledger (#623 D3) it failed about 1 run in 8 with 8 copies in
+/// parallel: one drain's bulk group `update` against another's new-group
+/// `insert ... on conflict`, each waiting on the other's transaction. The
+/// ledger path locks entries, then groups, each in one sorted statement.
 #[tokio::test]
-#[ignore = "#623 D3"]
 async fn exp2_4_aggregate() {
     let flavour = Flavour::Aggregate;
     let mut d = start(flavour, &[]).await;
@@ -372,11 +372,11 @@ async fn exp2_5(flavour: Flavour) {
     assert_oracle(&mut d, flavour).await;
 }
 
-/// Today: z keeps key 1, `(2,60,2)` against the oracle's `(2,50,1)`. The
-/// folded record names only a and b, so nothing corrects the Re-derive's
-/// count of key 1 in z (#494's shape).
+/// Before the ledger (#623 D3): z kept key 1, `(2,60,2)` against the
+/// oracle's `(2,50,1)`. The folded record named only a and b, so nothing
+/// corrected the live group re-derive's count of key 1 in z (#494's shape).
+/// On the ledger a Re-derive of key 5 writes only key 5's entry.
 #[tokio::test]
-#[ignore = "#623 D3"]
 async fn exp2_5_aggregate() {
     exp2_5(Flavour::Aggregate).await;
 }
@@ -402,12 +402,13 @@ async fn exp2_5b(flavour: Flavour) {
     assert_oracle(&mut d, flavour).await;
 }
 
-/// Today: z ends `(2,10,1)` against the oracle's `(2,50,1)`. Applied first,
-/// C2 takes key 1 out of z before C1 has put it in, which drops z's
-/// non-null count for `SUM(v)` to 0, so the total resets to NULL although
-/// key 5 is still in z; C1's +10 then lands on the reset total.
+/// Before the ledger (#623 D3): z ended `(2,10,1)` against the oracle's
+/// `(2,50,1)`. Applied first, C2 took key 1 out of z before C1 had put it
+/// in, which dropped z's non-null count for `SUM(v)` to 0, so the total
+/// reset to NULL although key 5 was still in z; C1's +10 then landed on the
+/// reset total. On the ledger C2 moves key 1's entry from a to b, and C1,
+/// older than the entry's `applied_lsn`, is skipped.
 #[tokio::test]
-#[ignore = "#623 D3"]
 async fn exp2_5b_aggregate() {
     exp2_5b(Flavour::Aggregate).await;
 }
@@ -629,9 +630,9 @@ async fn issue_392_one_to_one() {
 /// batch. The Re-derive (through z's member 5, sealed before C1 and drained
 /// after it) commits with key 1 counted in z. z must end without key 1.
 ///
-/// Today: z keeps key 1, `(2,60,2)` against the oracle's `(2,50,1)`.
+/// Before the ledger (#623 D3): z kept key 1, `(2,60,2)` against the
+/// oracle's `(2,50,1)`.
 #[tokio::test]
-#[ignore = "#623 D3"]
 async fn issue_494_aggregate() {
     let flavour = Flavour::Aggregate;
     let mut d = start(flavour, A_Z_B).await;
@@ -649,14 +650,11 @@ async fn issue_494_aggregate() {
 /// of 320 rows creates 20 groups no batch before it touched. No worker
 /// deadlocks.
 ///
-/// Ignored because it fails on `main` intermittently, not every run: about
-/// 1 run in 8 when 8 copies run in parallel,
-/// never in 15 runs alone (exp2_4 also hit it once in a full `verify`). The cycle is one drain's bulk group `update` against
-/// another's new-group `insert ... on conflict`, each waiting on the other's
-/// transaction. The engine retries, so the oracle still holds; the zero
-/// deadlocks D3 promises doesn't.
+/// Before the ledger (#623 D3) it failed about 1 run in 8 with 8 copies in
+/// parallel: one drain's bulk group `update` against another's new-group
+/// `insert ... on conflict`, each waiting on the other's transaction. The
+/// ledger path locks entries, then groups, each in one sorted statement.
 #[tokio::test]
-#[ignore = "#623 D3"]
 async fn issue_539_aggregate() {
     let flavour = Flavour::Aggregate;
     let mut d = start(flavour, &[]).await;
@@ -697,11 +695,10 @@ async fn issue_550(flavour: Flavour) {
     assert_oracle(&mut d, flavour).await;
 }
 
-/// Today: z keeps key 1, `(2,60,2)` against the oracle's `(2,50,1)`. The
-/// unpoisoned [`issue_494_aggregate`] fails the same way, so on today's
-/// engine this doesn't separate #550's parking from #494's fold.
+/// Before the ledger (#623 D3): z kept key 1, `(2,60,2)` against the
+/// oracle's `(2,50,1)`, as the unpoisoned [`issue_494_aggregate`] did. Now
+/// the release stages a Re-derive of key 1 and discards the parked rows.
 #[tokio::test]
-#[ignore = "#623 D3"]
 async fn issue_550_aggregate() {
     issue_550(Flavour::Aggregate).await;
 }
@@ -792,10 +789,12 @@ async fn nested_same_key_one_to_one() {
 /// - a basis taken in a separate statement between the read and the hook,
 ///   since nothing commits there.
 ///
-/// So D3 keeps the hook directly after its one read-and-snapshot statement,
-/// and adds assertions on the stored entries: W_between visible in chunk 2's
+/// So the ledger path keeps the hook directly after its one
+/// read-and-snapshot statement, and the aggregate flavour asserts on the
+/// stored entries ([`assert_chunk_bases`]): W_between visible in chunk 2's
 /// basis and not in chunk 1's, W_in visible in neither, and key 3 (only ever
-/// re-derived) with its `applied_lsn` unchanged by either Re-derive.
+/// re-derived) with its `applied_lsn` unchanged by either Re-derive. The 1-1
+/// flavour's entries are D6's.
 async fn chunked_read_exact_point(flavour: Flavour) {
     let mut d = start(
         flavour,
@@ -814,6 +813,7 @@ async fn chunked_read_exact_point(flavour: Flavour) {
     d.stage_recomputes(SRC, &["4", "5", "6"]).await;
     let chunk_2 = d.seal().await;
 
+    let applied_before = applied_lsn(&d, flavour, "3").await;
     let w_in = d.user().await;
     w_in.batch_execute(
         "begin; \
@@ -822,14 +822,23 @@ async fn chunked_read_exact_point(flavour: Flavour) {
     )
     .await
     .expect("open W_in");
+    let w_in_xid = xact_id(&w_in).await;
     d.drain(chunk_1, "chunk-1").await;
-    write(
-        &d,
-        "update public.src set v = v + 10 where id = 1; \
-         update public.src set v = v + 20 where id = 4; \
-         update public.src set g = 1 where id = 6",
-    )
-    .await;
+    let w_between = d.user().await;
+    w_between
+        .batch_execute(
+            "begin; \
+             update public.src set v = v + 10 where id = 1; \
+             update public.src set v = v + 20 where id = 4; \
+             update public.src set g = 1 where id = 6",
+        )
+        .await
+        .expect("open W_between");
+    let w_between_xid = xact_id(&w_between).await;
+    w_between
+        .batch_execute("commit")
+        .await
+        .expect("commit W_between");
     let mut chunk_2 = d
         .drain_frozen(
             chunk_2,
@@ -846,7 +855,79 @@ async fn chunked_read_exact_point(flavour: Flavour) {
     d.release(&mut chunk_2, PausePoint::AfterRederiveRead).await;
     chunk_2.finish().await;
     cdc.finish().await;
+    if matches!(flavour, Flavour::Aggregate) {
+        assert_chunk_bases(&d, &w_in_xid, &w_between_xid).await;
+        assert_eq!(
+            applied_lsn(&d, flavour, "3").await,
+            applied_before,
+            "a Re-derive leaves the entry's applied_lsn alone (the D split's Q1)"
+        );
+    }
     assert_oracle(&mut d, flavour).await;
+}
+
+/// The open transaction's id on `client`, as text.
+async fn xact_id(client: &tokio_postgres::Client) -> String {
+    client
+        .query_one("select pg_current_xact_id()::text", &[])
+        .await
+        .expect("read the transaction id")
+        .get(0)
+}
+
+/// Key `key`'s ledger `applied_lsn`, as text (`None` when unset), for a
+/// target on the ledger.
+async fn applied_lsn(d: &Driver, flavour: Flavour, key: &str) -> Option<String> {
+    if !matches!(flavour, Flavour::Aggregate) {
+        return None;
+    }
+    d.ctl
+        .query_one(
+            "select __applied_lsn::text from public.agg__ledger where __from_key = $1",
+            &[&key],
+        )
+        .await
+        .expect("read an entry's applied_lsn")
+        .get(0)
+}
+
+/// The entries [`chunked_read_exact_point`] left: chunk 1's keys (1–3) all
+/// carry one basis and chunk 2's (4–6) another, W_between is visible in
+/// chunk 2's and not chunk 1's, and W_in in neither. The CDC's Applies left
+/// every basis as its chunk's Re-derive wrote it.
+async fn assert_chunk_bases(d: &Driver, w_in: &str, w_between: &str) {
+    let rows = d
+        .ctl
+        .query(
+            "select __from_key, __basis::text, \
+                    pg_visible_in_snapshot($1::text::xid8, __basis), \
+                    pg_visible_in_snapshot($2::text::xid8, __basis) \
+             from public.agg__ledger where __from_key = any($3) order by __from_key",
+            &[&w_in, &w_between, &vec!["1", "2", "3", "4", "5", "6"]],
+        )
+        .await
+        .expect("read the chunks' entries");
+    let entries: Vec<(String, String, bool, bool)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    assert_eq!(entries.len(), 6, "{entries:?}");
+    let (chunk_1, chunk_2) = entries.split_at(3);
+    for chunk in [chunk_1, chunk_2] {
+        assert!(
+            chunk.iter().all(|e| e.1 == chunk[0].1),
+            "one basis per chunk: {entries:?}"
+        );
+    }
+    assert_ne!(chunk_1[0].1, chunk_2[0].1, "{entries:?}");
+    for (key, _, w_in_seen, w_between_seen) in &entries {
+        assert!(!w_in_seen, "W_in is in flight across both reads, key {key}");
+        let chunk_2_key = key.as_str() >= "4";
+        assert_eq!(
+            *w_between_seen, chunk_2_key,
+            "W_between commits between the reads, key {key}: {entries:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -857,4 +938,87 @@ async fn chunked_read_exact_point_aggregate() {
 #[tokio::test]
 async fn chunked_read_exact_point_one_to_one() {
     chunked_read_exact_point(Flavour::OneToOne).await;
+}
+
+// ------------------------------------------- chained prior images (#623 D3)
+
+/// A reader chained off a ledger target, and not on the ledger itself (a
+/// `MAX`), finds the groups a write moved away from through each written
+/// group's prior image, which the ledger path rebuilds from the upsert's
+/// result minus the page's increments. One page moves both of group 1's rows
+/// out and two new rows in (emptied and refilled), empties group 3 (deleted),
+/// and grows group 2, so the chained groups by `n` see each kind of prior.
+#[tokio::test]
+async fn a_chained_reader_follows_groups_emptied_and_refilled_in_one_page() {
+    // An integer `g`: a numeric group key can't key a chained reader.
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v numeric); \
+         alter table public.src replica identity full; \
+         insert into public.src values (1, 1, 10), (3, 1, 7), (5, 2, 1), (6, 3, 4)",
+        &[("id", int4), ("g", int4), ("v", ValueType::Numeric)],
+        &[Flavour::Aggregate.definition()],
+        &[SRC],
+    )
+    .await;
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM hi FROM public.agg GROUP BY n SELECT MAX(total) AS top",
+        &std::collections::HashMap::from([
+            ("g".to_string(), int4),
+            ("total".to_string(), ValueType::Numeric),
+            (
+                "n".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int8),
+            ),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the chained reader");
+    trellis::intake::publication::settle_registrations(d.pool()).await;
+    d.settle().await;
+    write(
+        &d,
+        "update public.src set g = 2 where id in (1, 3, 6); \
+         insert into public.src values (2, 1, 5), (4, 1, 6)",
+    )
+    .await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_oracle(&mut d, Flavour::Aggregate).await;
+    assert_eq!(
+        d.rows("select n, top from public.hi order by n").await,
+        d.rows(
+            "select n, max(total) from \
+             (select g, sum(v) as total, count(*) as n from public.src group by g) s \
+             group by n order by n"
+        )
+        .await,
+        "the chained reader (left) differs from the oracle (right)"
+    );
+}
+
+// -------------------------------------------- I2's visibility term (#623 D3)
+
+/// Two updates of key 1 commit: C1 in one batch, then C2 in a second batch
+/// with a `Recompute` of key 1, which folds C2 into a Re-derive. That drains
+/// first and reads C2's row; C1's batch drains after it. C1 is visible in
+/// the entry's basis, so it is skipped. Without the visibility term (the
+/// `lsn_only_skip` plant) C1 is still newer than the entry's `applied_lsn`,
+/// which a Re-derive leaves alone, so it applies and puts key 1 back to 15.
+/// C2 never applies on its own (its Re-derive counted it), so nothing
+/// repairs it.
+#[tokio::test]
+async fn a_change_the_rederive_read_is_not_applied_again_aggregate() {
+    let flavour = Flavour::Aggregate;
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(&d, "update public.src set v = 15 where id = 1").await;
+    let c1 = d.seal().await;
+    write(&d, "update public.src set v = 17 where id = 1").await;
+    d.stage_recomputes(SRC, &["1"]).await;
+    let c2_and_r = d.seal().await;
+    d.drain(c2_and_r, "a").await;
+    d.drain(c1, "b").await;
+    assert_oracle(&mut d, flavour).await;
 }

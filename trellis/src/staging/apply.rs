@@ -628,8 +628,12 @@ async fn read_live_rows_batch(
 
 /// [`read_live_rows_batch`]'s statement and the arrays it binds: one
 /// [`LiveRowsArm`] per pattern of `NULL` key columns among the batch's keys.
-struct LiveRowsQuery<'a> {
+pub(super) struct LiveRowsQuery<'a> {
     sql: String,
+    /// The same read before its `jsonb_each_text` split: one `(k, doc)` row
+    /// per matched source row, `doc` its `row_columns` as a text-valued
+    /// `jsonb` (#623 D3's Re-derive read, `super::ledger`).
+    pub(super) docs: String,
     arms: Vec<LiveRowsArm<'a>>,
 }
 
@@ -643,8 +647,8 @@ struct LiveRowsArm<'a> {
 }
 
 impl LiveRowsQuery<'_> {
-    /// The bind parameters, in the order `sql` numbers them.
-    fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
+    /// The bind parameters, in the order `sql` (and `docs`) number them.
+    pub(super) fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
         self.arms
             .iter()
             .flat_map(|arm| arm.parts.iter().map(|part| part as &(dyn ToSql + Sync)))
@@ -666,7 +670,7 @@ impl LiveRowsQuery<'_> {
 /// indexable: one `NULL`-keyed group in a batch turned the refetch into a
 /// nested loop over a sequential scan of the source. This is the same split
 /// `target_mutations::read_new_images` makes (issue #433).
-fn live_rows_query<'a>(
+pub(super) fn live_rows_query<'a>(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
     row_columns: &[String],
@@ -723,12 +727,13 @@ fn live_rows_query<'a>(
             )
         })
         .collect();
+    let docs = selects.join(" union all ");
     Ok(LiveRowsQuery {
         sql: format!(
-            "select m.k, e.key, e.value from ({}) m \
-             cross join lateral jsonb_each_text(m.doc) e",
-            selects.join(" union all ")
+            "select m.k, e.key, e.value from ({docs}) m \
+             cross join lateral jsonb_each_text(m.doc) e"
         ),
+        docs,
         arms: arms.into_values().collect(),
     })
 }
@@ -4039,6 +4044,11 @@ struct AggregateClearPlan {
     pk: Vec<PrimaryKeyColumn>,
     src_changed: Option<std::time::SystemTime>,
     origin_lsn: Option<PgLsn>,
+    /// #623 D3: whether the target is on the ledger, whose clear also
+    /// empties the ledger and raises the truncate floor to `truncate_lsn`.
+    on_ledger: bool,
+    /// The latest truncating commit's ring `lsn` this batch carries.
+    truncate_lsn: Option<PgLsn>,
 }
 
 /// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
@@ -5526,6 +5536,11 @@ pub struct ApplyPlan {
     /// vs. `apply_aggregate::apply_aggregate_target`'s sequential per-group
     /// upserts) are different enough not to share one plan type.
     aggregate_targets: HashMap<String, AggregateTargetPlan>,
+    /// #623 D3: the aggregate targets on the ledger (`super::ledger`), each
+    /// with this page's records for it, keyed by the definition's bare target
+    /// name like [`ApplyPlan::aggregate_targets`]. Ordered, so every page
+    /// writes them in one order.
+    ledger_targets: BTreeMap<String, super::ledger::LedgerTargetPlan>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// issue #60's truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
@@ -5776,6 +5791,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut versions: HashMap<String, Option<i64>> = HashMap::new();
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
     let mut aggregate_targets: HashMap<String, AggregateTargetPlan> = HashMap::new();
+    // #623 D3: aggregate targets on the ledger, in target order, so every
+    // page takes their locks in one order.
+    let mut ledger_targets: BTreeMap<String, super::ledger::LedgerTargetPlan> = BTreeMap::new();
     // Issue #52: every `Some(src_changed)` origin timestamp
     // `buffer_transform_apply_metrics` sees below, buffered per consuming
     // target — filtered into `ApplyPlan::end_to_end_origins` only for
@@ -5966,12 +5984,25 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         //   `apply_aggregate::accumulate_changes` takes. Only an aggregate
         //   reads them, and only a born-and-died key or a recompute folded
         //   with CDC rows has any, so almost every change decodes none.
+        // #623 D3: a definition on the ledger reads its images and its
+        // Re-derives in Phase 3 (`super::ledger`), so a source read only by
+        // such definitions, and by no relationship, decodes and re-reads
+        // nothing here.
+        let ledger_shapes: Vec<Option<super::ledger::LedgerShape>> = defs
+            .iter()
+            .map(|def| super::ledger::route(&def.def, &def.source_columns))
+            .collect();
+        let ledger_only = inbound_rels.is_empty() && ledger_shapes.iter().all(Option::is_some);
         let decode_old_side = needs_old_rows || !inbound_rels.is_empty();
         let mut batch = ImageBatch::default();
         let mut slots: Vec<(Option<usize>, Option<usize>, Vec<usize>)> =
             Vec::with_capacity(changes.len());
         let mut live_refetch_indices: Vec<usize> = Vec::new();
         for (i, change) in changes.iter().enumerate() {
+            if ledger_only {
+                slots.push((None, None, Vec::new()));
+                continue;
+            }
             if change.new_image.is_none() && change.old_image.is_none() {
                 live_refetch_indices.push(i);
             }
@@ -6216,7 +6247,37 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             }
         }
 
-        for def in &defs {
+        for (def, ledger_shape) in defs.iter().zip(ledger_shapes) {
+            // #623 D3: a plain aggregate on the ledger takes the records as
+            // they are; Phase 3 evaluates them (`super::ledger`).
+            if let Some(shape) = ledger_shape {
+                let target_plan = match ledger_targets.entry(def.def.target.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let identity = {
+                            let client = pool.get().await?;
+                            ddl::identity_key_columns(&**client, &def.target_table).await?
+                        };
+                        entry.insert(super::ledger::LedgerTargetPlan::new(
+                            &def.target_table,
+                            qualified_source,
+                            pk.clone(),
+                            identity,
+                            shape,
+                        ))
+                    }
+                };
+                for change in &changes {
+                    target_plan.push(change);
+                    buffer_transform_apply_metrics(
+                        &def.def.target,
+                        change,
+                        &mut end_to_end_origins,
+                        &mut transform_observations,
+                    );
+                }
+                continue;
+            }
             let KeySpace::Aggregate { group_by } = &def.def.key_space else {
                 let field_names: Vec<String> =
                     def.def.fields.iter().map(|f| f.name.clone()).collect();
@@ -6774,6 +6835,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             earliest_src_changed(existing.src_changed, change.src_changed);
                         existing.origin_lsn =
                             earliest_origin(existing.origin_lsn, change.origin_lsn);
+                        existing.truncate_lsn = existing.truncate_lsn.max(change.lsn);
                     } else {
                         // Issue #385: the ungated `identity_key_columns`, not
                         // `source_primary_key`. The clear only renders this
@@ -6803,6 +6865,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 pk,
                                 src_changed: change.src_changed,
                                 origin_lsn: change.origin_lsn,
+                                on_ledger: super::ledger::route(&def.def, &def.source_columns)
+                                    .is_some(),
+                                truncate_lsn: change.lsn,
                             },
                         );
                     }
@@ -6969,6 +7034,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut all_targets: std::collections::HashSet<&String> = targets.keys().collect();
     all_targets.extend(clears.keys());
     all_targets.extend(aggregate_targets.keys());
+    all_targets.extend(ledger_targets.keys());
     all_targets.extend(aggregate_clears.keys());
     // Epic #49 cross-cutting review fix (issues #51/#52): only the
     // terminal-filtered subset of `end_to_end_origins` survives into
@@ -7046,6 +7112,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         versions,
         targets,
         aggregate_targets,
+        ledger_targets,
         clears,
         aggregate_clears,
         poisoned_park,
@@ -8172,6 +8239,7 @@ pub(crate) struct PageClaim {
         segments = steps.len(),
         targets = plan.targets.len(),
         aggregate_targets = plan.aggregate_targets.len(),
+        ledger_targets = plan.ledger_targets.len(),
         keys_written = tracing::field::Empty,
         keys_deleted = tracing::field::Empty,
     )
@@ -8264,6 +8332,12 @@ pub(crate) async fn apply_page(
     // target's `GROUP BY` key (issue #315: each cleared group reaches the
     // seam, where it used to go unpropagated).
     for clear in plan.aggregate_clears.values() {
+        // #623 D3: a ledger target's truncate empties its ledger and raises
+        // its truncate floor (the D split's Q6), then clears its groups.
+        if clear.on_ledger {
+            super::ledger::truncate_ledger(txn, &clear.qualified_target, clear.truncate_lsn)
+                .await?;
+        }
         keys_deleted += clear_target(
             txn,
             &clear.qualified_target,
@@ -8315,6 +8389,18 @@ pub(crate) async fn apply_page(
             &mut mutations,
         )
         .await?;
+        keys_written += written;
+        keys_deleted += deleted;
+    }
+
+    // 3b'. #623 D3: aggregate targets on the ledger, in target order. A
+    // record's `applied_seg` is the page's latest segment: a key never splits
+    // across a page's segments by more than that, and a later stamp only
+    // delays tombstone GC (the D split's Q7).
+    let page_seg = steps.iter().map(|step| step.seg_seq).max().unwrap_or(0);
+    for ledger_plan in plan.ledger_targets.values() {
+        let (written, deleted) =
+            super::ledger::apply_ledger_target(txn, ledger_plan, page_seg, &mut mutations).await?;
         keys_written += written;
         keys_deleted += deleted;
     }
@@ -9068,6 +9154,7 @@ pub(crate) async fn apply_page(
         .values()
         .map(|t| &t.qualified_target)
         .chain(plan.aggregate_targets.values().map(|t| &t.target))
+        .chain(plan.ledger_targets.values().map(|t| &t.target))
     {
         super::interleave::pause_at(txn, super::interleave::PausePoint::BeforeCommit, target)
             .await?;

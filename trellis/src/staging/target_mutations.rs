@@ -172,8 +172,9 @@
 //! that unpublished them: an endpoint target's CDC already in the slot
 //! before intake's `ALTER PUBLICATION ... DROP TABLE` still arrives. A write
 //! staged by the previous binary reached the ring as a `Recompute` plus that
-//! CDC, which #321's recompute horizon absorbs for an aggregate reader
-//! (`aggregate_recompute_race_windows.rs`'s chained W1 pins it). A write this
+//! CDC, which #321's recompute horizon absorbs for an aggregate reader not
+//! on the ledger, and the ledger's basis check for one on it (#623 D3). A
+//! write this
 //! binary made before the drop committed would reach it as two deltas;
 //! pre-release, that window is accepted rather than migrated.
 //!
@@ -405,6 +406,19 @@ impl TargetMutations {
         Ok(info
             .has_readers
             .then(|| row_as_text_jsonb_sql(alias, &info.image_columns)))
+    }
+
+    /// The columns [`Self::image_sql`] renders for `target`, or `None` when
+    /// nothing reads it. For a writer that builds each prior image column by
+    /// column rather than from one row alias (#623 D3's ledger group upsert,
+    /// `super::ledger`).
+    pub(crate) async fn image_columns(
+        &mut self,
+        txn: &Transaction<'_>,
+        target: &str,
+    ) -> Result<Option<Vec<String>>, ApplyError> {
+        let info = self.info(txn, target).await?;
+        Ok(info.has_readers.then(|| info.image_columns.clone()))
     }
 
     /// Records that this transaction physically changed (wrote or deleted)

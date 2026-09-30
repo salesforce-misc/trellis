@@ -6387,6 +6387,35 @@ pub async fn source_table_version(
     Ok(row.map(|row| row.get(0)))
 }
 
+/// Definition `id`'s persisted source column types, on `client` (#623 D3:
+/// the orphan sweep's ledger routing, `staging::ledger::route`, in the
+/// discharge's transaction). Empty for an id with none.
+pub(crate) async fn source_columns_in(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<HashMap<String, ValueType>, CatalogError> {
+    let rows = client
+        .query(
+            "select e.key, e.value from transform_definitions t \
+             cross join lateral jsonb_each_text(t.source_columns) e where t.id = $1",
+            &[&id],
+        )
+        .await?;
+    let mut source_columns = HashMap::new();
+    for row in rows {
+        let key: String = row.get(0);
+        let value: String = row.get(1);
+        let Some(value_type) = decode_value_type(&value) else {
+            return Err(CatalogError::UnknownValueType {
+                column: key,
+                text: value,
+            });
+        };
+        source_columns.insert(key, value_type);
+    }
+    Ok(source_columns)
+}
+
 /// Reads back one definition by its catalog id, re-parsing `definition_text`
 /// exactly like every other read path in this module — used by
 /// `chunk_queue`'s claim loop to reconstruct the [`super::ast::TransformDef`]

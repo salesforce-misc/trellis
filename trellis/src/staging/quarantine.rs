@@ -50,7 +50,7 @@ use crate::defs::validate;
 use crate::pool::{Pool, quote_ident};
 
 #[cfg(any(test, feature = "internals"))]
-use super::append::{self, CdcOp, StagedChange};
+use super::append::{self, StagedChange};
 use super::append::{RING_SIZE, ring_table_name};
 use super::apply::{self, ApplyError};
 use super::fold::FoldedChange;
@@ -2836,18 +2836,28 @@ fn recompute_lock_sql(target_ident: &str, pk: &[PrimaryKeyColumn], image_select:
 // Release
 // ---------------------------------------------------------------------
 
-/// Operator-driven release, one transaction: replays every `poison_held` row
-/// for `(src_table, key)`, in batch order (`seg_seq` ascending) then
-/// position order (`held_seq` ascending — a tie-breaker only, since this
-/// table holds at most one row per `(src_table, key, seg_seq)`), into the
-/// active batch; then deletes the held rows, the marker, and the death
-/// counter. Doc 06: "Each replayed row keeps its **original** origin
-/// position" — [`StagedChange::Cdc`]'s `lsn`/`origin_lsn` fields are set
-/// from the held row's own columns, never reset, which is what keeps the
-/// key's band blocked until the release actually drains rather than
-/// silently un-gating the read-your-writes predicate.
+/// Operator-driven release, one transaction: stages one image-less
+/// `Recompute` of `(src_table, key)` into the active batch, then deletes the
+/// key's `poison_held` rows, its marker, and its death counter.
 ///
-/// Returns how many held rows were replayed.
+/// The parked rows are discarded, not replayed (#623 D3, the D split's
+/// finding 7). A replayed CDC row would carry the releaser's `row_txid`, not
+/// its source transaction's, and a ledger target decides whether a change is
+/// already counted by that id (ADR-0002 I2), so a replay could regress an
+/// entry a later Re-derive already moved past. The `Recompute` re-derives
+/// the key from its current row instead, on every target that reads it. It
+/// carries what the parked rows told a reader beyond the current row:
+///
+/// - the first parked row's pre-image (a recompute's own hint, or a CDC
+///   row's old image) as its prior image, the state readers last saw, which
+///   names the group an aggregate not on the ledger must also re-derive;
+/// - the parked rows' earliest `origin_lsn` (unknown if any is) and
+///   `src_changed`, and their deepest `hop_gen` (0 if any is a source
+///   change), so the key's band stays blocked until the release drains (doc
+///   06), as the replayed rows' own positions used to keep it;
+/// - the union of their `group_key`s.
+///
+/// Returns how many held rows were released.
 #[cfg(any(test, feature = "internals"))]
 pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usize, ApplyError> {
     // Issue #283: quarantine's tables are keyed canonically, but this is an
@@ -2856,17 +2866,16 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     // resolve) can still be keyed raw. Matching the set of both is what keeps a
     // release total either way — a partial release would leave orphaned parked
     // work `converge` gates on forever, which is strictly worse than the extra
-    // array element. Each replayed row is restaged under *its own* stored
-    // `src_table` rather than one chosen spelling, so a legacy bare held row
-    // goes back onto the ring exactly as it left it.
+    // array element. The `Recompute` is staged under the first held row's own
+    // stored `src_table`, so a legacy bare held row's key goes back onto the
+    // ring as it left it.
     let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
     let held = txn
         .query(
-            "select seg_seq, op, lsn, old_image::text, new_image::text, origin_lsn, \
-                    src_changed, hop_gen, group_key, src_table \
+            "select old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table \
              from poison_held \
              where src_table = any($1::text[]) and key = $2 \
              order by seg_seq asc, held_seq asc",
@@ -2874,53 +2883,35 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
         )
         .await?;
 
-    let changes: Vec<StagedChange> = held
-        .iter()
-        .map(|row| {
-            let op: String = row.get(1);
-            let lsn: Option<PgLsn> = row.get(2);
-            let old_image: Option<String> = row.get(3);
-            let new_image: Option<String> = row.get(4);
-            let origin_lsn: Option<PgLsn> = row.get(5);
-            let src_changed: Option<SystemTime> = row.get(6);
-            let hop_gen: i32 = row.get(7);
-            let group_key: Option<Vec<String>> = row.get(8);
-            let src_table: String = row.get(9);
-            if op == "recompute" {
-                StagedChange::Recompute {
-                    src_table: src_table.to_string(),
-                    key: key.to_string(),
-                    hop_gen,
-                    group_key,
-                    src_changed,
-                    // `park_batch_contribution` parks a hinted recompute's
-                    // prior image in `old_image` (issue #315).
-                    prior_image: old_image,
-                    origin_lsn,
-                }
-            } else {
-                let cdc_op = match op.as_str() {
-                    "insert" => CdcOp::Insert,
-                    "delete" => CdcOp::Delete,
-                    _ => CdcOp::Update,
-                };
-                StagedChange::Cdc {
-                    src_table: src_table.to_string(),
-                    key: key.to_string(),
-                    op: cdc_op,
-                    lsn,
-                    old_image,
-                    new_image,
-                    origin_lsn,
-                    src_changed,
-                    hop_gen,
-                    group_key,
+    if let Some(first) = held.first() {
+        let mut origin_lsn: Option<PgLsn> = first.get(1);
+        let mut src_changed: Option<SystemTime> = None;
+        let mut hop_gen = 0;
+        let mut source_change = false;
+        let mut group_key: Vec<String> = Vec::new();
+        for row in &held {
+            origin_lsn = super::fold::earliest_origin(origin_lsn, row.get(1));
+            let changed: Option<SystemTime> = row.get(2);
+            source_change |= changed.is_some();
+            src_changed = super::apply::earliest_src_changed(src_changed, changed);
+            hop_gen = hop_gen.max(row.get::<_, i32>(3));
+            for value in row.get::<_, Option<Vec<String>>>(4).unwrap_or_default() {
+                if !group_key.contains(&value) {
+                    group_key.push(value);
                 }
             }
-        })
-        .collect();
-
-    append::append(&txn, &changes).await?;
+        }
+        let change = StagedChange::Recompute {
+            src_table: first.get(5),
+            key: key.to_string(),
+            hop_gen: if source_change { 0 } else { hop_gen },
+            group_key: (!group_key.is_empty()).then_some(group_key),
+            src_changed,
+            prior_image: first.get(0),
+            origin_lsn,
+        };
+        append::append(&txn, &[change]).await?;
+    }
 
     txn.execute(
         "delete from poison_held where src_table = any($1::text[]) and key = $2",
@@ -2939,7 +2930,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     .await?;
 
     txn.commit().await?;
-    Ok(changes.len())
+    Ok(held.len())
 }
 
 // ---------------------------------------------------------------------
@@ -3392,6 +3383,7 @@ mod unit_tests {
             has_recompute: false,
             vanished_images: Vec::new(),
             ends_in_delete: false,
+            last_change: None,
         }
     }
 

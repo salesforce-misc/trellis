@@ -4591,13 +4591,14 @@ mod catch_up_tests {
     /// Issue #436 on a resume, #391's reproduction made deterministic. The
     /// rollup is paused at group 1 = 9 (ids 1, 3, 5), and id 3 is deleted
     /// meanwhile. The resume's discharge keeps group 1 (ids 1 and 5 still
-    /// back it); they are deleted before the rebuild reads, so it writes
-    /// nothing for group 1 and the pre-pause 9 survives it; id 7 lands after
+    /// back it; on the ledger it takes id 3 out, leaving 6); they are deleted
+    /// before the rebuild reads, so it writes nothing for group 1 and that
+    /// stale row survives it; id 7 lands after
     /// the read. Every one of those changes drains while the rollup is
     /// `backfilling`, so none reaches it. The go-live discharge must then
     /// leave group 1 exactly as the source has it. Its last row (7) is
     /// deleted in the discharge's gap and id 10 (100) lands after its read:
-    /// the right answer is 100. Folding those onto the stale 9 gives 102.
+    /// the right answer is 100. Folding those onto the stale row gives more.
     #[tokio::test]
     async fn a_resumed_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows()
      {
@@ -4660,10 +4661,13 @@ mod catch_up_tests {
         .await;
         drain_all(&pool, &mut discharger).await;
         finish_builds(&pool, &chunks).await;
+        // The rollup is on the ledger (#623 D3), so the dispatch's sweep
+        // re-derived id 3's entry, which the source no longer backed, and took
+        // it out of group 1: the stale row the rebuild leaves is ids 1 and 5.
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "12".to_string()), (1, "9".to_string())],
-            "group 1 still holds its pre-pause value"
+            vec![(0, "12".to_string()), (1, "6".to_string())],
+            "group 1 still holds its pre-rebuild value"
         );
 
         settle_orders_marker(&discharger).await;

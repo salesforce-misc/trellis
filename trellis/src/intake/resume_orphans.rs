@@ -213,6 +213,10 @@ struct Match {
     /// The ` left join ...` clauses a relationship-path `GROUP BY` key reads
     /// through; empty otherwise.
     joins: String,
+    /// #623 D3: a ledger target's ledger (quoted). A group row with a live
+    /// entry left is not an orphan here: the entry sweep re-derives the
+    /// entry, which deletes the group once it is empty.
+    ledger: Option<String>,
 }
 
 /// What a discharge's sweep deleted ([`Sweep::finish`]).
@@ -246,6 +250,17 @@ struct SweptTarget {
     /// one.
     returning: String,
     has_image: bool,
+    /// #623 D3: for a ledger target's group sweep, the ledger (quoted): a
+    /// group is deleted only if it still has no live entry when the delete
+    /// runs, since a Re-derive may have joined one since the read.
+    ledger_guard: Option<String>,
+    /// #623 D3: `Some` for a ledger target's entry sweep. Its branch finds
+    /// the ledger's live entries the source no longer backs, and
+    /// [`Sweep::delete`] re-derives them through this plan instead of
+    /// deleting target rows: the Re-derive finds no source row and takes
+    /// each entry out of its group, which deleting the group here would
+    /// leave counted in the ledger.
+    ledger_rederive: Option<crate::staging::ledger::LedgerTargetPlan>,
 }
 
 /// The targets one discharge sweeps, and what it has deleted from them so
@@ -300,12 +315,55 @@ impl Sweep {
                 tracing::debug!(target = %target, "swept target is gone; nothing to sweep");
                 continue;
             }
-            let matching = match &def.key_space {
+            // #623 D3: a target on the ledger is swept twice over. Its live
+            // entries the source no longer backs are re-derived here (which
+            // takes each out of its group, and deletes a group it empties),
+            // and a group row with no live entry left and no source row is
+            // deleted directly: a row a rebuild's build (which empties the
+            // ledger) found no source rows for.
+            let source_columns = crate::defs::catalog::source_columns_in(txn, id).await?;
+            let ledger = match crate::staging::ledger::route(&def, &source_columns) {
+                Some(shape) => {
+                    let source_pk = ddl::identity_key_columns(txn, &source_table).await?;
+                    let tag =
+                        i32::try_from(self.targets.len()).expect("fewer than 2^31 swept targets");
+                    self.targets.push(SweptTarget {
+                        id,
+                        status,
+                        target: target.clone(),
+                        target_ident: target_ident.clone(),
+                        key_cols: key_cols.clone(),
+                        aggregate: true,
+                        branches: vec![ledger_orphan_branch_sql(
+                            tag,
+                            &target,
+                            &ddl::qualified_source_table(&source_table),
+                            &source_pk,
+                        )],
+                        returning: String::new(),
+                        has_image: false,
+                        ledger_guard: None,
+                        ledger_rederive: Some(crate::staging::ledger::LedgerTargetPlan::new(
+                            &target,
+                            &source_table,
+                            source_pk,
+                            key_cols.clone(),
+                            shape,
+                        )),
+                    });
+                    Some(ddl::qualified_target_table_ident(
+                        &crate::defs::ledger::ledger_table_name(&target),
+                    ))
+                }
+                None => None,
+            };
+            let mut matching = match &def.key_space {
                 KeySpace::OneToOne => one_to_one_match(&key_cols),
                 KeySpace::Aggregate { group_by } => {
                     aggregate_match(txn, &source_table, &target, group_by, &key_cols).await?
                 }
             };
+            matching.ledger = ledger.clone();
             let tag = i32::try_from(self.targets.len()).expect("fewer than 2^31 swept targets");
             let branches = orphan_branches(
                 txn,
@@ -330,6 +388,8 @@ impl Sweep {
                 branches,
                 returning,
                 has_image: image_expr.is_some(),
+                ledger_guard: ledger,
+                ledger_rederive: None,
             });
         }
         Ok(())
@@ -372,6 +432,44 @@ impl Sweep {
             .ok()
             .and_then(|i| self.targets.get(i))
             .unwrap_or_else(|| panic!("the discharge read returned an unknown sweep tag {tag}"));
+        if let Some(template) = &target.ledger_rederive {
+            let applying: bool = txn
+                .query_one(
+                    "select exists (select 1 from transform_definitions \
+                     where id = $1 and status = $2)",
+                    &[&target.id, &target.status.as_str()],
+                )
+                .await?
+                .get(0);
+            if !applying {
+                return Ok(());
+            }
+            let mut plan = template.clone();
+            for key in keys.iter().filter_map(|key| key.first().cloned().flatten()) {
+                plan.push_rederive(key);
+            }
+            // The entries' `applied_seg`: the ring's latest segment, at or
+            // above any a change for these keys can still be pending in.
+            let seg_seq: Option<i64> = txn
+                .query_one("select max(seg_seq) from segments", &[])
+                .await?
+                .get(0);
+            let (_, deleted) = crate::staging::ledger::apply_ledger_target(
+                txn,
+                &plan,
+                seg_seq.unwrap_or(0),
+                &mut self.mutations,
+            )
+            .await?;
+            tracing::info!(
+                target = %target.target,
+                keys = keys.len(),
+                groups_deleted = deleted,
+                "re-derived ledger entries the source no longer backs"
+            );
+            self.swept.deleted += deleted;
+            return Ok(());
+        }
         let arity = target.key_cols.len();
         let arrays: Vec<Vec<Option<String>>> = (0..arity)
             .map(|j| keys.iter().map(|key| key[j].clone()).collect())
@@ -392,9 +490,32 @@ impl Sweep {
             .iter()
             .map(|c| format!("t.{}", quote_ident(&c.name)))
             .collect();
+        let guard = match &target.ledger_guard {
+            Some(ledger) => {
+                use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
+                let matches: Vec<String> = target
+                    .key_cols
+                    .iter()
+                    // Not `is not distinct from`, which no index serves.
+                    .map(|c| {
+                        format!(
+                            "(l.{0} = t.{0} or (l.{0} is null and t.{0} is null))",
+                            quote_ident(&c.name)
+                        )
+                    })
+                    .collect();
+                format!(
+                    " and not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
+                    quote_ident(MEMBER_COLUMN),
+                    quote_ident(TOMBSTONE_COLUMN),
+                    matches.join(" and "),
+                )
+            }
+            None => String::new(),
+        };
         let sql = format!(
             "delete from {} as t using (select {} from unnest({}) as u({})) as k \
-             where {} and exists ( \
+             where {}{guard} and exists ( \
                  select 1 from transform_definitions where id = ${} and status = ${} \
              ) \
              returning {}",
@@ -487,6 +608,7 @@ fn one_to_one_match(key_cols: &[PrimaryKeyColumn]) -> Match {
             })
             .collect(),
         joins: String::new(),
+        ledger: None,
     }
 }
 
@@ -574,6 +696,7 @@ async fn aggregate_match(
             }),
             "s",
         ),
+        ledger: None,
     })
 }
 
@@ -680,6 +803,8 @@ fn orphan_branch_sql(
 ) -> String {
     let mut filter = Vec::new();
     let mut matches = Vec::new();
+    // The same match against a ledger entry's group columns (#623 D3).
+    let mut ledger_matches = Vec::new();
     match pattern {
         OrphanPattern::Exactly(pattern) => {
             let is_null = |i: usize| {
@@ -693,11 +818,13 @@ fn orphan_branch_sql(
                 if is_null(i) {
                     filter.push(format!("t.{col} is null and "));
                     matches.push(format!("{} is null", part.source_sql));
+                    ledger_matches.push(format!("l.{col} is null"));
                 } else {
                     if part.nullable {
                         filter.push(format!("t.{col} is not null and "));
                     }
                     matches.push(format!("{} = t.{col}", part.source_sql));
+                    ledger_matches.push(format!("l.{col} = t.{col}"));
                 }
             }
         }
@@ -713,6 +840,7 @@ fn orphan_branch_sql(
                     "{} is not distinct from t.{}",
                     part.source_sql, part.target_col
                 ));
+                ledger_matches.push(format!("l.{0} is not distinct from t.{0}", part.target_col));
             }
         }
     }
@@ -721,13 +849,54 @@ fn orphan_branch_sql(
         .iter()
         .map(|p| format!("t.{}::text", p.target_col))
         .collect();
+    // A ledger target's group row is the sum of its live entries (#623 D3),
+    // so one with none is an orphan whatever the source holds: a source row
+    // the build didn't see joins its group through its own Re-derive, which
+    // starts the group again from zero.
+    let unbacked = match &matching.ledger {
+        Some(ledger) => {
+            use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
+            format!(
+                "not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
+                quote_ident(MEMBER_COLUMN),
+                quote_ident(TOMBSTONE_COLUMN),
+                ledger_matches.join(" and "),
+            )
+        }
+        None => format!(
+            "not exists (select 1 from {source_ident} as s{} where {})",
+            matching.joins,
+            matches.join(" and "),
+        ),
+    };
     format!(
         "select {tag}::int4, null::text, array[{}]::text[] from {target_ident} as t \
-         where {}not exists (select 1 from {source_ident} as s{} where {})",
+         where {}{unbacked}",
         key.join(", "),
         filter.concat(),
-        matching.joins,
-        matches.join(" and "),
+    )
+}
+
+/// A ledger target's branch of the read (#623 D3): `(tag, NULL, {key})` for
+/// every live ledger entry whose key no source row has. The key is the
+/// ring's encoding of the source key ([`ddl::pk_key_sql_expr`]), which the
+/// anti-join hashes on.
+fn ledger_orphan_branch_sql(
+    tag: i32,
+    target: &str,
+    source_ident: &str,
+    source_pk: &[PrimaryKeyColumn],
+) -> String {
+    use crate::defs::ledger::{KEY_COLUMN, MEMBER_COLUMN, TOMBSTONE_COLUMN, ledger_table_name};
+    let key = quote_ident(KEY_COLUMN);
+    format!(
+        "select {tag}::int4, null::text, array[l.{key}]::text[] from {} as l \
+         where l.{} and not l.{} \
+           and not exists (select 1 from {source_ident} as s where {} = l.{key})",
+        ddl::qualified_target_table_ident(&ledger_table_name(target)),
+        quote_ident(MEMBER_COLUMN),
+        quote_ident(TOMBSTONE_COLUMN),
+        ddl::pk_key_sql_expr(source_pk, Some("s")),
     )
 }
 
@@ -844,7 +1013,11 @@ mod db_tests {
         let (catch_all, hashable): (Vec<&str>, Vec<&str>) = planned
             .branches()
             .partition(|sql| sql.contains("is not distinct from"));
-        assert_eq!(hashable.len(), 2, "one branch per target: {hashable:?}");
+        assert_eq!(
+            hashable.len(),
+            3,
+            "one branch per target, and the ledger target's entry sweep (#623 D3): {hashable:?}"
+        );
         assert_eq!(catch_all.len(), 1, "the aggregate's catch-all");
         for sql in hashable {
             let plan: Vec<String> = txn
@@ -855,8 +1028,13 @@ mod db_tests {
                 .map(|row| row.get(0))
                 .collect();
             let plan = plan.join("\n");
+            // The one nested loop allowed is a ledger target's live-entry
+            // check (#623 D3), which probes the ledger's group index per
+            // group row rather than scanning anything.
+            let nested_ok = !plan.contains("Nested Loop")
+                || (plan.contains("__ledger_g_idx") && plan.matches("Nested Loop").count() == 1);
             assert!(
-                plan.contains("Anti Join") && !plan.contains("Nested Loop"),
+                plan.contains("Anti Join") && nested_ok,
                 "the sweep must plan as a set-based anti-join:\n{plan}"
             );
         }
@@ -876,11 +1054,15 @@ mod db_tests {
             .into_iter()
             .map(|row| row.get(0))
             .collect();
-        let source_scans: Vec<&String> =
-            plan.iter().filter(|l| l.contains(" on orders ")).collect();
+        // A ledger target's catch-all (#623 D3) probes its ledger rather than
+        // the source.
+        let source_scans: Vec<&String> = plan
+            .iter()
+            .filter(|l| l.contains(" on orders ") || l.contains(" on orders_by_g__ledger "))
+            .collect();
         assert!(
             !source_scans.is_empty() && source_scans.iter().all(|l| l.contains("never executed")),
-            "the catch-all must not scan the source when no row has a new pattern:\n{}",
+            "the catch-all must not scan the source or ledger when no row has a new pattern:\n{}",
             plan.join("\n")
         );
         let swept = sweep(&txn, &ids).await;
@@ -1166,6 +1348,7 @@ mod tests {
         let matching = Match {
             parts: vec![part("a", r#"s."a""#, false), part("b", r#"s."b""#, false)],
             joins: String::new(),
+            ledger: None,
         };
         assert_eq!(
             orphan_branch_sql(
@@ -1191,6 +1374,7 @@ mod tests {
                 part("h", r#"(s."h")::text"#, true),
             ],
             joins: r#" left join "c" as "c" on "c"."id" = s."cid""#.to_string(),
+            ledger: None,
         };
         let nullable = [0, 1];
         assert_eq!(
@@ -1223,6 +1407,7 @@ mod tests {
         let matching = Match {
             parts: vec![part("g", r#"(s."g")::numeric"#, true)],
             joins: String::new(),
+            ledger: None,
         };
         assert_eq!(
             orphan_branch_sql(

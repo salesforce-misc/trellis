@@ -242,6 +242,26 @@ pub struct FoldedChange {
     /// recompute. This is what tells the two apart, so the delete still
     /// ends the key across segments.
     pub ends_in_delete: bool,
+    /// #623 D3: the identity of the change that won the `new_image`
+    /// arg-extreme above (the latest image-bearing row or delete, by `(lsn,
+    /// change_id)`), which is the change a ledger target applies. `None` when
+    /// the record has no such row (only `recompute` rows), or that row has no
+    /// `lsn`. A ledger target re-derives such a record instead of applying
+    /// it (`super::ledger`).
+    pub last_change: Option<LastChange>,
+}
+
+/// The change a [`FoldedChange`] applies to a ledger target (#623 D3,
+/// ADR-0002 I2): its `lsn`, and the source transaction that committed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastChange {
+    /// The ring row's `lsn`: the trigger's `pg_current_wal_insert_lsn()`.
+    /// Writers of one key commit in `lsn` order, because the second waits on
+    /// the first's row lock.
+    pub lsn: PgLsn,
+    /// The ring row's `row_txid` (`xid8`, as text): the source transaction's
+    /// own id under trigger capture (C5).
+    pub row_txid: String,
 }
 
 /// The fenced window's full column projection the fold needs, with jsonb
@@ -253,7 +273,7 @@ pub struct FoldedChange {
 /// on `op` (see the discriminator comment below).
 const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
-     group_key, appended_at, change_id, route, op, relationship_id, retry_count";
+     group_key, appended_at, change_id, route, op, relationship_id, retry_count, row_txid";
 
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
 /// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
@@ -354,7 +374,7 @@ const PAGE_TABLE: &str = "trellis_drain_page";
 const FOLDED_COLUMNS: &str = "src_table, key, new_image, old_image, src_changed, origin_lsn, \
      lsn, hop_gen, first_seen, group_key, is_truncate, relationship_reverse_deferred, \
      retry_count, prior_image, min_image_lsn, row_count, has_recompute, vanished_images, \
-     ends_in_delete";
+     ends_in_delete, last_lsn, last_row_txid";
 
 /// Folds `bucket`'s share of `seg_seq`, from strictly after `after` (the
 /// start when `None`), into this session's [`PAGE_TABLE`], indexed on its
@@ -432,7 +452,7 @@ pub(crate) async fn read_page(
     let sql = read_page_sql(after.is_some());
     let rows = client.query(&sql, &params).await?;
     let next = (rows.len() > cap).then(|| PageKey {
-        route: rows[cap - 1].get(19),
+        route: rows[cap - 1].get(21),
         src_table: rows[cap - 1].get(0),
         key: rows[cap - 1].get(1),
     });
@@ -518,6 +538,10 @@ fn folded_from_row(row: &tokio_postgres::Row) -> FoldedChange {
             images
         },
         ends_in_delete: row.get(18),
+        last_change: row
+            .get::<_, Option<PgLsn>>(19)
+            .zip(row.get::<_, Option<String>>(20))
+            .map(|(lsn, row_txid)| LastChange { lsn, row_txid }),
     }
 }
 
@@ -638,7 +662,8 @@ fn fold_sql(
     // op)` pairs as one 2-D array so `new_image`, `vanished_images` and
     // `ends_in_delete` share one ordered aggregate (identical aggregate
     // calls are computed once) rather than sorting each group twice.
-    let last = "(array_agg(array[new_image, op] order by lsn desc, change_id desc) \
+    let last = "(array_agg(array[new_image, op, lsn::text, row_txid::text] \
+                                order by lsn desc, change_id desc) \
                      filter (where (old_image is not null or new_image is not null \
                                     or op = 'delete') \
                                and op <> 'recompute'))";
@@ -696,7 +721,9 @@ fn fold_sql(
                            filter (where new_image is null and old_image is not null \
                                      and op <> 'recompute')], null) \
              end as vanished_images, \
-             coalesce({last}[1][2] = 'delete', false) as ends_in_delete{extra} \
+             coalesce({last}[1][2] = 'delete', false) as ends_in_delete, \
+             ({last}[1][3])::pg_lsn as last_lsn, \
+             {last}[1][4] as last_row_txid{extra} \
          from filtered \
          group by src_table, key{tail}"
     )
@@ -904,12 +931,19 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     // delete. The `relationship_reverse_deferred` branch above never sees a
     // delete (its rows are `rel_reverse_deferred`), so segment order is
     // right for this flag there too.
-    let ends_in_delete =
-        if later.old_image.is_some() || later.new_image.is_some() || later.ends_in_delete {
-            later.ends_in_delete
-        } else {
-            earlier.ends_in_delete
-        };
+    let later_speaks =
+        later.old_image.is_some() || later.new_image.is_some() || later.ends_in_delete;
+    let ends_in_delete = if later_speaks {
+        later.ends_in_delete
+    } else {
+        earlier.ends_in_delete
+    };
+    // #623 D3: the change that supplied the post-image, by the same rule.
+    let last_change = if later_speaks {
+        later.last_change.clone()
+    } else {
+        earlier.last_change.clone()
+    };
 
     // Issue #486: the same "born and died" loss can happen across segments.
     // An insert sealed into `earlier` and a delete into `later` each fold to
@@ -955,6 +989,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         has_recompute: earlier.has_recompute || later.has_recompute,
         vanished_images,
         ends_in_delete,
+        last_change,
     }
 }
 
@@ -1058,6 +1093,7 @@ mod merge_tests {
             has_recompute: false,
             vanished_images: Vec::new(),
             ends_in_delete: false,
+            last_change: None,
         }
     }
 

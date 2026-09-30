@@ -69,11 +69,12 @@ pub enum Plant {
     /// folds *all* of its buckets instead of the ones it won, so two workers
     /// apply the same rows. Found by #557 part 1's review.
     ClaimAllBuckets,
-    /// Aggregate apply (`staging::apply_aggregate`): each apply transaction
-    /// takes a non-waiting advisory lock per group before its pre-lock, and
-    /// drops its delta for any group another open apply transaction already
-    /// holds. Only two workers applying one group at once can trip it.
-    /// Found by #557 part 1's review.
+    /// Aggregate apply (`staging::apply_aggregate`, and a ledger target's
+    /// group upsert in `staging::ledger` since #623 D3): each apply
+    /// transaction takes a non-waiting advisory lock per group before it
+    /// writes the group, and drops its delta for any group another open
+    /// apply transaction already holds. Only two workers applying one group
+    /// at once can trip it. Found by #557 part 1's review.
     DropRacingGroupDelta,
     /// Issue #344: a 1-1 write whose source row changed after Phase 2 read
     /// it applies anyway, instead of being settled against the current row
@@ -85,6 +86,16 @@ pub enum Plant {
     /// (`staging::apply_aggregate::delta_may_be_absorbed`). A commit a
     /// forced recompute already counted is then counted again.
     IgnoreRecomputeHorizon,
+    /// ADR-0002 I1 (#623 D3): a ledger target's page takes no entry lock
+    /// before its Re-derive read (`staging::ledger`), so the read can run
+    /// while another page is between its own read and its write for the
+    /// same key, and one of the two writes the entry from a stale read.
+    SkipLedgerLock,
+    /// ADR-0002 I2 (#623 D3): a ledger target skips a change only by `lsn`
+    /// (at or below the entry's `applied_lsn`), without the visibility test
+    /// against the entry's Re-derive `basis` (`staging::ledger`). A change a
+    /// Re-derive already read is then applied a second time.
+    LsnOnlySkip,
 }
 
 impl Plant {
@@ -94,6 +105,8 @@ impl Plant {
         Plant::DropRacingGroupDelta,
         Plant::StaleOneToOneWrite,
         Plant::IgnoreRecomputeHorizon,
+        Plant::SkipLedgerLock,
+        Plant::LsnOnlySkip,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -103,6 +116,8 @@ impl Plant {
             Plant::DropRacingGroupDelta => "drop_racing_group_delta",
             Plant::StaleOneToOneWrite => "stale_one_to_one_write",
             Plant::IgnoreRecomputeHorizon => "ignore_recompute_horizon",
+            Plant::SkipLedgerLock => "skip_ledger_lock",
+            Plant::LsnOnlySkip => "lsn_only_skip",
         }
     }
 

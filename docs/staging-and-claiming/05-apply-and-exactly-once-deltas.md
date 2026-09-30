@@ -207,6 +207,12 @@ Skipping would leave the target frozen until the key went quiet.
 
 ### Aggregate groups: the recompute horizon
 
+This section covers aggregate targets that are not on the ledger yet: any
+target with an `AVG`, `MIN`/`MAX` or composed field, a float argument, or a
+relationship. A plain `SUM`/`COUNT` target is on the ledger instead (see
+[Aggregate groups: the ledger](#aggregate-groups-the-ledger), #623 D3), with
+no horizon, pre-lock or probe.
+
 An aggregate group can also receive an absolute write. An image-less change
 (a catch-up enumeration, a chained hop's `Recompute`, a relationship fallback, a
 truncate) has no prior state to diff, so Phase 3 re-derives the whole group from
@@ -275,11 +281,12 @@ inline enumeration (#418): every ring capture runs in the backfill discharge,
 behind the #312 wait
 ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)).
 
-### The ledger (apply reads it from #623 D3)
+### The ledger
 
-ADR-0002 replaces the horizon with a per-key ledger. Today the ledger is only
-written: apply neither reads nor maintains it, so it goes stale after a target's
-first change. This section describes what exists so far.
+ADR-0002 replaces the horizon with a per-key ledger. Apply maintains it for
+plain aggregate targets since #623 D3 (next section). Every other target's
+ledger is only written by its build, and goes stale after the target's first
+change until its own part of #623 moves it.
 
 Every target has one, `<target>__ledger` in the target's schema, created in the
 registration transaction and dropped with the target (`defs::ledger`). It holds
@@ -311,6 +318,65 @@ target row holds the values.
 The one-pass aggregate build writes the ledger. It empties it, reads the source
 into it in one statement whose snapshot becomes every entry's basis, and then
 writes the group rows as a `GROUP BY` over it. The 1-1 build writes no entries.
+
+### Aggregate groups: the ledger
+
+An aggregate target whose every field is `SUM(x)`, `COUNT(*)` or `COUNT(x)`
+over an exact numeric source column, grouped by plain source columns, is on the
+ledger (`staging::ledger`, #623 D3). Each page applies its records for such a
+target in one transaction, in four steps:
+
+1. **Lock (I1, I5).** Insert a non-member placeholder entry for every key the
+   page has no entry for, then lock every entry `for update`, sorted by key, in
+   one statement.
+2. **Re-derive read.** A record staged as a `recompute`, or folded with one, is a
+   Re-derive. So is a record with no change to apply. One statement reads those
+   keys' current source rows *and* `pg_current_snapshot()`, after the lock. A key
+   with no row becomes a tombstone.
+3. **Entries, then groups, in one statement.** It first updates each entry:
+   - A Re-derive writes the entry from its read. It sets `__basis` to the
+     read's snapshot and leaves `__applied_lsn` alone (#623 Q1). Every change
+     the read saw is visible in that snapshot. Every change it missed is still
+     pending with its own ring row, and its trigger `lsn` may be below any
+     position the read could record.
+   - An Apply writes the entry from the record's new image, or makes a tombstone
+     for a delete. It sets `__applied_lsn` to the change's `lsn`. It changes the
+     entry only if all three hold (I2):
+     - the change's source transaction (`row_txid`) is not visible in the
+       entry's `__basis`;
+     - its `lsn` is above `__applied_lsn`;
+     - its `lsn` is above the target's truncate floor.
+
+   The statement then sums each updated entry's move from its old state to its
+   new one into per-group increments: the member count, and per argument its
+   sum and its non-null count. It upserts them in group order, incrementing every
+   column (I3). A `SUM` goes `NULL` when its non-null count reaches 0.
+4. **Empty groups go.** Groups whose `__trellis_members` reached 0 are deleted.
+
+There is no live `GROUP BY`, probe or horizon, and a page takes its locks in one
+order: entries, then groups, each in one sorted statement. A Re-derive of an
+unchanged key moves nothing, so a go-live re-read after the build writes no
+group rows.
+
+Each written or deleted group reaches the seam with its prior image. PG 17 has
+no `OLD` in `RETURNING`, so the image is rebuilt from the upsert's result minus
+the increments. A group the upsert created has no prior image.
+
+A fold record carries the identity of the change that won its post-image
+(`last_change`: its `lsn` and `row_txid`, see
+[04](04-claiming-and-the-fold.md)). That change is the one an Apply judges.
+
+**Truncate.** A source `TRUNCATE` empties the ledger, deletes every group row,
+and raises the target's truncate floor (`ledger_truncate_floor`) to the
+truncate's `lsn` (#623 Q6). `TRUNCATE` takes `ACCESS EXCLUSIVE`, so every
+earlier writer's trigger ran below that `lsn` and every later writer's above it.
+
+**Release and the orphan sweep.** Releasing a quarantined key
+(`staging::release_key`) stages one `Recompute` of it and discards the parked
+rows. A replayed row would carry the releaser's `row_txid`, not the source
+transaction's. A catch-up discharge's orphan sweep finds live entries the
+source no longer backs, and stages a `Recompute` of each instead of deleting
+their groups directly.
 
 ## What this replaced
 

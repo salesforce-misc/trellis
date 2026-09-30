@@ -59,6 +59,7 @@ pub mod error;
 pub mod fold;
 #[cfg(any(test, feature = "test-util"))]
 pub mod interleave;
+pub(crate) mod ledger;
 pub mod liveness;
 pub(crate) mod page;
 pub mod quarantine;

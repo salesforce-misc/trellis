@@ -31,7 +31,7 @@ async fn migrate_up_is_idempotent() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
-            50, 51, 53, 54, 55, 56
+            50, 51, 53, 54, 55, 56, 57
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -118,8 +118,10 @@ async fn migrate_up_is_idempotent() {
         // Issue #622 added V55 (`pending_backfill.capture_gate_lsn`, the
         // capture gate a trigger install or widen sets) and V56
         // (`column_status.awaiting_capture`, an `ALTER TRANSFORM` field held
-        // paused until the capture images the columns it reads).
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V56 to be applied"
+        // paused until the capture images the columns it reads). Issue #623
+        // D3 added V57 (`ledger_truncate_floor`, a ledger target's truncate
+        // floor).
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V57 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

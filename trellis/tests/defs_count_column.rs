@@ -460,11 +460,14 @@ async fn count_column_forced_full_recompute_still_excludes_nulls() {
         .await
         .expect("seed source rows");
 
-    // A bare recompute trigger carries no image at all, so
-    // `accumulate_changes` cannot fold it as a delta and forces the whole
-    // group onto `GroupPlan::force_full_recompute` — exercising
-    // `upsert_group`'s `probe_count` (single-group probe path).
-    stage_bare_recompute(&client, "1", "events").await;
+    // A bare recompute trigger carries no image at all. Since #623 D3 this
+    // target is on the ledger, where each is a Re-derive of its own key's
+    // entry, so every key is staged. (Before, `accumulate_changes` forced
+    // the whole group onto `GroupPlan::force_full_recompute` from one key,
+    // exercising `upsert_group`'s `probe_count`.)
+    for id in ["1", "2", "3", "4"] {
+        stage_bare_recompute(&client, id, "events").await;
+    }
     drain_sealed(&mut client, &db.pool, "count_worker_forced_v1").await;
 
     let got = read_totals(&client).await;
@@ -499,7 +502,8 @@ async fn count_column_bulk_forced_full_recompute_still_excludes_nulls() {
         .await
         .expect("seed source rows");
 
-    for id in ["1", "3", "6"] {
+    // Every key: on the ledger (#623 D3) a Re-derive covers its own key.
+    for id in ["1", "2", "3", "4", "5", "6"] {
         stage_bare_recompute(&client, id, "events").await;
     }
     drain_sealed(&mut client, &db.pool, "count_worker_forced_bulk_v1").await;
