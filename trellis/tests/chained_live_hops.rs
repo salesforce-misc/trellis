@@ -8,7 +8,7 @@
 //! publication, a write to it was staged twice under two spellings of the
 //! table — once by the applying transaction's own downstream propagation and
 //! once by intake — which live-locked the downstream apply. Issue #315 then
-//! took intermediate hops out of the publication altogether: every write to
+//! took intermediate hops out of the captured set altogether: every write to
 //! a target reaches its readers only through the target-mutation seam
 //! (`staging::target_mutations`), inside the writing transaction, so there is
 //! one staging and one spelling by construction. That also fixed an
@@ -16,13 +16,13 @@
 //! decoded at all (issue #315's original report: intake died on the first
 //! change).
 //!
-//! Intake's spelling of the root source is still real here: the tests read
-//! `pgoutput` off a second replication slot and feed it to a real
-//! `Intake::handle_event`, then seal and drain by hand
-//! (`support/pgoutput_intake.rs`). Hand-staging the root's CDC row instead
-//! would write intake's half of #267's spelling disagreement into the test
-//! (#369). Driving every step by hand makes each test deterministic: no
-//! background worker, no reconcile loop, no polling for convergence (#297).
+//! The root source's capture is real here: the tests install the capture
+//! triggers with the staging worker's own reconcile pass, then seal and drain
+//! by hand (`support/trigger_pipeline.rs`). Hand-staging the root's ring row
+//! instead would write capture's half of #267's spelling disagreement into
+//! the test (#369). Driving every step by hand makes each test
+//! deterministic: no background worker, no reconcile loop, no polling for
+//! convergence (#297).
 //! A drain that fails panics with its error, and a ring that never quiesces
 //! panics with its stuck `(src_table, key)` pairs, where #267 would once
 //! have retried a `draining` segment forever.
@@ -32,10 +32,10 @@ use std::collections::HashMap;
 use trellis::defs::ast::ValueType;
 use trellis::defs::install_definition;
 
-#[path = "support/pgoutput_intake.rs"]
-mod pgoutput_intake;
+#[path = "support/trigger_pipeline.rs"]
+mod trigger_pipeline;
 
-use pgoutput_intake::Pipeline;
+use trigger_pipeline::Pipeline;
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -72,7 +72,7 @@ async fn install_chain(
 /// the root reaches `h2` through the middle hop.
 #[tokio::test]
 async fn a_two_hop_one_to_one_chain_converges_without_publishing_the_middle_hop() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute("create table public.src (id integer primary key, val numeric)")
         .await
         .expect("create src");
@@ -93,7 +93,7 @@ async fn a_two_hop_one_to_one_chain_converges_without_publishing_the_middle_hop(
         .execute("insert into public.src (id, val) values (1, 1)", &[])
         .await
         .expect("insert into src");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(
         chain.rows(H2).await,
         rows(&[("1", "1")]),
@@ -105,7 +105,7 @@ async fn a_two_hop_one_to_one_chain_converges_without_publishing_the_middle_hop(
         .execute("update public.src set val = 2 where id = 1", &[])
         .await
         .expect("update src");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(chain.rows(H2).await, rows(&[("1", "2")]));
 
     chain
@@ -113,17 +113,15 @@ async fn a_two_hop_one_to_one_chain_converges_without_publishing_the_middle_hop(
         .execute("delete from public.src where id = 1", &[])
         .await
         .expect("delete from src");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(chain.rows(H2).await, rows(&[]));
-
-    chain.finish().await;
 }
 
 /// Issue #267 follow-up (the issue's repro is 1-1 only, 2 hops only): `h2`
 /// here is a *deeper* intermediate hop, and `h3` an aggregate reading it.
 #[tokio::test]
 async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute("create table public.src (id integer primary key, val numeric)")
         .await
         .expect("create src");
@@ -150,7 +148,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
         )
         .await
         .expect("insert into src");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(
         chain.rows(H3).await,
         rows(&[("7", "2")]),
@@ -163,10 +161,8 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
         .execute("update public.src set val = 8 where id = 1", &[])
         .await
         .expect("move row 1 to group 8");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(chain.rows(H3).await, rows(&[("7", "1"), ("8", "1")]));
-
-    chain.finish().await;
 }
 
 /// Issue #315's original report: an aggregate target feeding another
@@ -178,7 +174,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
 /// lets `hist` fix the group a row left.
 #[tokio::test]
 async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_group_moves() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     // A text group key: a transform chained off an aggregate target reads
     // its group column as a primary key, which can't be `numeric`.
     raw.batch_execute(
@@ -217,7 +213,7 @@ async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_grou
         )
         .await
         .expect("insert into src");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(
         chain.rows(HIST).await,
         rows(&[("2", "1"), ("1", "1")]),
@@ -233,7 +229,7 @@ async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_grou
         .execute("update public.src set val = 'a' where id = 3", &[])
         .await
         .expect("move row 3");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(
         chain.rows(HIST).await,
         rows(&[("3", "1")]),
@@ -246,12 +242,10 @@ async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_grou
         .execute("delete from public.src where id = 1", &[])
         .await
         .expect("delete row 1");
-    chain.settle().await;
+    chain.drain().await;
     assert_eq!(
         chain.rows(HIST).await,
         rows(&[("2", "1")]),
         "hist must follow agg's shrunken group"
     );
-
-    chain.finish().await;
 }

@@ -1181,16 +1181,13 @@ async fn a_truncate_claimed_through_the_predecessor_half_reaches_the_barrier() {
 
 /// Issue #271: a seal actually completing is the one transition that makes
 /// a segment claimable, so `seal_phase2` now `pg_notify`s `wake_channel` the
-/// instant it publishes the fence. Mirrors
-/// `intake_core.rs`'s `notify_is_only_delivered_after_staged_rows_are_visible`
-/// — the same "notify must not precede the fact it announces" property,
-/// proven the same way: a dedicated `LISTEN` connection must never observe
+/// instant it publishes the fence. The property is "notify must not precede
+/// the fact it announces": a dedicated `LISTEN` connection must never observe
 /// the notification before a completely separate connection can already see
 /// the fence it announces. `seal_phase2`'s own doc comment explains why this
-/// holds here even though, unlike `intake::advance_watermark_and_notify`,
-/// there is no explicit wrapping `Transaction` to point to: the `update` and
-/// the `pg_notify` are one statement, so Postgres's own single-statement
-/// implicit transaction is what makes the two atomic.
+/// holds even though there is no explicit wrapping `Transaction` to point
+/// to: the `update` and the `pg_notify` are one statement, so Postgres's own
+/// single-statement implicit transaction is what makes the two atomic.
 #[tokio::test]
 async fn seal_notify_is_only_delivered_after_the_fence_is_visible() {
     let cluster = TestCluster::start();

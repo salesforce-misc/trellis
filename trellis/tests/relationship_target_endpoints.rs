@@ -1,5 +1,5 @@
 //! Issue #375's direction 1 (#403): a relationship endpoint that is one of
-//! this instance's own targets is never published. The target-mutation seam
+//! this instance's own targets is never captured. The target-mutation seam
 //! is its only change feed, staging each write CDC-shaped (prior and new
 //! image, write token as `lsn`), so `create_relationship` asks nothing of the
 //! target's replica identity or key, and an aggregate target may be an
@@ -22,10 +22,10 @@ use trellis::defs::{
 };
 use trellis::integer::IntWidth;
 
-#[path = "support/pgoutput_intake.rs"]
-mod pgoutput_intake;
+#[path = "support/trigger_pipeline.rs"]
+mod trigger_pipeline;
 
-use pgoutput_intake::Pipeline;
+use trigger_pipeline::Pipeline;
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -57,7 +57,7 @@ async fn replica_identity(raw: &Client, qualified: &str) -> String {
 /// CDC needs (ADR-0005: checked, never altered).
 #[tokio::test]
 async fn a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished() {
-    let (_cluster, db, raw) = pgoutput_intake::database().await;
+    let (_cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, val numeric, grp integer); \
          create table public.reports (id integer primary key, oid integer); \
@@ -114,12 +114,12 @@ async fn a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished() {
 /// an aggregate becomes a to-many relationship's from-side. It used to be
 /// published then, on whatever identity it had, so an update reached the
 /// aggregate as CDC with no old image, counted as an insert into the new
-/// group without leaving the old one. Now it stays unpublished (asserted by
+/// group without leaving the old one. Now it stays uncaptured (asserted by
 /// [`Pipeline::attach`]), and the aggregate sees each write once, through the
 /// seam, with the prior image the seam captured under its row lock.
 #[tokio::test]
 async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through_the_seam_alone() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, val numeric); \
          alter table public.src replica identity full; \
@@ -151,13 +151,13 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
         )
         .await
         .expect("insert into src");
-    chain.settle().await;
+    chain.drain().await;
     chain
         .raw
         .execute("update public.src set val = 20 where id = 1", &[])
         .await
         .expect("update src");
-    chain.settle().await;
+    chain.drain().await;
 
     assert_eq!(
         chain
@@ -166,8 +166,6 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
         rows(&[("10", "1"), ("20", "1")]),
         "row 1 left group 10 and joined group 20, counted once"
     );
-
-    chain.finish().await;
 }
 
 /// Guard 2's same-instance half is gone: an aggregate target is accepted as
@@ -177,7 +175,7 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
 /// `endpoint_seam_feed.rs`.
 #[tokio::test]
 async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
-    let (_cluster, db, raw) = pgoutput_intake::database().await;
+    let (_cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.sales (id integer primary key, region integer, amount integer); \
          alter table public.sales replica identity full; \
@@ -227,7 +225,7 @@ async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
 /// build writes. The same rule a transform chaining off the target follows.
 #[tokio::test]
 async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
-    let (_cluster, db, raw) = pgoutput_intake::database().await;
+    let (_cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, val numeric); \
          insert into public.src values (1, 1), (2, 2); \
@@ -273,7 +271,7 @@ async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
 /// the join key itself is an integer.
 #[tokio::test]
 async fn an_aggregate_target_keyed_on_an_unsupported_type_is_refused_as_an_endpoint() {
-    let (_cluster, db, raw) = pgoutput_intake::database().await;
+    let (_cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.sales (id integer primary key, region integer, tier numeric, \
                                     amount integer); \

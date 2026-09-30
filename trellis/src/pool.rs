@@ -894,8 +894,7 @@ mod tests {
 
     /// Issue #672: `money` renders the same on every kind of session Trellis
     /// opens itself (pooled, unpooled, dedicated) even when the database's
-    /// own `lc_monetary` default says otherwise. The walsender, the fourth
-    /// kind, is covered with the other pins in `tests/intake_guc_pinning.rs`.
+    /// own `lc_monetary` default says otherwise.
     #[tokio::test]
     async fn money_renders_the_same_on_every_session_kind_under_a_hostile_lc_monetary() {
         let cluster = testkit::TestCluster::start();

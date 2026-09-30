@@ -3,7 +3,7 @@
 //! left and the group it joined correct.
 //!
 //! `h1` below is the target of `src -> h1` and the source of the aggregate
-//! `h1 -> h3`. Since issue #315 a target table is never published: the drain
+//! `h1 -> h3`. Since issue #315 a target table is never captured: the drain
 //! that writes `h1` stages its own downstream `Recompute` for `h3` inside the
 //! writing transaction (`staging::target_mutations`), and that is the only
 //! copy. Before, `h1` was published too, and intake decoded the same write a
@@ -11,18 +11,21 @@
 //! aggregate re-derived the group from live state (which already held the
 //! write) and then added the CDC delta on top of it.
 //!
-//! The tests drive intake and the drain by hand (`support/pgoutput_intake.rs`)
-//! so every hop lands in its own batch, rather than relying on seal timing.
+//! The tests install capture and drive the drain by hand
+//! (`support/trigger_pipeline.rs`) so every hop lands in its own batch,
+//! rather than relying on seal timing.
 
 use std::collections::HashMap;
 
+use trellis::capture::install::{Installed, installed};
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::install_definition;
 
-#[path = "support/pgoutput_intake.rs"]
-mod pgoutput_intake;
+#[path = "support/trigger_pipeline.rs"]
+mod trigger_pipeline;
 
-use pgoutput_intake::Pipeline;
+use trigger_pipeline::Pipeline;
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -38,9 +41,9 @@ fn groups(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
         .collect()
 }
 
-/// `src -> h1 -> h3`, with only `src` published.
+/// `src -> h1 -> h3`, with only `src` captured.
 async fn start() -> Pipeline {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute("create table public.src (id integer primary key, val numeric)")
         .await
         .expect("create src");
@@ -81,23 +84,28 @@ async fn an_aggregate_counts_an_intermediate_hops_write_once() {
 
     // The `src` insert reaches the ring, and draining it writes `h1`, whose
     // own downstream `Recompute` then drains into `h3` in a later batch.
-    hop.feed_and_drain().await;
+    hop.drain().await;
     assert_eq!(
         hop.rows(H3).await,
         groups(&[("7", "1")]),
         "the in-transaction propagation alone must count the row once"
     );
 
-    // Intake now decodes the transaction that wrote `h1`. `h1` isn't in the
-    // publication, so nothing of that write reaches the ring a second time.
-    hop.feed_and_drain().await;
+    // `h1` has no capture of its own, so the drain's write to it never
+    // reaches the ring a second time.
+    assert_eq!(
+        installed(&hop.raw, DEFAULT_SCHEMA, "public.h1")
+            .await
+            .expect("read h1's capture"),
+        Installed::Absent,
+        "an intermediate hop is never captured"
+    );
+    hop.drain().await;
     assert_eq!(
         hop.rows(H3).await,
         groups(&[("7", "1")]),
         "an intermediate hop's write must never be counted twice"
     );
-
-    hop.finish().await;
 }
 
 /// Issue #315's grain migration: `h3` groups by `h1.val`, a non-key column
@@ -114,14 +122,14 @@ async fn an_aggregate_over_a_hop_follows_a_row_that_moves_groups_and_then_leaves
         .batch_execute("insert into public.src (id, val) values (1, 7), (2, 7), (3, 9)")
         .await
         .expect("seed src");
-    hop.feed_and_drain().await;
+    hop.drain().await;
     assert_eq!(hop.rows(H3).await, groups(&[("7", "2"), ("9", "1")]),);
 
     hop.raw
         .execute("update public.src set val = 8 where id = 1", &[])
         .await
         .expect("move row 1 from group 7 to group 8");
-    hop.feed_and_drain().await;
+    hop.drain().await;
     assert_eq!(
         hop.rows(H3).await,
         groups(&[("7", "1"), ("8", "1"), ("9", "1")]),
@@ -136,12 +144,11 @@ async fn an_aggregate_over_a_hop_follows_a_row_that_moves_groups_and_then_leaves
         .execute("delete from public.src where id = 1", &[])
         .await
         .expect("delete group 8's only row");
-    hop.feed_and_drain().await;
+    hop.drain().await;
     assert_eq!(
         hop.rows(H3).await,
         groups(&[("9", "2")]),
         "a group every row left, by moving or by deletion, must be removed"
     );
 
-    hop.finish().await;
 }

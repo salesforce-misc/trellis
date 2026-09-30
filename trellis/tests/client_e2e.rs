@@ -1,9 +1,9 @@
 //! End-to-end tests for the [`trellis::Client`] runtime (issue #11's runtime
-//! increment): drive the *whole* pipeline — publication/slot setup, CDC
-//! intake, ring maintenance, and application workers — through the public
-//! `Client` API against a real, ephemeral Postgres instance
-//! (`testkit::TestCluster`), rather than staging changes into the ring by
-//! hand the way `apply.rs`/`intake_core.rs` do.
+//! increment): drive the *whole* pipeline — capture-trigger setup, ring
+//! maintenance, and application workers — through the public `Client` API
+//! against a real, ephemeral Postgres instance (`testkit::TestCluster`),
+//! rather than staging changes into the ring by hand the way `apply.rs`
+//! does.
 //!
 //! Two things this file exists to prove:
 //!
@@ -30,8 +30,7 @@ use trellis::defs::{
 use trellis::{Client as TrellisClient, ClientOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`) and pins
-/// `search_path`, matching `apply.rs`/`intake_core.rs`'s helper of the same
-/// name.
+/// `search_path`, matching `apply.rs`'s helper of the same name.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
     tokio::spawn(async move {

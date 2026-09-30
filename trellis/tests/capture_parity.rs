@@ -1,5 +1,5 @@
-//! Issue #622 (C2), acceptance A1: a capture trigger stages exactly what
-//! intake stages for the same write.
+//! Issue #622 (C2), acceptance A1: a capture trigger stages exactly the
+//! images its golden fixture records for the same write.
 //!
 //! One column per `docs/type-support.md` family (the #565 E3 matrix), with
 //! edge values and an all-`NULL` row, goes through insert, update and delete.
@@ -12,41 +12,35 @@
 //!
 //! Every write runs in an application session whose `DateStyle`, `TimeZone`,
 //! `bytea_output`, `IntervalStyle` and `extra_float_digits` all differ from
-//! the settings Trellis pins. The generated triggers are installed by hand,
-//! and a real [`trellis::intake::Intake`] decodes the same transactions from
-//! `pgoutput` (`support/pgoutput_intake.rs`). Both land in the ring. A
-//! trigger's rows are the ones whose `row_txid` is the writer's
-//! `pg_current_xact_id()`; the rest are intake's. The writer's role has no
+//! the settings Trellis pins. The generated triggers are installed by hand.
+//! Every ring row a step stages must carry the writer's
+//! `pg_current_xact_id()` as its `row_txid`. The writer's role has no
 //! privilege on Trellis's schema, so the `SECURITY DEFINER` functions are
 //! what reach the ring.
 //!
-//! Per step and per key, the two row sequences in `(lsn, change_id)` order
-//! must match: key, op, both images (intake's restricted to the columns the
-//! trigger images), `group_key` and `hop_gen`. Two differences are
-//! normalized, both documented in `trellis::capture`: intake's update that
-//! moves a primary key is compared as the delete plus insert a trigger
-//! stages, and `lsn`/`src_changed` are not compared (commit position and
-//! time for intake, statement position and time for a trigger).
+//! Per step, table and key, the rows in `(lsn, change_id)` order (key, op,
+//! both images restricted to the spec's columns, `group_key` and `hop_gen`)
+//! must equal the golden fixture `tests/fixtures/capture_parity.txt`.
+//! `lsn`/`src_changed` are not compared (statement position and time).
 //!
-//! The trigger rows are also checked against the golden fixture
-//! `tests/fixtures/capture_parity.txt`, so this test keeps its oracle once
-//! intake is deleted (C7 drops the intake half). Regenerate it with
-//! `TRELLIS_BLESS_CAPTURE_PARITY=1`.
+//! C2 recorded the fixture from trigger rows that matched, row for row, what
+//! intake decoded from the WAL for the same transactions, with two
+//! normalizations: an update that moved a primary key compared as the
+//! delete plus insert a trigger stages, and intake's images restricted to the
+//! trigger's columns. Intake is gone (#622 C7), so the fixture is the oracle.
+//! Regenerate it with `TRELLIS_BLESS_CAPTURE_PARITY=1` only for a change to
+//! what capture images, and review the diff as a behaviour change.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::capture::columns::{capture_spec, load_catalog};
-use trellis::capture::sql::{CaptureSpec, install_statements, pinned_output_settings};
+use trellis::capture::sql::{CaptureSpec, install_statements};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_relationship, install_definition, publication_tables};
-
-#[path = "support/pgoutput_intake.rs"]
-mod pgoutput_intake;
-
-use pgoutput_intake::Pipeline;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -165,7 +159,7 @@ const FAMILIES: &[(&str, &str, &[&str])] = &[
     (
         "c_comp",
         "public.pair",
-        // `ROW(NULL, NULL)` is not a NULL value (`pgoutput` sends `(,)`),
+        // `ROW(NULL, NULL)` is not a NULL value (its output is `(,)`),
         // though `IS NULL` is true of it.
         &["ROW(1, 'x y')::public.pair", "ROW(NULL, NULL)::public.pair"],
     ),
@@ -212,10 +206,7 @@ struct RingRow {
     has_lsn_and_time: bool,
 }
 
-/// Every ring row of `table` above `after`, in `(lsn, change_id)` order, with
-/// an intake update that moved the primary key split into the delete plus
-/// insert a trigger stages. Only a single-column key's move is recognized,
-/// which is the only kind the steps make.
+/// Every ring row of `table` above `after`, in `(lsn, change_id)` order.
 async fn ring_rows(raw: &Client, after: i64, table: &str, spec: &CaptureSpec) -> Vec<RingRow> {
     let ring = (0..4)
         .map(|s| format!("select * from {DEFAULT_SCHEMA}.seg_{s}"))
@@ -227,32 +218,17 @@ async fn ring_rows(raw: &Client, after: i64, table: &str, spec: &CaptureSpec) ->
              where e.key = any($3::text[]))"
         )
     };
-    let old_key = if spec.key().len() == 1 {
-        format!("r.old_image ->> {}", quote_literal(&spec.key()[0]))
-    } else {
-        "r.key".to_string()
-    };
     let sql = format!(
-        "select r.row_txid::text, x.key, to_jsonb(x.key)::text, \
-                jsonb_build_array(x.op, {ro}, {rn}, r.group_key, r.hop_gen)::text, \
-                jsonb_build_array(x.op, x.old_image, x.new_image, r.group_key, r.hop_gen)::text, \
+        "select r.row_txid::text, r.key, to_jsonb(r.key)::text, \
+                jsonb_build_array(r.op, {ro}, {rn}, r.group_key, r.hop_gen)::text, \
+                jsonb_build_array(r.op, r.old_image, r.new_image, r.group_key, r.hop_gen)::text, \
                 r.lsn is not distinct from r.origin_lsn, \
                 r.lsn is not null and r.src_changed is not null \
          from ({ring}) r \
-         cross join lateral ( \
-             select r.key, r.op, r.old_image, r.new_image, 0 as part \
-             where not (r.op = 'update' and {old_key} is distinct from r.key) \
-             union all \
-             select {old_key}, 'delete', r.old_image, null, 0 \
-             where r.op = 'update' and {old_key} is distinct from r.key \
-             union all \
-             select r.key, 'insert', null, r.new_image, 1 \
-             where r.op = 'update' and {old_key} is distinct from r.key \
-         ) x \
          where r.change_id > $1 and r.src_table = $2 \
-         order by r.lsn, r.change_id, x.part",
-        ro = restrict("x.old_image"),
-        rn = restrict("x.new_image"),
+         order by r.lsn, r.change_id",
+        ro = restrict("r.old_image"),
+        rn = restrict("r.new_image"),
     );
     let columns: Vec<String> = spec.columns().to_vec();
     raw.query(&sql, &[&after, &table, &columns])
@@ -271,23 +247,15 @@ async fn ring_rows(raw: &Client, after: i64, table: &str, spec: &CaptureSpec) ->
         .collect()
 }
 
-fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-fn by_key(rows: &[&RingRow]) -> BTreeMap<String, Vec<String>> {
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for row in rows {
-        out.entry(row.key.clone())
-            .or_default()
-            .push(row.doc.clone());
-    }
-    out
-}
-
 #[tokio::test]
-async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(
+        db.dsn(),
+        &format!("set search_path to {DEFAULT_SCHEMA}, public"),
+    )
+    .await;
 
     let fam_columns: Vec<String> = FAMILIES
         .iter()
@@ -379,7 +347,7 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
     assert_eq!(
         fam.group_key(),
         strings(&["fk2", "fk"]),
-        "group-key columns in physical order, as intake reads them"
+        "group-key columns in physical order"
     );
     let parent = &specs["public.parent"];
     assert_eq!(
@@ -407,30 +375,17 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
     .expect("every-family spec");
     specs.insert("public.fam".to_string(), every_family);
 
-    let mut pipeline = Pipeline::attach(cluster, db, raw, &published_refs(&published)).await;
-
     for spec in specs.values() {
         for statement in install_statements(DEFAULT_SCHEMA, spec).expect("generate") {
-            pipeline
-                .raw
-                .batch_execute(&statement)
+            raw.batch_execute(&statement)
                 .await
                 .unwrap_or_else(|e| panic!("install capture:\n{statement}\n{e}"));
         }
     }
 
-    // Intake decodes in `raw`'s backend, so pin it the way the walsender is
-    // pinned in production.
-    pipeline
-        .raw
-        .batch_execute(&pinned_output_settings().join("; "))
-        .await
-        .expect("pin raw");
     // The application role has no privilege on Trellis's schema: the
     // `SECURITY DEFINER` functions write the ring for it.
-    pipeline
-        .raw
-        .batch_execute(&format!(
+    raw.batch_execute(&format!(
             "do $$ begin create role {APP_ROLE}; \
              exception when duplicate_object then null; end $$; \
              grant usage on schema public to {APP_ROLE}; \
@@ -439,7 +394,7 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
         .await
         .expect("create the application role");
     let mut writer = connect(
-        pipeline.db.dsn(),
+        db.dsn(),
         &format!("set role {APP_ROLE}; {HOSTILE}"),
     )
     .await;
@@ -454,8 +409,7 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
     assert!(!usage, "the writer can't reach the ring on its own");
     // Nor can it execute a capture function (so it can't attach one to a
     // table of its own), yet its writes below still fire them.
-    let privileges = pipeline
-        .raw
+    let privileges = raw
         .query_one(
             "select count(*), \
                     count(*) filter (where pg_catalog.has_function_privilege($2, p.oid, 'execute')) \
@@ -556,8 +510,7 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
         ("truncate", strings(&["truncate public.ctl"])),
     ];
 
-    let mut after: i64 = pipeline
-        .raw
+    let mut after: i64 = raw
         .query_one(
             &format!(
                 "select coalesce(max(change_id), 0) from ({}) r",
@@ -586,16 +539,17 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
             .expect("writer xid")
             .get(0);
         txn.commit().await.expect("commit");
-        pipeline.feed_intake().await;
 
         golden.push(format!("# {step}"));
         let mut total = 0;
         for (table, spec) in &specs {
-            let all = ring_rows(&pipeline.raw, after, table, spec).await;
-            total += all.len();
-            let (trigger, intake): (Vec<&RingRow>, Vec<&RingRow>) =
-                all.iter().partition(|r| r.txid == xid);
+            let trigger = ring_rows(&raw, after, table, spec).await;
+            total += trigger.len();
             for row in &trigger {
+                assert_eq!(
+                    row.txid, xid,
+                    "{step}: every ring row is the writer's own ({table})"
+                );
                 assert_eq!(
                     row.doc, row.raw_doc,
                     "{step}: a trigger images exactly its spec's columns ({table})"
@@ -606,11 +560,6 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
                     "{step}: lsn and src_changed are set ({table})"
                 );
             }
-            assert_eq!(
-                by_key(&trigger),
-                by_key(&intake),
-                "{step}: trigger (left) and intake (right) disagree on {table}"
-            );
             let mut lines: Vec<(String, String)> = trigger
                 .iter()
                 .map(|r| (r.key.clone(), format!("{table}\t{}\t{}", r.key_json, r.doc)))
@@ -619,8 +568,7 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
             lines.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             golden.extend(lines.into_iter().map(|(_, line)| line));
         }
-        after = pipeline
-            .raw
+        after = raw
             .query_one(
                 &format!(
                     "select coalesce(max(change_id), $1) from ({}) r",
@@ -657,9 +605,4 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
     }
 
     drop(writer);
-    pipeline.finish().await;
-}
-
-fn published_refs(published: &[String]) -> Vec<&str> {
-    published.iter().map(String::as_str).collect()
 }

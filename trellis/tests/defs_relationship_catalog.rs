@@ -548,51 +548,6 @@ async fn a_to_many_to_side_with_default_replica_identity_is_rejected() {
     assert!(missing.is_none());
 }
 
-/// Issue #41: `REPLICA IDENTITY NOTHING` (`relreplident = 'n'`) is rejected too
-/// — it omits *every* column from pre-images, so the non-PK join key is just as
-/// absent as under the default identity. Pinned separately so a future SQL
-/// change can't silently start accepting `'n'`. Since issue #375 the endpoint
-/// keying guard catches it first: intake can't key a table with no replica
-/// identity at all, whatever the relationship's cardinality.
-#[tokio::test]
-#[ignore = "#622: deleted in C7/C8"]
-async fn a_to_many_to_side_with_replica_identity_nothing_is_rejected() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    create_table_with_plain_column(&db.pool, "products", "id").await;
-    {
-        let client = db.pool.get().await.expect("get connection");
-        client
-            .batch_execute("alter table products replica identity nothing")
-            .await
-            .expect("set replica identity nothing");
-    }
-
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
-    )
-    .await
-    .unwrap_err();
-
-    assert!(
-        matches!(
-            &err,
-            CatalogError::RelationshipEndpointNotChangeKeyed {
-                side: RelationshipSide::To,
-                endpoint,
-            } if endpoint == "trellis.products"
-        ),
-        "{err:?}"
-    );
-
-    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
-        .await
-        .expect("read query");
-    assert!(missing.is_none());
-}
-
 /// Issue #41: the same to-many relationship is accepted once the to-side has
 /// `REPLICA IDENTITY FULL`, which puts the non-PK join key into pre-images.
 #[tokio::test]
@@ -611,79 +566,6 @@ async fn a_to_many_to_side_with_replica_identity_full_is_accepted() {
     .expect("to-many with REPLICA IDENTITY FULL should be accepted");
 
     assert_eq!(created.cardinality, RelationshipCardinality::ToMany);
-}
-
-/// Issue #41: `REPLICA IDENTITY USING INDEX` is accepted iff the replica-
-/// identity index covers the join column. A unique index on the join column
-/// itself both covers it (accepted) — but note that also makes the column
-/// unique, so cardinality is `ToOne` and the gate doesn't even apply; to
-/// exercise the to-many index-coverage path we use a non-unique... which
-/// can't back a replica identity. So the meaningful to-many index case is a
-/// *multi-column* unique index that includes the join column: cardinality
-/// stays `ToMany` (the column isn't unique alone) yet the index covers it.
-#[tokio::test]
-#[ignore = "#622: deleted in C7/C8"]
-async fn a_to_many_to_side_with_covering_replica_identity_index_is_accepted() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    let client = db.pool.get().await.expect("get connection");
-    // Multi-column unique index over (id, region): `id` alone isn't unique
-    // (cardinality ToMany) but the index — set as the replica identity —
-    // covers `id`.
-    client
-        .batch_execute(
-            "create table products (id integer not null, region text not null);              create unique index products_id_region_uk on products (id, region);              alter table products replica identity using index products_id_region_uk",
-        )
-        .await
-        .expect("create products with covering replica-identity index");
-    drop(client);
-
-    let created = create_relationship(
-        &db.pool,
-        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
-    )
-    .await
-    .expect("covering replica-identity index should be accepted");
-
-    assert_eq!(created.cardinality, RelationshipCardinality::ToMany);
-}
-
-/// Issue #41: `REPLICA IDENTITY USING INDEX` is rejected when the replica-
-/// identity index does NOT cover the join column — the pre-image would carry
-/// the index's columns but not the join key.
-#[tokio::test]
-#[ignore = "#622: deleted in C7/C8"]
-async fn a_to_many_to_side_with_non_covering_replica_identity_index_is_rejected() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    let client = db.pool.get().await.expect("get connection");
-    // Replica-identity index is on `other_id`, not the join column `id`.
-    client
-        .batch_execute(
-            "create table products (id integer not null, other_id integer not null);              create unique index products_other_uk on products (other_id);              alter table products replica identity using index products_other_uk",
-        )
-        .await
-        .expect("create products with non-covering replica-identity index");
-    drop(client);
-
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        &err,
-        CatalogError::Validate(ValidationError::RelationshipToManyRequiresReplicaIdentity { .. })
-    ));
-
-    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
-        .await
-        .expect("read query");
-    assert!(missing.is_none());
 }
 
 /// Issue #590: creates `order_line_items(product_id <from_decl>)` and

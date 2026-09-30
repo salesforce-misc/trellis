@@ -12,14 +12,13 @@
 //!
 //! No live `Client` (issue #301). This used to drive the full runtime and
 //! poll the target under a 20s budget per step. Now each source change is
-//! mirrored by the CDC row intake would stage for it (the composite key
-//! joined with U+001F in declared order, text-valued JSON images), staged by
-//! hand and drained through the engine's own apply path, so every target
-//! value is still one the engine computed and wrote. Intake's own half, that
+//! mirrored by the ring row a capture trigger stages for it (the composite
+//! key joined with U+001F in declared order, text-valued JSON images), staged
+//! by hand and drained through the engine's own apply path, so every target
+//! value is still one the engine computed and wrote. The capture half, that
 //! a composite key really is staged in that form, is covered where it can be
-//! checked directly: `intake_core.rs`'s
-//! `a_composite_key_declared_out_of_physical_column_order_stages_in_declared_order`
-//! (real logical replication) and `intake::tests`' `extract_key_*` unit tests.
+//! checked directly: `capture_parity.rs`'s composite primary key declared out
+//! of physical order, against its golden fixture.
 //!
 //! `defs::oracle::recompute` (the cross-check oracle `client_e2e.rs` compares
 //! against) is intentionally not used here: that oracle's own `pk_column: &str`

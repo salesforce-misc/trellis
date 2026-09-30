@@ -6,18 +6,18 @@
 //! `to_regclass` the unquoted `Shop.OrderItems`, which Postgres folds to
 //! the nonexistent `shop.orderitems`: install failed with `NoPrimaryKey`.
 //!
-//! CDC is real `pgoutput` fed to a real intake and drained by hand
-//! (`support/pgoutput_intake.rs`), so nothing here polls for convergence.
+//! Capture is the real triggers, and the ring is drained by hand
+//! (`support/trigger_pipeline.rs`), so nothing here polls for convergence.
 
 use std::collections::HashMap;
 
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_relationship, install_definition};
 
-#[path = "support/pgoutput_intake.rs"]
-mod pgoutput_intake;
+#[path = "support/trigger_pipeline.rs"]
+mod trigger_pipeline;
 
-use pgoutput_intake::Pipeline;
+use trigger_pipeline::Pipeline;
 
 const SOURCE_DDL: &str = "create schema \"Shop\"; \
      create table \"Shop\".\"OrderItems\" (id bigint primary key, order_id bigint, qty integer); \
@@ -53,7 +53,7 @@ async fn install_over(db: &testkit::TestDatabase, text: &str, source_columns: &[
 /// the same mixed-case schema, `"Shop"."ItemCopy"`.
 #[tokio::test]
 async fn a_one_to_one_transform_over_a_mixed_case_table_backfills_and_applies_cdc() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(SOURCE_DDL)
         .await
         .expect("seed the source");
@@ -80,20 +80,18 @@ async fn a_one_to_one_transform_over_a_mixed_case_table_backfills_and_applies_cd
         )
         .await
         .expect("write the source");
-    pipeline.settle().await;
+    pipeline.drain().await;
     assert_eq!(
         pipeline.rows(COPY).await,
         rows(&[("2", "30"), ("3", "5"), ("4", "7")]),
         "CDC insert, update and delete all reached the target"
     );
-
-    pipeline.finish().await;
 }
 
 /// An aggregate over `"Shop"."OrderItems"`, grouped by a column of it.
 #[tokio::test]
 async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(SOURCE_DDL)
         .await
         .expect("seed the source");
@@ -121,14 +119,12 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
         )
         .await
         .expect("write the source");
-    pipeline.settle().await;
+    pipeline.drain().await;
     assert_eq!(
         pipeline.rows(TOTALS).await,
         rows(&[("10", "30"), ("20", "12"), ("30", "1")]),
         "CDC insert, update and delete all reached the aggregate"
     );
-
-    pipeline.finish().await;
 }
 
 /// A 1-1 transform over a mixed-case table reading a to-one relationship
@@ -138,7 +134,7 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
 /// both look the to-side up by its unquoted identity, quoted for the lookup.
 #[tokio::test]
 async fn a_relationship_between_mixed_case_tables_backfills_and_applies_cdc() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create table public.\"Products\" (id bigint primary key, price numeric); \
          alter table public.\"Products\" replica identity full; \
@@ -166,7 +162,7 @@ async fn a_relationship_between_mixed_case_tables_backfills_and_applies_cdc() {
         Pipeline::attach(cluster, db, raw, &["public.OrderItems", "public.Products"]).await;
     const ENRICHED: &str = "select id::text, price::text from enriched";
     // Drain whatever the install staged before reading the backfill.
-    pipeline.settle().await;
+    pipeline.drain().await;
     assert_eq!(
         pipeline.rows(ENRICHED).await,
         rows(&[("1", "10"), ("2", "20")]),
@@ -178,20 +174,18 @@ async fn a_relationship_between_mixed_case_tables_backfills_and_applies_cdc() {
         .batch_execute("update public.\"Products\" set price = 15 where id = 1")
         .await
         .expect("update a product");
-    pipeline.settle().await;
+    pipeline.drain().await;
     pipeline
         .raw
         .batch_execute("insert into public.\"OrderItems\" (id, product_id) values (3, 1)")
         .await
         .expect("insert an order item");
-    pipeline.settle().await;
+    pipeline.drain().await;
     assert_eq!(
         pipeline.rows(ENRICHED).await,
         rows(&[("1", "15"), ("2", "20"), ("3", "15")]),
         "the to-side update and the from-side insert both reached the target"
     );
-
-    pipeline.finish().await;
 }
 
 /// A relationship whose to-side is one of this instance's own targets, in a
@@ -203,7 +197,7 @@ async fn a_relationship_between_mixed_case_tables_backfills_and_applies_cdc() {
 /// its unquoted identity. The plain source to-side above never reaches them.
 #[tokio::test]
 async fn a_relationship_to_a_mixed_case_target_applies_cdc_through_the_seam() {
-    let (cluster, db, raw) = pgoutput_intake::database().await;
+    let (cluster, db, raw) = trigger_pipeline::database().await;
     raw.batch_execute(
         "create schema \"Shop\"; \
          create table public.products (id bigint primary key, price numeric); \
@@ -245,7 +239,7 @@ async fn a_relationship_to_a_mixed_case_target_applies_cdc_through_the_seam() {
         )
         .await
         .expect("seed the rows");
-    pipeline.settle().await;
+    pipeline.drain().await;
     assert_eq!(
         pipeline.rows(ENRICHED).await,
         rows(&[("1", "10"), ("2", "20")]),
@@ -257,12 +251,10 @@ async fn a_relationship_to_a_mixed_case_target_applies_cdc_through_the_seam() {
         .batch_execute("update public.products set price = 15 where id = 1")
         .await
         .expect("update a product");
-    pipeline.settle().await;
+    pipeline.drain().await;
     assert_eq!(
         pipeline.rows(ENRICHED).await,
         rows(&[("1", "15"), ("2", "20")]),
         "the target's seam-fed update reached the reader"
     );
-
-    pipeline.finish().await;
 }
