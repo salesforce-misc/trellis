@@ -2464,6 +2464,66 @@ mod catch_up_tests {
             .map(|row| (row.get(0), row.get(1), row.get(2)))
     }
 
+    /// A captured table that loses its primary key while a definition reads
+    /// it: the discharge's enumeration has no key to stage its rows under, so
+    /// it fails with [`IntakeError::NoIdentityKey`] naming the table, and the
+    /// marker stays with that error recorded and a backoff (issue #407)
+    /// instead of failing the pass.
+    #[tokio::test]
+    async fn an_enumeration_of_a_table_that_lost_its_primary_key_fails_with_no_identity_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.nokey (id bigint primary key); \
+                 insert into public.nokey values (1);",
+            )
+            .await
+            .expect("seed a source table");
+        register_reader(&db, "public.nokey", "nokey_reader").await;
+        capture_for_test(&mut client, &["public.nokey"]).await;
+        assert!(
+            retry_state(&client, "public.nokey").await.is_some(),
+            "the capture install parks the table's join marker"
+        );
+        client
+            .batch_execute("alter table public.nokey drop constraint nokey_pkey")
+            .await
+            .expect("drop the captured table's primary key");
+
+        let failures = run_pending_backfills_until(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+            &|| false,
+        )
+        .await
+        .expect("a failing marker must not fail the pass");
+        match failures.as_slice() {
+            [
+                FailedDischarge {
+                    table,
+                    error: IntakeError::NoIdentityKey { table: keyless },
+                },
+            ] => {
+                assert_eq!(table, "public.nokey");
+                assert_eq!(keyless, "public.nokey");
+            }
+            other => panic!("expected one NoIdentityKey failure, got {other:?}"),
+        }
+        let (attempts, last_error, _) = retry_state(&client, "public.nokey")
+            .await
+            .expect("the failing marker stays");
+        assert_eq!(attempts, 1);
+        let last_error = last_error.expect("the failure's error is recorded");
+        assert!(
+            last_error.contains("public.nokey") && last_error.contains("no primary key"),
+            "the recorded error names the table and the cause, got {last_error:?}"
+        );
+    }
+
     /// Issue #407 (ADR-0016): a marker whose discharge always fails doesn't
     /// stop the healthy marker behind it in the same pass. The failure is
     /// recorded on the marker with a backoff, the marker isn't retried

@@ -2414,7 +2414,7 @@ impl ReverseGuardFailure {
 /// Guard (c) (plan doc §2; the guard measured to do most of the correctness
 /// work, 1174/3000 ablation runs corrupted without it): "is there a staged
 /// change on `from_table`, matching any of `keys` via `from_col` against
-/// either its `old_image` or `new_image`, committed (`lsn`) at or before
+/// either its `old_image` or `new_image`, staged (`lsn`) at or before
 /// `watermark_x`, that hasn't drained yet?"
 ///
 /// "Hasn't drained yet" mirrors [`converge::converged_through`]'s own
@@ -2443,22 +2443,23 @@ impl ReverseGuardFailure {
 /// existing test exercises a to-one relationship's from-side table being
 /// truncated mid-flight).
 ///
-/// **Seam rows (issue #402).** A from-side that is one of this instance's
-/// targets can reach the ring as the target-mutation seam's CDC-shaped rows,
-/// whose `lsn` is the writer's pre-commit write token, not its commit. Guard
-/// (a)'s premise, "once the ring holds everything through `X`, every change at
-/// or below `X` is in the ring", does not hold for them: a row with a token at
-/// or below `X` can belong to a writer that has not committed, so this scan
-/// can't see it. The check is still no weaker than it is against the same
-/// writes' CDC. A token is below its writer's commit, so a write whose CDC row
-/// would be at or below `X` has a seam row at or below `X` too, and a writer
-/// that committed before this scan committed its seam row with it. A seam row
-/// this scan can't see belongs to a writer that commits after the scan, so
-/// after `X` was captured: its CDC row would be above `X` and excluded as well.
-/// The argument only uses "token below commit", so it does not matter that `X`
-/// is a WAL *write* position while the token is an *insert* position. What does
-/// change is that a seam row can match here although its writer committed after
-/// `X`, which only defers more.
+/// **Pre-commit positions (issues #402, #622).** No ring row's `lsn` is its
+/// writer's commit: the capture trigger stamps `pg_current_wal_insert_lsn()`
+/// inside the writer's transaction, and the target-mutation seam stamps a
+/// token its writer reads before committing. So guard (a)'s old premise,
+/// "once the ring holds everything through `X`, every change at or below `X`
+/// is in the ring", does not hold: a row at or below `X` can belong to a
+/// writer that has not committed, and this scan can't see it. The check is
+/// still no weaker than it was against intake's commit positions. A
+/// pre-commit position is below its writer's commit, so a write that
+/// committed at or below `X` has a row at or below `X` too, and a writer that
+/// committed before this scan committed its row with it. A row this scan
+/// can't see belongs to a writer that commits after the scan, so after `X`
+/// was captured: its commit position would have been above `X` and excluded
+/// as well. The argument only uses "position below commit", so it does not
+/// matter that `X` is a WAL *write* position while a row's `lsn` is an
+/// *insert* position. What does change is that a row can match here although
+/// its writer committed after `X`, which only defers more.
 async fn from_side_change_in_flight(
     txn: &Transaction<'_>,
     from_table: &str,
