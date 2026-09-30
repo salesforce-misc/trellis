@@ -3,13 +3,16 @@
 //!
 //! # Which targets
 //!
-//! [`route`] sends an aggregate target here iff every field is `SUM(x)`,
-//! `COUNT(*)` or `COUNT(x)` over a plain source column `x` of an exact numeric
-//! type, every `GROUP BY` key is a plain source column, and it reads no
-//! relationship. (No definition has a filter yet.) Every other aggregate
-//! target stays on `super::apply_aggregate`'s path, with its pre-lock, probe
-//! and recompute horizons, until #623 D3b–D5 move it. A target is entirely on
-//! one path or the other.
+//! [`route`] sends an aggregate target here iff every field is `SUM(x)` or
+//! `AVG(x)` over a plain source column `x` of an exact numeric type, or
+//! `COUNT(*)`, or `COUNT(x)` over a plain source column of any type but
+//! `json`/`jsonb`; every `GROUP BY` key is a plain source column; and it
+//! reads no relationship. (The grammar has no definition filter yet.) Every
+//! other aggregate target (`MIN`/`MAX` and the other recompute-only
+//! aggregates, a composed field, an argument that is an expression, a float
+//! `SUM`/`AVG`, a relationship) stays on `super::apply_aggregate`'s path,
+//! with its pre-lock, probe and recompute horizons, until #623 D4/D5 move
+//! it. A target is entirely on one path or the other.
 //!
 //! # The ledger
 //!
@@ -60,6 +63,7 @@ use crate::defs::ast::{
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::eval;
 use crate::defs::ledger as schema;
+use crate::defs::pg_type::PgType;
 use crate::pool::{quote_ident, quote_literal};
 
 use super::apply::ApplyError;
@@ -81,6 +85,29 @@ enum LedgerField {
     CountStar { column: String },
     /// `COUNT(x)`: the count of argument `arg`'s non-null contributions.
     CountArg { column: String, arg: usize },
+    /// `AVG(x)`: `column` is the hidden running sum `sum` over the hidden
+    /// count `count` (shared with a `SUM(x)`, issue #48) as `numeric`, which
+    /// is Postgres's own `avg()` over an exact numeric argument, and `NULL`
+    /// when `count` is 0.
+    Avg {
+        column: String,
+        sum: String,
+        count: String,
+        arg: usize,
+    },
+}
+
+/// One contribution column of a ledger-routed target.
+#[derive(Debug, Clone, PartialEq)]
+struct Contrib {
+    /// The ledger column (`__arg<n>`).
+    column: String,
+    /// The source column it holds.
+    source: String,
+    /// Whether a `SUM` or `AVG` sums it. A `COUNT(x)`-only argument needs
+    /// only its NULL-ness, so it may be of any type and gets no sum
+    /// increment.
+    summed: bool,
 }
 
 /// What a ledger-routed definition's target looks like ([`route`]).
@@ -89,9 +116,8 @@ pub(crate) struct LedgerShape {
     /// The `GROUP BY` columns: each is a source column of the same name, and
     /// the target's and the ledger's column of that name.
     group_cols: Vec<String>,
-    /// The contribution columns, in [`schema::contributions`]' order: the
-    /// ledger column (`__arg<n>`) and the source column it holds.
-    contribs: Vec<(String, String)>,
+    /// The contribution columns, in [`schema::contributions`]' order.
+    contribs: Vec<Contrib>,
     fields: Vec<LedgerField>,
 }
 
@@ -118,19 +144,14 @@ pub(crate) fn route(
         group_cols.push(column.clone());
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
-    let exact_column = |expr: &Expr| -> Option<String> {
+    let column = |expr: &Expr| -> Option<String> {
         match expr {
-            Expr::Column(column)
-                if source_columns
-                    .get(column)
-                    .is_some_and(|t| t.is_exact_numeric_family()) =>
-            {
-                Some(column.clone())
-            }
+            Expr::Column(column) if source_columns.contains_key(column) => Some(column.clone()),
             _ => None,
         }
     };
-    // Every field must be a bare `SUM`/`COUNT` call before anything is
+    let exact = |column: &str| source_columns[column].is_exact_numeric_family();
+    // Every field must be a bare `SUM`/`AVG`/`COUNT` call before anything is
     // derived from the fields.
     let value_fields: Vec<&FieldDef> = def
         .fields
@@ -141,20 +162,41 @@ pub(crate) fn route(
         match &substituted[&field.name] {
             Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {}
             Expr::FunctionCall { name, args }
-                if (name == "SUM" || name == "COUNT") && args.len() == 1 =>
+                if (name == "SUM" || name == "AVG") && args.len() == 1 =>
             {
-                exact_column(&args[0])?;
+                if !exact(&column(&args[0])?) {
+                    return None;
+                }
+            }
+            Expr::FunctionCall { name, args } if name == "COUNT" && args.len() == 1 => {
+                // An image holds a column's output text, which
+                // `jsonb_populate_record` would store in a `json`/`jsonb`
+                // contribution as a JSON string, not the value the build
+                // writes. Every other type goes through its input function.
+                if matches!(
+                    source_columns[&column(&args[0])?],
+                    ValueType::Other(PgType::Json | PgType::Jsonb)
+                ) {
+                    return None;
+                }
             }
             _ => return None,
         }
     }
     let contributions = schema::contributions(&def.fields, group_by, &substituted);
+    let summed = |arg: &Expr| {
+        value_fields.iter().any(|f| {
+            matches!(&substituted[&f.name], Expr::FunctionCall { name, args }
+                if (name == "SUM" || name == "AVG") && args.first() == Some(arg))
+        })
+    };
     let mut contribs = Vec::with_capacity(contributions.len());
     for contribution in &contributions {
-        contribs.push((
-            contribution.column.clone(),
-            exact_column(&contribution.arg)?,
-        ));
+        contribs.push(Contrib {
+            column: contribution.column.clone(),
+            source: column(&contribution.arg)?,
+            summed: summed(&contribution.arg),
+        });
     }
     let arg_of = |arg: &Expr| -> usize {
         contributions
@@ -168,6 +210,12 @@ pub(crate) fn route(
         .map(|field| match &substituted[&field.name] {
             Expr::FunctionCall { name, args } if name == "SUM" => LedgerField::Sum {
                 column: field.name.clone(),
+                count: count_cols[&field.name].clone(),
+                arg: arg_of(&args[0]),
+            },
+            Expr::FunctionCall { name, args } if name == "AVG" => LedgerField::Avg {
+                column: field.name.clone(),
+                sum: ddl::avg_sum_column(&field.name),
                 count: count_cols[&field.name].clone(),
                 arg: arg_of(&args[0]),
             },
@@ -302,7 +350,7 @@ fn ledger_statement(
     let target = &plan.target_ident;
     let q = |c: &str| quote_ident(c);
     let groups: Vec<String> = shape.group_cols.iter().map(|c| q(c)).collect();
-    let args: Vec<String> = shape.contribs.iter().map(|(c, _)| q(c)).collect();
+    let args: Vec<String> = shape.contribs.iter().map(|c| q(&c.column)).collect();
     let values: Vec<&String> = groups.iter().chain(&args).collect();
     let cols = |alias: &str| -> String {
         values
@@ -324,7 +372,7 @@ fn ledger_statement(
         .group_cols
         .iter()
         .map(|c| (c, c))
-        .chain(shape.contribs.iter().map(|(l, s)| (l, s)))
+        .chain(shape.contribs.iter().map(|c| (&c.column, &c.source)))
         .map(|(ledger_col, source_col)| {
             format!(
                 "{}, b.__img -> {}",
@@ -335,11 +383,20 @@ fn ledger_statement(
         .collect();
     let set_values: Vec<String> = values.iter().map(|c| format!("{c} = v.{c}")).collect();
 
-    // Per-group increments: `dm` members, and per argument `ds<i>` (sum) and
-    // `dc<i>` (non-null count).
+    // Per-group increments: `dm` members, and per argument `dc<i>` (its
+    // non-null count) and, for a summed argument, `ds<i>` (its sum).
     let mut deltas = vec!["sum(m.__sign) as __dm".to_string()];
     let mut nonzero = vec!["sum(m.__sign) <> 0".to_string()];
     for (i, a) in args.iter().enumerate() {
+        deltas.push(format!(
+            "sum(case when m.{a} is null then 0 else m.__sign end) as __dc{i}"
+        ));
+        nonzero.push(format!(
+            "sum(case when m.{a} is null then 0 else m.__sign end) <> 0"
+        ));
+        if !shape.contribs[i].summed {
+            continue;
+        }
         // Summed per sign and then subtracted, not `sum(__sign * a)`: the
         // product is computed in the argument's own type, so negating an
         // `integer`'s -2147483648 (or a `bigint`'s minimum) overflows it.
@@ -349,13 +406,7 @@ fn ledger_statement(
              - coalesce(sum(m.{a}) filter (where m.__sign < 0), 0))"
         );
         deltas.push(format!("{ds} as __ds{i}"));
-        deltas.push(format!(
-            "sum(case when m.{a} is null then 0 else m.__sign end) as __dc{i}"
-        ));
         nonzero.push(format!("{ds} <> 0"));
-        nonzero.push(format!(
-            "sum(case when m.{a} is null then 0 else m.__sign end) <> 0"
-        ));
     }
     let group_list = |alias: &str| -> String {
         groups
@@ -372,7 +423,6 @@ fn ledger_statement(
     let mut insert_vals: Vec<String> = groups.iter().map(|c| format!("d.{c}")).collect();
     let mut updates = Vec::new();
     let mut priors: HashMap<String, String> = HashMap::new();
-    let mut counts_emitted: Vec<&str> = Vec::new();
     for field in &shape.fields {
         match field {
             LedgerField::Sum { column, count, arg } => {
@@ -392,13 +442,51 @@ fn ledger_statement(
                          else coalesce(up.{f}, 0) - d.__ds{arg} end"
                     ),
                 );
-                if !counts_emitted.contains(&count.as_str()) {
-                    counts_emitted.push(count);
-                    insert_cols.push(c.clone());
-                    insert_vals.push(format!("d.__dc{arg}"));
-                    updates.push(format!("{c} = t.{c} + excluded.{c}"));
-                    priors.insert(count.clone(), format!("up.{c} - d.__dc{arg}"));
-                }
+            }
+            LedgerField::Avg {
+                column,
+                sum,
+                count,
+                arg,
+            } => {
+                // The running sum as `SUM`'s, and the visible column
+                // `sum / count::numeric`: Postgres's `avg()` over an exact
+                // numeric argument is `numeric_div` of the same two, and the
+                // one-pass build writes the same expression.
+                let (f, s, c) = (q(column), q(sum), q(count));
+                let new_sum = format!("coalesce(t.{s}, 0) + coalesce(excluded.{s}, 0)");
+                let new_count = format!("t.{c} + excluded.{c}");
+                insert_cols.push(s.clone());
+                insert_vals.push(format!(
+                    "case when d.__dc{arg} = 0 and d.__ds{arg} = 0 then null else d.__ds{arg} end"
+                ));
+                insert_cols.push(f.clone());
+                insert_vals.push(format!(
+                    "case when d.__dc{arg} = 0 then null \
+                     else d.__ds{arg} / d.__dc{arg}::numeric end"
+                ));
+                updates.push(format!(
+                    "{s} = case when {new_count} = 0 then null else {new_sum} end"
+                ));
+                updates.push(format!(
+                    "{f} = case when {new_count} = 0 then null \
+                     else ({new_sum}) / ({new_count})::numeric end"
+                ));
+                let (old_sum, old_count) = (
+                    format!("coalesce(up.{s}, 0) - d.__ds{arg}"),
+                    format!("up.{c} - d.__dc{arg}"),
+                );
+                priors.insert(
+                    sum.clone(),
+                    format!("case when {old_count} = 0 then null else {old_sum} end"),
+                );
+                priors.insert(
+                    column.clone(),
+                    format!(
+                        "case when {old_count} = 0 then null \
+                         else ({old_sum}) / ({old_count})::numeric end"
+                    ),
+                );
             }
             LedgerField::CountStar { column } => {
                 let f = q(column);
@@ -415,6 +503,23 @@ fn ledger_statement(
                 priors.insert(column.clone(), format!("up.{f} - d.__dc{arg}"));
             }
         }
+    }
+    // A `SUM`'s or `AVG`'s hidden count, once per shared column (issue #48).
+    let mut counts_emitted: Vec<&str> = Vec::new();
+    for field in &shape.fields {
+        let (LedgerField::Sum { count, arg, .. } | LedgerField::Avg { count, arg, .. }) = field
+        else {
+            continue;
+        };
+        if counts_emitted.contains(&count.as_str()) {
+            continue;
+        }
+        counts_emitted.push(count);
+        let c = q(count);
+        insert_cols.push(c.clone());
+        insert_vals.push(format!("d.__dc{arg}"));
+        updates.push(format!("{c} = t.{c} + excluded.{c}"));
+        priors.insert(count.clone(), format!("up.{c} - d.__dc{arg}"));
     }
     insert_cols.push(members.clone());
     insert_vals.push("d.__dm".to_string());
@@ -604,9 +709,9 @@ pub(crate) async fn apply_ledger_target(
     let mut snapshot: Option<String> = None;
     if !rederive.is_empty() {
         let mut columns: Vec<String> = plan.shape.group_cols.clone();
-        for (_, source_col) in &plan.shape.contribs {
-            if !columns.contains(source_col) {
-                columns.push(source_col.clone());
+        for contrib in &plan.shape.contribs {
+            if !columns.contains(&contrib.source) {
+                columns.push(contrib.source.clone());
             }
         }
         let query = super::apply::live_rows_query(
@@ -813,7 +918,14 @@ mod tests {
         )
         .expect("routed");
         assert_eq!(s.group_cols, vec!["g"]);
-        assert_eq!(s.contribs, vec![("__arg0".to_string(), "v".to_string())]);
+        assert_eq!(
+            s.contribs,
+            vec![Contrib {
+                column: "__arg0".to_string(),
+                source: "v".to_string(),
+                summed: true
+            }]
+        );
         assert_eq!(
             s.fields,
             vec![
@@ -840,17 +952,72 @@ mod tests {
         );
     }
 
+    /// #623 D3b: `AVG` over an exact numeric column shares `SUM`'s hidden
+    /// count, and `COUNT(x)` takes a column of any type but `json`/`jsonb`,
+    /// whose contribution gets no sum.
+    #[test]
+    fn avg_and_count_of_any_column_route_to_the_ledger() {
+        let s = shape(
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(v) AS total, AVG(v) AS mean, \
+             COUNT(name) AS named",
+            &[
+                ("g", INT),
+                ("v", ValueType::Integer(crate::integer::IntWidth::Int8)),
+                ("name", ValueType::Text),
+            ],
+        )
+        .expect("routed");
+        assert_eq!(
+            s.contribs,
+            vec![
+                Contrib {
+                    column: "__arg0".to_string(),
+                    source: "v".to_string(),
+                    summed: true
+                },
+                Contrib {
+                    column: "__arg1".to_string(),
+                    source: "name".to_string(),
+                    summed: false
+                },
+            ]
+        );
+        assert_eq!(
+            s.fields[1],
+            LedgerField::Avg {
+                column: "mean".to_string(),
+                sum: "__mean_sum".to_string(),
+                count: "__total_count".to_string(),
+                arg: 0
+            }
+        );
+        assert_eq!(
+            s.fields[2],
+            LedgerField::CountArg {
+                column: "named".to_string(),
+                arg: 1
+            }
+        );
+    }
+
     #[test]
     fn every_other_aggregate_stays_on_the_old_path() {
         let cols = &[
             ("g", INT),
             ("v", ValueType::Numeric),
             ("f", ValueType::Float(crate::float::FloatWidth::Float8)),
+            ("name", ValueType::Text),
+            ("doc", ValueType::Other(PgType::Jsonb)),
         ];
         for text in [
-            "TRANSFORM t FROM s GROUP BY g SELECT AVG(v) AS x",
             "TRANSFORM t FROM s GROUP BY g SELECT MIN(v) AS x",
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(f) AS x",
+            "TRANSFORM t FROM s GROUP BY g SELECT AVG(f) AS x",
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(v) AS x, SUM(name) AS y",
+            "TRANSFORM t FROM s GROUP BY g SELECT COUNT(doc) AS x",
+            "TRANSFORM t FROM s GROUP BY g SELECT AVG(v + 1) AS x",
+            "TRANSFORM t FROM s GROUP BY g SELECT COUNT(v + 1) AS x",
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(v) AS t, COUNT(*) AS n, t + n AS x",
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(v + 1) AS x",
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(v) + COUNT(*) AS x",
             "TRANSFORM t FROM s SELECT v AS x",

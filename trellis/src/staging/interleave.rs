@@ -35,7 +35,7 @@
 //! # Where the points sit
 //!
 //! The names are the ledger design's steps (ADR-0002, "Apply" and
-//! "Re-derive"). A plain `SUM`/`COUNT` aggregate is on the ledger since #623
+//! "Re-derive"). A plain `SUM`/`AVG`/`COUNT` aggregate is on the ledger since #623
 //! D3 (`super::ledger`); every other target has no entry lock and no ledger
 //! Re-derive yet, so each point sits at the step that plays that role now:
 //!

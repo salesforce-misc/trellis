@@ -208,10 +208,11 @@ Skipping would leave the target frozen until the key went quiet.
 ### Aggregate groups: the recompute horizon
 
 This section covers aggregate targets that are not on the ledger yet: any
-target with an `AVG`, `MIN`/`MAX` or composed field, a float argument, or a
-relationship. A plain `SUM`/`COUNT` target is on the ledger instead (see
-[Aggregate groups: the ledger](#aggregate-groups-the-ledger), #623 D3), with
-no horizon, pre-lock or probe.
+target with a `MIN`/`MAX` (or other recompute-only) or composed field, an
+aggregate argument that is an expression, a float `SUM`/`AVG`, or a
+relationship. A plain `SUM`/`AVG`/`COUNT` target is on the ledger instead
+(see [Aggregate groups: the ledger](#aggregate-groups-the-ledger), #623 D3),
+with no horizon, pre-lock or probe.
 
 An aggregate group can also receive an absolute write. An image-less change
 (a catch-up enumeration, a chained hop's `Recompute`, a relationship fallback, a
@@ -321,9 +322,12 @@ writes the group rows as a `GROUP BY` over it. The 1-1 build writes no entries.
 
 ### Aggregate groups: the ledger
 
-An aggregate target whose every field is `SUM(x)`, `COUNT(*)` or `COUNT(x)`
-over an exact numeric source column, grouped by plain source columns, is on the
-ledger (`staging::ledger`, #623 D3). Each page applies its records for such a
+An aggregate target whose every field is `SUM(x)` or `AVG(x)` over an exact
+numeric source column, `COUNT(*)`, or `COUNT(x)` over a source column of any
+type but `json`/`jsonb`, grouped by plain source columns, is on the ledger
+(`staging::ledger`, #623 D3). `AVG(x)` keeps its hidden running sum and count
+as today and writes `sum / count::numeric`, which is Postgres's own `avg()`
+over an exact numeric argument. Each page applies its records for such a
 target in one transaction, in four steps:
 
 1. **Lock (I1, I5).** Insert a non-member placeholder entry for every key the

@@ -2118,6 +2118,7 @@ async fn count_star_composes_with_avg_across_insert_update_delete_and_grain_migr
 /// full-recompute gap `SUM`/`AVG` already have coverage for — see
 /// `image_less_recompute_trigger_still_probes_a_stale_sum_field`.
 #[tokio::test]
+#[ignore = "#623 D5: old aggregate path deleted"]
 async fn count_star_image_less_recompute_trigger_probes_a_stale_count() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

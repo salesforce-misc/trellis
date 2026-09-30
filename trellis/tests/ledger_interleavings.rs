@@ -13,8 +13,9 @@
 //! (<https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484>),
 //! the shapes of the issues the ledger supersedes (#389, #392, #494, #539,
 //! #550), and `chunked_read_exact_point` (the per-chunk exact read point,
-//! the user's Q1 on the D split). Each runs in two flavours where the shape
-//! applies: a plain `SUM`/`COUNT` aggregate and a 1-1 target.
+//! the user's Q1 on the D split). Each runs in the flavours the shape
+//! applies to: a plain `SUM`/`COUNT` aggregate, the same with an `AVG` and a
+//! `COUNT(x)` (#623 D3b), and a 1-1 target.
 //!
 //! A scenario that fails on today's engine is `#[ignore]`d naming the D part
 //! that makes it pass; that part un-ignores it. The wrong value each one
@@ -39,6 +40,9 @@ const SRC: &str = "public.src";
 #[derive(Clone, Copy, Debug)]
 enum Flavour {
     Aggregate,
+    /// `AVG` beside a `SUM` sharing its hidden count, and `COUNT(x)`: on the
+    /// ledger since #623 D3b.
+    AggregateAvg,
     /// A recompute-only aggregate (`MIN`/`MAX`), for #494's D4 variant.
     AggregateMinMax,
     OneToOne,
@@ -50,6 +54,10 @@ impl Flavour {
             Flavour::Aggregate => {
                 "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n"
             }
+            Flavour::AggregateAvg => {
+                "TRANSFORM agg FROM public.src GROUP BY g \
+                 SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n"
+            }
             Flavour::AggregateMinMax => {
                 "TRANSFORM agg FROM public.src GROUP BY g \
                  SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"
@@ -60,7 +68,7 @@ impl Flavour {
 
     fn target(self) -> &'static str {
         match self {
-            Flavour::Aggregate | Flavour::AggregateMinMax => "public.agg",
+            Flavour::Aggregate | Flavour::AggregateAvg | Flavour::AggregateMinMax => "public.agg",
             Flavour::OneToOne => "public.one",
         }
     }
@@ -68,6 +76,7 @@ impl Flavour {
     fn actual(self) -> &'static str {
         match self {
             Flavour::Aggregate => "select g, total, n from public.agg order by g",
+            Flavour::AggregateAvg => "select g, total, mean, nv, n from public.agg order by g",
             Flavour::AggregateMinMax => "select g, lo, hi, n from public.agg order by g",
             Flavour::OneToOne => "select id, g, v from public.one order by id",
         }
@@ -78,11 +87,19 @@ impl Flavour {
             Flavour::Aggregate => {
                 "select g, sum(v), count(*) from public.src group by g order by g"
             }
+            Flavour::AggregateAvg => {
+                "select g, sum(v), avg(v), count(v), count(*) from public.src group by g order by g"
+            }
             Flavour::AggregateMinMax => {
                 "select g, min(v), max(v), count(*) from public.src group by g order by g"
             }
             Flavour::OneToOne => "select id, g, v from public.src order by id",
         }
+    }
+
+    /// Whether the flavour's target is on the ledger.
+    fn on_ledger(self) -> bool {
+        matches!(self, Flavour::Aggregate | Flavour::AggregateAvg)
     }
 }
 
@@ -855,7 +872,7 @@ async fn chunked_read_exact_point(flavour: Flavour) {
     d.release(&mut chunk_2, PausePoint::AfterRederiveRead).await;
     chunk_2.finish().await;
     cdc.finish().await;
-    if matches!(flavour, Flavour::Aggregate) {
+    if flavour.on_ledger() {
         assert_chunk_bases(&d, &w_in_xid, &w_between_xid).await;
         assert_eq!(
             applied_lsn(&d, flavour, "3").await,
@@ -878,7 +895,7 @@ async fn xact_id(client: &tokio_postgres::Client) -> String {
 /// Key `key`'s ledger `applied_lsn`, as text (`None` when unset), for a
 /// target on the ledger.
 async fn applied_lsn(d: &Driver, flavour: Flavour, key: &str) -> Option<String> {
-    if !matches!(flavour, Flavour::Aggregate) {
+    if !flavour.on_ledger() {
         return None;
     }
     d.ctl
@@ -1077,4 +1094,154 @@ async fn the_minimum_integer_contribution_leaves_its_group() {
     let b = d.seal().await;
     d.drain(b, "a").await;
     assert_oracle(&mut d, Flavour::Aggregate).await;
+}
+
+// ------------------------------------------------- the AVG flavour (#623 D3b)
+
+// The scenarios above with `AVG` beside the `SUM` whose hidden count it
+// shares, and a `COUNT(v)`: on the ledger since #623 D3b. Before it the
+// target was on the old path, where exp2_5, exp2_5b and issue_550 fail as
+// their aggregate flavours' doc comments describe.
+
+#[tokio::test]
+async fn pause_points_fire_in_page_order_aggregate_avg() {
+    pause_points_fire_in_page_order(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_2_aggregate_avg() {
+    exp2_2(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_2b_aggregate_avg() {
+    exp2_2b(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_5_aggregate_avg() {
+    exp2_5(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_5b_aggregate_avg() {
+    exp2_5b(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_9_aggregate_avg() {
+    exp2_9(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_9b_aggregate_avg() {
+    exp2_9b(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_9c_aggregate_avg() {
+    exp2_9c(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_9d_aggregate_avg() {
+    exp2_9d(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn exp2_10_aggregate_avg() {
+    exp2_10(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn issue_392_aggregate_avg() {
+    issue_392(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn issue_550_aggregate_avg() {
+    issue_550(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn chunked_read_exact_point_aggregate_avg() {
+    chunked_read_exact_point(Flavour::AggregateAvg).await;
+}
+
+/// `AVG` on the ledger equals Postgres's `avg()` over the source, as text,
+/// for `integer`, `bigint` and `numeric` arguments: the same `numeric`
+/// result type and scale. The pages move rows between groups, null an
+/// argument, delete rows, take a group's non-null count to 0 while it keeps
+/// members (`AVG` goes NULL, `COUNT(*)` stays), re-derive keys, and carry the
+/// `integer` minimum, `bigint` values whose sum overflows `bigint`, and
+/// `numeric`s of three scales, including removing the widest.
+#[tokio::test]
+async fn avg_equals_postgres_avg_over_integer_bigint_and_numeric() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let int8 = ValueType::Integer(trellis::integer::IntWidth::Int8);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, a integer, b bigint, \
+                                  c numeric, name text); \
+         alter table public.src replica identity full; \
+         insert into public.src values \
+             (1, 1, -2147483648, 9223372036854775807, 1.5, 'x'), \
+             (2, 1, 7, 9223372036854775806, 2.125, null), \
+             (3, 2, null, null, 0.1, 'y'), \
+             (4, 2, 3, 4, null, 'z')",
+        &[
+            ("id", int4),
+            ("g", int4),
+            ("a", int4),
+            ("b", int8),
+            ("c", ValueType::Numeric),
+            ("name", ValueType::Text),
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g \
+           SELECT AVG(a) AS avg_a, AVG(b) AS avg_b, AVG(c) AS avg_c, COUNT(name) AS named, \
+                  COUNT(*) AS n"],
+        &[SRC],
+    )
+    .await;
+    let actual = "select g, avg_a, avg_b, avg_c, named, n from public.agg order by g";
+    let expected = "select g, avg(a), avg(b), avg(c), count(name), count(*) \
+                    from public.src group by g order by g";
+    let steps = [
+        "insert into public.src values (5, 1, 2147483647, -1, 10.12345, 'w'); \
+         update public.src set g = 2 where id = 2",
+        "delete from public.src where id = 2; \
+         update public.src set a = null, b = null, c = null, name = null where id = 4",
+        "update public.src set a = null, b = null, c = null where id = 3; \
+         insert into public.src values (6, 3, 1, 1, 1, null)",
+        "update public.src set g = 3, c = 2.5 where id = 5",
+    ];
+    for (i, step) in steps.iter().enumerate() {
+        write(&d, step).await;
+        if i == 2 {
+            d.stage_recomputes(SRC, &["1", "4", "5"]).await;
+        }
+        let b = d.seal().await;
+        d.drain(b, &format!("w{i}")).await;
+        d.settle().await;
+        assert_eq!(
+            d.rows(actual).await,
+            d.rows(expected).await,
+            "after step {i}: the target (left) differs from the oracle (right)"
+        );
+    }
+    assert!(
+        d.rows("select 1 from public.agg where g = 2 and avg_a is null and n = 2")
+            .await
+            .len()
+            == 1,
+        "group 2 keeps its members with no non-null argument"
+    );
+    assert_eq!(
+        d.rows(
+            "select __from_key from public.agg__ledger where __applied_lsn is not null order by 1"
+        )
+        .await,
+        ["(2)", "(3)", "(4)", "(5)", "(6)"],
+        "the target is on the ledger: every key a change reached has an applied entry \
+         (key 1 was only re-derived)"
+    );
 }
