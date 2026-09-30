@@ -317,7 +317,7 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // #623 D3 added V57 (`ledger_truncate_floor`), #622 C6 V58
     // (`capture_failures`, the `schema_changed` ring op), and #622 C8 V59
     // (drops `replication_progress` and `slot_loss_pauses`). Issue #687
-    // added V60 (`capture_failures.error`).
+    // added V60 (`capture_failures.error` and `capture_holdups`).
     assert_eq!(
         applied,
         vec![

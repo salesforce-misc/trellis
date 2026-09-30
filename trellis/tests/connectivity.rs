@@ -123,7 +123,7 @@ async fn migrate_up_is_idempotent() {
         // floor). #622 C6 added V58 (the `schema_changed` ring op,
         // `segments.has_schema_change` and `capture_failures`), and C8 V59
         // (drops `replication_progress` and `slot_loss_pauses`). Issue #687
-        // added V60 (`capture_failures.error`).
+        // added V60 (`capture_failures.error` and `capture_holdups`).
         "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60 to be applied"
     );
 

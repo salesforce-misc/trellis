@@ -738,7 +738,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     } = config;
 
     let seal_config = SealConfig::default();
-    // The capture pass keeps its lock waits in memory under the instance's
+    // The capture pass rate-limits its logs in memory under the instance's
     // database and schema; the loop forgets them when it stops.
     let database: Option<String> = session
         .client()

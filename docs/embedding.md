@@ -122,7 +122,8 @@ So:
   `status()` reports what it waits on (`capture_wait`). An install that fails
   for another reason, such as a source that lost its primary key, is on
   `capture_failure` instead, and is retried every pass until you fix the
-  cause. Both are reported only by the process running the staging worker.
+  cause. Every process's `status()` reports both, wherever the staging worker
+  runs.
 
 ```rust
 // A web process: define transforms, never drains anything.

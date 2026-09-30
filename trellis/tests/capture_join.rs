@@ -537,11 +537,11 @@ async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
     );
 }
 
-/// The in-memory lock wait `status().capture_wait` reports goes once the
-/// table stops waiting for its lock, including when its capture then fails
-/// for another reason (#622 C5 review): its primary key dropped here. (A
-/// dropped read column no longer fails the pass: since C6 the pass pauses
-/// its reader instead.)
+/// The lock wait `status().capture_wait` reports goes once the table stops
+/// waiting for its lock, including when its capture then fails for another
+/// reason (#622 C5 review): its primary key dropped here. The failure takes
+/// its place (#687). (A dropped read column no longer fails the pass: since
+/// C6 the pass pauses its reader instead.)
 #[tokio::test]
 async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
     let cluster = TestCluster::start();
@@ -550,11 +550,6 @@ async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
     raw.batch_execute("create table public.u (id int primary key, a int)")
         .await
         .expect("seed");
-    let database: String = raw
-        .query_one("select current_database()::text", &[])
-        .await
-        .expect("database")
-        .get(0);
     let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM tu FROM public.u SELECT a AS a")
@@ -564,7 +559,8 @@ async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
     let holder = hold_table(db.dsn(), "public.u").await;
     let outcome = capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
     assert_eq!(outcome.waiting.len(), 1, "{outcome:?}");
-    assert!(reconcile::lock_wait(&database, SCHEMA, "public.u").is_some());
+    let reported = trellis.status("tu").await.expect("status").expect("tu");
+    assert!(reported.capture_wait.is_some(), "{reported:?}");
     holder
         .batch_execute("commit")
         .await
@@ -579,11 +575,104 @@ async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
         matches!(outcome.failed[0].1, CaptureError::NoPrimaryKey { .. }),
         "{outcome:?}"
     );
+    let reported = trellis.status("tu").await.expect("status").expect("tu");
     assert_eq!(
-        reconcile::lock_wait(&database, SCHEMA, "public.u"),
-        None,
+        reported.capture_wait, None,
         "the table fails now; it no longer waits for a lock"
     );
+    assert!(reported.capture_failure.is_some(), "{reported:?}");
+}
+
+/// What holds a definition's capture back is recorded in the catalog, so a
+/// handle in a process that doesn't run the staging worker reports it too
+/// (#687, the user's Q5 decision: in a typical deployment the web process
+/// polls `status()` and a separate worker process runs staging). Here the
+/// worker's in-process state is dropped, as when its process stops, and a
+/// fresh handle still sees the wait, then the failure.
+#[tokio::test]
+async fn another_handle_sees_the_capture_wait_and_failure() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute("create table public.u (id int primary key, a int)")
+        .await
+        .expect("seed");
+    let database: String = raw
+        .query_one("select current_database()::text", &[])
+        .await
+        .expect("database")
+        .get(0);
+    definer(db.dsn())
+        .await
+        .apply("TRANSFORM tu FROM public.u SELECT a AS a")
+        .await
+        .expect("define");
+
+    let holder = hold_table(db.dsn(), "public.u").await;
+    let holder_pid = backend_pid(&holder).await;
+    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
+    assert_eq!(outcome.waiting.len(), 1, "{outcome:?}");
+    reconcile::forget_instance(&database, SCHEMA);
+    let web = definer(db.dsn()).await;
+    let reported = web.status("tu").await.expect("status").expect("tu");
+    let wait = reported
+        .capture_wait
+        .expect("a handle without the staging worker sees the wait");
+    assert_eq!(wait.table, "public.u");
+    assert_eq!(wait.operation, "install");
+    assert!(
+        wait.blockers
+            .iter()
+            .any(|line| line.contains(&format!("pid {holder_pid}"))),
+        "{wait:?}"
+    );
+    // A second waiting pass keeps when the wait began.
+    capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
+    let again = web
+        .status("tu")
+        .await
+        .expect("status")
+        .expect("tu")
+        .capture_wait
+        .expect("still waiting");
+    assert_eq!(again.waiting_since, wait.waiting_since);
+    holder
+        .batch_execute("commit")
+        .await
+        .expect("end the holder");
+
+    raw.batch_execute("alter table public.u drop constraint u_pkey")
+        .await
+        .expect("drop the primary key");
+    capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    reconcile::forget_instance(&database, SCHEMA);
+    let reported = definer(db.dsn())
+        .await
+        .status("tu")
+        .await
+        .expect("status")
+        .expect("tu");
+    assert_eq!(reported.capture_wait, None);
+    let failure = reported
+        .capture_failure
+        .expect("a handle without the staging worker sees the failure");
+    assert!(failure.error.contains("no primary key"), "{failure:?}");
+
+    raw.batch_execute("alter table public.u add primary key (id)")
+        .await
+        .expect("restore the primary key");
+    capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let reported = web.status("tu").await.expect("status").expect("tu");
+    assert_eq!(
+        (reported.capture_wait, reported.capture_failure),
+        (None, None)
+    );
+    let rows: i64 = raw
+        .query_one("select count(*) from capture_holdups", &[])
+        .await
+        .expect("count holdups")
+        .get(0);
+    assert_eq!(rows, 0, "a landed install clears its row");
 }
 
 /// A partitioned table can't be captured by statement triggers on its

@@ -19,8 +19,7 @@ defmodule Trellis.Status do
       a schema change paused it (resume it once fixed), or installing
       capture keeps failing (it clears once the cause is fixed).
 
-  `capture_wait`, and a `capture_failure` that isn't a pause, are only seen
-  in the process running the staging worker.
+  Every process sees them, whichever one runs the staging worker.
   """
 
   @typedoc "A transform's lifecycle status."

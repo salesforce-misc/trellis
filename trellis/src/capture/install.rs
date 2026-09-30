@@ -57,9 +57,9 @@
 //! pass began waiting, and every session that holds or is queued for a
 //! conflicting lock ([`Blocker`]: its pid, or a prepared transaction's gid;
 //! its backend type; its lock mode; since when; and the start of its query).
-//! The reconcile pass retries on its next pass and keeps the report in
-//! memory, where `Trellis::status` reports it as a waiting definition's
-//! `capture_wait` (Q5). Without a deadline an operation waits until it
+//! The reconcile pass retries on its next pass and records the report in
+//! `capture_holdups`, where `Trellis::status` reports it as a waiting
+//! definition's `capture_wait` (Q5, #687). Without a deadline an operation waits until it
 //! lands. While it retries, it logs the blockers at most every five seconds.
 //!
 //! `pg_stat_activity` shows another role's backend only to a superuser or a
@@ -193,9 +193,9 @@
 //! a function an older generator left behind is replaced.
 //!
 //! Nothing else this module writes is installed state. The capture gate
-//! belongs to a pending marker and goes with it. A [`LockWait`] is returned,
-//! not stored in the database; the reconcile pass keeps the latest one per
-//! table in memory (Q9).
+//! belongs to a pending marker and goes with it. A [`LockWait`] is returned;
+//! the reconcile pass records the latest one per table in `capture_holdups`
+//! (#687), which describes other sessions, not what is installed.
 //!
 //! # The Trellis role (#622 plan Q3)
 //!

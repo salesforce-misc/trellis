@@ -635,46 +635,49 @@ impl Trellis {
     }
 
     /// What holds up the capture a definition sourced from `source_table`
-    /// waits on (issue #622 C5, #687): the latest lock wait, then the latest
-    /// other failure, that this process's staging worker recorded for the
-    /// source, or for the to-side of a relationship declared on it. Only a
-    /// staging worker running in this process is seen.
+    /// waits on (issue #622 C5, #687): the lock wait, then the other
+    /// failure, that the staging worker's latest pass recorded in
+    /// `capture_holdups` for the source, or for the to-side of a relationship
+    /// declared on it. The staging worker may run in any process.
     async fn capture_holdup(
         &self,
         client: &impl tokio_postgres::GenericClient,
         source_table: &str,
     ) -> Result<(Option<CaptureWait>, Option<CaptureFailure>), TrellisError> {
-        let schema = self.config.schema();
-        let database: String = client
-            .query_one("select pg_catalog.current_database()::text", &[])
-            .await?
-            .get(0);
-        let mut tables = vec![source_table.to_string()];
-        tables.extend(
-            client
-                .query(
-                    "select to_schema || '.' || to_table from relationship_definitions \
-                     where from_schema || '.' || from_table = $1 order by id",
-                    &[&source_table],
-                )
-                .await?
-                .into_iter()
-                .map(|row| row.get::<_, String>(0)),
-        );
-        use crate::capture::reconcile;
-        let wait = tables
-            .iter()
-            .find_map(|table| reconcile::lock_wait(&database, schema, table))
-            .map(|wait| CaptureWait::from(&wait));
-        let failure = tables
-            .iter()
-            .find_map(|table| reconcile::failure(&database, schema, table))
-            .map(|failure| CaptureFailure {
-                source_table: failure.table,
-                columns: failure.columns,
-                error: failure.error,
-                detected_at: failure.since,
-            });
+        let rows = client
+            .query(
+                "select h.table_name, h.since, h.operation, h.lock_mode, h.observed_at, \
+                        h.blockers, h.error, h.columns \
+                 from capture_holdups h \
+                 join (select $1::text as t, 0::bigint as ord \
+                       union all \
+                       select to_schema || '.' || to_table, id from relationship_definitions \
+                       where from_schema || '.' || from_table = $1) read \
+                   on read.t = h.table_name \
+                 order by read.ord",
+                &[&source_table],
+            )
+            .await?;
+        let wait = rows.iter().find_map(|row| {
+            let operation: Option<String> = row.get(2);
+            operation.map(|operation| CaptureWait {
+                table: row.get(0),
+                operation,
+                lock_mode: row.get(3),
+                waiting_since: row.get(1),
+                observed_at: row.get(4),
+                blockers: row.get(5),
+            })
+        });
+        let failure = rows.iter().find_map(|row| {
+            let error: Option<String> = row.get(6);
+            error.map(|error| CaptureFailure {
+                source_table: row.get(0),
+                columns: row.get(7),
+                error,
+                detected_at: row.get(1),
+            })
+        });
         Ok((wait, failure))
     }
 
@@ -1447,8 +1450,9 @@ pub struct DefinitionStatus {
     /// go. A definition waits on capture while it is `waiting_to_backfill`,
     /// or while an `ALTER TRANSFORM` field it gained is paused until the
     /// capture images the column it reads (it is `catching_up` then, #687).
-    /// In memory only: reported when the staging worker runs in this
-    /// process.
+    /// The staging worker's latest pass records it in the catalog
+    /// (`capture_holdups`), so every process reports it, wherever the worker
+    /// runs.
     pub capture_wait: Option<CaptureWait>,
     /// Set while capture of a table the definition reads is broken, and
     /// only fixing the cause gets the definition going again. Either:
@@ -1461,8 +1465,7 @@ pub struct DefinitionStatus {
     /// - or, while it waits on capture as for `capture_wait`, the staging
     ///   worker's install or widen fails for a reason other than a lock (no
     ///   primary key, a statement that fails, #687). Every pass retries it,
-    ///   and it clears once one succeeds. In memory only, like
-    ///   `capture_wait`.
+    ///   and it clears once one succeeds. Recorded like `capture_wait`.
     pub capture_failure: Option<CaptureFailure>,
 }
 
@@ -1506,23 +1509,6 @@ pub struct CaptureWait {
     /// pid (or prepared transaction), backend type (`autovacuum worker`,
     /// say), lock mode, for how long, and the start of its query.
     pub blockers: Vec<String>,
-}
-
-impl From<&crate::capture::install::LockWait> for CaptureWait {
-    fn from(wait: &crate::capture::install::LockWait) -> Self {
-        CaptureWait {
-            table: wait.table.clone(),
-            operation: wait.operation.as_str().to_string(),
-            lock_mode: wait.lock_mode.clone(),
-            waiting_since: wait.waiting_since,
-            observed_at: wait.observed_at,
-            blockers: wait
-                .blockers
-                .iter()
-                .map(|blocker| blocker.describe(wait.observed_at))
-                .collect(),
-        }
-    }
 }
 
 /// The retry state of a source table's backfill marker whose discharge has
