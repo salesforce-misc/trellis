@@ -60,15 +60,12 @@ fn proptest_config() -> ProptestConfig {
     }
 }
 
-/// Runs `program` with `plan` against a fresh database on `cluster`, with
-/// slot and publication names unique to that database (issue #188).
+/// Runs `program` with `plan` against a fresh database on `cluster`.
 async fn run(cluster: &TestCluster, program: &Program, plan: &RestorePlan) -> Result<(), String> {
     let db = cluster.create_isolated_database().await;
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
-    let unique = db.name().replace('-', "_");
-    backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
     match run_convergence_with_restore(&mut backend, &pool, db.name(), program, plan, cluster).await

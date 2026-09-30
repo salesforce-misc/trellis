@@ -2,8 +2,8 @@
 //! mechanism (#132's four correctness rules) for to-one relationships under
 //! the specific timing #34's original relationship suite never exercised —
 //! a parent (to-side) change landing close enough to a from-side change on
-//! the *same* parent that the two can race across a seal boundary, an
-//! intake-lag window, or an out-of-order segment drain.
+//! the *same* parent that the two can race across a seal boundary, within
+//! one batch, or through an out-of-order segment drain.
 //!
 //! [`generative::generate::build_relationship_interleaving_scenario`] builds
 //! the five scenario shapes (the canonical parent-field-update case, plus
@@ -26,12 +26,12 @@
 //!
 //! Two timing modes are driven per variant:
 //!
-//! - **`run_in_the_same_intake_window`** (#138 item 2, the intake-lag
-//!   window): the parent-side and from-side critical ops are applied
-//!   back-to-back with no intervening `quiesce()` call, so the from-side
-//!   change may still be uncommitted-to-the-ring (behind the watermark) when
-//!   the parent's reverse work is enumerated. Single-worker, no forced seal
-//!   — the cheap, always-on half of the coverage.
+//! - **`run_back_to_back`** (#138 item 2, originally the intake-lag window):
+//!   the parent-side and from-side critical ops are applied back-to-back
+//!   with no intervening `quiesce()` call, so both usually land in the same
+//!   batch. Single-worker, no forced seal — the cheap, always-on half of the
+//!   coverage. (Under trigger capture a committed change is in the ring at
+//!   commit, so there is no staging lag left to race, #622.)
 //! - **`run_across_a_seal_boundary`** (#138 items 1 and 3, the seal-boundary
 //!   and out-of-order-segment-drain scenarios): the parent-side change is
 //!   sealed into its own segment before the from-side change is even
@@ -88,7 +88,7 @@
 //! `trellis/tests/apply_relationships.rs` — both test-only, no production
 //! code changed.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
@@ -122,22 +122,15 @@ async fn apply_checked(backend: &mut ManualBackend, op: &Op) {
     );
 }
 
-/// Polls [`ManualBackend::has_pending`] until a just-committed change has
-/// actually reached the ring, or panics after `timeout`. See
+/// Asserts a just-committed change is in the ring: a capture trigger stages
+/// it in the writer's own transaction (#622), so it is there at commit. See
 /// [`ManualBackend::force_seal_active_segment`]'s doc comment for why a
-/// caller must do this before sealing.
-async fn wait_until_pending(backend: &ManualBackend, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if backend.has_pending().await.expect("check pending") {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for a committed change to reach the ring — intake may be stuck"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+/// caller must know this before sealing.
+async fn assert_pending(backend: &ManualBackend) {
+    assert!(
+        backend.has_pending().await.expect("check pending"),
+        "a committed change must be in the ring at commit"
+    );
 }
 
 /// Quiesces, snapshots, and runs the three-way oracle check
@@ -161,12 +154,10 @@ async fn assert_converges(pool: &Pool, program: &Program, backend: &mut ManualBa
     }
 }
 
-/// #138 item 2 (the intake-lag window): the parent-side and from-side
-/// critical ops commit back-to-back with no `quiesce()` in between, so
-/// intake may not yet have staged the from-side change (or may not yet have
-/// staged the parent's) when the other's processing begins. Single-worker,
-/// no forced seal.
-async fn run_in_the_same_intake_window(variant: RelInterleavingVariant) {
+/// #138 item 2: the parent-side and from-side critical ops commit
+/// back-to-back with no `quiesce()` in between, so both usually land in the
+/// same batch. Single-worker, no forced seal.
+async fn run_back_to_back(variant: RelInterleavingVariant) {
     let scenario = build_relationship_interleaving_scenario(variant);
     let program = &scenario.program;
 
@@ -232,14 +223,8 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
     }
     // Widening `maintenance_interval` above means nothing auto-seals the
     // seed batch either unless this does it by hand first — `quiesce()`
-    // only waits for convergence, it never forces a seal on its own. Must
-    // wait for intake to actually stage the seeds first (not just check
-    // once): checking `has_pending` a single time right after the apply
-    // loop can race intake's own WAL consumption and see nothing yet,
-    // silently skipping the seal and leaving `quiesce()` to hang until the
-    // next (3s-away) automatic tick — or, worse, race that automatic tick
-    // mid-manual-seal below.
-    wait_until_pending(&backend, Duration::from_secs(5)).await;
+    // only waits for convergence, it never forces a seal on its own.
+    assert_pending(&backend).await;
     backend
         .force_seal_active_segment()
         .await
@@ -252,14 +237,14 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
     );
 
     apply_checked(&mut backend, &program.ops[scenario.parent_op]).await;
-    wait_until_pending(&backend, Duration::from_secs(5)).await;
+    assert_pending(&backend).await;
     let parent_seg = backend
         .force_seal_active_segment()
         .await
         .expect("seal the parent's own segment");
 
     apply_checked(&mut backend, &program.ops[scenario.from_side_op]).await;
-    wait_until_pending(&backend, Duration::from_secs(5)).await;
+    assert_pending(&backend).await;
     let from_side_seg = backend
         .force_seal_active_segment()
         .await
@@ -282,28 +267,28 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
 const SEAL_BOUNDARY_WORKERS: usize = 2;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn parent_field_update_converges_in_the_same_intake_window() {
-    run_in_the_same_intake_window(RelInterleavingVariant::ParentFieldUpdate).await;
+async fn parent_field_update_converges_back_to_back() {
+    run_back_to_back(RelInterleavingVariant::ParentFieldUpdate).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn parent_insert_converges_in_the_same_intake_window() {
-    run_in_the_same_intake_window(RelInterleavingVariant::ParentInsert).await;
+async fn parent_insert_converges_back_to_back() {
+    run_back_to_back(RelInterleavingVariant::ParentInsert).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn parent_delete_converges_in_the_same_intake_window() {
-    run_in_the_same_intake_window(RelInterleavingVariant::ParentDelete).await;
+async fn parent_delete_converges_back_to_back() {
+    run_back_to_back(RelInterleavingVariant::ParentDelete).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repoint_to_nonexistent_parent_converges_in_the_same_intake_window() {
-    run_in_the_same_intake_window(RelInterleavingVariant::RepointToNonexistentParent).await;
+async fn repoint_to_nonexistent_parent_converges_back_to_back() {
+    run_back_to_back(RelInterleavingVariant::RepointToNonexistentParent).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repoint_to_null_parent_converges_in_the_same_intake_window() {
-    run_in_the_same_intake_window(RelInterleavingVariant::RepointToNullParent).await;
+async fn repoint_to_null_parent_converges_back_to_back() {
+    run_back_to_back(RelInterleavingVariant::RepointToNullParent).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -478,7 +463,7 @@ mod obligation_matrix {
                 "generative/tests/convergence.rs::a_to_one_relationship_aggregated_inside_a_group_by_converges_end_to_end",
             ]),
             (ReverseDelta, NullJoinKey) => Handled(&[
-                "repoint_to_null_parent_converges_in_the_same_intake_window (this file, Part 1)",
+                "repoint_to_null_parent_converges_back_to_back (this file, Part 1)",
                 "repoint_to_null_parent_converges_across_a_seal_boundary (this file, Part 1)",
             ]),
             (ReverseFallback, NullJoinKey) => Handled(&[
@@ -545,7 +530,7 @@ mod obligation_matrix {
             (ReverseDelta, MissingOrRepointedParent) => Handled(&[
                 "trellis/tests/apply_relationship_reverse.rs::parent_insert_is_picked_up_by_the_reverse_path",
                 "trellis/tests/apply_relationship_reverse.rs::parent_delete_is_picked_up_by_the_reverse_path",
-                "repoint_to_nonexistent_parent_converges_in_the_same_intake_window (this file, Part 1)",
+                "repoint_to_nonexistent_parent_converges_back_to_back (this file, Part 1)",
                 "repoint_to_nonexistent_parent_converges_across_a_seal_boundary (this file, Part 1)",
             ]),
             (ReverseFallback, MissingOrRepointedParent) => Handled(&[

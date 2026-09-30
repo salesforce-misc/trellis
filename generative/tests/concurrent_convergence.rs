@@ -380,12 +380,6 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
             let mut backend = ManualBackend::connect_with_workers(db.dsn(), PROPERTY_WORKERS)
                 .await
                 .expect("connect concurrent backend");
-            // Issue #188: unique per-case slot/publication names, not the
-            // shared `ClientOptions::default()` literals — see
-            // `tests/convergence.rs`'s module doc comment for the
-            // shared-cluster slot-collision this avoids.
-            let unique = db.name().replace('-', "_");
-            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
@@ -462,12 +456,6 @@ fn run_concurrent_case(
             )
             .await
             .expect("connect concurrent backend");
-            // Issue #188: unique per-case slot/publication names, as
-            // `run_one` uses. The backend hands its publication to the
-            // operator handle that takes the mid-burst actions, so
-            // `request_backfill` checks the one the engine runs (#641).
-            let unique = db.name().replace('-', "_");
-            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
@@ -852,8 +840,6 @@ async fn every_mid_burst_action_runs_while_its_burst_writes_the_source() {
     .expect("connect concurrent backend");
     // Non-default names, as the properties use: `request_backfill` has to
     // check the backend's own publication, not the default one (#641).
-    let unique = db.name().replace('-', "_");
-    backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
     let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
         .await
@@ -920,8 +906,8 @@ fn group_moves() -> generative::model::Program {
 /// then leaves `z` in a commit above the horizon, and both moves fold into
 /// one later batch as `a -> b`. The fold keeps only the first old image and
 /// the last new one, so nothing names `z` and its count is never taken back.
-/// On disk, intake runs far enough behind the source that most group writes
-/// are such re-derives, where on tmpfs they are rare. #556 milestone D
+/// On disk, the drain runs far enough behind the source that most group
+/// writes are such re-derives, where on tmpfs they are rare. #556 milestone D
 /// (#623) removes the horizons and lists #494 in its acceptance.
 ///
 /// Runs [`group_moves`] `ATTEMPTS` times, each on a fresh database, in
@@ -958,8 +944,6 @@ async fn group_moves_converge_on_disk() {
         )
         .await
         .expect("connect backend");
-        let unique = db.name().replace('-', "_");
-        backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
         let pool =
             Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
         match run_convergence_concurrent(&mut backend, &pool, &program, &plan).await {
@@ -1321,8 +1305,6 @@ async fn hot_key_case_3_11_converges() {
         )
         .await
         .expect("connect concurrent backend");
-        let unique = db.name().replace('-', "_");
-        backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
         let pool =
             Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
         let started = std::time::Instant::now();

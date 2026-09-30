@@ -20,8 +20,8 @@
 //! * **Both engines are live for the whole run.** Both are installed before
 //!   either applies its first op, and neither is torn down until the run
 //!   ends, so every op of either program is applied while the other
-//!   instance's staging worker, intake/CDC consumer, maintenance loop, and
-//!   application workers are all running.
+//!   instance's staging worker (capture reconcile included), maintenance
+//!   loop, and application workers are all running.
 //! * **Ops are interleaved, not batched per instance.** Step `n` applies
 //!   instance A's op `n` *and* instance B's op `n` before *either* instance
 //!   is asked to quiesce, so at the moment the harness asks for convergence
@@ -193,23 +193,11 @@ impl<B: Backend> InstanceRun<'_, B> {
 ///
 /// [`super::run_convergence`] checks after every op, and does so cheaply,
 /// because a single instance's `quiesce()` almost always returns as soon as
-/// its own commit has drained. **With a co-tenant instance in the same
-/// cluster that used not to be true, and the reason is worth writing down.**
-///
-/// `quiesce()` waits for the engine's own convergence watermark, whose token
-/// is `pg_current_wal_lsn()` — a **cluster-wide** LSN. So when instance A
-/// asks "have I converged?", it is really asking "has my pipeline confirmed
-/// through an LSN that includes instance B's writes?" — writes A's
-/// publication filters out and A therefore never receives as data. A's
-/// `replication_progress.confirmed_lsn` used to advance past them only on a
-/// keepalive, whose persist is throttled to once per
-/// `intake::KEEPALIVE_PERSIST_INTERVAL` (10s), so *every* quiesce in a
-/// two-instance run cost ~10s, and per-op checking would have cost roughly
-/// `20 * 10s` per case. Since issue #452 the waiter writes a
-/// `trellis.converge` logical message both intakes confirm through at once,
-/// so that cost is gone. The bounded number of checks was sized for it and
-/// stays until someone decides per-op localization is worth the extra
-/// quiesces.
+/// its own commit has drained. The bounded number of checks here was sized
+/// when a co-tenant instance's writes made every quiesce wait out a
+/// replication keepalive (~10s). Trigger capture (#622) has no such wait,
+/// and the bound stays until someone decides per-op localization is worth
+/// the extra quiesces.
 ///
 /// **This makes divergence localization coarser**, exactly like
 /// [`super::run_convergence_bursty`]'s: a divergence is only known to have

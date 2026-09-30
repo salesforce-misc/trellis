@@ -66,13 +66,6 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     let mut backend = SubprocessBackend::connect(db.dsn(), engine_bin)
         .await
         .expect("connect subprocess backend");
-    // Issue #188: a unique slot/publication per isolated database, same
-    // rationale as every `ManualBackend`-driven test in this suite —
-    // `TestCluster`'s underlying Postgres cluster is shared across
-    // concurrently-running tests, and a replication slot name is
-    // cluster-wide, not database-scoped.
-    let unique = db.name().replace('-', "_");
-    backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
 
     backend
         .install(&program)

@@ -25,7 +25,7 @@ mod two_instance;
 
 pub use concurrent::{ConcurrentRun, run_convergence_concurrent};
 pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES, RelPath};
-pub use db_admin::{check_slot_loss_detected, run_convergence_with_db_admin};
+pub use db_admin::run_convergence_with_db_admin;
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
 pub use two_instance::{
@@ -186,20 +186,11 @@ pub enum RunError {
     /// A scheduled [`Backend::scale_out`] (improvement-plan task E3) failed.
     ScaleOut(String),
     /// Issue #236: carrying out a database-administration action failed
-    /// (the harness's side of it: restarting the server, reconnecting,
-    /// stopping or starting the engine, losing the slot, resuming).
+    /// (the harness's side of it: restarting the server and reconnecting).
     DbAdmin {
         op_index: usize,
         action: DbAdminAction,
         error: String,
-    },
-    /// Issue #236: after a lost replication slot the engine came back up
-    /// with these `(target, status)` definitions not `paused`, so it carried
-    /// on over a gap its stream never delivered instead of pausing them
-    /// (issue #310's contract).
-    SlotLossUndetected {
-        op_index: usize,
-        not_paused: Vec<(String, String)>,
     },
     /// Issue #236: carrying out a backup or restore failed (the harness's
     /// side of it: reconnecting after the backup's stop, stopping the
@@ -219,10 +210,10 @@ pub enum RunError {
         at_backup: Snapshot,
         restored: Snapshot,
     },
-    /// Issue #236: after a cold-copy restore, which brings the replication
-    /// slot back with everything else, these `(target, status)` definitions
-    /// were `paused` once the engine caught up with `op_index`. Nothing about
-    /// the restore warrants a pause (the 2026-09-24 decision on #236).
+    /// Issue #236: after a cold-copy restore these `(target, status)`
+    /// definitions were `paused` once the engine caught up with `op_index`.
+    /// Nothing about the restore warrants a pause (the 2026-09-24 decision on
+    /// #236).
     PausedAfterRestore {
         op_index: usize,
         paused: Vec<(String, String)>,

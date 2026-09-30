@@ -4,9 +4,9 @@
 //! against the restored database, and converge.
 //!
 //! What this checks is the assumption the 2026-09-24 decision on issue #236
-//! rests on: Trellis keeps its catalog, staging ring, `replication_progress`
-//! row and targets in the database it reads from, so a restore rolls all of
-//! them back to the same point and what comes back is consistent with
+//! rests on: Trellis keeps its catalog, staging ring, capture triggers and
+//! targets in the database it reads from, so a restore rolls all of them
+//! back to the same point and what comes back is consistent with
 //! itself. Trellis has no restore-specific handling, and needs none.
 //!
 //! The oracle is "cloned" at *k* for free: it recomputes from the source
@@ -16,15 +16,14 @@
 //! nothing it shouldn't), and its targets must converge to the oracle over
 //! that source. Then every replayed op is checked like any other.
 //!
-//! A cold copy brings the replication slot back exactly where the restored
-//! progress row expects it, so intake must carry on from the restored point
-//! with no pause. A transform paused anywhere on the restored side is a
-//! failure ([`RunError::PausedAfterRestore`]), not a recovery: nothing here
-//! resumes one.
+//! Capture carries on from the restored point with no pause. A transform
+//! paused anywhere on the restored side is a failure
+//! ([`RunError::PausedAfterRestore`]), not a recovery: nothing here resumes
+//! one.
 //!
 //! The backup is taken right after op *k* is applied, before the run waits
-//! for the engine to catch up, so the backed-up ring, progress row and slot
-//! usually have that op's change in flight.
+//! for the engine to catch up, so the backed-up ring usually has that op's
+//! change in flight.
 //!
 //! Concrete over [`ManualBackend`] for the same reason as
 //! [`super::run_convergence_with_db_admin`]. The whole program installs up
@@ -40,17 +39,15 @@ use super::{
     Divergence, Outcome, RunError, apply_and_check_outcome, check_defs, quiesce_snapshot_and_check,
 };
 
-/// The status issue #310's recovery gives a transform whose slot was lost,
-/// which a cold-copy restore must never produce.
+/// The status a cold-copy restore must never leave a transform in.
 const PAUSED: &str = "paused";
 
 /// Issue #236's check that a cold-copy restore carried on without a pause.
 /// `statuses` is every installed definition's `(target, status)` on the
 /// restored database, read after the engine caught up with `op_index`.
 ///
-/// Panics on an empty `statuses`, like
-/// [`super::check_slot_loss_detected`]: a program with no transform has
-/// nothing that could have paused.
+/// Panics on an empty `statuses`: a program with no transform has nothing
+/// that could have paused.
 pub fn check_no_pause_after_restore(
     op_index: usize,
     statuses: Vec<(String, String)>,
@@ -161,11 +158,6 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
     let restored_pool = Config::from_dsn(dsn)
         .and_then(|config| Pool::new(&config))
         .map_err(|e| restore_error(k, "open the oracle's pool on the restore", e))?;
-
-    // TODO(#558): a `BackupKind::BaseBackup` restore has no slot. Here is
-    // where it would instead check issue #310's pause
-    // (`super::check_slot_loss_detected`), resume every transform and let the
-    // fresh backfill converge, rather than requiring no pause below.
 
     // Op `k` again, now on the restore: nothing paused, the source is what
     // the original's was, and the targets converge over it. The pause check

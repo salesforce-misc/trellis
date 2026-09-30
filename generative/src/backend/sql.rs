@@ -677,9 +677,8 @@ pub(super) async fn quiesce(
             // A catch-up parked and discharged between the ring wait and the
             // read above leaves its definition `live` again, with only its
             // enumeration in the ring. Those rows have no origin, so they
-            // gate every token, `token` included; intake's progress past it
-            // only ever grows, so this one check fails only if such rows
-            // appeared.
+            // gate every token, `token` included, so this one check fails
+            // only if such rows appeared.
             if converged_through(raw, token).await? {
                 return Ok(());
             }
@@ -781,9 +780,7 @@ mod tests {
     async fn catalog_definition(client: &tokio_postgres::Client, status: &str) -> TransformDef {
         client
             .batch_execute(&format!(
-                "insert into replication_progress (slot_name, confirmed_lsn) \
-                     values ('fake', 'FFFFFFFF/FFFFFFFF'); \
-                 insert into source_table_versions (source_table, version) values ('{SOURCE}', 1); \
+                "insert into source_table_versions (source_table, version) values ('{SOURCE}', 1); \
                  insert into transform_definitions \
                      (target_table, source_table, source_version, definition_text, status) \
                      values ('public.t', '{SOURCE}', 1, 'TRANSFORM t FROM s SELECT a AS a', '{status}')"

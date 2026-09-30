@@ -41,10 +41,11 @@ measurement writeup.
 That stall was an engine bug, issue #452, not the seal age gate
 (`SealConfig::age_gate`) that `local_docs/transit-comparison.md` §3.3
 suspected: a convergence wait whose token landed past the last decoded
-change waited for intake's keepalive-driven persist, throttled to once per
-10s. The waiter now asks intake to confirm through its token with a logical
-message, and the fast-lane binaries' serial time dropped from 385s to 174s
-(fifteen binaries, measured 2026-09-24). The figures above predate that fix.
+change waited for the then-replication intake's keepalive-driven persist,
+throttled to once per 10s. Fixing that dropped the fast-lane binaries'
+serial time from 385s to 174s (fifteen binaries, measured 2026-09-24), and
+trigger capture (#622) removed the wait altogether. The figures above
+predate both.
 What's left of a quiesce's floor is mostly the backfill discharge's
 `reconcile_interval` (5s), which a new registration waits out before its
 backfill starts.

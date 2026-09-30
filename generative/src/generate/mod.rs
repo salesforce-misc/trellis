@@ -1872,7 +1872,7 @@ pub fn build_program_multi_with_relationships(
 // to-one enrichment settled; what #138 asks the generative suite to stress
 // is *timing* — a parent (to-side) change landing close enough to a
 // from-side change on the *same* parent that the two can race across a
-// seal boundary, an intake-lag window, or an out-of-order segment drain
+// seal boundary, within one batch, or through an out-of-order segment drain
 // (see `trellis/tests/spike_102.rs`'s `spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work`,
 // branch `spike/issue-102-validation-v2`, for the real-engine scenario
 // shape this mirrors).
@@ -3164,7 +3164,7 @@ mod strategy {
     use super::*;
     use crate::model::{
         BackupKind, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction, NoiseEvent,
-        NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SlotLossKind,
+        NoiseEventKind, NoisePlan, RestartMode, RestorePlan,
     };
     use proptest::prelude::*;
 
@@ -4396,9 +4396,8 @@ mod strategy {
         })
     }
 
-    /// Issue #236: one [`DbAdminAction`] other than a slot loss, weighted
-    /// toward the cheap ones.
-    fn db_admin_in_place_action() -> impl Strategy<Value = DbAdminAction> {
+    /// Issue #236: one [`DbAdminAction`], weighted toward the cheap ones.
+    fn db_admin_action() -> impl Strategy<Value = DbAdminAction> {
         prop_oneof![
             2 => Just(DbAdminAction::Checkpoint),
             2 => Just(DbAdminAction::RestartPostgres(RestartMode::Fast)),
@@ -4406,33 +4405,14 @@ mod strategy {
         ]
     }
 
-    fn slot_loss_kind() -> impl Strategy<Value = SlotLossKind> {
-        prop_oneof![
-            // Invalidating writes and checkpoints ~20MB of WAL per round, so
-            // it's drawn less often than a plain drop.
-            2 => Just(SlotLossKind::Dropped),
-            1 => Just(SlotLossKind::Invalidated),
-        ]
-    }
-
     /// Issue #236: a database-administration plan for `program`, 0-3 events
     /// anchored anywhere in its ops.
     ///
-    /// At most three, because every [`RestartMode`] restart makes the
-    /// engine's intake supervisor wait out a backoff that doubles from 1s
-    /// and resets only after an attempt stays up for 60s. Four restarts in
-    /// one short program already cost 1+2+4+8s.
-    ///
-    /// A slot loss can land on any op, a delete or truncate included: the
-    /// loss puts that op in the gap, and since issue #330 the operator's
-    /// `RESUME` drops target rows whose source rows the gap removed.
+    /// At most three, so a short program isn't dominated by restarts.
     pub fn db_admin_plan_for(program: &Program) -> impl Strategy<Value = DbAdminPlan> + use<> {
         let op_count = program.ops.len();
-        let action = prop_oneof![
-            3 => db_admin_in_place_action(),
-            2 => slot_loss_kind().prop_map(DbAdminAction::LoseSlot),
-        ];
-        let event = (0..op_count, action).prop_map(|(op, action)| DbAdminEvent { op, action });
+        let event =
+            (0..op_count, db_admin_action()).prop_map(|(op, action)| DbAdminEvent { op, action });
         prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
     }
 
@@ -4531,26 +4511,13 @@ mod strategy {
     /// [`trivial_program_with`]'s full mix — a deliberate, documented scope
     /// cut, discovered *while building this task*, mirroring
     /// [`grain_value`]'s own history of a found-but-then-out-of-scope engine
-    /// bug (issue #128, since fixed).** Restarting the primary client mid-stream originally reproduced
-    /// a real engine bug: `intake::Intake::connect` built its
-    /// `pgwire_replication::ReplicationConfig` with no explicit `start_lsn`,
-    /// so a fresh connection resumed from the replication *slot's own*
-    /// server-tracked `confirmed_flush_lsn` — which only advances once a
-    /// Standby Status Update actually reaches the server, an async, lagging
-    /// acknowledgment distinct from (and potentially behind) this
-    /// application's own durably-persisted `replication_progress.confirmed_lsn`.
-    /// A crash between "durably stage a transaction" and "the next status
-    /// update reaching Postgres" left the slot itself stale; reconnecting
-    /// against it (the previous behavior) made Postgres *redeliver* one or
-    /// more already-staged-and-fully-applied transactions, which the ring's
-    /// fold only collapses when a duplicate lands *before* the original
-    /// segment seals — once draining has already applied it, a redelivered
-    /// duplicate is a second, independent delta, silently double-counting an
-    /// `Aggregate` target's `SUM`/`COUNT`. **Fixed** (see
-    /// `intake::Intake::connect`'s own updated doc comment/code):
-    /// `Intake::connect` now passes its own durably-read `last_confirmed` as
-    /// `start_lsn` explicitly, which can never be behind the slot's own
-    /// position, closing the large majority of this race.
+    /// bug (issue #128, since fixed).** Restarting the primary client
+    /// mid-stream originally reproduced a real engine bug in the replication
+    /// intake Trellis ran before #622: a fresh connection resumed from the
+    /// slot's server-tracked position rather than the durably persisted
+    /// watermark, so Postgres redelivered already-applied transactions,
+    /// silently double-counting an `Aggregate` target's `SUM`/`COUNT`. Fixed
+    /// then, and gone with intake.
     ///
     /// **A second, deeper bug survived that fix — since root-caused and
     /// fixed too, unrelated to replication or to `OneToOne` at all.** A
@@ -4578,8 +4545,8 @@ mod strategy {
     /// independent re-review found scale-out — which never touches
     /// intake/replication at all — could also lose a brand-new row/group
     /// entirely (reproduced on the very first case generated in a fresh run,
-    /// no restart involved). That ruled out both `Intake::connect`'s
-    /// `start_lsn` path *and* the next hypothesis considered
+    /// no restart involved). That ruled out both the intake resume position
+    /// *and* the next hypothesis considered
     /// (`claim`'s live-worker-count bucket-share math miscounting a
     /// joining/leaving worker — ruled out directly: every program this
     /// generator draws stays far below `claim::MIN_ROWS_TO_SPLIT`, so every

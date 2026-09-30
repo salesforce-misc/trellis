@@ -18,9 +18,8 @@
 //! **Why this is structurally very unlikely to be flaky, not just usually
 //! lucky.** `ManualBackend::apply` returns as soon as the raw source
 //! statement's own transaction commits — nothing about that commit touches
-//! the engine. Reflecting it in the target requires, at minimum: the
-//! logical-replication stream delivering and decoding the WAL record
-//! (`trellis::intake`), appending it to the staging ring, *sealing* the
+//! the engine beyond the capture trigger's ring row. Reflecting it in the
+//! target requires, at minimum: *sealing* the
 //! active segment — which only happens on the staging worker's fixed
 //! `maintenance_interval` tick (**300ms** by default,
 //! `trellis::client::ClientOptions::maintenance_interval`, and this backend

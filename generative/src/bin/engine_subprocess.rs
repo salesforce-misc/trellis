@@ -6,22 +6,18 @@
 //! `Command::spawn()` and `testkit::crash::CrashGuard` to `SIGKILL`. It
 //! deliberately does *not* reuse `trellis run`'s CLI: that command derives
 //! its source-table set from the catalog at connect time (see its own
-//! module doc comment) and exposes no way to pin a specific
-//! slot/publication/`wake_channel`, both of which
-//! `SubprocessBackend`/`ManualBackend` need explicit control over (issue
-//! #188 — a replication slot name is cluster-wide, not database-scoped, so
-//! tests sharing one Postgres cluster across isolated databases must be able
-//! to give each backend its own). Configuration here is entirely
+//! module doc comment) and exposes no way to pin the worker counts and
+//! maintenance cadence `SubprocessBackend` needs explicit control over.
+//! Configuration here is entirely
 //! environment-variable driven, matching the pattern
 //! `testkit::crash::CrashGuard`'s own doc comment calls for ("a binary...
 //! re-invoked with an env var... telling it which operation to run").
 //!
 //! Required env vars: `TRELLIS_DSN`, `TRELLIS_STAGING_WORKER` (`"true"`/
-//! `"false"`), `TRELLIS_APPLICATION_THREADS` (a `usize`), `TRELLIS_SLOT`,
-//! `TRELLIS_PUBLICATION`, `TRELLIS_MAINTENANCE_INTERVAL_MS` (a `u64`),
-//! `TRELLIS_READY_MARKER` (a path). There is no source-table list: the
-//! staging worker publishes what the catalog's definitions read (issue
-//! #427). Two more env vars are read directly by `staging::apply`'s
+//! `"false"`), `TRELLIS_APPLICATION_THREADS` (a `usize`),
+//! `TRELLIS_MAINTENANCE_INTERVAL_MS` (a `u64`), `TRELLIS_READY_MARKER` (a
+//! path). There is no source-table list: the staging worker captures what
+//! the catalog's definitions read (issue #427). Two more env vars are read directly by `staging::apply`'s
 //! own test-only pause hook, never by this binary — see
 //! `SubprocessBackend::spawn_engine`'s doc comment for why they only need to
 //! be present in this process's environment, not parsed here:
@@ -57,8 +53,6 @@ fn main() {
             eprintln!("engine_subprocess: TRELLIS_APPLICATION_THREADS must be a usize: {err}");
             std::process::exit(2);
         });
-    let slot = required_env("TRELLIS_SLOT");
-    let publication = required_env("TRELLIS_PUBLICATION");
     let maintenance_interval_ms: u64 = required_env("TRELLIS_MAINTENANCE_INTERVAL_MS")
         .parse()
         .unwrap_or_else(|err| {
@@ -70,8 +64,6 @@ fn main() {
     let options = ClientOptions {
         staging_worker,
         application_threads,
-        slot,
-        publication,
         maintenance_interval: Duration::from_millis(maintenance_interval_ms),
         ..Default::default()
     };

@@ -87,15 +87,10 @@
 //! # A cost that used to set this file's shape
 //!
 //! Every `quiesce()` in a two-instance run used to cost ~10 seconds, against
-//! ~0.1s for the identical single-instance run. `quiesce()`'s token is
-//! `pg_current_wal_lsn()` — a **cluster-wide** LSN — so an instance asking
-//! "have I converged?" is really asking whether it has confirmed through
-//! WAL its co-tenant wrote and its own publication filters out. That used
-//! to advance only on a keepalive, whose persist is throttled to once per
-//! 10s (`intake::KEEPALIVE_PERSIST_INTERVAL`). Since issue #452 the waiter
-//! writes a `trellis.converge` logical message that both instances' intakes
-//! decode and confirm through at once, so the co-tenant costs nothing
-//! extra. [`MAX_CHECKS_PER_RUN`] was sized for the old cost.
+//! ~0.1s for the identical single-instance run: the replication intake Trellis
+//! ran before #622 confirmed WAL its co-tenant wrote only on a throttled
+//! keepalive. Trigger capture has no such wait. [`MAX_CHECKS_PER_RUN`] was
+//! sized for the old cost.
 //!
 //! # Running this property alone (design doc §9)
 //!
@@ -167,9 +162,7 @@ struct Instance {
 /// Stands up one Trellis instance inside `db`, in its own named schema.
 ///
 /// `tag` distinguishes the two instances everywhere a name has to differ:
-/// the instance schema, the transform target schema, and the replication
-/// slot/publication (issue #188 — a slot name is unique cluster-wide, so it
-/// has to carry both the database's unique suffix *and* the instance tag).
+/// the instance schema and the transform target schema.
 /// Nothing else is made distinct: both instances share the database, its
 /// WAL, its catalog, and its advisory-lock keyspace, which is the whole
 /// point (see the module doc comment).
@@ -207,13 +200,10 @@ async fn stand_up(db: &TestDatabase, label: InstanceLabel, tag: &str) -> Instanc
         .await
         .expect("migrate instance schema");
 
-    let mut backend =
+    let backend =
         ManualBackend::connect_with_instance(db.dsn(), &schema, &target_schema, 1, None)
             .await
             .expect("connect instance backend");
-    // Issue #188: unique per-case *and* per-instance slot/publication names.
-    let unique = format!("{}_{tag}", db.name().replace('-', "_"));
-    backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
 
     Instance {
         backend,

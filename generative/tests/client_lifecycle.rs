@@ -19,17 +19,11 @@
 //! from `tests/convergence.rs`.
 //!
 //! **This file's restart property found a real engine bug, and fixed the
-//! majority of it.** The engine's own `intake::Intake::connect` built its replication
-//! connection with no explicit `start_lsn`, so a fresh connection (as a
-//! restart produces) resumed from the replication *slot's own*
-//! server-tracked position rather than this application's own durably
-//! persisted watermark, which can be strictly ahead of it (an async,
-//! lagging acknowledgment) — Postgres would then redeliver already-staged-
-//! and-applied transactions, which the ring's fold only dedupes within a
-//! still-active segment, silently double-counting an `Aggregate` target's
-//! `SUM`/`COUNT` once the original segment had already sealed and drained.
-//! See `intake::Intake::connect`'s doc comment for the fix (pass
-//! `last_confirmed` as `start_lsn` explicitly).
+//! majority of it.** The replication intake Trellis ran before #622 resumed
+//! a fresh connection from the replication slot's server-tracked position
+//! rather than its own durably persisted watermark, so Postgres redelivered
+//! already-applied transactions, silently double-counting an `Aggregate`
+//! target's `SUM`/`COUNT`. That intake is gone.
 //!
 //! **Independent-review update, since resolved:** a second, deeper bug
 //! survived that fix, and for a while was believed to be a rarer residual
@@ -143,12 +137,6 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
-            // Issue #188: unique per-case slot/publication names, not the
-            // shared `ClientOptions::default()` literals — see
-            // `tests/convergence.rs`'s module doc comment for the
-            // shared-cluster slot-collision this avoids.
-            let unique = db.name().replace('-', "_");
-            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
@@ -174,8 +162,8 @@ proptest! {
     ///
     /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
     /// fixed.** This property is exactly what surfaced the bug, in two
-    /// layers: first `intake::Intake::connect`'s missing `start_lsn`
-    /// (fixed, see its own doc comment), then a second, deeper one this
+    /// layers: first the pre-#622 intake's resume position (fixed, and
+    /// since deleted with intake), then a second, deeper one this
     /// property (and [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`]
     /// below) kept reproducing even after that fix — a genuine `MissingRow`
     /// divergence at a real, not-rare rate. That second bug turned out to
@@ -203,9 +191,9 @@ proptest! {
     /// [`property_convergence_holds_across_a_mid_stream_client_restart`] above, but
     /// with no restart involved at all — a brand-new `Aggregate` group
     /// (source row `c6 = 2`) inserted shortly after `schedule_scale_out`
-    /// never appeared in its target. That ruled out `Intake::connect`'s
-    /// `start_lsn` path as the mechanism (scale-out never touches
-    /// intake/replication) and — once traced — also ruled out the
+    /// never appeared in its target. That ruled out the intake resume
+    /// position as the mechanism (scale-out never touched intake) and —
+    /// once traced — also ruled out the
     /// once-leading hypothesis that `claim`'s live-worker-count bucket-share
     /// math was miscounting a joining/leaving worker: every program this
     /// suite generates stays far below `claim::MIN_ROWS_TO_SPLIT`, so every

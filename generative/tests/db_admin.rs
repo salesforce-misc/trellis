@@ -1,11 +1,10 @@
 //! Issue #236 (layer-3 bucket 5, `docs/generative-test-suite.md` §7):
 //! database-administration actions interleaved with a program's ops —
-//! `CHECKPOINT`, a Postgres restart (fast, and immediate so the next start
-//! runs crash recovery), and losing the replication slot (dropped, or
-//! invalidated by the server). Each is an oracle identity, so every op is
+//! `CHECKPOINT`, and a Postgres restart (fast, and immediate so the next
+//! start runs crash recovery). Each is an oracle identity, so every op is
 //! still judged by the unchanged recompute oracle at quiescence; see
 //! `generative::run::run_convergence_with_db_admin` for what each action
-//! demands of the engine, and the extra detection check a slot loss gets.
+//! demands of the engine.
 //!
 //! Every hand-built pin owns its cluster, because a restart severs every
 //! connection on it. The property shares one per thread like the other
@@ -18,7 +17,7 @@ use generative::generate::{
     db_admin_plan_for, trivial_program,
 };
 use generative::model::{
-    DbAdminAction, DbAdminEvent, DbAdminPlan, Op, OpOutcome, Program, RestartMode, SlotLossKind,
+    DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode,
 };
 use generative::run::{RunError, run_convergence_with_db_admin};
 use proptest::prelude::*;
@@ -55,15 +54,12 @@ fn proptest_config() -> ProptestConfig {
     }
 }
 
-/// Runs `program` with `plan` against a fresh database on `cluster`, with
-/// slot and publication names unique to that database (issue #188).
+/// Runs `program` with `plan` against a fresh database on `cluster`.
 async fn run(cluster: &TestCluster, program: &Program, plan: &DbAdminPlan) -> Result<(), String> {
     let db = cluster.create_isolated_database().await;
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
-    let unique = db.name().replace('-', "_");
-    backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
     match run_convergence_with_db_admin(&mut backend, &pool, program, plan, cluster).await {
@@ -89,9 +85,8 @@ fn program_with_db_admin_plan() -> impl Strategy<Value = (Program, DbAdminPlan)>
 proptest! {
     #![proptest_config(proptest_config())]
 
-    /// Checkpoints, Postgres restarts and slot losses anywhere in a
-    /// generated program never perturb convergence, and a slot loss always
-    /// pauses every transform before the operator resumes them.
+    /// Checkpoints and Postgres restarts anywhere in a generated program
+    /// never perturb convergence.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_db_admin_actions_never_perturb_convergence((program, plan) in program_with_db_admin_plan()) {
@@ -104,17 +99,13 @@ proptest! {
 }
 
 /// No database: every drawn plan is anchored inside its program and holds at
-/// most three events, and across enough draws every action shows up, and a
-/// slot loss lands on a row-removing op (a delete or truncate in the gap,
-/// issue #330) as well as on an insert or update, so none silently drops out
-/// of the sweep.
+/// most three events, and across enough draws every action shows up, so
+/// none silently drops out of the sweep.
 #[test]
 fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let mut runner = TestRunner::default();
     let strategy = program_with_db_admin_plan();
-    let (mut checkpoint, mut fast, mut immediate, mut dropped, mut invalidated) =
-        (false, false, false, false, false);
-    let (mut gap_adds, mut gap_removes) = (false, false);
+    let (mut checkpoint, mut fast, mut immediate) = (false, false, false);
     for _ in 0..300 {
         let (program, plan) = strategy
             .new_tree(&mut runner)
@@ -127,23 +118,12 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                 DbAdminAction::Checkpoint => checkpoint = true,
                 DbAdminAction::RestartPostgres(RestartMode::Fast) => fast = true,
                 DbAdminAction::RestartPostgres(RestartMode::Immediate) => immediate = true,
-                DbAdminAction::LoseSlot(kind) => {
-                    match program.ops[event.op] {
-                        Op::Delete { .. } | Op::Truncate { .. } => gap_removes = true,
-                        _ => gap_adds = true,
-                    }
-                    match kind {
-                        SlotLossKind::Dropped => dropped = true,
-                        SlotLossKind::Invalidated => invalidated = true,
-                    }
-                }
             }
         }
     }
     assert!(
-        checkpoint && fast && immediate && dropped && invalidated && gap_adds && gap_removes,
-        "checkpoint={checkpoint} fast={fast} immediate={immediate} dropped={dropped} \
-         invalidated={invalidated} gap_adds={gap_adds} gap_removes={gap_removes}"
+        checkpoint && fast && immediate,
+        "checkpoint={checkpoint} fast={fast} immediate={immediate}"
     );
 }
 
@@ -220,8 +200,9 @@ fn plan(events: &[(usize, DbAdminAction)]) -> DbAdminPlan {
 /// Postgres restarts with each op's change still in flight: a fast restart
 /// after a seed insert, an immediate one (crash recovery on the next start)
 /// after the delete, and a checkpoint after the last update. The engine
-/// reconnects on its own every time: intake through its supervisor, the
-/// pool by recycling, and the harness never touches the engine client.
+/// reconnects on its own every time: the staging worker's maintenance loop
+/// by reconnecting, the pool by recycling, and the harness never touches the
+/// engine client.
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_restarts_with_work_in_flight_converge() {
     let cluster = TestCluster::start();
@@ -231,89 +212,6 @@ async fn postgres_restarts_with_work_in_flight_converge() {
         (4, DbAdminAction::RestartPostgres(RestartMode::Immediate)),
         (5, DbAdminAction::Checkpoint),
     ]);
-    run(&cluster, &program, &plan)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-}
-
-/// Issue #310's recovery, driven through the generative harness: the slot
-/// is dropped while the engine is stopped and an update lands in the gap.
-/// The restart must pause both transforms (the run checks this before
-/// resuming), and the operator's `RESUME` must rebuild both targets,
-/// including the gap's update, to the oracle.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "#622: deleted in C7/C8"]
-async fn a_dropped_slot_pauses_every_transform_and_resuming_converges() {
-    let cluster = TestCluster::start();
-    let program = one_to_one_and_aggregate_program();
-    let plan = plan(&[(3, DbAdminAction::LoseSlot(SlotLossKind::Dropped))]);
-    run(&cluster, &program, &plan)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-}
-
-/// The same with the slot invalidated by the server (`wal_status = 'lost'`)
-/// rather than dropped, which takes #310's other recovery path: the dead
-/// slot is dropped before a fresh one is created.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "#622: deleted in C7/C8"]
-async fn an_invalidated_slot_pauses_every_transform_and_resuming_converges() {
-    let cluster = TestCluster::start();
-    let program = one_to_one_and_aggregate_program();
-    let plan = plan(&[(5, DbAdminAction::LoseSlot(SlotLossKind::Invalidated))]);
-    run(&cluster, &program, &plan)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-
-    // The cluster-wide retention cap the invalidation lowered is back out of
-    // the configuration files, so it can't reach a later case.
-    let db = cluster.create_isolated_database().await;
-    let overridden: i64 = db
-        .pool
-        .get()
-        .await
-        .expect("acquire connection")
-        .query_one(
-            "select count(*) from pg_file_settings where name = 'max_slot_wal_keep_size'",
-            &[],
-        )
-        .await
-        .expect("read pg_file_settings")
-        .get(0);
-    assert_eq!(
-        overridden, 0,
-        "max_slot_wal_keep_size left set after the run"
-    );
-}
-
-/// A slot loss whose gap deletes a source row. The resume's rebuild must
-/// drop the deleted row's 1-1 target row and take it out of its aggregate
-/// group, though no stream ever delivered the delete (issue #330).
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "#622: deleted in C7/C8"]
-async fn a_slot_loss_whose_gap_deletes_a_row_converges_after_resume() {
-    let cluster = TestCluster::start();
-    let program = one_to_one_and_aggregate_program();
-    let plan = plan(&[(4, DbAdminAction::LoseSlot(SlotLossKind::Dropped))]);
-    run(&cluster, &program, &plan)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-}
-
-/// A slot loss whose gap truncates the source: the resume's rebuild must
-/// empty both targets, the aggregate included, from a source it enumerates
-/// as having no rows at all (issue #330).
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "#622: deleted in C7/C8"]
-async fn a_slot_loss_whose_gap_truncates_the_source_converges_after_resume() {
-    let cluster = TestCluster::start();
-    let mut program = one_to_one_and_aggregate_program();
-    let table = program.tables[0].name.clone();
-    program.ops.push(Op::Truncate {
-        table,
-        expect: OpOutcome::Succeeds,
-    });
-    let plan = plan(&[(6, DbAdminAction::LoseSlot(SlotLossKind::Dropped))]);
     run(&cluster, &program, &plan)
         .await
         .unwrap_or_else(|e| panic!("{e}"));

@@ -321,7 +321,7 @@ pub struct Program {
 /// `tables`, so `run::check_program`'s oracle can never resolve a
 /// definition's source/target against it (that function only ever walks
 /// `Program.tables`/`Program.defs`), and no definition reads it, so the
-/// engine never publishes it and CDC intake never watches it either.
+/// engine never captures it either.
 /// Values follow the same rendered-text convention [`Op`] uses (`None` is
 /// SQL `NULL`).
 #[derive(Debug, Clone, PartialEq)]
@@ -520,19 +520,6 @@ pub enum RestartMode {
     Immediate,
 }
 
-/// How a [`DbAdminAction::LoseSlot`] takes the replication slot away
-/// (issue #236). These are the two shapes of loss issue #310 recovers from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotLossKind {
-    /// The slot is gone: a manual drop, a pre-PG-17 failover, or the source
-    /// restored from a backup that carries no slot.
-    Dropped,
-    /// The slot still exists but the server invalidated it
-    /// (`wal_status = 'lost'`) because its retained WAL passed
-    /// `max_slot_wal_keep_size`.
-    Invalidated,
-}
-
 /// A database-administration action (issue #236, layer-3 bucket 5 in
 /// `docs/generative-test-suite.md` §7). Each one leaves the correct
 /// converged state unchanged, so the oracle needs no changes: the run
@@ -544,28 +531,17 @@ pub enum DbAdminAction {
     /// run waits for it, so the op's change is usually still in flight.
     Checkpoint,
     /// Restarts the Postgres server, at the same point as `Checkpoint`.
-    /// Every connection the engine holds (replication stream, producer
-    /// session, pool, wake listener) is severed while work is in flight, and
+    /// Every connection the engine holds (producer session, pool, wake
+    /// listener) is severed while work is in flight, and
     /// the engine has to reconnect by itself: the harness never restarts the
     /// engine client for it.
     RestartPostgres(RestartMode),
-    /// Loses the replication slot while the engine is stopped, with the
-    /// anchor op landing in the gap no stream will deliver. The harness
-    /// stops the engine, loses the slot, applies the op, and starts the
-    /// engine again. Issue #310's contract is then checked before anything
-    /// else: every installed transform must come up `paused` (the loss was
-    /// detected and nothing carried on over the gap). The harness then acts
-    /// as the operator and `RESUME`s every transform, and the rebuilt targets
-    /// must converge to the oracle like any other op.
-    LoseSlot(SlotLossKind),
 }
 
 /// One [`DbAdminAction`], anchored to `ops[op]` (so `op < ops.len()`). See
 /// each action for where exactly around that op it fires. Several events
 /// may share an anchor. They fire in the order they appear in
-/// [`DbAdminPlan::events`], except that a `LoseSlot` always brackets the
-/// op's apply and the others follow it, and a second `LoseSlot` on the same
-/// op adds nothing to the first.
+/// [`DbAdminPlan::events`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct DbAdminEvent {
     pub op: usize,
@@ -579,23 +555,18 @@ pub struct DbAdminPlan {
     pub events: Vec<DbAdminEvent>,
 }
 
-/// How a [`RestorePlan`] backs the source cluster up (issue #236). The kinds
-/// differ in whether the replication slot survives the restore, which is
-/// the only thing about a restore Trellis sees differently (the 2026-09-24
-/// decision on issue #236: its catalog, ring, progress row and targets live
-/// in the backed-up database, so a restore rolls them all back together).
+/// How a [`RestorePlan`] backs the source cluster up (issue #236). Trellis's
+/// catalog, ring, capture triggers and targets all live in the backed-up
+/// database, so a restore rolls them all back together (the 2026-09-24
+/// decision on issue #236).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupKind {
     /// A file-level copy of the whole data directory, taken while the
-    /// server is stopped. The slot comes back exactly where the restored
-    /// progress row expects it, so intake carries on from the restored
-    /// point with no pause.
+    /// server is stopped. Capture carries on from the restored point with no
+    /// pause.
     ColdCopy,
-    // TODO(#558): `BaseBackup`, a `pg_basebackup` restore. It leaves
-    // `pg_replslot/` out, so the restored source has no slot: expect
-    // issue #310's pause, an operator resume, then a fresh backfill (#558's
-    // scenario 10). `crate::run::run_convergence_with_restore` marks where
-    // that expectation goes.
+    // TODO(#558): `BaseBackup`, a `pg_basebackup` restore. With no
+    // replication slot to lose (#622), it should behave like `ColdCopy`.
 }
 
 /// A backup-and-restore schedule for one program run (issue #236), driven by

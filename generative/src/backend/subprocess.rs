@@ -60,8 +60,8 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long [`SubprocessBackend`] waits for a freshly spawned
 /// `engine_subprocess` to write its readiness marker (i.e. for
-/// `trellis::Client::start` to finish setup — publication/slot/snapshot
-/// handshake) before giving up. Generous for the same reason
+/// `trellis::Client::start` to finish setup, capture install included)
+/// before giving up. Generous for the same reason
 /// `ManualBackend::QUIESCE_TIMEOUT` is: a genuinely stuck startup should
 /// time out loudly, not hang the suite.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -182,8 +182,6 @@ pub struct SubprocessBackend {
     engine_bin: PathBuf,
     tables: HashMap<String, Table>,
     defs: Vec<TransformDef>,
-    slot: String,
-    publication: String,
     application_threads: usize,
     maintenance_interval: Duration,
     /// The primary engine subprocess, once spawned. `None` before the first
@@ -223,11 +221,8 @@ impl SubprocessBackend {
     /// module compiles as part of the plain library target, which never
     /// gets it).
     ///
-    /// One application worker, the engine's default maintenance cadence,
-    /// the shared default `"trellis_slot"`/`"trellis_pub"` names — see
-    /// [`SubprocessBackend::connect_with_options`]/
-    /// [`SubprocessBackend::set_slot_and_publication`] to override any of
-    /// those (same rationale as `ManualBackend`'s equivalents — issue #188).
+    /// One application worker and the engine's default maintenance cadence
+    /// — see [`SubprocessBackend::connect_with_options`] to override either.
     ///
     /// `dsn` must be given explicitly (design doc §6: refuse an unnamed
     /// target), matching `ManualBackend::connect`.
@@ -286,8 +281,6 @@ impl SubprocessBackend {
             engine_bin: engine_bin.into(),
             tables: HashMap::new(),
             defs: Vec::new(),
-            slot: "trellis_slot".to_string(),
-            publication: "trellis_pub".to_string(),
             application_threads,
             maintenance_interval: maintenance_interval
                 .unwrap_or_else(|| trellis::ClientOptions::default().maintenance_interval),
@@ -299,24 +292,6 @@ impl SubprocessBackend {
             pause_trigger_path,
             pause_marker_path,
         })
-    }
-
-    /// Overrides the slot/publication names the primary `engine_subprocess`
-    /// is spawned with, instead of the shared `"trellis_slot"`/
-    /// `"trellis_pub"` defaults — same issue #188 rationale as
-    /// `ManualBackend::set_slot_and_publication`: a logical replication slot
-    /// name is unique cluster-wide, so two backends sharing one Postgres
-    /// cluster (even across separate isolated databases) need distinct
-    /// names. Must be called before the first [`SubprocessBackend::install`]
-    /// (which is the only call that spawns the primary subprocess); a
-    /// subprocess already spawned ignores a later call.
-    pub fn set_slot_and_publication(
-        &mut self,
-        slot: impl Into<String>,
-        publication: impl Into<String>,
-    ) {
-        self.slot = slot.into();
-        self.publication = publication.into();
     }
 
     /// Arms `staging::apply`'s test-only pre-commit pause hook
@@ -430,8 +405,6 @@ impl SubprocessBackend {
                     "1".to_string()
                 },
             )
-            .env("TRELLIS_SLOT", &self.slot)
-            .env("TRELLIS_PUBLICATION", &self.publication)
             .env(
                 "TRELLIS_MAINTENANCE_INTERVAL_MS",
                 self.maintenance_interval.as_millis().to_string(),
@@ -578,9 +551,9 @@ impl super::Backend for SubprocessBackend {
     /// in-process simulation: `SIGKILL`s the currently running primary
     /// subprocess (via [`CrashGuard::kill`]), waits for it to actually exit
     /// (recording the exit status — see [`SubprocessBackend::last_kill_status`]),
-    /// then spawns a fresh one against the exact same dsn/slot/publication
-    /// `install` originally used (it reads the tables to publish from the
-    /// catalog, issue #427). The ring is durable
+    /// then spawns a fresh one against the exact same dsn `install`
+    /// originally used (it reads the tables to capture from the catalog,
+    /// issue #427). The ring is durable
     /// Postgres state untouched by any of this, so the fresh subprocess is
     /// expected to redrive exactly whatever the killed one left mid-flight —
     /// including, if [`SubprocessBackend::arm_pause_before_commit`] paused it

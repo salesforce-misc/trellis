@@ -52,12 +52,12 @@ use trellis::dev::staging::{
     StagingError, has_pending as staging_has_pending, retire_drained_segments, seal_phase1,
     seal_phase2,
 };
-use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, IntakeError, Pool};
+use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 
 use super::Snapshot;
 use super::sql::{self, quote_ident};
 use crate::model::{
-    BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, SlotLossKind, Table,
+    BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
 };
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
@@ -92,18 +92,14 @@ const RESTART_PRODUCER_RETRY_MAX_DELAY: Duration = Duration::from_millis(320);
 /// Whether `err` is the producer-singleton-lock conflict
 /// (`trellis::StagingError::ProducerAlreadyRunning`) [`ManualBackend::restart`]'s
 /// bounded retry (issue #251) specifically targets — recognized in both
-/// shapes it can reach a fresh [`EngineClient::start_with_config`] call
-/// through: directly (`setup_staging`'s own producer session, inside
-/// `ClientError::Staging`) or via intake's separate internal session
-/// (`ClientError::Intake(IntakeError::Staging(..))`, opened after the first
-/// session already dropped — see `trellis::client`'s `setup_staging` doc
-/// comment). Every other `ClientError` variant is a real failure `restart`
-/// should surface immediately, not retry.
+/// shape it reaches a fresh [`EngineClient::start_with_config`] call
+/// through: `setup_staging`'s producer session, inside
+/// `ClientError::Staging`. Every other `ClientError` variant is a real
+/// failure `restart` should surface immediately, not retry.
 fn is_producer_already_running(err: &ClientError) -> bool {
     matches!(
         err,
         ClientError::Staging(StagingError::ProducerAlreadyRunning)
-            | ClientError::Intake(IntakeError::Staging(StagingError::ProducerAlreadyRunning))
     )
 }
 
@@ -185,20 +181,6 @@ pub enum ManualBackendError {
     DefinitionSettleTimeout {
         unsettled: Vec<String>,
         waited: Duration,
-    },
-    /// Issue #236: [`ManualBackend::stop_engine`] shut the engine down, but
-    /// the server still reported its replication slot active after
-    /// `waited`, so the slot can't be dropped or invalidated yet.
-    SlotStillActive {
-        slot: String,
-        waited: Duration,
-    },
-    /// Issue #236: [`ManualBackend::lose_slot`] couldn't get the server to
-    /// invalidate the slot within its budget. `wal_status` is the last value
-    /// observed.
-    SlotNotInvalidated {
-        slot: String,
-        wal_status: Option<String>,
     },
     /// Issue #236: a statement sent through the `Trellis` facade (the
     /// operator's `RESUME TRANSFORM`) failed.
@@ -340,17 +322,6 @@ pub struct ManualBackend {
     /// fresh client against the exact same target rather than needing the
     /// caller to hand the options back in.
     client_options: Option<ClientOptions>,
-    /// Overrides `ClientOptions::default()`'s shared `"trellis_slot"`/
-    /// `"trellis_pub"` literals for the primary `install`-started
-    /// `EngineClient`, when set via [`ManualBackend::set_slot_and_publication`]
-    /// before the first [`ManualBackend::install`] call. `None` (every
-    /// existing caller) keeps today's shared-literal behavior. See issue
-    /// #188: a logical replication slot name is unique cluster-wide, not
-    /// scoped per database, so two `ManualBackend`s against different
-    /// isolated databases on the *same* shared Postgres cluster (e.g.
-    /// `generative/tests/convergence.rs`'s thread-local `TestCluster`) must
-    /// not both install against the literal default name.
-    slot_and_publication: Option<(String, String)>,
     /// Additional application-worker-only clients started by
     /// [`ManualBackend::scale_out`] (improvement-plan task E3). Kept alive for
     /// the backend's own lifetime (dropped, and so best-effort-signalled to
@@ -516,7 +487,6 @@ impl ManualBackend {
             raw,
             engine_client: None,
             client_options: None,
-            slot_and_publication: None,
             scale_out_clients: Vec::new(),
             tables: HashMap::new(),
             defs: Vec::new(),
@@ -527,48 +497,6 @@ impl ManualBackend {
             config,
             operator: None,
         })
-    }
-
-    /// Overrides the slot/publication names [`ManualBackend::install`] uses
-    /// to start the primary `EngineClient`, instead of
-    /// `ClientOptions::default()`'s shared `"trellis_slot"`/`"trellis_pub"`
-    /// literals. Must be called before the first `install` (which is the
-    /// only call that starts the primary client — see
-    /// [`super::Backend::install`]'s impl below); a client already started
-    /// ignores a later call.
-    ///
-    /// Issue #188: a logical replication slot name is unique cluster-wide,
-    /// not scoped per database, even though the slot itself is tied to one
-    /// database. A caller driving multiple `ManualBackend`s against
-    /// separate isolated databases on the *same* shared Postgres cluster
-    /// (e.g. `generative/tests/convergence.rs`'s thread-local `TestCluster`,
-    /// one per proptest case) must give each a distinct slot/publication
-    /// name, or a later case can collide with an earlier case's slot that
-    /// hasn't actually been torn down yet (`trellis::Client::drop` is a
-    /// best-effort shutdown signal, not a synchronous join — see its own
-    /// doc comment) and get misdiagnosed by
-    /// the engine's own `intake::publication::create_slot_and_park_markers` as an
-    /// orphaned slot.
-    pub fn set_slot_and_publication(
-        &mut self,
-        slot: impl Into<String>,
-        publication: impl Into<String>,
-    ) {
-        self.slot_and_publication = Some((slot.into(), publication.into()));
-    }
-
-    /// Options for an operator's `Trellis` handle (one that runs no
-    /// background work): the backend's own publication, so
-    /// `request_backfill` checks membership in the publication the primary
-    /// client actually runs (issue #641), not the default one.
-    fn operator_options(&self) -> trellis::TrellisOptions {
-        trellis::TrellisOptions {
-            publication: self
-                .slot_and_publication
-                .as_ref()
-                .map(|(_, publication)| publication.clone()),
-            ..Default::default()
-        }
     }
 
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
@@ -599,16 +527,16 @@ impl ManualBackend {
     /// `trellis::dev::staging::has_pending`, exposed so a caller stressing the
     /// relationship-delta interleaving scenarios
     /// (`crate::generate::build_relationship_interleaving_scenario`) can
-    /// poll for "the op I just committed has actually reached the ring"
-    /// before calling [`ManualBackend::force_seal_active_segment`] — sealing
-    /// before intake has consumed the change just seals an empty (or stale)
-    /// active segment, silently defeating the deterministic seal-boundary
-    /// reproduction the caller is trying to build.
+    /// confirm "the op I just committed is in the ring" before calling
+    /// [`ManualBackend::force_seal_active_segment`] — sealing an empty (or
+    /// stale) active segment would silently defeat the deterministic
+    /// seal-boundary reproduction the caller is trying to build. A capture
+    /// trigger stages a change in the writer's own transaction (#622), so it
+    /// is there at commit.
     ///
     /// Not a substitute for [`ManualBackend::quiesce`]: this only reports
-    /// whether intake has *staged* something, not whether it has been
-    /// applied/drained — exactly the distinction #138's "intake-lag window"
-    /// scenario needs a caller to be able to observe.
+    /// whether something is *staged*, not whether it has been
+    /// applied/drained.
     pub async fn has_pending(&self) -> Result<bool, ManualBackendError> {
         Ok(staging_has_pending(&self.raw).await?)
     }
@@ -626,9 +554,9 @@ impl ManualBackend {
     /// deterministically instead of hoping a maintenance tick's timing does
     /// it for you.
     ///
-    /// Callers **must** first confirm the change they mean to seal has
-    /// actually reached the ring (poll [`ManualBackend::has_pending`]) —
-    /// see that method's doc comment.
+    /// Callers **must** first confirm the change they mean to seal is in
+    /// the ring ([`ManualBackend::has_pending`]) — see that method's doc
+    /// comment.
     ///
     /// `seal_phase1`'s three refusals (`RingFull`, `SealGateBlocked`,
     /// `Raced`) are backpressure the caller must retry through, not
@@ -781,14 +709,6 @@ impl ManualBackend {
     }
 }
 
-/// How long [`ManualBackend::stop_engine`] waits for the server to release
-/// the replication slot after the engine shut down.
-const SLOT_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long [`ManualBackend::lose_slot`] keeps generating WAL and
-/// checkpointing before giving up on getting the slot invalidated.
-const SLOT_INVALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// How long [`await_pool_usable`] keeps trying after a Postgres restart.
 const POOL_USABLE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -826,14 +746,6 @@ pub async fn await_pool_usable(pool: &Pool) -> Result<(), ManualBackendError> {
 /// ([`super::ClusterControl`]), since only the cluster knows its data
 /// directory.
 impl ManualBackend {
-    /// The replication slot the primary engine client streams from.
-    fn slot_name(&self) -> Result<String, ManualBackendError> {
-        self.client_options
-            .as_ref()
-            .map(|options| options.slot.clone())
-            .ok_or(ManualBackendError::NoClientStarted)
-    }
-
     /// Replaces the backend's raw session and waits for its pool to work
     /// again, after a Postgres restart severed both. The engine client is
     /// left alone: reconnecting is its own job, and that is what a
@@ -843,35 +755,13 @@ impl ManualBackend {
         await_pool_usable(&self.pool).await
     }
 
-    /// Shuts the primary engine client down and waits for the server to
-    /// release its replication slot, so the slot can be dropped or
-    /// invalidated. The walsender can outlive the client's disconnect for a
-    /// moment, which is why this polls. [`Self::start_engine`] brings an
-    /// equivalent client back.
+    /// Shuts the primary engine client down. [`Self::start_engine`] brings
+    /// an equivalent client back.
     pub async fn stop_engine(&mut self) -> Result<(), ManualBackendError> {
-        let slot = self.slot_name()?;
         if let Some(client) = self.engine_client.take() {
             client.shutdown().await?;
         }
-        let started = std::time::Instant::now();
-        loop {
-            let active: i64 = self
-                .raw
-                .query_one(
-                    "select count(*) from pg_replication_slots where slot_name = $1 and active",
-                    &[&slot],
-                )
-                .await?
-                .get(0);
-            if active == 0 {
-                return Ok(());
-            }
-            let waited = started.elapsed();
-            if waited >= SLOT_RELEASE_TIMEOUT {
-                return Err(ManualBackendError::SlotStillActive { slot, waited });
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        Ok(())
     }
 
     /// Starts a primary engine client with the options [`Backend::install`]
@@ -887,99 +777,12 @@ impl ManualBackend {
         Ok(())
     }
 
-    /// Loses the primary client's replication slot, which must not be in use
-    /// (call [`Self::stop_engine`] first).
-    ///
-    /// [`SlotLossKind::Invalidated`] gets the server to invalidate the slot
-    /// for real rather than faking the catalog: it drops
-    /// `max_slot_wal_keep_size` to zero, writes WAL past it with
-    /// non-transactional logical messages (no table, so nothing a
-    /// publication could carry), switches segments and checkpoints until the
-    /// slot reads `wal_status = 'lost'`. The setting is cluster-wide, so it
-    /// is put back before this returns, whether or not the invalidation
-    /// took. Any other slot on the cluster that lags gets invalidated
-    /// too; on the generative suite's clusters those are only earlier cases'
-    /// leftovers.
-    pub async fn lose_slot(&self, kind: SlotLossKind) -> Result<(), ManualBackendError> {
-        let slot = self.slot_name()?;
-        match kind {
-            SlotLossKind::Dropped => {
-                self.raw
-                    .execute("select pg_drop_replication_slot($1)", &[&slot])
-                    .await?;
-                Ok(())
-            }
-            SlotLossKind::Invalidated => {
-                // `ALTER SYSTEM` refuses to run in a transaction block, so
-                // each statement goes on its own. The reset is attempted
-                // whatever happened before it, a failed reload after the
-                // `set` included: `ALTER SYSTEM` persists in
-                // `postgresql.auto.conf`, so a skipped reset would keep the
-                // cap at zero for every later case on this cluster, across
-                // restarts too. The first error wins.
-                let invalidated = async {
-                    self.raw
-                        .execute("alter system set max_slot_wal_keep_size = '0'", &[])
-                        .await?;
-                    self.raw.execute("select pg_reload_conf()", &[]).await?;
-                    self.invalidate_slot(&slot).await
-                }
-                .await;
-                let reset = async {
-                    self.raw
-                        .execute("alter system reset max_slot_wal_keep_size", &[])
-                        .await?;
-                    self.raw.execute("select pg_reload_conf()", &[]).await?;
-                    Ok::<(), ManualBackendError>(())
-                }
-                .await;
-                invalidated.and(reset)
-            }
-        }
-    }
-
-    /// [`Self::lose_slot`]'s invalidation loop, run while
-    /// `max_slot_wal_keep_size` is zero. Invalidation is decided at
-    /// checkpoint time, so each round writes WAL, switches segments and
-    /// checkpoints, then looks.
-    async fn invalidate_slot(&self, slot: &str) -> Result<(), ManualBackendError> {
-        let started = std::time::Instant::now();
-        loop {
-            self.raw
-                .batch_execute(
-                    "select pg_logical_emit_message(false, 'generative', repeat('x', 1048576)) \
-                     from generate_series(1, 20); \
-                     select pg_switch_wal(); \
-                     checkpoint;",
-                )
-                .await?;
-            let wal_status: Option<String> = self
-                .raw
-                .query_opt(
-                    "select wal_status from pg_replication_slots where slot_name = $1",
-                    &[&slot],
-                )
-                .await?
-                .and_then(|row| row.get(0));
-            if wal_status.as_deref() == Some("lost") {
-                return Ok(());
-            }
-            if started.elapsed() >= SLOT_INVALIDATION_TIMEOUT {
-                return Err(ManualBackendError::SlotNotInvalidated {
-                    slot: slot.to_string(),
-                    wal_status,
-                });
-            }
-        }
-    }
-
     /// A second backend over a restored copy of this backend's database at
     /// `dsn` (issue #236), with this one's engine client already started on
     /// it. Nothing is installed: the restored database already holds the
     /// program's tables, catalog, ring and targets as of the backup, so this
     /// only carries over what the harness itself remembers (the tables and
-    /// definitions it snapshots, and the client options, slot and
-    /// publication names included) and starts an equivalent client, the way
+    /// definitions it snapshots, and the client options) and starts an equivalent client, the way
     /// an operator would start Trellis again on a restored server.
     ///
     /// Fails with [`ManualBackendError::NoClientStarted`] if this backend
@@ -996,7 +799,6 @@ impl ManualBackend {
             Some(self.maintenance_interval),
         )
         .await?;
-        restored.slot_and_publication = self.slot_and_publication.clone();
         restored.client_options = self.client_options.clone();
         restored.tables = self.tables.clone();
         restored.defs = self.defs.clone();
@@ -1031,7 +833,7 @@ impl ManualBackend {
     /// source data; [`Backend::quiesce`] waits for them to finish.
     pub async fn resume_all(&self) -> Result<(), ManualBackendError> {
         let facade =
-            trellis::Trellis::connect(self.config.clone(), self.operator_options()).await?;
+            trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default()).await?;
         for def in &self.defs {
             facade
                 .apply(&format!("RESUME TRANSFORM {}", def.target))
@@ -1069,21 +871,12 @@ impl super::Backend for ManualBackend {
         // The staging worker publishes whatever the definitions just
         // registered read, straight from the catalog (issue #427).
         if !program.tables.is_empty() && self.engine_client.is_none() {
-            let mut options = ClientOptions {
+            let options = ClientOptions {
                 staging_worker: true,
                 application_threads: self.application_threads,
                 maintenance_interval: self.maintenance_interval,
                 ..Default::default()
             };
-            // Issue #188: a caller that needs to coexist with other
-            // `ManualBackend`s on the same shared Postgres cluster (see
-            // `set_slot_and_publication`'s doc comment) overrides the
-            // otherwise-shared default slot/publication names here, at the
-            // one place the primary client actually starts.
-            if let Some((slot, publication)) = &self.slot_and_publication {
-                options.slot = slot.clone();
-                options.publication = publication.clone();
-            }
             let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;
             self.engine_client = Some(client);
             // Remembered so `restart` (improvement-plan task E3) can start an
@@ -1445,7 +1238,7 @@ impl super::ConcurrentBackend for ManualBackend {
         }
         if self.operator.is_none() {
             self.operator = Some(
-                trellis::Trellis::connect(self.config.clone(), self.operator_options()).await?,
+                trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default()).await?,
             );
         }
         let operator = self.operator.as_ref().expect("connected just above");

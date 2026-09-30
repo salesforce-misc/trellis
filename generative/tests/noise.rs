@@ -11,38 +11,16 @@
 //!
 //! # E5 scope cut: `CHECKPOINT` only, not a full Postgres restart
 //!
-//! A full `TestCluster` restart was investigated and deliberately **not**
-//! built. The engine's own `intake::Intake::run` (the staging worker's logical-
-//! replication consumer) returns `Err` the instant its replication
-//! connection drops — confirmed by reading `trellis/src/intake/mod.rs`
-//! directly, not assumed — and `trellis::client::run` spawns it as
-//! `let _ = intake.run().await;`, silently discarding that error with no
-//! reconnect logic at all. A live `ManualBackend`'s own `raw` connection
-//! (`ManualBackend::connect`) has the same shape: one `tokio_postgres::connect`
-//! call, no supervisor. A real Postgres restart severs every one of these
-//! connections at once, so recovering would need genuinely new machinery —
-//! a way to tear down and rebuild `ManualBackend`'s connection *and* a fresh
-//! `trellis::Client` against the same already-installed schema (never
-//! re-running `install`, which would try to recreate tables that already
-//! exist) — which is real, separate, engine-adjacent work, not a "bucket 1,
-//! converged-state-unchanged" widening. This mirrors exactly the reasoning
-//! that already scoped slot-invalidation out of this same task: "the client
-//! needs to surface a loud, specific recovery story" is a different shape of
-//! test than "convergence still holds unattended." Both restart and slot
-//! invalidation are follow-ups, not built here.
+//! A full `TestCluster` restart was deliberately **not** built here, when
+//! the engine had no reconnect story for one. `CHECKPOINT` is a plain SQL
+//! statement over the same connection everything else already uses, changes
+//! no connection state, and (per Postgres's own docs) only flushes dirty
+//! buffers and writes a WAL checkpoint record, so it has no reason to
+//! disturb the staging pipeline. This file's property is exactly the
+//! empirical check that this is really true (design doc §6: don't assert
+//! what you haven't run), not just a restated assumption.
 //!
-//! `CHECKPOINT` has none of that problem — it's a plain SQL statement over
-//! the same connection everything else already uses, changes no connection
-//! state, and (per Postgres's own docs) only flushes dirty buffers and
-//! writes a WAL checkpoint record, so it has no reason to disturb a live
-//! replication slot or the staging pipeline's own watermark polling. This
-//! file's property is exactly the empirical check that this is really true
-//! (design doc §6: don't assert what you haven't run), not just a restated
-//! assumption.
-//!
-//! Since then the engine restarts intake on its own (issue #325) and a lost
-//! slot pauses transforms instead of wedging (issue #310), and issue #236
-//! built both follow-ups: see `tests/db_admin.rs`.
+//! Issue #236 later built the restart follow-up: see `tests/db_admin.rs`.
 //!
 //! Reuses the shared-cluster/isolated-database-per-case `Harness` pattern
 //! from `tests/convergence.rs` (see that file's module doc comment for why
@@ -95,12 +73,6 @@ fn run_one(program: &Program, noise: &NoisePlan) -> Result<(), TestCaseError> {
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
-            // Issue #188: unique per-case slot/publication names, not the
-            // shared `ClientOptions::default()` literals — see
-            // `tests/convergence.rs`'s module doc comment for the
-            // shared-cluster slot-collision this avoids.
-            let unique = db.name().replace('-', "_");
-            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
             let pool = trellis::Pool::new(
                 &trellis::Config::from_dsn(db.dsn().to_string()).expect("config"),
             )
