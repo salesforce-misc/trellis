@@ -80,10 +80,6 @@ A third option, `worker_threads`, is unrelated to either: it sizes the
 runtime a `BlockingTrellis` or binding handle owns. The bindings default it to
 2; Rust's `TrellisOptions` leaves it at one thread per core unless you set it.
 
-Rust's `TrellisOptions` still has a `publication` field. It is ignored: the
-staging worker captures changes with triggers, not a publication (#622), and
-the field goes in a later release.
-
 ### What the staging worker needs from the database
 
 The staging worker captures each source table's changes with statement
@@ -91,11 +87,11 @@ triggers that write into Trellis's staging ring in the application's own
 transaction (#622; [stage 1](staging-and-claiming/01-capture-by-triggers.md)).
 So:
 
-* **No `wal_level = logical`, no `REPLICATION` role attribute, no replication
-  slot.** Nothing reads the WAL.
+* **No `wal_level = logical` and no `REPLICATION` role attribute.** Nothing
+  reads the WAL.
 * **Ownership of every source table**, or membership in the role that owns
   it. The worker installs the triggers with `ENABLE ALWAYS`, which only the
-  owner may run. (Publishing a table needed ownership too.)
+  owner may run.
 * **The role that owns the Trellis schema** owns the capture functions, which
   run `SECURITY DEFINER`, so application roles writing a source table need no
   privilege on Trellis's schema.
@@ -105,10 +101,6 @@ So:
   pass while a long transaction or an autovacuum holds the table. Meanwhile the
   transform stays `waiting_to_backfill`, and `status()` reports what it waits
   on (`capture_wait`, in Rust).
-
-A database used by a Trellis build from before #622 may still have a
-`trellis_slot` replication slot that nothing consumes any more, which pins WAL
-until the disk fills. Drop it once: `select pg_drop_replication_slot('trellis_slot')`.
 
 ```rust
 // A web process: define transforms, never drains anything.
@@ -120,12 +112,11 @@ Defining a transform is cheap wherever it runs. `apply` validates the
 definition, creates the target table, records the transform as
 `waiting_to_backfill`, and returns. The target name must be free: `apply`
 refuses a transform whose target already exists as any table or view. It
-doesn't read the source table's rows and doesn't touch the replication
-publication or slot, so it takes the same time against an empty table as
-against a billion-row one. The dedicated worker does
-the rest in the background: it installs capture triggers on the source, reads its existing rows,
-builds the target, catches it up with whatever changed while it was
-building, and flips the transform to `live`
+doesn't read the source table's rows or install its capture triggers, so it
+takes the same time against an empty table as against a billion-row one. The
+dedicated worker does the rest in the background: it installs capture triggers
+on the source, reads its existing rows, builds the target, catches it up with
+whatever changed while it was building, and flips the transform to `live`
 ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 So a web process needs no ownership of the source tables; only the worker
 does. It does need to create tables: each target table in the target

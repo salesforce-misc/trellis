@@ -87,7 +87,7 @@ its `status` moving — so the two tiers don't conflict.
 
 Issue #55 wires the `waiting_to_backfill`/`backfilling`/`live` transitions on
 this field — the `xmin`-fence wait
-(`trellis/src/intake/publication.rs`'s `Snapshot::settled_since`) and both
+(`trellis/src/intake/markers.rs`'s `Snapshot::settled_since`) and both
 backfill-enumeration paths — plus a `quarantined → waiting_to_backfill` resume
 (`staging::quarantine::resume_transform`). The whole-transform fuse-trip that
 would *write* `Quarantined` is designed for but not yet implemented (follow-up,

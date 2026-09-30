@@ -1,8 +1,8 @@
 # Staging and Claiming
 
-**What this is.** How Trellis gets a committed source-database change from the
-write-ahead log into a derived table exactly once, with no window in which a
-change is acknowledged but not durable. This series lays out the design — the
+**What this is.** How Trellis gets a committed source-database change into a
+derived table exactly once, with no window in which a change is committed but
+not staged. This series lays out the design — the
 invariants and reasoning first, the SQL second.
 
 ## Where this fits in Trellis
@@ -19,20 +19,18 @@ Trellis takes this path at all.
 You have a stream of committed changes and a set of workers that apply their
 derived effects. Three things are simultaneously true and awkward:
 
-1. **The stream has a single cursor.** A Postgres logical replication slot (like
-   a Kafka partition offset or a MySQL binlog position) is a single-consumer,
-   monotonic position. Acknowledging position *L* lets the server discard
-   everything at or below *L* — acknowledge too early and the data is
-   unrecoverable.
+1. **Capture runs on the writer's path.** A capture trigger runs inside the
+   application's transaction, so every write pays for what it does, and
+   anything it waits on stalls the application. It can afford a blind insert
+   and nothing more.
 2. **Applying the effects is slow and wants to be parallel.** Recomputing derived
-   values costs orders of magnitude more than decoding a change, so if the cursor
-   advances only at apply speed, the log grows without bound whenever compute
-   falls behind.
+   values costs orders of magnitude more than capturing a change, so it can't
+   run in the writer's transaction without making every write pay for it.
 3. **Some effects are not idempotent.** A `sum` maintained by adding `+f(new)`
    and subtracting `−f(old)` is wrong if applied twice or zero times. Re-running
    it is not a safe repair.
 
-The design resolves all three by **splitting acknowledgment from application**
+The design resolves all three by **splitting capture from application**
 with a durable staging area in between, then making that area's handoff to
 workers structurally exactly-once rather than exactly-once by bookkeeping.
 
@@ -41,7 +39,7 @@ workers structurally exactly-once rather than exactly-once by bookkeeping.
 ```mermaid
 flowchart TB
     subgraph src["Source of change"]
-        WAL["WAL / logical slot\n(single-consumer cursor)"]
+        SRC["application write\n+ capture trigger"]
     end
 
     subgraph stage["Staging area (durable, in the same database)"]
@@ -58,8 +56,7 @@ flowchart TB
 
     TGT["derived tables /\ndelta aggregates"]
 
-    WAL -->|"① decode → buffer per txn"| ACT
-    ACT -->|"② stage + advance watermark\nIN ONE TXN, then ack the slot"| WAL
+    SRC -->|"①② append ring rows\nIN THE WRITER'S TXN"| ACT
     ACT -->|"③ seal (2-phase flip)"| SEALED
     SEALED -->|"④ claim a bucket share\n+ fold per key"| D1
     SEALED --> D2
@@ -86,7 +83,7 @@ A source `TRUNCATE` cuts across sealing, the fold, and apply; its
 whole-keyspace-clear semantics and drain-ordering barrier are written up in
 [truncate-propagation-spec.md](truncate-propagation-spec.md).
 
-Four guarantees are correctness (intake durability, one batch per row, claimed
+Four guarantees are correctness (capture durability, one batch per row, claimed
 batches immutable, exactly-once deltas); each is enforced in exactly one stage,
 and duplicating any of them is how the design rots. Everything else — buckets,
 heartbeats, poison quarantine, truncate eligibility — is liveness, throughput,
@@ -94,7 +91,7 @@ or observability.
 
 ## The state you have to keep
 
-Seven durable objects; only three are ever `UPDATE`d, which lets the
+Only a few of these durable objects are ever `UPDATE`d, which lets the
 high-volume ones be append-only and vacuum-free.
 
 | Object | Mutability | Role |
@@ -105,7 +102,6 @@ high-volume ones be append-only and vacuum-free.
 | `segments` (registry) | one row per live batch, updated | state machine, fence, bucket mask |
 | `seg_claims` | one row per in-flight bucket | the claim; its primary key *is* the exclusion |
 | `drainers` | one row per live worker | share denominator for fair fan-out |
-| `replication_progress` | one row per slot | the durable acknowledgment watermark |
 | `poison` / `poison_held` / `key_deaths` | per quarantined key | keeps a killer change from wedging the system |
 | `transform_fuse_gate` | one row per poisoned source table | serializes concurrent evictions' fuse checks (issue #159) |
 

@@ -56,7 +56,7 @@ commits on its own before any fold, so a peer's claim never waits on this
 worker's fold (#328).
 
 **Phase 2 holds no locks and no transaction.** Deliberate: compute can be
-arbitrarily expensive without blocking intake, another worker, or — by holding a
+arbitrarily expensive without blocking a writer, another worker, or — by holding a
 snapshot open — the seal gate and cleanup pass. The price is that the world can
 move under you, which the version fence and the immutable batch exist to handle.
 
@@ -235,8 +235,9 @@ So the live read records its basis as a WAL position, and a delta checks it:
    `pg_current_wal_insert_lsn()` into the group row's hidden
    `__trellis_recompute_lsn`. The function is evaluated while the statement runs,
    after its snapshot is taken. A commit visible to that snapshot wrote its
-   commit record before it became visible, so its `end_lsn` (the `lsn` intake
-   stamps on its ring rows) is at or below the stamped value.
+   commit record before it became visible, and its ring rows' `lsn` (the
+   insert position when its capture trigger ran) is below that record, so at
+   or below the stamped value.
 2. **The extinct horizon.** A deleted row can't hold a horizon, so each batch
    whose live reads find a group empty raises its target's single row in
    `aggregate_extinct_horizon` to the insert position after those reads. That
@@ -266,20 +267,13 @@ So the live read records its basis as a WAL position, and a delta checks it:
 This is the same "re-evaluate, never skip" choice as the 1-1 basis check. An LSN
 at or below the horizon only *may* have been read, so skipping the delta would be
 unsound. Re-deriving is correct either way. The cost is that a group keeps being
-re-derived while intake lags behind the apply and changes keep arriving for it.
-In steady state that is a catch-up effect. A target reaches its readers through
-one feed only, the seam (a relationship-endpoint target included, since issue
-#375), so a chained aggregate sees no CDC for it at all. The horizon still
-matters for one window: the upgrade that took endpoint targets out of the
-publication, where CDC for an endpoint written before the drop still arrives
-after the seam's `Recompute` for the same write.
+re-derived while rows staged before its horizon keep draining for it. In steady
+state that is a catch-up effect. A target reaches its readers through one feed
+only, the seam (a relationship-endpoint target included, since issue #375), so a
+chained aggregate sees no CDC for it at all.
 
-The same rule covers a definition's inline enumeration at `DEFINE` time
-(issue #322), which has no intake to wait on. The #312 watermark wait in
-[01](01-intake-and-lsn-confirmation.md) is now an optimization that makes these
-re-derivations rarer, not a correctness requirement. ADR-0016 retired that
-inline enumeration (#418): every ring capture runs in the backfill discharge,
-behind the #312 wait
+The same rule covers the backfill discharge's enumeration, whose read can see a
+commit whose captured rows are still pending
 ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)).
 
 ### The ledger
@@ -497,8 +491,7 @@ transaction id and every lock it took before, for as long as the holder
 does. Vacuum can't pass it, and the sealer's gate, which waits out every
 transaction running when the last fence was taken, refuses every seal
 meanwhile. In #617 a drain batch's ledger insert waited 1 h 50 min behind
-chunk transactions: the open transaction pinned the slot's `restart_lsn`,
-`pg_wal` reached 190 GB, and the sealer was refused for the whole wait
+chunk transactions, and the sealer was refused for the whole wait
 ([#617 final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160)).
 
 **The rule.** Every lock wait in a Trellis transaction is bounded by
@@ -545,47 +538,26 @@ every writer for 25 s behind one open transaction; with a 50 ms
 `lock_timeout` retried every 200 ms the worst writer wait was 52 ms
 ([E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)).
 
-**The rule.** DDL on a user table runs in a retry loop (`locks::DdlRetry`),
-each attempt its own transaction under a short per-attempt `lock_timeout`, one
-attempt per `locks::USER_TABLE_DDL_RETRY_INTERVAL` (200 ms), until it lands.
-The per-attempt timeout depends on the lock the DDL takes:
+**The rule.** DDL on a user table (`CREATE`/`DROP TRIGGER`, #622) runs in a
+retry loop (`locks::DdlRetry`), each attempt its own transaction under
+`locks::USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms), E7's shape, one attempt per
+`locks::USER_TABLE_DDL_RETRY_INTERVAL` (200 ms). The staging worker's
+reconcile pass leaves a table whose lock stays held to the next pass
+([01](01-capture-by-triggers.md#installing-widening-narrowing-and-uninstalling)).
+The retire path's `TRUNCATE` is the older precedent: it takes its lock
+`NOWAIT` and skips the slot until the next tick.
 
-- **A lock writers queue behind** (`CREATE`/`DROP TRIGGER`'s `SHARE ROW
-  EXCLUSIVE`, from #622): `locks::USER_TABLE_DDL_LOCK_TIMEOUT`, 50 ms, E7's
-  shape.
-- **`SHARE UPDATE EXCLUSIVE`** (`ALTER PUBLICATION ... ADD/DROP TABLE` in
-  `reconcile_publication`, today's only user-table DDL): writers don't
-  conflict with it, so they never queue behind it, and I6 doesn't bound it.
-  Only I7's rule applies: it mustn't wait with a snapshot open for a long
-  time behind whatever holds the table (a manual `VACUUM`, `CREATE INDEX
-  CONCURRENTLY`, an `ALTER TABLE`, an autovacuum). Its per-attempt timeout
-  is `locks::share_update_exclusive_ddl_timeout`: twice the session's
-  `deadlock_timeout`, at least 2 s, at most `LOCK_TIMEOUT`. It must outwait
-  `deadlock_timeout` because that is when a waiter runs the deadlock check,
-  and the check is what cancels an autovacuum that blocks it. With a 50 ms
-  timeout the check never runs. On Postgres 17, with a throttled autovacuum
-  on the table, every 50 ms `ALTER PUBLICATION` attempt timed out, so the
-  join would have waited out the whole vacuum, hours on a large table. A
-  2 s attempt had the vacuum cancelled and landed in 1.0 s. An
-  anti-wraparound autovacuum is never cancelled; the loop waits that one out.
-
-The maintenance loop, the only sealer, makes one attempt per reconcile pass
-and leaves the change to the next pass; startup retries until it lands. The
-retire path's `TRUNCATE` is the older precedent: it takes its lock `NOWAIT`
-and skips the slot until the next tick.
-
-**Open for #622.** `CREATE`/`DROP TRIGGER` conflict with `SHARE UPDATE
-EXCLUSIVE` too, so an autovacuum blocks them in the same way. Their 50 ms
-timeout can't outwait `deadlock_timeout` without queueing writers for that
-long, so a trigger join on a table under a long autovacuum waits the vacuum
-out.
+An autovacuum holding the table blocks the DDL the same way. Postgres cancels
+one only when a waiter runs its deadlock check, after `deadlock_timeout`,
+which a 50 ms attempt never reaches, so a join on a table under a long
+autovacuum waits the vacuum out (#622 plan Q1).
 
 ## Downstream propagation, and why it terminates
 
 Step 4 stages the keys whose derived values depend on what just changed —
 including, for a one-to-many aggregate, the parent groups of a changed child.
-This is where the old-image requirement from
-[01](01-intake-and-lsn-confirmation.md) is cashed in: a child **delete** or a
+This is where the old image a capture trigger stages
+([01](01-capture-by-triggers.md)) is cashed in: a child **delete** or a
 **re-parent** must refresh both the group the child joined (from the live row) and
 the group it left (from the staged old image, which is the only place that
 information still exists).
@@ -602,7 +574,7 @@ Two termination mechanisms:
   named error identifying the bound, the generation and the cycling tables.
 
 An absolute round ceiling survives as defence-in-depth, catching runaways the hop
-bound cannot (e.g. an unbounded stream of fresh intake). It is no longer the
+bound cannot (e.g. an unbounded stream of fresh source changes). It is no longer the
 contract, so its message stays hedged: exceeding it is *not* necessarily a cycle.
 
 ## Suppressing no-op writes

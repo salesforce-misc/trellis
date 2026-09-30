@@ -1,6 +1,6 @@
 # Stage 2 — The staging area: an append-only ring of segments
 
-← [Intake](01-intake-and-lsn-confirmation.md) · next → [Sealing and the fence](03-sealing-and-the-fence.md)
+← [Capture by triggers](01-capture-by-triggers.md) · next → [Sealing and the fence](03-sealing-and-the-fence.md)
 
 **What this stage owns:** the physical shape of the durable worklist — how a
 change is written, and why nothing on the hot path is ever updated or deleted.
@@ -85,11 +85,11 @@ the *table definition* rather than the producer — the trick that makes them fr
 All three ride the insert that is happening anyway: no extra statement, no round
 trip, and — decisively — **no extra lock**.
 
-`route` must reach **all four producers**, which do not share a code path: three
-append client-rendered `VALUES` tuples; backfill appends server-side via `INSERT …
-SELECT`. A client-stamped route would be rendered twice in two languages, and the
-first divergence lands one key in two partitions. A generated column is the only
-shape with a single definition.
+`route` must reach **all four producers**, which do not share a code path: two
+append client-rendered `VALUES` tuples; capture triggers and backfill append
+server-side via `INSERT … SELECT`. A client-stamped route would be rendered
+twice in two languages, and the first divergence lands one key in two
+partitions. A generated column is the only shape with a single definition.
 
 It is **stored, not recomputed at read time**. `hashtext` is immutable within a
 build but not across major versions, so a batch drained partly under one hash and
@@ -98,12 +98,11 @@ on a non-idempotent delta path.
 
 ## The four producers
 
-All four append into the active segment through the same path — one path is far
-easier to keep correct:
+All four append into the active segment:
 
 | Producer | What it appends | Carries images? |
 |---|---|---|
-| CDC intake | the decoded change | yes — `old_image` and/or `new_image` |
+| Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image` |
 | Reverse propagation (a worker staging its dependents) | a bare recompute trigger | **no** |
 | Definition re-derive (a formula changed) | a bare recompute trigger | **no** |
 | Backfill / snapshot enumeration | a bare recompute trigger, server-side | **no** |

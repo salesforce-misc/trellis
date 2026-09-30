@@ -8,7 +8,7 @@ A condensed checklist. Each item links to the document that argues for it.
 
 | Essential to the guarantees | Postgres-specific |
 |---|---|
-| Stage and watermark commit atomically; acknowledge the cursor only afterwards | logical replication, `pgoutput`, standby status updates |
+| A change is staged in the transaction that makes it | `AFTER … FOR EACH STATEMENT` triggers with transition tables |
 | The staging area is append-only on the hot path | a *ring* of N tables, `TRUNCATE` as the retirement primitive |
 | Batches are cut in visibility space, with a published, write-once fence | `txid_current()` defaults and `txid_snapshot` columns |
 | A batch is immutable once sealed; every producer writes to the active batch | four producers, two of them SQL-side |
@@ -20,12 +20,10 @@ A condensed checklist. Each item links to the document that argues for it.
 
 ## Foundations to lock down first
 
-- [ ] **The source delivers committed changes in commit order, with an
-      explicitly-acknowledged monotonic cursor** — Postgres logical replication.
-      → [01](01-intake-and-lsn-confirmation.md)
-- [ ] **The staging tables and the watermark share a transaction** — both live in
-      the same Postgres database. Non-negotiable.
-      → [01](01-intake-and-lsn-confirmation.md)
+- [ ] **The staging tables and the source tables share a transaction** — capture
+      triggers stage each change in the writer's own transaction, so a change is
+      staged exactly when it commits. Same Postgres database. Non-negotiable.
+      → [01](01-capture-by-triggers.md)
 - [ ] **The staging tables and the *target* tables share a transaction** — same
       database — what makes exactly-once for non-idempotent effects possible.
       → [05](05-apply-and-exactly-once-deltas.md)
@@ -41,9 +39,9 @@ A condensed checklist. Each item links to the document that argues for it.
 
 ## Build order
 
-1. **Staging table + blind append + the atomic stage/watermark/acknowledge
-   sequence.** Prove no-loss under kill -9 at each of the three points before
-   moving on. → [01](01-intake-and-lsn-confirmation.md), [02](02-the-staging-ring.md)
+1. **Staging table + blind append + the capture triggers.** Prove a change is
+   staged exactly when its write commits, under kill -9 and rollback, before
+   moving on. → [01](01-capture-by-triggers.md), [02](02-the-staging-ring.md)
 2. **Seal with a single bucket, and the fence.** One worker, no parallelism. Get
    the straddler and phase-gap tests green here — much harder to debug once
    buckets exist. → [03](03-sealing-and-the-fence.md)

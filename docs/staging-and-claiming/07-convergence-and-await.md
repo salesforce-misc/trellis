@@ -28,9 +28,8 @@ in the ring when the token is read, and the waiter writes nothing.
 ## The predicate
 
 `converged_through(token)` is **one statement**, so every condition is evaluated
-against one committed snapshot. True iff all three hold (a fourth, "intake has
-durably staged past the token", went with intake in #622 C5: a trigger-captured
-change's rows commit with it, below its commit position):
+against one committed snapshot. True iff all three hold (numbered 2–4, as in
+`staging::converge`):
 
 2. **the active batch's table holds no row with `origin_lsn <= token`** — the
    active tail. The pointer resolves in the same statement, so a concurrent seal
@@ -45,9 +44,9 @@ change. It LEAST-merges in the fold ([04](04-claiming-and-the-fold.md)) — a re
 can only make it older — while the ordinary position GREATEST-advances. Downstream
 propagation carries the *minimum* trigger origin to the dependent it stages; `0`
 means "unknown, conservatively old", and so does a `NULL` origin, which wins the
-LEAST-merge rather than losing it. Intake stamps each row with its commit's own
-position (a capture trigger, the insert position when it runs, below the
-commit); only rows with genuinely unknown origin (a backfill enumeration, a write
+LEAST-merge rather than losing it. A capture trigger stamps each row with the
+WAL insert position when it runs, below its commit's position; only rows with
+genuinely unknown origin (a backfill enumeration, a write
 made outside a drain) stay `NULL` (issue #469).
 
 > **Invariant (await soundness):** every un-reflected effect of a commit at

@@ -12,15 +12,13 @@ the README for fuller motivation).
 
 ## Source tables
 
-**Trellis requires every source table to have a primary key.** A change arriving
-over logical replication is identified by its primary key, and a 1-1 target
-inherits that key as its own. A definition over a table with no primary key is
-rejected when it is defined, with an error naming the table. Trellis never adds
-the key itself: the source schema is the user's
+**Trellis requires every source table to be a plain table with a primary
+key.** A change a capture trigger stages is identified by its primary key, and
+a 1-1 target inherits that key as its own. A definition over a table with no
+primary key, or over a partitioned table, is rejected when it is defined, with
+an error naming the table. Trellis never adds the key itself: the source schema
+is the user's
 ([0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)).
-A table whose replica identity is `USING INDEX` over a unique index is accepted
-too, since that index plays the primary key's part, but a primary key is the
-rule to design to.
 
 **Key columns need a deterministic collation** (#638). Trellis matches keys by
 their exact text, but a nondeterministic collation's `=` (an ICU collation
@@ -48,21 +46,16 @@ definition, or an `ALTER TRANSFORM` that adds or alters such a field, is
 rejected. `CHAR_LENGTH` and `OCTET_LENGTH` don't depend on collation, so they
 accept any column.
 
-Some shapes need more than the key. An aggregate, and any read through a to-one
-relationship, needs a deleted or re-keyed source row's whole old image, which
-Postgres logs only under `REPLICA IDENTITY FULL`. That, too, is checked and
-never applied; the rejection quotes the exact `ALTER TABLE` to run.
-
 One consequence is worth stating plainly: **an aggregate target does not qualify
 as a source table.** Its grouping columns may be `NULL`, so its identity is a
 `UNIQUE NULLS NOT DISTINCT` constraint rather than a primary key. Chaining off
 it still works inside the instance that owns it, because an instance hands each
 write to one of its own targets on to that target's readers in the writing
-transaction, never over logical replication (see
+transaction, never through capture triggers (see
 [Chaining and cycle detection](#chaining-and-cycle-detection)). That internal
 path is what makes the chain possible, and it stops at the instance boundary: to
-another Trellis instance, or to any other logical-replication consumer, an
-aggregate target is an ordinary table with no primary key, and Trellis rejects
+another Trellis instance, an aggregate target is an ordinary table with no
+primary key, and Trellis rejects
 it as a source like any other. See [instance-identity](instance-identity.md)
 for the cross-instance rules.
 
@@ -162,9 +155,8 @@ related table — order lines decorated with `product.category_name`.
 A relationship is a named, directed link from one table to another, defined by a
 join key (`order_line_items.product_id -> products.id`) and declared as its own
 reusable statement. Either endpoint may be a source table or a transform
-target, 1-1 or aggregate. A source-table endpoint needs a primary key (or
-`REPLICA IDENTITY USING INDEX`), like any table Trellis reads over logical
-replication. A target endpoint needs neither: Trellis's own writes to it reach
+target, 1-1 or aggregate. A source-table endpoint needs a primary key, like any
+table Trellis captures. A target endpoint doesn't: Trellis's own writes to it reach
 the relationship directly (issue #375), so it must be `live` when the
 relationship is declared: its initial build writes it outside that path. Both
 endpoints are written as bare table names and resolved once, through the
@@ -231,8 +223,8 @@ A transform can only chain off a target once that target's own transform is
 1-1 target whose chunked backfill hasn't finished) is refused with
 `TransformNotLive`: wait for the upstream to go live, then define the chained
 transform. Each write to a target reaches the transforms reading it inside the
-same transaction as the write; a target is never part of the CDC publication
-itself, not even one that is a relationship endpoint. That in-transaction hand-off
+same transaction as the write; Trellis never installs capture triggers on a
+target, not even one that is a relationship endpoint. That in-transaction hand-off
 is why an aggregate target, which has no primary key, can be chained off at all
 (see [Source tables](#source-tables)). It does not cross into another instance.
 
@@ -269,12 +261,9 @@ undefined. Treat a target as read-only, and specifically:
 * **Do not add, drop, rename or retype columns.** Trellis addresses its columns
   by name and type. Redefining the transform is how a column changes
   ([Changing a definition](#changing-a-definition)).
-* **Do not change the key constraints or the replica identity.** A 1-1 target's
-  primary key and an aggregate target's unique grouping constraint are how
-  Trellis addresses a row when it upserts or deletes it. The replica identity
-  matters once the table is in a publication, which is the case for a target
-  that another instance reads as a source:
-  `REPLICA IDENTITY NOTHING` makes Postgres refuse Trellis's own updates.
+* **Do not change the key constraints.** A 1-1 target's primary key and an
+  aggregate target's unique grouping constraint are how Trellis addresses a
+  row when it upserts or deletes it.
 * **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
   the table and its definition together, and refuses while another definition
   still chains off it. A hand `TRUNCATE` leaves the table empty until the
@@ -310,12 +299,9 @@ Every defined transform carries an observable **status**:
   fuse. The same frozen state `quarantined` is, reached by the other trigger: the
   target stops being written to and holds its current, now-stale value. Resuming
   likewise re-runs the backfill from `waiting_to_backfill`. Trellis also pauses
-  transforms itself when the replication slot feeding them is lost, for
-  example after the source database is restored from a backup that doesn't
-  carry the slot (a `pg_basebackup`, say; a cold copy of the stopped cluster
-  does carry it, so nothing pauses). It logs which
-  transforms it paused and why until each one is resumed
-  ([intake failure modes](staging-and-claiming/01-intake-and-lsn-confirmation.md#failure-modes)).
+  a transform itself when a source column it reads is renamed or dropped, with
+  the reason on its status (`capture_failure`)
+  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column-622-c6)).
 
 An application can list defined transforms and read each one's status — enough to
 tell a newly-defined transform is still populating, without a metrics pipeline

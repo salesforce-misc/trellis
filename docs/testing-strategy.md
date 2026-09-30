@@ -76,11 +76,11 @@ generative/chaos failure that root-causes to a pure function.
 
 **Real behavior against a real Postgres, scripted end-to-end.** These live in
 `trellis/tests/*` and lean on `testkit`, which owns a disposable cluster
-(`initdb`/`postgres`/`pg_ctl` on a private socket, `wal_level=logical`, torn down on
-`Drop`); CI provisions the server binaries. They own:
+(`initdb`/`postgres`/`pg_ctl` on a private socket, torn down on `Drop`); CI
+provisions the server binaries. They own:
 
-- The logical-replication ingestion path end-to-end: source DML → pgoutput decode →
-  staging → tuple-marker and LSN-confirmation validation.
+- The capture path end-to-end: source DML → capture trigger → staging ring, with
+  each family's images pinned against a golden fixture (`capture_parity.rs`).
 - **Scripted interleavings** — hand-authored concurrency/crash scenarios that must
   always hold: `testkit::crash::CrashGuard` (SIGKILL a child mid-drain),
   `crash::OpenTransaction` (a straddling transaction across a batch boundary).
@@ -161,7 +161,7 @@ and borrows the oracle once (below) to keep them honest.
   under sustained disruption: no deadlock, livelock, permanent stall, or unbounded
   lag runaway.
 - **Long-horizon degradation and resource safety** — leaks and slow bleed visible
-  only over hours: memory growth, connection/file-handle leaks, slot lag, WAL
+  only over hours: memory growth, connection/file-handle leaks, ring backlog, WAL
   retention, disk consumption.
 - **Operational faults not modeled as oracle identities** — Postgres restart/failover
   under live load, network partition/latency, disk-full, OOM killer, clock skew,
@@ -189,7 +189,7 @@ Alongside the generative harness, the chaos tier needs:
     double-apply; monotonic progress.
   - *Liveness* (eventually): once faults quiesce, convergence within a bounded time;
     steady-state lag bounded under load; no permanent stall.
-  - *Resource* (bounded over the run): slot lag, WAL, memory, connections don't grow
+  - *Resource* (bounded over the run): ring backlog, WAL, memory, connections don't grow
     without bound.
 - **A quiet-window convergence gate** — periodically stop the workload, let it settle,
   run the generative **oracle once** as ground truth. The single place chaos reaches

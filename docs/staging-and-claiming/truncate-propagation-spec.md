@@ -8,12 +8,11 @@ tables it feeds. The machinery lives in `staging::apply`, `staging::fold`, and
 
 - A source `TRUNCATE` clears **all derived/target rows produced from each named
   source relation**; post-truncate inserts then re-populate normally.
-- Postgres pre-expands `CASCADE` server-side: the pgoutput TRUNCATE message's
-  `relation_ids` already lists every truncated table **in the publication**. We
-  iterate that list; we do **not** traverse cascade ourselves. A cascaded child
-  outside the publication was never replicated, so nothing to clear.
-- The `options` bits (bit0 CASCADE, bit1 RESTART IDENTITY) are informational; we
-  act only on the listed relations.
+- Every captured table carries its own `AFTER TRUNCATE` capture trigger, and
+  Postgres fires it for every table a `TRUNCATE` empties, `CASCADE` children
+  included. So each truncated table that is captured stages its own truncate
+  row; we do **not** traverse cascade ourselves. A cascaded child nothing
+  captures has nothing to clear.
 
 ## The ordering hazard
 
@@ -88,9 +87,10 @@ That is correct: a recompute re-reads *live* source state, which already
 reflects the truncate. Only image-bearing rows carry stale state and must be
 voided below the truncate.
 
-A truncate and inserts **in the same source transaction** share the commit
-`lsn`; `change_id` (intake append order = execution order) breaks the tie, so
-truncate-then-insert orders correctly.
+A truncate and inserts **in the same source transaction** stage in execution
+order: each statement's capture trigger runs after the previous statement's, so
+its rows carry a later `change_id` and an `lsn` no earlier than the previous
+statement's, and truncate-then-insert orders correctly.
 
 ## Invariants to preserve
 

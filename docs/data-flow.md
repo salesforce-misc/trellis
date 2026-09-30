@@ -5,10 +5,11 @@ feeds — the **physical** flow and timing that [transforms](transforms.md)
 deliberately omits. Why it's asynchronous:
 [ADR-0002](decisions/0002-async-data-flow.md).
 
-Trellis watches source tables over Postgres **logical replication**, pulls
-committed changes in batches, collapses each batch into the minimal set of
-writes against the affected calculated rows, and re-feeds those writes to any
-downstream transforms — all outside the application's write path.
+Trellis captures each change to a source table with **triggers** that write it
+into a staging ring in the writer's own transaction, pulls the staged changes
+in batches, collapses each batch into the minimal set of writes against the
+affected calculated rows, and re-feeds those writes to any downstream
+transforms. Only the capture runs on the application's write path.
 
 This is the **logical** map. The machinery that implements it — durable staging
 ring, sealing, claiming and folding, exactly-once deltas, the read-your-writes
@@ -29,54 +30,47 @@ Three properties shape the rest of this design:
   so it can be isolated while the rest keep flowing.
 
 The costs we design around: eventual consistency (see
-[Reading derived data](#reading-derived-data)), replication-slot management, and
-the ~1-CPU WAL-decoding ceiling below.
+[Reading derived data](#reading-derived-data)), and the capture's cost on every
+write to a captured table.
 
-## Ingestion via logical replication
+## Capture by triggers
 
-> **Superseded design (2026-09-27).** This section describes the code on
-> `main`: capture by logical replication, the backfill discharge, markers and
-> the go-live re-read. [ADR-0002](decisions/0002-async-data-flow.md) replaces
-> them with trigger capture and a build that applies from its first chunk. The
-> text is rewritten as that lands (#556).
-
-Trellis subscribes to the source tables through a Postgres **logical replication
-slot**, which delivers a committed, LSN-ordered stream of row-level changes
-(insert / update / delete) for the tables feeding any transform. How a decoded
-change becomes a durable staged row, and why the slot is acknowledged only
-*after* that stage commits, is
-[stage 01](staging-and-claiming/01-intake-and-lsn-confirmation.md).
+Each source table some transform reads carries statement-level `AFTER`
+triggers. They append the statement's row-level changes (insert / update /
+delete, with old and new images keyed by primary key) to the staging ring in
+the writer's own transaction, so a change is staged exactly when it commits.
+The staging worker installs them in the background once a transform reads the
+table. How the triggers work, what they cost the writer and how they're
+installed, widened and removed is
+[stage 01](staging-and-claiming/01-capture-by-triggers.md).
 
 * **Calculated columns live on a neighbor table**, never on the source row.
-  Writing them back onto a replicated source row would feed our own writes into
-  ingestion.
-* At least one Trellis client should stay connected while writes may happen, so
-  the slot doesn't accumulate unbounded WAL and block source writes. Changes
-  drain into a **staging area** — an append-only ring of segments, nothing on
-  the hot path ever updated ([stage 02](staging-and-claiming/02-the-staging-ring.md)).
-* WAL decoding is capped at ~1 CPU by Postgres, the primary throughput ceiling
-  for the async path.
-* The slot's confirmed position is a durable **LSN watermark** — the point up to
-  which all changes have been ingested. Downstream progress is tracked in the
-  same LSN space (see [Reading derived data](#reading-derived-data)).
+  Writing them back onto a captured source row would feed our own writes into
+  capture.
+* Changes land in a **staging area** — an append-only ring of segments, nothing
+  on the hot path ever updated
+  ([stage 02](staging-and-claiming/02-the-staging-ring.md)).
+* Each staged row carries the WAL insert position at capture, below its
+  commit's position, and a read-your-writes token is a WAL position, so
+  downstream progress is tracked in the same LSN space (see
+  [Reading derived data](#reading-derived-data)).
 
-The stream carries changes only. The rows a table already holds when a
+The triggers capture changes only. The rows a table already holds when a
 transform starts reading it are captured separately, by the path below.
 
 ## Capturing a table's existing rows
 
 > **Superseded design (2026-09-27).** This section describes the code on
-> `main`: capture by logical replication, the backfill discharge, markers and
-> the go-live re-read. [ADR-0002](decisions/0002-async-data-flow.md) replaces
-> them with trigger capture and a build that applies from its first chunk. The
-> text is rewritten as that lands (#556).
+> `main`: the backfill discharge, markers and the go-live re-read.
+> [ADR-0002](decisions/0002-async-data-flow.md) replaces them with a build that
+> applies from its first chunk. The text is rewritten as that lands (#556).
 
 A new transform's target has to reflect every row its source already holds,
-not only the changes that arrive after it's defined. Replication doesn't carry
-those rows, so Trellis reads them from the table: the **capture**. The capture
-and the stream have to meet exactly. Every commit to the source is either seen
-by the capture or delivered by the stream afterward, and a commit that both see
-is counted once.
+not only the changes that arrive after it's defined. The triggers don't see
+those rows, so Trellis reads them from the table: the **capture**. The read
+and the triggers have to meet exactly. Every commit to the source is either
+seen by the read or captured by the triggers, and a commit that both see is
+counted once.
 
 There is one capture path, and every definition's initial build goes through
 it ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)). Resumes,
@@ -89,8 +83,8 @@ park a catch-up marker (#425, #426).
 
 Registering a transform (`Trellis::apply` with a `TRANSFORM` statement)
 validates the definition, creates the target table, writes the catalog row as
-`waiting_to_backfill`, and returns. It reads no source rows and makes no
-replication change, so its latency doesn't depend on the table's size.
+`waiting_to_backfill`, and returns. It reads no source rows and installs no
+triggers, so its latency doesn't depend on the table's size.
 
 The table and the catalog row commit in one transaction, so a registration that
 fails leaves neither behind and can be retried as is. If any relation (table,
@@ -109,30 +103,24 @@ drain threads.
    **fence** yet. The first discharge pass to see the marker takes the fence,
    the transaction id of a statement run after reading the committed marker,
    and records it on the marker for later passes.
-   - If the table isn't in the publication yet, the staging worker's reconcile
-     pass (`reconcile_publication`) adds it and parks the marker in the same
-     transaction. The fence has to cover every transaction that could have
-     written the table before the join committed. A snapshot taken inside the
-     `ALTER`'s own transaction falls short of a writer that starts between that
-     snapshot and the commit. The discharge's fence postdates the commit, so it
-     waits out that writer too
-     ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes),
-     #431).
-   - If the source needs no publication change, the staging worker's next
-     reconcile pass parks the marker on it (`park_registration_markers`, in the
-     same transaction as any publication change). That covers a table that is
-     already published and a source that is another definition's target, which
-     is never published (#315). Registration itself parks nothing: which
-     publication the staging worker serves is that worker's own option, so
-     registration can't tell whether the source is published yet.
+   - If nothing captures the table yet, the staging worker's reconcile pass
+     installs its triggers and parks the marker in the same transaction,
+     under a table lock, so no writer of the table is in flight when it
+     commits ([stage 01 — The join fence](staging-and-claiming/01-capture-by-triggers.md#the-join-fence)).
+     The discharge's fence postdates that commit (#431).
+   - If the source is already captured, or is another definition's target,
+     which is never captured (#315), the marker comes from the staging
+     worker's reconcile pass once every table the definition reads is
+     captured with the columns it needs: a widen parks it with the new
+     capture functions, and otherwise the pass parks it
+     (`park_ready_registration_markers`). Registration itself parks nothing.
 
-   Only the staging worker changes the publication, and the catalog is its only
-   source of truth for what to publish. That includes the shrink after a
+   Only the staging worker changes capture, and the catalog is its only
+   source of truth for what to capture. That includes the shrink after a
    `DROP`: the drop only removes catalog rows, and the next reconcile pass
-   takes out a table nothing reads any more (#427). A table has at most one
-   marker, and a second park merges into it and clears its fence, so the
-   next pass fences it afresh
-   ([intake](staging-and-claiming/01-intake-and-lsn-confirmation.md#adjacent-invariants-that-are-easy-to-miss)).
+   uninstalls the triggers of a table nothing reads any more (#427). A table
+   has at most one marker, and a second park merges into it and clears its
+   fence, so the next pass fences it afresh.
 2. **Wait.** The discharge (`run_pending_backfills_until`, once per maintenance
    pass) skips a marker until its fence settles: every transaction that was
    open when it was fenced has ended (`now.xmin > fence`, where the fence is
@@ -140,9 +128,6 @@ drain threads.
    is cluster-wide, an unrelated long transaction can hold this step up. That
    is safe, and the definition's `waiting_to_backfill` status is the signal
    ([observability](observability.md#backfill-status-and-the-xmin-caveat)).
-   Once the fence settles, the discharge also waits for intake to stage through
-   the WAL position its read snapshot was taken at (#312), so the stream's copy
-   of any commit the read also sees is staged no later than the read's output.
 3. **Capture and build.** The discharge takes the capture snapshot and
    dispatches each of the table's `waiting_to_backfill` definitions' build by
    shape, in one transaction with the marker's delete:
@@ -186,24 +171,23 @@ drain threads.
 
 ### Why the path is gap-free
 
-- **Nothing falls between the read and the stream.** The capture snapshot is
+- **Nothing falls between the read and the triggers.** The capture snapshot is
   taken after the fence settles, and the fence postdates the join's commit. A
   transaction that was open when the join committed had either ended by the
   fence or was open at it and waited out, so the snapshot sees its commit. Any
-  commit the snapshot doesn't see belongs to a transaction that began after
-  the join, and the stream carries it.
+  write the snapshot doesn't see committed after the join, and every write to
+  the table after the join runs its capture trigger.
 - **A commit both see is counted once.** Commits between the join and the
-  capture snapshot are read *and* streamed. For a 1-1 target that's harmless,
+  capture snapshot are read *and* captured. For a 1-1 target that's harmless,
   because apply re-evaluates the row from live state. For an aggregate, the
   read's image-less `Recompute` re-derives the whole group, and the recompute
-  horizon keeps the streamed delta from counting the commit a second time
+  horizon keeps the captured delta from counting the commit a second time
   ([stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)).
   A direct build records the same horizon on every group row it writes, and
-  on the target for the groups it found empty (#419). #312's wait for intake
-  only makes those re-derivations rarer.
+  on the target for the groups it found empty (#419).
 - **Changes during the build aren't lost.** Apply skips a definition that
   isn't `live`, so a change that drains while the build runs doesn't reach it.
-  For ring enumeration on a published source that can't happen: the maintenance
+  For ring enumeration on a captured source that can't happen: the maintenance
   loop that runs the discharge is also the only sealer, so nothing staged
   after the pass starts drains before the flip to `live`, and everything
   staged before it committed before the capture snapshot. A source that is
@@ -211,7 +195,7 @@ drain threads.
   the target-mutation seam, from drain workers that don't wait for a seal, and
   only to applying ones, so the enumeration moves the definition to
   `catching_up` (applying, not yet `live`) and parks a catch-up marker on it
-  (`go_live` in `intake::publication`, #315, #476). Chunked and direct builds
+  (`go_live` in `intake::markers`, #315, #476). Chunked and direct builds
   read the source through many snapshots over a longer time, so finishing one
   parks a fresh catch-up marker on every table the build read
   (`complete_direct_backfill`; a direct build also reads each relationship
@@ -221,7 +205,7 @@ drain threads.
   read, even one that looks unchanged: a row inserted and deleted again
   during the build leaves the table's row count and `xmin`s as they were,
   although the build counted it (#468). A commit the build read whose
-  streamed delta drains after the flip needs no catch-up: it's harmless for a
+  captured delta drains after the flip needs no catch-up: it's harmless for a
   1-1 target and re-derived by the recompute horizon for an aggregate
   (above).
 - **A target drops rows its source no longer backs.** The read only reaches
@@ -238,7 +222,7 @@ drain threads.
 
   The anti-joins are branches of the read's own cursor, so a row is judged
   unbacked on exactly the snapshot the read enumerates (#436). The discharge
-  deletes those rows by key as it fetches the cursor, after the intake wait.
+  deletes those rows by key as it fetches the cursor.
   A row unbacked on that snapshot is gone, and any later change that backs
   it again rebuilds it; a row backed on it is re-derived by the read's
   `Recompute`. So the sweep is exact for aggregates as well as 1-1. Each
@@ -248,39 +232,20 @@ drain threads.
   target's extinct horizon (#321) too, and such a delta re-derives the group
   from the source instead of subtracting from nothing.
 
-### A fresh install
+### Re-reading a table for applying readers
 
-A fresh install creates the replication slot and parks a marker on every
-table the catalog says to publish, in one transaction, after slot creation
-returns (`intake::publication::create_slot_and_park_markers`). It reads no
-source table itself. The first discharge pass reads each table after the slot
-exists, so every commit the read misses comes after the slot's consistent
-point and is streamed. The discharge skips a table no definition reads yet,
-since nothing would consume its rows. A definition registered on it later
-gets its own capture.
-
-A slot is fresh whenever it has no `replication_progress` row, so the catalog
-can already hold applying definitions: it outlived the slot they were built
-under (setup pointed at a new slot name, say). Those definitions have missed
-whatever committed before the new slot's consistent point, so each marker is
-a go-live catch-up for the table's applying readers. They report
-`catching_up` until the discharge has re-read the table and swept their
-targets for rows the source no longer backs, which a re-read alone can't
-reach
+The staging worker can install a table's triggers while definitions already
+apply from it: the triggers were dropped by hand, say, and the next reconcile
+pass puts them back. Those definitions have missed whatever committed without
+the triggers, so the install's marker is a go-live catch-up for each of the
+table's applying readers (`park_table_catch_ups`). They report `catching_up`
+until the discharge has re-read the table and swept their targets for rows the
+source no longer backs, which a re-read alone can't reach
 ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)).
-An explicit `Trellis::request_backfill`, and a table rejoining the
-publication after an operator dropped it, park the same catch-ups for the
-same reason, and a re-read table that is a relationship's to-side also has
-its settled projections refreshed
+An explicit `Trellis::request_backfill` parks the same catch-ups for the same
+reason, and a re-read table that is a relationship's to-side also has its
+settled projections refreshed
 ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)).
-A slot lost under the same name is recovered differently
-(`intake::slot_loss`): the slot is recreated without a read, every transform
-it fed is paused, and each one's resume parks its own marker.
-
-Reading inside the slot-creation transaction instead would not be gap-free.
-`pg_create_logical_replication_slot` exports no snapshot, and the transaction's
-own snapshot is taken before slot creation waits for in-flight transactions, so
-a row committed during that wait would be neither read nor streamed (#393).
 
 ### What it asks of a deployment
 

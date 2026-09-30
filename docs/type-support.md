@@ -10,9 +10,15 @@ A type is never simply "supported." It earns its way into six roles, ordered
 **floor → ceiling** — the matrix doubles as a maturity ladder, and most types
 climb it left-to-right:
 
-1. **Ingest / passthrough** — decode from logical replication and copy into a
-   derived table unchanged. The floor under every other role, and nearly
-   everything clears it. Since #108 a column's role is decided by its raw
+1. **Ingest / passthrough** — captured as text and copied into a derived
+   table unchanged. The floor under every other role, and nearly everything
+   clears it. A capture trigger renders each column with `format('%s', col)`,
+   which calls the type's own output function, under the output settings
+   every Trellis connection pins (`pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`, set
+   on each capture function), so an image doesn't depend on the writer's
+   session. `trellis/tests/capture_parity.rs` pins one column of each family
+   below, written from a session whose settings all differ from the pinned
+   ones, against a golden fixture (`trellis/tests/fixtures/capture_parity.txt`). Since #108 a column's role is decided by its raw
    `pg_attribute.atttypid`, through the OID registry in
    `trellis/src/defs/pg_type.rs`, rather than by text-matching
    `format_type`'s rendering: every family the registry knows becomes a
@@ -54,9 +60,8 @@ climb it left-to-right:
    as `ValueType::Numeric`: `-0` and `0` are `=` in Postgres but render as
    `'-0'` and `'0'`, so a `::text`-matched float key splits one Postgres
    group into two target rows.
-4. **Primary key** — identify a target row. A stricter join key: it must come
-   from the source's replica identity and present in the old-image for
-   updates/deletes. Gated to the join-key-safe allowlist
+4. **Primary key** — identify a target row. A stricter join key: it must be
+   the source's primary key, which every capture image carries. Gated to the join-key-safe allowlist
    (`is_text_stable_join_key_type`) — an unsafe single-column PK
    (`numeric`/`timestamptz`/`interval`, which `::text`-matching
    would silently mismatch) is rejected at define time with
@@ -112,7 +117,7 @@ per-type capability, so it's omitted from the aggregate cells.
 | `date` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113 — no typed index needed. `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE |
 | `time` `timetz` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#113) | ✅ MIN/MAX | `time_out`/`timetz_out` are the block's only IMMUTABLE output functions; `timetz`'s `=` is identity on `(time, zone)` |
 | `timestamp` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113/#248 — bijective under `::text`, and `to_jsonb` (the live-row reads) now renders it the same way (#248 replaced `to_jsonb(t.*)` with an explicit per-column `jsonb_build_object`) |
-| `timestamptz` | ✅ | 🎯 | ✅ | ✅ | ✅ | ✅ MIN/MAX | key roles landed in #246 — #248 fixed the `to_jsonb` split (shared with `timestamp`), and #246 pinned `TimeZone` on the walsender too (`pgwire-replication` 0.4.1's `ReplicationConfig::with_options`), closing the pool-vs-walsender render gap `TimeZone` alone couldn't close before. No typed literal yet — a separate, smaller gap (see "Cross-cutting concerns" below) |
+| `timestamptz` | ✅ | 🎯 | ✅ | ✅ | ✅ | ✅ MIN/MAX | key roles landed in #246 — #248 fixed the `to_jsonb` split (shared with `timestamp`), and #246 pinned `TimeZone` on every renderer Trellis uses, capture functions included, so the pool and a capture image render it alike. No typed literal yet — a separate, smaller gap (see "Cross-cutting concerns" below) |
 | `interval` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ✅ `SUM` (recompute-only); ❌ MIN/MAX | `'24 hours' = '1 day'` but they render differently, so no *text* match works; #110 comparing decoded values would. `max` is scan-order dependent even on the server (#113) |
 | `jsonb` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#115) | ✅ `jsonb_agg` (recompute-only, `jsonb` argument only) | `json` excluded (no `=`); key order canonicalizes but embedded-number scale doesn't — #110's typed key index is the unlock, like `numeric`/`real`/`timestamptz` |
 | `inet` | ✅ | 🎯 | ✅ `GROUP BY` only; ❌ relationship/PK | ❌ | ✅ | ✅ MIN/MAX (own type) | second `::text` renderer (`network_show`) disagrees with `inet_out` on bare host addresses — the `boolean` shape (#116) |
@@ -135,11 +140,11 @@ ADR-0004 admits only operators/functions whose output depends solely on their
 inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wrong:
 
 * **`money`** — comparison (`cash_eq`/`cash_cmp`) *is* immutable, but text I/O
-  (`cash_out`) is `STABLE` (`lc_monetary`), so the CDC-decoded text is
+  (`cash_out`) is `STABLE` (`lc_monetary`), so its text is
   locale-dependent. Issue #672 pins `lc_monetary` to `'C'` in
   `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`, so a passthrough `money` column now
-  renders the same (`$1,234.56`) on every connection Trellis opens, walsender
-  included. It stays excluded from the key and computed roles; use `numeric`.
+  renders the same (`$1,234.56`) on every connection Trellis opens and in
+  every capture image. It stays excluded from the key and computed roles; use `numeric`.
 * **`json`** — has *no* `=` operator; can never be a key. `jsonb` can.
 * **`text`/`varchar`/`char`** — Postgres marks these comparisons IMMUTABLE
   despite collation-sensitivity. Our own bar is a **deterministic collation** (or
@@ -151,8 +156,8 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 * **`timestamptz`** — value comparison immutable, and *text rendering* now
   is too: it is GUC-dependent (`TimeZone`), and issue #246 pins `TimeZone`
   to `'UTC'` in `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` on **every**
-  connection Trellis opens, pool and walsender alike (see "Two renderers,
-  and the walsender" below). No typed key index needed — `timestamptz_out`
+  connection Trellis opens and on every capture function (see the
+  `timestamptz` note under "Cross-cutting concerns" below). No typed key index needed — `timestamptz_out`
   under a fixed `TimeZone` is a bijection on the instant, exactly the
   argument #113 made before declining the pin for the *other* reason
   covered below.
@@ -329,39 +334,20 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 
     Note the shape: one value, two renderers, no arbiter — the same defect
     *shape* as issue #246, one layer in (there it is the pool versus the
-    walsender; here it was `::text` versus `to_jsonb` inside one process).
+    capture image; here it was `::text` versus `to_jsonb` inside one process).
     Closing #248 did not touch #246 — different renderer pairs — which is
     why `timestamptz` needed #246 too, independently (below).
   * **`timestamptz` had a second, independent blocker #248 did not touch,
     which issue #246 closed.** Pinning `TimeZone = 'UTC'` in
-    `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` *would* make its `::text`
+    `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` makes its `::text`
     rendering a bijection on the instant, and Trellis owning all its own
-    connections means the blast radius on application sessions is nil. That
-    alone used not to be enough, because logical-decoding output is produced
-    by the output function running in the **walsender**, under the
-    walsender's GUCs, and `pgwire_replication`'s `ReplicationConfig` v0.4
-    exposed no way to send startup runtime parameters. The two used to agree
-    only by falling back to the same server default; pinning the pool alone
-    would have traded that accidental symmetry for a guaranteed asymmetry on
-    every non-UTC server. **Issue #246 fixed the library gap**:
-    `pgwire-replication` 0.4.1 added `ReplicationConfig::with_options`
-    (Postgres itself already honoured startup `options` on a replication
-    connection — `PGOPTIONS='-c timezone=UTC'` works with `pg_recvlogical`
-    — the missing piece was purely the Rust client exposing it), and
-    `intake::IntakeConfig::replication_config` now calls it with
-    `pool::deterministic_text_output_options()` — the same
-    `DETERMINISTIC_TEXT_OUTPUT_GUCS` the pool pins, reparsed into the
-    startup `options` shape, so the two can never hand-drift apart. The
-    walsender now genuinely pins `TimeZone = 'UTC'`, closing the gap for
-    real rather than merely continuing the old accidental agreement.
-
-    This also retired the rule the constant used to live under: back when
-    only the pool could be pinned, a GUC could only join it if it was
-    **output-identical to a stock server's default** (so the *unpinned*
-    walsender would agree by luck) — which is why #113 added `IntervalStyle`
-    (`postgres` is stock-identical) but not `TimeZone` (no stock value to
-    lean on). Now that the walsender is pinned for real via `with_options`,
-    that test no longer applies to a sixth GUC either.
+    connections means the blast radius on application sessions is nil. But
+    a capture image is rendered by a second renderer, the capture function,
+    in the application's own session, so the pin has to reach it too, or a
+    non-UTC server would render an image and a live read of the same value
+    differently. Each capture function carries the constant's settings as
+    its own `SET` clauses (`capture::sql`), so the two can't drift apart,
+    and a GUC added to the constant is pinned on both at once.
   * **`interval` can never be a text-matched key.**
     `'24 hours'::interval = '1 day'::interval` is **true** while their
     `::text` differs — one value, many renderings, structurally the float
@@ -407,7 +393,7 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     stay correct read on another. (A `timetz` offset literal is canonical
     when its trailing all-zero tail is dropped and only then:
     `+05:00:30` is what `timetz_out` prints, while `+05:30:00` is not.)
-    `TIMESTAMPTZ`'s original blocker — the same walsender/pool `TimeZone`
+    `TIMESTAMPTZ`'s original blocker — the same capture/pool `TimeZone`
     gap that kept it off the key roles — is gone as of issue #246, but it is
     still absent from the typed-literal allowlist for a narrower, separate
     reason: a typed literal needs its own canonical-form checker (this
@@ -491,8 +477,8 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     pg_cast where castsource = 'boolean'::regtype and casttarget =
     'text'::regtype` names `pg_catalog.text(boolean)`, a *second*, dedicated
     cast function Postgres ships only for `boolean` (`'true'`/`'false'`),
-    distinct from `boolout` (`'t'`/`'f'`, what CDC/`pgoutput` decodes and
-    what `intake::extract_key` stores verbatim). Every other type swept —
+    distinct from `boolout` (`'t'`/`'f'`, what a capture image and its key
+    hold, since `format('%s', col)` calls the output function). Every other type swept —
     `smallint`/`integer`/`bigint`/`oid`/`uuid`/`text`/the temporal
     families/`bytea` — has no `pg_cast` row for `text` at all; their `::text`
     *is* their output function. This is a structurally new defect shape for
@@ -501,9 +487,9 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     `-0`/`0`), but a second, wholly independent cast function that silently
     disagrees with the first.
   * **The join/primary-key role stays refused, and this is why `boolean` is
-    *not* added to `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.** `intake::
-    extract_key` builds a CDC-derived key's text from the wire tuple
-    verbatim (`boolout`'s `'t'`/`'f'`), and several of `staging::apply`'s
+    *not* added to `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.** A capture
+    trigger builds a key's text with the output function (`boolout`'s
+    `'t'`/`'f'`), and several of `staging::apply`'s
     scalar single-key lookups (`check_reverse_guards` and its siblings)
     still compare that against a live column's `{col}::text` rendering
     (`pg_catalog.text(boolean)`'s `'true'`/`'false'`) — two different
@@ -602,8 +588,7 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     `catalog::TEXT_STABLE_JOIN_KEY_TYPES` the way `bytea`/`oid` did.
   * **Sharing a `pg_cast` row does not mean sharing its divergence — that
     turned out to be a per-type fact, checked live rather than inferred from
-    the row.** `inet_out` (what CDC/`pgoutput` decodes, what
-    `intake::extract_key` stores verbatim) omits the `/prefixlen` suffix
+    the row.** `inet_out` (what a capture image and its key hold) omits the `/prefixlen` suffix
     exactly when the stored netmask covers the whole address
     (`'192.168.1.5'::inet::text` via `inet_out` is `192.168.1.5`), while
     `network_show` — the shared cast, what `<col>::text` and hence
@@ -671,7 +656,7 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     not through `pg_cast`'s `network_show` override, and inherits `inet_out`'s
     host-address elision the same way `inet_out` itself does. This is
     `to_jsonb`-versus-`inet_out` agreement, not a *third* renderer: the real
-    conflict remains `inet_out` (⟵ CDC) versus `<col>::text` (⟵ everything
+    conflict remains `inet_out` (⟵ capture) versus `<col>::text` (⟵ everything
     the engine itself renders, since issue #248's
     `staging::apply::row_as_text_jsonb_sql` replaced every bare
     `to_jsonb(t.*)` row-body read with an explicit `<col>::text`, so nothing

@@ -663,8 +663,8 @@ implementation plan's backbone; each item names what landed it.
   target-mutation seam (should).
 - **Group probes:** the existence probe and group pre-lock (#326);
   `apply_forced_groups_bulk`.
-- **Docs:** [stage 01](../staging-and-claiming/01-intake-and-lsn-confirmation.md)
-  in full; stage 04's fold half; stage 05's basis-check and
+- **Docs:** stage 01 (`01-intake-and-lsn-confirmation.md`) in full;
+  stage 04's fold half; stage 05's basis-check and
   recompute-horizon sections; the capture sections of
   [data-flow](../data-flow.md), [embedding](../embedding.md) and
   [observability](../observability.md), which describe the code as it stands

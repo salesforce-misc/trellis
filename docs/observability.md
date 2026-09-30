@@ -51,13 +51,14 @@ logs/spans ──► `tracing` facade ──► optional OTLP export layer
 
 ### What "latency" means
 
-The clock is already flowing in: the **source commit timestamp** rides on the
-replication `Commit` event (`commit_time_micros`,
-`trellis/src/intake/mod.rs`). Two families of measurement follow:
+The clock is already flowing in: every staged source change carries
+`src_changed`, the time its capture trigger ran (`trellis/src/capture/sql.rs`).
+That is the change's time, not its commit's. Two families of measurement
+follow:
 
 * **Per-transform latency** — from a change arriving at a transform's input to
   its output being applied. One histogram per transform.
-* **End-to-end latency** — from the *source* commit to the *final* transform's
+* **End-to-end latency** — from the *source* change to the *final* transform's
   apply, keyed by the **terminal transform** (not source→sink pair) to keep
   cardinality low.
 
@@ -65,7 +66,7 @@ Supporting counters/gauges keep the histograms interpretable:
 
 * `changes_applied_total{transform}` — staged changes each transform folded
   and applied. One change is one row in the staging ring: a source row change
-  that intake staged from logical replication, or a row an upstream transform's
+  that a capture trigger staged, or a row an upstream transform's
   write staged for the next hop. The count doesn't depend on how rows were
   batched, so you can compare it with the source's own write rate. The one
   exception is a `TRUNCATE`: it counts as one change, and rows staged before it
@@ -81,25 +82,6 @@ Supporting counters/gauges keep the histograms interpretable:
 * `staging_segments{state}` — a cheap system-level gauge counting segments by
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
   chosen over a per-transform depth gauge for lower cost.
-* `intake_restarts_total{outcome}` — times CDC intake stopped (`error`, or
-  `stream_ended`) and the client restarted it with capped exponential backoff.
-  Every stop is also logged at `error!` with the cause. A sustained
-  non-zero rate means source changes aren't being staged. The third outcome,
-  `producer_lock_held`, means another producer session holds the staging
-  producer lock: this client is standing by and retrying so it can take over,
-  and it logs that at `info!` once, then `debug!`, instead of as an error.
-* `intake_consecutive_failures{slot}` — intake failures in a row since intake
-  last stayed up for 60s. It reads `0` while intake is healthy and climbs while
-  it's stuck restarting. Alert on this (say, `>= 3`) rather than on the
-  lifetime counter, which can't tell an occasional blip from a stuck loop.
-  `producer_lock_held` restarts count toward it, because the lock's holder
-  can be this client's own previous session that Postgres hasn't yet noticed
-  is dead (after a network partition, until the server's TCP keepalive gives
-  up on it; Trellis sets that to about 25s on the producer session unless the
-  DSN or a role or database default sets its own `tcp_keepalives_*`), and then
-  nothing is staging. If you deliberately run a second `staging_worker` client
-  as a standby, its value climbs while the active one reads `0`, so alert on
-  `min by (slot)` across processes.
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#transform-status-lifecycle), a small enumerable state.
@@ -183,9 +165,8 @@ quarantine are two arcs of one lifecycle:
 * **`waiting_to_backfill`** — defined, but its source's existing rows haven't
   been read yet. Every new transform starts here, and registration returns
   with it here. It stays until the staging worker has joined its source
-  (published it if needed and parked a `pending_backfill` marker), the
-  marker's transaction fence has settled (see caveat below), and intake has
-  caught up to the read's snapshot
+  (installed its capture triggers if needed and parked a `pending_backfill`
+  marker) and the marker's transaction fence has settled (see caveat below)
   ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
   A direct build that failed comes back here too, retried after a backoff;
   `Trellis::status` reports its error meanwhile (`backfill_failure`).
@@ -204,8 +185,8 @@ quarantine are two arcs of one lifecycle:
   maintenance tick, and that discharge flips the transform `live`. A `live`
   transform comes back here for its own catch-up: an `ALTER TRANSFORM` that
   added columns, a resumed column, a rebuild of a transform whose target it
-  reads, or a re-read of a table it reads (`Trellis::request_backfill`, a
-  fresh replication slot, or the table rejoining the publication). A catch-up that keeps failing keeps the transform here, with
+  reads, or a re-read of a table it reads (`Trellis::request_backfill`, or
+  the table's capture triggers put back after someone dropped them). A catch-up that keeps failing keeps the transform here, with
   the error on `Trellis::status` when the failing marker is on its source.
 * **`live`** — the steady state: a watermark token taken after a commit and
   awaited with `Trellis::await_converged` guarantees the target reflects that
@@ -223,16 +204,16 @@ quarantine are two arcs of one lifecycle:
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
 source only once a conservative transaction fence settles (`now.xmin >
-fence`, `trellis/src/intake/publication.rs`). Because `xmin` is
+fence`, `trellis/src/intake/markers.rs`). Because `xmin` is
 **cluster-global**, any unrelated long-running transaction *anywhere in the
 cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
 until that transaction ends. Since every new transform goes through this wait
 ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)), a long
 transaction delays every registration from going live, not only the ones on a
-newly published table.
+newly captured table.
 
 This wait is **safe, not a fault**: the apply loop and every `live` transform are
-unaffected, and even the new table's *new* changes stream through — only its
+unaffected, and even the new table's *new* changes are captured — only its
 *historical* rows are withheld until the fence settles. So we deliberately emit no
 stall metric, warning log, or timeout — the `waiting_to_backfill` status is the
 whole signal.

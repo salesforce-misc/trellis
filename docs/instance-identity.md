@@ -85,7 +85,7 @@ one database to keep this honest; it found two real gaps, both since closed:
 
 * **The producer singleton is keyed by schema.** Postgres advisory locks are
   keyed by `(database, key)` — a session's `search_path` is not part of the
-  lock tag. So the "exactly one CDC intake producer" guard
+  lock tag. So the "exactly one staging worker" guard
   (`staging::session`) must derive its key from the instance schema, as
   `staging::session::producer_singleton_lock_key` now does; a global constant
   made the guard fire across instances.
@@ -96,11 +96,12 @@ one database to keep this honest; it found two real gaps, both since closed:
   fine for a one-instance process, wrong for anything holding a `Config` (like
   `Trellis`) and impossible for two instances in one process.
 
-Two things remain the operator's responsibility, not the engine's:
+Capture triggers are named after the instance schema
+(`capture::sql::trigger_name`), and their functions live in it, so two
+instances can capture one table without replacing each other's triggers.
 
-* **Distinct replication slot and publication names** per instance
-  (`ClientOptions::slot`/`publication`). A slot name is unique cluster-wide;
-  a publication name is unique per database. Neither is schema-qualified.
+One thing remains the operator's responsibility, not the engine's:
+
 * **Distinct transform target schemas** (`Config::target_schema`) if the two
   instances materialize similarly-named targets. Target tables are
   application data, deliberately outside the instance schema (see
@@ -118,23 +119,18 @@ aggregate target. Trellis requires a source table to have a primary key
 target has none: its grouping columns may be `NULL`, so its identity is a
 `UNIQUE NULLS NOT DISTINCT` constraint. Inside the owning instance that never
 matters, because an instance hands each write to one of its own targets on to
-that target's readers in the writing transaction, without logical replication.
+that target's readers in the writing transaction, without capture triggers.
 That internal path stops at the instance boundary. The reading instance's only
-view of the table is CDC through its own publication, and it has no primary key
+view of the table is its own capture triggers, and they have no primary key
 to identify a change by, so `CREATE TRANSFORM` rejects the definition with
-`SourceNotChangeKeyed` (issue #376). Publishing the table would also make
-Postgres refuse the owning instance's own updates to it, since it has no replica
-identity. To chain off an aggregate target, define the downstream transform in
-the instance that owns it. The same goes for a relationship: `CREATE
+`SourceNotChangeKeyed` (issue #376). To chain off an aggregate target, define
+the downstream transform in the instance that owns it. The same goes for a relationship: `CREATE
 RELATIONSHIP` rejects an endpoint that is another instance's aggregate target
 with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
-would publish it just the same.
+would capture it just the same.
 
 Co-tenant instances don't slow each other's convergence waits.
-`staging::watermark_token` is `pg_current_wal_lsn()`, a cluster-wide LSN, so
-"has this instance converged?" is asked against WAL the instance's own
-publication filters out. Confirming past that WAL used to wait for a
-throttled keepalive, so a busy neighbour added up to 10s to every wait. A
-waiter now writes a `trellis.converge` logical message, which every slot in
-the database decodes, and each instance's intake confirms through it at once
-(issue #452).
+`staging::watermark_token` is `pg_current_wal_lsn()`, a cluster-wide LSN, but
+an instance's wait reads only its own ring. A change it captures is in the ring
+when the change commits, so there is nothing to wait for in WAL a neighbour
+wrote.

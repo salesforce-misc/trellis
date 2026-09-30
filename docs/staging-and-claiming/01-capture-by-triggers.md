@@ -10,9 +10,8 @@ transaction.* A change is in the ring exactly when the write that made it
 committed. A crash at any instant loses nothing and replays nothing, because
 there is no second transaction to lose or replay.
 
-This replaced capture by logical replication (the stream, the slot and the
-publication) in #622 C5, as [ADR-0002](../decisions/0002-async-data-flow.md)
-decided. The code is in `trellis/src/capture/`.
+[ADR-0002](../decisions/0002-async-data-flow.md) records why capture works
+this way. The code is in `trellis/src/capture/`.
 
 ## The capture function
 
@@ -139,8 +138,8 @@ statement trigger, the reverse of the WAL's order; nothing depends on it.
 
 Because a change's ring rows commit with the change, every commit at or below
 a watermark token already has its rows in the ring when the token is read.
-The read-your-writes predicate ([07](07-convergence-and-await.md)) needs no
-"intake has staged past the token" condition, and a waiter writes nothing.
+The read-your-writes predicate ([07](07-convergence-and-await.md)) only asks
+the ring, and a waiter writes nothing.
 
 ## A renamed or dropped column (#622 C6)
 
@@ -223,8 +222,7 @@ ignored test.
 The capture runs inside the application's transaction, so the writer pays for
 it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
-WAL per row (#622 C4, `local_docs/bench/622-baseline.md`). The slot deferred
-that cost to intake and capped it at intake's staging rate.
+WAL per row (#622 C4, `local_docs/bench/622-baseline.md`).
 
 ## Trellis migrations and the write path
 
