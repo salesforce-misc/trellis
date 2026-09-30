@@ -1154,7 +1154,7 @@ fn pk_range_where(
 /// `MIN`/`MAX`. A float `SUM`/`AVG` lands here too — float addition has no
 /// exact inverse — which is why [`classify_field`] must be told the field's
 /// type rather than assuming `numeric`.
-enum FieldKind {
+pub(crate) enum FieldKind {
     Sum,
     Avg,
     Count,
@@ -1178,7 +1178,7 @@ enum FieldKind {
 /// `NaN`/`Infinity` absorption would silently drift from a server-side
 /// `sum()`. The same hazard #111's review found in the gate itself, one
 /// layer up.
-fn classify_field(expr: &Expr, value_type: ValueType) -> FieldKind {
+pub(crate) fn classify_field(expr: &Expr, value_type: ValueType) -> FieldKind {
     match expr {
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             match classify("COUNT", AggregateArg::Count(CountArg::Star)) {

@@ -126,6 +126,54 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
     );
 }
 
+/// #623 D4: recompute-only fields (MIN/MAX, a composed field, an
+/// expression argument) over mixed-case columns of a mixed-case table
+/// recompute from ledger entries whose contribution and group columns carry
+/// those names quoted.
+#[tokio::test]
+async fn recomputed_fields_over_mixed_case_columns_follow_cdc() {
+    let (cluster, db, raw) = trigger_pipeline::database().await;
+    raw.batch_execute(
+        "create schema \"Shop\"; \
+         create table \"Shop\".\"OrderItems\" (id bigint primary key, \"OrderId\" bigint, \"Qty\" integer); \
+         insert into \"Shop\".\"OrderItems\" (id, \"OrderId\", \"Qty\") values (1, 10, 2), (2, 10, 3), (3, 20, 5)",
+    )
+    .await
+    .expect("seed the source");
+    install_over(
+        &db,
+        "TRANSFORM qty_span FROM Shop.OrderItems GROUP BY OrderId \
+         SELECT MIN(Qty) AS lo, MAX(Qty + 1) AS hi1, MAX(Qty) + MIN(Qty) AS ends",
+        &["id", "OrderId", "Qty"],
+    )
+    .await;
+
+    let mut pipeline = Pipeline::attach(cluster, db, raw, &["Shop.OrderItems"]).await;
+    const SPANS: &str = "select \"OrderId\"::text, concat_ws(',', lo, hi1, ends) from qty_span";
+    assert_eq!(
+        pipeline.rows(SPANS).await,
+        rows(&[("10", "2,4,5"), ("20", "5,6,10")]),
+        "the backfill folded every pre-existing row"
+    );
+
+    pipeline
+        .raw
+        .batch_execute(
+            "insert into \"Shop\".\"OrderItems\" (id, \"OrderId\", \"Qty\") values (4, 20, 7); \
+             update \"Shop\".\"OrderItems\" set \"Qty\" = 30 where id = 2; \
+             delete from \"Shop\".\"OrderItems\" where id = 1; \
+             delete from \"Shop\".\"OrderItems\" where id = 3",
+        )
+        .await
+        .expect("write the source");
+    pipeline.drain().await;
+    assert_eq!(
+        pipeline.rows(SPANS).await,
+        rows(&[("10", "30,31,60"), ("20", "7,8,14")]),
+        "CDC retracted the old extremes and recomputed each group"
+    );
+}
+
 /// A 1-1 transform over a mixed-case table reading a to-one relationship
 /// into another mixed-case table: the forward path (a new from-side row
 /// resolves its parent through the projection) and the reverse path (a

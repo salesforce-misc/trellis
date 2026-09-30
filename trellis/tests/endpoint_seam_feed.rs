@@ -1054,3 +1054,175 @@ async fn an_avg_target_endpoints_prior_images_carry_its_old_means() {
         "store 101 lost region 2's mean as a delta"
     );
 }
+
+/// A hand-staged source delete, standing in for intake.
+async fn stage_source_delete(raw: &mut Client, src_table: &str, key: &str, old: &str) {
+    let txn = raw.transaction().await.expect("begin");
+    append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: src_table.to_string(),
+            key: key.to_string(),
+            op: CdcOp::Delete,
+            lsn: Some(testkit::wal_insert_lsn(&txn).await),
+            old_image: Some(old.to_string()),
+            new_image: None,
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the delete");
+    txn.commit().await.expect("commit");
+}
+
+/// #623 D4: a `MIN`/`MAX` target on the ledger that is a relationship's
+/// to-side stages its groups' prior images with the values the readers last
+/// saw. The ledger recomputes `MIN`/`MAX` after the upsert, so the prior is
+/// the row before that recompute, exact even for a group the page empties
+/// and refills (no increment can rebuild an old maximum). An aggregate
+/// reading the target through the relationship takes each change as new
+/// minus old, and the offset proves it took a delta, not a re-derive.
+#[tokio::test]
+async fn a_min_max_target_endpoints_prior_images_carry_its_old_extremes() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.sales (id integer primary key, region integer, amount integer); \
+         insert into public.sales values (1, 1, 10), (2, 1, 20), (3, 2, 5); \
+         create table public.stores (id integer primary key, region integer, kind text); \
+         insert into public.stores values (100, 1, 'a'), (101, 2, 'a'), (102, 1, 'b')",
+    )
+    .await
+    .expect("create sources");
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.region_tops FROM public.sales GROUP BY region \
+         SELECT MAX(amount) AS top, MIN(amount) AS low",
+        &int_columns(&["id", "region", "amount"]),
+        "public",
+    )
+    .await
+    .expect("install region_tops");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP tops FROM stores.region TO region_tops.region",
+    )
+    .await
+    .expect("a relationship whose to-side is a MIN/MAX target");
+    let mut store_columns = int_columns(&["id", "region"]);
+    store_columns.insert("kind".to_string(), ValueType::Text);
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.kind_tops FROM public.stores GROUP BY kind \
+         SELECT SUM(tops.top) AS total",
+        &store_columns,
+        "public",
+    )
+    .await
+    .expect("install kind_tops");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let totals = "select kind, total::text from public.kind_tops";
+    assert_eq!(
+        rows(&raw, totals).await,
+        BTreeMap::from([
+            ("a".to_string(), "25".to_string()),
+            ("b".to_string(), "20".to_string()),
+        ]),
+    );
+    raw.execute("update public.kind_tops set total = total + 1000", &[])
+        .await
+        .expect("offset every group");
+
+    // One page empties region 1 and refills it (top 20 -> 3, low 10 -> 3),
+    // and raises region 2 (5 -> 7).
+    raw.batch_execute(
+        "delete from public.sales where region = 1; \
+         insert into public.sales values (4, 1, 3); \
+         update public.sales set amount = 7 where id = 3",
+    )
+    .await
+    .expect("write the source");
+    for (key, amount) in [("1", "10"), ("2", "20")] {
+        stage_source_delete(
+            &mut raw,
+            "public.sales",
+            key,
+            &format!(r#"{{"id":"{key}","region":"1","amount":"{amount}"}}"#),
+        )
+        .await;
+    }
+    stage_source_insert(
+        &mut raw,
+        "public.sales",
+        "4",
+        r#"{"id":"4","region":"1","amount":"3"}"#,
+    )
+    .await;
+    stage_source_update(
+        &mut raw,
+        "public.sales",
+        "3",
+        r#"{"id":"3","region":"2","amount":"5"}"#,
+        r#"{"id":"3","region":"2","amount":"7"}"#,
+    )
+    .await;
+    drain_round(&db.pool, &mut raw).await;
+    let slot: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    let mut staged: Vec<Vec<Option<String>>> = raw
+        .query(
+            &format!(
+                "select op, coalesce(old_image, new_image) ->> 'region', \
+                        old_image ->> 'top', old_image ->> 'low', \
+                        new_image ->> 'top', new_image ->> 'low' \
+                 from seg_{slot} where src_table = 'public.region_tops'"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the ring")
+        .into_iter()
+        .map(|row| (0..6).map(|i| row.get::<_, Option<String>>(i)).collect())
+        .collect();
+    staged.sort();
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        staged,
+        vec![
+            vec![s("update"), s("1"), s("20"), s("10"), s("3"), s("3")],
+            vec![s("update"), s("2"), s("5"), s("5"), s("7"), s("7")],
+        ],
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select __from_key, __tombstone::text from public.region_tops__ledger \
+             where __applied_lsn is not null"
+        )
+        .await,
+        BTreeMap::from([
+            ("1".to_string(), "true".to_string()),
+            ("2".to_string(), "true".to_string()),
+            ("3".to_string(), "false".to_string()),
+            ("4".to_string(), "false".to_string()),
+        ]),
+        "the target is on the ledger"
+    );
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, totals).await,
+        BTreeMap::from([
+            ("a".to_string(), "1010".to_string()),
+            ("b".to_string(), "1003".to_string()),
+        ]),
+        "each store took its region's new maximum minus its old one"
+    );
+}
