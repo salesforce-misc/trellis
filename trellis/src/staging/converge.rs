@@ -334,14 +334,24 @@ pub async fn table_changes_pending_through(
     Ok(row.get(0))
 }
 
-/// Takes a watermark token: `pg_current_wal_lsn()` on the caller's own
-/// connection. The caller must run this *after* its mutation has committed
-/// — taken any earlier, it would bound the write from below instead of
-/// above, and [`await_converged`] could return before the write is actually
-/// reflected (docs/staging-and-claiming/07-convergence-and-await.md,
+/// Takes a watermark token: `pg_current_wal_insert_lsn()` on the caller's
+/// own connection. The caller must run this *after* its mutation has
+/// committed — taken any earlier, it would bound the write from below
+/// instead of above, and [`await_converged`] could return before the write
+/// is actually reflected (docs/staging-and-claiming/07-convergence-and-await.md,
 /// "Watermark tokens").
+///
+/// The *insert* position, not `pg_current_wal_lsn()`'s *write* position
+/// (issue #697): a writer with `synchronous_commit = off` gets its commit
+/// back before its WAL is written, so the write position can still be below
+/// the `origin_lsn` its capture trigger stamped (itself an insert position),
+/// and a token taken from it would let the wait return before that change is
+/// applied. Every WAL record of a transaction, its commit record included,
+/// is inserted before the commit returns, whatever `synchronous_commit` says.
 pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, StagingError> {
-    let row = client.query_one("select pg_current_wal_lsn()", &[]).await?;
+    let row = client
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await?;
     Ok(row.get(0))
 }
 

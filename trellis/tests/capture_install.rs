@@ -230,11 +230,13 @@ async fn an_install_captures_writes_and_a_repeat_install_changes_nothing() {
         .expect("read acls")
         .get(0);
     assert_eq!(unrevoked, 0, "a null proacl means PUBLIC may execute");
-    // Owned by the role that owns the instance schema.
+    // Owned by the role that owns the ring.
     let foreign_owned: i64 = client
         .query_one(
             "select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
-             where n.nspname = $1 and p.proname like 'cap\\_%' and p.proowner <> n.nspowner",
+             where n.nspname = $1 and p.proname like 'cap\\_%' \
+               and p.proowner <> (select c.relowner from pg_class c \
+                                  where c.relnamespace = n.oid and c.relname = 'seg_0')",
             &[&DEFAULT_SCHEMA],
         )
         .await
@@ -856,6 +858,84 @@ async fn a_repeatable_read_writer_is_captured_into_a_batch_that_claims_it() {
 #[tokio::test]
 async fn a_serializable_writer_is_captured_into_a_batch_that_claims_it() {
     a_snapshot_isolation_writer_is_claimed_exactly_once(IsolationLevel::Serializable).await;
+}
+
+/// Issue #701: a DBA pre-creates the instance schema as role X, and a login
+/// role L, a member of X, runs the migrations and the install. The ring is
+/// L's and X has no privilege on it, so the capture functions must be L's
+/// too, or every captured write fails. A test cluster connects as a
+/// superuser, for whom every privilege check passes, so the setup uses real
+/// roles and the application writes as a third one.
+#[tokio::test]
+async fn a_schema_pre_created_by_another_role_still_captures_writes() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let admin = connect(db.dsn()).await;
+    admin
+        .batch_execute(&format!(
+            "create role cap701_schema_owner nologin; \
+             create role cap701_trellis login in role cap701_schema_owner; \
+             create role cap701_app login; \
+             grant create on database \"{}\" to cap701_trellis; \
+             grant create on schema public to cap701_trellis; \
+             create schema {DEFAULT_SCHEMA} authorization cap701_schema_owner",
+            db.name()
+        ))
+        .await
+        .expect("roles and a pre-created schema");
+    let as_role = |role: &str| {
+        assert!(db.dsn().contains("user=postgres"), "{}", db.dsn());
+        db.dsn().replace("user=postgres", &format!("user={role}"))
+    };
+
+    let config = trellis::Config::with_schema(as_role("cap701_trellis"), DEFAULT_SCHEMA)
+        .expect("valid config");
+    let pool = trellis::Pool::new(&config).expect("pool");
+    trellis::migrate(&pool, &config)
+        .await
+        .expect("migrate as the login role");
+    let mut installer = connect(&as_role("cap701_trellis")).await;
+    install_t(&mut installer).await;
+    installer
+        .batch_execute("grant select, insert, update, delete on public.t to cap701_app")
+        .await
+        .expect("grant the application its table");
+
+    let owners: Vec<(String, String)> = admin
+        .query(
+            "select pg_catalog.pg_get_userbyid(n.nspowner)::text, \
+                    pg_catalog.pg_get_userbyid(p.proowner)::text \
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
+             where n.nspname = $1 and p.proname like 'cap\\_%'",
+            &[&DEFAULT_SCHEMA],
+        )
+        .await
+        .expect("read owners")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(owners.len(), CaptureEvent::ALL.len(), "{owners:?}");
+    for (schema_owner, function_owner) in &owners {
+        assert_eq!(schema_owner, "cap701_schema_owner");
+        assert_eq!(function_owner, "cap701_trellis", "the ring's owner");
+    }
+
+    let app = connect(&as_role("cap701_app")).await;
+    for statement in [
+        "insert into public.t values ('k', 1, 2)",
+        "update public.t set a = 3 where id = 'k'",
+        "delete from public.t where id = 'k'",
+    ] {
+        app.batch_execute(statement)
+            .await
+            .unwrap_or_else(|err| panic!("{statement}: {err:?}"));
+    }
+    let ops: Vec<String> = ring_rows(&installer, "k")
+        .await
+        .into_iter()
+        .map(|(op, _, _)| op)
+        .collect();
+    assert_eq!(ops, ["insert", "update", "delete"]);
 }
 
 /// A role without `pg_read_all_stats` can't see another role's backend in

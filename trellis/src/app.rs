@@ -1111,7 +1111,7 @@ impl Trellis {
         Ok(crate::staging::session::producer_is_running(&**client, self.config.schema()).await?)
     }
 
-    /// A read-your-writes watermark (issue #192): `pg_current_wal_lsn()`,
+    /// A read-your-writes watermark (issue #192): `pg_current_wal_insert_lsn()`,
     /// read on a freshly acquired pool connection — see
     /// [`crate::staging::converge::watermark_token`] for the exact
     /// semantics.
@@ -1124,9 +1124,10 @@ impl Trellis {
     /// tokens"). The write itself doesn't need to go through this same
     /// connection or even through [`Trellis`] at all — any connection works,
     /// as long as this call happens after the write's commit returns:
-    /// `pg_current_wal_lsn()` reports the server's current WAL position, not
-    /// something scoped to one session, so it's guaranteed to be at or past
-    /// the write's own commit LSN by the time this query runs.
+    /// `pg_current_wal_insert_lsn()` reports the server's current WAL insert
+    /// position, not something scoped to one session, so it's guaranteed to
+    /// be at or past the write's own commit record by the time this query
+    /// runs, even for a writer with `synchronous_commit = off` (issue #697).
     ///
     /// Pairs with [`Trellis::await_converged`]:
     ///

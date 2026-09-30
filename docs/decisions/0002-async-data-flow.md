@@ -483,14 +483,17 @@ applying.
 
 ## Convergence and status
 
-- **Should:** the watermark token stays `pg_current_wal_lsn()` read after
+- **Should:** the watermark token is `pg_current_wal_insert_lsn()` read after
   the caller's commit, and `origin_lsn` is stamped from the trigger's
   pre-commit `pg_current_wal_insert_lsn()`. A commit the caller could see
   before taking its token has its ring rows in the same transaction, each
   with `origin_lsn` at or below the commit's position, so the predicate of
   [stage 07](../staging-and-claiming/07-convergence-and-await.md) over ring
   rows alone is sound; a transaction straddling the token over-reports, the
-  safe direction. There is no capture watermark to check. *Evidence:*
+  safe direction. The token is the insert position because the write
+  position, `pg_current_wal_lsn()`, lags a commit made with
+  `synchronous_commit = off` and can sit below its rows' `origin_lsn`
+  (issue #697). There is no capture watermark to check. *Evidence:*
   [E5](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977).
 - **Must:** three stored statuses: `waiting_to_backfill` (registered, chunk
   plan not yet written; normally momentary), `backfilling` (applying, chunks

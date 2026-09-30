@@ -214,10 +214,20 @@
 //!
 //! The functions are `SECURITY DEFINER`, so they run as their owner, the
 //! Trellis role, whichever application role writes the table, and the
-//! application needs no privilege on Trellis's schema. A session that isn't
-//! the schema's owner itself but a member of it (a login role granted the
-//! Trellis role, say) hands the functions to the owner with `ALTER FUNCTION
-//! … OWNER TO` in the same transaction.
+//! application needs no privilege on Trellis's schema. What they write is the
+//! ring (`seg_*`, the `change_id` sequence and `ring_slot_mirror`), so their
+//! owner is the ring's owner, the role that ran the migrations. A session
+//! that isn't that role itself but a member of it (a login role granted the
+//! Trellis role, say) hands the functions to it with `ALTER FUNCTION … OWNER
+//! TO` in the same transaction, and a session that isn't a member fails
+//! there, loudly, instead of installing functions that can't write.
+//!
+//! The schema's owner is not a stand-in for the ring's (issue #701). A DBA
+//! can pre-create the schema as one role and have a login role that is a
+//! member of it run the migrations: `create schema if not exists` keeps the
+//! DBA's role as the schema's owner, while the ring belongs to the login
+//! role, and the schema's owner has no privilege on it. Functions owned by
+//! the schema's owner would fail every captured write.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -528,7 +538,7 @@ pub async fn narrow(
     schema: &str,
     spec: &CaptureSpec,
 ) -> Result<(), CaptureError> {
-    let owner = foreign_schema_owner(&*client, schema).await?;
+    let owner = foreign_ring_owner(&*client, schema).await?;
     let txn = client.transaction().await?;
     for statement in sql::function_statements(schema, spec)? {
         txn.batch_execute(&statement).await?;
@@ -656,7 +666,7 @@ async fn attempt(
 ) -> Result<(), CaptureError> {
     let table = op.table();
     let owner = match op {
-        Op::Install(_) | Op::Widen(_) => foreign_schema_owner(&*client, schema).await?,
+        Op::Install(_) | Op::Widen(_) => foreign_ring_owner(&*client, schema).await?,
         Op::Uninstall(_) => None,
     };
     let txn = client.transaction().await?;
@@ -717,18 +727,22 @@ async fn attempt(
     Ok(())
 }
 
-/// The role that owns instance schema `schema`, when the session's role
-/// isn't it: the functions are handed to it (see "The Trellis role").
-async fn foreign_schema_owner(
+/// The role that owns instance schema `schema`'s ring, when the session's
+/// role isn't it: the functions are handed to it (see "The Trellis role").
+/// `seg_0` stands for the ring: the migrations create every ring table as
+/// one role.
+async fn foreign_ring_owner(
     client: &impl GenericClient,
     schema: &str,
 ) -> Result<Option<String>, CaptureError> {
     let row = client
         .query_opt(
-            "select case when n.nspowner = r.oid then null \
-                         else pg_catalog.pg_get_userbyid(n.nspowner)::text end \
-             from pg_catalog.pg_namespace n, pg_catalog.pg_roles r \
-             where n.nspname = $1 and r.rolname = current_user",
+            "select case when c.relowner = r.oid then null \
+                         else pg_catalog.pg_get_userbyid(c.relowner)::text end \
+             from pg_catalog.pg_class c \
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace, \
+             pg_catalog.pg_roles r \
+             where n.nspname = $1 and c.relname = 'seg_0' and r.rolname = current_user",
             &[&schema],
         )
         .await?;

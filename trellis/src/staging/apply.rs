@@ -1664,14 +1664,13 @@ pub(crate) struct RelationshipReverseRecord {
     prev_gen: Option<i64>,
     /// Issue #132 guard (a): `X`, "the source's write frontier," captured in
     /// the same Phase 2 statement as `prev_lsn`/`prev_gen` above (via
-    /// `pg_current_wal_lsn()` against the same connection). Phase 3 must not
-    /// apply this record until [`StagedWatermark::get`] reports everything
-    /// committed at or before this value is staged (always, under trigger
-    /// capture) — see
-    /// `check_reverse_guards`'s guard (a) arm and this module's "Issue #131,
-    /// #132" doc section for why a lower/earlier capture is always safe (it
-    /// only makes the barrier easier, never wrongly permissive) while a
-    /// later one would not be.
+    /// `pg_current_wal_insert_lsn()` against the same connection). Phase 3
+    /// must not apply this record until [`StagedWatermark::get`] reports
+    /// everything committed at or before this value is staged (always, under
+    /// trigger capture). Guard (c) also bounds its in-flight check by it, and
+    /// there a lower value is the unsafe direction: it would miss a committed
+    /// change's pending ring rows, which is why this is the insert position
+    /// and not the write position (issue #697).
     watermark: PgLsn,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
@@ -2170,10 +2169,13 @@ struct ReverseCapture {
 
 /// Live-reads the settled parent projection's current
 /// [`ddl::PROJECTION_LSN_COLUMN`]/[`ddl::PROJECTION_GEN_COLUMN`] for `key`,
-/// **and** captures guard (a)'s `X` — `pg_current_wal_lsn()`, "the source's
-/// write frontier" — in the very same statement, per the issue's own
-/// requirement (`select ..., pg_current_wal_lsn() from <projection> where
-/// ...`), not as a separate round trip. A plain, unlocked read taken once in
+/// **and** captures guard (a)'s `X` — `pg_current_wal_insert_lsn()`, "the
+/// source's write frontier" — in the very same statement, not as a separate
+/// round trip. The insert position, not `pg_current_wal_lsn()`'s write
+/// position (issue #697): a change committed with `synchronous_commit = off`
+/// is visible to the live reads guard (c) protects before its WAL is written,
+/// and its ring rows' `lsn` (an insert position) can be above the write
+/// position, so guard (c) would not see it pending. A plain, unlocked read taken once in
 /// Phase 2; Phase 3 (`apply_and_mark_drained_many`'s "3d" step,
 /// `check_reverse_guards`) re-validates `prev_lsn`/`prev_gen` under `FOR
 /// UPDATE` and re-checks the watermark against the live
@@ -2185,7 +2187,7 @@ struct ReverseCapture {
 /// old/new key, per `compute`'s own "both images absent" skip, but this
 /// function does not assume that), or no projection row exists yet for
 /// `key` (a parent that's about to be INSERTed) — in every such case this
-/// still issues a bare `select pg_current_wal_lsn()` so `watermark` is
+/// still issues a bare `select pg_current_wal_insert_lsn()` so `watermark` is
 /// always populated: guard (a) applies to every reverse record, including a
 /// parent insert, not only ones with an existing projection row.
 async fn capture_reverse_guard_state(
@@ -2202,7 +2204,7 @@ async fn capture_reverse_guard_state(
         let row = client
             .query_opt(
                 &format!(
-                    "select {lsn_ident}, {gen_ident}, pg_current_wal_lsn() \
+                    "select {lsn_ident}, {gen_ident}, pg_current_wal_insert_lsn() \
                      from {qualified_projection} where {key_ident}::text = $1"
                 ),
                 &[&key],
@@ -2216,7 +2218,9 @@ async fn capture_reverse_guard_state(
             });
         }
     }
-    let row = client.query_one("select pg_current_wal_lsn()", &[]).await?;
+    let row = client
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await?;
     Ok(ReverseCapture {
         prev_lsn: None,
         prev_gen: None,

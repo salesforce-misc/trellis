@@ -92,12 +92,14 @@ So:
 * **Ownership of every source table**, or membership in the role that owns
   it. The worker installs the triggers with `ENABLE ALWAYS`, which only the
   owner may run.
-* **The role that owns the Trellis schema** owns the capture functions, which
-  run `SECURITY DEFINER`, so application roles writing a source table need no
-  privilege on Trellis's schema. That role must keep `USAGE` on the schema,
-  `INSERT` on the ring segments (`seg_0` to `seg_3`), and `USAGE` on the
-  `staging_change_id_seq` and `ring_slot_mirror` sequences. It has them as
-  their owner unless someone revokes them.
+* **The role that ran the migrations** owns the ring and the capture
+  functions, which run `SECURITY DEFINER`, so application roles writing a
+  source table need no privilege on Trellis's schema. The schema itself may
+  belong to another role that pre-created it; a worker whose login role isn't
+  the one that ran the migrations must be a member of it. The owning role must
+  keep `USAGE` on the schema, `INSERT` on the ring segments (`seg_0` to
+  `seg_3`), and `USAGE` on the `staging_change_id_seq` and `ring_slot_mirror`
+  sequences. It has them as their owner unless someone revokes them.
 * **Leave the capture triggers alone.** Each source table carries four
   triggers named `<schema>_capture_<event>` (`trellis_capture_insert` and so
   on for the default schema). Disabling or dropping one, or making the

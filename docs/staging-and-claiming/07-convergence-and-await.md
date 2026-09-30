@@ -15,11 +15,15 @@ something cheaper. If you build one thing from this series carefully, build this
 
 A caller reads its own writes without waiting for global idleness:
 
-1. after its mutation commits, it reads `pg_current_wal_lsn()` **on its own
+1. after its mutation commits, it reads `pg_current_wal_insert_lsn()` **on its own
    connection** — the **token**;
 2. it polls until derived state reflects every commit at or below the token.
 
 Taken *after* the write commits, the token bounds that write's position from above.
+It is the WAL *insert* position, not `pg_current_wal_lsn()`'s *write* position: a
+writer with `synchronous_commit = off` gets its commit back before its WAL is written,
+so the write position can still sit below the `origin_lsn` its trigger stamped, and
+the wait would return before the change is applied (issue #697).
 The engine's workers do the work; the caller only waits — no client-driven drain loop.
 Capture triggers write a change's ring rows in the writer's own transaction
 ([01](01-capture-by-triggers.md)), so every commit at or below the token is already

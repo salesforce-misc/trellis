@@ -130,7 +130,7 @@ with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
 would capture it just the same.
 
 Co-tenant instances don't slow each other's convergence waits.
-`staging::watermark_token` is `pg_current_wal_lsn()`, a cluster-wide LSN, but
+`staging::watermark_token` is `pg_current_wal_insert_lsn()`, a cluster-wide LSN, but
 an instance's wait reads only its own ring. A change it captures is in the ring
 when the change commits, so there is nothing to wait for in WAL a neighbour
 wrote.

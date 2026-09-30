@@ -1,7 +1,7 @@
 //! Issue #452: `Trellis::await_converged` on a quiet stream must return as
 //! soon as the write is applied.
 //!
-//! The token is `pg_current_wal_lsn()`, so WAL between the caller's commit
+//! The token is `pg_current_wal_insert_lsn()`, so WAL between the caller's commit
 //! and its token read can carry no captured change (a write to an uncaptured
 //! table, the engine's own staging and draining of the write). Under the
 //! replication intake Trellis ran before #622 that left nothing to confirm

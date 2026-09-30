@@ -20,12 +20,16 @@
 //! `await_converged_waits_for_a_sealed_write_until_it_is_applied` stages a
 //! real write's CDC row by hand and drains it through the engine's own apply
 //! path, so the target value it reads back is one the engine computed.
+//! `a_token_after_an_asynchronous_commit_waits_for_the_write` (issue #697)
+//! writes through a real capture trigger and never drains.
 
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
+use trellis::capture::install;
+use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{
     StagedWatermark, StagingError, apply, has_pending, retire_drained_segments, seal,
@@ -382,4 +386,98 @@ fn blocking_trellis_watermark_token_and_await_converged_round_trip() {
 
     trellis.shutdown().expect("shutdown (sync)");
     drop(setup_runtime);
+}
+
+/// Issue #697: a writer with `synchronous_commit = off` gets its commit back
+/// before its WAL is written, so the WAL *write* position can still be below
+/// the `origin_lsn` (an *insert* position) its capture trigger stamped. The
+/// token must bound those rows anyway, or the wait returns before the write
+/// is applied. Nothing drains here, so the wait can only time out: the test
+/// can't pass by timing.
+///
+/// Three writes, each checked on its own row, because a WAL page that fills
+/// between a trigger and its commit gets written at once and would close the
+/// gap for that one write.
+#[tokio::test]
+async fn a_token_after_an_asynchronous_commit_waits_for_the_write() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    // The WAL writer writes an asynchronous commit out within
+    // `wal_writer_delay` (200ms by default). Stretch it to its maximum so the
+    // write position stays behind each write below until its token is read.
+    // Set first, so the WAL writer has picked it up at its next wakeup.
+    raw.batch_execute("alter system set wal_writer_delay = '10s'")
+        .await
+        .expect("alter wal_writer_delay");
+    raw.batch_execute("select pg_reload_conf()")
+        .await
+        .expect("reload");
+    raw.batch_execute("create table public.t (id text primary key, a int)")
+        .await
+        .expect("create public.t");
+    let spec = CaptureSpec::new(
+        "public.t",
+        vec!["id".to_string()],
+        ["a".to_string()],
+        Vec::new(),
+    )
+    .expect("valid spec");
+    let mut installer = connect_raw(db.dsn()).await;
+    assert!(matches!(
+        install::install(&mut installer, DEFAULT_SCHEMA, &spec, None)
+            .await
+            .expect("install"),
+        install::Progress::Done(true)
+    ));
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+    let before = trellis.watermark_token().await.expect("watermark_token");
+    trellis
+        .await_converged(before, Duration::from_secs(5))
+        .await
+        .expect("nothing is captured at or below a token taken before the writes");
+
+    let writer = connect_raw(db.dsn()).await;
+    writer
+        .batch_execute("set synchronous_commit = off")
+        .await
+        .expect("asynchronous commit");
+    for id in ["k1", "k2", "k3"] {
+        writer
+            .execute("insert into public.t values ($1, 1)", &[&id])
+            .await
+            .expect("captured write");
+        let token = trellis.watermark_token().await.expect("watermark_token");
+        let origin: PgLsn = raw
+            .query_one(
+                "select origin_lsn from ( \
+                     select origin_lsn, key, src_table from seg_0 \
+                     union all select origin_lsn, key, src_table from seg_1 \
+                     union all select origin_lsn, key, src_table from seg_2 \
+                     union all select origin_lsn, key, src_table from seg_3 \
+                 ) r where src_table = 'public.t' and key = $1",
+                &[&id],
+            )
+            .await
+            .expect("the write's ring row")
+            .get(0);
+        assert!(
+            origin <= token,
+            "the token {token} taken after {id}'s commit is below its ring row's origin {origin}"
+        );
+        if id == "k1" {
+            match trellis
+                .await_converged(token, Duration::from_millis(100))
+                .await
+            {
+                Err(TrellisError::Staging(StagingError::ConvergenceTimeout { .. })) => {}
+                other => panic!("the wait returned before k1 drained: {other:?}"),
+            }
+        }
+    }
+    trellis.shutdown().await.expect("shutdown");
 }

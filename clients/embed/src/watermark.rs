@@ -3,7 +3,7 @@
 //! (ADR-0010 decision 4): the host has no business doing arithmetic on it.
 //!
 //! The string is the WAL position in Postgres's own `X/X` spelling
-//! (`pg_current_wal_lsn()`'s), which makes it readable in a log line. Hosts
+//! (`pg_current_wal_insert_lsn()`'s), which makes it readable in a log line. Hosts
 //! must still treat it as opaque; only this module reads it.
 
 use trellis::{ErrorCode, PgLsn};
