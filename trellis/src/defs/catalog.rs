@@ -2574,16 +2574,22 @@ async fn create_target_in_txn(
             format!("{schema}.{taken}")
         },
     };
-    // `ddl` also creates the target's ledger (#623 D2), which Trellis owns
-    // just the same, so its name has to be free too.
+    // `ddl` also creates the target's ledger (#623 D2) and, for a
+    // ledger-routed aggregate, its group-delta table (#625 F1), which Trellis
+    // owns just the same, so their names have to be free too.
     let ledger = super::ledger::ledger_table_name(table);
+    let deltas = super::ledger::deltas_table_name(table);
     let taken: Option<String> = txn
         .query_opt(
             "select c.relname::text from pg_catalog.pg_class c \
              join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
              where n.nspname = $1 and c.relname = any($2) \
              order by c.relname = $3 desc limit 1",
-            &[&schema, &[table, ledger.as_str()].as_slice(), &table],
+            &[
+                &schema,
+                &[table, ledger.as_str(), deltas.as_str()].as_slice(),
+                &table,
+            ],
         )
         .await?
         .map(|row| row.get(0));

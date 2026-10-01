@@ -120,10 +120,14 @@ pub enum ValidationError {
     /// source would feed our own writes back into capture (see
     /// `docs/data-flow.md`).
     TargetEqualsSource { table: String },
-    /// The target's name ends with [`super::ledger::LEDGER_SUFFIX`], which
-    /// names every target's ledger table (#623 D2): this target would be
-    /// another target's ledger.
-    ReservedTargetSuffix { target: String },
+    /// The target's name ends with `suffix`, one of
+    /// [`super::ledger::RESERVED_TARGET_SUFFIXES`], which name the tables
+    /// Trellis keeps beside a target (its ledger, #623 D2, and its group
+    /// deltas, #625 F1): this target would be one of another target's.
+    ReservedTargetSuffix {
+        target: String,
+        suffix: &'static str,
+    },
     /// The target's name is longer than [`super::ledger::MAX_TARGET_NAME_LEN`]
     /// bytes, so its ledger's name (the target's plus
     /// [`super::ledger::LEDGER_SUFFIX`]) would pass Postgres's 63-byte
@@ -701,11 +705,10 @@ impl fmt::Display for ValidationError {
                 "target table '{table}' is the same as the source table; calculated \
                  columns must live on a separate neighbor table"
             ),
-            ValidationError::ReservedTargetSuffix { target } => write!(
+            ValidationError::ReservedTargetSuffix { target, suffix } => write!(
                 f,
-                "target name '{target}' ends with '{}', which Trellis reserves for the \
-                 ledger table it keeps beside every target; choose a name that doesn't",
-                super::ledger::LEDGER_SUFFIX
+                "target name '{target}' ends with '{suffix}', which Trellis reserves for \
+                 the tables it keeps beside a target; choose a name that doesn't"
             ),
             ValidationError::TargetNameTooLong { target, max } => write!(
                 f,
@@ -1037,10 +1040,15 @@ pub fn validate(
         });
     }
 
-    // #623 D2: every target has a ledger named `<target>__ledger` beside it.
-    if def.target.ends_with(super::ledger::LEDGER_SUFFIX) {
+    // #623 D2, #625 F1: a target has a ledger named `<target>__ledger` beside
+    // it, and a ledger-routed aggregate also `<target>__deltas`.
+    if let Some(suffix) = super::ledger::RESERVED_TARGET_SUFFIXES
+        .into_iter()
+        .find(|suffix| def.target.ends_with(suffix))
+    {
         return Err(ValidationError::ReservedTargetSuffix {
             target: def.target.clone(),
+            suffix,
         });
     }
     if def.target.len() > super::ledger::MAX_TARGET_NAME_LEN {
@@ -4045,10 +4053,26 @@ mod tests {
         assert_eq!(
             err,
             ValidationError::ReservedTargetSuffix {
-                target: "t__ledger".to_string()
+                target: "t__ledger".to_string(),
+                suffix: "__ledger",
             }
         );
         assert!(err.to_string().contains("__ledger"), "{err}");
+        // #625 F1: `t__deltas` is `t`'s group-delta table.
+        let err = validate(
+            &parsed("TRANSFORM t__deltas FROM s GROUP BY g SELECT COUNT(*) AS n"),
+            &columns,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::ReservedTargetSuffix {
+                target: "t__deltas".to_string(),
+                suffix: "__deltas",
+            }
+        );
+        assert!(err.to_string().contains("__deltas"), "{err}");
 
         let longest = "t".repeat(crate::defs::ledger::MAX_TARGET_NAME_LEN);
         assert_eq!(

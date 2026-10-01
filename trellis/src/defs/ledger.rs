@@ -16,9 +16,15 @@
 //! - **1-1 targets**: the key and the ordering state only. The target row
 //!   holds the values.
 //!
-//! **Nothing on the apply path reads a ledger yet.** The build writes an
-//! aggregate target's ledger; apply doesn't maintain it, so it goes stale
-//! after the target's first change. #623 part D3 is its first reader.
+//! The build writes an aggregate target's ledger, and Apply maintains it for
+//! the targets `staging::ledger` routes (#623 D3, D4): each page locks, reads
+//! and rewrites the entries of the keys it applies, and their group rows are
+//! the sums of the moves. A relationship-fed target's ledger is written by the
+//! build only, until #623 D5.
+//!
+//! A routed target also gets `<target>__deltas` ([`aggregate_deltas_ddl`],
+//! #625 F1): the per-group increments a build chunk records instead of
+//! writing group rows, which the merger (`staging::build`) folds into them.
 //!
 //! The bookkeeping columns are `__`-prefixed so they can't collide with a
 //! `GROUP BY` column, which validation keeps out of that prefix
@@ -36,10 +42,19 @@ use crate::pool::quote_ident;
 /// so one target's ledger can never be another target.
 pub const LEDGER_SUFFIX: &str = "__ledger";
 
-/// The longest target name whose ledger name still fits Postgres's 63-byte
-/// identifier limit (`NAMEDATALEN - 1`). A longer ledger name would be
-/// silently truncated, onto the target's own name at the limit.
+/// The suffix a target's group-delta table adds to the target's name (#625
+/// F1). Reserved like [`LEDGER_SUFFIX`], and no longer than it, so
+/// [`MAX_TARGET_NAME_LEN`] covers both.
+pub const DELTAS_SUFFIX: &str = "__deltas";
+
+/// The longest target name whose ledger and delta table names still fit
+/// Postgres's 63-byte identifier limit (`NAMEDATALEN - 1`). A longer name
+/// would be silently truncated, onto the target's own name at the limit.
 pub const MAX_TARGET_NAME_LEN: usize = 63 - LEDGER_SUFFIX.len();
+const _: () = assert!(DELTAS_SUFFIX.len() <= LEDGER_SUFFIX.len());
+
+/// The reserved suffixes of the tables Trellis keeps beside a target.
+pub const RESERVED_TARGET_SUFFIXES: [&str; 2] = [LEDGER_SUFFIX, DELTAS_SUFFIX];
 
 /// The source row's key, encoded exactly as the ring's `key`
 /// ([`super::ddl::pk_key_sql_expr`]).
@@ -67,6 +82,55 @@ pub(crate) const TOMBSTONE_COLUMN: &str = "__tombstone";
 /// A target's ledger table name.
 pub(crate) fn ledger_table_name(target: &str) -> String {
     format!("{target}{LEDGER_SUFFIX}")
+}
+
+/// A target's group-delta table name (#625 F1).
+pub(crate) fn deltas_table_name(target: &str) -> String {
+    format!("{target}{DELTAS_SUFFIX}")
+}
+
+/// A target's group-delta table, schema-qualified and quoted for SQL text,
+/// from the target's schema and bare name.
+pub(crate) fn qualified_deltas_table(target_schema: &str, target: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_ident(target_schema),
+        quote_ident(&deltas_table_name(target))
+    )
+}
+
+/// Empties a target's group-delta table, `qualified_deltas` (quoted), if it
+/// has one: the deltas go wherever the ledger is emptied (#625 F1's B4), since
+/// each records a move between entries the emptying discards. A target the
+/// ledger path doesn't route has none, and neither does one created before
+/// #625 F1.
+pub(crate) async fn truncate_deltas(
+    client: &impl tokio_postgres::GenericClient,
+    qualified_deltas: &str,
+) -> Result<(), tokio_postgres::Error> {
+    let exists: bool = client
+        .query_one("select to_regclass($1) is not null", &[&qualified_deltas])
+        .await?
+        .get(0);
+    if exists {
+        client
+            .batch_execute(&format!("truncate {qualified_deltas}"))
+            .await?;
+    }
+    Ok(())
+}
+
+/// A delta row's member-count increment column.
+pub(crate) const DELTA_MEMBERS_COLUMN: &str = "__dm";
+
+/// A delta row's increment of contribution `i`'s non-null count.
+pub(crate) fn delta_count_column(i: usize) -> String {
+    format!("__dc{i}")
+}
+
+/// A delta row's increment of summed contribution `i`'s sum.
+pub(crate) fn delta_sum_column(i: usize) -> String {
+    format!("__ds{i}")
 }
 
 /// A target's ledger, schema-qualified and quoted for SQL text, from the
@@ -307,6 +371,41 @@ pub(crate) fn aggregate_ledger_index_ddl(
     sql
 }
 
+/// A ledger-routed aggregate target's group-delta table DDL (#625 F1), as a
+/// statement to append to the target's own: the `GROUP BY` columns typed as
+/// the target's, the member-count increment, and per contribution `i` its
+/// non-null count increment and, when `summed[i]`, its sum increment.
+///
+/// A build chunk appends one row per group it moved instead of writing the
+/// group row, and the merger (`staging::build`) claims, deletes and sums
+/// them into the groups. No primary key: rows are only ever appended and
+/// claimed. Logged: a delta row records an entry move that already
+/// committed, so losing it on a crash would lose the move for good.
+pub(crate) fn aggregate_deltas_ddl(
+    qualified_deltas: &str,
+    group_columns: &[LedgerColumn],
+    summed: &[bool],
+) -> String {
+    let mut columns: Vec<String> = group_columns.iter().map(LedgerColumn::render).collect();
+    columns.push(format!(
+        "{} bigint not null",
+        quote_ident(DELTA_MEMBERS_COLUMN)
+    ));
+    for (i, summed) in summed.iter().enumerate() {
+        columns.push(format!(
+            "{} bigint not null",
+            quote_ident(&delta_count_column(i))
+        ));
+        if *summed {
+            columns.push(format!(
+                "{} numeric not null",
+                quote_ident(&delta_sum_column(i))
+            ));
+        }
+    }
+    format!("; create table {qualified_deltas} ({})", columns.join(", "))
+}
+
 /// A 1-1 target's ledger DDL (#623 Q2 (c)): the key and the ordering state,
 /// with no values (the target row holds them), as a statement to append to
 /// the target's own. Created empty: the 1-1 build's writes are absolute, and
@@ -492,6 +591,24 @@ mod tests {
         assert_eq!(
             ledger_table_name(&"x".repeat(MAX_TARGET_NAME_LEN)).len(),
             63
+        );
+        assert_eq!(deltas_table_name("totals"), "totals__deltas");
+        assert!(deltas_table_name(&"x".repeat(MAX_TARGET_NAME_LEN)).len() <= 63);
+    }
+
+    #[test]
+    fn the_deltas_table_holds_the_group_and_one_increment_per_accumulator() {
+        assert_eq!(
+            aggregate_deltas_ddl(
+                r#""public"."t__deltas""#,
+                &[LedgerColumn {
+                    name: "g".to_string(),
+                    pg_type: "integer".to_string(),
+                    collation: None,
+                }],
+                &[true, false],
+            ),
+            r#"; create table "public"."t__deltas" ("g" integer, "__dm" bigint not null, "__dc0" bigint not null, "__ds0" numeric not null, "__dc1" bigint not null)"#
         );
     }
 }

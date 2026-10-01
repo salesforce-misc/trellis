@@ -30,15 +30,22 @@
 //! aggregate argument, and the ordering state (`applied_lsn`, `applied_seg`,
 //! `basis`, `tombstone`). A group row is the sum of its live members'
 //! entries, plus the hidden member count `__trellis_members`, and is deleted
-//! when that count reaches 0 (I3). The one-pass build writes both.
+//! when every accumulator on it (members, each count, each sum) is 0 (I3;
+//! #625 F1's B5, see [`finish_groups`]). The one-pass build writes both.
+//!
+//! A Re-derive build's chunks (`super::build`, #625 F1) rewrite entries with
+//! [`lock_entries`] and [`chunk_statement`] but leave the groups to the
+//! merger ([`merge_statement`]), which upserts their deltas with the same
+//! [`group_upsert_sql`] a page uses.
 //!
 //! # One page, one target ([`apply_ledger_target`])
 //!
-//! 1. **Lock** (I1, I5): insert a non-member placeholder for every key of the
-//!    page that has no entry, then `select … for update` every entry, sorted
-//!    by key, in one statement. A tombstone collected between the two
-//!    (`super::retire::collect_tombstones`, #623 D7) leaves its key with no
-//!    entry to lock, so the lock is retaken until it holds every key.
+//! 1. **Lock** (I1, I5, [`lock_entries`]): insert a non-member placeholder
+//!    for every key of the page that has no entry, then `select … for
+//!    update` every entry, sorted by key, in one statement. A tombstone
+//!    collected between the two (`super::retire::collect_tombstones`, #623
+//!    D7) leaves its key with no entry to lock, so the lock is retaken until
+//!    it holds every key.
 //! 2. **Re-derive read**: a record staged as a `recompute` (or folded with
 //!    one) is a Re-derive, and so is one with no change identity. One
 //!    statement reads those keys' source rows *and* `pg_current_snapshot()`,
@@ -54,7 +61,7 @@
 //!      and is above the target's truncate floor (I2, Q6).
 //! 4. The recomputed fields of every group the page kept are rewritten from
 //!    its live entries.
-//! 5. Groups whose member count reached 0 are deleted.
+//! 5. Groups whose every accumulator reached 0 are deleted.
 //!
 //! Every written or deleted group reaches the target-mutation seam with its
 //! prior image, rebuilt from the upsert's result minus the increments (PG 17
@@ -168,7 +175,14 @@ pub(crate) struct LedgerShape {
 }
 
 impl LedgerShape {
-    fn recomputes(&self) -> bool {
+    /// Per contribution, in order, whether a maintained `SUM`/`AVG` sums it:
+    /// the contributions whose group-delta row carries a sum increment
+    /// ([`schema::aggregate_deltas_ddl`]).
+    pub(crate) fn summed(&self) -> Vec<bool> {
+        self.contribs.iter().map(|c| c.summed).collect()
+    }
+
+    pub(super) fn recomputes(&self) -> bool {
         self.fields
             .iter()
             .any(|f| matches!(f, LedgerField::Recompute { .. }))
@@ -358,6 +372,9 @@ pub(crate) struct LedgerTargetPlan {
     pub(crate) target: String,
     target_ident: String,
     ledger_ident: String,
+    /// The target's group deltas (#625 F1), which only a build chunk and the
+    /// merger ([`super::build`]) read or write.
+    deltas_ident: String,
     /// The source's qualified identity, for the Re-derive read.
     source_table: String,
     source_pk: Vec<PrimaryKeyColumn>,
@@ -380,12 +397,23 @@ impl LedgerTargetPlan {
             target: target.to_string(),
             target_ident: ddl::qualified_target_table_ident(target),
             ledger_ident: ddl::qualified_target_table_ident(&schema::ledger_table_name(target)),
+            deltas_ident: ddl::qualified_target_table_ident(&schema::deltas_table_name(target)),
             source_table: source_table.to_string(),
             source_pk,
             identity,
             shape,
             records: Vec::new(),
         }
+    }
+
+    /// The source's qualified identity.
+    pub(super) fn source_table(&self) -> &str {
+        &self.source_table
+    }
+
+    /// The source's primary key.
+    pub(super) fn source_pk(&self) -> &[PrimaryKeyColumn] {
+        &self.source_pk
     }
 
     /// Adds a Re-derive of source key `key`, with no provenance (the orphan
@@ -437,11 +465,349 @@ fn apply_predicate(visibility: bool) -> String {
     )
 }
 
+/// The quoted `GROUP BY` columns and contribution columns of `shape`'s
+/// entries: what a Re-derive or an Apply writes, and what a move carries.
+fn entry_columns(shape: &LedgerShape) -> (Vec<String>, Vec<String>) {
+    (
+        shape.group_cols.iter().map(|c| quote_ident(c)).collect(),
+        shape
+            .contribs
+            .iter()
+            .map(|c| quote_ident(&c.column))
+            .collect(),
+    )
+}
+
+/// `alias.c` for each of `columns`, comma-joined.
+fn prefixed(columns: &[String], alias: &str) -> String {
+    columns
+        .iter()
+        .map(|c| format!("{alias}.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `old` CTE: the entries of the keys bound as `keys` (a `text[]`
+/// parameter) as the statement found them, each with whether it counted as
+/// a live member.
+fn old_cte(plan: &LedgerTargetPlan, keys: &str) -> String {
+    let (groups, args) = entry_columns(&plan.shape);
+    let values: Vec<String> = groups.into_iter().chain(args).collect();
+    format!(
+        "old as ( \
+             select l.{key} as __k, {l_cols}, l.{member} and not l.{tombstone} as __live \
+             from {ledger} l where l.{key} = any({keys}::text[]) \
+         )",
+        key = quote_ident(schema::KEY_COLUMN),
+        member = quote_ident(schema::MEMBER_COLUMN),
+        tombstone = quote_ident(schema::TOMBSTONE_COLUMN),
+        l_cols = prefixed(&values, "l"),
+        ledger = plan.ledger_ident,
+    )
+}
+
+/// What the `upd` CTE (an update of the ledger `l`) returns: each written
+/// entry's key, values and whether it now counts as a live member.
+fn upd_returning(plan: &LedgerTargetPlan) -> String {
+    let (groups, args) = entry_columns(&plan.shape);
+    let values: Vec<String> = groups.into_iter().chain(args).collect();
+    format!(
+        "l.{key} as __k, {l_cols}, l.{member} and not l.{tombstone} as __live",
+        key = quote_ident(schema::KEY_COLUMN),
+        member = quote_ident(schema::MEMBER_COLUMN),
+        tombstone = quote_ident(schema::TOMBSTONE_COLUMN),
+        l_cols = prefixed(&values, "l"),
+    )
+}
+
+/// The `moves` and `d` CTEs over `old` and `upd`: each written entry's move
+/// out of its old group and into its new one, summed per group into `d`'s
+/// increments. `d` has the `GROUP BY` columns, `__gk` (the group's identity
+/// key), `__dm` (members), per argument `i` `__dc<i>` (its non-null count)
+/// and, for a summed one, `__ds<i>` (its sum), and `__ks` (the keys that
+/// moved it). A group whose increments are all 0 is left out.
+fn moves_and_deltas(plan: &LedgerTargetPlan) -> String {
+    let shape = &plan.shape;
+    let (groups, args) = entry_columns(shape);
+    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
+
+    // Per-group increments: `dm` members, and per argument `dc<i>` (its
+    // non-null count) and, for a summed argument, `ds<i>` (its sum).
+    let mut deltas = vec![format!("sum(m.__sign) as {}", schema::DELTA_MEMBERS_COLUMN)];
+    let mut nonzero = vec!["sum(m.__sign) <> 0".to_string()];
+    // A recomputed field can change with no increment changing (`MAX` of a
+    // value moved from 10 to 50): the group is kept if any entry's values
+    // changed at all. Compared as text, so `1.5` and `1.50` differ: a `MAX`
+    // shows whichever spelling it picks.
+    if shape.recomputes() {
+        nonzero.push("bool_or(m.__rc)".to_string());
+    }
+    for (i, a) in args.iter().enumerate() {
+        deltas.push(format!(
+            "sum(case when m.{a} is null then 0 else m.__sign end) as {}",
+            schema::delta_count_column(i)
+        ));
+        nonzero.push(format!(
+            "sum(case when m.{a} is null then 0 else m.__sign end) <> 0"
+        ));
+        if !shape.contribs[i].summed {
+            continue;
+        }
+        // Summed per sign and then subtracted, not `sum(__sign * a)`: the
+        // product is computed in the argument's own type, so negating an
+        // `integer`'s -2147483648 (or a `bigint`'s minimum) overflows it.
+        // `sum` widens first (`integer` to `bigint`, `bigint` to `numeric`).
+        let ds = format!(
+            "(coalesce(sum(m.{a}) filter (where m.__sign > 0), 0) \
+             - coalesce(sum(m.{a}) filter (where m.__sign < 0), 0))"
+        );
+        deltas.push(format!("{ds} as {}", schema::delta_sum_column(i)));
+        nonzero.push(format!("{ds} <> 0"));
+    }
+    format!(
+        "moves as ( \
+             select {u_cols}, 1 as __sign, u.__k, {rc} as __rc \
+             from upd u join old o on o.__k = u.__k where u.__live \
+             union all \
+             select {o_cols}, -1 as __sign, o.__k, {rc} as __rc \
+             from old o join upd u on u.__k = o.__k where o.__live \
+         ), \
+         d as ( \
+             select {m_groups}, {m_gk} as __gk, {deltas}, array_agg(m.__k) as __ks \
+             from moves m group by {m_groups} \
+             having {nonzero} \
+         )",
+        rc = format!(
+            "row(o.__live, {})::text is distinct from row(u.__live, {})::text",
+            prefixed(&values, "o"),
+            prefixed(&values, "u")
+        ),
+        u_cols = prefixed(&values, "u"),
+        o_cols = prefixed(&values, "o"),
+        m_groups = prefixed(&groups, "m"),
+        m_gk = ddl::pk_key_sql_expr(&plan.identity, Some("m")),
+        deltas = deltas.join(", "),
+        nonzero = nonzero.join(" or "),
+    )
+}
+
+/// The group upsert over a preceding `d` CTE of per-group increments (as
+/// [`moves_and_deltas`] renders it): the `up` CTE, and the query that
+/// returns each written group's identity key, whether the upsert created
+/// it, its `ctid`, `d.__ks`, its prior image for the seam (`null` with no
+/// `image_columns`) and whether every accumulator on it is now 0 (#625 F1's
+/// B5), in that order.
+struct GroupUpsert {
+    cte: String,
+    select: String,
+}
+
+/// Renders [`GroupUpsert`] for `plan`. `racing` is the `drop_racing` plant's
+/// filter on `d`, or empty.
+fn group_upsert_sql(
+    plan: &LedgerTargetPlan,
+    image_columns: Option<&[String]>,
+    racing: &str,
+) -> GroupUpsert {
+    let shape = &plan.shape;
+    let q = |c: &str| quote_ident(c);
+    let (groups, _) = entry_columns(shape);
+    let members = q(ddl::MEMBERS_COLUMN);
+
+    // The upsert's columns, inserted values, and conflict updates; each
+    // maintained column's prior value over the upsert's result `up` and the
+    // increments `d`; and the accumulators B5 reads.
+    //
+    // A `SUM` (or an `AVG`'s hidden running sum) is `NULL` when its hidden
+    // count is 0 *and* the sum is 0, not on the count alone. Under one
+    // channel the two agree: no non-null contribution sums to exactly 0.
+    // While a Re-derive build runs, a group has two (Apply and the merger,
+    // #625 F1), and the count can pass through 0 with the other channel's
+    // sum still owed, which a `NULL` would lose (finding 5).
+    let mut insert_cols = groups.clone();
+    let mut insert_vals: Vec<String> = groups.iter().map(|c| format!("d.{c}")).collect();
+    let mut updates = Vec::new();
+    let mut priors: HashMap<String, String> = HashMap::new();
+    let mut accumulators = vec![format!("t.{members} = 0")];
+    for field in &shape.fields {
+        match field {
+            LedgerField::Sum { column, count, arg } => {
+                let (f, c) = (q(column), q(count));
+                let new_sum = format!("coalesce(t.{f}, 0) + coalesce(excluded.{f}, 0)");
+                insert_cols.push(f.clone());
+                insert_vals.push(format!(
+                    "case when d.__dc{arg} = 0 and d.__ds{arg} = 0 then null else d.__ds{arg} end"
+                ));
+                updates.push(format!(
+                    "{f} = case when t.{c} + excluded.{c} = 0 and {new_sum} = 0 then null \
+                     else {new_sum} end"
+                ));
+                let old_sum = format!("coalesce(up.{f}, 0) - d.__ds{arg}");
+                priors.insert(
+                    column.clone(),
+                    format!(
+                        "case when up.{c} - d.__dc{arg} = 0 and {old_sum} = 0 then null \
+                         else {old_sum} end"
+                    ),
+                );
+                accumulators.push(format!("coalesce(t.{f}, 0) = 0"));
+            }
+            LedgerField::Avg {
+                column,
+                sum,
+                count,
+                arg,
+            } => {
+                // The running sum as `SUM`'s, and the visible column
+                // `sum / count::numeric`: Postgres's `avg()` over an exact
+                // numeric argument is `numeric_div` of the same two, and the
+                // one-pass build writes the same expression.
+                let (f, s, c) = (q(column), q(sum), q(count));
+                let new_sum = format!("coalesce(t.{s}, 0) + coalesce(excluded.{s}, 0)");
+                let new_count = format!("t.{c} + excluded.{c}");
+                insert_cols.push(s.clone());
+                insert_vals.push(format!(
+                    "case when d.__dc{arg} = 0 and d.__ds{arg} = 0 then null else d.__ds{arg} end"
+                ));
+                insert_cols.push(f.clone());
+                insert_vals.push(format!(
+                    "case when d.__dc{arg} = 0 then null \
+                     else d.__ds{arg} / d.__dc{arg}::numeric end"
+                ));
+                updates.push(format!(
+                    "{s} = case when {new_count} = 0 and {new_sum} = 0 then null \
+                     else {new_sum} end"
+                ));
+                updates.push(format!(
+                    "{f} = case when {new_count} = 0 then null \
+                     else ({new_sum}) / ({new_count})::numeric end"
+                ));
+                let (old_sum, old_count) = (
+                    format!("coalesce(up.{s}, 0) - d.__ds{arg}"),
+                    format!("up.{c} - d.__dc{arg}"),
+                );
+                priors.insert(
+                    sum.clone(),
+                    format!(
+                        "case when {old_count} = 0 and {old_sum} = 0 then null \
+                         else {old_sum} end"
+                    ),
+                );
+                priors.insert(
+                    column.clone(),
+                    format!(
+                        "case when {old_count} = 0 then null \
+                         else ({old_sum}) / ({old_count})::numeric end"
+                    ),
+                );
+                accumulators.push(format!("coalesce(t.{s}, 0) = 0"));
+            }
+            LedgerField::CountStar { column } => {
+                let f = q(column);
+                insert_cols.push(f.clone());
+                insert_vals.push("d.__dm".to_string());
+                updates.push(format!("{f} = t.{f} + excluded.{f}"));
+                priors.insert(column.clone(), format!("up.{f} - d.__dm"));
+                accumulators.push(format!("t.{f} = 0"));
+            }
+            LedgerField::CountArg { column, arg } => {
+                let f = q(column);
+                insert_cols.push(f.clone());
+                insert_vals.push(format!("d.__dc{arg}"));
+                updates.push(format!("{f} = t.{f} + excluded.{f}"));
+                priors.insert(column.clone(), format!("up.{f} - d.__dc{arg}"));
+                accumulators.push(format!("t.{f} = 0"));
+            }
+            // Written by `recompute_statement`; the upsert leaves the old
+            // value, which is the prior.
+            LedgerField::Recompute { .. } => {}
+        }
+    }
+    // A `SUM`'s or `AVG`'s hidden count, once per shared column (issue #48).
+    let mut counts_emitted: Vec<&str> = Vec::new();
+    for field in &shape.fields {
+        let (LedgerField::Sum { count, arg, .. } | LedgerField::Avg { count, arg, .. }) = field
+        else {
+            continue;
+        };
+        if counts_emitted.contains(&count.as_str()) {
+            continue;
+        }
+        counts_emitted.push(count);
+        let c = q(count);
+        insert_cols.push(c.clone());
+        insert_vals.push(format!("d.__dc{arg}"));
+        updates.push(format!("{c} = t.{c} + excluded.{c}"));
+        priors.insert(count.clone(), format!("up.{c} - d.__dc{arg}"));
+        accumulators.push(format!("t.{c} = 0"));
+    }
+    insert_cols.push(members.clone());
+    insert_vals.push("d.__dm".to_string());
+    updates.push(format!("{members} = t.{members} + excluded.{members}"));
+    priors.insert(
+        ddl::MEMBERS_COLUMN.to_string(),
+        format!("up.{members} - d.__dm"),
+    );
+
+    let prior_image = match image_columns {
+        Some(columns) => {
+            let pairs: Vec<String> = columns
+                .iter()
+                .map(|c| {
+                    let value = priors
+                        .get(c)
+                        .cloned()
+                        .unwrap_or_else(|| format!("up.{}", q(c)));
+                    format!("{}, ({value})::text", quote_literal(c))
+                })
+                .collect();
+            format!("jsonb_build_object({})::text", pairs.join(", "))
+        }
+        None => "null::text".to_string(),
+    };
+    GroupUpsert {
+        cte: format!(
+            "up as ( \
+                 insert into {target} as t ({insert_cols}) \
+                 select {insert_vals} from d{racing} order by {d_groups} \
+                 on conflict ({group_cols}) do update set {updates} \
+                 returning t.*, {t_gk} as __trellis_gk, (t.xmax = 0) as __trellis_inserted, \
+                           t.ctid::text as __trellis_ctid, ({empty}) as __trellis_empty \
+             )",
+            target = plan.target_ident,
+            insert_cols = insert_cols.join(", "),
+            insert_vals = insert_vals.join(", "),
+            d_groups = prefixed(&groups, "d"),
+            group_cols = groups.join(", "),
+            updates = updates.join(", "),
+            t_gk = ddl::pk_key_sql_expr(&plan.identity, Some("t")),
+            empty = accumulators.join(" and "),
+        ),
+        select: format!(
+            "select up.__trellis_gk, up.__trellis_inserted, up.__trellis_ctid, d.__ks, \
+                    {prior_image}, up.__trellis_empty \
+             from up join d on {up_d}",
+            // Each upserted group back to its increments by the group
+            // columns' own equality, not by their text: equal values can
+            // render differently (`numeric` `1.5` and `1.50`, `float` `0` and
+            // `-0`), and the target row keeps whichever spelling created it.
+            // A one-element array compares `NULL` equal to `NULL` (the `nulls
+            // not distinct` key) and still hashes.
+            up_d = groups
+                .iter()
+                .map(|c| format!("array[up.{c}] = array[d.{c}]"))
+                .collect::<Vec<_>>()
+                .join(" and "),
+        ),
+    }
+}
+
 /// The page's one ledger-and-groups statement (see the module doc, step 3).
 /// Binds `$1` keys, `$2` Re-derive flags, `$3` `lsn`s, `$4` `row_txid`s,
 /// `$5` images (all `text[]`, in key order), `$6` the Re-derive read's
 /// snapshot, `$7` the page's segment and `$8` the target's identity.
 /// `image_columns` are the seam's prior-image columns (`None`: no reader).
+/// Returns [`GroupUpsert`]'s columns.
 fn ledger_statement(
     plan: &LedgerTargetPlan,
     image_columns: Option<&[String]>,
@@ -450,25 +816,15 @@ fn ledger_statement(
 ) -> String {
     let shape = &plan.shape;
     let ledger = &plan.ledger_ident;
-    let target = &plan.target_ident;
     let q = |c: &str| quote_ident(c);
-    let groups: Vec<String> = shape.group_cols.iter().map(|c| q(c)).collect();
-    let args: Vec<String> = shape.contribs.iter().map(|c| q(&c.column)).collect();
-    let values: Vec<&String> = groups.iter().chain(&args).collect();
-    let cols = |alias: &str| -> String {
-        values
-            .iter()
-            .map(|c| format!("{alias}.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let (groups, args) = entry_columns(shape);
+    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
     let member = q(schema::MEMBER_COLUMN);
     let tombstone = q(schema::TOMBSTONE_COLUMN);
     let key = q(schema::KEY_COLUMN);
     let basis = q(schema::BASIS_COLUMN);
     let applied = q(schema::APPLIED_LSN_COLUMN);
     let seg = q(schema::APPLIED_SEG_COLUMN);
-    let members = q(ddl::MEMBERS_COLUMN);
 
     // An image's plain-column values keyed by ledger column, for
     // `jsonb_populate_record`, and each value `v` carries: the record's
@@ -507,178 +863,6 @@ fn ledger_statement(
     }
     let set_values: Vec<String> = values.iter().map(|c| format!("{c} = v.{c}")).collect();
 
-    // Per-group increments: `dm` members, and per argument `dc<i>` (its
-    // non-null count) and, for a summed argument, `ds<i>` (its sum).
-    let mut deltas = vec!["sum(m.__sign) as __dm".to_string()];
-    let mut nonzero = vec!["sum(m.__sign) <> 0".to_string()];
-    // A recomputed field can change with no increment changing (`MAX` of a
-    // value moved from 10 to 50): the group is kept if any entry's values
-    // changed at all. Compared as text, so `1.5` and `1.50` differ: a `MAX`
-    // shows whichever spelling it picks.
-    if shape.recomputes() {
-        nonzero.push("bool_or(m.__rc)".to_string());
-    }
-    for (i, a) in args.iter().enumerate() {
-        deltas.push(format!(
-            "sum(case when m.{a} is null then 0 else m.__sign end) as __dc{i}"
-        ));
-        nonzero.push(format!(
-            "sum(case when m.{a} is null then 0 else m.__sign end) <> 0"
-        ));
-        if !shape.contribs[i].summed {
-            continue;
-        }
-        // Summed per sign and then subtracted, not `sum(__sign * a)`: the
-        // product is computed in the argument's own type, so negating an
-        // `integer`'s -2147483648 (or a `bigint`'s minimum) overflows it.
-        // `sum` widens first (`integer` to `bigint`, `bigint` to `numeric`).
-        let ds = format!(
-            "(coalesce(sum(m.{a}) filter (where m.__sign > 0), 0) \
-             - coalesce(sum(m.{a}) filter (where m.__sign < 0), 0))"
-        );
-        deltas.push(format!("{ds} as __ds{i}"));
-        nonzero.push(format!("{ds} <> 0"));
-    }
-    let group_list = |alias: &str| -> String {
-        groups
-            .iter()
-            .map(|c| format!("{alias}.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    // The upsert's columns, inserted values, and conflict updates; and each
-    // maintained column's prior value over the upsert's result `up` and the
-    // increments `d`.
-    let mut insert_cols = groups.clone();
-    let mut insert_vals: Vec<String> = groups.iter().map(|c| format!("d.{c}")).collect();
-    let mut updates = Vec::new();
-    let mut priors: HashMap<String, String> = HashMap::new();
-    for field in &shape.fields {
-        match field {
-            LedgerField::Sum { column, count, arg } => {
-                let (f, c) = (q(column), q(count));
-                insert_cols.push(f.clone());
-                insert_vals.push(format!(
-                    "case when d.__dc{arg} = 0 and d.__ds{arg} = 0 then null else d.__ds{arg} end"
-                ));
-                updates.push(format!(
-                    "{f} = case when t.{c} + excluded.{c} = 0 then null \
-                     else coalesce(t.{f}, 0) + coalesce(excluded.{f}, 0) end"
-                ));
-                priors.insert(
-                    column.clone(),
-                    format!(
-                        "case when up.{c} - d.__dc{arg} = 0 then null \
-                         else coalesce(up.{f}, 0) - d.__ds{arg} end"
-                    ),
-                );
-            }
-            LedgerField::Avg {
-                column,
-                sum,
-                count,
-                arg,
-            } => {
-                // The running sum as `SUM`'s, and the visible column
-                // `sum / count::numeric`: Postgres's `avg()` over an exact
-                // numeric argument is `numeric_div` of the same two, and the
-                // one-pass build writes the same expression.
-                let (f, s, c) = (q(column), q(sum), q(count));
-                let new_sum = format!("coalesce(t.{s}, 0) + coalesce(excluded.{s}, 0)");
-                let new_count = format!("t.{c} + excluded.{c}");
-                insert_cols.push(s.clone());
-                insert_vals.push(format!(
-                    "case when d.__dc{arg} = 0 and d.__ds{arg} = 0 then null else d.__ds{arg} end"
-                ));
-                insert_cols.push(f.clone());
-                insert_vals.push(format!(
-                    "case when d.__dc{arg} = 0 then null \
-                     else d.__ds{arg} / d.__dc{arg}::numeric end"
-                ));
-                updates.push(format!(
-                    "{s} = case when {new_count} = 0 then null else {new_sum} end"
-                ));
-                updates.push(format!(
-                    "{f} = case when {new_count} = 0 then null \
-                     else ({new_sum}) / ({new_count})::numeric end"
-                ));
-                let (old_sum, old_count) = (
-                    format!("coalesce(up.{s}, 0) - d.__ds{arg}"),
-                    format!("up.{c} - d.__dc{arg}"),
-                );
-                priors.insert(
-                    sum.clone(),
-                    format!("case when {old_count} = 0 then null else {old_sum} end"),
-                );
-                priors.insert(
-                    column.clone(),
-                    format!(
-                        "case when {old_count} = 0 then null \
-                         else ({old_sum}) / ({old_count})::numeric end"
-                    ),
-                );
-            }
-            LedgerField::CountStar { column } => {
-                let f = q(column);
-                insert_cols.push(f.clone());
-                insert_vals.push("d.__dm".to_string());
-                updates.push(format!("{f} = t.{f} + excluded.{f}"));
-                priors.insert(column.clone(), format!("up.{f} - d.__dm"));
-            }
-            LedgerField::CountArg { column, arg } => {
-                let f = q(column);
-                insert_cols.push(f.clone());
-                insert_vals.push(format!("d.__dc{arg}"));
-                updates.push(format!("{f} = t.{f} + excluded.{f}"));
-                priors.insert(column.clone(), format!("up.{f} - d.__dc{arg}"));
-            }
-            // Written by `recompute_statement`; the upsert leaves the old
-            // value, which is the prior.
-            LedgerField::Recompute { .. } => {}
-        }
-    }
-    // A `SUM`'s or `AVG`'s hidden count, once per shared column (issue #48).
-    let mut counts_emitted: Vec<&str> = Vec::new();
-    for field in &shape.fields {
-        let (LedgerField::Sum { count, arg, .. } | LedgerField::Avg { count, arg, .. }) = field
-        else {
-            continue;
-        };
-        if counts_emitted.contains(&count.as_str()) {
-            continue;
-        }
-        counts_emitted.push(count);
-        let c = q(count);
-        insert_cols.push(c.clone());
-        insert_vals.push(format!("d.__dc{arg}"));
-        updates.push(format!("{c} = t.{c} + excluded.{c}"));
-        priors.insert(count.clone(), format!("up.{c} - d.__dc{arg}"));
-    }
-    insert_cols.push(members.clone());
-    insert_vals.push("d.__dm".to_string());
-    updates.push(format!("{members} = t.{members} + excluded.{members}"));
-    priors.insert(
-        ddl::MEMBERS_COLUMN.to_string(),
-        format!("up.{members} - d.__dm"),
-    );
-
-    let prior_image = match image_columns {
-        Some(columns) => {
-            let pairs: Vec<String> = columns
-                .iter()
-                .map(|c| {
-                    let value = priors
-                        .get(c)
-                        .cloned()
-                        .unwrap_or_else(|| format!("up.{}", q(c)));
-                    format!("{}, ({value})::text", quote_literal(c))
-                })
-                .collect();
-            format!("jsonb_build_object({})::text", pairs.join(", "))
-        }
-        None => "null::text".to_string(),
-    };
     // Planted bug (#557): drop the increments of a group another apply
     // transaction holds. See `crate::plant`.
     let racing = if drop_racing {
@@ -686,6 +870,7 @@ fn ledger_statement(
     } else {
         ""
     };
+    let upsert = group_upsert_sql(plan, image_columns, racing);
 
     format!(
         "with b as ( \
@@ -699,10 +884,7 @@ fn ledger_statement(
              from b cross join lateral \
                   jsonb_populate_record(null::{ledger}, jsonb_build_object({doc})) r{typed_row} \
          ), \
-         old as ( \
-             select l.{key} as __k, {l_cols}, l.{member} and not l.{tombstone} as __live \
-             from {ledger} l where l.{key} = any($1::text[]) \
-         ), \
+         {old}, \
          fl as (select floor from ledger_truncate_floor where target_table = $8), \
          upd as ( \
              update {ledger} l set {set_values}, \
@@ -712,63 +894,160 @@ fn ledger_statement(
                  {seg} = greatest(l.{seg}, $7::bigint) \
              from v \
              where l.{key} = v.__k and (v.__rederive or ({predicate})) \
-             returning l.{key} as __k, {l_cols}, l.{member} and not l.{tombstone} as __live \
+             returning {returning} \
          ), \
-         moves as ( \
-             select {u_cols}, 1 as __sign, u.__k, {rc} as __rc \
-             from upd u join old o on o.__k = u.__k where u.__live \
-             union all \
-             select {o_cols}, -1 as __sign, o.__k, {rc} as __rc \
-             from old o join upd u on u.__k = o.__k where o.__live \
-         ), \
-         d as ( \
-             select {m_groups}, {m_gk} as __gk, {deltas}, array_agg(m.__k) as __ks \
-             from moves m group by {m_groups} \
-             having {nonzero} \
-         ), \
-         up as ( \
-             insert into {target} as t ({insert_cols}) \
-             select {insert_vals} from d{racing} order by {d_groups} \
-             on conflict ({group_cols}) do update set {updates} \
-             returning t.*, {t_gk} as __trellis_gk, (t.xmax = 0) as __trellis_inserted, \
-                       t.ctid::text as __trellis_ctid \
-         ) \
-         select up.__trellis_gk, up.__trellis_inserted, up.__trellis_ctid, \
-                up.{members}, d.__ks, {prior_image} \
-         from up join d on {up_d}",
+         {moves_and_deltas}, \
+         {up} \
+         {select}",
         v_cols = v_cols.join(", "),
-        rc = format!(
-            "row(o.__live, {})::text is distinct from row(u.__live, {})::text",
-            cols("o"),
-            cols("u")
-        ),
-        l_cols = cols("l"),
-        u_cols = cols("u"),
-        o_cols = cols("o"),
         doc = doc.join(", "),
+        old = old_cte(plan, "$1"),
         set_values = set_values.join(", "),
         predicate = apply_predicate(visibility),
-        m_groups = group_list("m"),
-        m_gk = ddl::pk_key_sql_expr(&plan.identity, Some("m")),
-        deltas = deltas.join(", "),
+        returning = upd_returning(plan),
+        moves_and_deltas = moves_and_deltas(plan),
+        up = upsert.cte,
+        select = upsert.select,
+    )
+}
+
+/// A build chunk's one read-and-write statement (#625 F1, the chunk
+/// Re-derive; called from [`super::build`]): `pg_current_snapshot()`, the
+/// active segment's `seg_seq` and the locked keys' source rows, read
+/// together; the keys' entries rewritten from them (`basis` := the
+/// snapshot, `applied_seg` raised to that segment, `applied_lsn` left alone,
+/// a key with no row a tombstone); and the moves' per-group increments
+/// appended to the target's group deltas. No group row is touched, and no
+/// row data leaves the statement. Returns the entries written and the
+/// delta rows appended.
+///
+/// `range_where` is the chunk's `(lo, hi]` predicate over the source's bare
+/// key columns, binding `$1..$n`; `keys` is the locked keys' `text[]`
+/// parameter (`$n+1`). Reading the range as well as the keys lets the read
+/// scan the key's index for the chunk, and the keys keep a row inserted since
+/// the keys were read out: its entry isn't locked, so its own change applies
+/// it.
+///
+/// The segment stamp is what [`super::retire::collect_tombstones`] reads
+/// (#625 finding 11): every change the snapshot sees was captured into the
+/// highest segment it sees or an earlier one, so once that segment and all
+/// before it are drained, no change the tombstone must outlast can arrive.
+pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: &str) -> String {
+    let shape = &plan.shape;
+    let q = |c: &str| quote_ident(c);
+    let (groups, args) = entry_columns(shape);
+    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
+    let k_expr = ddl::pk_key_sql_expr(&plan.source_pk, Some("s"));
+    let mut src_cols: Vec<String> = groups.iter().map(|c| format!("s.{c} as {c}")).collect();
+    for contrib in &shape.contribs {
+        src_cols.push(match &contrib.source {
+            ContribSource::Column(source) => format!("s.{} as {}", q(source), q(&contrib.column)),
+            ContribSource::Expr { sql, .. } => format!("{sql} as {}", q(&contrib.column)),
+        });
+    }
+    let set_values: Vec<String> = values.iter().map(|c| format!("{c} = v.{c}")).collect();
+    let mut delta_cols = groups.clone();
+    delta_cols.push(schema::DELTA_MEMBERS_COLUMN.to_string());
+    for (i, contrib) in shape.contribs.iter().enumerate() {
+        delta_cols.push(schema::delta_count_column(i));
+        if contrib.summed {
+            delta_cols.push(schema::delta_sum_column(i));
+        }
+    }
+    format!(
+        "with snap as ( \
+             select pg_catalog.pg_current_snapshot() as __snap, \
+                    (select max(seg_seq) from segments) as __seg \
+         ), \
+         src as ( \
+             select {k_expr} as __k, {src_cols} \
+             from {source} s join unnest({keys}::text[]) as u(__trellis_k) \
+                  on u.__trellis_k = {k_expr} \
+             where {range_where} \
+         ), \
+         v as ( \
+             select u.__k, r.__k is not null as __present, {r_cols} \
+             from unnest({keys}::text[]) as u(__k) left join src r on r.__k = u.__k \
+         ), \
+         {old}, \
+         upd as ( \
+             update {ledger} l set {set_values}, \
+                 {member} = v.__present, {tombstone} = not v.__present, \
+                 {basis} = snap.__snap, {seg} = greatest(l.{seg}, snap.__seg) \
+             from v, snap \
+             where l.{key} = v.__k \
+             returning {returning} \
+         ), \
+         {moves_and_deltas}, \
+         ins as ( \
+             insert into {deltas} ({delta_cols}) select {delta_cols} from d \
+         ) \
+         select (select count(*) from upd), (select count(*) from d)",
+        source = ddl::qualified_source_table(&plan.source_table),
+        src_cols = src_cols.join(", "),
+        r_cols = prefixed(&values, "r"),
+        old = old_cte(plan, keys),
+        ledger = plan.ledger_ident,
+        set_values = set_values.join(", "),
+        member = q(schema::MEMBER_COLUMN),
+        tombstone = q(schema::TOMBSTONE_COLUMN),
+        basis = q(schema::BASIS_COLUMN),
+        seg = q(schema::APPLIED_SEG_COLUMN),
+        key = q(schema::KEY_COLUMN),
+        returning = upd_returning(plan),
+        moves_and_deltas = moves_and_deltas(plan),
+        deltas = plan.deltas_ident,
+        delta_cols = delta_cols.join(", "),
+    )
+}
+
+/// The merger's one statement (#625 F1; called from [`super::build`]):
+/// claims up to `$1` of the target's delta rows that no other merger holds,
+/// deletes them, sums them per group and upserts the sums in group order,
+/// as Apply's statement does. Returns one row per written group, each
+/// [`GroupUpsert`]'s columns after the count of rows claimed, or one row
+/// with only that count when no group was written.
+pub(super) fn merge_statement(plan: &LedgerTargetPlan, image_columns: Option<&[String]>) -> String {
+    let shape = &plan.shape;
+    let (groups, _) = entry_columns(shape);
+    let mut sums = vec![format!(
+        "sum(g.{dm})::bigint as {dm}",
+        dm = schema::DELTA_MEMBERS_COLUMN
+    )];
+    let mut nonzero = vec![format!("sum(g.{}) <> 0", schema::DELTA_MEMBERS_COLUMN)];
+    for (i, contrib) in shape.contribs.iter().enumerate() {
+        let dc = schema::delta_count_column(i);
+        sums.push(format!("sum(g.{dc})::bigint as {dc}"));
+        nonzero.push(format!("sum(g.{dc}) <> 0"));
+        if contrib.summed {
+            let ds = schema::delta_sum_column(i);
+            sums.push(format!("sum(g.{ds}) as {ds}"));
+            nonzero.push(format!("sum(g.{ds}) <> 0"));
+        }
+    }
+    let upsert = group_upsert_sql(plan, image_columns, "");
+    format!(
+        "with gone as ( \
+             delete from {deltas} where ctid = any(array( \
+                 select ctid from {deltas} limit $1 for update skip locked)) \
+             returning * \
+         ), \
+         d as ( \
+             select {g_groups}, {g_gk} as __gk, {sums}, '{{}}'::text[] as __ks \
+             from gone g group by {g_groups} \
+             having {nonzero} \
+         ), \
+         {up} \
+         select c.__claimed, w.* \
+         from (select count(*) as __claimed from gone) c \
+         left join ({select}) w on true",
+        deltas = plan.deltas_ident,
+        g_groups = prefixed(&groups, "g"),
+        g_gk = ddl::pk_key_sql_expr(&plan.identity, Some("g")),
+        sums = sums.join(", "),
         nonzero = nonzero.join(" or "),
-        insert_cols = insert_cols.join(", "),
-        insert_vals = insert_vals.join(", "),
-        d_groups = group_list("d"),
-        group_cols = groups.join(", "),
-        updates = updates.join(", "),
-        t_gk = ddl::pk_key_sql_expr(&plan.identity, Some("t")),
-        // Each upserted group back to its increments by the group columns'
-        // own equality, not by their text: equal values can render
-        // differently (`numeric` `1.5` and `1.50`, `float` `0` and `-0`), and
-        // the target row keeps whichever spelling created it. A one-element
-        // array compares `NULL` equal to `NULL` (the `nulls not distinct`
-        // key) and still hashes.
-        up_d = groups
-            .iter()
-            .map(|c| format!("array[up.{c}] = array[d.{c}]"))
-            .collect::<Vec<_>>()
-            .join(" and "),
+        up = upsert.cte,
+        select = upsert.select,
     )
 }
 
@@ -856,14 +1135,162 @@ fn recompute_statement(plan: &LedgerTargetPlan) -> Option<String> {
     ))
 }
 
-/// One group the page wrote, from [`ledger_statement`]'s result.
-struct WrittenGroup {
+/// One group a statement wrote, from [`GroupUpsert`]'s columns.
+pub(super) struct WrittenGroup {
     key: String,
     inserted: bool,
     ctid: String,
-    members: i64,
     keys: Vec<String>,
     prior: Option<String>,
+    /// Every accumulator on the row is 0 (#625 F1's B5): the row is
+    /// equivalent to no row, and is deleted.
+    empty: bool,
+}
+
+impl WrittenGroup {
+    /// [`GroupUpsert`]'s columns of `row`, starting at column `at`. `None`
+    /// for the merger's row that only carries its claim count.
+    pub(super) fn from_row(row: &tokio_postgres::Row, at: usize) -> Option<Self> {
+        Some(Self {
+            key: row.get::<_, Option<String>>(at)?,
+            inserted: row.get(at + 1),
+            ctid: row.get(at + 2),
+            keys: row.get(at + 3),
+            prior: row.get(at + 4),
+            empty: row.get(at + 5),
+        })
+    }
+}
+
+/// The groups a statement kept, by `ctid`: those with some accumulator not
+/// 0. [`recompute_statement`] rewrites their recomputed fields.
+fn kept_ctids(groups: &[WrittenGroup]) -> Vec<&str> {
+    groups
+        .iter()
+        .filter(|g| !g.empty)
+        .map(|g| g.ctid.as_str())
+        .collect()
+}
+
+/// Deletes the written groups whose every accumulator is 0 (#625 F1's B5),
+/// each already locked by the upsert that wrote it, and hands every written
+/// or deleted group to the seam with its prior image (none for a group the
+/// statement created) and the provenance `provenance` gives it. A group
+/// created and emptied by the same statement never existed for anyone else,
+/// and isn't recorded. Returns the groups written and deleted.
+///
+/// B5 is "every accumulator is 0", not "`__trellis_members <= 0`": while a
+/// Re-derive build runs, a group has two channels (Apply writes it, and the
+/// merger folds a chunk's deltas into it), so its member count can reach 0
+/// with the other channel's sum still owed, and deleting it then would lose
+/// that sum (#625 finding 5). A row whose accumulators are all 0 is the same
+/// as no row to the upsert, so this rule loses nothing. Under one channel
+/// it deletes exactly what the member rule did: no members means no
+/// non-null contributions and nothing summed.
+pub(super) async fn finish_groups(
+    txn: &Transaction<'_>,
+    plan: &LedgerTargetPlan,
+    groups: Vec<WrittenGroup>,
+    mutations: &mut TargetMutations,
+    provenance: impl Fn(&WrittenGroup) -> (i32, Option<SystemTime>, Option<PgLsn>),
+) -> Result<(usize, usize), ApplyError> {
+    let emptied: Vec<&str> = groups
+        .iter()
+        .filter(|g| g.empty)
+        .map(|g| g.ctid.as_str())
+        .collect();
+    if !emptied.is_empty() {
+        txn.execute(
+            &format!(
+                "delete from {} where ctid = any($1::text[]::tid[])",
+                plan.target_ident
+            ),
+            &[&emptied],
+        )
+        .await?;
+    }
+    let (mut written, mut deleted) = (0, 0);
+    for group in groups {
+        if group.empty && group.inserted {
+            continue;
+        }
+        if group.empty {
+            deleted += 1;
+        } else {
+            written += 1;
+        }
+        let (hop_gen, src_changed, origin) = provenance(&group);
+        let prior = if group.inserted { None } else { group.prior };
+        mutations.record(&plan.target, group.key, prior, hop_gen, src_changed, origin);
+    }
+    Ok((written, deleted))
+}
+
+/// Locks the ledger entries of `keys` (I1, I5): inserts a non-member
+/// placeholder for every key with no entry, then `select … for update`
+/// every entry, sorted by key. A tombstone the placeholder insert found can
+/// be collected (`super::retire::collect_tombstones`, #623 D7) before the
+/// lock reaches it, leaving its key with no entry: the lock is then taken
+/// again, placeholders first, until it holds every key.
+///
+/// Shared by a page ([`apply_ledger_target`]) and a build chunk
+/// ([`super::build`], #625 F1). `skip_lock` is the `skip_ledger_lock`
+/// plant's: read without the lock.
+pub(super) async fn lock_entries(
+    txn: &Transaction<'_>,
+    plan: &LedgerTargetPlan,
+    keys: &[&str],
+    skip_lock: bool,
+) -> Result<(), ApplyError> {
+    let ledger = &plan.ledger_ident;
+    let key_col = quote_ident(schema::KEY_COLUMN);
+    let mut distinct = keys.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    loop {
+        txn.execute(
+            &format!(
+                "insert into {ledger} ({key_col}, {}) \
+                 select k, false from unnest($1::text[]) as k order by k \
+                 on conflict do nothing",
+                quote_ident(schema::MEMBER_COLUMN)
+            ),
+            &[&distinct],
+        )
+        .await?;
+        // Test-only pause point (#623 D7). See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::AfterPlaceholders,
+            &plan.target,
+        )
+        .await?;
+        if skip_lock {
+            break;
+        }
+        let locked = txn
+            .execute(
+                &format!(
+                    "select 1 from {ledger} where {key_col} = any($1::text[]) \
+                     order by {key_col} for update"
+                ),
+                &[&distinct],
+            )
+            .await?;
+        if locked as usize == distinct.len() {
+            break;
+        }
+    }
+    // Test-only pause point (#623 D1). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterEntryLock,
+        &plan.target,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Applies one page's records to one ledger target, in the page's
@@ -885,64 +1312,14 @@ pub(crate) async fn apply_ledger_target(
     let mut records: Vec<&LedgerRecord> = plan.records.iter().collect();
     records.sort_by(|a, b| a.key.cmp(&b.key));
     let keys: Vec<&str> = records.iter().map(|r| r.key.as_str()).collect();
-    let ledger = &plan.ledger_ident;
-    let key_col = quote_ident(schema::KEY_COLUMN);
 
-    // 1. The entry lock (I1, I5): placeholders for new keys, then every
-    // entry, sorted. A tombstone the placeholder insert found can be
-    // collected (`super::retire::collect_tombstones`) before the lock
-    // reaches it, leaving its key with no entry: the lock is then taken
-    // again, placeholders first.
-    let mut distinct = keys.clone();
-    distinct.dedup();
-    loop {
-        txn.execute(
-            &format!(
-                "insert into {ledger} ({key_col}, {}) \
-                 select k, false from unnest($1::text[]) as k order by k \
-                 on conflict do nothing",
-                quote_ident(schema::MEMBER_COLUMN)
-            ),
-            &[&keys],
-        )
-        .await?;
-        // Test-only pause point (#623 D7). See `super::interleave`.
-        #[cfg(any(test, feature = "test-util"))]
-        super::interleave::pause_at(
-            txn,
-            super::interleave::PausePoint::AfterPlaceholders,
-            &plan.target,
-        )
-        .await?;
-        // Planted bug (#557): read without the entry lock. See `crate::plant`.
-        #[cfg(any(test, feature = "test-util"))]
-        let skip_lock = crate::plant::fires(crate::plant::Plant::SkipLedgerLock, true);
-        #[cfg(not(any(test, feature = "test-util")))]
-        let skip_lock = false;
-        if skip_lock {
-            break;
-        }
-        let locked = txn
-            .execute(
-                &format!(
-                    "select 1 from {ledger} where {key_col} = any($1::text[]) \
-                     order by {key_col} for update"
-                ),
-                &[&keys],
-            )
-            .await?;
-        if locked as usize == distinct.len() {
-            break;
-        }
-    }
-    // Test-only pause point (#623 D1). See `super::interleave`.
+    // 1. The entry lock (I1, I5).
+    // Planted bug (#557): read without the entry lock. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    super::interleave::pause_at(
-        txn,
-        super::interleave::PausePoint::AfterEntryLock,
-        &plan.target,
-    )
-    .await?;
+    let skip_lock = crate::plant::fires(crate::plant::Plant::SkipLedgerLock, true);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let skip_lock = false;
+    lock_entries(txn, plan, &keys, skip_lock).await?;
 
     // 2. The Re-derive read: its rows and its snapshot in one statement.
     let rederive: Vec<&str> = records
@@ -1039,22 +1416,11 @@ pub(crate) async fn apply_ledger_target(
         .await?;
     let groups: Vec<WrittenGroup> = rows
         .iter()
-        .map(|row| WrittenGroup {
-            key: row.get(0),
-            inserted: row.get(1),
-            ctid: row.get(2),
-            members: row.get(3),
-            keys: row.get(4),
-            prior: row.get(5),
-        })
+        .filter_map(|row| WrittenGroup::from_row(row, 0))
         .collect();
     // 4. The recomputed fields of every group the page kept.
     if let Some(recompute) = recompute_statement(plan) {
-        let kept: Vec<&str> = groups
-            .iter()
-            .filter(|g| g.members > 0)
-            .map(|g| g.ctid.as_str())
-            .collect();
+        let kept = kept_ctids(&groups);
         if !kept.is_empty() {
             txn.execute(&recompute, &[&kept]).await?;
         }
@@ -1068,37 +1434,11 @@ pub(crate) async fn apply_ledger_target(
     )
     .await?;
 
-    // 5. Emptied groups go. Every one is locked by the upsert already.
-    let emptied: Vec<&str> = groups
-        .iter()
-        .filter(|g| g.members <= 0)
-        .map(|g| g.ctid.as_str())
-        .collect();
-    if !emptied.is_empty() {
-        txn.execute(
-            &format!(
-                "delete from {} where ctid = any($1::text[]::tid[])",
-                plan.target_ident
-            ),
-            &[&emptied],
-        )
-        .await?;
-    }
-
-    // The seam: each group with the provenance of the records that moved it.
+    // 5. Emptied groups go, and the seam gets each group with the
+    // provenance of the records that moved it.
     let by_key: HashMap<&str, &LedgerRecord> =
         records.iter().map(|r| (r.key.as_str(), *r)).collect();
-    let (mut written, mut deleted) = (0, 0);
-    for group in groups {
-        let deleting = group.members <= 0;
-        if deleting && group.inserted {
-            continue;
-        }
-        if deleting {
-            deleted += 1;
-        } else {
-            written += 1;
-        }
+    finish_groups(txn, plan, groups, mutations, |group| {
         let mut hop_gen = 0;
         let mut src_changed: Option<SystemTime> = None;
         let mut origin: Option<Option<PgLsn>> = None;
@@ -1111,22 +1451,14 @@ pub(crate) async fn apply_ledger_target(
                 Some(o) => earliest_origin(o, record.origin_lsn),
             });
         }
-        let prior = if group.inserted { None } else { group.prior };
-        mutations.record(
-            &plan.target,
-            group.key,
-            prior,
-            hop_gen,
-            src_changed,
-            origin.flatten(),
-        );
-    }
-    Ok((written, deleted))
+        (hop_gen, src_changed, origin.flatten())
+    })
+    .await
 }
 
-/// Empties a ledger target for a source `TRUNCATE` (the D split's Q6) and
-/// raises its truncate floor to `lsn`, the truncate's ring `lsn`. The caller
-/// clears the group rows.
+/// Empties a ledger target for a source `TRUNCATE` (the D split's Q6),
+/// with its group deltas (#625 F1's B4), and raises its truncate floor to
+/// `lsn`, the truncate's ring `lsn`. The caller clears the group rows.
 pub(super) async fn truncate_ledger(
     txn: &Transaction<'_>,
     target: &str,
@@ -1136,6 +1468,11 @@ pub(super) async fn truncate_ledger(
         "truncate {}",
         ddl::qualified_target_table_ident(&schema::ledger_table_name(target))
     ))
+    .await?;
+    schema::truncate_deltas(
+        txn,
+        &ddl::qualified_target_table_ident(&schema::deltas_table_name(target)),
+    )
     .await?;
     if let Some(lsn) = lsn {
         txn.execute(

@@ -58,6 +58,9 @@
 pub mod append;
 pub mod apply;
 pub mod apply_aggregate;
+// Driven only by the tests until #625 F2 schedules a Re-derive build.
+#[allow(dead_code)]
+pub mod build;
 pub mod capture_audit;
 pub mod claim;
 pub mod converge;

@@ -47,6 +47,15 @@
 //! | [`PausePoint::AfterGroupUpsert`] | never reached | after the entries-and-groups statement | after the delta groups' upsert |
 //! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write | after the page's last write |
 //!
+//! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
+//! column's first three points for its target too: `AfterPlaceholders` and
+//! `AfterEntryLock` around the same entry lock, and `AfterRederiveRead`
+//! directly after its one read-and-write statement (the entries rewritten
+//! and the deltas appended, uncommitted). The merger
+//! (`super::build::merge_deltas`) fires `AfterGroupUpsert` after its one
+//! statement, holding its claimed delta rows and its groups. A test runs
+//! either inside [`with_scope`] as it would a drain.
+//!
 //! A later part that replaces a step moves its hook with it.
 
 use std::future::Future;

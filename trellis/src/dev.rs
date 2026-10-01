@@ -106,6 +106,15 @@ pub mod interleave {
     pub use crate::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 }
 
+/// The Re-derive build's primitives (#625 F1): one build chunk and one
+/// merger pass, for a harness that drives a build by hand before #625 F2
+/// schedules it. See `crate::staging::build`'s module doc.
+pub mod build {
+    pub use crate::staging::build::{
+        BuildPlan, CHUNK_LOCK_TIMEOUT, ChunkOutcome, MergeOutcome, merge_deltas, run_chunk,
+    };
+}
+
 /// Planted ordering bugs (issue #557 part 3). A harness reads which plant
 /// this process runs with and how often it fired; it never arms one, since
 /// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.

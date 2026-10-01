@@ -713,7 +713,7 @@ pub(crate) async fn backfill_altered_columns(
 
 /// The bind parameters [`pk_range_where`]'s clause expects for `(lo, hi]`:
 /// `lo`'s values (when there is a lower bound), then `hi`'s.
-fn range_params<'a>(
+pub(crate) fn range_params<'a>(
     lo: &'a Option<Vec<String>>,
     hi: &'a [String],
 ) -> Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)> {
@@ -1276,7 +1276,7 @@ fn pk_row_cmp(
 /// scalar), binding the bounds as `$1..$n` (and `$n+1..$2n` when `lo` is
 /// present, `n = pk.len()`). Paired with [`discover_pk_ranges`]; the caller
 /// binds `hi` (first chunk) or `lo, hi`.
-fn pk_range_where(
+pub(crate) fn pk_range_where(
     pk_idents: &[String],
     pk: &[PrimaryKeyColumn],
     lo: &Option<Vec<String>>,
@@ -1848,6 +1848,13 @@ async fn backfill_aggregate(
             return Err(BackfillError::Superseded);
         }
         let horizon = load_emptied_ledger(&txn, &ledger, &ledger_sql).await?;
+        // The group deltas recorded moves between the entries just discarded
+        // (#625 F1's B4).
+        super::ledger::truncate_deltas(
+            &*txn,
+            &super::ledger::qualified_deltas_table(target_schema, &def.target),
+        )
+        .await?;
         txn.commit().await?;
         horizon
     };

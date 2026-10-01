@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use trellis::capture::install::{self, Progress};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::intake::markers;
+use trellis::staging::build::{self, BuildPlan, ChunkOutcome, MergeOutcome};
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
     ApplyError, ApplyOutcome, StagedChange, StagedWatermark, append, apply, collect_tombstones,
@@ -129,14 +131,26 @@ impl Driver {
     /// Seals both phases and returns the sealed batch. Retires every drained
     /// segment it can first, so a test never runs the four-slot ring full.
     pub async fn seal(&mut self) -> i64 {
-        self.retire().await;
-        let outcome = seal::seal_phase1(&mut self.ctl)
+        self.try_seal()
             .await
-            .expect("seal phase 1");
+            .expect("seal phase 1: the seal gate is blocked")
+    }
+
+    /// [`Self::seal`], or `None` when the seal gate refuses it: a
+    /// transaction that may still write into the active segment's
+    /// predecessor is open (backpressure, which a test running other
+    /// transactions concurrently can meet).
+    pub async fn try_seal(&mut self) -> Option<i64> {
+        self.retire().await;
+        let outcome = match seal::seal_phase1(&mut self.ctl).await {
+            Ok(outcome) => outcome,
+            Err(trellis::staging::StagingError::SealGateBlocked) => return None,
+            Err(err) => panic!("seal phase 1: {err}"),
+        };
         seal::seal_phase2(&self.ctl, outcome.sealed_seg_seq, WAKE)
             .await
             .expect("seal phase 2");
-        outcome.sealed_seg_seq
+        Some(outcome.sealed_seg_seq)
     }
 
     /// Stages an image-less `Recompute` (today's Re-derive request) for each
@@ -195,13 +209,9 @@ impl Driver {
         self.spawn_drain(batch, worker, live_workers, &[]).await
     }
 
-    async fn spawn_drain(
-        &self,
-        batch: i64,
-        worker: &str,
-        live_workers: i64,
-        points: &[(PausePoint, &str)],
-    ) -> RunningDrain {
+    /// A [`PauseScope`] with each of `points` armed, each on a pause lock the
+    /// gate takes now.
+    async fn arm(&self, points: &[(PausePoint, &str)]) -> (Arc<PauseScope>, Vec<Frozen>) {
         let scope = PauseScope::new();
         let mut frozen = Vec::with_capacity(points.len());
         for &(point, target) in points {
@@ -216,6 +226,17 @@ impl Driver {
                 reached: Some(scope.arm(point, target, lock_key)),
             });
         }
+        (scope, frozen)
+    }
+
+    async fn spawn_drain(
+        &self,
+        batch: i64,
+        worker: &str,
+        live_workers: i64,
+        points: &[(PausePoint, &str)],
+    ) -> RunningDrain {
+        let (scope, frozen) = self.arm(points).await;
         let pool = self.db.pool.clone();
         let worker = worker.to_string();
         // Claims again until the claim wins nothing, so a worker whose peers
@@ -239,6 +260,87 @@ impl Driver {
         RunningDrain {
             handle: Some(handle),
             frozen,
+        }
+    }
+
+    /// The Re-derive build plan for bare target `target` (#625 F1).
+    pub async fn build_plan(&self, target: &str) -> BuildPlan {
+        BuildPlan::load(&self.db.pool, target)
+            .await
+            .expect("load the build plan")
+            .unwrap_or_else(|| panic!("{target} is not a Re-derive build shape"))
+    }
+
+    /// Runs and commits one build chunk, `(lo, hi]` of `plan`'s source.
+    pub async fn chunk(&self, plan: &BuildPlan, lo: Option<&str>, hi: &str) -> ChunkOutcome {
+        self.chunk_frozen(plan, lo, hi, &[]).await.finish().await
+    }
+
+    /// Starts one build chunk in its own task, frozen at each of `points`
+    /// once reached, as [`Self::drain_frozen`] does for a drain.
+    pub async fn chunk_frozen(
+        &self,
+        plan: &BuildPlan,
+        lo: Option<&str>,
+        hi: &str,
+        points: &[(PausePoint, &str)],
+    ) -> Running<ChunkOutcome> {
+        let (scope, frozen) = self.arm(points).await;
+        let pool = self.db.pool.clone();
+        let plan = plan.clone();
+        let (lo, hi) = (lo.map(str::to_string), hi.to_string());
+        let handle = tokio::spawn(with_scope(scope, async move {
+            let mut client = pool.get().await?;
+            let txn = client.transaction().await?;
+            let outcome = build::run_chunk(&txn, &plan, lo.as_deref(), &hi).await?;
+            txn.commit().await?;
+            Ok(outcome)
+        }));
+        Running {
+            handle: Some(handle),
+            frozen,
+        }
+    }
+
+    /// Runs and commits one merger pass of up to `limit` delta rows.
+    pub async fn merge(&self, plan: &BuildPlan, limit: i64) -> MergeOutcome {
+        self.merge_frozen(plan, limit, &[]).await.finish().await
+    }
+
+    /// Starts one merger pass in its own task, frozen at each of `points`
+    /// once reached.
+    pub async fn merge_frozen(
+        &self,
+        plan: &BuildPlan,
+        limit: i64,
+        points: &[(PausePoint, &str)],
+    ) -> Running<MergeOutcome> {
+        let (scope, frozen) = self.arm(points).await;
+        let pool = self.db.pool.clone();
+        let plan = plan.clone();
+        let handle = tokio::spawn(with_scope(scope, async move {
+            let mut client = pool.get().await?;
+            let txn = client.transaction().await?;
+            let outcome = build::merge_deltas(&txn, &plan, limit).await?;
+            txn.commit().await?;
+            Ok(outcome)
+        }));
+        Running {
+            handle: Some(handle),
+            frozen,
+        }
+    }
+
+    /// Merges until no delta row is left, returning the rows merged.
+    pub async fn merge_all(&self, plan: &BuildPlan) -> i64 {
+        const LIMIT: i64 = 5_000;
+        let mut merged = 0;
+        loop {
+            let outcome = self.merge(plan, LIMIT).await;
+            merged += outcome.claimed;
+            if outcome.claimed < LIMIT {
+                return merged;
+            }
         }
     }
 
@@ -275,6 +377,33 @@ impl Driver {
             assert!(
                 Instant::now() < deadline,
                 "no backend queued behind the frozen worker (pid {pid}) within 60 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits until at least `n` backends are queued on a lock some other
+    /// backend holds. Like [`Self::wait_blocked_behind`], for when the test
+    /// has forced `n` waiters but not which holder each queues behind.
+    pub async fn wait_blocked(&self, n: i64) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let blocked: i64 = self
+                .ctl
+                .query_one(
+                    "select count(*) from pg_stat_activity \
+                     where cardinality(pg_blocking_pids(pid)) > 0",
+                    &[],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if blocked >= n {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{blocked} of {n} backends queued on a lock within 60 s"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -341,7 +470,7 @@ impl Driver {
     }
 
     /// Releases `drain`'s pause at `point` once it has been reached.
-    pub async fn release(&self, drain: &mut RunningDrain, point: PausePoint) {
+    pub async fn release<T>(&self, drain: &mut Running<T>, point: PausePoint) {
         let at = drain
             .frozen
             .iter()
@@ -359,12 +488,15 @@ struct Frozen {
 }
 
 /// A drain running in its own task. See [`Driver::drain_frozen`].
-pub struct RunningDrain {
-    handle: Option<JoinHandle<Result<Option<ApplyOutcome>, ApplyError>>>,
+pub type RunningDrain = Running<Option<ApplyOutcome>>;
+
+/// A drain or a build chunk running in its own task.
+pub struct Running<T> {
+    handle: Option<JoinHandle<Result<T, ApplyError>>>,
     frozen: Vec<Frozen>,
 }
 
-impl RunningDrain {
+impl<T> Running<T> {
     /// Waits until the worker is frozen at `point`. Panics if the drain
     /// finishes (or fails) without reaching it.
     pub async fn reached(&mut self, point: PausePoint) -> Reached {
@@ -378,23 +510,23 @@ impl RunningDrain {
         tokio::select! {
             reached = rx => reached.expect("pause scope dropped"),
             finished = handle => panic!(
-                "the drain finished without reaching {point:?}: {:?}",
-                finished.expect("drain task").map(|o| o.map(|o| (o.keys_written, o.keys_deleted)))
+                "the task finished without reaching {point:?}: {:?}",
+                finished.expect("task").map(|_| ())
             ),
         }
     }
 
-    /// Waits for the drain to finish, after every armed point was released.
-    pub async fn finish(mut self) -> Option<ApplyOutcome> {
+    /// Waits for the task to finish, after every armed point was released.
+    pub async fn finish(self) -> T {
+        self.finish_result().await.expect("the task failed")
+    }
+
+    /// [`Self::finish`], returning the task's error instead of panicking.
+    pub async fn finish_result(mut self) -> Result<T, ApplyError> {
         assert!(
             self.frozen.is_empty(),
-            "release every armed point before finishing the drain"
+            "release every armed point before finishing the task"
         );
-        self.handle
-            .take()
-            .expect("drain task")
-            .await
-            .expect("drain task")
-            .expect("drain_once")
+        self.handle.take().expect("task").await.expect("task")
     }
 }

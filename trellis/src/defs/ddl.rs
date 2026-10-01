@@ -1937,6 +1937,15 @@ pub(crate) async fn aggregate_target_table_ddl(
         &contribution_columns,
         !super::eval::relationship_references(def).is_empty(),
     ));
+    // #625 F1: a target Apply maintains on the ledger also gets its group
+    // deltas, which a Re-derive build's chunks write instead of the groups.
+    if let Some(shape) = crate::staging::ledger::route(def, source_columns) {
+        sql.push_str(&super::ledger::aggregate_deltas_ddl(
+            &super::ledger::qualified_deltas_table(target_schema, &def.target),
+            &group_columns,
+            &shape.summed(),
+        ));
+    }
     Ok(sql)
 }
 

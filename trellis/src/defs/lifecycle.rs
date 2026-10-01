@@ -370,12 +370,14 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // so this is Trellis's to drop; a caller who wants the derived rows to
     // survive unmaintained leaves the definition paused instead of dropping it.
     txn.batch_execute(&format!(
-        "drop table if exists {}; drop table if exists {}",
+        "drop table if exists {}; drop table if exists {}; drop table if exists {}",
         quote_qualified(&qualified),
         quote_qualified(&super::ledger::ledger_table_name(&qualified)),
+        quote_qualified(&super::ledger::deltas_table_name(&qualified)),
     ))
     .await?;
-    // The target's ledger (#623 D2) went with it just above. Its extinct
+    // The target's ledger (#623 D2) and group deltas (#625 F1) went with it
+    // just above. Its extinct
     // horizon and its truncate floor (#623 D3) are keyed by the target's
     // name, so without this a later target of the same name would inherit
     // them.

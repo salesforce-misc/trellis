@@ -348,8 +348,13 @@ target in one transaction, in four steps:
    The statement then sums each updated entry's move from its old state to its
    new one into per-group increments: the member count, and per argument its
    sum and its non-null count. It upserts them in group order, incrementing every
-   column (I3). A `SUM` goes `NULL` when its non-null count reaches 0.
-4. **Empty groups go.** Groups whose `__trellis_members` reached 0 are deleted.
+   column (I3). A `SUM` goes `NULL` when its non-null count and its sum both
+   reach 0.
+4. **Empty groups go.** Groups whose every accumulator (`__trellis_members`,
+   each count, each sum) reached 0 are deleted. With one writer of groups that
+   is the same as the member count reaching 0. A Re-derive build adds a second
+   writer (next section), and then a group can reach 0 members while a sum is
+   still owed to it.
 
 There is no live `GROUP BY`, probe or horizon, and a page takes its locks in one
 order: entries, then groups, each in one sorted statement. A Re-derive of an
@@ -364,9 +369,21 @@ A fold record carries the identity of the change that won its post-image
 (`last_change`: its `lsn` and `row_txid`, see
 [04](04-claiming-and-the-fold.md)). That change is the one an Apply judges.
 
-**Truncate.** A source `TRUNCATE` empties the ledger, deletes every group row,
-and raises the target's truncate floor (`ledger_truncate_floor`) to the
-truncate's `lsn` (#623 Q6). `TRUNCATE` takes `ACCESS EXCLUSIVE`, so every
+**Build chunks and the merger (#625 F1, not yet scheduled).** A Re-derive
+build re-derives the source a primary-key range at a time. A chunk takes the
+same entry lock as a page (with a 1 s `lock_timeout`, so it gives way to a
+page), and then one statement reads the range's locked rows with
+`pg_current_snapshot()` and the active segment, rewrites their entries
+(stamping `__applied_seg` with that segment, so the tombstone GC can collect a
+chunk's tombstones), and appends each group's increments to
+`<target>__deltas`. It never writes a group row. A merger claims delta rows
+`for update skip locked`, deletes them, and upserts their sums per group with
+the page's upsert, in group order. The delta rows are discarded only with the
+ledger: by a truncate, a drop, or the one-pass build.
+
+**Truncate.** A source `TRUNCATE` empties the ledger and the group deltas,
+deletes every group row, and raises the target's truncate floor
+(`ledger_truncate_floor`) to the truncate's `lsn` (#623 Q6). `TRUNCATE` takes `ACCESS EXCLUSIVE`, so every
 earlier writer's trigger ran below that `lsn` and every later writer's above it.
 
 **Release and the orphan sweep.** Releasing a quarantined key

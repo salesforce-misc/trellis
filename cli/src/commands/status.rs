@@ -165,8 +165,11 @@ fn format_definitions(definitions: &[DefinitionSummary]) -> String {
                 def.status.as_str(),
                 format_timestamp(def.created_at)
             );
-            // Issue #461: a failing backfill is retried forever, so without
-            // this a definition stuck on one only shows as its status.
+            // Issues #461 and #616: a failing backfill is retried after a
+            // backoff, narrowed to the key that fails it, or charged until
+            // the definition pauses (#625 F4). While it fails, this line is
+            // where the error, attempts and next attempt show; the status
+            // alone still reads `backfilling`.
             if let Some(failure) = &def.backfill_failure {
                 line.push_str(&format!(
                     "    backfill of {} failing: attempts={} next_attempt_at={} error={:?}\n",

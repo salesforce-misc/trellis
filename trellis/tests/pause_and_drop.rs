@@ -591,6 +591,10 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
          where target_table = '{DEFAULT_TARGET_SCHEMA}.order_rollup'"
     );
     assert_eq!(count(&raw, &horizons).await, 1, "precondition: a horizon");
+    assert!(
+        table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__deltas").await,
+        "precondition: a ledger-routed target has its group deltas (#625 F1)"
+    );
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -603,6 +607,10 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     assert!(
         !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__ledger").await,
         "the drop takes the target's ledger with it"
+    );
+    assert!(
+        !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__deltas").await,
+        "and its group deltas"
     );
     assert_eq!(
         count(&raw, &horizons).await,
