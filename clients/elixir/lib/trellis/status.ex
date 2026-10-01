@@ -10,8 +10,9 @@ defmodule Trellis.Status do
   The other fields say what the transform is stuck on, and are `nil` when
   nothing holds it up:
 
-    * `backfill_failure` is set while the backfill of its source table keeps
-      failing, and names the cause.
+    * `backfill_failure` is set while its build keeps failing (one of its
+      build chunks, or the backfill of its source table), and names the
+      cause.
     * `capture_wait` is set while installing or widening capture on a table
       it reads waits for a lock another session holds. It clears once that
       session lets go.
@@ -116,9 +117,11 @@ end
 
 defmodule Trellis.BackfillFailure do
   @moduledoc """
-  A source table's backfill that keeps failing: how many attempts have failed,
-  the latest error, and when the staging worker tries again. It retries on
-  its own; fix the cause and the next attempt goes through.
+  A build that keeps failing: how many attempts have failed, the latest
+  error, and when it is tried again. It retries on its own, except that a
+  build failing for a reason no row explains pauses the transform after a
+  few attempts (`next_attempt_at` is then when it paused). Fix the cause,
+  resume a paused transform, and the next attempt goes through.
   """
 
   @type t :: %__MODULE__{

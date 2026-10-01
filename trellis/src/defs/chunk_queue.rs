@@ -11,7 +11,7 @@
 //! `backfill_chunks` table (`V20__backfill_chunks.sql`), in the discharge's own
 //! transaction. That applies to a fresh registration and to a resumed
 //! definition's rebuild alike. [`claim_chunks`]/[`reclaim_stale_chunks`]/
-//! [`release_chunk`] mirror `staging::claim`/`staging::liveness`'s
+//! [`fail_chunk`] mirror `staging::claim`/`staging::liveness`'s
 //! claim/reclaim-stale/release-on-error idiom for sealed ring segments,
 //! collapsed onto one table (a chunk, unlike a segment, is never bucket-split
 //! across several workers at once — see the migration's own doc comment).
@@ -34,7 +34,14 @@
 //! issue #419), a row with no bounds ([`ChunkWork::DirectBuild`]) that one
 //! drain worker runs start to finish. Everything above applies to it
 //! unchanged, except that a failed job hands its build back to the discharge
-//! rather than being released for an immediate retry ([`fail_chunk`]).
+//! rather than being released for a retry ([`fail_chunk`]).
+//!
+//! A chunk that fails never retries silently (#616). [`fail_chunk`] records
+//! the failure on the chunk's row, where `Trellis::status` reports it, logs
+//! it at warn, and by its kind backs the chunk off for a retry, splits it to
+//! narrow a failure on its data down to the key that causes it and
+//! quarantines that key, or, once a failure that can't be narrowed has been
+//! charged [`MAX_CHARGED_ATTEMPTS`] times, pauses the definition.
 
 use std::time::Duration;
 
@@ -72,6 +79,9 @@ pub enum ChunkQueueError {
     /// in that case, so this is a defensive "should not happen," not an
     /// expected outcome).
     DefinitionNotFound { definition_id: i64 },
+    /// Quarantining the key a failed chunk narrowed to, or checking the
+    /// whole-transform fuse after it, failed (#616).
+    Quarantine(Box<crate::staging::ApplyError>),
 }
 
 impl ChunkQueueError {
@@ -90,6 +100,7 @@ impl ChunkQueueError {
             ChunkQueueError::Backfill(err) => err.code(),
             ChunkQueueError::Catalog(err) => err.code(),
             ChunkQueueError::DefinitionNotFound { .. } => ErrorCode::Internal,
+            ChunkQueueError::Quarantine(err) => err.code(),
         }
     }
 }
@@ -108,11 +119,28 @@ impl std::fmt::Display for ChunkQueueError {
                 f,
                 "backfill chunk named definition {definition_id}, which no longer exists"
             ),
+            ChunkQueueError::Quarantine(err) => {
+                write!(
+                    f,
+                    "quarantining a failed backfill chunk's key failed: {err}"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for ChunkQueueError {}
+impl std::error::Error for ChunkQueueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ChunkQueueError::Db(err) => Some(err),
+            ChunkQueueError::Pool(err) => Some(err),
+            ChunkQueueError::Backfill(err) => Some(err),
+            ChunkQueueError::Catalog(err) => Some(err),
+            ChunkQueueError::DefinitionNotFound { .. } => None,
+            ChunkQueueError::Quarantine(err) => Some(err.as_ref()),
+        }
+    }
+}
 
 impl From<tokio_postgres::Error> for ChunkQueueError {
     fn from(err: tokio_postgres::Error) -> Self {
@@ -301,7 +329,7 @@ pub(crate) async fn dispatch_direct_build(
 /// chunk a worker still held across the resume is never claimable again and
 /// never completes the definition, whose rebuild (the resume's own discharge,
 /// which may enqueue fresh chunks) owns its way back to `live`:
-/// [`release_chunk`]/[`reclaim_stale_chunks`]/[`finish_chunk`] discard it
+/// [`fail_chunk`]/[`reclaim_stale_chunks`]/[`finish_chunk`] discard it
 /// rather than freeing or completing it. It writes nothing after the resume
 /// either ([`ClaimFence`]).
 const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at";
@@ -454,9 +482,13 @@ pub async fn claim_chunks(
             // `update` so a frozen definition's chunks never enter the
             // `for update skip locked` window at all — a frozen definition
             // can't starve its siblings out of the `limit $2` budget.
+            //
+            // A chunk whose last run failed waits out its backoff
+            // (`next_attempt_at`, #616) before it is handed out again.
             "with candidate as ( \
                  select bc.id from backfill_chunks bc \
                  where not bc.done and bc.claimed_by is null \
+                   and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
                    and exists ( \
                        select 1 from transform_definitions d \
                        where d.id = bc.definition_id and d.status = any($3) \
@@ -527,15 +559,18 @@ pub async fn reclaim_stale_chunks(
     Ok(n)
 }
 
-/// Releases a claim immediately on a chunk-execution error — the
-/// `backfill_chunks` analogue of `staging::liveness::release`. Scoped
-/// `claimed_by = $2` for the same reason that function is: a claim already
-/// reclaimed out from under this caller (the TTL sweep, or another worker) is
-/// left untouched.
+/// Releases a claim immediately, recording nothing — the `backfill_chunks`
+/// analogue of `staging::liveness::release`. A drain worker gives up a
+/// failed chunk through [`fail_chunk`] instead, which records the failure
+/// (#616); this is the bare release the tests drive a held chunk with.
+/// Scoped `claimed_by = $2` for the same reason that function is: a claim
+/// already reclaimed out from under this caller (the TTL sweep, or another
+/// worker) is left untouched.
 ///
 /// A chunk held across its definition's resume ([`STALE`]) is deleted instead
 /// of freed (issue #360) — see [`free_or_discard_claims`]. Returns how many
 /// claims (zero or one) it released or discarded.
+#[cfg(any(test, feature = "internals"))]
 pub async fn release_chunk(
     client: &mut impl GenericClient,
     id: i64,
@@ -568,11 +603,120 @@ pub async fn release_chunk(
     Ok(n)
 }
 
+/// How many failures a chunk may be charged before its definition is paused
+/// with the error (#616). A failure is charged when it is neither transient
+/// nor narrowed to a key: it says nothing about any one row, and retrying it
+/// without end would leave the definition `backfilling` forever with only a
+/// log line to show for it. A direct-build job counts its handed-back
+/// attempts against the same limit.
+pub(crate) const MAX_CHARGED_ATTEMPTS: i32 = 5;
+
+/// The backoff after a chunk's first failure, doubled per further failure.
+const RETRY_BASE: Duration = Duration::from_secs(1);
+
+/// The longest a failed chunk waits before it is claimed again.
+const RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// How long a chunk waits after its `attempts`th failure before it is
+/// claimed again: [`RETRY_BASE`], doubled per further failure, capped at
+/// [`RETRY_CAP`].
+fn retry_delay(attempts: i32) -> Duration {
+    let doublings = u32::try_from(attempts.saturating_sub(1))
+        .unwrap_or(0)
+        .min(31);
+    RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_CAP)
+}
+
+/// What a chunk's failure says about how to retry it (#616).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// A lost connection, a lock or serialization conflict, a busy server:
+    /// the same failures the drain retries without charging a key
+    /// (`staging::quarantine::is_transient_error`).
+    Transient,
+    /// Postgres rejected a value (SQLSTATE class `22`, a data exception such
+    /// as an overflow or a division by zero) or a constraint (class `23`).
+    /// Some row of the range caused it, so the chunk narrows itself to that
+    /// row's key.
+    Data,
+    /// Anything else: a missing table or column, an unsupported shape, a
+    /// failure with no SQLSTATE of its own. It would fail for every key of
+    /// the range alike, so narrowing it would quarantine whichever key it
+    /// tried alone; it is retried and charged instead.
+    Unnarrowable,
+}
+
+impl FailureKind {
+    fn of(err: &ChunkQueueError) -> Self {
+        if crate::staging::quarantine::is_transient_error(err) {
+            return FailureKind::Transient;
+        }
+        let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(err) = link {
+            if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+                return match pg.code().map(|code| code.code().get(..2)) {
+                    Some(Some("22" | "23")) => FailureKind::Data,
+                    _ => FailureKind::Unnarrowable,
+                };
+            }
+            link = err.source();
+        }
+        FailureKind::Unnarrowable
+    }
+}
+
+/// What [`fail_chunk`] did with a failed chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkFailure {
+    /// The caller's claim was already gone (reclaimed by the stale-claim
+    /// sweep): the chunk is its new holder's, and nothing was recorded.
+    NotHeld,
+    /// The chunk was held across its definition's resume ([`STALE`]), or its
+    /// definition was frozen while a direct-build job ran: it was deleted,
+    /// and the resume's rebuild owns the work.
+    Discarded,
+    /// The chunk is claimable again after a backoff. `charged` says whether
+    /// the failure counted toward [`MAX_CHARGED_ATTEMPTS`].
+    Retrying { charged: bool, delay: Duration },
+    /// A data failure: the chunk was split at `mid` into two chunks that run
+    /// at once, narrowing the failure toward the key that causes it.
+    Split { mid: String },
+    /// A data failure narrowed to `key`, now quarantined
+    /// (`staging::quarantine::evict_build_key`); the chunk runs again at once
+    /// without it. `fuse_tripped` says whether that quarantined the
+    /// definition too, as the whole-transform fuse does after
+    /// [`crate::staging::quarantine::DEFAULT_TRANSFORM_DEATH_THRESHOLD`]
+    /// keys.
+    Quarantined { key: String, fuse_tripped: bool },
+    /// The chunk was charged its [`MAX_CHARGED_ATTEMPTS`]th failure, so its
+    /// definition was paused. The chunk stays, unclaimed, as the record
+    /// `Trellis::status` reports until a resume replaces it.
+    Paused,
+    /// A direct-build job handed its build back to the backfill discharge,
+    /// whose marker carries `attempts` failures.
+    HandedBack { attempts: i32 },
+}
+
 /// Gives up `chunk` after running it failed with `error` — what a drain
-/// worker calls instead of [`finish_chunk`] on a failure.
+/// worker calls instead of [`finish_chunk`] on a failure — and logs at warn
+/// what it did, with the definition, the chunk, its range or key, the
+/// attempt and when the next one is (#616).
 ///
-/// A [`ChunkWork::Range`] chunk is released ([`release_chunk`]): the next
-/// claim retries it.
+/// A [`ChunkWork::Range`] chunk records the failure on its row (`attempts`,
+/// `last_error`, `next_attempt_at`, which `Trellis::status` reports) and,
+/// by the failure's [`FailureKind`]:
+///
+/// - **transient:** is released for a retry after a backoff, uncharged;
+/// - **data:** is narrowed by bisection. While its range holds more than one
+///   key it is split in two by key count, and both halves are claimable at
+///   once; the half without the failing key finishes, and the other splits
+///   again. A range down to one key quarantines that key
+///   (`staging::quarantine::evict_build_key`) and runs again without it, so
+///   the build finishes without the key, and the whole-transform fuse is
+///   checked (`staging::quarantine::trip_build_fuse`);
+/// - **anything else**, or a data failure whose range no longer holds a key:
+///   is released after a backoff and charged, and its
+///   [`MAX_CHARGED_ATTEMPTS`]th charge pauses the definition instead.
 ///
 /// A [`ChunkWork::DirectBuild`] job **hands its build back to the backfill
 /// discharge** (ADR-0016, issue #419), in one transaction: the job row is
@@ -584,23 +728,289 @@ pub async fn release_chunk(
 /// reports the error through the marker like any failed discharge. The
 /// retry is a fresh dispatch, so it re-plans the build by shape: a build that
 /// failed [`BackfillError::Unsupported`] because the catalog changed under it
-/// goes to the ring fallback. A definition that was paused or quarantined
-/// meanwhile only loses the job: its resume parks a marker and rebuilds. A
-/// job held across a resume ([`STALE`]) is discarded as usual.
+/// goes to the ring fallback. A transient failure isn't charged an attempt.
+/// A build can't be narrowed, so its [`MAX_CHARGED_ATTEMPTS`]th charged
+/// failure pauses the definition instead, keeping the job row as the record.
+/// A definition that was paused or quarantined meanwhile only loses the job:
+/// its resume parks a marker and rebuilds. A job held across a resume
+/// ([`STALE`]) is discarded as usual.
 ///
-/// Scoped to `claimed_by`'s current claim, like [`release_chunk`]: a claim
-/// already reclaimed out from under this caller is left to its new holder.
-/// Returns how many claims (zero or one) it gave up.
+/// Scoped to `claimed_by`'s current claim: a claim already reclaimed out
+/// from under this caller is left to its new holder.
 pub async fn fail_chunk(
     pool: &Pool,
     chunk: &ClaimedChunk,
     claimed_by: &str,
+    error: &ChunkQueueError,
+) -> Result<ChunkFailure, ChunkQueueError> {
+    let kind = FailureKind::of(error);
+    let message = error.to_string();
+    let (outcome, attempts, location) = match &chunk.work {
+        ChunkWork::Range { lo, hi } => {
+            let (outcome, attempts) =
+                fail_range_chunk(pool, chunk, lo.as_deref(), hi, claimed_by, kind, &message)
+                    .await?;
+            let location = match &outcome {
+                ChunkFailure::Quarantined { key, .. } => format!("key {key}"),
+                _ => format!("range ({}, {hi}]", lo.as_deref().unwrap_or("-infinity")),
+            };
+            (outcome, attempts, location)
+        }
+        ChunkWork::DirectBuild => {
+            let (outcome, attempts) =
+                fail_direct_build(pool, chunk, claimed_by, kind, &message).await?;
+            (outcome, attempts, "the whole source".to_string())
+        }
+    };
+    log_failure(chunk, kind, &outcome, attempts, &location, &message);
+    Ok(outcome)
+}
+
+/// [`fail_chunk`]'s log line for one failure. Returns nothing: the line is
+/// the whole point.
+fn log_failure(
+    chunk: &ClaimedChunk,
+    kind: FailureKind,
+    outcome: &ChunkFailure,
+    attempt: i32,
+    location: &str,
     error: &str,
-) -> Result<u64, ChunkQueueError> {
-    let mut client = pool.get().await?;
-    if matches!(chunk.work, ChunkWork::Range { .. }) {
-        return release_chunk(&mut **client, chunk.id, claimed_by).await;
+) {
+    let definition_id = chunk.definition_id;
+    let chunk_id = chunk.id;
+    let kind = format!("{kind:?}").to_lowercase();
+    match outcome {
+        ChunkFailure::NotHeld => tracing::warn!(
+            definition_id, chunk_id, chunk = %location, failure = %kind, error = %error,
+            "backfill chunk failed after its claim was reclaimed; its new holder retries it"
+        ),
+        ChunkFailure::Discarded => tracing::warn!(
+            definition_id, chunk_id, chunk = %location, failure = %kind, error = %error,
+            "backfill chunk failed after its definition was frozen or resumed; discarded it"
+        ),
+        ChunkFailure::Retrying { charged, delay } => tracing::warn!(
+            definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
+            charged, max_charged = MAX_CHARGED_ATTEMPTS,
+            next_attempt_in_secs = delay.as_secs_f64(), error = %error,
+            "backfill chunk failed; retrying it after a backoff"
+        ),
+        ChunkFailure::Split { mid } => tracing::warn!(
+            definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
+            split_at = %mid, next_attempt_in_secs = 0.0, error = %error,
+            "backfill chunk failed on its data; split it in two to narrow the failure to a key"
+        ),
+        ChunkFailure::Quarantined { key, fuse_tripped } => tracing::warn!(
+            definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
+            key = %key, fuse_tripped, next_attempt_in_secs = 0.0, error = %error,
+            "backfill chunk failure narrowed to one key; quarantined the key, and the build \
+             goes on without it"
+        ),
+        ChunkFailure::Paused => tracing::warn!(
+            definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
+            max_charged = MAX_CHARGED_ATTEMPTS, error = %error,
+            "backfill chunk kept failing without narrowing to a key; paused the definition \
+             (resume it once the cause is fixed)"
+        ),
+        ChunkFailure::HandedBack { attempts } => tracing::warn!(
+            definition_id, chunk_id, chunk = %location, failure = %kind, attempt = *attempts,
+            max_charged = MAX_CHARGED_ATTEMPTS, error = %error,
+            "direct build failed; handing it back to the backfill discharge, which retries it \
+             after a backoff"
+        ),
     }
+}
+
+/// Records a failure on chunk `id`'s row and frees its claim: `attempts`
+/// failures so far, `charged` of them charged, `error`, and claimable again
+/// after `delay`.
+async fn record_failure(
+    txn: &tokio_postgres::Transaction<'_>,
+    id: i64,
+    attempts: i32,
+    charged: i32,
+    error: &str,
+    delay: Duration,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "update backfill_chunks set claimed_by = null, claimed_at = null, \
+             attempts = $2, charged = $3, last_error = $4, \
+             next_attempt_at = now() + make_interval(secs => $5) \
+         where id = $1",
+        &[&id, &attempts, &charged, &error, &delay.as_secs_f64()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Pauses definition `id` because its build failed in a way no retry or
+/// narrowing gets past, in the caller's transaction, which holds its row. A
+/// definition already frozen keeps its status.
+async fn pause_for_build_failure(
+    txn: &tokio_postgres::Transaction<'_>,
+    id: i64,
+) -> Result<(), tokio_postgres::Error> {
+    let paused = txn
+        .execute(
+            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
+            &[
+                &id,
+                &TransformStatus::Paused.as_str(),
+                &TransformStatus::dispatchable(),
+            ],
+        )
+        .await?;
+    if paused == 1 {
+        tracing::warn!(
+            definition_id = id,
+            to = %TransformStatus::Paused.as_str(),
+            "transform status transition: its build kept failing; paused"
+        );
+    }
+    Ok(())
+}
+
+/// [`fail_chunk`] for a [`ChunkWork::Range`] chunk. Returns what it did and
+/// the chunk's failure count, this one included.
+async fn fail_range_chunk(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    lo: Option<&str>,
+    hi: &str,
+    claimed_by: &str,
+    kind: FailureKind,
+    error: &str,
+) -> Result<(ChunkFailure, i32), ChunkQueueError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    // The definition row first, as `finish_chunk` locks it, then the chunk:
+    // the order resume takes them in (issue #434).
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for update",
+        &[&chunk.definition_id],
+    )
+    .await?;
+    let Some(row) = txn
+        .query_opt(
+            &format!(
+                "select {STALE}, bc.attempts + 1, bc.charged, d.source_table, d.target_table \
+                 from backfill_chunks bc \
+                 join transform_definitions d on d.id = bc.definition_id \
+                 where bc.id = $1 and bc.claimed_by = $2 and not bc.done \
+                 for update of bc"
+            ),
+            &[&chunk.id, &claimed_by],
+        )
+        .await?
+    else {
+        return Ok((ChunkFailure::NotHeld, 0));
+    };
+    let attempts: i32 = row.get(1);
+    if row.get::<_, bool>(0) {
+        discard_resumed_chunks(&txn, &[chunk.id]).await?;
+        txn.commit().await?;
+        return Ok((ChunkFailure::Discarded, attempts));
+    }
+    let charged: i32 = row.get(2);
+    let source_table: String = row.get(3);
+    let target_table: String = row.get(4);
+
+    let narrowed = match kind {
+        FailureKind::Data => {
+            Some(backfill::narrow_one_to_one_chunk(&*txn, &source_table, lo, hi).await?)
+        }
+        FailureKind::Transient | FailureKind::Unnarrowable => None,
+    };
+    let outcome = match narrowed {
+        Some(backfill::ChunkNarrowing::Split { mid }) => {
+            // This row keeps the lower half, and a new one takes the upper
+            // half. Both carry the failure so far, so `status` keeps
+            // reporting it while the build narrows, and the build's
+            // `fuse_rearmed_at`, so a resume supersedes both alike.
+            txn.execute(
+                "insert into backfill_chunks \
+                     (definition_id, lo, hi, fuse_rearmed_at, attempts, charged, \
+                      last_error, next_attempt_at) \
+                 select definition_id, $2, hi, fuse_rearmed_at, $3, charged, $4, now() \
+                 from backfill_chunks where id = $1",
+                &[&chunk.id, &mid, &attempts, &error],
+            )
+            .await?;
+            txn.execute(
+                "update backfill_chunks set hi = $2 where id = $1",
+                &[&chunk.id, &mid],
+            )
+            .await?;
+            record_failure(&txn, chunk.id, attempts, charged, error, Duration::ZERO).await?;
+            ChunkFailure::Split { mid }
+        }
+        Some(backfill::ChunkNarrowing::Key(key)) => {
+            crate::staging::quarantine::evict_build_key(&txn, &source_table, &key, error)
+                .await
+                .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
+            record_failure(&txn, chunk.id, attempts, charged, error, Duration::ZERO).await?;
+            ChunkFailure::Quarantined {
+                key,
+                fuse_tripped: false,
+            }
+        }
+        None if kind == FailureKind::Transient => {
+            let delay = retry_delay(attempts);
+            record_failure(&txn, chunk.id, attempts, charged, error, delay).await?;
+            ChunkFailure::Retrying {
+                charged: false,
+                delay,
+            }
+        }
+        // Unnarrowable, or a data failure in a range with no key left to
+        // blame (they were deleted or quarantined since the chunk ran).
+        Some(backfill::ChunkNarrowing::Empty) | None => {
+            let charged = charged + 1;
+            if charged >= MAX_CHARGED_ATTEMPTS {
+                record_failure(&txn, chunk.id, attempts, charged, error, Duration::ZERO).await?;
+                pause_for_build_failure(&txn, chunk.definition_id).await?;
+                ChunkFailure::Paused
+            } else {
+                let delay = retry_delay(attempts);
+                record_failure(&txn, chunk.id, attempts, charged, error, delay).await?;
+                ChunkFailure::Retrying {
+                    charged: true,
+                    delay,
+                }
+            }
+        }
+    };
+    txn.commit().await?;
+
+    let outcome = match outcome {
+        ChunkFailure::Quarantined { key, .. } => {
+            let (_, target) = target_table
+                .split_once('.')
+                .expect("target_table is always schema-qualified (issue #73)");
+            let fuse_tripped = crate::staging::quarantine::trip_build_fuse(
+                pool,
+                chunk.definition_id,
+                target,
+                &source_table,
+            )
+            .await
+            .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
+            ChunkFailure::Quarantined { key, fuse_tripped }
+        }
+        outcome => outcome,
+    };
+    Ok((outcome, attempts))
+}
+
+/// [`fail_chunk`] for a [`ChunkWork::DirectBuild`] job. Returns what it did
+/// and the build's failure count.
+async fn fail_direct_build(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+    kind: FailureKind,
+    error: &str,
+) -> Result<(ChunkFailure, i32), ChunkQueueError> {
+    let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     // The definition row first, as `finish_chunk` locks it, then the job.
     txn.execute(
@@ -621,40 +1031,56 @@ pub async fn fail_chunk(
         )
         .await?
     else {
-        return Ok(0);
+        return Ok((ChunkFailure::NotHeld, 0));
+    };
+    let prior_attempts: i32 = row.get(1);
+    // A transient failure isn't charged: the marker retries it with the
+    // backoff its earlier failures earned.
+    let attempts = match kind {
+        FailureKind::Transient => prior_attempts,
+        FailureKind::Data | FailureKind::Unnarrowable => prior_attempts.saturating_add(1),
     };
     if row.get::<_, bool>(0) {
         discard_resumed_chunks(&txn, &[chunk.id]).await?;
         txn.commit().await?;
-        return Ok(1);
+        return Ok((ChunkFailure::Discarded, attempts));
     }
-    txn.execute("delete from backfill_chunks where id = $1", &[&chunk.id])
-        .await?;
     let status_text: String = row.get(3);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    if status == TransformStatus::Backfilling {
-        txn.execute(
-            "update transform_definitions set status = $1 where id = $2",
-            &[
-                &TransformStatus::WaitingToBackfill.as_str(),
-                &chunk.definition_id,
-            ],
-        )
-        .await?;
-        let source_table: String = row.get(2);
-        let attempts = row.get::<_, i32>(1).saturating_add(1);
-        crate::intake::markers::park_failed_build(&*txn, &source_table, attempts, error).await?;
-        tracing::info!(
-            definition_id = chunk.definition_id,
-            from = %TransformStatus::Backfilling.as_str(),
-            to = %TransformStatus::WaitingToBackfill.as_str(),
-            "transform status transition: direct build failed; handed back to the discharge"
-        );
+    if status != TransformStatus::Backfilling {
+        txn.execute("delete from backfill_chunks where id = $1", &[&chunk.id])
+            .await?;
+        txn.commit().await?;
+        return Ok((ChunkFailure::Discarded, attempts));
     }
+    if kind != FailureKind::Transient && attempts >= MAX_CHARGED_ATTEMPTS {
+        record_failure(&txn, chunk.id, attempts, attempts, error, Duration::ZERO).await?;
+        pause_for_build_failure(&txn, chunk.definition_id).await?;
+        txn.commit().await?;
+        return Ok((ChunkFailure::Paused, attempts));
+    }
+    txn.execute("delete from backfill_chunks where id = $1", &[&chunk.id])
+        .await?;
+    txn.execute(
+        "update transform_definitions set status = $1 where id = $2",
+        &[
+            &TransformStatus::WaitingToBackfill.as_str(),
+            &chunk.definition_id,
+        ],
+    )
+    .await?;
+    let source_table: String = row.get(2);
+    crate::intake::markers::park_failed_build(&*txn, &source_table, attempts, error).await?;
+    tracing::info!(
+        definition_id = chunk.definition_id,
+        from = %TransformStatus::Backfilling.as_str(),
+        to = %TransformStatus::WaitingToBackfill.as_str(),
+        "transform status transition: direct build failed; handed back to the discharge"
+    );
     txn.commit().await?;
-    Ok(1)
+    Ok((ChunkFailure::HandedBack { attempts }, attempts))
 }
 
 /// Gives up the claims `rows` (each `(chunk id, stale)`, locked by the
@@ -1407,6 +1833,115 @@ mod tests {
         );
     }
 
+    /// #616: a chunk of a composite-key source that fails on one row's data
+    /// splits by key count down to that row's key, quarantines it under the
+    /// key's ring encoding, and the build finishes without it. Driven one
+    /// claim at a time.
+    #[tokio::test]
+    async fn a_composite_key_chunk_narrows_to_its_failing_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let text = "TRANSFORM pair_doubles FROM pairs SELECT x + x AS y";
+        raw.batch_execute(&format!(
+            "create table public.pairs (a int, b text, x int, primary key (a, b)); \
+             insert into public.pairs values \
+                 (1, 'a', 1), (1, 'b', {}), (2, 'a', 3), (2, 'b', 4), (3, 'a', 5); \
+             create table public.pair_doubles (a int, b text, y int, primary key (a, b)); \
+             insert into source_table_versions (source_table, version) \
+             values ('public.pairs', 1)",
+            i32::MAX
+        ))
+        .await
+        .expect("seed source");
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.pair_doubles', 'public.pairs', 1, $1, 'waiting_to_backfill') \
+                 returning id",
+                &[&text],
+            )
+            .await
+            .expect("seed definition")
+            .get(0);
+        let def = parse(text).expect("parse definition");
+        assert_eq!(
+            dispatch(&pool, id, &def, "public.pairs").await,
+            Some(TransformStatus::Backfilling)
+        );
+
+        let mut outcomes = Vec::new();
+        for _ in 0..20 {
+            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
+                break;
+            };
+            match run_claimed_chunk(
+                &pool,
+                &chunk,
+                WORKER,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                Ok(()) => finish_chunk(&pool, &chunk, WORKER).await.expect("finish"),
+                Err(err) => outcomes.push(
+                    fail_chunk(&pool, &chunk, WORKER, &err)
+                        .await
+                        .expect("fail the chunk"),
+                ),
+            }
+        }
+
+        let key = ddl_key(&["1", "b"]);
+        assert!(
+            matches!(outcomes.first(), Some(ChunkFailure::Split { .. })),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes.last(),
+            Some(&ChunkFailure::Quarantined {
+                key: key.clone(),
+                fuse_tripped: false
+            }),
+            "{outcomes:?}"
+        );
+        assert_eq!(status_of(&raw, id).await, "catching_up");
+        let poisoned: Vec<String> = raw
+            .query(
+                "select key from poison where src_table = 'public.pairs'",
+                &[],
+            )
+            .await
+            .expect("read poison")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(poisoned, vec![key]);
+        let built: Vec<(i32, String, i32)> = raw
+            .query("select a, b, y from public.pair_doubles order by a, b", &[])
+            .await
+            .expect("read the target")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        assert_eq!(
+            built,
+            vec![
+                (1, "a".to_string(), 2),
+                (2, "a".to_string(), 6),
+                (2, "b".to_string(), 8),
+                (3, "a".to_string(), 10)
+            ]
+        );
+    }
+
+    /// A composite key's ring encoding of `parts`.
+    fn ddl_key(parts: &[&str]) -> String {
+        super::super::ddl::join_pk_key(parts)
+    }
+
     /// Seeds `public.orders` (three rows over two groups) and a
     /// `waiting_to_backfill` aggregate definition `rollup` over it, creating
     /// its target table unless `with_target` is `false`.
@@ -1560,10 +2095,10 @@ mod tests {
         )
         .await
         .expect_err("the build has no target to write");
-        let given_up = fail_chunk(&pool, &job[0], WORKER, &error.to_string())
+        let given_up = fail_chunk(&pool, &job[0], WORKER, &error)
             .await
             .expect("fail the job");
-        assert_eq!(given_up, 1);
+        assert_eq!(given_up, ChunkFailure::HandedBack { attempts: 3 });
 
         assert_eq!(status_of(&raw, id).await, "waiting_to_backfill");
         let jobs: i64 = raw
@@ -1601,13 +2136,65 @@ mod tests {
         let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
         pause_transform(&pool, "rollup").await.expect("pause");
 
-        fail_chunk(&pool, &job[0], WORKER, "boom")
+        let boom = ChunkQueueError::Backfill(BackfillError::Unsupported("boom".to_string()));
+        let given_up = fail_chunk(&pool, &job[0], WORKER, &boom)
             .await
             .expect("fail the job");
 
+        assert_eq!(given_up, ChunkFailure::Discarded);
         assert_eq!(status_of(&raw, id).await, "paused");
         assert_eq!(chunk_count(&raw, id).await, 0);
         assert_eq!(marker_generation(&raw, "public.orders").await, None);
+    }
+
+    /// #616: a direct build can't be narrowed to a key, so the
+    /// [`MAX_CHARGED_ATTEMPTS`]th failure in a row pauses its definition
+    /// rather than handing it back again. The job stays as the record of the
+    /// failure, and no marker is parked: the resume parks one and rebuilds.
+    #[tokio::test]
+    async fn a_direct_build_that_keeps_failing_pauses_its_definition() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        // No target table, so the build's write fails.
+        let id = seed_waiting_aggregate(&pool, &raw, false).await;
+        dispatch_job(&pool, id, MAX_CHARGED_ATTEMPTS - 1).await;
+
+        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
+        let error = run_claimed_chunk(
+            &pool,
+            &job[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect_err("the build has no target to write");
+        let given_up = fail_chunk(&pool, &job[0], WORKER, &error)
+            .await
+            .expect("fail the job");
+
+        assert_eq!(given_up, ChunkFailure::Paused);
+        assert_eq!(status_of(&raw, id).await, "paused");
+        assert_eq!(marker_generation(&raw, "public.orders").await, None);
+        let record = raw
+            .query_one(
+                "select attempts, last_error, claimed_by from backfill_chunks \
+                 where definition_id = $1",
+                &[&id],
+            )
+            .await
+            .expect("the job stays as the record");
+        assert_eq!(record.get::<_, i32>(0), MAX_CHARGED_ATTEMPTS);
+        assert_eq!(record.get::<_, Option<String>>(1), Some(error.to_string()));
+        assert_eq!(record.get::<_, Option<String>>(2), None);
+
+        resume_transform(&pool, "rollup").await.expect("resume");
+        assert_eq!(
+            chunk_count(&raw, id).await,
+            0,
+            "the resume clears the record"
+        );
     }
 
     /// Issue #434: a chunk held across a pause and a completed resume must

@@ -1569,10 +1569,11 @@ async fn heartbeat_worker_if_due(
 /// Claims one pending direct-build backfill chunk (`defs::chunk_queue`,
 /// docs/decisions/0007's amendment) and executes it, marking it done
 /// (flipping its definition `backfilling` -> `live` once every chunk is done
-/// — see `chunk_queue::finish_chunk`) or, on a write error, releasing the
-/// claim immediately for the reclaim-stale sweep or another worker to retry
-/// — the same "release on error rather than wait out the TTL" discipline
-/// [`app_worker_loop`]'s segment path uses.
+/// — see `chunk_queue::finish_chunk`) or, on a write error, giving it up at
+/// once through `chunk_queue::fail_chunk`, which records and logs the
+/// failure and retries, narrows or pauses (#616) — the same "release on
+/// error rather than wait out the TTL" discipline [`app_worker_loop`]'s
+/// segment path uses.
 /// Returns whether it claimed anything, so the caller's own idle-wait
 /// decision treats a tick that only did backfill work as progress too.
 ///
@@ -1611,16 +1612,18 @@ async fn drain_backfill_chunks(
         Ok(()) => {
             let _ = chunk_queue::finish_chunk(pool, &chunk, claimed_by).await;
         }
+        // `fail_chunk` logs the failure and what it did about it (#616).
         Err(err) => {
-            if matches!(chunk.work, chunk_queue::ChunkWork::DirectBuild) {
+            if let Err(fail_err) = chunk_queue::fail_chunk(pool, &chunk, claimed_by, &err).await {
                 tracing::warn!(
                     definition_id = chunk.definition_id,
+                    chunk_id = chunk.id,
                     error = %err,
-                    "direct build failed; handing it back to the backfill discharge, \
-                     which retries it after a backoff"
+                    record_error = %fail_err,
+                    "backfill chunk failed, and recording the failure failed too; the \
+                     stale-claim sweep frees the chunk for a retry"
                 );
             }
-            let _ = chunk_queue::fail_chunk(pool, &chunk, claimed_by, &err.to_string()).await;
         }
     }
     true
@@ -2703,6 +2706,335 @@ mod backfill_chunk_claim_tests {
             .expect("read status")
             .get(0);
         assert_eq!(status, "catching_up", "the build finished");
+    }
+}
+
+#[cfg(test)]
+mod backfill_chunk_failure_tests {
+    //! #616: a backfill chunk that fails says so, and stops retrying blindly.
+    //! Each test drives the chunks itself, one [`drain_backfill_chunks`] call
+    //! at a time, and makes a backed-off chunk due by hand rather than
+    //! waiting for it.
+
+    use super::log_capture::install_capture;
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    use crate::app::{Trellis, TrellisOptions};
+    use crate::defs::ast::ValueType;
+    use crate::defs::model::TransformStatus;
+    use crate::integer::IntWidth;
+
+    const WORKER: &str = "issue-616-worker";
+
+    struct Fixture {
+        _cluster: testkit::TestCluster,
+        _db: testkit::TestDatabase,
+        pool: Pool,
+        raw: tokio_postgres::Client,
+        trellis: Trellis,
+        id: i64,
+    }
+
+    /// Seeds `public.nums` with `rows` rows (`x = id`, except `x = bad_x` at
+    /// `bad_id`) and registers `TRANSFORM doubles FROM nums SELECT x + x`
+    /// over it, its build dispatched onto the chunk queue.
+    async fn seed(rows: i64, bad: Option<(i64, i32)>) -> Fixture {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let trellis = Trellis::connect(config, TrellisOptions::default())
+            .await
+            .expect("connect");
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public; \
+             create table public.nums (id bigint primary key, x integer); \
+             insert into public.nums select g, g from generate_series(1, {rows}) g",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("seed source");
+        if let Some((bad_id, bad_x)) = bad {
+            raw.execute(
+                "update public.nums set x = $2 where id = $1",
+                &[&bad_id, &bad_x],
+            )
+            .await
+            .expect("seed the bad row");
+        }
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+            ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        let def = defs::install_definition(
+            &pool,
+            "TRANSFORM doubles FROM nums SELECT x + x AS doubled",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install_definition");
+        crate::intake::markers::discharge_registrations(&pool)
+            .await
+            .expect("dispatch the build");
+        Fixture {
+            _cluster: cluster,
+            _db: db,
+            pool,
+            raw,
+            trellis,
+            id: def.id,
+        }
+    }
+
+    impl Fixture {
+        async fn drain_one(&self) -> bool {
+            drain_backfill_chunks(
+                &self.pool,
+                WORKER,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+        }
+
+        /// Runs chunks until none is claimable, failing the test if that
+        /// takes more than `bound` calls.
+        async fn drain_all(&self, bound: usize) -> usize {
+            for calls in 0..bound {
+                if !self.drain_one().await {
+                    return calls;
+                }
+            }
+            panic!("the chunk queue still had claimable work after {bound} runs");
+        }
+
+        /// Makes every backed-off chunk due now.
+        async fn make_due(&self) {
+            self.raw
+                .execute(
+                    "update backfill_chunks set next_attempt_at = now() where definition_id = $1",
+                    &[&self.id],
+                )
+                .await
+                .expect("make the chunks due");
+        }
+
+        async fn status(&self) -> crate::app::DefinitionStatus {
+            self.trellis
+                .status("doubles")
+                .await
+                .expect("status")
+                .expect("the definition exists")
+        }
+
+        async fn chunk(&self) -> (i32, i32, bool, Option<String>) {
+            let row = self
+                .raw
+                .query_one(
+                    "select attempts, charged, next_attempt_at > now(), claimed_by \
+                     from backfill_chunks where definition_id = $1 and not done",
+                    &[&self.id],
+                )
+                .await
+                .expect("one undone chunk");
+            (row.get(0), row.get(1), row.get(2), row.get(3))
+        }
+    }
+
+    /// #616's repro: a plain 1-1 build over a source larger than one chunk,
+    /// whose `x + x` overflows on one row. It used to retry that chunk
+    /// forever, silently, with the definition stuck in `backfilling`. Now
+    /// the failure is on the definition's status and in a warn line while
+    /// the chunk narrows itself to the key, the key is quarantined, and the
+    /// build finishes without it.
+    #[tokio::test]
+    async fn a_chunk_that_fails_on_its_data_quarantines_the_key_and_the_build_finishes() {
+        let f = seed(50_001, Some((30_000, i32::MAX))).await;
+        let (_guard, captured) = install_capture();
+
+        assert!(f.drain_one().await, "the first chunk ran");
+        let status = f.status().await;
+        assert_eq!(status.status, TransformStatus::Backfilling);
+        let failure = status
+            .backfill_failure
+            .expect("the failing chunk is on the status");
+        assert!(
+            failure.last_error.contains("out of range"),
+            "{}",
+            failure.last_error
+        );
+        assert_eq!(failure.source_table, "public.nums");
+        assert_eq!(failure.attempts, 1);
+
+        let runs = f.drain_all(200).await;
+        assert!(runs > 0);
+
+        let status = f.status().await;
+        assert_eq!(
+            status.status,
+            TransformStatus::CatchingUp,
+            "the build finished without the key"
+        );
+        assert_eq!(status.backfill_failure, None, "no chunk is left failing");
+        crate::intake::markers::discharge_registrations(&f.pool)
+            .await
+            .expect("discharge the go-live catch-up");
+        assert_eq!(f.status().await.status, TransformStatus::Live);
+        let target = f
+            .raw
+            .query_one(
+                "select count(*), count(*) filter (where id = 30000), \
+                        count(*) filter (where doubled = 2 * id) \
+                 from public.doubles",
+                &[],
+            )
+            .await
+            .expect("read the target");
+        assert_eq!(target.get::<_, i64>(0), 50_000);
+        assert_eq!(target.get::<_, i64>(1), 0, "the failing key is left out");
+        assert_eq!(target.get::<_, i64>(2), 50_000);
+
+        let quarantined = f
+            .trellis
+            .sample_quarantined("doubles", None, 10)
+            .await
+            .expect("sample the quarantined keys");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].key, "30000");
+        assert!(quarantined[0].error_message.contains("out of range"));
+        let parked: Vec<(String, i64)> = f
+            .raw
+            .query(
+                "select op, seg_seq from poison_held where key = '30000'",
+                &[],
+            )
+            .await
+            .expect("read the parked re-derive")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            parked,
+            vec![(
+                "recompute".to_string(),
+                crate::staging::quarantine::BUILD_PARK_SEG_SEQ
+            )],
+            "a release re-derives the key"
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        let warned = |message: &str| {
+            events.iter().any(|event| {
+                event.level == tracing::Level::WARN
+                    && event
+                        .fields
+                        .get("message")
+                        .is_some_and(|m| m.contains(message))
+                    && event.fields.get("definition_id") == Some(&f.id.to_string())
+            })
+        };
+        assert!(warned("split it in two"), "{events:#?}");
+        assert!(warned("quarantined the key"), "{events:#?}");
+    }
+
+    /// #616: a transient failure (here a serialization failure a trigger on
+    /// the target raises) is retried after a backoff and charged nothing.
+    #[tokio::test]
+    async fn a_transient_chunk_failure_is_retried_after_a_backoff_without_a_charge() {
+        let f = seed(3, None).await;
+        f.raw
+            .batch_execute(
+                "create function public.doubles_conflict() returns trigger language plpgsql as $$ \
+                 begin raise exception 'conflict' using errcode = 'serialization_failure'; end $$; \
+                 create trigger doubles_conflict before insert on public.doubles \
+                 for each statement execute function public.doubles_conflict()",
+            )
+            .await
+            .expect("make the write conflict");
+
+        assert!(f.drain_one().await);
+        assert_eq!(
+            f.chunk().await,
+            (1, 0, true, None),
+            "one failure, uncharged, backed off, unclaimed"
+        );
+        assert!(!f.drain_one().await, "the chunk isn't due yet");
+        let status = f.status().await;
+        assert_eq!(status.status, TransformStatus::Backfilling);
+        let failure = status.backfill_failure.expect("the failure is reported");
+        assert!(failure.last_error.contains("conflict"));
+        assert!(failure.next_attempt_at > SystemTime::now());
+
+        f.raw
+            .batch_execute("drop trigger doubles_conflict on public.doubles")
+            .await
+            .expect("end the conflict");
+        f.make_due().await;
+        assert_eq!(f.drain_all(5).await, 1);
+        let status = f.status().await;
+        assert_eq!(status.status, TransformStatus::CatchingUp);
+        assert_eq!(status.backfill_failure, None);
+    }
+
+    /// #616: a failure that says nothing about any row (here the target
+    /// lost the column the build writes) is retried and charged, and its
+    /// last charge pauses the definition with the error on its status. The
+    /// resume clears it and rebuilds.
+    #[tokio::test]
+    async fn a_chunk_failure_that_cannot_be_narrowed_pauses_the_definition() {
+        let f = seed(3, None).await;
+        f.raw
+            .batch_execute("alter table public.doubles drop column doubled")
+            .await
+            .expect("break the target");
+
+        for charge in 1..chunk_queue::MAX_CHARGED_ATTEMPTS {
+            f.make_due().await;
+            assert!(f.drain_one().await);
+            assert_eq!(f.chunk().await, (charge, charge, true, None));
+            assert_eq!(f.status().await.status, TransformStatus::Backfilling);
+        }
+        f.make_due().await;
+        assert!(f.drain_one().await);
+
+        let status = f.status().await;
+        assert_eq!(status.status, TransformStatus::Paused);
+        let failure = status
+            .backfill_failure
+            .expect("the pause carries the error");
+        assert!(
+            failure.last_error.contains("doubled"),
+            "{}",
+            failure.last_error
+        );
+        assert_eq!(
+            failure.attempts,
+            u32::try_from(chunk_queue::MAX_CHARGED_ATTEMPTS).unwrap()
+        );
+        f.make_due().await;
+        assert!(
+            !f.drain_one().await,
+            "a paused definition's chunk isn't claimed"
+        );
+
+        crate::staging::quarantine::resume_transform(&f.pool, "doubles")
+            .await
+            .expect("resume");
+        let status = f.status().await;
+        assert_eq!(status.status, TransformStatus::WaitingToBackfill);
+        assert_eq!(
+            status.backfill_failure, None,
+            "the resume clears the failure"
+        );
     }
 }
 

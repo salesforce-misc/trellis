@@ -35,8 +35,8 @@ module Trellis
 
   # A registered transform definition, as Trellis.definitions lists it:
   # Definition's fields, with the time it was registered (a Time) in place
-  # of its source columns. backfill_failure is nil unless its source table's
-  # backfill keeps failing.
+  # of its source columns. backfill_failure is nil unless its build keeps
+  # failing.
   DefinitionSummary = Data.define(:id, :target_table, :source_table, :source_version, :status,
                                   :created_at, :backfill_failure) do
     def self.from_native(hash)
@@ -56,7 +56,8 @@ module Trellis
   #
   # The other fields say what the definition is stuck on, and are nil when
   # nothing holds it up:
-  # - backfill_failure: its source table's backfill keeps failing.
+  # - backfill_failure: its build keeps failing (one of its build chunks, or
+  #   its source table's backfill).
   # - capture_wait: installing or widening capture on a table it reads waits
   #   for a lock another session holds. It clears once that session lets go.
   # - capture_failure: capture of a table it reads is broken. A schema change
@@ -99,10 +100,12 @@ module Trellis
     end
   end
 
-  # Why a definition's source table isn't backfilling: the backfill marker is
-  # parked on source_table after `attempts` failures, the latest being
-  # last_error, and won't be retried before next_attempt_at (a Time). It
-  # retries on its own: fix the cause and the next attempt goes through.
+  # Why a definition's build isn't finishing: the build of source_table has
+  # failed `attempts` times, the latest being last_error, and won't be
+  # retried before next_attempt_at (a Time). It retries on its own, except
+  # that a build failing for a reason no row explains pauses the definition
+  # after a few attempts (next_attempt_at is then when it paused). Fix the
+  # cause, resume a paused definition, and the next attempt goes through.
   BackfillFailure = Data.define(:source_table, :attempts, :last_error, :next_attempt_at) do
     def self.from_native(hash)
       new(**hash.except(:next_attempt_at_micros),

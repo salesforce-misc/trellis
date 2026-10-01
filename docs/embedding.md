@@ -552,16 +552,19 @@ Three things a poll needs to handle:
   and Trellis reports nothing but the status meanwhile. So poll with a
   deadline of your own, and from somewhere that can wait (a deploy check, a
   background job), not a web request.
-* **A failing build doesn't fail the poll.** When the backfill can't start,
-  or an aggregate's or relationship-enriched transform's build fails, it
-  goes back to `waiting_to_backfill` and is retried forever, with the error
-  on the status's `backfill_failure` (the source table, attempt count, last
-  error and next attempt time) ([a backfill that keeps
+* **A failing build doesn't fail the poll.** While a build keeps failing,
+  the error is on the status's `backfill_failure` (the source table, attempt
+  count, last error and next attempt time) ([a backfill that keeps
   failing](observability.md#a-backfill-that-keeps-failing)). Log that
-  error; it's usually the whole answer. A plain 1-1 build is split into
-  chunks, and a chunk that fails (a field that overflows its type on some
-  row, say) is retried as it stands: the transform stays `backfilling`,
-  `backfill_failure` stays empty, and only your deadline notices.
+  error; it's usually the whole answer. When the backfill can't start, it
+  stays `waiting_to_backfill` and is retried forever. A plain 1-1 build is
+  split into chunks, and a chunk that fails on a row (a field that
+  overflows its type, say) quarantines that row's key and finishes without
+  it, so the transform still goes `live`; the key is in
+  `sample_quarantined`. A build that keeps failing for a reason no row
+  explains (a missing column, say) is paused after a few attempts, with
+  the error still on `backfill_failure`: fix the cause and `RESUME
+  TRANSFORM <target>`.
 * **Renaming or dropping a source column never fails your writes.** The
   capture trigger notices the column is gone, and Trellis pauses every
   transform that reads it, with the table and column on the status's

@@ -67,8 +67,8 @@ pub struct PlainDefinitionSummary {
     pub status: &'static str,
     /// When the definition was registered, as [`crate::epoch_micros`].
     pub created_at_micros: i64,
-    /// Set while the definition's source table's backfill keeps failing to
-    /// discharge; see [`DefinitionSummary::backfill_failure`].
+    /// Set while the definition's build keeps failing; see
+    /// [`DefinitionSummary::backfill_failure`].
     pub backfill_failure: Option<PlainBackfillFailure>,
 }
 

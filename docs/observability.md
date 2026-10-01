@@ -247,6 +247,37 @@ is surfaced (issue #407,
   indented line under each affected definition, so one listing shows every
   stuck backfill.
 
+A build that has started fails differently (#616). A plain 1-1 transform's
+build runs as chunks of its source's primary-key range on the drain workers,
+and each chunk that fails is logged as a warning with the definition, the
+chunk, its range or key, the attempt and what happens next. What happens next
+depends on the failure:
+
+* **A transient failure** (a lost connection, a lock or serialization
+  conflict, a busy server) is retried after a backoff of 1 second, doubling
+  after each further failure up to 5 minutes. It counts toward nothing.
+* **A failure on a row's data** (Postgres rejected a value or a constraint:
+  an overflow or a division by zero, say) is narrowed to
+  the row. The chunk splits in two by key count and both halves run at once;
+  the half without the row finishes, and the other splits again, until the
+  chunk holds the row's key alone. That key is quarantined as the drain
+  quarantines a key that fails (ADR-0003): it is in `poison`, so
+  `Trellis::sample_quarantined` lists it, and the build finishes without it.
+  Releasing it once the row is fixed re-derives it into the target. The
+  whole-transform fuse counts these keys too: a build that quarantines five
+  is quarantined itself.
+* **Any other failure** (a missing table or column, say) is retried with the
+  same backoff, and its fifth attempt pauses the transform. An aggregate's or
+  relationship-enriched transform's build, which runs as one job rather than
+  chunks, is paused after five failed attempts in a row too, since it can't
+  be narrowed to a key. Fix the cause and resume the transform, which
+  rebuilds it.
+
+Meanwhile `DefinitionStatus::backfill_failure` carries the failing chunk's
+error, attempt count and next attempt time, ahead of any failure of the
+source table's marker. A transform paused this way keeps the error there
+until it is resumed.
+
 ## Dependencies
 
 Approved and pinned in `trellis/Cargo.toml` (issues #51/#56); rationale in

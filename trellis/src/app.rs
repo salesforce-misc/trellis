@@ -511,19 +511,23 @@ impl Trellis {
             .read_only(true)
             .start()
             .await?;
-        // Issue #461: the same `pending_backfill` join `status` reads its
-        // `backfill_failure` from, in the one listing query (`table_name` is
-        // the table's primary key, so it adds at most one row per definition).
+        // Issue #461: the same `pending_backfill` and failing-chunk joins
+        // `status` reads its `backfill_failure` from, in the one listing
+        // query (`table_name` is the table's primary key, and the chunk join
+        // takes one chunk, so each adds at most one row per definition).
         let rows = txn
             .query(
-                "select d.id, d.target_table, d.source_table, d.source_version, d.created_at, \
-                        pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
-                        pb.last_error as backfill_last_error, \
-                        pb.next_attempt_at as backfill_next_attempt_at \
-                 from transform_definitions d \
-                 left join pending_backfill pb \
-                   on pb.table_name = d.source_table and pb.last_error is not null \
-                 order by d.id",
+                &format!(
+                    "select d.id, d.target_table, d.source_table, d.source_version, d.created_at, \
+                            pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
+                            pb.last_error as backfill_last_error, \
+                            pb.next_attempt_at as backfill_next_attempt_at, {CHUNK_FAILURE_COLUMNS} \
+                     from transform_definitions d \
+                     left join pending_backfill pb \
+                       on pb.table_name = d.source_table and pb.last_error is not null \
+                     {CHUNK_FAILURE_JOIN} \
+                     order by d.id"
+                ),
                 &[],
             )
             .await?;
@@ -567,10 +571,10 @@ impl Trellis {
     /// #497). That one is derived from the upstream's status when read.
     ///
     /// Also reports why a definition isn't getting there, when the cause is a
-    /// failing backfill of its source table
-    /// ([`DefinitionStatus::backfill_failure`], issue #407): the staging
-    /// worker retries it with backoff forever, so without this the only
-    /// sign would be a warning in that worker's log.
+    /// failing build ([`DefinitionStatus::backfill_failure`], issues #407,
+    /// #616): a failing chunk of it, or a failing backfill of its source
+    /// table. Both are retried with backoff, so without this the only sign
+    /// would be a warning in a worker's log.
     pub async fn status(
         &self,
         target_table: &str,
@@ -593,20 +597,24 @@ impl Trellis {
             .await?;
         let row = txn
             .query_opt(
-                "select d.status, d.id, d.source_table, \
-                        pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
-                        pb.last_error as backfill_last_error, \
-                        pb.next_attempt_at as backfill_next_attempt_at, \
-                        cf.source_table as capture_table, cf.columns as capture_columns, \
-                        cf.error as capture_error, cf.detected_at as capture_detected_at, \
-                        exists (select 1 from column_status cs \
-                                where cs.transform_table = $1 and cs.awaiting_capture) \
-                          as awaiting_capture \
-                 from transform_definitions d \
-                 left join pending_backfill pb \
-                   on pb.table_name = d.source_table and pb.last_error is not null \
-                 left join capture_failures cf on cf.transform_id = d.id \
-                 where split_part(d.target_table, '.', 2) = $1",
+                &format!(
+                    "select d.status, d.id, d.source_table, \
+                            pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
+                            pb.last_error as backfill_last_error, \
+                            pb.next_attempt_at as backfill_next_attempt_at, \
+                            {CHUNK_FAILURE_COLUMNS}, \
+                            cf.source_table as capture_table, cf.columns as capture_columns, \
+                            cf.error as capture_error, cf.detected_at as capture_detected_at, \
+                            exists (select 1 from column_status cs \
+                                    where cs.transform_table = $1 and cs.awaiting_capture) \
+                              as awaiting_capture \
+                     from transform_definitions d \
+                     left join pending_backfill pb \
+                       on pb.table_name = d.source_table and pb.last_error is not null \
+                     {CHUNK_FAILURE_JOIN} \
+                     left join capture_failures cf on cf.transform_id = d.id \
+                     where split_part(d.target_table, '.', 2) = $1"
+                ),
                 &[&target_table],
             )
             .await?;
@@ -1400,14 +1408,40 @@ async fn reported_status(
         .unwrap_or(stored))
 }
 
+/// The columns [`backfill_failure`] reads a failing build chunk from, joined
+/// by [`CHUNK_FAILURE_JOIN`] (#616).
+const CHUNK_FAILURE_COLUMNS: &str = "bcf.attempts as chunk_attempts, \
+     bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next_attempt_at";
+
+/// The definition's current build chunk that has failed, if any, aliased
+/// `bcf` for [`CHUNK_FAILURE_COLUMNS`] (#616): the one that has failed most,
+/// leaving out finished chunks and those of a build a resume superseded.
+const CHUNK_FAILURE_JOIN: &str = "left join lateral ( \
+         select bc.attempts, bc.last_error, bc.next_attempt_at from backfill_chunks bc \
+         where bc.definition_id = d.id and not bc.done and bc.last_error is not null \
+           and bc.fuse_rearmed_at is not distinct from d.fuse_rearmed_at \
+         order by bc.attempts desc, bc.id limit 1 \
+     ) bcf on true";
+
 /// The [`BackfillFailure`] in a row of [`Trellis::status`]'s or
-/// [`Trellis::definitions`]' query: `pending_backfill`'s `table_name`,
-/// `attempts`, `last_error` and `next_attempt_at`, selected as
-/// `backfill_table`, `backfill_attempts`, `backfill_last_error` and
-/// `backfill_next_attempt_at` from a left join on the definition's source
-/// table where `last_error` is set. `None` when the join found no failing
-/// marker. Read by name, so the two queries can order their columns freely.
+/// [`Trellis::definitions`]' query. The definition's own failing build chunk
+/// comes first ([`CHUNK_FAILURE_COLUMNS`], #616): its `attempts`,
+/// `last_error` and `next_attempt_at` on the definition's `source_table`.
+/// Otherwise `pending_backfill`'s `table_name`, `attempts`, `last_error` and
+/// `next_attempt_at`, selected as `backfill_table`, `backfill_attempts`,
+/// `backfill_last_error` and `backfill_next_attempt_at` from a left join on
+/// the definition's source table where `last_error` is set. `None` when
+/// neither found a failure. Read by name, so the two queries can order their
+/// columns freely.
 fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
+    if let Some(last_error) = row.get::<_, Option<String>>("chunk_last_error") {
+        return Some(BackfillFailure {
+            source_table: row.get("source_table"),
+            attempts: u32::try_from(row.get::<_, i32>("chunk_attempts")).unwrap_or(0),
+            last_error,
+            next_attempt_at: row.get("chunk_next_attempt_at"),
+        });
+    }
     row.get::<_, Option<String>>("backfill_table")
         .map(|source_table| BackfillFailure {
             source_table,
@@ -1438,16 +1472,29 @@ fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
 pub struct DefinitionStatus {
     /// Where the transform is in its lifecycle (issue #55).
     pub status: TransformStatus,
-    /// Set while the backfill marker parked on the definition's source table
-    /// keeps failing to discharge (issue #407, ADR-0016), or carries the error
-    /// of a direct build that failed and was handed back to it (issue #419).
-    /// That discharge runs
-    /// every build of a `waiting_to_backfill` definition on the table and the
-    /// catch-up of every `catching_up` one, so its failure is reported on each
-    /// definition that reads the table, whatever its status. A definition
-    /// stuck in `waiting_to_backfill` with this set is waiting on the cause
-    /// named in [`BackfillFailure::last_error`], not on the discharge's turn.
-    /// It clears once the discharge succeeds or the table is parked again.
+    /// Set while the definition's build keeps failing. Either:
+    ///
+    /// - one of its build chunks failed (#616), and is waiting out a backoff
+    ///   before it is retried, or is being narrowed to the key it fails on.
+    ///   It clears once the chunk finishes. A key the narrowing quarantines
+    ///   is reported by [`Trellis::quarantined`] instead, and the build
+    ///   finishes without it. A definition `paused` with this set was paused
+    ///   by its build: a chunk kept failing in a way no retry or narrowing
+    ///   gets past (a missing table or column, say). Fix the cause and resume
+    ///   it, which rebuilds it and clears this;
+    /// - or the backfill marker parked on the definition's source table
+    ///   keeps failing to discharge (issue #407, ADR-0016), or carries the
+    ///   error of a direct build that failed and was handed back to it
+    ///   (issue #419). That discharge runs every build of a
+    ///   `waiting_to_backfill` definition on the table and the catch-up of
+    ///   every `catching_up` one, so its failure is reported on each
+    ///   definition that reads the table, whatever its status. A definition
+    ///   stuck in `waiting_to_backfill` with this set is waiting on the cause
+    ///   named in [`BackfillFailure::last_error`], not on the discharge's
+    ///   turn. It clears once the discharge succeeds or the table is parked
+    ///   again.
+    ///
+    /// The definition's own chunk is reported when both are set.
     pub backfill_failure: Option<BackfillFailure>,
     /// Set while the definition waits on capture, because the staging worker
     /// can't yet take the lock it needs to install or widen the capture
@@ -1518,19 +1565,26 @@ pub struct CaptureWait {
     pub blockers: Vec<String>,
 }
 
-/// The retry state of a source table's backfill marker whose discharge has
-/// failed (issue #407). The discharge retries it with capped exponential
-/// backoff, and never gives up on its own: fix the cause (or drop the
-/// definitions reading the table) and the next attempt goes through.
+/// The retry state of a definition's failing build (see
+/// [`DefinitionStatus::backfill_failure`]): one of its build chunks (#616),
+/// or the backfill marker on its source table whose discharge has failed
+/// (issue #407). Both are retried with capped exponential backoff. A chunk
+/// that fails on its data is narrowed to the key that causes it, which is
+/// quarantined; one that fails otherwise pauses the definition after a few
+/// charged attempts. The marker's discharge never gives up on its own: fix
+/// the cause (or drop the definitions reading the table) and the next
+/// attempt goes through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillFailure {
-    /// The qualified source table the marker is parked on.
+    /// The qualified source table the build reads.
     pub source_table: String,
-    /// How many discharges of the marker have failed since it was parked.
+    /// How many times the chunk (counting the chunk it was split from), or
+    /// the marker's discharge since it was parked, has failed.
     pub attempts: u32,
-    /// The latest failure's error, as the staging worker's log reported it.
+    /// The latest failure's error, as the worker's log reported it.
     pub last_error: String,
-    /// The earliest time the staging worker's discharge tries it again.
+    /// The earliest time the build tries it again. For a definition its
+    /// build paused, when it paused: nothing retries it until it is resumed.
     pub next_attempt_at: SystemTime,
 }
 
@@ -1546,7 +1600,7 @@ pub struct DefinitionSummary {
     /// [`TransformStatus`].
     pub status: TransformStatus,
     pub created_at: SystemTime,
-    /// Why the backfill of this definition's source table keeps failing, if
+    /// Why this definition's build keeps failing, if
     /// it does: the same value [`DefinitionStatus::backfill_failure`] reports
     /// (issue #461).
     pub backfill_failure: Option<BackfillFailure>,

@@ -203,6 +203,13 @@ pub(super) fn is_claim_lost(err: &ApplyError) -> bool {
 /// transient too, since it is load or a briefly unreachable server, not
 /// anything a record did.
 fn is_transient(err: &ApplyError) -> bool {
+    is_transient_error(err)
+}
+
+/// [`is_transient`] over any error's [`std::error::Error::source`] chain, for
+/// a caller whose error isn't an [`ApplyError`]: a backfill chunk's
+/// (`defs::chunk_queue::fail_chunk`, #616) is classified by the same rule.
+pub(crate) fn is_transient_error(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = link {
         if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
@@ -1703,9 +1710,103 @@ pub async fn trip_transform_fuse_if_crossed(
         );
     }
     for def in &definitions {
-        quarantine_if_crossed(txn, src_table, def).await?;
+        quarantine_if_crossed(
+            txn,
+            src_table,
+            def.id,
+            &def.def.target,
+            &TransformStatus::applying(),
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// The `poison_held.seg_seq` a build's parked re-derive ([`evict_build_key`])
+/// is held under. No batch has it, so it never collides with a batch's own
+/// parked contribution for the key (which `on conflict do nothing` would
+/// drop), and it sorts after every one of them: [`release_key`] takes its
+/// prior image from the first held row, and a batch's parked change carries
+/// the image readers last saw, which the build's re-derive doesn't know.
+pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
+
+/// Quarantines `key` of `src_table` (canonical) because a backfill chunk
+/// narrowed its failure, `last_error`, to that key alone
+/// (`defs::chunk_queue::fail_chunk`, #616), in the caller's transaction.
+/// It is the chunk-shaped counterpart of a drain's eviction
+/// ([`isolate_and_evict`]):
+///
+/// - a `poison` row, so the drain leaves the key out of every batch and the
+///   build's chunks leave it out of their writes;
+/// - a death in `key_deaths`, with the error;
+/// - a parked `recompute` in `poison_held`, so [`release_key`] re-stages the
+///   key as a re-derive once its cause is fixed. It carries the WAL insert
+///   position as its origin, so, like a batch's parked change, it holds
+///   every watermark token taken from then on until the release drains
+///   (`converge`'s condition 4).
+///
+/// The key is evicted on its first failure, where a drain's needs
+/// [`DEFAULT_DEATH_THRESHOLD`]: the chunk has already reproduced the failure
+/// alone, on the key's current row. The whole-transform fuse is checked
+/// once the caller has committed, by [`trip_build_fuse`].
+pub(crate) async fn evict_build_key(
+    txn: &Transaction<'_>,
+    src_table: &str,
+    key: &str,
+    last_error: &str,
+) -> Result<(), ApplyError> {
+    record_key_death(txn, src_table, key, last_error).await?;
+    txn.execute(
+        "insert into poison (src_table, key, last_error) \
+         values ($1, $2, $3) \
+         on conflict (src_table, key) do update set \
+             last_error = excluded.last_error, poisoned_at = now()",
+        &[&src_table, &key, &last_error],
+    )
+    .await?;
+    txn.execute(
+        "insert into poison_held (src_table, key, seg_seq, op, origin_lsn) \
+         values ($1, $2, $3, 'recompute', pg_current_wal_insert_lsn()) \
+         on conflict (src_table, key, seg_seq) do nothing",
+        &[&src_table, &key, &BUILD_PARK_SEG_SEQ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Checks the whole-transform fuse after a build quarantined a key of
+/// `src_table` ([`evict_build_key`]), in a transaction of its own: every
+/// applying definition on the source, as after a drain's eviction
+/// ([`trip_transform_fuse_if_crossed`]), and the building definition
+/// `definition_id` itself, which that check skips because it isn't applying
+/// yet. A build whose chunks fail on [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]
+/// keys is quarantined like a live definition whose drain does, so a failure
+/// that only looks like a data error (it narrows to whichever key a chunk
+/// tries alone) stops after that many keys. Returns whether the building
+/// definition was quarantined.
+///
+/// Separate from the eviction's transaction so the fuse's gate is never taken
+/// while the chunk queue holds the definition row, which the drain's fuse
+/// takes after the gate.
+pub(crate) async fn trip_build_fuse(
+    pool: &Pool,
+    definition_id: i64,
+    target: &str,
+    src_table: &str,
+) -> Result<bool, ApplyError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    trip_transform_fuse_if_crossed(&txn, pool, src_table).await?;
+    let tripped = quarantine_if_crossed(
+        &txn,
+        src_table,
+        definition_id,
+        target,
+        &[TransformStatus::Backfilling.as_str()],
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(tripped)
 }
 
 /// One candidate's half of [`trip_transform_fuse_if_crossed`]: quarantines
@@ -1734,10 +1835,16 @@ pub async fn trip_transform_fuse_if_crossed(
 /// for one call site isn't worth it. The row lock this takes is the same one
 /// the unconditional write it replaced took, and only when the definition
 /// actually trips.
+///
+/// `statuses` are the ones the definition may be frozen from: the applying
+/// ones for a drain's eviction, `backfilling` for a build's
+/// ([`trip_build_fuse`]).
 async fn quarantine_if_crossed(
     txn: &Transaction<'_>,
     src_table: &str,
-    def: &Definition,
+    id: i64,
+    target: &str,
+    statuses: &[&str],
 ) -> Result<bool, ApplyError> {
     const WINDOWED_COUNT: &str = "(select count(*) from poison p \
          where p.src_table = $3 \
@@ -1751,9 +1858,9 @@ async fn quarantine_if_crossed(
             ),
             &[
                 &TransformStatus::Quarantined.as_str(),
-                &def.id,
+                &id,
                 &src_table,
-                &TransformStatus::applying(),
+                &statuses,
                 &(DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64),
             ],
         )
@@ -1763,7 +1870,7 @@ async fn quarantine_if_crossed(
     };
     let poisoned_count: i64 = row.get(0);
     tracing::warn!(
-        transform = %def.def.target,
+        transform = %target,
         src_table = %src_table,
         poisoned_count,
         "whole-transform fuse tripped; quarantining"
@@ -4350,9 +4457,15 @@ mod unit_tests {
     async fn trip_candidate(pool: &Pool, src_table: &str, def: &Definition) -> bool {
         let mut client = pool.get().await.expect("pool connection");
         let txn = client.transaction().await.expect("begin");
-        let tripped = quarantine_if_crossed(&txn, src_table, def)
-            .await
-            .expect("fuse write");
+        let tripped = quarantine_if_crossed(
+            &txn,
+            src_table,
+            def.id,
+            &def.def.target,
+            &TransformStatus::applying(),
+        )
+        .await
+        .expect("fuse write");
         txn.commit().await.expect("commit");
         tripped
     }

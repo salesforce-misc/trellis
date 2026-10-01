@@ -5,8 +5,8 @@ defmodule Trellis.DefinitionSummary do
   its source columns.
 
   `target_table` and `source_table` are fully qualified (`schema.table`).
-  `backfill_failure` is set while the backfill of the source table keeps
-  failing, as in `Trellis.Status`.
+  `backfill_failure` is set while its build keeps failing, as in
+  `Trellis.Status`.
   """
 
   @type t :: %__MODULE__{
