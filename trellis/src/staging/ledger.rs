@@ -45,7 +45,9 @@
 //!    update` every entry, sorted by key, in one statement. A tombstone
 //!    collected between the two (`super::retire::collect_tombstones`, #623
 //!    D7) leaves its key with no entry to lock, so the lock is retaken until
-//!    it holds every key.
+//!    it holds every key, each time from a savepoint taken before the first
+//!    pass, so that no placeholder is inserted under a held entry lock
+//!    (#712).
 //! 2. **Re-derive read**: a record staged as a `recompute` (or folded with
 //!    one) is a Re-derive, and so is one with no change identity. One
 //!    statement reads those keys' source rows *and* `pg_current_snapshot()`,
@@ -1231,12 +1233,25 @@ pub(super) async fn finish_groups(
     Ok((written, deleted))
 }
 
+/// The savepoint [`lock_entries`] rolls back to on a retake (#712).
+const ENTRY_LOCK_SAVEPOINT: &str = "trellis_entry_lock";
+
 /// Locks the ledger entries of `keys` (I1, I5): inserts a non-member
 /// placeholder for every key with no entry, then `select … for update`
 /// every entry, sorted by key. A tombstone the placeholder insert found can
 /// be collected (`super::retire::collect_tombstones`, #623 D7) before the
 /// lock reaches it, leaving its key with no entry: the lock is then taken
 /// again, placeholders first, until it holds every key.
+///
+/// A retake first gives back every lock and placeholder of the pass before
+/// (#712), by rolling back to a savepoint taken before the first pass. Kept,
+/// the next pass would insert a placeholder while holding entry locks,
+/// breaking I5's one order: another transaction that inserted the collected
+/// key's placeholder first and then queued on a held lock would deadlock
+/// with this one, queued on its placeholder. The savepoint covers only this
+/// function's own statements, so the caller's earlier work in the
+/// transaction, and a `SET LOCAL` it made before (a build chunk's lock
+/// timeout), survive the rollback.
 ///
 /// Shared by a page ([`apply_ledger_target`]) and a build chunk
 /// ([`super::build`], #625 F1). `skip_lock` is the `skip_ledger_lock`
@@ -1252,6 +1267,8 @@ pub(super) async fn lock_entries(
     let mut distinct = keys.to_vec();
     distinct.sort_unstable();
     distinct.dedup();
+    txn.batch_execute(&format!("savepoint {ENTRY_LOCK_SAVEPOINT}"))
+        .await?;
     loop {
         txn.execute(
             &format!(
@@ -1286,7 +1303,11 @@ pub(super) async fn lock_entries(
         if locked as usize == distinct.len() {
             break;
         }
+        txn.batch_execute(&format!("rollback to savepoint {ENTRY_LOCK_SAVEPOINT}"))
+            .await?;
     }
+    txn.batch_execute(&format!("release savepoint {ENTRY_LOCK_SAVEPOINT}"))
+        .await?;
     // Test-only pause point (#623 D1). See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(

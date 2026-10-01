@@ -1842,3 +1842,61 @@ async fn gc_under_a_concurrent_reinsert_aggregate() {
 async fn gc_under_a_concurrent_reinsert_aggregate_min_max() {
     gc_under_a_concurrent_reinsert(Flavour::AggregateMinMax).await;
 }
+
+/// The entry lock's retake keeps I5's one global order (#712). Page A
+/// (batch 2) is frozen after its placeholder insert, which found key 2's
+/// tombstone and so inserted nothing. The GC collects that tombstone, and
+/// page B (batch 3, on the same keys) inserts key 2's placeholder in its
+/// place and is frozen there. A then locks key 1, finds no entry for key 2
+/// and takes the lock again, and its placeholder insert for key 2 queues on
+/// B's uncommitted one. Released, B's lock queues on key 1. Had A kept key
+/// 1's lock across the retake, that is a deadlock; A gives it back before
+/// inserting again, so B goes first and A follows.
+#[tokio::test]
+async fn a_retaken_entry_lock_never_deadlocks() {
+    let flavour = Flavour::Aggregate;
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
+    write(&d, "delete from public.src where id = 2").await;
+    let b1 = d.seal().await;
+    d.drain(b1, "a").await;
+    write(
+        &d,
+        "update public.src set v = 11 where id = 1; insert into public.src values (2, 1, 25)",
+    )
+    .await;
+    let b2 = d.seal().await;
+    write(
+        &d,
+        "update public.src set v = 12 where id = 1; update public.src set v = 26 where id = 2",
+    )
+    .await;
+    let b3 = d.seal().await;
+    assert_eq!(tombstones(&d).await, ["(2)"]);
+
+    let mut page_a = d
+        .drain_frozen(
+            b2,
+            "a",
+            &[(PausePoint::AfterPlaceholders, flavour.target())],
+        )
+        .await;
+    page_a.reached(PausePoint::AfterPlaceholders).await;
+    assert_eq!(d.collect_tombstones().await, 1, "key 2's tombstone goes");
+    let mut page_b = d
+        .drain_frozen(
+            b3,
+            "b",
+            &[(PausePoint::AfterPlaceholders, flavour.target())],
+        )
+        .await;
+    let frozen_b = page_b.reached(PausePoint::AfterPlaceholders).await;
+    d.release(&mut page_a, PausePoint::AfterPlaceholders).await;
+    d.wait_blocked_behind(frozen_b.backend_pid).await;
+    d.release(&mut page_b, PausePoint::AfterPlaceholders).await;
+    let (a, b) = tokio::join!(page_a.finish_result(), page_b.finish_result());
+
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    a.expect("page A");
+    b.expect("page B");
+    assert_oracle(&mut d, flavour).await;
+}

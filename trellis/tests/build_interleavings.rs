@@ -764,6 +764,100 @@ async fn key_3_entry(d: &Driver) -> Option<(bool, Option<i64>)> {
         .map(|r| (r.get(0), r.get(1)))
 }
 
+// ------------------------------------------ the entry lock's retake (#712)
+
+/// A build whose ledger holds key 2's tombstone, already collectible, and
+/// whose source has key 2 back: every key chunked, key 2 deleted and
+/// drained, then key 1 updated and key 2 re-inserted, captured into the
+/// returned batch, which is left undrained.
+async fn start_retake(flavour: Flavour) -> (Driver, BuildPlan, i64) {
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    d.chunk(&plan, None, "3").await;
+    let user = d.user().await;
+    user.batch_execute("delete from public.src where id = 2")
+        .await
+        .expect("delete key 2");
+    let deleted = d.seal().await;
+    d.drain(deleted, "apply").await;
+    user.batch_execute(
+        "update public.src set v = 11 where id = 1; insert into public.src values (2, 1, 25)",
+    )
+    .await
+    .expect("update key 1, re-insert key 2");
+    let batch = d.seal().await;
+    (d, plan, batch)
+}
+
+/// A page retaking its entry lock gives back the lock it already holds
+/// before inserting a placeholder again, so a chunk that took the collected
+/// key's placeholder in the meantime gets every lock it asks for. The page
+/// (keys 1 and 2) is frozen after its placeholder insert, which found key
+/// 2's tombstone. The GC collects it, and the chunk (keys 1 to 3) inserts
+/// key 2's placeholder and is frozen there. The page locks key 1, finds no
+/// entry for key 2, retakes, and queues on the chunk's placeholder; then
+/// the chunk locks its keys. Had the page kept key 1's lock, the chunk would
+/// queue on it: a deadlock, or the chunk giving up at its lock timeout.
+#[tokio::test]
+async fn a_page_retaking_its_entry_lock_never_deadlocks_with_a_chunk() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan, batch) = start_retake(flavour).await;
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    assert_eq!(d.collect_tombstones().await, 1, "key 2's tombstone goes");
+    let mut chunk = d
+        .chunk_frozen(&plan, None, "3", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    let frozen = chunk.reached(PausePoint::AfterPlaceholders).await;
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut chunk, PausePoint::AfterPlaceholders).await;
+    let chunked = chunk.finish_result().await;
+    let paged = page.finish_result().await;
+
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_eq!(chunked.expect("the chunk takes every lock").keys, 3);
+    paged.expect("the page");
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// A chunk retaking its entry lock keeps its own short lock timeout: the
+/// savepoint the retake rolls back to is taken after the chunk set it. The
+/// chunk (keys 1 to 3) is frozen after its placeholder insert, which found
+/// key 2's tombstone. The GC collects it, and a page inserts key 2's
+/// placeholder and is frozen there, holding it. The chunk retakes, queues
+/// on that placeholder, and gives up at its own timeout rather than the
+/// page session's two minutes.
+#[tokio::test]
+async fn a_chunk_retaking_its_entry_lock_keeps_its_lock_timeout() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan, batch) = start_retake(flavour).await;
+    let mut chunk = d
+        .chunk_frozen(&plan, None, "3", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    chunk.reached(PausePoint::AfterPlaceholders).await;
+    assert_eq!(d.collect_tombstones().await, 1, "key 2's tombstone goes");
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    d.release(&mut chunk, PausePoint::AfterPlaceholders).await;
+    let err = tokio::time::timeout(std::time::Duration::from_secs(30), chunk.finish_result())
+        .await
+        .expect("the chunk gives up at its own lock timeout, not the session's")
+        .expect_err("the chunk gives up on key 2");
+    assert!(
+        trellis::locks::is_lock_not_available(&err),
+        "a lock timeout, not {err}"
+    );
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    page.finish().await;
+    assert_eq!(d.chunk(&plan, None, "3").await.keys, 3);
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
 // ------------------------------------------------ a build under writers
 
 /// A chunk's `(lo, hi]`, as encoded keys.
