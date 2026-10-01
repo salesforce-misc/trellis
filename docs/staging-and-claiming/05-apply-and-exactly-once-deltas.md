@@ -377,9 +377,15 @@ page), and then one statement reads the range's locked rows with
 (stamping `__applied_seg` with that segment, so the tombstone GC can collect a
 chunk's tombstones), and appends each group's increments to
 `<target>__deltas`. It never writes a group row. A merger claims delta rows
-`for update skip locked`, deletes them, and upserts their sums per group with
-the page's upsert, in group order. The delta rows are discarded only with the
-ledger: by a truncate, a drop, or the one-pass build.
+oldest first through an index on their identity key `__seq` (`for update skip
+locked`), deletes them, and upserts their sums per group with the page's
+upsert, in group order. Only one merger works on a target at a time: it takes
+a transaction-scoped advisory lock on the target without waiting, and a second
+merger skips the target instead of queueing on the first's group rows (#625
+F2b). The delta table is a queue, so its statistics are unreliable: the merge
+statement runs with nested loops and sequential scans off, and a merger
+vacuums the table every 100,000 rows it merges. The delta rows are discarded
+only with the ledger: by a truncate, a drop, or the one-pass build.
 
 **Truncate.** A source `TRUNCATE` empties the ledger and the group deltas,
 deletes every group row, and raises the target's truncate floor

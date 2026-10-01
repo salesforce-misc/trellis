@@ -114,6 +114,39 @@ impl Fixture {
             .expect("build step")
     }
 
+    /// Claims and runs up to `max` plan jobs and chunks by hand, with no
+    /// merge between them. Returns how many it ran.
+    async fn run_chunks_by_hand(&self, max: usize) -> usize {
+        let pool = &self.db.pool;
+        for ran in 0..max {
+            let claimed = {
+                let client = pool.get().await.expect("pool");
+                chunk_queue::claim_chunks_of(
+                    &**client,
+                    "hand",
+                    1,
+                    &[chunk_queue::KIND_PLAN, chunk_queue::KIND_REDERIVE],
+                )
+                .await
+                .expect("claim")
+            };
+            let Some(chunk) = claimed.into_iter().next() else {
+                return ran;
+            };
+            build::run_claimed(pool, &chunk, "hand", &OPTIONS).await;
+        }
+        max
+    }
+
+    /// The one definition's id.
+    async fn definition_id(&self) -> i64 {
+        self.raw
+            .query_one("select id from transform_definitions", &[])
+            .await
+            .expect("definition id")
+            .get(0)
+    }
+
     /// Seals and drains the ring until nothing is pending.
     async fn drain(&mut self) {
         let watermark = StagedWatermark::saturated();
@@ -338,23 +371,7 @@ async fn the_flip_happens_only_after_the_last_merge() {
     let pool = &f.db.pool;
 
     // Run the plan and every chunk by hand, with no merge between them.
-    loop {
-        let claimed = {
-            let client = pool.get().await.expect("pool");
-            chunk_queue::claim_chunks_of(
-                &**client,
-                "hand",
-                1,
-                &[chunk_queue::KIND_PLAN, chunk_queue::KIND_REDERIVE],
-            )
-            .await
-            .expect("claim")
-        };
-        let Some(chunk) = claimed.into_iter().next() else {
-            break;
-        };
-        build::run_claimed(pool, &chunk, "hand", &OPTIONS).await;
-    }
+    f.run_chunks_by_hand(usize::MAX).await;
     assert_eq!(
         f.count("select count(*) from backfill_chunks where not done")
             .await,
@@ -364,12 +381,7 @@ async fn the_flip_happens_only_after_the_last_merge() {
     let pending = f.count("select count(*) from public.agg__deltas").await;
     assert!(pending > 0, "the chunks left deltas for the merger");
     assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    let id: i64 = f
-        .raw
-        .query_one("select id from transform_definitions", &[])
-        .await
-        .expect("definition id")
-        .get(0);
+    let id = f.definition_id().await;
     assert!(
         !build::try_complete(pool, id).await.expect("try_complete"),
         "not live while deltas are pending"
@@ -387,6 +399,95 @@ async fn the_flip_happens_only_after_the_last_merge() {
         Some("live"),
         "the merge that emptied the delta table flipped it"
     );
+    f.assert_agg_oracle().await;
+}
+
+/// The strict flip still waits for a merge in flight (#625 F2b, B7): a
+/// merge that has claimed and deleted the last delta rows but not committed
+/// leaves the table non-empty to everyone else, so neither `try_complete`
+/// nor a worker's step flips the build until it commits. The worker skips
+/// the merge (another holds the target), finds nothing else to do and
+/// reports idle without waiting on it.
+#[tokio::test]
+async fn the_flip_waits_for_a_merge_in_flight() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    f.pass().await;
+    let pool = &f.db.pool;
+    f.run_chunks_by_hand(usize::MAX).await;
+    let id = f.definition_id().await;
+    let plan = BuildPlan::load(pool, "agg")
+        .await
+        .expect("load the plan")
+        .expect("a buildable target");
+
+    let mut client = pool.get().await.expect("pool");
+    let merge = client.transaction().await.expect("begin the merge");
+    let outcome = build::merge_deltas(&merge, &plan, i64::MAX)
+        .await
+        .expect("merge every delta row");
+    assert!(outcome.claimed > 0 && !outcome.skipped, "{outcome:?}");
+
+    assert!(
+        !build::try_complete(pool, id).await.expect("try_complete"),
+        "not live while the last merge is uncommitted"
+    );
+    assert_eq!(
+        f.step(&OPTIONS).await,
+        Step::Idle,
+        "a worker skips the busy target, and has nothing else to do"
+    );
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+
+    merge.commit().await.expect("commit the merge");
+    assert!(
+        build::try_complete(pool, id).await.expect("try_complete"),
+        "the flip once the merge committed"
+    );
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// A worker that finds its target's merger busy takes a chunk instead of
+/// waiting for the merge or reporting idle (#625 F2b): one merger per
+/// target, and the rest of the workers build.
+#[tokio::test]
+async fn a_worker_takes_a_chunk_while_another_merges() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    f.pass().await;
+    let pool = &f.db.pool;
+    // The plan job and two chunks, so every group has two delta rows, and
+    // chunks are left.
+    assert_eq!(f.run_chunks_by_hand(3).await, 3);
+    let plan = BuildPlan::load(pool, "agg")
+        .await
+        .expect("load the plan")
+        .expect("a buildable target");
+    let mut client = pool.get().await.expect("pool");
+    let merge = client.transaction().await.expect("begin the merge");
+    // One row: its group's other row is left for a second merger, which
+    // would wait on this merge's group row if it took it.
+    assert_eq!(
+        build::merge_deltas(&merge, &plan, 1)
+            .await
+            .expect("merge")
+            .claimed,
+        1
+    );
+
+    let step = tokio::time::timeout(Duration::from_secs(30), f.step(&OPTIONS))
+        .await
+        .expect("the step doesn't wait on the merge in flight");
+    assert_eq!(step, Step::Chunk);
+    assert!(
+        f.count("select count(*) from public.agg__deltas").await > 0,
+        "the chunk appended deltas the busy merger can't take"
+    );
+    merge.commit().await.expect("commit the merge");
+    drop(client);
+
+    let (steps, _) = f.run("agg").await;
+    assert!(steps.contains(&Step::Merged), "{steps:?}");
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
 }
 

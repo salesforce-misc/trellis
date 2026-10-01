@@ -65,15 +65,34 @@
 //!
 //! # The merger
 //!
-//! [`merge_deltas`] claims up to `limit` delta rows no other merger holds
-//! (`for update skip locked`), deletes them, sums them per group and upserts
-//! the sums in group order, all in one statement
+//! [`merge_deltas`] claims up to `limit` delta rows, oldest first through
+//! the claim key's index (`for update skip locked`), deletes them, sums them
+//! per group and upserts the sums in group order, all in one statement
 //! ([`super::ledger::merge_statement`]), with the same upsert Apply uses.
 //! Then it deletes the groups whose every accumulator is 0 and hands every
 //! written group to the target-mutation seam, as Apply does
 //! ([`super::ledger::finish_groups`]). A merger locks only delta rows it
 //! claims without waiting and group rows in group order, so it can't
-//! deadlock with another merger or with a page.
+//! deadlock with a page.
+//!
+//! **One merger per target (F2b).** A merger first takes its target's
+//! transaction-scoped advisory lock without waiting, and skips the target if
+//! another transaction holds it: two mergers' batches almost always share a
+//! group, and the second would wait on the first's group row for the rest of
+//! the first's transaction (the F2 profile measured that at ~30% of build
+//! worker time on 8 workers). The skipping worker goes on to a chunk.
+//! The skip changes nothing [`try_complete`] reads: a merge in flight holds
+//! its claimed rows deleted but uncommitted, so the table still reads
+//! non-empty to everyone else until it commits.
+//!
+//! **The delta table is a queue (F2b).** Every row is deleted soon after
+//! it's appended, so its heap and the claim key's index fill with dead rows
+//! between vacuums, and its statistics say little about its contents. The
+//! claim and the emptiness checks read through the index, the merge
+//! statement runs with plan settings that don't depend on the statistics
+//! ([`merge_deltas`]), and a merger vacuums the table every
+//! [`VACUUM_EVERY`] rows it merges, so the walk past dead index entries
+//! stays bounded by that, not by the build's length.
 //!
 //! While a target is being built its groups have two channels, Apply and the
 //! merger, so a group can be transiently partial or even negative. B5 (a
@@ -90,6 +109,8 @@
 //! recompute the groups it writes, which is #625 F5. [`BuildPlan::load`]
 //! returns `None` for anything else.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio_postgres::{GenericClient, IsolationLevel, Transaction};
@@ -282,27 +303,90 @@ pub async fn run_chunk(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MergeOutcome {
     /// The delta rows it claimed and deleted. Fewer than the `limit` means
-    /// none were left that no other merger held.
+    /// none were left.
     pub claimed: i64,
     /// The groups it wrote and kept.
     pub written: usize,
     /// The groups it emptied and deleted.
     pub deleted: usize,
+    /// Another transaction was merging the target, so this one claimed
+    /// nothing and touched nothing (#625 F2b).
+    pub skipped: bool,
+}
+
+/// The first key of the transaction-scoped advisory lock a merger holds on
+/// its target (#625 F2b); the second is `hashtext` of the target's quoted,
+/// qualified delta table. The two-key form keeps it apart from the
+/// single-`bigint` producer lock (`super::session`).
+const MERGER_LOCK_CLASS: i32 = 625;
+
+/// The plan settings the merge statement runs under (#625 F2b; see
+/// `ledger::merge_statement`), so its plan doesn't hang on the delta
+/// table's statistics: no nested loop, so the upsert's result joins the
+/// group sums by hash whatever the claim's row estimate, and no sequential
+/// scan, so the claim walks the claim key's index. [`MERGE_PLAN_RESET`]
+/// puts them back after the statement.
+const MERGE_PLAN_SETTINGS: &str = "set local enable_nestloop = off; set local enable_seqscan = off";
+
+/// Undoes [`MERGE_PLAN_SETTINGS`] for the rest of the transaction.
+const MERGE_PLAN_RESET: &str =
+    "set local enable_nestloop to default; set local enable_seqscan to default";
+
+/// The plan [`merge_deltas`] would run for `limit` rows, as `explain`'s
+/// text, under the same settings, in `txn`. For tests of the plan's shape.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_merge(
+    txn: &Transaction<'_>,
+    plan: &BuildPlan,
+    limit: i64,
+) -> Result<String, ApplyError> {
+    let sql = ledger::merge_statement(&plan.ledger, None);
+    txn.batch_execute(MERGE_PLAN_SETTINGS).await?;
+    let rows = txn.query(&format!("explain {sql}"), &[&limit]).await?;
+    txn.batch_execute(MERGE_PLAN_RESET).await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Folds up to `limit` of the target's group-delta rows into its groups, in
 /// `txn` (see the module doc). The caller commits.
+///
+/// At most one merger works on a target at a time (#625 F2b): this takes
+/// the target's merger lock without waiting, and if another transaction
+/// holds it returns at once with [`MergeOutcome::skipped`] set and nothing
+/// done. Two mergers of one target would upsert overlapping groups and the
+/// second would wait on the first's group rows for its whole transaction.
 pub async fn merge_deltas(
     txn: &Transaction<'_>,
     plan: &BuildPlan,
     limit: i64,
 ) -> Result<MergeOutcome, ApplyError> {
     let ledger = &plan.ledger;
+    let locked: bool = txn
+        .query_one(
+            "select pg_try_advisory_xact_lock($1, hashtext($2))",
+            &[&MERGER_LOCK_CLASS, &ledger.deltas_ident],
+        )
+        .await?
+        .get(0);
+    if !locked {
+        return Ok(MergeOutcome {
+            claimed: 0,
+            written: 0,
+            deleted: 0,
+            skipped: true,
+        });
+    }
     let mut mutations = TargetMutations::new();
     let image_columns = mutations.image_columns(txn, &ledger.target).await?;
     let sql = ledger::merge_statement(ledger, image_columns.as_deref());
     let started = Instant::now();
+    txn.batch_execute(MERGE_PLAN_SETTINGS).await?;
     let rows = txn.query(&sql, &[&limit]).await?;
+    txn.batch_execute(MERGE_PLAN_RESET).await?;
     metrics::record_build_statement(BuildStatement::MergeUpsert, started.elapsed());
     // Test-only pause point, after the merger's upsert, with its claimed
     // delta rows and its groups locked. See `super::interleave`.
@@ -327,6 +411,7 @@ pub async fn merge_deltas(
         claimed,
         written,
         deleted,
+        skipped: false,
     })
 }
 
@@ -630,10 +715,7 @@ async fn building(pool: &Pool) -> Result<Vec<(i64, String)>, ChunkQueueError> {
 async fn has_deltas(pool: &Pool, target: &str) -> Result<bool, ChunkQueueError> {
     let deltas = ddl::qualified_target_table_ident(&crate::defs::ledger::deltas_table_name(target));
     let client = pool.get().await?;
-    match client
-        .query_one(&format!("select exists (select 1 from {deltas})"), &[])
-        .await
-    {
+    match client.query_one(&any_delta_sql(&deltas), &[]).await {
         Ok(row) => Ok(row.get(0)),
         Err(err) if super::quarantine::is_undefined_table(&err) => Ok(false),
         Err(err) => Err(err.into()),
@@ -913,14 +995,75 @@ async fn merge_once(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
         }
         Err(err) => return Err(build_error(err)),
     };
+    if outcome.skipped {
+        // Another worker is merging this target: leave it to that one.
+        txn.rollback().await?;
+        return Ok(0);
+    }
     let started = Instant::now();
     txn.commit().await?;
     metrics::record_build_statement(BuildStatement::MergeCommit, started.elapsed());
     metrics::record_build_merge(u64::try_from(outcome.claimed).unwrap_or(0));
+    if vacuum_due(id, outcome.claimed) {
+        let started = Instant::now();
+        let deltas = &plan.ledger.deltas_ident;
+        if let Err(err) = vacuum_deltas(&**client, deltas).await {
+            tracing::debug!(table = %deltas, error = %err, "vacuuming a group-delta table failed");
+        }
+        metrics::record_build_statement(BuildStatement::MergeVacuum, started.elapsed());
+    }
     if outcome.claimed < MERGE_BATCH {
         try_complete(pool, id).await?;
     }
     Ok(outcome.claimed)
+}
+
+/// The delta rows one process merges into a target between its vacuums of
+/// the target's delta table (#625 F2b).
+///
+/// A merger's claim walks the claim key's index from its oldest entry, and
+/// every row merged since the table's last vacuum leaves a dead entry there
+/// (killed on the first walk, but still on its leaf page until a vacuum
+/// removes it). Autovacuum comes at most once per `autovacuum_naptime`, a
+/// minute by default, which at a merger's ~200,000 rows/s is ~12M dead
+/// entries and ~60 ms of walking per claim. Vacuuming every this many rows
+/// keeps the walk under ~300 leaf pages, at the cost of one vacuum (the
+/// pages changed since the last one, and the index) per 20 merges.
+pub const VACUUM_EVERY: i64 = 20 * MERGE_BATCH;
+
+/// Counts `claimed` rows merged into definition `id`'s target by this
+/// process, and says whether that brings it to [`VACUUM_EVERY`] since its
+/// last vacuum (and restarts the count if so). A per-process count: each
+/// process vacuums after its own merges, and a restart only delays the next
+/// vacuum.
+fn vacuum_due(id: i64, claimed: i64) -> bool {
+    static MERGED: LazyLock<Mutex<HashMap<i64, i64>>> = LazyLock::new(Mutex::default);
+    let mut merged = MERGED.lock().unwrap_or_else(PoisonError::into_inner);
+    let since = merged.entry(id).or_insert(0);
+    *since += claimed;
+    if *since < VACUUM_EVERY {
+        return false;
+    }
+    *since = 0;
+    true
+}
+
+/// Vacuums the delta table `deltas` (quoted, qualified), outside any
+/// transaction. The caller treats it as best-effort: a failure costs only
+/// the next claims' walk (see [`VACUUM_EVERY`]). It skips the table rather
+/// than wait if another vacuum holds it, always cleans the index (a vacuum
+/// that bypassed index cleanup would leave the dead entries the claim
+/// walks), and never truncates, so it never takes the lock that would make a
+/// chunk's delta insert wait.
+async fn vacuum_deltas(
+    client: &impl GenericClient,
+    deltas: &str,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute(&format!(
+            "vacuum (skip_locked, index_cleanup on, truncate false) {deltas}"
+        ))
+        .await
 }
 
 /// Moves definition `id` `backfilling -> live` once its Re-derive build is
@@ -992,12 +1135,64 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
     }
     let deltas =
         ddl::qualified_target_table_ident(&crate::defs::ledger::deltas_table_name(&target));
-    match client
-        .query_one(&format!("select not exists (select 1 from {deltas})"), &[])
-        .await
-    {
-        Ok(row) => Ok(row.get(0)),
+    match client.query_one(&any_delta_sql(&deltas), &[]).await {
+        Ok(row) => Ok(!row.get::<_, bool>(0)),
         Err(err) if super::quarantine::is_undefined_table(&err) => Ok(false),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// One statement: whether the delta table `deltas` (quoted, qualified) has
+/// a row visible to it. It reads the oldest row through the claim key's
+/// index (#625 F2b): an `exists` over the table would scan the heap from
+/// block 0, past every page the mergers emptied.
+fn any_delta_sql(deltas: &str) -> String {
+    let seq = quote_ident(crate::defs::ledger::DELTA_SEQ_COLUMN);
+    format!("select (select {seq} from {deltas} order by {seq} limit 1) is not null")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_process_vacuums_a_target_every_vacuum_every_merged_rows() {
+        // Ids no other test uses: the count is process-wide.
+        let (a, b) = (-6_251, -6_252);
+        assert!(!vacuum_due(a, VACUUM_EVERY - 1));
+        assert!(!vacuum_due(b, VACUUM_EVERY - 1));
+        assert!(vacuum_due(a, 1), "a reaches the threshold");
+        assert!(!vacuum_due(a, VACUUM_EVERY - 1), "and counts again from 0");
+        assert!(vacuum_due(b, MERGE_BATCH), "b counts on its own");
+    }
+
+    #[tokio::test]
+    async fn the_delta_vacuum_runs_on_an_indexed_queue() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("pool");
+        client
+            .batch_execute(
+                "create table public.q (__seq bigint generated always as identity, g int); \
+                 create index on public.q (__seq); \
+                 insert into public.q (g) select i from generate_series(1, 1000) i; \
+                 delete from public.q where __seq <= 900",
+            )
+            .await
+            .expect("a queue with dead rows");
+        vacuum_deltas(&**client, "public.q")
+            .await
+            .expect("vacuum the queue");
+        // A vacuum records the live rows it counted in `pg_class` as it
+        // finishes (an analyze would too, and nothing ran one).
+        let reltuples: f32 = client
+            .query_one(
+                "select reltuples from pg_class where oid = 'public.q'::regclass",
+                &[],
+            )
+            .await
+            .expect("read the table's row count")
+            .get(0);
+        assert_eq!(reltuples, 100.0, "the vacuum counted the live rows");
     }
 }

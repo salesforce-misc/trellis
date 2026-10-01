@@ -387,7 +387,7 @@ pub(crate) struct LedgerTargetPlan {
     ledger_ident: String,
     /// The target's group deltas (#625 F1), which only a build chunk and the
     /// merger ([`super::build`]) read or write.
-    deltas_ident: String,
+    pub(crate) deltas_ident: String,
     /// The source's qualified identity, for the Re-derive read.
     source_table: String,
     source_pk: Vec<PrimaryKeyColumn>,
@@ -1021,10 +1021,19 @@ pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: 
 
 /// The merger's one statement (#625 F1; called from [`super::build`]):
 /// claims up to `$1` of the target's delta rows that no other merger holds,
-/// deletes them, sums them per group and upserts the sums in group order,
-/// as Apply's statement does. Returns one row per written group, each
-/// [`GroupUpsert`]'s columns after the count of rows claimed, or one row
-/// with only that count when no group was written.
+/// oldest first through the claim key's index (F2b), deletes them, sums them
+/// per group and upserts the sums in group order, as Apply's statement does.
+/// Returns one row per written group, each [`GroupUpsert`]'s columns after
+/// the count of rows claimed, or one row with only that count when no group
+/// was written.
+///
+/// The caller runs it with nested loops and sequential scans off
+/// (`super::build::merge_deltas`). The claim's row estimate comes from the
+/// delta table's statistics, which a queue's churn leaves meaningless: an
+/// autoanalyze that samples a mostly-dead heap records `reltuples = 0`, the
+/// planner then expects one claimed row, and joins the upsert's result back
+/// to the group sums (`up join d`) in a nested loop that is quadratic in the
+/// batch (#625 F2b: 1.8 s instead of 25 ms for 5,000 rows).
 pub(super) fn merge_statement(plan: &LedgerTargetPlan, image_columns: Option<&[String]>) -> String {
     let shape = &plan.shape;
     let (groups, _) = entry_columns(shape);
@@ -1047,7 +1056,8 @@ pub(super) fn merge_statement(plan: &LedgerTargetPlan, image_columns: Option<&[S
     format!(
         "with gone as ( \
              delete from {deltas} where ctid = any(array( \
-                 select ctid from {deltas} limit $1 for update skip locked)) \
+                 select ctid from {deltas} order by {seq} limit $1 \
+                 for update skip locked)) \
              returning * \
          ), \
          d as ( \
@@ -1060,6 +1070,7 @@ pub(super) fn merge_statement(plan: &LedgerTargetPlan, image_columns: Option<&[S
          from (select count(*) as __claimed from gone) c \
          left join ({select}) w on true",
         deltas = plan.deltas_ident,
+        seq = quote_ident(schema::DELTA_SEQ_COLUMN),
         g_groups = prefixed(&groups, "g"),
         g_gk = ddl::pk_key_sql_expr(&plan.identity, Some("g")),
         sums = sums.join(", "),
