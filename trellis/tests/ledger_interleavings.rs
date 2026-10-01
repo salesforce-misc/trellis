@@ -1794,8 +1794,9 @@ async fn an_out_of_order_drain_holds_gc_back_aggregate_min_max() {
 /// GC under a concurrent re-insert of a deleted key: the re-insert's page is
 /// frozen after its placeholder insert, which found key 1's tombstone and
 /// so inserted nothing. The GC collects that tombstone before the page's
-/// entry lock, which then finds no entry for key 1 and must take the lock
-/// again, placeholders first, or the re-insert is lost. The same page holds
+/// entry lock, which then finds no entry for key 1: the page must roll
+/// back and retry, inserting key 1's placeholder afresh (#712), or the
+/// re-insert is lost. The same page holds
 /// an update of key 3 older than key 3's delete, drained in the batch above
 /// it, so key 3's tombstone must outlive the GC.
 async fn gc_under_a_concurrent_reinsert(flavour: Flavour) {
@@ -1843,17 +1844,17 @@ async fn gc_under_a_concurrent_reinsert_aggregate_min_max() {
     gc_under_a_concurrent_reinsert(Flavour::AggregateMinMax).await;
 }
 
-/// The entry lock's retake keeps I5's one global order (#712). Page A
-/// (batch 2) is frozen after its placeholder insert, which found key 2's
-/// tombstone and so inserted nothing. The GC collects that tombstone, and
-/// page B (batch 3, on the same keys) inserts key 2's placeholder in its
-/// place and is frozen there. A then locks key 1, finds no entry for key 2
-/// and takes the lock again, and its placeholder insert for key 2 queues on
-/// B's uncommitted one. Released, B's lock queues on key 1. Had A kept key
-/// 1's lock across the retake, that is a deadlock; A gives it back before
-/// inserting again, so B goes first and A follows.
+/// A page whose entry lock loses a key to the GC keeps I5's one global
+/// order (#712). Page A (batch 2) is frozen after its placeholder insert,
+/// which found key 2's tombstone and so inserted nothing. The GC collects
+/// that tombstone, and page B (batch 3, on the same keys) inserts key 2's
+/// placeholder in its place and is frozen there. A then locks key 1, finds
+/// no entry for key 2, rolls back and retries, and its retry's placeholder
+/// insert for key 2 queues on B's uncommitted one. Released, B locks key 1.
+/// Had A kept key 1's lock while inserting key 2's placeholder again, that
+/// is a deadlock; A gives it back first, so B goes first and A follows.
 #[tokio::test]
-async fn a_retaken_entry_lock_never_deadlocks() {
+async fn an_entry_lost_to_the_gc_never_deadlocks() {
     let flavour = Flavour::Aggregate;
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
     write(&d, "delete from public.src where id = 2").await;

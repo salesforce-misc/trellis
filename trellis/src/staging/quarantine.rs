@@ -201,7 +201,9 @@ pub(super) fn is_claim_lost(err: &ApplyError) -> bool {
 /// both to [`crate::error_code::ErrorCode::Connectivity`]. A pool timeout
 /// (waiting for a free connection, creating one, or recycling one) is
 /// transient too, since it is load or a briefly unreachable server, not
-/// anything a record did.
+/// anything a record did. So is [`ApplyError::LedgerEntryCollected`], a
+/// ledger entry lock that lost a key to the tombstone GC (#712), whose
+/// retry finds the key gone and inserts it afresh.
 fn is_transient(err: &ApplyError) -> bool {
     is_transient_error(err)
 }
@@ -212,6 +214,9 @@ fn is_transient(err: &ApplyError) -> bool {
 pub(crate) fn is_transient_error(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = link {
+        if let Some(ApplyError::LedgerEntryCollected { .. }) = err.downcast_ref::<ApplyError>() {
+            return true;
+        }
         if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
             return is_transient_sqlstate(pg.code())
                 || crate::error_code::classify_pg_error(pg)
@@ -3952,6 +3957,22 @@ mod unit_tests {
         for (name, err) in wrapped {
             assert_eq!(classify(&err), FailureClass::Transient, "{name}");
         }
+    }
+
+    /// #712: an entry lock that lost a key to the tombstone GC is retried
+    /// uncharged, bare or wrapped, by the drain (`classify`) and by a
+    /// backfill chunk (`is_transient_error`).
+    #[test]
+    fn a_collected_ledger_entry_is_transient() {
+        use crate::defs::backfill::BackfillError;
+        let collected = || ApplyError::LedgerEntryCollected {
+            target: "public.agg".to_string(),
+        };
+        let wrapped = ApplyError::Backfill(BackfillError::Propagation(Box::new(collected())));
+        assert_eq!(classify(&collected()), FailureClass::Transient);
+        assert_eq!(classify(&wrapped), FailureClass::Transient);
+        assert!(is_transient_error(&collected()));
+        assert!(is_transient_error(&wrapped));
     }
 
     #[test]

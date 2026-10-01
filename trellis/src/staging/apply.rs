@@ -155,6 +155,15 @@ pub enum ApplyError {
     /// [`super::liveness::release`]'s doc comment on why a fence miss is
     /// not parked behind the reclaim TTL.
     VersionFenceMiss { src_table: String },
+    /// The entry lock of a ledger target (`super::ledger::lock_entries`)
+    /// found a key with no entry: the tombstone GC
+    /// (`super::retire::collect_tombstones`, #623 D7) collected it between
+    /// the placeholder insert and the sorted `for update` (#712). Transient,
+    /// like a deadlock: the transaction rolls back, giving up every lock it
+    /// took, and its retry inserts the key's placeholder afresh. Retaking
+    /// the lock inside the transaction instead would insert that placeholder
+    /// while holding the other keys' locks, out of I5's one order.
+    LedgerEntryCollected { target: String },
     /// Downstream propagation would have staged a `Recompute` row past
     /// [`MAX_HOP_GEN`]. Named rather than silently truncated: an operator
     /// needs to know a wave ran away, and which target tables it ran away
@@ -258,6 +267,7 @@ impl ApplyError {
             ApplyError::Pool(err) => err.code(),
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
+            | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. } => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
@@ -306,6 +316,11 @@ impl fmt::Display for ApplyError {
                 f,
                 "source table '{src_table}' changed definitions mid-drain; retry against the \
                  current catalog"
+            ),
+            ApplyError::LedgerEntryCollected { target } => write!(
+                f,
+                "a ledger entry of '{target}' was collected while its lock was being taken; \
+                 retry the transaction"
             ),
             ApplyError::HopBoundExceeded { hop_gen, tables } => write!(
                 f,
@@ -368,6 +383,7 @@ impl std::error::Error for ApplyError {
             ApplyError::Intake(err) => Some(err),
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
+            | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::SourceTableDropped { .. }
             | ApplyError::ColumnNotPaused { .. }

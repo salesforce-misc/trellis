@@ -21,8 +21,10 @@ use std::sync::{Arc, Mutex};
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
+use trellis::staging::apply::ApplyError;
 use trellis::staging::build::{BuildPlan, ChunkOutcome};
 use trellis::staging::interleave::PausePoint;
+use trellis::staging::quarantine::{FailureClass, classify};
 
 const TARGET: &str = "public.agg";
 
@@ -764,7 +766,7 @@ async fn key_3_entry(d: &Driver) -> Option<(bool, Option<i64>)> {
         .map(|r| (r.get(0), r.get(1)))
 }
 
-// ------------------------------------------ the entry lock's retake (#712)
+// ------------------------------- an entry the GC collects mid-lock (#712)
 
 /// A build whose ledger holds key 2's tombstone, already collectible, and
 /// whose source has key 2 back: every key chunked, key 2 deleted and
@@ -788,17 +790,18 @@ async fn start_retake(flavour: Flavour) -> (Driver, BuildPlan, i64) {
     (d, plan, batch)
 }
 
-/// A page retaking its entry lock gives back the lock it already holds
-/// before inserting a placeholder again, so a chunk that took the collected
-/// key's placeholder in the meantime gets every lock it asks for. The page
-/// (keys 1 and 2) is frozen after its placeholder insert, which found key
-/// 2's tombstone. The GC collects it, and the chunk (keys 1 to 3) inserts
-/// key 2's placeholder and is frozen there. The page locks key 1, finds no
-/// entry for key 2, retakes, and queues on the chunk's placeholder; then
-/// the chunk locks its keys. Had the page kept key 1's lock, the chunk would
-/// queue on it: a deadlock, or the chunk giving up at its lock timeout.
+/// A page whose entry lock loses a key to the GC gives up every lock it
+/// holds before inserting that key's placeholder again, so a chunk that
+/// took the placeholder in the meantime gets every lock it asks for. The
+/// page (keys 1 and 2) is frozen after its placeholder insert, which found
+/// key 2's tombstone. The GC collects it, and the chunk (keys 1 to 3)
+/// inserts key 2's placeholder and is frozen there. The page locks key 1,
+/// finds no entry for key 2, rolls back and retries, and its retry queues on
+/// the chunk's placeholder; then the chunk locks its keys. Had the page kept
+/// key 1's lock, the chunk would queue on it: a deadlock, or the chunk giving
+/// up at its lock timeout.
 #[tokio::test]
-async fn a_page_retaking_its_entry_lock_never_deadlocks_with_a_chunk() {
+async fn a_page_losing_an_entry_to_the_gc_never_deadlocks_with_a_chunk() {
     let flavour = Flavour::Sum;
     let (mut d, plan, batch) = start_retake(flavour).await;
     let mut page = d
@@ -822,15 +825,12 @@ async fn a_page_retaking_its_entry_lock_never_deadlocks_with_a_chunk() {
     assert_oracle(&mut d, &plan, flavour).await;
 }
 
-/// A chunk retaking its entry lock keeps its own short lock timeout: the
-/// savepoint the retake rolls back to is taken after the chunk set it. The
-/// chunk (keys 1 to 3) is frozen after its placeholder insert, which found
-/// key 2's tombstone. The GC collects it, and a page inserts key 2's
-/// placeholder and is frozen there, holding it. The chunk retakes, queues
-/// on that placeholder, and gives up at its own timeout rather than the
-/// page session's two minutes.
+/// A chunk whose entry lock loses a key to the GC gives up with a transient
+/// error, to be retried, rather than re-derive its range with that key
+/// unlocked. The chunk (keys 1 to 3) is frozen after its placeholder
+/// insert, which found key 2's tombstone, and the GC collects it.
 #[tokio::test]
-async fn a_chunk_retaking_its_entry_lock_keeps_its_lock_timeout() {
+async fn a_chunk_losing_an_entry_to_the_gc_gives_up_transiently() {
     let flavour = Flavour::Sum;
     let (mut d, plan, batch) = start_retake(flavour).await;
     let mut chunk = d
@@ -838,21 +838,14 @@ async fn a_chunk_retaking_its_entry_lock_keeps_its_lock_timeout() {
         .await;
     chunk.reached(PausePoint::AfterPlaceholders).await;
     assert_eq!(d.collect_tombstones().await, 1, "key 2's tombstone goes");
-    let mut page = d
-        .drain_frozen(batch, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
-        .await;
-    page.reached(PausePoint::AfterPlaceholders).await;
     d.release(&mut chunk, PausePoint::AfterPlaceholders).await;
-    let err = tokio::time::timeout(std::time::Duration::from_secs(30), chunk.finish_result())
-        .await
-        .expect("the chunk gives up at its own lock timeout, not the session's")
-        .expect_err("the chunk gives up on key 2");
+    let err = chunk.finish_result().await.expect_err("key 2 has no entry");
     assert!(
-        trellis::locks::is_lock_not_available(&err),
-        "a lock timeout, not {err}"
+        matches!(err, ApplyError::LedgerEntryCollected { .. }),
+        "the entry was collected, not {err}"
     );
-    d.release(&mut page, PausePoint::AfterPlaceholders).await;
-    page.finish().await;
+    assert_eq!(classify(&err), FailureClass::Transient);
+    d.drain(batch, "page").await;
     assert_eq!(d.chunk(&plan, None, "3").await.keys, 3);
     assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
     assert_oracle(&mut d, &plan, flavour).await;

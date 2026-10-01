@@ -144,7 +144,9 @@ pub struct ChunkOutcome {
 ///
 /// A lock wait past [`CHUNK_LOCK_TIMEOUT`] fails the chunk with `55P03`
 /// (`crate::locks::is_lock_not_available`), and the caller rolls back and
-/// retries it later.
+/// retries it later. So does an entry the tombstone GC collects while the
+/// chunk takes its lock ([`ApplyError::LedgerEntryCollected`], #712). Both
+/// are transient (`crate::staging::quarantine::classify`).
 ///
 /// The range predicate is the 1-1 build's row comparison, which admits a key
 /// with a `NULL` part when an earlier part decides it. Only a source keyed
