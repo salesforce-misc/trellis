@@ -572,9 +572,10 @@ Three things a poll needs to handle:
   keep running. Put the column back (or redefine the transform) and `RESUME
   TRANSFORM <target>` rebuilds it; renaming a primary-key column, or
   redefining the primary key, pauses every transform on the table.
-* **`quarantined` can come before `live`.** The fuse can trip once apply
-  maintains a transform, which starts at `catching_up`, so a transform can
-  go from `catching_up` to `quarantined` without ever reporting `live`. Its
+* **`quarantined` can come before `live`.** The fuse can trip while a
+  plain 1-1 transform's build quarantines rows that fail (`backfilling`),
+  and once apply maintains a transform, which starts at `catching_up`, so a
+  transform can reach `quarantined` without ever reporting `live`. Its
   target holds what the build wrote, and it won't move again on its own:
   `quarantined` and `sample_quarantined` show which rows failed and why, and
   `RESUME TRANSFORM <target>` rebuilds it from `waiting_to_backfill` once the
