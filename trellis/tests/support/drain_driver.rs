@@ -46,9 +46,10 @@ pub async fn connect(dsn: &str) -> Client {
     client
 }
 
+/// Fields drop in declaration order: the clients first, then the database,
+/// then the cluster, so `TestDatabase::drop`'s `dropdb` runs against a live
+/// server instead of retrying against a stopped one and leaking.
 pub struct Driver {
-    pub cluster: TestCluster,
-    pub db: TestDatabase,
     /// Seals, stages recomputes and reads the oracle. Never frozen and never
     /// holds a pause lock.
     pub ctl: Client,
@@ -56,6 +57,8 @@ pub struct Driver {
     /// else, so it can never be part of a deadlock cycle.
     gate: Client,
     next_lock: AtomicI64,
+    pub db: TestDatabase,
+    pub cluster: TestCluster,
 }
 
 impl Driver {
