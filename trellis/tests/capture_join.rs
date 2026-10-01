@@ -1018,6 +1018,13 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending anywhere in the ring: the hand-driven stand-in for a running
 /// client's maintenance loop and drain workers (as in `alter_transform.rs`).
+///
+/// Each round drains every claimable segment, as a drain worker does, not
+/// only the one it just sealed: a test that ran a `Client` first can inherit
+/// a segment that client's maintenance loop sealed just before `shutdown`,
+/// which its drain worker never claimed. Nothing newer retires past an
+/// undrained segment, so draining only its own seals would leave each round
+/// taking a fresh ring slot until a seal is refused `RingFull`.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
     let watermark = StagedWatermark::saturated();
@@ -1026,18 +1033,29 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
         seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_join_wake")
             .await
             .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_join_test",
-            1,
-            "trellis_capture_join_test",
-            &watermark,
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
+        while let Some(&seg_seq) = apply::next_claimable_segments(&*client, 1)
+            .await
+            .expect("next claimable segments")
+            .first()
+        {
+            // `None`: another claimant holds what's left of it. Nothing runs
+            // beside this helper, so stop rather than spin; `has_pending`
+            // below then fails the round loop.
+            if apply::drain_once(
+                pool,
+                seg_seq,
+                "capture_join_test",
+                1,
+                "trellis_capture_join_test",
+                &watermark,
+            )
+            .await
+            .expect("drain_once")
+            .is_none()
+            {
+                break;
+            }
+        }
         retire_drained_segments(client)
             .await
             .expect("retire drained segments");
@@ -1046,6 +1064,59 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
         }
     }
     panic!("the ring did not reach quiescence within 16 seal/drain rounds");
+}
+
+/// `drain_to_quiescence` drains a segment it didn't seal itself. A running
+/// `Client`'s maintenance loop can seal one just before `shutdown` lands,
+/// after its drain worker's last claim (#714's CI failure, in
+/// `an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen`).
+/// Left sealed, it keeps every newer segment from retiring, so the helper's
+/// own seals fill the ring and the next one is refused `RingFull`.
+#[tokio::test]
+async fn drain_to_quiescence_drains_a_segment_sealed_before_it_ran() {
+    use trellis::staging::seal;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.u (id int primary key, a int, b int); \
+         insert into public.u select g, g, 10 * g from generate_series(1, 3) g;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tu FROM public.u SELECT a AS a")
+        .await
+        .expect("define");
+    bring_live(&mut raw, &db.pool, "tu").await;
+
+    raw.batch_execute("update public.u set a = a + 100")
+        .await
+        .expect("write");
+    // The seal a shut-down client's maintenance loop left behind: nothing
+    // ever claims it.
+    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, outcome.sealed_seg_seq, "capture_join_wake")
+        .await
+        .expect("seal phase 2");
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    let (undrained, wrong): (i64, i64) = {
+        let row = raw
+            .query_one(
+                "select (select count(*) from segments where state not in ('active', 'drained')), \
+                        (select count(*) from public.u s left join public.tu t using (id) \
+                         where t.a is distinct from s.a)",
+                &[],
+            )
+            .await
+            .expect("read the outcome");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(undrained, 0, "every sealed segment drained");
+    assert_eq!(wrong, 0, "the target equals the source");
 }
 
 /// Whether `tu.b2`'s pause waits for a capture that images its column.
