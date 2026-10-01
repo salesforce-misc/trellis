@@ -699,3 +699,197 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
         "the old build's target equals its oracle"
     );
 }
+
+/// A worker that dies after a chunk's or a merge's commit, before its own
+/// flip check, leaves a finished build `backfilling`; the next worker step
+/// that finds nothing to claim makes the flip (`work_once`'s idle check).
+#[tokio::test]
+async fn a_flip_missed_by_a_dead_worker_is_made_by_the_next_idle_step() {
+    let mut f = Fixture::new(30, &[AGG]).await;
+    f.pass().await;
+    assert_eq!(f.step(&OPTIONS).await, Step::Planned);
+    let pool = &f.db.pool;
+    let plan = BuildPlan::load(pool, "agg")
+        .await
+        .expect("load")
+        .expect("a re-derive shape");
+
+    // Every chunk and the merge, each committed by a worker that dies before
+    // it checks for the flip.
+    loop {
+        let claimed = {
+            let client = pool.get().await.expect("pool");
+            chunk_queue::claim_chunks_of(&**client, "dying", 1, &[chunk_queue::KIND_REDERIVE])
+                .await
+                .expect("claim")
+        };
+        let Some(chunk) = claimed.into_iter().next() else {
+            break;
+        };
+        let ChunkWork::Rederive { lo, hi } = &chunk.work else {
+            panic!("claimed {:?}", chunk.work);
+        };
+        let mut client = pool.get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        build::run_chunk(&txn, &plan, lo.as_deref(), hi)
+            .await
+            .expect("the chunk writes");
+        txn.execute(
+            "update backfill_chunks set done = true, claimed_by = null where id = $1",
+            &[&chunk.id],
+        )
+        .await
+        .expect("mark the chunk done");
+        txn.commit().await.expect("commit the chunk");
+    }
+    {
+        let mut client = pool.get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        build::merge_deltas(&txn, &plan, 10_000)
+            .await
+            .expect("merge");
+        txn.commit().await.expect("commit the merge");
+    }
+    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
+    assert_eq!(
+        f.status("agg").await.as_deref(),
+        Some("backfilling"),
+        "nobody checked for the flip"
+    );
+
+    assert_eq!(f.step(&OPTIONS).await, Step::Completed);
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    assert_eq!(f.build("agg").await, None);
+    f.assert_agg_oracle().await;
+}
+
+/// The start waits out its source's capture gate (#625 Q2(a)): while a
+/// change the old, narrower capture function staged is still pending, a
+/// definition that needs the widened column stays `waiting_to_backfill`,
+/// and the pass after that change drains starts it.
+#[tokio::test]
+async fn the_start_waits_for_the_widens_capture_gate() {
+    const COUNTS: &str = "TRANSFORM cnt FROM public.src GROUP BY g SELECT COUNT(*) AS n";
+    let mut f = Fixture::new(50, &[COUNTS]).await;
+    f.pass().await;
+    f.run("cnt").await;
+    assert_eq!(f.status("cnt").await.as_deref(), Some("live"));
+
+    // Staged by the capture function `cnt` needs, which doesn't image `v`,
+    // and left in the ring.
+    f.raw
+        .batch_execute("update public.src set v = v + 1000 where id = 3")
+        .await
+        .expect("write before the widen");
+    let columns = [
+        ("id".to_string(), ValueType::Numeric),
+        ("g".to_string(), ValueType::Numeric),
+        ("v".to_string(), ValueType::Numeric),
+    ]
+    .into_iter()
+    .collect();
+    trellis::defs::install_definition(&f.db.pool, AGG, &columns, "public")
+        .await
+        .expect("register a definition that reads v");
+
+    f.pass().await;
+    assert_eq!(
+        f.status("agg").await.as_deref(),
+        Some("waiting_to_backfill"),
+        "the widen's gate holds the start while the old-body row is pending"
+    );
+    assert_eq!(f.build("agg").await, None);
+    assert_eq!(
+        f.count(
+            "select count(*) from backfill_chunks c join transform_definitions d \
+             on d.id = c.definition_id where d.target_table = 'public.agg'"
+        )
+        .await,
+        0,
+        "no plan job yet"
+    );
+
+    f.drain().await;
+    f.pass().await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// A definition paused part-way through its Re-derive build and resumed has
+/// ledger entries, some for keys deleted while it was paused, which only
+/// #625 F3's sweep would retire. So it goes to the old build, which empties
+/// the ledger and the delta table, and `build` is cleared at the resume.
+#[tokio::test]
+async fn a_build_resumed_with_entries_takes_the_old_build() {
+    let mut f = Fixture::new(100, &[AGG]).await;
+    f.pass().await;
+    for _ in 0..4 {
+        f.drain().await;
+        f.step(&OPTIONS).await;
+    }
+    assert!(
+        f.count("select count(*) from public.agg__ledger").await > 0,
+        "some chunks ran"
+    );
+    let trellis = f.trellis().await;
+    trellis
+        .apply("PAUSE TRANSFORM agg")
+        .await
+        .expect("pause the building transform");
+    // Deleted while paused: the entries of the keys the first chunks re-derived
+    // stay live.
+    f.raw
+        .batch_execute("delete from public.src where id <= 15")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+
+    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+    assert_eq!(
+        f.status("agg").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    assert_eq!(f.build("agg").await, None, "a resume clears `build`");
+
+    f.pass().await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("agg").await, None, "the old build took it");
+    let pool = f.db.pool.clone();
+    let job = {
+        let client = pool.get().await.expect("pool");
+        chunk_queue::claim_chunks(&**client, "old", 1)
+            .await
+            .expect("claim the direct build")
+            .into_iter()
+            .next()
+            .expect("the direct build job")
+    };
+    assert_eq!(job.work, ChunkWork::DirectBuild);
+    chunk_queue::run_claimed_chunk(
+        &pool,
+        &job,
+        "old",
+        Duration::from_secs(1),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("run the direct build");
+    chunk_queue::finish_chunk(&pool, &job, "old")
+        .await
+        .expect("finish the direct build");
+    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
+    for _ in 0..3 {
+        f.pass().await;
+        f.drain().await;
+    }
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.step(&OPTIONS).await,
+        Step::Idle,
+        "nothing of the re-derive build is left"
+    );
+    f.assert_agg_oracle().await;
+}

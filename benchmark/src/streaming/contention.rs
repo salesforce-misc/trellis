@@ -182,8 +182,9 @@ pub enum BuildClass {
     /// A chunk's entry lock: the placeholder insert and the sorted
     /// `for update`.
     ChunkLock,
-    /// The rest of a chunk: its key read, its read-and-write statement (the
-    /// entries and the delta insert) and its commit.
+    /// The rest of a chunk's transaction: its claim fence, its key read, its
+    /// read-and-write statement (the entries and the delta insert), its done
+    /// mark and its commit.
     ChunkWrite,
     /// A merger pass: the claim, sum and group upsert, the all-zero delete
     /// and the seam.

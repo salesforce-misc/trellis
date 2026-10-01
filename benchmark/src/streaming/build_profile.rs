@@ -5,10 +5,14 @@
 //! across the window like every other scrape here ([`super::scrape`]):
 //!
 //! - worker-seconds per build statement class
-//!   (`trellis_build_statement_seconds{class}`'s `_sum`): the chunk's key
-//!   read, entry lock, read-and-write (its one statement, which also inserts
-//!   the deltas) and commit, and the merger's upsert, finish and commit, plus
-//!   the plan job. Per 10k built rows, they are the profile's cost split;
+//!   (`trellis_build_statement_seconds{class}`'s `_sum`): the chunk's setup
+//!   (its catalog reads, begin and claim fence), key read, entry lock (a
+//!   lock that times out included), read-and-write (its one statement, which
+//!   also inserts the deltas) and commit, and the merger's setup, upsert,
+//!   finish and commit, plus the plan job. Per 10k built rows, they are the
+//!   profile's cost split, and their total is the build's worker time except
+//!   for the drain worker's scheduling reads between steps (which targets
+//!   are building, whether one has deltas, the backlog bound, the claim);
 //! - chunk transactions (`trellis_build_chunk_seconds`): how many, and p50
 //!   and p99 read off the histogram's buckets (about 25% apart, so each is
 //!   the upper bound of the bucket it falls in), and the max

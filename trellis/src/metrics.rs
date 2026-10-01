@@ -159,6 +159,10 @@ const BUILD_CHUNK_BUCKETS: &[f64] = &[
 /// `class` label (#625 F2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildStatement {
+    /// A chunk's catalog reads before its transaction's work: its
+    /// definition and target plan, a pooled connection, the begin and its
+    /// claim fence.
+    ChunkSetup,
     /// A chunk's read of the keys in its range.
     ChunkKeys,
     /// A chunk's entry lock (placeholders, then the sorted `for update`).
@@ -168,6 +172,10 @@ pub enum BuildStatement {
     ChunkWrite,
     /// A chunk's commit, and marking it done.
     ChunkCommit,
+    /// A merger pass's catalog reads before its upsert: its definition and
+    /// target plan, a pooled connection, the begin and the definition row's
+    /// `for key share`.
+    MergeSetup,
     /// The merger's claim, delete, sum and group upsert (one statement).
     MergeUpsert,
     /// The merger's all-zero group delete and the seam.
@@ -180,11 +188,13 @@ pub enum BuildStatement {
 
 impl BuildStatement {
     /// Every class, in label order.
-    pub const ALL: [BuildStatement; 8] = [
+    pub const ALL: [BuildStatement; 10] = [
+        BuildStatement::ChunkSetup,
         BuildStatement::ChunkKeys,
         BuildStatement::ChunkLock,
         BuildStatement::ChunkWrite,
         BuildStatement::ChunkCommit,
+        BuildStatement::MergeSetup,
         BuildStatement::MergeUpsert,
         BuildStatement::MergeFinish,
         BuildStatement::MergeCommit,
@@ -194,10 +204,12 @@ impl BuildStatement {
     /// The `class` label.
     pub fn label(self) -> &'static str {
         match self {
+            BuildStatement::ChunkSetup => "chunk_setup",
             BuildStatement::ChunkKeys => "chunk_keys",
             BuildStatement::ChunkLock => "chunk_lock",
             BuildStatement::ChunkWrite => "chunk_write",
             BuildStatement::ChunkCommit => "chunk_commit",
+            BuildStatement::MergeSetup => "merge_setup",
             BuildStatement::MergeUpsert => "merge_upsert",
             BuildStatement::MergeFinish => "merge_finish",
             BuildStatement::MergeCommit => "merge_commit",
@@ -556,6 +568,26 @@ mod tests {
         assert!(
             rendered.contains("le=\"0.25\""),
             "rendered output missing a LATENCY_BUCKETS boundary: {rendered}"
+        );
+    }
+
+    /// #625 F2: a build chunk's histogram renders with its own ~25% buckets,
+    /// not [`LATENCY_BUCKETS`], since the profile reads its percentiles off
+    /// them.
+    #[test]
+    fn build_chunk_seconds_render_with_their_own_buckets() {
+        record_build_chunk(Duration::from_millis(150), 10, 3);
+
+        let rendered = Metrics::new().render_prometheus();
+        for le in ["0.125", "0.16", "0.2"] {
+            assert!(
+                rendered.contains(&format!("{BUILD_CHUNK_METRIC}_bucket{{le=\"{le}\"}}")),
+                "missing the chunk histogram's {le} bound: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains(&format!("{BUILD_CHUNK_MAX_METRIC} ")),
+            "missing the chunk max gauge: {rendered}"
         );
     }
 

@@ -228,17 +228,24 @@ pub async fn run_chunk(
     }
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
 
-    // 2. The entry lock, under the chunk's own short lock timeout.
+    // 2. The entry lock, under the chunk's own short lock timeout. Its time
+    // is recorded whether or not the lock is had: a chunk that gives up
+    // spent it waiting all the same.
     let started = Instant::now();
-    let previous: String = txn
-        .query_one("select current_setting('lock_timeout')", &[])
-        .await?
-        .get(0);
-    crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
-    ledger::lock_entries(txn, ledger, &key_refs, false).await?;
-    txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
-        .await?;
+    let locked = async {
+        let previous: String = txn
+            .query_one("select current_setting('lock_timeout')", &[])
+            .await?
+            .get(0);
+        crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+        ledger::lock_entries(txn, ledger, &key_refs, false).await?;
+        txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
+            .await?;
+        Ok::<_, ApplyError>(())
+    }
+    .await;
     metrics::record_build_statement(BuildStatement::ChunkLock, started.elapsed());
+    locked?;
 
     // 3. The read, the entries and the deltas, in one statement.
     let started = Instant::now();
@@ -713,6 +720,7 @@ async fn run_rederive(
     hi: &str,
     options: &WorkerOptions,
 ) -> Result<(), ChunkQueueError> {
+    let setup_started = Instant::now();
     let definition = catalog::definition_by_id(pool, chunk.definition_id)
         .await?
         .ok_or(ChunkQueueError::DefinitionNotFound {
@@ -748,6 +756,7 @@ async fn run_rederive(
         txn.rollback().await?;
         return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
     }
+    metrics::record_build_statement(BuildStatement::ChunkSetup, setup_started.elapsed());
     let outcome = run_chunk(&txn, &plan, lo, hi).await.map_err(build_error)?;
     let commit_started = Instant::now();
     txn.execute(
@@ -866,6 +875,7 @@ async fn run_plan(
 /// pass quietly. Then [`try_complete`] when the pass drained the table.
 /// Returns how many delta rows it folded.
 async fn merge_once(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
+    let setup_started = Instant::now();
     let Some(definition) = catalog::definition_by_id(pool, id).await? else {
         return Ok(0);
     };
@@ -893,6 +903,7 @@ async fn merge_once(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
         txn.rollback().await?;
         return Ok(0);
     }
+    metrics::record_build_statement(BuildStatement::MergeSetup, setup_started.elapsed());
     let outcome = match merge_deltas(&txn, &plan, MERGE_BATCH).await {
         Ok(outcome) => outcome,
         Err(ApplyError::Db(err)) if super::quarantine::is_undefined_table(&err) => {

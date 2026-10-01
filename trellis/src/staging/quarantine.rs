@@ -2557,8 +2557,17 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // from folding (and their parked `poison_held` work remains releasable
     // via `release_key`), they just no longer count toward this transform's
     // fuse.
+    //
+    // `build = null` too (#625 F2): a definition paused during a Re-derive
+    // build is no longer under one. The staging worker's next pass starts a
+    // new one if it still qualifies (`staging::build::start_ready_builds`),
+    // and otherwise an old build takes it. Every old dispatch then sees
+    // `build` null, the ring enumeration's `go_live` included, so a resumed
+    // definition never ends `live` still marked as building, which
+    // `catalog::table_has_reader` would skip.
     txn.execute(
-        "update transform_definitions set status = $1, fuse_rearmed_at = now() where id = $2",
+        "update transform_definitions \
+         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;
