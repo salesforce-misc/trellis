@@ -99,25 +99,19 @@ pub(crate) fn qualified_deltas_table(target_schema: &str, target: &str) -> Strin
     )
 }
 
-/// Empties a target's group-delta table, `qualified_deltas` (quoted), if it
-/// has one: the deltas go wherever the ledger is emptied (#625 F1's B4), since
-/// each records a move between entries the emptying discards. A target the
-/// ledger path doesn't route has none, and neither does one created before
-/// #625 F1.
+/// Empties a target's group-delta table, `qualified_deltas` (quoted): the
+/// deltas go wherever the ledger is emptied (#625 F1's B4), since each
+/// records a move between entries the emptying discards. Only a target
+/// `staging::ledger::route` sends to the ledger has one
+/// ([`super::ddl::aggregate_target_table_ddl`]), so the caller asks `route`
+/// first, as the DDL did.
 pub(crate) async fn truncate_deltas(
     client: &impl tokio_postgres::GenericClient,
     qualified_deltas: &str,
 ) -> Result<(), tokio_postgres::Error> {
-    let exists: bool = client
-        .query_one("select to_regclass($1) is not null", &[&qualified_deltas])
-        .await?
-        .get(0);
-    if exists {
-        client
-            .batch_execute(&format!("truncate {qualified_deltas}"))
-            .await?;
-    }
-    Ok(())
+    client
+        .batch_execute(&format!("truncate {qualified_deltas}"))
+        .await
 }
 
 /// A delta row's member-count increment column.

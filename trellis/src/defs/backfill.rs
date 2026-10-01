@@ -1849,12 +1849,15 @@ async fn backfill_aggregate(
         }
         let horizon = load_emptied_ledger(&txn, &ledger, &ledger_sql).await?;
         // The group deltas recorded moves between the entries just discarded
-        // (#625 F1's B4).
-        super::ledger::truncate_deltas(
-            &*txn,
-            &super::ledger::qualified_deltas_table(target_schema, &def.target),
-        )
-        .await?;
+        // (#625 F1's B4). Only a ledger-routed target has them: a
+        // relationship-fed one (until #623 D5) builds here too, with none.
+        if crate::staging::ledger::route(def, source_columns).is_some() {
+            super::ledger::truncate_deltas(
+                &*txn,
+                &super::ledger::qualified_deltas_table(target_schema, &def.target),
+            )
+            .await?;
+        }
         txn.commit().await?;
         horizon
     };

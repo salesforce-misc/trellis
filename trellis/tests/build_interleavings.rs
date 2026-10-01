@@ -471,20 +471,6 @@ async fn a_transiently_negative_group_goes_once_merged() {
 
 // --------------------------------------------------------------- deadlocks
 
-/// Server-wide deadlocks so far, from `pg_stat_database`. A backend reports
-/// its counters when it goes idle, so this can lag a deadlock by a few
-/// seconds; [`Driver::deadlocks_logged`] is the exact check beside it.
-async fn deadlock_count(d: &Driver) -> i64 {
-    d.ctl
-        .query_one(
-            "select coalesce(sum(deadlocks), 0)::bigint from pg_stat_database",
-            &[],
-        )
-        .await
-        .expect("read pg_stat_database")
-        .get(0)
-}
-
 /// Two mergers on overlapping groups, and a page on the same groups, never
 /// deadlock: a merger claims delta rows without waiting (`skip locked`) and
 /// upserts its groups in group order, and a page locks its entries and then
@@ -494,6 +480,13 @@ async fn deadlock_count(d: &Driver) -> i64 {
 /// the rows A didn't and queues on A's groups, and a page queues on them
 /// too. Then a free-running round: chunk runners, two merger loops and pages
 /// at once, with the source moving under them.
+///
+/// A deadlock shows as the `deadlock detected` error in this test's own
+/// cluster log ([`Driver::deadlocks_logged`]), which the aborted backend
+/// writes before its client sees the error, so the check is exact when the
+/// last transaction has finished. `pg_stat_database.deadlocks` is not used:
+/// a backend reports it only when its pending stats are next flushed, so it
+/// can lag (#297).
 #[tokio::test]
 async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
     let flavour = Flavour::Sum;
@@ -502,7 +495,6 @@ async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
         "insert into public.src select i, i % 20, i from generate_series(1, 2000) i;",
     )
     .await;
-    let before = deadlock_count(&d).await;
 
     // Forced.
     d.chunk(&plan, None, "100").await;
@@ -556,11 +548,6 @@ async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
 
     assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
     assert_oracle(&mut d, &plan, flavour).await;
-    assert_eq!(
-        deadlock_count(&d).await,
-        before,
-        "pg_stat_database.deadlocks"
-    );
 }
 
 // ---------------------------------------------------------------- truncate

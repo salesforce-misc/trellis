@@ -120,11 +120,6 @@ impl BuildPlan {
             ),
         }))
     }
-
-    /// The target's qualified identity (`schema.table`).
-    pub fn target(&self) -> &str {
-        &self.ledger.target
-    }
 }
 
 /// What one [`run_chunk`] did.
@@ -141,6 +136,11 @@ pub struct ChunkOutcome {
 /// `txn` (see the module doc). `lo` and `hi` are encoded keys, as
 /// `backfill_chunks` stores a range's bounds; `lo` is `None` for the first
 /// chunk. The caller commits.
+///
+/// `txn` must be `read committed`, as a page's is: step 3's snapshot has to
+/// be its own statement's, taken after the entry lock (ADR-0002 I1). Under
+/// `repeatable read` it would be the transaction's, from step 1, and the
+/// chunk could rewrite an entry over a change a page applied between.
 ///
 /// A lock wait past [`CHUNK_LOCK_TIMEOUT`] fails the chunk with `55P03`
 /// (`crate::locks::is_lock_not_available`), and the caller rolls back and

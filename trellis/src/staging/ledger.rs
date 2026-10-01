@@ -932,6 +932,11 @@ fn ledger_statement(
 /// (#625 finding 11): every change the snapshot sees was captured into the
 /// highest segment it sees or an earlier one, so once that segment and all
 /// before it are drained, no change the tombstone must outlast can arrive.
+/// The next segment's row is inserted by the seal's phase 1
+/// (`super::seal::seal_phase1`), and the sealed segment's fence is taken
+/// only after that commits, so a snapshot that doesn't see the next segment
+/// is older than the fence of the newest one it does see: that fence sees
+/// every change the snapshot sees.
 pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: &str) -> String {
     let shape = &plan.shape;
     let q = |c: &str| quote_ident(c);
