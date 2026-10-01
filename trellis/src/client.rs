@@ -3036,6 +3036,134 @@ mod backfill_chunk_failure_tests {
             "the resume clears the failure"
         );
     }
+
+    /// #616: a key the build quarantined and the operator released while
+    /// the definition is still `backfilling` reaches the target. The
+    /// release's re-derive drains before the definition applies anything,
+    /// so the drain skips it for this definition, and the chunk that held
+    /// the key has already finished without it. The go-live catch-up's
+    /// enumeration is what writes it.
+    #[tokio::test]
+    async fn a_key_released_while_its_build_runs_reaches_the_target() {
+        // The failing key is the lowest, so each split keeps it in the
+        // first chunk, which is also the next one claimed (by id).
+        let mut f = seed(20, Some((1, i32::MAX))).await;
+        let mut quarantined = false;
+        for _ in 0..20 {
+            let chunk = chunk_queue::claim_chunks(&f.raw, WORKER, 1)
+                .await
+                .expect("claim")
+                .pop()
+                .expect("a claimable chunk");
+            let err = chunk_queue::run_claimed_chunk(
+                &f.pool,
+                &chunk,
+                WORKER,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await;
+            match err {
+                Ok(()) => chunk_queue::finish_chunk(&f.pool, &chunk, WORKER)
+                    .await
+                    .expect("finish"),
+                Err(err) => {
+                    let outcome = chunk_queue::fail_chunk(&f.pool, &chunk, WORKER, &err)
+                        .await
+                        .expect("fail the chunk");
+                    if matches!(outcome, chunk_queue::ChunkFailure::Quarantined { .. }) {
+                        quarantined = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(quarantined, "the build narrowed its failure to key 1");
+        // The chunk that held the key runs again without it and finishes,
+        // while the upper halves of its splits are still to run.
+        assert!(f.drain_one().await);
+        let held: i64 = f
+            .raw
+            .query_one(
+                "select count(*) from backfill_chunks where definition_id = $1 and not done",
+                &[&f.id],
+            )
+            .await
+            .expect("count the chunks left")
+            .get(0);
+        assert!(held > 0, "the build isn't finished");
+        assert_eq!(f.status().await.status, TransformStatus::Backfilling);
+
+        f.raw
+            .execute("update public.nums set x = 1 where id = 1", &[])
+            .await
+            .expect("fix the row");
+        crate::staging::quarantine::release_key(&f.pool, "public.nums", "1")
+            .await
+            .expect("release the key");
+        drain_ring(&f.pool, &mut f.raw).await;
+        assert_eq!(f.status().await.status, TransformStatus::Backfilling);
+
+        f.drain_all(20).await;
+        assert_eq!(f.status().await.status, TransformStatus::CatchingUp);
+        let built: i64 = f
+            .raw
+            .query_one("select count(*) from public.doubles where id = 1", &[])
+            .await
+            .expect("read the target")
+            .get(0);
+        assert_eq!(built, 0, "neither the release nor the build wrote the key");
+        crate::intake::markers::discharge_registrations(&f.pool)
+            .await
+            .expect("discharge the go-live catch-up");
+        assert_eq!(f.status().await.status, TransformStatus::Live);
+        drain_ring(&f.pool, &mut f.raw).await;
+
+        let target = f
+            .raw
+            .query_one(
+                "select count(*), count(*) filter (where id = 1 and doubled = 2) \
+                 from public.doubles",
+                &[],
+            )
+            .await
+            .expect("read the target");
+        assert_eq!(target.get::<_, i64>(0), 20);
+        assert_eq!(target.get::<_, i64>(1), 1, "the released key is built");
+    }
+
+    /// Seals and drains the ring until nothing is pending: a bounded loop,
+    /// not a convergence wait.
+    async fn drain_ring(pool: &Pool, client: &mut tokio_postgres::Client) {
+        let watermark = staging::StagedWatermark::saturated();
+        for _ in 0..16 {
+            let outcome = staging::seal::seal_phase1(client)
+                .await
+                .expect("seal phase 1");
+            staging::seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+                .await
+                .expect("seal phase 2");
+            while staging::apply::drain_once(
+                pool,
+                outcome.sealed_seg_seq,
+                WORKER,
+                1,
+                "wake",
+                &watermark,
+            )
+            .await
+            .expect("drain_once")
+            .is_some()
+            {}
+            staging::retire_drained_segments(client)
+                .await
+                .expect("retire drained segments");
+            if !staging::has_pending(client).await.expect("has_pending") {
+                return;
+            }
+        }
+        panic!("the ring did not drain within 16 seal/drain rounds");
+    }
 }
 
 #[cfg(test)]
