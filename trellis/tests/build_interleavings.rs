@@ -651,6 +651,38 @@ async fn the_merge_plan_survives_empty_statistics() {
     );
 }
 
+/// The merge statement's plan settings end with the statement (#625 F2b):
+/// the rest of the merger's transaction, the empty-group delete and the
+/// seam's statements, plans as usual.
+#[tokio::test]
+async fn the_merge_plan_settings_end_with_the_merge_statement() {
+    let (d, plan) = start_build_with(
+        Flavour::Sum,
+        "insert into public.src select i, i % 20, i from generate_series(1, 200) i;",
+    )
+    .await;
+    d.chunk(&plan, None, "200").await;
+    let mut client = d.db.pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let outcome = build::merge_deltas(&txn, &plan, 1_000)
+        .await
+        .expect("merge");
+    assert_eq!((outcome.claimed, outcome.skipped), (20, false));
+    let row = txn
+        .query_one(
+            "select current_setting('enable_nestloop'), current_setting('enable_seqscan')",
+            &[],
+        )
+        .await
+        .expect("read the plan settings");
+    assert_eq!(
+        (row.get::<_, String>(0), row.get::<_, String>(1)),
+        ("on".to_string(), "on".to_string()),
+        "the merger's transaction plans as usual after its merge statement"
+    );
+    txn.commit().await.expect("commit");
+}
+
 /// The merger claims the oldest delta rows first, in append order, through
 /// the claim key's index (#625 F2b), not in the heap's physical order. A
 /// delta row rewritten in place keeps its claim key but moves to the end of

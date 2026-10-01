@@ -332,6 +332,23 @@ const MERGE_PLAN_SETTINGS: &str = "set local enable_nestloop = off; set local en
 const MERGE_PLAN_RESET: &str =
     "set local enable_nestloop to default; set local enable_seqscan to default";
 
+/// Runs `sql`, the merge statement or an `explain` of it, binding `$1` to
+/// `limit`, under [`MERGE_PLAN_SETTINGS`], and puts the settings back after
+/// it. The one place both [`merge_deltas`] and [`explain_merge`] run it, so
+/// the plan a test explains is the plan a merger runs. An error leaves the
+/// settings on, but it also aborts `txn`, and a `set local` ends with the
+/// transaction.
+async fn query_under_merge_plan(
+    txn: &Transaction<'_>,
+    sql: &str,
+    limit: i64,
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    txn.batch_execute(MERGE_PLAN_SETTINGS).await?;
+    let rows = txn.query(sql, &[&limit]).await?;
+    txn.batch_execute(MERGE_PLAN_RESET).await?;
+    Ok(rows)
+}
+
 /// The plan [`merge_deltas`] would run for `limit` rows, as `explain`'s
 /// text, under the same settings, in `txn`. For tests of the plan's shape.
 #[cfg(any(test, feature = "internals"))]
@@ -341,9 +358,7 @@ pub async fn explain_merge(
     limit: i64,
 ) -> Result<String, ApplyError> {
     let sql = ledger::merge_statement(&plan.ledger, None);
-    txn.batch_execute(MERGE_PLAN_SETTINGS).await?;
-    let rows = txn.query(&format!("explain {sql}"), &[&limit]).await?;
-    txn.batch_execute(MERGE_PLAN_RESET).await?;
+    let rows = query_under_merge_plan(txn, &format!("explain {sql}"), limit).await?;
     Ok(rows
         .iter()
         .map(|row| row.get::<_, String>(0))
@@ -384,9 +399,7 @@ pub async fn merge_deltas(
     let image_columns = mutations.image_columns(txn, &ledger.target).await?;
     let sql = ledger::merge_statement(ledger, image_columns.as_deref());
     let started = Instant::now();
-    txn.batch_execute(MERGE_PLAN_SETTINGS).await?;
-    let rows = txn.query(&sql, &[&limit]).await?;
-    txn.batch_execute(MERGE_PLAN_RESET).await?;
+    let rows = query_under_merge_plan(txn, &sql, limit).await?;
     metrics::record_build_statement(BuildStatement::MergeUpsert, started.elapsed());
     // Test-only pause point, after the merger's upsert, with its claimed
     // delta rows and its groups locked. See `super::interleave`.
@@ -646,8 +659,9 @@ pub async fn work_once(
         return Ok(Step::Idle);
     }
     for (id, target) in &building {
-        // Rows other mergers hold are skipped: a pass that claims none
-        // falls through to the next target, then to a chunk.
+        // A target another worker is merging is skipped (#625 F2b): a pass
+        // that claims none falls through to the next target, then to a
+        // chunk.
         if has_deltas(pool, target).await? && merge_once(pool, *id).await? > 0 {
             return Ok(Step::Merged);
         }
