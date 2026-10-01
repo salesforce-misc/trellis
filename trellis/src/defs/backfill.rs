@@ -871,10 +871,13 @@ async fn write_one_to_one_range(
     // A quarantined key is left out (#616): it stays out of the target until
     // `release_key` re-derives it, exactly as the drain leaves it out of every
     // batch. The build's own narrowing quarantines the key a chunk fails on
-    // (`chunk_queue::fail_chunk`), and the chunk then runs without it.
+    // (`chunk_queue::fail_chunk`), and the chunk then runs without it. So is a
+    // key with a `NULL` part, which no target row can represent
+    // ([`key_not_null`]).
     let where_clause = format!(
-        "{} and {}",
+        "{} and {} and {}",
         pk_range_where(&pk_idents, pk, lo),
+        key_not_null(&pk_idents),
         not_quarantined(pk, params.len() + 1),
     );
     params.push(&source_table);
@@ -1003,6 +1006,24 @@ fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
     )
 }
 
+/// SQL predicate: no part of the key `pk_idents` is `NULL`. A genuine
+/// `PRIMARY KEY` never has one, but a source keyed by a nullable `UNIQUE
+/// NULLS NOT DISTINCT` index (an aggregate target's grouping columns, issue
+/// #128) can, and a `(lo, hi]` row comparison still admits such a row
+/// whenever an earlier part decides it (`(2, NULL) <= (3, 'a')`). No target
+/// row can represent it (the target's own primary key is `NOT NULL`), so a
+/// 1-1 range write leaves it out, as [`discover_pk_ranges`] does and as the
+/// drain skips the key (issue #205). Writing it would fail the chunk with a
+/// not-null violation that [`narrow_one_to_one_chunk`], which never counts
+/// such a row, would pin on an innocent key beside it.
+fn key_not_null(pk_idents: &[String]) -> String {
+    pk_idents
+        .iter()
+        .map(|c| format!("{c} is not null"))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// What [`narrow_one_to_one_chunk`] found in a failed chunk's range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChunkNarrowing {
@@ -1041,14 +1062,11 @@ pub(crate) async fn narrow_one_to_one_chunk(
     let source = ddl::qualified_source_table(source_table);
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let mut params = range_params(&lo, &hi);
-    let not_null = pk_idents
-        .iter()
-        .map(|c| format!("{c} is not null"))
-        .collect::<Vec<_>>()
-        .join(" and ");
+    // The keys [`write_one_to_one_range`] writes, by the same predicate.
     let where_clause = format!(
-        "{} and {not_null} and {}",
+        "{} and {} and {}",
         pk_range_where(&pk_idents, &pk, &lo),
+        key_not_null(&pk_idents),
         not_quarantined(&pk, params.len() + 1),
     );
     params.push(&source_table);

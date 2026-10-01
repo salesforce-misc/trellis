@@ -1937,6 +1937,90 @@ mod tests {
         );
     }
 
+    /// A source keyed by a nullable `UNIQUE NULLS NOT DISTINCT` index (an
+    /// aggregate target's grouping columns, issue #128) can hold a row with a
+    /// `NULL` key part that a range's row comparison still admits, because an
+    /// earlier part decides it: `(2, NULL) <= (3, 'a')`. No target row can
+    /// represent that key, so the build leaves it out, as the drain does. It
+    /// must not fail the chunk: the narrowing never counts such a row, so it
+    /// would quarantine the innocent key beside it and then pause the
+    /// definition.
+    #[tokio::test]
+    async fn a_chunk_leaves_out_a_row_with_a_null_key_part() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let text = "TRANSFORM pair_doubles FROM pairs SELECT x + x AS y";
+        raw.batch_execute(
+            "create table public.pairs (a int, b text, x int, unique nulls not distinct (a, b)); \
+             insert into public.pairs values (1, 'a', 1), (2, null, 2), (3, 'a', 3); \
+             create table public.pair_doubles (a int, b text, y int, primary key (a, b)); \
+             insert into source_table_versions (source_table, version) \
+             values ('public.pairs', 1)",
+        )
+        .await
+        .expect("seed source");
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.pair_doubles', 'public.pairs', 1, $1, 'waiting_to_backfill') \
+                 returning id",
+                &[&text],
+            )
+            .await
+            .expect("seed definition")
+            .get(0);
+        let def = parse(text).expect("parse definition");
+        assert_eq!(
+            dispatch(&pool, id, &def, "public.pairs").await,
+            Some(TransformStatus::Backfilling)
+        );
+
+        let mut outcomes = Vec::new();
+        for _ in 0..20 {
+            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
+                break;
+            };
+            match run_claimed_chunk(
+                &pool,
+                &chunk,
+                WORKER,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                Ok(()) => finish_chunk(&pool, &chunk, WORKER).await.expect("finish"),
+                Err(err) => outcomes.push(
+                    fail_chunk(&pool, &chunk, WORKER, &err)
+                        .await
+                        .expect("fail the chunk"),
+                ),
+            }
+        }
+
+        assert_eq!(outcomes, vec![], "no chunk failed");
+        assert_eq!(status_of(&raw, id).await, "catching_up");
+        let poisoned: i64 = raw
+            .query_one("select count(*) from poison", &[])
+            .await
+            .expect("read poison")
+            .get(0);
+        assert_eq!(poisoned, 0);
+        let built: Vec<(i32, String, i32)> = raw
+            .query("select a, b, y from public.pair_doubles order by a, b", &[])
+            .await
+            .expect("read the target")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        assert_eq!(
+            built,
+            vec![(1, "a".to_string(), 2), (3, "a".to_string(), 6)]
+        );
+    }
+
     /// A composite key's ring encoding of `parts`.
     fn ddl_key(parts: &[&str]) -> String {
         super::super::ddl::join_pk_key(parts)
