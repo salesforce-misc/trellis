@@ -187,6 +187,18 @@ impl LedgerShape {
             .iter()
             .any(|f| matches!(f, LedgerField::Recompute { .. }))
     }
+
+    /// Whether a Re-derive build serves this shape yet (#625 F2): every
+    /// field is maintained by increments (no recompute) over plain source
+    /// columns (no expression argument). #625 F5 widens it to the rest of
+    /// what [`route`] takes.
+    pub(super) fn rederive_buildable(&self) -> bool {
+        !self.recomputes()
+            && self
+                .contribs
+                .iter()
+                .all(|c| matches!(c.source, ContribSource::Column(_)))
+    }
 }
 
 /// Whether `def` is a target the ledger path maintains (see the module doc),

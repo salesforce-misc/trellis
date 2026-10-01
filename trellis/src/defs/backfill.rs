@@ -1150,6 +1150,49 @@ async fn discover_pk_ranges(
     source: &str,
     pk: &[PrimaryKeyColumn],
 ) -> Result<Vec<(Option<Vec<String>>, Vec<String>)>, BackfillError> {
+    walk_pk_ranges(client, source, pk, None, BACKFILL_CHUNK_ROWS, usize::MAX).await
+}
+
+/// Up to `max` consecutive `(lo, hi]` ranges of `source` (the encoded
+/// source table name) of about `rows` rows each, starting above `after` (an
+/// encoded key as `backfill_chunks` stores it; `None` from the first row):
+/// [`discover_pk_ranges`]' walk, a batch at a time, for the Re-derive build's
+/// plan job (#625 F2, Q13). Fewer than `max` ranges means the walk reached
+/// the last row.
+pub(crate) async fn next_pk_ranges(
+    client: &impl GenericClient,
+    source_table: &str,
+    pk: &[PrimaryKeyColumn],
+    after: Option<&str>,
+    rows: i64,
+    max: usize,
+) -> Result<Vec<(Option<String>, String)>, BackfillError> {
+    let start = after
+        .map(|key| -> Result<Vec<String>, BackfillError> {
+            Ok(ddl::split_pk_key(pk, source_table, key)?
+                .into_iter()
+                .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
+                .collect())
+        })
+        .transpose()?;
+    let source = ddl::qualified_source_table(source_table);
+    Ok(walk_pk_ranges(client, &source, pk, start, rows.max(1), max)
+        .await?
+        .into_iter()
+        .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
+        .collect())
+}
+
+/// [`discover_pk_ranges`]' walk from `start`, `rows` rows per range, at most
+/// `max` ranges.
+async fn walk_pk_ranges(
+    client: &impl GenericClient,
+    source: &str,
+    pk: &[PrimaryKeyColumn],
+    start: Option<Vec<String>>,
+    rows: i64,
+    max: usize,
+) -> Result<Vec<(Option<Vec<String>>, Vec<String>)>, BackfillError> {
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let col_list = pk_idents.join(", ");
     // Qualified with the inner subquery's own alias (`s.`), not bare column
@@ -1203,8 +1246,8 @@ async fn discover_pk_ranges(
         .join(" and ");
 
     let mut ranges = Vec::new();
-    let mut lo: Option<Vec<String>> = None;
-    loop {
+    let mut lo: Option<Vec<String>> = start;
+    while ranges.len() < max {
         let row = match &lo {
             None => {
                 client
@@ -1212,7 +1255,7 @@ async fn discover_pk_ranges(
                         &format!(
                             "select {hi_select} from \
                              (select {col_list} from {source} where {not_null_filter} \
-                              order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
+                              order by {col_list} limit {rows}) s \
                              order by {order_desc} limit 1"
                         ),
                         &[],
@@ -1229,7 +1272,7 @@ async fn discover_pk_ranges(
                             "select {hi_select} from \
                              (select {col_list} from {source} \
                               where {where_clause} and {not_null_filter} \
-                              order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
+                              order by {col_list} limit {rows}) s \
                              order by {order_desc} limit 1"
                         ),
                         &params,

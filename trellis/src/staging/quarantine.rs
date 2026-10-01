@@ -1710,14 +1710,13 @@ pub async fn trip_transform_fuse_if_crossed(
         );
     }
     for def in &definitions {
-        quarantine_if_crossed(
-            txn,
-            src_table,
-            def.id,
-            &def.def.target,
-            &TransformStatus::applying(),
-        )
-        .await?;
+        // A Re-derive build applies from its start (#625 F2), so its fuse
+        // trips from `backfilling` too.
+        let mut statuses = TransformStatus::applying();
+        if def.rederive_build {
+            statuses.push(TransformStatus::Backfilling.as_str());
+        }
+        quarantine_if_crossed(txn, src_table, def.id, &def.def.target, &statuses).await?;
     }
     Ok(())
 }

@@ -69,6 +69,13 @@ pub struct EngineTuning {
     /// ([`ClientOptions::drain_batch_cap`], issue #620). A small value forces
     /// paging on a scenario whose segments would otherwise drain whole.
     pub drain_batch_cap: usize,
+    /// Whether the staging worker builds a qualifying definition with the
+    /// Re-derive build ([`ClientOptions::rederive_build`], #625 F2). Off in
+    /// stock.
+    pub rederive_build: bool,
+    /// Source rows per Re-derive build chunk
+    /// ([`ClientOptions::build_chunk_rows`]).
+    pub build_chunk_rows: i64,
 }
 
 impl Default for EngineTuning {
@@ -86,6 +93,8 @@ impl Default for EngineTuning {
             maintenance_interval: STOCK_MAINTENANCE_INTERVAL,
             reconcile_interval: STOCK_RECONCILE_INTERVAL,
             drain_batch_cap: trellis::ClientOptions::default().drain_batch_cap,
+            rederive_build: trellis::ClientOptions::default().rederive_build,
+            build_chunk_rows: trellis::ClientOptions::default().build_chunk_rows,
         }
     }
 }
@@ -116,6 +125,8 @@ impl EngineTuning {
             maintenance_interval: self.maintenance_interval,
             reconcile_interval: self.reconcile_interval,
             drain_batch_cap: self.drain_batch_cap,
+            rederive_build: self.rederive_build,
+            build_chunk_rows: self.build_chunk_rows,
             ..Default::default()
         }
     }

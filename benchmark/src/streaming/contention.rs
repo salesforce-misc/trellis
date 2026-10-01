@@ -173,6 +173,78 @@ pub fn statement_class(query: &str, target: &str) -> StatementClass {
     }
 }
 
+/// A Re-derive build's statement classes (#625 F2), told apart by the
+/// `application_name` its transactions set (`trellis::dev::staging`'s
+/// `CHUNK_APPLICATION_NAME`/`MERGE_APPLICATION_NAME`): a chunk's entry lock
+/// shares its text with a drain page's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuildClass {
+    /// A chunk's entry lock: the placeholder insert and the sorted
+    /// `for update`.
+    ChunkLock,
+    /// The rest of a chunk: its key read, its read-and-write statement (the
+    /// entries and the delta insert) and its commit.
+    ChunkWrite,
+    /// A merger pass: the claim, sum and group upsert, the all-zero delete
+    /// and the seam.
+    MergeUpsert,
+}
+
+impl BuildClass {
+    pub const ALL: [BuildClass; 3] = [
+        BuildClass::ChunkLock,
+        BuildClass::ChunkWrite,
+        BuildClass::MergeUpsert,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BuildClass::ChunkLock => "chunk_lock",
+            BuildClass::ChunkWrite => "chunk_write",
+            BuildClass::MergeUpsert => "merge_upsert",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The build class of a backend running `query` under `application_name`,
+/// or `None` for anything that isn't a Re-derive build's.
+pub fn build_class(application_name: &str, query: &str) -> Option<BuildClass> {
+    if application_name == trellis::dev::staging::MERGE_APPLICATION_NAME {
+        return Some(BuildClass::MergeUpsert);
+    }
+    if application_name != trellis::dev::staging::CHUNK_APPLICATION_NAME {
+        return None;
+    }
+    let q = query.to_ascii_lowercase();
+    Some(
+        if q.contains(LEDGER_MARKER)
+            && (q.contains("for update") || q.contains("on conflict do nothing"))
+            && !q.contains("pg_current_snapshot")
+        {
+            BuildClass::ChunkLock
+        } else {
+            BuildClass::ChunkWrite
+        },
+    )
+}
+
+/// One sampled wait, `type:event` (`Lock:transactionid`, `LWLock:WALWrite`,
+/// `IO:DataFileRead`), or `running` / `idle_in_txn` when not waiting.
+fn wait_label(state: &str, wait_event_type: Option<&str>, wait_event: Option<&str>) -> String {
+    if state.starts_with("idle in transaction") {
+        return "idle_in_txn".to_string();
+    }
+    match (wait_event_type, wait_event) {
+        (Some(t), Some(e)) => format!("{t}:{e}"),
+        (Some(t), None) => t.to_string(),
+        (None, _) => "running".to_string(),
+    }
+}
+
 /// Whose backend a sampled row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -335,6 +407,10 @@ pub struct ContentionSummary {
     pub page_lock_waits: DurationStats,
     /// Page transactions' row-lock hold (see the module doc).
     pub page_lock_holds: DurationStats,
+    /// Per [`BuildClass::ALL`]: each sampled wait ([`wait_label`]) of that
+    /// class's backends, as a mean backend count. A Re-derive build's
+    /// statements are counted here and not in the page classes above.
+    pub build_waits: [Vec<(String, f64)>; 3],
 }
 
 /// How many `(class, statement)` pairs [`ContentionSummary::top_statements`]
@@ -391,7 +467,7 @@ impl ContentionSummary {
              \"engine_io_mean\":{:.3},\"engine_idle_in_txn_mean\":{:.3},\
              \"engine_running_mean\":{:.3},\"engine_other_mean\":{:.3},\
              \"generator_lock_mean\":{:.3},\"top_statements\":[{}],\
-             \"lock_wait_classes\":{{{}}}}}",
+             \"lock_wait_classes\":{{{}}},\"build_waits\":{{{}}}}}",
             self.samples,
             self.engine_busy_mean,
             self.engine_row_lock_mean,
@@ -424,6 +500,20 @@ impl ContentionSummary {
                 ))
                 .collect::<Vec<_>>()
                 .join(","),
+            BuildClass::ALL
+                .iter()
+                .zip(&self.build_waits)
+                .map(|(class, waits)| format!(
+                    "\"{}\":{{{}}}",
+                    class.label(),
+                    waits
+                        .iter()
+                        .map(|(wait, mean)| format!("\"{wait}\":{mean:.3}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
         )
     }
 
@@ -448,6 +538,8 @@ pub struct ActivityRow {
     pub wait_event_type: Option<String>,
     pub wait_event: Option<String>,
     pub query: String,
+    /// The backend's `application_name` ([`build_class`]).
+    pub application_name: String,
     /// When the sample was taken (`clock_timestamp()`).
     pub at: f64,
     pub xact_start: Option<f64>,
@@ -496,6 +588,7 @@ pub struct Accumulator {
     class_waits: [DurationRecorder; 5],
     page_waits: DurationRecorder,
     page_holds: DurationRecorder,
+    build_waits: [HashMap<String, f64>; 3],
 }
 
 impl Accumulator {
@@ -512,6 +605,7 @@ impl Accumulator {
             class_waits: Default::default(),
             page_waits: DurationRecorder::default(),
             page_holds: DurationRecorder::default(),
+            build_waits: Default::default(),
         }
     }
 
@@ -571,7 +665,23 @@ impl Accumulator {
             };
             *slot += 1.0;
 
-            let statement = statement_class(&row.query, &self.target);
+            // A Re-derive build's statements are reported on their own, and
+            // kept out of the page classes: its entry lock reads like a
+            // page's.
+            let build = build_class(&row.application_name, &row.query);
+            if let Some(build) = build {
+                *self.build_waits[build.index()]
+                    .entry(wait_label(
+                        &row.state,
+                        row.wait_event_type.as_deref(),
+                        row.wait_event.as_deref(),
+                    ))
+                    .or_default() += 1.0;
+            }
+            let statement = match build {
+                Some(_) => StatementClass::Other,
+                None => statement_class(&row.query, &self.target),
+            };
             let lock_waiting = row.wait_event_type.as_deref() == Some("Lock");
             if lock_waiting {
                 s.lock_wait_classes[statement.index()].wait_mean += 1.0;
@@ -685,6 +795,14 @@ impl Accumulator {
         for class in &mut summary.lock_wait_classes {
             class.wait_mean /= n;
         }
+        for (out, waits) in summary.build_waits.iter_mut().zip(&self.build_waits) {
+            let mut waits: Vec<(String, f64)> = waits
+                .iter()
+                .map(|(wait, count)| (wait.clone(), count / n))
+                .collect();
+            waits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            *out = waits;
+        }
         for mean in [
             &mut summary.engine_busy_mean,
             &mut summary.engine_row_lock_mean,
@@ -738,7 +856,7 @@ const SAMPLE_SQL: &str = "\
            extract(epoch from clock_timestamp())::float8, \
            extract(epoch from a.xact_start)::float8, \
            extract(epoch from a.query_start)::float8, \
-           extract(epoch from w.waitstart)::float8 \
+           extract(epoch from w.waitstart)::float8, a.application_name \
     from pg_stat_activity a left join w on w.pid = a.pid \
     where a.datname = current_database() and a.pid <> pg_backend_pid() \
       and a.backend_type = 'client backend' and a.state <> 'idle'";
@@ -785,6 +903,7 @@ pub async fn sample_while(
                 xact_start: r.get(6),
                 query_start: r.get(7),
                 lock_wait_start: r.get(8),
+                application_name: r.get::<_, Option<String>>(9).unwrap_or_default(),
             })
             .collect();
         acc.add(&snapshot);
@@ -862,6 +981,43 @@ mod tests {
 
     const PRELOCK: &str = "select 1 from \"public\".\"agg_totals\" t join unnest($1) k \
                            on t.grp = k.c0 order by t.grp for update of t";
+
+    #[test]
+    fn a_build_chunk_is_told_from_a_page_by_its_application_name() {
+        let lock = "select 1 from \"public\".\"agg_totals__ledger\" where \"__from_key\" = \
+                    any($1::text[]) order by \"__from_key\" for update";
+        let chunk = trellis::dev::staging::CHUNK_APPLICATION_NAME;
+        let merge = trellis::dev::staging::MERGE_APPLICATION_NAME;
+        assert_eq!(build_class(chunk, lock), Some(BuildClass::ChunkLock));
+        assert_eq!(
+            build_class(
+                chunk,
+                "with snap as (select pg_current_snapshot() ...) select 1"
+            ),
+            Some(BuildClass::ChunkWrite)
+        );
+        assert_eq!(
+            build_class(merge, "with claimed as ..."),
+            Some(BuildClass::MergeUpsert)
+        );
+        assert_eq!(build_class("", lock), None, "a page's lock is a page's");
+
+        let mut acc = Accumulator::new(Vec::new(), "agg_totals");
+        acc.add(&[ActivityRow {
+            application_name: chunk.to_string(),
+            ..row(1, "active", Some(("Lock", "transactionid")), lock)
+        }]);
+        let summary = acc.finish();
+        assert_eq!(
+            summary.build_waits[BuildClass::ChunkLock.index()],
+            vec![("Lock:transactionid".to_string(), 1.0)]
+        );
+        assert_eq!(
+            summary.lock_wait_classes[StatementClass::LedgerLock.index()].wait_mean,
+            0.0,
+            "a chunk's lock wait isn't a page's"
+        );
+    }
 
     #[test]
     fn row_lock_waits_are_transactionid_and_tuple_only() {

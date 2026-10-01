@@ -31,7 +31,7 @@ async fn migrate_up_is_idempotent() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
-            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63
+            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -124,9 +124,10 @@ async fn migrate_up_is_idempotent() {
         // `segments.has_schema_change` and `capture_failures`), and C8 V59
         // (drops `replication_progress` and `slot_loss_pauses`). Issue #687
         // added V60 (`capture_failures.error` and `capture_holdups`). #625
-        // F4 added V63 (`backfill_chunks`' failure record, #616); V61 and
-        // V62 are left free for the other lane's #623 work.
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 to be applied"
+        // F4 added V63 (`backfill_chunks`' failure record, #616), and F2
+        // V64 (the Re-derive build's chunk kinds and `build` column); V61
+        // and V62 are left free for the other lane's #623 work.
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 and V64 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

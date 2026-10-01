@@ -131,6 +131,7 @@ mod tests {
             status,
             source_table: "public.widgets".to_string(),
             target_table: "public.widget_prices".to_string(),
+            rederive_build: false,
         }
     }
 

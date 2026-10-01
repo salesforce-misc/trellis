@@ -82,6 +82,13 @@ pub enum ChunkQueueError {
     /// Quarantining the key a failed chunk narrowed to, or checking the
     /// whole-transform fuse after it, failed (#616).
     Quarantine(Box<crate::staging::ApplyError>),
+    /// A Re-derive build's plan job or chunk failed (#625 F2,
+    /// `staging::build`).
+    Build(Box<crate::staging::ApplyError>),
+    /// A claimed row's `kind` and bounds were not one this build knows
+    /// (`backfill_chunks_kind_bounds` rules out a mismatch; `sweep` is
+    /// #625 F3's and never claimed here).
+    UnknownKind { kind: String },
 }
 
 impl ChunkQueueError {
@@ -101,6 +108,8 @@ impl ChunkQueueError {
             ChunkQueueError::Catalog(err) => err.code(),
             ChunkQueueError::DefinitionNotFound { .. } => ErrorCode::Internal,
             ChunkQueueError::Quarantine(err) => err.code(),
+            ChunkQueueError::Build(err) => err.code(),
+            ChunkQueueError::UnknownKind { .. } => ErrorCode::Internal,
         }
     }
 }
@@ -125,6 +134,10 @@ impl std::fmt::Display for ChunkQueueError {
                     "quarantining a failed backfill chunk's key failed: {err}"
                 )
             }
+            ChunkQueueError::Build(err) => write!(f, "re-derive build step failed: {err}"),
+            ChunkQueueError::UnknownKind { kind } => {
+                write!(f, "claimed a backfill chunk of unknown kind {kind:?}")
+            }
         }
     }
 }
@@ -138,6 +151,8 @@ impl std::error::Error for ChunkQueueError {
             ChunkQueueError::Catalog(err) => Some(err),
             ChunkQueueError::DefinitionNotFound { .. } => None,
             ChunkQueueError::Quarantine(err) => Some(err.as_ref()),
+            ChunkQueueError::Build(err) => Some(err.as_ref()),
+            ChunkQueueError::UnknownKind { .. } => None,
         }
     }
 }
@@ -185,7 +200,40 @@ pub enum ChunkWork {
     /// set-based build (ADR-0007), run as one job (issue #419; the row's
     /// `hi` is null). See [`dispatch_direct_build`].
     DirectBuild,
+    /// A Re-derive build's plan job (#625 F2, `staging::build`): walks the
+    /// source's primary key from `cursor`, the last boundary it enqueued
+    /// (`None` before the first), and enqueues [`ChunkWork::Rederive`] rows
+    /// in batches.
+    Plan { cursor: Option<String> },
+    /// One `(lo, hi]` range of a Re-derive build (`staging::build::run_chunk`).
+    Rederive { lo: Option<String>, hi: String },
 }
+
+impl ChunkWork {
+    /// The `backfill_chunks.kind` word of this work (V64).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ChunkWork::Range { .. } => KIND_RANGE,
+            ChunkWork::DirectBuild => KIND_DIRECT,
+            ChunkWork::Plan { .. } => KIND_PLAN,
+            ChunkWork::Rederive { .. } => KIND_REDERIVE,
+        }
+    }
+}
+
+/// `backfill_chunks.kind` of a plain 1-1 definition's range chunk.
+pub const KIND_RANGE: &str = "range";
+/// `backfill_chunks.kind` of a direct-build job.
+pub const KIND_DIRECT: &str = "direct";
+/// `backfill_chunks.kind` of a Re-derive build's plan job.
+pub const KIND_PLAN: &str = "plan";
+/// `backfill_chunks.kind` of a Re-derive build's chunk.
+pub const KIND_REDERIVE: &str = "rederive";
+
+/// The kinds the old builds' path claims ([`claim_chunks`]): a drain worker
+/// runs these before its segments, as it always has. The Re-derive build's
+/// kinds are claimed after them (`staging::build`, #625 B6).
+pub const OLD_BUILD_KINDS: [&str; 2] = [KIND_RANGE, KIND_DIRECT];
 
 /// Dispatches a plain (non-relationship) 1-1 definition's build onto the
 /// durable queue, inside the backfill discharge's own transaction (ADR-0016):
@@ -233,8 +281,8 @@ pub(crate) async fn dispatch_one_to_one(
         .map(|(lo, hi)| (lo.as_deref(), hi.as_str()))
         .unzip();
     txn.execute(
-        "insert into backfill_chunks (definition_id, lo, hi, fuse_rearmed_at) \
-         select d.id, r.lo, r.hi, d.fuse_rearmed_at \
+        "insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at) \
+         select d.id, 'range', r.lo, r.hi, d.fuse_rearmed_at \
          from unnest($2::text[], $3::text[]) with ordinality as r(lo, hi, n) \
          cross join transform_definitions d \
          where d.id = $1 \
@@ -255,13 +303,18 @@ pub(crate) async fn dispatch_one_to_one(
 /// Moves `definition_id` `waiting_to_backfill` -> `backfilling`, taking its
 /// row lock. Returns `false`, touching nothing, when it had already left
 /// `waiting_to_backfill` (an operator paused it since the discharge read it).
+///
+/// Clears `build`: a definition paused during a Re-derive build and resumed
+/// onto this path is no longer under one, so it must not apply while this
+/// build runs (`Definition::applies`, #625 F2).
 async fn start_backfilling(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
 ) -> Result<bool, CatalogError> {
     let promoted = txn
         .execute(
-            "update transform_definitions set status = $1 where id = $2 and status = $3",
+            "update transform_definitions set status = $1, build = null \
+             where id = $2 and status = $3",
             &[
                 &TransformStatus::Backfilling.as_str(),
                 &definition_id,
@@ -303,8 +356,10 @@ pub(crate) async fn dispatch_direct_build(
         return Ok(None);
     }
     txn.execute(
-        "insert into backfill_chunks (definition_id, lo, hi, fuse_rearmed_at, prior_attempts) \
-         select id, null, null, fuse_rearmed_at, $2 from transform_definitions where id = $1",
+        "insert into backfill_chunks \
+             (definition_id, kind, lo, hi, fuse_rearmed_at, prior_attempts) \
+         select id, 'direct', null, null, fuse_rearmed_at, $2 \
+         from transform_definitions where id = $1",
         &[&definition_id, &prior_attempts],
     )
     .await?;
@@ -332,7 +387,7 @@ pub(crate) async fn dispatch_direct_build(
 /// [`fail_chunk`]/[`reclaim_stale_chunks`]/[`finish_chunk`] discard it
 /// rather than freeing or completing it. It writes nothing after the resume
 /// either ([`ClaimFence`]).
-const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at";
+pub(crate) const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at";
 
 /// The claim a drain worker holds on one chunk, which fences every target
 /// write the chunk makes (issue #434).
@@ -388,7 +443,17 @@ pub(crate) struct ClaimFence<'a> {
     idle_timeout: Duration,
 }
 
-impl ClaimFence<'_> {
+impl<'a> ClaimFence<'a> {
+    /// The fence of `claimed_by`'s claim on chunk `chunk_id`, idle for at
+    /// most `idle_timeout` inside a fenced transaction.
+    pub(crate) fn new(chunk_id: i64, claimed_by: &'a str, idle_timeout: Duration) -> Self {
+        Self {
+            chunk_id,
+            claimed_by,
+            idle_timeout,
+        }
+    }
+
     /// Locks the claim for the rest of `txn` and returns whether it still
     /// holds: the chunk is undone, still claimed by this worker, and not
     /// [`STALE`]. The caller writes nothing in `txn` when it doesn't.
@@ -445,10 +510,23 @@ impl ClaimFence<'_> {
 /// since a chunk is never bucket-split (see this module's doc comment). The
 /// `for update skip locked` candidate selection means two workers racing this
 /// call never claim the same row twice and never block on each other.
+///
+/// Claims only the old builds' kinds ([`OLD_BUILD_KINDS`]); a Re-derive
+/// build's work is claimed by [`claim_chunks_of`] (#625 F2).
 pub async fn claim_chunks(
     client: &impl GenericClient,
     claimed_by: &str,
     limit: i64,
+) -> Result<Vec<ClaimedChunk>, ChunkQueueError> {
+    claim_chunks_of(client, claimed_by, limit, &OLD_BUILD_KINDS).await
+}
+
+/// [`claim_chunks`] for the rows whose `kind` is one of `kinds`.
+pub async fn claim_chunks_of(
+    client: &impl GenericClient,
+    claimed_by: &str,
+    limit: i64,
+    kinds: &[&str],
 ) -> Result<Vec<ClaimedChunk>, ChunkQueueError> {
     if limit <= 0 {
         return Ok(Vec::new());
@@ -487,7 +565,7 @@ pub async fn claim_chunks(
             // (`next_attempt_at`, #616) before it is handed out again.
             "with candidate as ( \
                  select bc.id from backfill_chunks bc \
-                 where not bc.done and bc.claimed_by is null \
+                 where not bc.done and bc.claimed_by is null and bc.kind = any($4) \
                    and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
                    and exists ( \
                        select 1 from transform_definitions d \
@@ -501,21 +579,32 @@ pub async fn claim_chunks(
              set claimed_by = $1, claimed_at = now() \
              from candidate \
              where c.id = candidate.id \
-             returning c.id, c.definition_id, c.lo, c.hi",
-            &[&claimed_by, &limit, &dispatchable],
+             returning c.id, c.definition_id, c.lo, c.hi, c.kind",
+            &[&claimed_by, &limit, &dispatchable, &kinds],
         )
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| ClaimedChunk {
-            id: row.get(0),
-            definition_id: row.get(1),
-            work: match row.get::<_, Option<String>>(3) {
-                Some(hi) => ChunkWork::Range { lo: row.get(2), hi },
-                None => ChunkWork::DirectBuild,
-            },
+    rows.into_iter()
+        .map(|row| {
+            let kind: String = row.get(4);
+            let (lo, hi): (Option<String>, Option<String>) = (row.get(2), row.get(3));
+            let work = match (kind.as_str(), hi) {
+                (KIND_RANGE, Some(hi)) => ChunkWork::Range { lo, hi },
+                (KIND_DIRECT, None) => ChunkWork::DirectBuild,
+                (KIND_PLAN, None) => ChunkWork::Plan { cursor: lo },
+                (KIND_REDERIVE, Some(hi)) => ChunkWork::Rederive { lo, hi },
+                (kind, _) => {
+                    return Err(ChunkQueueError::UnknownKind {
+                        kind: kind.to_string(),
+                    });
+                }
+            };
+            Ok(ClaimedChunk {
+                id: row.get(0),
+                definition_id: row.get(1),
+                work,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Sweeps every chunk claim whose `claimed_at` is older than `ttl` — the
@@ -617,14 +706,19 @@ const RETRY_BASE: Duration = Duration::from_secs(1);
 /// The longest a failed chunk waits before it is claimed again.
 const RETRY_CAP: Duration = Duration::from_secs(300);
 
+/// The longest a failed Re-derive chunk or plan job waits before it is
+/// claimed again (#625 F2). Its usual failure is its entry lock's short
+/// timeout behind a drain page, which says nothing about the chunk.
+const REDERIVE_RETRY_CAP: Duration = Duration::from_secs(5);
+
 /// How long a chunk waits after its `attempts`th failure before it is
 /// claimed again: [`RETRY_BASE`], doubled per further failure, capped at
 /// [`RETRY_CAP`].
-fn retry_delay(attempts: i32) -> Duration {
+fn retry_delay(attempts: i32, cap: Duration) -> Duration {
     let doublings = u32::try_from(attempts.saturating_sub(1))
         .unwrap_or(0)
         .min(31);
-    RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_CAP)
+    RETRY_BASE.saturating_mul(1 << doublings).min(cap)
 }
 
 /// What a chunk's failure says about how to retry it (#616).
@@ -747,14 +841,57 @@ pub async fn fail_chunk(
     let message = error.to_string();
     let (outcome, attempts, location) = match &chunk.work {
         ChunkWork::Range { lo, hi } => {
-            let (outcome, attempts) =
-                fail_range_chunk(pool, chunk, lo.as_deref(), hi, claimed_by, kind, &message)
-                    .await?;
+            let (outcome, attempts) = fail_range_chunk(
+                pool,
+                chunk,
+                Some((lo.as_deref(), hi)),
+                claimed_by,
+                kind,
+                &message,
+                RETRY_CAP,
+            )
+            .await?;
             let location = match &outcome {
                 ChunkFailure::Quarantined { key, .. } => format!("key {key}"),
                 _ => format!("range ({}, {hi}]", lo.as_deref().unwrap_or("-infinity")),
             };
             (outcome, attempts, location)
+        }
+        // A Re-derive build's work isn't narrowed to a key yet (#625 F5): a
+        // data failure is charged like any other, and its
+        // [`MAX_CHARGED_ATTEMPTS`]th charge pauses the definition. A
+        // transient one (the chunk's short entry-lock timeout, mostly) backs
+        // off for at most [`REDERIVE_RETRY_CAP`], so a chunk that keeps
+        // meeting drain pages isn't left out for minutes.
+        ChunkWork::Rederive { lo, hi } => {
+            let (outcome, attempts) = fail_range_chunk(
+                pool,
+                chunk,
+                None,
+                claimed_by,
+                kind,
+                &message,
+                REDERIVE_RETRY_CAP,
+            )
+            .await?;
+            let location = format!(
+                "re-derive range ({}, {hi}]",
+                lo.as_deref().unwrap_or("-infinity")
+            );
+            (outcome, attempts, location)
+        }
+        ChunkWork::Plan { .. } => {
+            let (outcome, attempts) = fail_range_chunk(
+                pool,
+                chunk,
+                None,
+                claimed_by,
+                kind,
+                &message,
+                REDERIVE_RETRY_CAP,
+            )
+            .await?;
+            (outcome, attempts, "the re-derive build's plan".to_string())
         }
         ChunkWork::DirectBuild => {
             let (outcome, attempts) =
@@ -869,16 +1006,21 @@ async fn pause_for_build_failure(
     Ok(())
 }
 
-/// [`fail_chunk`] for a [`ChunkWork::Range`] chunk. Returns what it did and
-/// the chunk's failure count, this one included.
+/// [`fail_chunk`] for a [`ChunkWork::Range`] chunk, and for a Re-derive
+/// build's chunk or plan job. Returns what it did and the chunk's failure
+/// count, this one included.
+///
+/// `narrow` is the range a data failure is narrowed within, or `None` when
+/// the chunk isn't narrowed: its data failures are charged like any other.
+/// `retry_cap` caps the backoff.
 async fn fail_range_chunk(
     pool: &Pool,
     chunk: &ClaimedChunk,
-    lo: Option<&str>,
-    hi: &str,
+    narrow: Option<(Option<&str>, &str)>,
     claimed_by: &str,
     kind: FailureKind,
     error: &str,
+    retry_cap: Duration,
 ) -> Result<(ChunkFailure, i32), ChunkQueueError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
@@ -914,11 +1056,11 @@ async fn fail_range_chunk(
     let source_table: String = row.get(3);
     let target_table: String = row.get(4);
 
-    let narrowed = match kind {
-        FailureKind::Data => {
+    let narrowed = match (kind, narrow) {
+        (FailureKind::Data, Some((lo, hi))) => {
             Some(backfill::narrow_one_to_one_chunk(&*txn, &source_table, lo, hi).await?)
         }
-        FailureKind::Transient | FailureKind::Unnarrowable => None,
+        _ => None,
     };
     let outcome = match narrowed {
         Some(backfill::ChunkNarrowing::Split { mid }) => {
@@ -954,7 +1096,7 @@ async fn fail_range_chunk(
             }
         }
         None if kind == FailureKind::Transient => {
-            let delay = retry_delay(attempts);
+            let delay = retry_delay(attempts, retry_cap);
             record_failure(&txn, chunk.id, attempts, charged, error, delay).await?;
             ChunkFailure::Retrying {
                 charged: false,
@@ -970,7 +1112,7 @@ async fn fail_range_chunk(
                 pause_for_build_failure(&txn, chunk.definition_id).await?;
                 ChunkFailure::Paused
             } else {
-                let delay = retry_delay(attempts);
+                let delay = retry_delay(attempts, retry_cap);
                 record_failure(&txn, chunk.id, attempts, charged, error, delay).await?;
                 ChunkFailure::Retrying {
                     charged: true,
@@ -1209,6 +1351,13 @@ pub async fn run_claimed_chunk(
         .await
         .map_err(ChunkQueueError::from),
         ChunkWork::DirectBuild => run_direct_build(pool, &definition, target_schema, fence).await,
+        // A Re-derive build's work runs through `staging::build`, which
+        // claims it itself; `claim_chunks` never hands it out.
+        work @ (ChunkWork::Plan { .. } | ChunkWork::Rederive { .. }) => {
+            Err(ChunkQueueError::UnknownKind {
+                kind: work.kind().to_string(),
+            })
+        }
     };
     match ran {
         // The fence stopped the write (issue #434). The caller's
@@ -1321,12 +1470,12 @@ async fn touch_chunk_claim(pool: &Pool, id: i64, claimed_by: &str) {
 /// scoped to exactly one chunk's execution, refreshing through the caller's
 /// own connection pool rather than a dedicated connection, and stops simply
 /// by being dropped (which aborts the task) once that call returns.
-struct ChunkHeartbeat {
+pub(crate) struct ChunkHeartbeat {
     task: tokio::task::JoinHandle<()>,
 }
 
 impl ChunkHeartbeat {
-    fn spawn(pool: Pool, id: i64, claimed_by: String, interval: Duration) -> Self {
+    pub(crate) fn spawn(pool: Pool, id: i64, claimed_by: String, interval: Duration) -> Self {
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1419,6 +1568,44 @@ pub async fn finish_chunk(
         complete_if_no_chunks_remain_in_txn(&txn, chunk.definition_id).await?;
     }
 
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Gives up `chunk` after its fence stopped a Re-derive build's write
+/// (`staging::build`, #625 F2): deletes it if it was held across its
+/// definition's resume ([`STALE`]), as [`finish_chunk`] does, and otherwise
+/// leaves it alone (its claim was reclaimed, or it is done).
+pub(crate) async fn discard_if_superseded(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+) -> Result<(), ChunkQueueError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    // The definition row first, then the chunk: resume's order (#434).
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for update",
+        &[&chunk.definition_id],
+    )
+    .await?;
+    let rows = txn
+        .query(
+            &format!(
+                "select bc.id, {STALE} from backfill_chunks bc \
+                 join transform_definitions d on d.id = bc.definition_id \
+                 where bc.id = $1 and bc.claimed_by = $2 and not bc.done \
+                 for update of bc"
+            ),
+            &[&chunk.id, &claimed_by],
+        )
+        .await?;
+    let stale: Vec<i64> = rows
+        .iter()
+        .filter(|row| row.get::<_, bool>(1))
+        .map(|row| row.get(0))
+        .collect();
+    discard_resumed_chunks(&txn, &stale).await?;
     txn.commit().await?;
     Ok(())
 }

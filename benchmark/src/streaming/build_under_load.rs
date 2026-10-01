@@ -51,6 +51,14 @@
 //!   staged row, killed at 13.8 GB for 20M rows); the `converge` peak is the
 //!   number #620's batch cap has to bound.
 //!
+//! - with `--rederive-build` (#625 F2), the Re-derive build's profile
+//!   ([`build_profile`]): worker-seconds per build statement class, chunk
+//!   transaction p50/p99/max, delta rows appended and merged and the delta
+//!   table's peak, chunks that gave up on their entry lock, seal refusals,
+//!   and the `pg_wal` directory's peak; and the contention sampler's
+//!   `build_waits`, the build's backends' waits by class. `--writers 0`
+//!   makes it a build-only run.
+//!
 //! The run's stderr carries a progress line every `--progress-secs` with the
 //! current and peak RSS. Run it under a memory cap on a shared box:
 //! `systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 bench ...`.
@@ -68,6 +76,7 @@ use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
+use crate::streaming::build_profile::{self, BuildProfile, MetricsSnapshot};
 use crate::streaming::chain::numeric_columns;
 use crate::streaming::contention::{self, ContentionSummary};
 use crate::streaming::disk_tier::{self, LatencyHistogram, json_ms};
@@ -144,6 +153,12 @@ impl WriterTally {
 pub struct BuildUnderLoadResult {
     pub cfg: BuildUnderLoad,
     pub application_threads: usize,
+    /// The engine's `rederive_build` and `build_chunk_rows` (#625 F2).
+    pub rederive_build: bool,
+    pub build_chunk_rows: i64,
+    /// The Re-derive build's profile columns ([`build_profile`]), over the
+    /// same window as `disk`. All zero for the old build.
+    pub build: BuildProfile,
     pub load_secs: f64,
     pub load_rows_per_sec: f64,
     /// `alter table ... add primary key` after the load.
@@ -316,7 +331,8 @@ impl BuildUnderLoadResult {
         let w = &self.writes;
         format!(
             "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"writers\":{},\"write_rate\":{},\
-             \"application_threads\":{},\"load_secs\":{:.3},\"load_rows_per_sec\":{:.0},\
+             \"application_threads\":{},\"rederive_build\":{},\"build_chunk_rows\":{},\
+             \"load_secs\":{:.3},\"load_rows_per_sec\":{:.0},\
              \"index_secs\":{:.3},\"build_secs\":{:.3},\"chunks\":{},\"first_claim_secs\":{},\
              \"first_chunk_secs\":{},\"chunks_per_sec\":{},\"define_to_live_secs\":{:.3},\
              \"post_live_secs\":{:.3},\"converged_secs\":{},\"tail_secs\":{},\
@@ -327,7 +343,7 @@ impl BuildUnderLoadResult {
              \"writer_errors\":{},\"writer_lat_p50_ms\":{},\"writer_lat_p99_ms\":{},\
              \"writer_lat_build_p50_ms\":{},\"writer_lat_build_p99_ms\":{},\
              \"deadlocks\":{},\"xact_rollbacks\":{},\"wal_bytes\":{},\
-             \"folded_rows\":{},\"wal_bytes_per_row\":{:.1},{},{},{},{},\
+             \"folded_rows\":{},\"wal_bytes_per_row\":{:.1},{},{},{},{},{},\
              \"peak_xmin_age_xids\":{},\"peak_xmin_hold_secs\":{:.3},\
              \"peak_xmin_holder\":\"{}\",\"peak_xact_secs\":{:.3},\"peak_xact_query\":\"{}\",\
              \"source_bytes\":{},\"target_bytes\":{},\"contention\":{}}}",
@@ -337,6 +353,8 @@ impl BuildUnderLoadResult {
             self.cfg.writers,
             self.cfg.write_rate,
             self.application_threads,
+            self.rederive_build,
+            self.build_chunk_rows,
             self.load_secs,
             self.load_rows_per_sec,
             self.index_secs,
@@ -373,6 +391,7 @@ impl BuildUnderLoadResult {
             self.server.json_fields(self.folded_rows(), self.cfg.rows),
             self.contention.lock_json_fields(),
             self.memory.json_fields(),
+            self.build.json_fields(),
             self.peak_xmin_age_xids,
             self.peak_xmin_hold_secs,
             disk_tier::json_escape(&self.peak_xmin_holder),
@@ -396,7 +415,7 @@ impl BuildUnderLoadResult {
             "build-under-load: {} rows / {} groups, loaded at {:.0} rows/s; build {:.1}s over {} \
              chunks (first done {}), live after {:.1}s; converged {} (tail {}, engine settled {}, {} oracle checks of {}), oracle_ok={} \
              ({} mismatched); writers {:.0}/{} stmt/s (kept={}), commit p50/p99 {}/{} ms \
-             overall, {}/{} ms during build; {}; {}; page lock hold p99 {} ms, wait p99 {} ms; {}",
+             overall, {}/{} ms during build; {}; {}; page lock hold p99 {} ms, wait p99 {} ms; {}; {}",
             self.cfg.rows,
             self.cfg.groups,
             self.load_rows_per_sec,
@@ -433,6 +452,7 @@ impl BuildUnderLoadResult {
             json_ms(self.contention.page_lock_holds.p99_ms),
             json_ms(self.contention.page_lock_waits.p99_ms),
             self.memory.human(),
+            self.build.human(),
         )
     }
 }
@@ -774,7 +794,7 @@ async fn mismatched_groups(raw: &RawClient, terminal: &str) -> i64 {
 }
 
 pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadResult {
-    assert!(cfg.rows >= 1 && cfg.groups >= 1 && cfg.writers >= 1 && cfg.write_rate > 0.0);
+    assert!(cfg.rows >= 1 && cfg.groups >= 1 && (cfg.writers == 0 || cfg.write_rate > 0.0));
     let memory = RssSampler::start(
         process_memory::DEFAULT_INTERVAL,
         cfg.progress.map(|every| (every, "build-under-load")),
@@ -820,6 +840,13 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
 
     let disk_start = disk_tier::sample(&sampler).await;
+    let metrics_start = MetricsSnapshot::take();
+    let peaks_stop = Arc::new(AtomicBool::new(false));
+    let peaks_task = tokio::spawn(build_profile::sample_peaks(
+        connect_raw(db.dsn()).await,
+        TARGET.to_string(),
+        peaks_stop.clone(),
+    ));
     let server_start = server_cost::start(&cluster);
     let (deadlocks_before, rollbacks_before) = contention::deadlocks_and_rollbacks(&sampler).await;
     let contention_stop = Arc::new(AtomicBool::new(false));
@@ -891,6 +918,9 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let xmin = xmin_task.await.expect("xmin sampler");
     let writer_secs = stopped_at.duration_since(shared.start).as_secs_f64();
     let achieved_write_rate = writes.total() as f64 / writer_secs;
+    // `--writers 0`: a build-only run, which keeps its (zero) rate.
+    let kept_target_rate = cfg.writers == 0
+        || achieved_write_rate >= cfg.write_rate * (1.0 - GENERATOR_UNDERSHOOT_TOLERANCE);
 
     // Every writer has returned, so each of its statements has committed:
     // a position read now bounds all of them from above.
@@ -940,7 +970,13 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         tokio::time::sleep(CONVERGE_POLL).await;
     }
     contention_stop.store(true, Ordering::Relaxed);
+    peaks_stop.store(true, Ordering::Relaxed);
     let disk = disk_tier::since(&sampler, &disk_start).await;
+    let build = BuildProfile::between(
+        &metrics_start,
+        &MetricsSnapshot::take(),
+        peaks_task.await.expect("peak sampler"),
+    );
     let server = server_start.finish(&sampler).await;
     let contention = contention_task.await.expect("contention sampler");
     memory.end_phase("converge");
@@ -963,6 +999,9 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     BuildUnderLoadResult {
         cfg,
         application_threads: tuning.application_threads,
+        rederive_build: tuning.rederive_build,
+        build_chunk_rows: tuning.build_chunk_rows,
+        build,
         load_secs,
         load_rows_per_sec,
         index_secs,
@@ -985,8 +1024,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         oracle_check_secs,
         writer_secs,
         achieved_write_rate,
-        kept_target_rate: achieved_write_rate
-            >= cfg.write_rate * (1.0 - GENERATOR_UNDERSHOOT_TOLERANCE),
+        kept_target_rate,
         writes,
         deadlocks: deadlocks_after - deadlocks_before,
         xact_rollbacks: rollbacks_after - rollbacks_before,

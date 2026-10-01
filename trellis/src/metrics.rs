@@ -118,6 +118,135 @@ const RELATIONSHIP_REVERSE_DEFERRED_METRIC: &str = "trellis_relationship_reverse
 const RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC: &str =
     "trellis_relationship_reverse_fairness_escalated_total";
 
+/// #625 F2: worker time a Re-derive build spends in each of its statement
+/// classes, labeled `class` ([`BuildStatement`]). The `_sum` per class is
+/// worker-seconds; the profile divides it by the rows built.
+const BUILD_STATEMENT_METRIC: &str = "trellis_build_statement_seconds";
+
+/// #625 F2: one Re-derive build chunk's transaction, from its begin to its
+/// commit (the span its entry locks and snapshot are held).
+const BUILD_CHUNK_METRIC: &str = "trellis_build_chunk_seconds";
+
+/// #625 F2: the longest [`BUILD_CHUNK_METRIC`] this process has recorded.
+const BUILD_CHUNK_MAX_METRIC: &str = "trellis_build_chunk_seconds_max";
+
+/// #625 F2: source keys a Re-derive build's chunks re-derived.
+const BUILD_ROWS_METRIC: &str = "trellis_build_rows_total";
+
+/// #625 F2: group-delta rows Re-derive build chunks appended, and that
+/// mergers folded into groups, labeled `step` (`appended`/`merged`).
+const BUILD_DELTA_ROWS_METRIC: &str = "trellis_build_delta_rows_total";
+
+/// #625 F2: Re-derive build chunks that gave up on their entry lock's short
+/// timeout and were released for a retry.
+const BUILD_CHUNK_LOCK_TIMEOUTS_METRIC: &str = "trellis_build_chunk_lock_timeouts_total";
+
+/// #625 F2: seals refused because the ring had no free slot, after the
+/// retirement the seal answers that with (`staging::seal_if_active_nonempty`).
+const SEAL_REFUSED_METRIC: &str = "trellis_seal_refused_total";
+
+/// [`BUILD_CHUNK_METRIC`]'s buckets: finer than [`LATENCY_BUCKETS`], since a
+/// chunk's percentiles are a profile column (#625 §4). About 25% apart from
+/// 1 ms to 2 minutes.
+const BUILD_CHUNK_BUCKETS: &[f64] = &[
+    0.001, 0.00125, 0.0016, 0.002, 0.0025, 0.0032, 0.004, 0.005, 0.0063, 0.008, 0.01, 0.0125,
+    0.016, 0.02, 0.025, 0.032, 0.04, 0.05, 0.063, 0.08, 0.1, 0.125, 0.16, 0.2, 0.25, 0.32, 0.4,
+    0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0,
+    25.0, 32.0, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0,
+];
+
+/// A Re-derive build's statement classes, [`BUILD_STATEMENT_METRIC`]'s
+/// `class` label (#625 F2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStatement {
+    /// A chunk's read of the keys in its range.
+    ChunkKeys,
+    /// A chunk's entry lock (placeholders, then the sorted `for update`).
+    ChunkLock,
+    /// A chunk's one read-and-write statement: the snapshot, the entries
+    /// and the group-delta insert.
+    ChunkWrite,
+    /// A chunk's commit, and marking it done.
+    ChunkCommit,
+    /// The merger's claim, delete, sum and group upsert (one statement).
+    MergeUpsert,
+    /// The merger's all-zero group delete and the seam.
+    MergeFinish,
+    /// The merger's commit.
+    MergeCommit,
+    /// The plan job's boundary walk and chunk inserts.
+    Plan,
+}
+
+impl BuildStatement {
+    /// Every class, in label order.
+    pub const ALL: [BuildStatement; 8] = [
+        BuildStatement::ChunkKeys,
+        BuildStatement::ChunkLock,
+        BuildStatement::ChunkWrite,
+        BuildStatement::ChunkCommit,
+        BuildStatement::MergeUpsert,
+        BuildStatement::MergeFinish,
+        BuildStatement::MergeCommit,
+        BuildStatement::Plan,
+    ];
+
+    /// The `class` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            BuildStatement::ChunkKeys => "chunk_keys",
+            BuildStatement::ChunkLock => "chunk_lock",
+            BuildStatement::ChunkWrite => "chunk_write",
+            BuildStatement::ChunkCommit => "chunk_commit",
+            BuildStatement::MergeUpsert => "merge_upsert",
+            BuildStatement::MergeFinish => "merge_finish",
+            BuildStatement::MergeCommit => "merge_commit",
+            BuildStatement::Plan => "plan",
+        }
+    }
+}
+
+/// Records `elapsed` worker time in Re-derive build statement class
+/// `class` (#625 F2).
+pub fn record_build_statement(class: BuildStatement, elapsed: Duration) {
+    ensure_installed();
+    metrics::histogram!(BUILD_STATEMENT_METRIC, "class" => class.label())
+        .record(elapsed.as_secs_f64());
+}
+
+/// Records one committed Re-derive build chunk (#625 F2): its transaction's
+/// duration, the keys it re-derived and the delta rows it appended.
+pub fn record_build_chunk(elapsed: Duration, keys: u64, delta_rows: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MAX_NANOS: AtomicU64 = AtomicU64::new(0);
+    ensure_installed();
+    let secs = elapsed.as_secs_f64();
+    metrics::histogram!(BUILD_CHUNK_METRIC).record(secs);
+    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    let max = MAX_NANOS.fetch_max(nanos, Ordering::Relaxed).max(nanos);
+    metrics::gauge!(BUILD_CHUNK_MAX_METRIC).set(max as f64 / 1e9);
+    metrics::counter!(BUILD_ROWS_METRIC).increment(keys);
+    metrics::counter!(BUILD_DELTA_ROWS_METRIC, "step" => "appended").increment(delta_rows);
+}
+
+/// Records group-delta rows a merger folded (#625 F2).
+pub fn record_build_merge(delta_rows: u64) {
+    ensure_installed();
+    metrics::counter!(BUILD_DELTA_ROWS_METRIC, "step" => "merged").increment(delta_rows);
+}
+
+/// Counts a Re-derive build chunk that gave up on its entry lock (#625 F2).
+pub fn increment_build_chunk_lock_timeouts() {
+    ensure_installed();
+    metrics::counter!(BUILD_CHUNK_LOCK_TIMEOUTS_METRIC).increment(1);
+}
+
+/// Counts a seal refused for a full ring (#625 F2).
+pub fn increment_seal_refused() {
+    ensure_installed();
+    metrics::counter!(SEAL_REFUSED_METRIC).increment(1);
+}
+
 /// The process-wide recorder handle, built and installed on first use. See
 /// the module doc comment's "Recorder installation" section.
 fn handle() -> &'static PrometheusHandle {
@@ -144,6 +273,11 @@ fn described_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
     let recorder = PrometheusBuilder::new()
         .set_buckets(LATENCY_BUCKETS)
         .expect("LATENCY_BUCKETS is non-empty and every boundary is finite")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(BUILD_CHUNK_METRIC.to_string()),
+            BUILD_CHUNK_BUCKETS,
+        )
+        .expect("BUILD_CHUNK_BUCKETS is non-empty and every boundary is finite")
         .build_recorder();
     metrics::with_local_recorder(&recorder, describe_metrics);
     recorder
@@ -157,6 +291,39 @@ fn described_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
 /// put there; issue #53's exposition is meant to be self-documenting for an
 /// operator reading a raw scrape, so every series gets one.
 fn describe_metrics() {
+    metrics::describe_histogram!(
+        BUILD_STATEMENT_METRIC,
+        metrics::Unit::Seconds,
+        "Worker time a Re-derive build spent per statement class, labeled by class."
+    );
+    metrics::describe_histogram!(
+        BUILD_CHUNK_METRIC,
+        metrics::Unit::Seconds,
+        "Duration of each committed Re-derive build chunk's transaction."
+    );
+    metrics::describe_gauge!(
+        BUILD_CHUNK_MAX_METRIC,
+        metrics::Unit::Seconds,
+        "The longest Re-derive build chunk transaction this process has committed."
+    );
+    metrics::describe_counter!(
+        BUILD_ROWS_METRIC,
+        "Count of source keys Re-derive build chunks re-derived."
+    );
+    metrics::describe_counter!(
+        BUILD_DELTA_ROWS_METRIC,
+        "Count of group-delta rows Re-derive build chunks appended and mergers folded, labeled \
+         by step (appended/merged)."
+    );
+    metrics::describe_counter!(
+        BUILD_CHUNK_LOCK_TIMEOUTS_METRIC,
+        "Count of Re-derive build chunks that gave up on their entry lock's timeout and were \
+         released for a retry."
+    );
+    metrics::describe_counter!(
+        SEAL_REFUSED_METRIC,
+        "Count of seals refused because the staging ring had no free slot."
+    );
     metrics::describe_histogram!(
         TRANSFORM_LATENCY_METRIC,
         metrics::Unit::Seconds,

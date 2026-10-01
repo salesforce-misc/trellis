@@ -94,9 +94,10 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 ///
 /// - `--rows <n>` (10,000,000) COPY-loaded into `agg_src`, `grp` uniform over
 ///   `--groups <n>` (100,000), by `--loaders <n>` (4) connections;
-/// - `--writers <n>` (8) paced writers at `--write-rate <stmt/s>` (2,000 in
-///   total), starting `--pre-define-secs` (2) before the definition and
-///   running `--duration-secs` (20) after it reads `live`;
+/// - `--writers <n>` (8; 0 for a build-only run) paced writers at
+///   `--write-rate <stmt/s>` (2,000 in total), starting `--pre-define-secs`
+///   (2) before the definition and running `--duration-secs` (20) after it
+///   reads `live`;
 /// - `--build-timeout-secs` (3,600) for define -> `live`, `--grace-secs`
 ///   (600) for the target to converge once the writers stop, and at least
 ///   `--oracle-poll-min-secs` (5) between full-source oracle comparisons after
@@ -106,7 +107,9 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 ///
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
-/// `--reconcile-interval-ms`, `--drain-batch-cap`). Postgres settings for a disk
+/// `--reconcile-interval-ms`, `--drain-batch-cap`), and #625 F2's
+/// `--rederive-build` (build the target with the Re-derive build) and
+/// `--build-chunk-rows <n>` (its chunk size, 10,000). Postgres settings for a disk
 /// run go through testkit's `TRELLIS_TESTKIT_PG_OPTIONS`, e.g.
 /// `'shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB'` (#617's).
 fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
@@ -124,7 +127,11 @@ fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad 
         rows: positive("--rows", 10_000_000.0) as u64,
         groups: positive("--groups", 100_000.0) as i32,
         loaders: positive("--loaders", 4.0) as usize,
-        writers: positive("--writers", 8.0) as usize,
+        writers: {
+            let v = number(args, "--writers").unwrap_or(8.0);
+            assert!(v >= 0.0, "--writers must not be negative, got {v}");
+            v as usize
+        },
         write_rate: positive("--write-rate", 2_000.0),
         pre_define: secs(args, "--pre-define-secs").unwrap_or(Duration::from_secs(2)),
         post_live: secs(args, "--duration-secs").unwrap_or(Duration::from_secs(20)),
@@ -218,6 +225,13 @@ fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
         drain_batch_cap: number(args, "--drain-batch-cap")
             .map(|v| v as usize)
             .unwrap_or(default.drain_batch_cap),
+        rederive_build: args.iter().any(|a| a == "--rederive-build") || default.rederive_build,
+        build_chunk_rows: number(args, "--build-chunk-rows")
+            .map(|v| {
+                assert!(v >= 1.0, "--build-chunk-rows must be at least 1, got {v}");
+                v as i64
+            })
+            .unwrap_or(default.build_chunk_rows),
     }
 }
 
@@ -808,6 +822,35 @@ mod tests {
             .drain_batch_cap,
             5000
         );
+    }
+
+    #[test]
+    fn tuning_reads_the_rederive_build_flags_or_keeps_them_off() {
+        let stock = tuning(&argv(&["build-under-load"]), EngineTuning::default());
+        assert!(!stock.rederive_build);
+        assert_eq!(
+            stock.build_chunk_rows,
+            trellis::ClientOptions::default().build_chunk_rows
+        );
+        let t = tuning(
+            &argv(&[
+                "build-under-load",
+                "--rederive-build",
+                "--build-chunk-rows",
+                "50000",
+            ]),
+            EngineTuning::default(),
+        );
+        assert!(t.rederive_build);
+        assert_eq!(t.build_chunk_rows, 50_000);
+        assert!(t.client_options().rederive_build);
+        assert_eq!(t.client_options().build_chunk_rows, 50_000);
+    }
+
+    #[test]
+    fn build_under_load_takes_zero_writers() {
+        let c = build_under_load_config(&argv(&["build-under-load", "--writers", "0"]));
+        assert_eq!(c.writers, 0);
     }
 
     #[test]

@@ -470,6 +470,10 @@ pub async fn seal_if_active_nonempty(
     let outcome = match attempt {
         Ok(outcome) => outcome,
         Err(StagingError::SealGateBlocked) => return Ok(None),
+        Err(err @ StagingError::RingFull { .. }) => {
+            crate::metrics::increment_seal_refused();
+            return Err(err);
+        }
         Err(other) => return Err(other),
     };
     seal_phase2(client, outcome.sealed_seg_seq, wake_channel).await?;

@@ -53,6 +53,38 @@ pub struct Definition {
     /// `staging::apply::compute`'s `downstream_readers` check for the one
     /// call site that needs exactly this).
     pub target_table: String,
+    /// Whether a Re-derive build is running for it
+    /// (`transform_definitions.build = 'rederive'`, #625 F2; see
+    /// `crate::staging::build`). Such a definition applies from the commit
+    /// that moved it to `backfilling` ([`Self::applies`]).
+    pub rederive_build: bool,
+}
+
+impl Definition {
+    /// Whether Apply maintains this definition: it folds every change to
+    /// what it reads into its target, and the target-mutation seam stages
+    /// its source's writes for it. A [`TransformStatus::is_applying`]
+    /// status, or `backfilling` under a Re-derive build (#625 B1), which
+    /// applies from its start. [`APPLYING_SQL`] is the same test in SQL.
+    pub fn applies(&self) -> bool {
+        self.status.is_applying()
+            || (self.status == TransformStatus::Backfilling && self.rederive_build)
+    }
+}
+
+/// [`Definition::applies`] as a SQL predicate over a `transform_definitions`
+/// row, unqualified: a status [`TransformStatus::is_applying`] holds for, or
+/// `backfilling` under a Re-derive build. Qualify the columns with
+/// [`applying_sql`] where the row has an alias.
+pub const APPLYING_SQL: &str =
+    "(status in ('live', 'catching_up') or (status = 'backfilling' and build = 'rederive'))";
+
+/// [`APPLYING_SQL`] over a `transform_definitions` row aliased `alias`.
+pub fn applying_sql(alias: &str) -> String {
+    format!(
+        "({alias}.status in ('live', 'catching_up') \
+         or ({alias}.status = 'backfilling' and {alias}.build = 'rederive'))"
+    )
 }
 
 /// A transform's lifecycle status (issue #55), persisted as
@@ -483,5 +515,26 @@ mod tests {
         );
         assert!(TransformStatus::Paused.is_frozen());
         assert!(TransformStatus::Quarantined.is_frozen());
+    }
+
+    /// [`APPLYING_SQL`] names exactly the statuses `is_applying` holds for,
+    /// plus a Re-derive build's `backfilling`.
+    #[test]
+    fn applying_sql_agrees_with_is_applying() {
+        use super::{APPLYING_SQL, applying_sql};
+        let words: Vec<&str> = TransformStatus::applying();
+        for word in &words {
+            assert!(APPLYING_SQL.contains(&format!("'{word}'")));
+        }
+        assert_eq!(
+            words.len(),
+            2,
+            "APPLYING_SQL spells out both applying words"
+        );
+        assert_eq!(
+            applying_sql("t"),
+            "(t.status in ('live', 'catching_up') \
+             or (t.status = 'backfilling' and t.build = 'rederive'))"
+        );
     }
 }

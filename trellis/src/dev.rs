@@ -66,6 +66,10 @@ pub mod defs {
 
 /// The engine items `generative`'s backend drivers reach for under `staging`.
 pub mod staging {
+    /// Read, never set: `benchmark`'s contention sampler tells a Re-derive
+    /// build's statements from a drain page's by the `application_name`
+    /// their transactions set (#625 F2's profile).
+    pub use crate::staging::build::{CHUNK_APPLICATION_NAME, MERGE_APPLICATION_NAME};
     /// Read, never set: the concurrent tier's coverage report (issue #557)
     /// counts bursts large enough to seal into a split batch, and must follow
     /// the threshold if it moves.

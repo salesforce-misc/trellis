@@ -68,6 +68,7 @@
 //! - [`server_cost`]: Postgres CPU, `deadlock detected` log lines, the
 //!   engine's lock-timeout warnings and ledger bytes over a window (#623 D1).
 
+pub mod build_profile;
 pub mod build_under_load;
 pub mod capture_ceiling;
 pub mod chain;

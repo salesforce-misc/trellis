@@ -2545,6 +2545,7 @@ async fn create_definition_inner(
         status,
         source_table: qualified_source,
         target_table: qualified_target,
+        rederive_build: false,
     })
 }
 
@@ -5703,6 +5704,7 @@ struct PendingDefinition {
     source_columns: HashMap<String, ValueType>,
     source_table: String,
     target_table: String,
+    rederive_build: bool,
 }
 
 /// The transform definitions that depend on `node_table` via a `kind` edge
@@ -5722,8 +5724,9 @@ struct PendingDefinition {
 /// lateral`) matters: a definition whose `source_columns` is `{}` must still
 /// come back with zero entries, not disappear from the result entirely.
 ///
-/// **Applying definitions only** ([`TransformStatus::is_applying`]: `live`
-/// or `catching_up`; the public API design's ADR-0007 amendment,
+/// **Applying definitions only** ([`super::model::Definition::applies`]:
+/// `live` or `catching_up`, or `backfilling` under a Re-derive build, which
+/// applies from its start, #625 F2; the public API design's ADR-0007 amendment,
 /// closing the CDC race commit 1fa8570 reopened): a `waiting_to_backfill`/
 /// `backfilling`/`quarantined` definition's target may not yet reflect every
 /// pre-existing source row (the direct-build chunk queue, or a
@@ -5762,16 +5765,19 @@ pub async fn dependents_of(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value
-             from schema_nodes from_node
-             join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
-             join schema_nodes to_node on to_node.id = se.to_node_id
-             join transform_definitions t on t.target_table = to_node.table_name
-             left join lateral jsonb_each_text(t.source_columns) e on true
-             where from_node.table_name = $1 and t.status = any($3)
-             order by t.id",
-            &[&node_table, &kind.as_str(), &TransformStatus::applying()],
+            &format!(
+                "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
+                        t.target_table, e.key, e.value, t.build is not distinct from 'rederive'
+                 from schema_nodes from_node
+                 join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
+                 join schema_nodes to_node on to_node.id = se.to_node_id
+                 join transform_definitions t on t.target_table = to_node.table_name
+                 left join lateral jsonb_each_text(t.source_columns) e on true
+                 where from_node.table_name = $1 and {}
+                 order by t.id",
+                super::model::applying_sql("t")
+            ),
+            &[&node_table, &kind.as_str()],
         )
         .await?;
 
@@ -5798,6 +5804,7 @@ pub async fn dependents_of(
                 source_columns: HashMap::new(),
                 source_table: row.get(4),
                 target_table: row.get(5),
+                rederive_build: row.get(8),
             }
         });
 
@@ -5824,6 +5831,7 @@ pub async fn dependents_of(
             status: pending.status,
             source_table: pending.source_table,
             target_table: pending.target_table,
+            rederive_build: pending.rederive_build,
         });
     }
     Ok(result)
@@ -5936,7 +5944,8 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
 /// ([`crate::intake::markers::run_pending_backfills`]) skips enumerating
 /// a table this says `false` for (issue #417), since nothing would consume the
 /// `Recompute` rows; it excludes the definitions it just dispatched to chunked
-/// builds, which read the table themselves (issue #418).
+/// builds, which read the table themselves (issue #418), and every definition
+/// a Re-derive build is running for, whose chunks do too (#625 F2).
 pub(crate) async fn table_has_reader(
     client: &impl GenericClient,
     qualified_table: &str,
@@ -5946,7 +5955,7 @@ pub(crate) async fn table_has_reader(
         .query_one(
             &format!(
                 "{} select exists (select 1 from reachable where table_name = $1)",
-                reachable_tables_cte("not (id = any($2))")
+                reachable_tables_cte("not (id = any($2)) and build is null")
             ),
             &[&qualified_table, &excluding],
         )
@@ -6093,7 +6102,7 @@ pub(crate) async fn definition_by_id(
     let rows = client
         .query(
             "select t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value \
+                    t.target_table, e.key, e.value, t.build is not distinct from 'rederive' \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where t.id = $1",
@@ -6109,6 +6118,7 @@ pub(crate) async fn definition_by_id(
     let status_text: String = rows[0].get(2);
     let source_table: String = rows[0].get(3);
     let target_table: String = rows[0].get(4);
+    let rederive_build: bool = rows[0].get(7);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
@@ -6137,6 +6147,7 @@ pub(crate) async fn definition_by_id(
         status,
         source_table,
         target_table,
+        rederive_build,
     }))
 }
 
@@ -6166,7 +6177,7 @@ pub async fn definition_by_target(
     let rows = client
         .query(
             "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value \
+                    t.target_table, e.key, e.value, t.build is not distinct from 'rederive' \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where split_part(t.target_table, '.', 2) = $1",
@@ -6183,6 +6194,7 @@ pub async fn definition_by_target(
     let status_text: String = rows[0].get(3);
     let source_table: String = rows[0].get(4);
     let qualified_target_table: String = rows[0].get(5);
+    let rederive_build: bool = rows[0].get(8);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
@@ -6211,6 +6223,7 @@ pub async fn definition_by_target(
         status,
         source_table,
         target_table: qualified_target_table,
+        rederive_build,
     }))
 }
 
