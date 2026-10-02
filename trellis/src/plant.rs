@@ -110,7 +110,9 @@ pub enum Plant {
     ChunkWithoutEntryLock,
     /// #625 F3 (B3): the build's merger (`staging::build::merge_deltas`)
     /// applies the group-delta rows it claims without deleting them, so the
-    /// next merge applies them again.
+    /// next merge applies them again. It fires on a target's first merge in
+    /// the process only: kept every time, the rows would be merged forever
+    /// and the build never end, which a test sees as a hang, not a catch.
     MergeWithoutDelete,
 }
 

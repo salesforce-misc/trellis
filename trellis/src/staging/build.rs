@@ -539,9 +539,22 @@ pub async fn merge_deltas(
     let mut mutations = TargetMutations::new();
     let image_columns = mutations.image_columns(txn, &ledger.target).await?;
     // Planted bug (#625 F3): the merger keeps the delta rows it applies, so
-    // the next merge applies them again. See `crate::plant`.
+    // the next merge applies them again. Once per target per process, so
+    // the build still ends (kept every time, the rows would be merged
+    // forever). See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    let keep_claimed = crate::plant::fires(crate::plant::Plant::MergeWithoutDelete, true);
+    let keep_claimed = if crate::plant::armed() == Some(crate::plant::Plant::MergeWithoutDelete) {
+        let database: String = txn
+            .query_one("select current_database()::text", &[])
+            .await?
+            .get(0);
+        crate::plant::fires(
+            crate::plant::Plant::MergeWithoutDelete,
+            first_planted_merge(&format!("{database}.{}", ledger.deltas_ident)),
+        )
+    } else {
+        false
+    };
     #[cfg(not(any(test, feature = "test-util")))]
     let keep_claimed = false;
     let sql = ledger::merge_statement(ledger, image_columns.as_deref(), keep_claimed);
@@ -573,6 +586,19 @@ pub async fn merge_deltas(
         deleted,
         skipped: false,
     })
+}
+
+/// Whether this is the first merge of the target `deltas` names (its
+/// database and delta table) this process makes under the
+/// `merge_without_delete` plant ([`merge_deltas`]), recording it if so.
+#[cfg(any(test, feature = "test-util"))]
+fn first_planted_merge(deltas: &str) -> bool {
+    static MERGED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(Mutex::default);
+    MERGED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(deltas.to_string())
 }
 
 // ---------------------------------------------------------------------

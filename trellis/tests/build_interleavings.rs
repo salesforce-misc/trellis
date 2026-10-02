@@ -876,6 +876,49 @@ async fn a_chunk_gives_up_on_a_key_a_page_holds() {
     assert_oracle(&mut d, &plan, flavour).await;
 }
 
+/// A chunk takes its entry lock before it reads (ADR-0002 I1 for the build,
+/// #625 F3's `chunk_without_entry_lock` plant). Key 2 already has an entry
+/// (an Apply counted it before its chunk ran), and a page applying a later
+/// change to it is frozen after its entry lock, before it writes. The chunk
+/// over key 2 queues behind it in its entry lock, and its read sees the
+/// page's commit. Read before the lock, it would see the entry as it was
+/// before the page, then wait on the page's row lock in its write and move
+/// key 2 from that stale entry, counting the page's change twice. (A page
+/// frozen after its write would hold the chunk anyway: the chunk's
+/// placeholder insert waits on the entry's in-progress update.) A chunk
+/// that gives up at its short lock timeout runs again.
+#[tokio::test]
+async fn a_chunk_reads_an_entry_only_once_the_page_holding_it_commits() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = v + 10 where id = 2")
+        .await
+        .expect("update key 2");
+    let batch = d.seal().await;
+    d.drain(batch, "apply").await;
+    user.batch_execute("update public.src set v = v + 100 where id = 2")
+        .await
+        .expect("update key 2 again");
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterEntryLock, TARGET)])
+        .await;
+    let frozen = page.reached(PausePoint::AfterEntryLock).await;
+    let chunk = d.chunk_frozen(&plan, None, "3", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut page, PausePoint::AfterEntryLock).await;
+    page.finish().await;
+    match chunk.finish_result().await {
+        Ok(outcome) => assert_eq!(outcome.keys, 3),
+        Err(err) if trellis::locks::is_lock_not_available(&err) => {
+            assert_eq!(d.chunk(&plan, None, "3").await.keys, 3);
+        }
+        Err(err) => panic!("the chunk failed: {err}"),
+    }
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
 // ------------------------------------------------------- tombstone GC (D7)
 
 /// A chunk's tombstone (a key it locked whose row was deleted before its
