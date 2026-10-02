@@ -464,7 +464,7 @@ impl LedgerTargetPlan {
 /// ADR-0002 I2 as SQL over the ledger entry `l`, the batch row `v` (its
 /// `lsn` and `txid`) and the target's truncate floor `fl`: whether an Apply
 /// changes the entry. `visibility` false renders the `lsn_only_skip` plant.
-fn apply_predicate(visibility: bool) -> String {
+pub(super) fn apply_predicate(visibility: bool) -> String {
     let basis = quote_ident(schema::BASIS_COLUMN);
     let applied = quote_ident(schema::APPLIED_LSN_COLUMN);
     let seen = if visibility {

@@ -164,9 +164,9 @@ const DRAINED_PREFIX_SQL: &str = "\
     from segments";
 
 /// Every ledger table there is, schema-qualified and quoted: a
-/// definition's `<target>__ledger`, where it exists. Only aggregate targets
-/// have one today; a 1-1 target's (#623 D6) is found the same way, with the
-/// same ordering-state columns, so [`collect_tombstones`] collects it as is.
+/// definition's `<target>__ledger`, where it exists. An aggregate target's
+/// and a 1-1 target's (#623 D6) carry the same ordering-state columns, so
+/// [`collect_tombstones`] collects both alike.
 const LEDGER_TABLES_SQL: &str = "\
     select format('%I.%I', n.nspname, c.relname) \
     from transform_definitions d \

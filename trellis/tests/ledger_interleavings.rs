@@ -25,17 +25,20 @@
 //! flavour is on the ledger since #623 D3, where it re-reads the key's row
 //! and snapshot in one statement and rewrites the key's entry
 //! (`trellis::staging::ledger`), and the `MIN`/`MAX` flavour since D4
-//! recomputes its written groups from the entries. The 1-1 flavour re-reads
-//! the row (#344) until D6.
+//! recomputes its written groups from the entries. The 1-1 flavour is on its
+//! ledger since D6 (`trellis::staging::one_to_one_ledger`), where a
+//! Re-derive reads the row and snapshot in one statement and stamps the
+//! key's entry.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, Running};
+use tokio_postgres::types::PgLsn;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ValueType;
+use trellis::defs::{Statement, ValueType, alter_transform, parse_statement};
 use trellis::staging::interleave::PausePoint;
-use trellis::staging::{StagedWatermark, apply, claim};
+use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, claim, quarantine};
 
 const SRC: &str = "public.src";
 
@@ -99,12 +102,14 @@ impl Flavour {
         }
     }
 
-    /// Whether the flavour's target is on the ledger.
-    fn on_ledger(self) -> bool {
-        matches!(
-            self,
-            Flavour::Aggregate | Flavour::AggregateAvg | Flavour::AggregateMinMax
-        )
+    /// The flavour's target's ledger.
+    fn ledger(self) -> &'static str {
+        match self {
+            Flavour::Aggregate | Flavour::AggregateAvg | Flavour::AggregateMinMax => {
+                "public.agg__ledger"
+            }
+            Flavour::OneToOne => "public.one__ledger",
+        }
     }
 }
 
@@ -170,9 +175,6 @@ async fn pause_points_fire_in_page_order(flavour: Flavour) {
     ];
     if matches!(flavour, Flavour::OneToOne) {
         points.retain(|p| *p != PausePoint::AfterGroupUpsert);
-    }
-    if !flavour.on_ledger() {
-        points.retain(|p| *p != PausePoint::AfterPlaceholders);
     }
     let armed: Vec<(PausePoint, &str)> = points.iter().map(|p| (*p, flavour.target())).collect();
     let mut drain = d.drain_frozen(batch, "a", &armed).await;
@@ -548,6 +550,80 @@ async fn exp2_9d_one_to_one() {
     exp2_9d(Flavour::OneToOne).await;
 }
 
+/// Adversarial (#623 D6 review): a Re-derive absorbs key 1's two updates (W1
+/// then W2, folded with a same-batch recompute marker so W2 never gets its
+/// own standalone Apply record), landing basis after both. W1's own,
+/// separate, older-lsn capture then drains on its own: ADR-0002 I2's
+/// visibility clause must skip it since the Re-derive's basis already saw
+/// it. With only the `lsn > applied_lsn` half of I2 (`applied_lsn` is still
+/// null — the Re-derive never bumps it), W1's stale apply slips through,
+/// overwrites `v` back to 15, and nothing is left pending to self-correct:
+/// W2's own image was absorbed by the Re-derive, never becoming an
+/// independent, higher-lsn Apply that a later drain could use to re-fix the
+/// row. This is the one shape where I2's visibility half, not its `lsn`
+/// half, is load-bearing for a 1-1 target.
+#[tokio::test]
+async fn a_rederive_absorbed_update_leaves_an_older_capture_skippable_only_by_visibility() {
+    let flavour = Flavour::OneToOne;
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(&d, "update public.src set v = 15 where id = 1").await;
+    let b1 = d.seal().await;
+    write(&d, "update public.src set v = 30 where id = 1").await;
+    d.stage_recomputes(SRC, &["1"]).await;
+    let b2 = d.seal().await;
+    // B2 folds a CDC change for key 1 with a same-batch recompute marker for
+    // key 1, so its record settles as a Re-derive (`has_recompute`): it
+    // reads the row live (sees 30, after both updates) and stamps the
+    // entry's basis, but leaves `applied_lsn` untouched.
+    d.drain(b2, "a").await;
+    assert_eq!(
+        d.rows(flavour.actual()).await,
+        ["(1,1,30)", "(2,1,20)"],
+        "the Re-derive wrote the live value"
+    );
+    // B1 (W1's own, lower-lsn capture) drains on its own, after the
+    // Re-derive's basis already saw it commit.
+    d.drain(b1, "b").await;
+    assert_oracle(&mut d, flavour).await;
+}
+
+/// A source `TRUNCATE` empties a 1-1 target's ledger, so a change from before
+/// it that still reaches a page afterward meets no entry, no basis and no
+/// `applied_lsn`: only the truncate floor (the D split's Q6) tells it is
+/// older than the truncate. Here one is staged by hand at an `lsn` below the
+/// truncate's; applied, it would bring back a row the source no longer has.
+#[tokio::test]
+async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() {
+    let flavour = Flavour::OneToOne;
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(&d, "truncate public.src").await;
+    d.settle().await;
+    assert_eq!(d.rows(flavour.actual()).await, Vec::<String>::new());
+
+    let mut client = d.pool().get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    trellis::staging::append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: SRC.to_string(),
+            key: "1".to_string(),
+            op: CdcOp::Insert,
+            lsn: Some(PgLsn::from(1)),
+            old_image: None,
+            new_image: Some(r#"{"id":"1","g":"1","v":"10"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the pre-truncate change");
+    txn.commit().await.expect("commit");
+    drop(client);
+    assert_oracle(&mut d, flavour).await;
+}
+
 // ----------------------------------------------------------------- exp 2, 10
 
 /// Exp 2 scenario 10: C (key 1's update) is in flight when a Re-derive of
@@ -767,9 +843,13 @@ async fn nested_same_key_aggregate() {
     nested_same_key(Flavour::Aggregate).await;
 }
 
-/// Passes today only because the 1-1 apply re-reads the live row under its
-/// stripe lock (#344): the last captured image is key 1 in group 1, not 2.
+/// Today: `[(1,1,30), (2,3,5)]` against the oracle's `[(1,2,30), (2,3,5)]`.
+/// On the ledger (D6) a 1-1 Apply writes its image, and the last captured
+/// image is key 1 in group 1, not 2; before D6 it passed only because the
+/// 1-1 apply re-read the live row (#344). #680 tracks the limitation until
+/// D8's NEW-only capture.
 #[tokio::test]
+#[ignore = "#623 D8"]
 async fn nested_same_key_one_to_one() {
     nested_same_key(Flavour::OneToOne).await;
 }
@@ -818,8 +898,8 @@ async fn nested_same_key_one_to_one() {
 /// read-and-snapshot statement, and the aggregate flavour asserts on the
 /// stored entries ([`assert_chunk_bases`]): W_between visible in chunk 2's
 /// basis and not in chunk 1's, W_in visible in neither, and key 3 (only ever
-/// re-derived) with its `applied_lsn` unchanged by either Re-derive. The 1-1
-/// flavour's entries are D6's.
+/// re-derived) with its `applied_lsn` unchanged by either Re-derive, in
+/// every flavour.
 async fn chunked_read_exact_point(flavour: Flavour) {
     let mut d = start(
         flavour,
@@ -880,14 +960,12 @@ async fn chunked_read_exact_point(flavour: Flavour) {
     d.release(&mut chunk_2, PausePoint::AfterRederiveRead).await;
     chunk_2.finish().await;
     cdc.finish().await;
-    if flavour.on_ledger() {
-        assert_chunk_bases(&d, &w_in_xid, &w_between_xid).await;
-        assert_eq!(
-            applied_lsn(&d, flavour, "3").await,
-            applied_before,
-            "a Re-derive leaves the entry's applied_lsn alone (the D split's Q1)"
-        );
-    }
+    assert_chunk_bases(&d, flavour, &w_in_xid, &w_between_xid).await;
+    assert_eq!(
+        applied_lsn(&d, flavour, "3").await,
+        applied_before,
+        "a Re-derive leaves the entry's applied_lsn alone (the D split's Q1)"
+    );
     assert_oracle(&mut d, flavour).await;
 }
 
@@ -900,15 +978,14 @@ async fn xact_id(client: &tokio_postgres::Client) -> String {
         .get(0)
 }
 
-/// Key `key`'s ledger `applied_lsn`, as text (`None` when unset), for a
-/// target on the ledger.
+/// Key `key`'s ledger `applied_lsn`, as text (`None` when unset).
 async fn applied_lsn(d: &Driver, flavour: Flavour, key: &str) -> Option<String> {
-    if !flavour.on_ledger() {
-        return None;
-    }
     d.ctl
         .query_one(
-            "select __applied_lsn::text from public.agg__ledger where __from_key = $1",
+            &format!(
+                "select __applied_lsn::text from {} where __from_key = $1",
+                flavour.ledger()
+            ),
             &[&key],
         )
         .await
@@ -920,14 +997,17 @@ async fn applied_lsn(d: &Driver, flavour: Flavour, key: &str) -> Option<String> 
 /// carry one basis and chunk 2's (4–6) another, W_between is visible in
 /// chunk 2's and not chunk 1's, and W_in in neither. The CDC's Applies left
 /// every basis as its chunk's Re-derive wrote it.
-async fn assert_chunk_bases(d: &Driver, w_in: &str, w_between: &str) {
+async fn assert_chunk_bases(d: &Driver, flavour: Flavour, w_in: &str, w_between: &str) {
     let rows = d
         .ctl
         .query(
-            "select __from_key, __basis::text, \
-                    pg_visible_in_snapshot($1::text::xid8, __basis), \
-                    pg_visible_in_snapshot($2::text::xid8, __basis) \
-             from public.agg__ledger where __from_key = any($3) order by __from_key",
+            &format!(
+                "select __from_key, __basis::text, \
+                        pg_visible_in_snapshot($1::text::xid8, __basis), \
+                        pg_visible_in_snapshot($2::text::xid8, __basis) \
+                 from {} where __from_key = any($3) order by __from_key",
+                flavour.ledger()
+            ),
             &[&w_in, &w_between, &vec!["1", "2", "3", "4", "5", "6"]],
         )
         .await
@@ -1717,14 +1797,18 @@ async fn a_stalled_claim_does_not_reclaim_buckets_a_peer_drained_meanwhile() {
 // ------------------------------------------------------ tombstone GC (D7)
 //
 // `trellis::staging::collect_tombstones` deletes the tombstones at or below
-// the contiguous drained prefix. Each scenario also fails under the
+// the contiguous drained prefix, on an aggregate ledger and (since D6) a 1-1
+// one alike. Each scenario also fails under the
 // `early_tombstone_gc` plant, which collects through the highest drained
 // segment instead.
 
-/// The keys of `public.agg`'s ledger tombstones, as `(key)` rows.
-async fn tombstones(d: &Driver) -> Vec<String> {
-    d.rows("select __from_key from public.agg__ledger where __tombstone order by 1")
-        .await
+/// The keys of `flavour`'s ledger tombstones, as `(key)` rows.
+async fn tombstones(d: &Driver, flavour: Flavour) -> Vec<String> {
+    d.rows(&format!(
+        "select __from_key from {} where __tombstone order by 1",
+        flavour.ledger()
+    ))
+    .await
 }
 
 /// Exp 2 scenario 9 with a GC between the delete and its older update: the
@@ -1737,12 +1821,12 @@ async fn exp2_9_gc_waits_for_the_older_update(flavour: Flavour) {
     write(&d, "delete from public.src where id = 1").await;
     let b2 = d.seal().await;
     d.drain(b2, "a").await;
-    assert_eq!(tombstones(&d).await, ["(1)"]);
+    assert_eq!(tombstones(&d, flavour).await, ["(1)"]);
     assert_eq!(d.collect_tombstones().await, 0, "the update's batch lags");
-    assert_eq!(tombstones(&d).await, ["(1)"]);
+    assert_eq!(tombstones(&d, flavour).await, ["(1)"]);
     d.drain(b1, "b").await;
     assert_eq!(d.collect_tombstones().await, 1, "nothing lags any more");
-    assert!(tombstones(&d).await.is_empty());
+    assert!(tombstones(&d, flavour).await.is_empty());
     assert_oracle(&mut d, flavour).await;
 }
 
@@ -1754,6 +1838,11 @@ async fn exp2_9_gc_waits_for_the_older_update_aggregate() {
 #[tokio::test]
 async fn exp2_9_gc_waits_for_the_older_update_aggregate_min_max() {
     exp2_9_gc_waits_for_the_older_update(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn exp2_9_gc_waits_for_the_older_update_one_to_one() {
+    exp2_9_gc_waits_for_the_older_update(Flavour::OneToOne).await;
 }
 
 /// A batch drained out of order holds GC back at the batch below it: the
@@ -1769,13 +1858,13 @@ async fn an_out_of_order_drain_holds_gc_back(flavour: Flavour) {
     write(&d, "delete from public.src where id = 1").await;
     let b3 = d.seal().await;
     d.drain(b3, "a").await;
-    assert_eq!(tombstones(&d).await, ["(1)", "(3)"]);
+    assert_eq!(tombstones(&d, flavour).await, ["(1)", "(3)"]);
     assert_eq!(
         d.collect_tombstones().await,
         1,
         "only the batch below the lagging one is in the drained prefix"
     );
-    assert_eq!(tombstones(&d).await, ["(1)"]);
+    assert_eq!(tombstones(&d, flavour).await, ["(1)"]);
     d.drain(b2, "b").await;
     assert_eq!(d.collect_tombstones().await, 1);
     assert_oracle(&mut d, flavour).await;
@@ -1789,6 +1878,11 @@ async fn an_out_of_order_drain_holds_gc_back_aggregate() {
 #[tokio::test]
 async fn an_out_of_order_drain_holds_gc_back_aggregate_min_max() {
     an_out_of_order_drain_holds_gc_back(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn an_out_of_order_drain_holds_gc_back_one_to_one() {
+    an_out_of_order_drain_holds_gc_back(Flavour::OneToOne).await;
 }
 
 /// GC under a concurrent re-insert of a deleted key: the re-insert's page is
@@ -1813,7 +1907,7 @@ async fn gc_under_a_concurrent_reinsert(flavour: Flavour) {
     write(&d, "delete from public.src where id = 3").await;
     let b3 = d.seal().await;
     d.drain(b3, "a").await;
-    assert_eq!(tombstones(&d).await, ["(1)", "(3)"]);
+    assert_eq!(tombstones(&d, flavour).await, ["(1)", "(3)"]);
     let mut reinsert = d
         .drain_frozen(
             b2,
@@ -1827,7 +1921,7 @@ async fn gc_under_a_concurrent_reinsert(flavour: Flavour) {
         1,
         "key 1's tombstone goes; key 3's is above the frozen batch"
     );
-    assert_eq!(tombstones(&d).await, ["(3)"]);
+    assert_eq!(tombstones(&d, flavour).await, ["(3)"]);
     d.release(&mut reinsert, PausePoint::AfterPlaceholders)
         .await;
     reinsert.finish().await;
@@ -1844,6 +1938,11 @@ async fn gc_under_a_concurrent_reinsert_aggregate_min_max() {
     gc_under_a_concurrent_reinsert(Flavour::AggregateMinMax).await;
 }
 
+#[tokio::test]
+async fn gc_under_a_concurrent_reinsert_one_to_one() {
+    gc_under_a_concurrent_reinsert(Flavour::OneToOne).await;
+}
+
 /// A page whose entry lock loses a key to the GC keeps I5's one global
 /// order (#712). Page A (batch 2) is frozen after its placeholder insert,
 /// which found key 2's tombstone and so inserted nothing. The GC collects
@@ -1853,9 +1952,7 @@ async fn gc_under_a_concurrent_reinsert_aggregate_min_max() {
 /// insert for key 2 queues on B's uncommitted one. Released, B locks key 1.
 /// Had A kept key 1's lock while inserting key 2's placeholder again, that
 /// is a deadlock; A gives it back first, so B goes first and A follows.
-#[tokio::test]
-async fn an_entry_lost_to_the_gc_never_deadlocks() {
-    let flavour = Flavour::Aggregate;
+async fn an_entry_lost_to_the_gc_never_deadlocks(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
     write(&d, "delete from public.src where id = 2").await;
     let b1 = d.seal().await;
@@ -1872,7 +1969,7 @@ async fn an_entry_lost_to_the_gc_never_deadlocks() {
     )
     .await;
     let b3 = d.seal().await;
-    assert_eq!(tombstones(&d).await, ["(2)"]);
+    assert_eq!(tombstones(&d, flavour).await, ["(2)"]);
 
     let mut page_a = d
         .drain_frozen(
@@ -1900,4 +1997,183 @@ async fn an_entry_lost_to_the_gc_never_deadlocks() {
     a.expect("page A");
     b.expect("page B");
     assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn an_entry_lost_to_the_gc_never_deadlocks_aggregate() {
+    an_entry_lost_to_the_gc_never_deadlocks(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn an_entry_lost_to_the_gc_never_deadlocks_one_to_one() {
+    an_entry_lost_to_the_gc_never_deadlocks(Flavour::OneToOne).await;
+}
+
+// ------------------------------------- a 1-1 and an aggregate in one page
+
+/// A 1-1 and an aggregate target fed from one source take their entry locks
+/// in one order in every page (I5): every 1-1 ledger, then every aggregate
+/// one (`apply_page`, steps 3 and 4). Page A is frozen holding both, after
+/// the aggregate's entry lock; page B, on the same keys written in the other
+/// order, queues behind it. Released, B follows A with no deadlock, and both
+/// targets match their oracles.
+#[tokio::test]
+async fn a_one_to_one_and_an_aggregate_in_one_page_never_deadlock() {
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v numeric); \
+         insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 5)",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("v", ValueType::Numeric),
+        ],
+        &[
+            Flavour::Aggregate.definition(),
+            Flavour::OneToOne.definition(),
+        ],
+        &[SRC],
+    )
+    .await;
+    write(
+        &d,
+        "update public.src set v = 11 where id = 1; update public.src set g = 2 where id = 3",
+    )
+    .await;
+    let b1 = d.seal().await;
+    write(
+        &d,
+        "update public.src set g = 1 where id = 3; update public.src set v = 12 where id = 1",
+    )
+    .await;
+    let b2 = d.seal().await;
+    let deadlocks_before = d.deadlocks_logged().len();
+
+    let mut page_a = d
+        .drain_frozen(
+            b1,
+            "a",
+            &[(PausePoint::AfterEntryLock, Flavour::Aggregate.target())],
+        )
+        .await;
+    let frozen_a = page_a.reached(PausePoint::AfterEntryLock).await;
+    let page_b = d.drain_frozen(b2, "b", &[]).await;
+    d.wait_blocked_behind(frozen_a.backend_pid).await;
+    d.release(&mut page_a, PausePoint::AfterEntryLock).await;
+    let (a, b) = tokio::join!(page_a.finish_result(), page_b.finish_result());
+
+    let deadlocks = d.deadlocks_logged().split_off(deadlocks_before);
+    assert!(
+        deadlocks.is_empty(),
+        "deadlocks detected:\n{}",
+        deadlocks.join("\n--\n")
+    );
+    a.expect("page A");
+    b.expect("page B");
+    assert_oracle(&mut d, Flavour::Aggregate).await;
+    assert_oracle(&mut d, Flavour::OneToOne).await;
+}
+
+// ------------------------------------------- the direct 1-1 writers (D6)
+//
+// A column resume (`staging::quarantine::recompute_column`) and an `ALTER
+// TRANSFORM`'s backfill (`defs::backfill::backfill_altered_columns`) write
+// 1-1 target rows outside a page. Each takes the entries of the keys it
+// writes before reading them, as a page's Re-derive does, so a page with a
+// CDC change to the same key, committed after the writer's read, queues
+// behind the writer and applies after it. Without the entry lock the page
+// applies first and the writer then puts its older read over it.
+
+/// The direct writer is frozen after its read; key 1 changes and commits,
+/// and its batch drains on a second worker, which must queue behind the
+/// writer. The page computed before the writer committed, so it skips the
+/// writer's still-paused field, which only the writer's parked catch-up
+/// brings up to date; every other field must already be the page's.
+async fn a_direct_writer_and_a_concurrent_change(d: &mut Driver, mut writer: Running<()>) {
+    let frozen = writer.reached(PausePoint::AfterRederiveRead).await;
+    write(d, "update public.src set g = 3, v = 30 where id = 1").await;
+    let batch = d.seal().await;
+    let page = d.drain_frozen(batch, "b", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut writer, PausePoint::AfterRederiveRead).await;
+    writer.finish().await;
+    page.finish().await;
+}
+
+/// A column resume racing a CDC change to a key it re-derives. `v` is
+/// paused while key 1's `v` moves 10 to 15, so the target holds the old 10;
+/// the resume then re-derives every row, and key 1 changes again under it.
+#[tokio::test]
+async fn a_column_resume_racing_a_change_to_the_same_key() {
+    let flavour = Flavour::OneToOne;
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    d.ctl
+        .execute(
+            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('one', 'v', 'paused by the test', true)",
+            &[],
+        )
+        .await
+        .expect("pause one.v");
+    write(&d, "update public.src set v = 15 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_eq!(
+        d.rows(flavour.actual()).await,
+        ["(1,1,10)", "(2,1,20)"],
+        "the paused column keeps its old value"
+    );
+
+    let resume = d
+        .run_frozen(
+            &[(PausePoint::AfterRederiveRead, flavour.target())],
+            |pool| async move {
+                quarantine::resume_column(&pool, "one", "v").await?;
+                Ok(())
+            },
+        )
+        .await;
+    a_direct_writer_and_a_concurrent_change(&mut d, resume).await;
+    assert_eq!(
+        d.rows("select id, g from public.one order by id").await,
+        d.rows("select id, g from public.src order by id").await,
+        "before the catch-up, the page's change applied after the resume's older read"
+    );
+    d.catch_up().await;
+    assert_oracle(&mut d, flavour).await;
+}
+
+/// An `ALTER TRANSFORM`'s backfill racing a CDC change to a key it writes:
+/// the added `w` is paused until the backfill ends, and the backfill writes
+/// every field.
+#[tokio::test]
+async fn an_alter_backfill_racing_a_change_to_the_same_key() {
+    let flavour = Flavour::OneToOne;
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    let Statement::AlterTransform(alter) =
+        parse_statement("ALTER TRANSFORM one ADD v + v AS w").expect("parse")
+    else {
+        panic!("not an ALTER");
+    };
+    let backfill = d
+        .run_frozen(
+            &[(PausePoint::AfterRederiveRead, flavour.target())],
+            |pool| async move {
+                alter_transform(&pool, &alter).await.expect("alter one");
+                Ok(())
+            },
+        )
+        .await;
+    a_direct_writer_and_a_concurrent_change(&mut d, backfill).await;
+    assert_eq!(
+        d.rows(flavour.actual()).await,
+        d.rows(flavour.expected()).await,
+        "before the catch-up, the page's change applied after the backfill's older read"
+    );
+    d.catch_up().await;
+    assert_eq!(
+        d.rows("select id, g, v, w from public.one order by id")
+            .await,
+        d.rows("select id, g, v, v + v from public.src order by id")
+            .await,
+    );
 }

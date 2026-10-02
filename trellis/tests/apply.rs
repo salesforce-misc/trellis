@@ -1065,10 +1065,10 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
 }
 
 /// Issue #392's check on the 1-1 path: a `recompute` folded with the key's
-/// CDC update leaves a record that looks like a plain update, but a 1-1 write
-/// is the whole row evaluated from its image, never a delta on the stored
-/// value. So a stale target row (999 here) is still repaired, with no need
-/// for the aggregate path's `has_recompute` handling.
+/// CDC update leaves a record that looks like a plain update, but it carries
+/// `has_recompute`, so the 1-1 ledger (#623 D6) re-derives it from the live
+/// row rather than applying the update's image. So a stale target row (999
+/// here) is still repaired.
 #[tokio::test]
 async fn a_recompute_folded_with_a_cdc_update_still_repairs_a_stale_one_to_one_row() {
     let cluster = TestCluster::start();
@@ -2051,8 +2051,9 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
     let refetch_queries: Vec<&str> = log
         .lines()
-        // `join unnest(` singles out Phase 2's refetch: Phase 3's issue #344
-        // check also reads `orders` by key, but from its own `unnest(...)`.
+        // `join unnest(` singles out the batched read of `orders` by key: on
+        // the 1-1 ledger (#623 D6) it is Phase 3's Re-derive read, under the
+        // entry lock, and Phase 2 reads nothing.
         .filter(|line| {
             line.contains("from \"trellis\".\"orders\" t")
                 && line.contains("\"id\" =")
@@ -2318,8 +2319,9 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
     let refetch_queries: Vec<&str> = log
         .lines()
-        // `join unnest(` singles out Phase 2's refetch: Phase 3's issue #344
-        // check also reads `orders` by key, but from its own `unnest(...)`.
+        // `join unnest(` singles out the batched read of `orders` by key: on
+        // the 1-1 ledger (#623 D6) it is Phase 3's Re-derive read, under the
+        // entry lock, and Phase 2 reads nothing.
         .filter(|line| {
             line.contains("from \"trellis\".\"orders\" t")
                 && line.contains("\"id\" =")
@@ -2587,6 +2589,12 @@ async fn next_claimable_segments_stops_at_the_first_undrained_truncate() {
 // computed, then the source row changes and batch 2 drains completely, and
 // only then does batch 1's Phase 3 run. The target must end on the value the
 // source's current state implies, whatever batch 1 computed.
+//
+// On the 1-1 ledger (#623 D6) batch 1's Phase 3 takes the key's entry lock,
+// then an Apply writes only if ADR-0002's I2 holds (here its `lsn` is below
+// the entry's `applied_lsn`, which batch 2 raised), and a Re-derive reads the
+// live row under that lock. The `stale_one_to_one_write` plant, which drops
+// I2, fails every Apply test here.
 // ---------------------------------------------------------------------------
 
 /// A source `orders` table, an `order_totals` (`price + tax`) definition over
@@ -2693,7 +2701,8 @@ async fn drain_everything_left(pool: &trellis::Pool, client: &Client) {
 }
 
 /// The repro from issue #344: batch 1 is a bare recompute trigger (the shape
-/// a catch-up enumeration stages), so its Phase 2 reads the live source row.
+/// a catch-up enumeration stages), a Re-derive. Its live read now happens in
+/// Phase 3 under the entry lock, so it reads the row batch 2 wrote.
 #[tokio::test]
 async fn a_recompute_read_before_a_newer_batch_drains_does_not_overwrite_it() {
     let (_cluster, db, mut client) = out_of_order_fixture(Some("(1, 10.00, 1.00)")).await;

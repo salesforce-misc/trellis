@@ -36,14 +36,15 @@
 //!
 //! The names are the ledger design's steps (ADR-0002, "Apply" and
 //! "Re-derive"). A plain `SUM`/`AVG`/`COUNT` aggregate is on the ledger since #623
-//! D3 (`super::ledger`); every other target has no entry lock and no ledger
-//! Re-derive yet, so each point sits at the step that plays that role now:
+//! D3 (`super::ledger`) and a 1-1 target since D6 (`super::one_to_one_ledger`);
+//! every other aggregate target has no entry lock and no ledger Re-derive
+//! yet, so each point sits at the step that plays that role now:
 //!
 //! | Point | 1-1 target | Aggregate target on the ledger | Other aggregate target |
 //! |---|---|---|---|
-//! | [`PausePoint::AfterPlaceholders`] | never reached | after the placeholder insert, before the entry lock (each time it is taken) | never reached |
-//! | [`PausePoint::AfterEntryLock`] | after the per-key stripe locks (`lock_one_to_one_keys`, #344) | after the sorted entry lock | after the group pre-lock (`prelock_sql`) |
-//! | [`PausePoint::AfterRederiveRead`] | after the live re-read (`reconcile_with_source`) | directly after the one read-and-snapshot statement, when the page re-derives any key | after the forced groups' live re-read (`apply_forced_groups_bulk`), when the page forces any |
+//! | [`PausePoint::AfterPlaceholders`] | after the placeholder insert, before the entry lock | after the placeholder insert, before the entry lock (each time it is taken) | never reached |
+//! | [`PausePoint::AfterEntryLock`] | after the sorted entry lock | after the sorted entry lock | after the group pre-lock (`prelock_sql`) |
+//! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key | directly after the one read-and-snapshot statement, when the page re-derives any key | after the forced groups' live re-read (`apply_forced_groups_bulk`), when the page forces any |
 //! | [`PausePoint::AfterGroupUpsert`] | never reached | after the entries-and-groups statement | after the delta groups' upsert |
 //! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write | after the page's last write |
 //!
@@ -71,11 +72,11 @@ pub enum PausePoint {
     /// After a ledger target's placeholder insert, before its entry lock
     /// (#623 D7): where a tombstone the insert found can be collected.
     AfterPlaceholders,
-    /// After the page has locked the entries (today: stripes or group rows)
-    /// it will write.
+    /// After the page has locked the entries (off the ledger, the group
+    /// rows) it will write.
     AfterEntryLock,
-    /// After a Re-derive's live read of the source (today: the 1-1 re-read
-    /// or a forced group recompute).
+    /// After a Re-derive's live read of the source (off the ledger, a
+    /// forced group recompute).
     AfterRederiveRead,
     /// After the page's group increments (aggregate targets only).
     AfterGroupUpsert,

@@ -25,6 +25,7 @@ use std::time::SystemTime;
 
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
+use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
@@ -35,7 +36,9 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{TransformStatus, create_definition, create_target_table, install_definition};
 use trellis::staging::apply;
-use trellis::staging::{FoldedChange, IsolationOutcome, StagedWatermark, isolate_and_evict};
+use trellis::staging::{
+    FoldedChange, IsolationOutcome, LastChange, StagedWatermark, isolate_and_evict,
+};
 
 // ---------------------------------------------------------------------
 // A minimal capturing `tracing_subscriber::Layer`
@@ -454,7 +457,11 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         has_recompute: false,
         vanished_images: Vec::new(),
         ends_in_delete: false,
-        last_change: None,
+        // #623 D6: an Apply (its image is the change), not a Re-derive.
+        last_change: Some(LastChange {
+            lsn: PgLsn::from(1),
+            row_txid: "1".to_string(),
+        }),
     }];
 
     let result = isolate_and_evict(

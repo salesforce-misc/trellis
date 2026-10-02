@@ -606,12 +606,10 @@ async fn backfill_one_to_one(
                 source_table,
                 pk,
                 &substituted,
-                None,
                 &lo,
                 &hi,
             )
             .await
-            .map(drop)
         })
         .await?;
     }
@@ -621,92 +619,98 @@ async fn backfill_one_to_one(
 
 /// Populates every one of `written_fields` across `def`'s target in one
 /// source enumeration — `ALTER TRANSFORM`'s single-pass column-add/alter
-/// backfill (`catalog::alter_transform`, ADR-0015, issue #241), reusing
-/// exactly the PK-range-chunked writer ([`write_one_to_one_range`])
-/// [`backfill_one_to_one`] already uses for a first `define`'s initial
-/// build, restricted to write only `written_fields` rather than every field
-/// of `def`.
+/// backfill (`catalog::alter_transform`, ADR-0015, issue #241), over the
+/// same `(lo, hi]` PK ranges a first build walks.
 ///
-/// `def` is the *merged* (already-edited) field list, so cross-field-alias
-/// substitution ([`substitute_all_fields`]) can still resolve a new field's
-/// reference to an existing sibling column — but only `written_fields` ever
-/// enters the `INSERT`/`ON CONFLICT UPDATE SET` column list: an untouched
-/// existing field is never re-computed or re-written by this call, matching
-/// ADR-0015's "an edit never rewrites the whole target table to change one
-/// column."
+/// Each range is one Re-derive of its keys on the target's ledger
+/// (`staging::apply::DirectRederive`, #623 D6), as a page Re-derives a key:
+/// the range's entries are locked in key order, the rows are read with the
+/// snapshot that stamps each entry's `basis`, and only a row whose values
+/// change is written, through the target-mutation seam (issue #315). A
+/// concurrent page's Apply of a change the read already saw is then refused
+/// (ADR-0002 I2), and one the read didn't see waits on the entry lock.
 ///
-/// Deliberately bypasses [`write_one_to_one_range`]'s usual "skip whatever
-/// `column_status` currently has paused" exclusion for exactly the fields in
-/// `written_fields`: those fields are paused by `alter_transform`'s own
-/// caller for the specific purpose of letting *this* call populate them
-/// while live CDC apply leaves them alone — the same "the one write path
-/// allowed to touch a paused column is the operator-driven recompute that
-/// owns the pause" pattern `staging::quarantine::resume_column`'s own
-/// `recompute_column` already relies on for a single-column resume.
+/// `def` is the *merged* (already-edited) field list. `written_fields` are
+/// paused by `alter_transform` for exactly this call, which writes them
+/// anyway — the one write path allowed to touch a paused column is the
+/// operator-driven recompute that owns the pause, as
+/// `staging::quarantine::resume_column`'s `recompute_column` does. Every
+/// other paused column is left as it is. A quarantined key and a key with a
+/// `NULL` part are left out, as a first build leaves them out.
 ///
 /// Relationship-free 1-1 only ([`uses_relationships`] is `alter_transform`'s
-/// own gate before this is ever called) — this has no join-aware
-/// counterpart the way [`backfill_relationship_one_to_one`] is for a first
-/// `define`; see `catalog::alter_transform`'s doc comment for why that's a
-/// deliberate, flagged scope-down rather than a fundamental limit.
+/// own gate before this is ever called).
 pub(crate) async fn backfill_altered_columns(
     pool: &Pool,
     def: &TransformDef,
-    target_schema: &str,
     source_table: &str,
+    target_table: &str,
+    source_columns: &HashMap<String, ValueType>,
     written_fields: &HashSet<String>,
 ) -> Result<(), BackfillError> {
+    /// A range's attempts while the tombstone GC keeps collecting an entry
+    /// the range locks (#712), before the error is returned.
+    const ATTEMPTS: usize = 8;
     let pk = source_primary_key(pool, source_table).await?;
-    let substituted = substitute_all_fields(def)?;
     let source = ddl::qualified_source_table(source_table);
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let mut client = pool.get().await?;
-    // Issue #315: unlike a first build, this rewrites a live target that
-    // other definitions may already read, so each chunk's changed rows go
-    // through the target-mutation seam in the chunk's own transaction.
-    let qualified_target = crate::intake::markers::qualify(target_schema, &def.target)
-        .map_err(|err| BackfillError::Unsupported(err.to_string()))?;
+    let excluded: HashSet<String> = paused_columns_for(&**client, &def.target)
+        .await?
+        .into_iter()
+        .filter(|name| !written_fields.contains(name))
+        .collect();
     for (lo, hi) in discover_pk_ranges(&**client, &source, &pk).await? {
-        let txn = client.transaction().await?;
-        let mut mutations = TargetMutations::new();
-        let prior_image_expr = mutations.image_sql(&txn, &qualified_target, "t").await?;
-        let mut prior_images: HashMap<String, String> = HashMap::new();
-        if let Some(expr) = &prior_image_expr {
-            // Row-lock the chunk's existing target rows in ascending key
-            // order (a drain's own pre-lock order) and capture each one's
-            // prior image before the write below changes it.
-            let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-            let sql = format!(
-                "select {}, ({expr})::text from {} t where {} order by {} for update",
-                ddl::pk_key_sql_expr(&pk, Some("t")),
-                qualified_target_table(target_schema, def),
-                pk_range_where(&pk_idents, &pk, &lo),
-                pk_idents.join(", "),
-            );
-            let params = range_params(&lo, &hi);
-            for row in txn.query(&sql, &params).await? {
-                prior_images.insert(row.get(0), row.get(1));
-            }
+        let mut params = range_params(&lo, &hi);
+        let where_clause = format!(
+            "{} and {} and {}",
+            pk_range_where(&pk_idents, &pk, &lo),
+            key_not_null(&pk_idents),
+            not_quarantined(&pk, params.len() + 1),
+        );
+        params.push(&source_table);
+        let keys: Vec<String> = client
+            .query(
+                &format!(
+                    "select {} from {source} as {SOURCE_ALIAS} where {where_clause}",
+                    ddl::pk_key_sql_expr(&pk, Some(SOURCE_ALIAS)),
+                ),
+                &params,
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if keys.is_empty() {
+            continue;
         }
-        let written = write_one_to_one_range(
-            &*txn,
+        let rederive = crate::staging::apply::DirectRederive::new(
+            pool,
             def,
-            target_schema,
             source_table,
-            &pk,
-            &substituted,
-            Some(written_fields),
-            &lo,
-            &hi,
+            target_table,
+            source_columns,
+            excluded.clone(),
+            false,
+            &keys,
         )
         .await?;
-        if prior_image_expr.is_some() {
-            for key in written {
-                let prior = prior_images.remove(&key);
-                mutations.record(&qualified_target, key, prior, 0, None, None);
+        for attempt in 1.. {
+            let txn = client.transaction().await?;
+            let mut mutations = TargetMutations::new();
+            match rederive.settle(&txn, &mut mutations).await {
+                Ok(()) => {}
+                Err(crate::staging::apply::ApplyError::LedgerEntryCollected { .. })
+                    if attempt < ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
             }
+            mutations.flush(&txn).await?;
+            txn.commit().await?;
+            break;
         }
-        mutations.flush(&txn).await?;
-        txn.commit().await?;
     }
     Ok(())
 }
@@ -768,17 +772,9 @@ async fn write_one_to_one_range(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
     substituted: &[Expr],
-    // `Some(set)` restricts the write to exactly `set` — used only by
-    // [`backfill_altered_columns`]'s column-add/alter single-pass backfill,
-    // which must deliberately write a field `column_status` currently has
-    // paused (see that function's own doc comment). `None` is every other
-    // caller's ordinary path: every field of `def` *except* whatever
-    // `column_status` currently has paused, unchanged from before this
-    // parameter existed.
-    restrict_to: Option<&HashSet<String>>,
     lo: &Option<Vec<String>>,
     hi: &[String],
-) -> Result<Vec<String>, BackfillError> {
+) -> Result<(), BackfillError> {
     let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
@@ -788,20 +784,8 @@ async fn write_one_to_one_range(
     // this definition currently has paused from both the computed column
     // list and the `ON CONFLICT` update set — see `paused_columns_for`'s doc
     // comment for why a durable, re-executable chunk write can't skip this.
-    // Skipped entirely when `restrict_to` is `Some`: that caller already
-    // knows exactly which fields it wants written (and, per its own doc
-    // comment, wants them written *because* they're paused), so there is
-    // nothing for this exclusion to add.
-    let paused = match restrict_to {
-        Some(_) => HashSet::new(),
-        None => paused_columns_for(client, &def.target).await?,
-    };
-    let should_write = |name: &str| -> bool {
-        match restrict_to {
-            Some(set) => set.contains(name),
-            None => !paused.contains(name),
-        }
-    };
+    let paused = paused_columns_for(client, &def.target).await?;
+    let should_write = |name: &str| !paused.contains(name);
 
     let field_idents: Vec<String> = def
         .fields
@@ -844,27 +828,7 @@ async fn write_one_to_one_range(
             .map(|f| format!("{f} = excluded.{f}"))
             .collect::<Vec<_>>()
             .join(", ");
-        // `ALTER TRANSFORM`'s rewrite of a live target (`restrict_to`) skips
-        // a row whose written columns already hold the new values, so only a
-        // real change is reported below (issue #315).
-        let unchanged_guard = if restrict_to.is_some() {
-            format!(
-                " where ({}) is distinct from ({})",
-                field_idents
-                    .iter()
-                    .map(|f| format!("{target}.{f}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                field_idents
-                    .iter()
-                    .map(|f| format!("excluded.{f}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-        } else {
-            String::new()
-        };
-        format!("on conflict ({pk_col_list}) do update set {update_sets}{unchanged_guard}")
+        format!("on conflict ({pk_col_list}) do update set {update_sets}")
     };
 
     let mut params = range_params(lo, hi);
@@ -881,26 +845,13 @@ async fn write_one_to_one_range(
         not_quarantined(pk, params.len() + 1),
     );
     params.push(&source_table);
-    // Only `ALTER TRANSFORM`'s rewrite (`restrict_to`) reports the keys it
-    // changed, for the target-mutation seam: a first build's target has no
-    // reader yet (`catalog::reject_non_live_upstream`).
-    if restrict_to.is_some() {
-        let insert_sql = format!(
-            "insert into {target} ({insert_cols}) \
-             select {select_exprs} from {source} as {SOURCE_ALIAS} where {where_clause} \
-             {on_conflict} returning {}",
-            ddl::pk_key_sql_expr(pk, None),
-        );
-        let rows = client.query(&insert_sql, &params).await?;
-        return Ok(rows.into_iter().map(|row| row.get(0)).collect());
-    }
     let insert_sql = format!(
         "insert into {target} ({insert_cols}) \
          select {select_exprs} from {source} as {SOURCE_ALIAS} where {where_clause} \
          {on_conflict}"
     );
     client.execute(&insert_sql, &params).await?;
-    Ok(Vec::new())
+    Ok(())
 }
 
 /// The read-only "planning" half of [`backfill_one_to_one`] (docs/decisions/0007's
@@ -981,12 +932,10 @@ pub(crate) async fn execute_one_to_one_chunk(
             source_table,
             &pk,
             &substituted,
-            None,
             &lo,
             &hi,
         )
         .await
-        .map(drop)
     })
     .await
 }

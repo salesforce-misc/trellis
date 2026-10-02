@@ -106,6 +106,6 @@ Each is a regression to something this design deliberately avoids:
   error into permanently hidden work.
 - A new write path that neither commutes nor checks its basis — it is correct
   only while its batches happen to drain in order
-  ([05](05-apply-and-exactly-once-deltas.md#absolute-writes-do-not-commute-the-basis-check)).
+  ([05](05-apply-and-exactly-once-deltas.md#absolute-writes-do-not-commute-the-1-1-ledger)).
 - An unreferenced data-modifying or `FOR UPDATE` CTE — Postgres may plan it away,
   and it will lock nothing while looking like it does.

@@ -1649,10 +1649,6 @@ pub async fn alter_transform(
         .await?;
     }
 
-    let (target_schema, _) = current
-        .target_table
-        .split_once('.')
-        .expect("target_table is always schema-qualified (issue #73)");
     let target_ident = ddl::qualified_target_table_ident(&current.target_table);
 
     let mut client = pool.get().await?;
@@ -1838,8 +1834,9 @@ pub async fn alter_transform(
         backfill::backfill_altered_columns(
             pool,
             &merged,
-            target_schema,
             &current.source_table,
+            &current.target_table,
+            &current.source_columns,
             &written_fields,
         )
         .await

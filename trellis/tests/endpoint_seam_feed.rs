@@ -40,6 +40,21 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
+/// The ledger a 1-1 target gets with its production DDL (#623 D6,
+/// `defs::ledger::one_to_one_ledger_ddl`), for each of `targets` this file
+/// creates by hand in `public`.
+async fn one_to_one_ledgers(raw: &Client, targets: &[&str]) {
+    for target in targets {
+        raw.batch_execute(&format!(
+            "create table public.{target}__ledger (\"__from_key\" text primary key, \
+             \"__applied_lsn\" pg_lsn, \"__applied_seg\" bigint, \"__basis\" pg_snapshot, \
+             \"__tombstone\" boolean not null default false)"
+        ))
+        .await
+        .expect("create a hand-made 1-1 target's ledger");
+    }
+}
+
 async fn setup() -> (TestCluster, TestDatabase, Client) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -182,6 +197,7 @@ async fn a_seam_row_on_a_target_to_side_advances_its_to_one_projection() {
     )
     .await
     .expect("create sources");
+    one_to_one_ledgers(&raw, &["t", "report_view"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -287,6 +303,7 @@ async fn a_seam_row_on_a_target_to_side_drives_an_aggregates_reverse_delta() {
     )
     .await
     .expect("create sources");
+    one_to_one_ledgers(&raw, &["posts"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.posts FROM public.posts_src SELECT word_count AS word_count",
@@ -374,6 +391,7 @@ async fn a_from_side_targets_seam_group_key_bumps_an_erased_parents_gen() {
     )
     .await
     .expect("create sources");
+    one_to_one_ledgers(&raw, &["children", "child_view"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.children FROM public.children_src SELECT parent_id AS parent_id",
@@ -576,6 +594,7 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
     )
     .await
     .expect("create sources");
+    one_to_one_ledgers(&raw, &["store_view"]).await;
     install_definition(
         &db.pool,
         "TRANSFORM public.region_totals FROM public.sales GROUP BY region \
@@ -715,6 +734,7 @@ async fn a_truncate_clear_of_an_endpoint_target_stages_per_key_deletes() {
     )
     .await
     .expect("create sources");
+    one_to_one_ledgers(&raw, &["t", "report_view"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -798,6 +818,7 @@ async fn a_from_side_target_of_two_relationships_unions_both_join_keys() {
     )
     .await
     .expect("create sources");
+    one_to_one_ledgers(&raw, &["items"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.items FROM public.items_src \

@@ -129,9 +129,9 @@ accident.
 Nor does it **order a key's writes across batches.** A key lands in one bucket
 *per batch*, but batches drain out of order and in parallel, so two batches'
 records for the same key can reach Phase 3 in either order. Deltas commute, so
-that's harmless for them. Absolute (1-1) writes don't, and Phase 3's per-key
-ordering lock and basis check exist for that
-([05](05-apply-and-exactly-once-deltas.md#absolute-writes-do-not-commute-the-basis-check)).
+that's harmless for them. Absolute (1-1) writes don't, and the 1-1 ledger's
+entry lock and I2 test exist for that
+([05](05-apply-and-exactly-once-deltas.md#absolute-writes-do-not-commute-the-1-1-ledger)).
 
 **The honest cost:** the fold filter `route % bucket_count = ANY(mine)` rides the
 sequential scan the fold already does, so **every holder scans the whole batch for

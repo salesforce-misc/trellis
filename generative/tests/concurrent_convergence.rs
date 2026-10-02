@@ -1451,15 +1451,15 @@ fn plant_reaches(plant: &str, key_space: &trellis::dev::defs::ast::KeySpace) -> 
     match Plant::from_name(plant) {
         None => true,
         Some(Plant::ClaimAllBuckets) => true,
-        // The ledger plants (#623 D3, D7) break the ledger path, which only
-        // aggregate targets take so far.
+        // The aggregate ledger plants (#623 D3) break the aggregate ledger
+        // path; the tombstone GC (D7) collects 1-1 ledgers too since D6.
         Some(
             Plant::DropRacingGroupDelta
             | Plant::IgnoreRecomputeHorizon
             | Plant::SkipLedgerLock
-            | Plant::LsnOnlySkip
-            | Plant::EarlyTombstoneGc,
+            | Plant::LsnOnlySkip,
         ) => aggregate,
+        Some(Plant::EarlyTombstoneGc) => true,
         Some(Plant::StaleOneToOneWrite) => !aggregate,
     }
 }

@@ -1432,8 +1432,9 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
 /// rather than against the computed key-contract text. Resuming over a
 /// composite key, across more than one write-back chunk, with key parts that
 /// hold the key contract's own separator and escape characters, must still
-/// land every recomputed value on exactly its own row, and must not invent a
-/// row for a source key the target doesn't have.
+/// land every recomputed value on exactly its own row. A resume is a
+/// Re-derive of every source key (#623 D6), so a source key the target
+/// lacks gets its row too.
 #[tokio::test]
 async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
     let cluster = TestCluster::start();
@@ -1518,7 +1519,7 @@ async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
         .await
         .expect("compare target to source");
     let (total, wrong, orphans): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
-    assert_eq!(total, 2501, "no row may be added for the missing key");
+    assert_eq!(total, 2502, "the missing key's row is re-derived too");
     assert_eq!(
         wrong, 0,
         "every existing row must hold its own recomputed value"

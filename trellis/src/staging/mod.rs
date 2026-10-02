@@ -68,6 +68,7 @@ pub mod fold;
 pub mod interleave;
 pub(crate) mod ledger;
 pub mod liveness;
+pub(crate) mod one_to_one_ledger;
 pub(crate) mod page;
 pub mod quarantine;
 pub mod retire;
@@ -146,7 +147,7 @@ pub use claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS};
 #[cfg(any(test, feature = "internals"))]
 pub use converge::{converged_through, pending_count};
 #[cfg(any(test, feature = "internals"))]
-pub use fold::{BucketFilter, FoldedChange, PageKey, fold, merge_folded_changes};
+pub use fold::{BucketFilter, FoldedChange, LastChange, PageKey, fold, merge_folded_changes};
 #[cfg(any(test, feature = "internals"))]
 pub use liveness::{FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff};
 #[cfg(any(test, feature = "internals"))]

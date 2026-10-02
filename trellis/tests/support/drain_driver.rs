@@ -331,6 +331,23 @@ impl Driver {
         }
     }
 
+    /// Starts `work` (given the pool) in its own task, frozen at each of
+    /// `points` once reached, as [`Self::drain_frozen`] does for a drain: for
+    /// a writer outside the drain, a column resume or an `ALTER`'s backfill.
+    pub async fn run_frozen<T, F, Fut>(&self, points: &[(PausePoint, &str)], work: F) -> Running<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(trellis::Pool) -> Fut,
+        Fut: Future<Output = Result<T, ApplyError>> + Send + 'static,
+    {
+        let (scope, frozen) = self.arm(points).await;
+        let handle = tokio::spawn(with_scope(scope, work(self.db.pool.clone())));
+        Running {
+            handle: Some(handle),
+            frozen,
+        }
+    }
+
     /// Merges until no delta row is left, returning the rows merged.
     pub async fn merge_all(&self, plan: &BuildPlan) -> i64 {
         const LIMIT: i64 = 5_000;
@@ -424,6 +441,21 @@ impl Driver {
             }
         }
         panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+    }
+
+    /// Discharges every parked catch-up marker (a column resume's, an
+    /// `ALTER TRANSFORM`'s) and settles the re-derives it stages.
+    pub async fn catch_up(&mut self) {
+        self.settle().await;
+        markers::run_pending_backfills(
+            &mut self.ctl,
+            WAKE,
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("run_pending_backfills");
+        self.settle().await;
     }
 
     /// Frees the ring slots of drained segments.

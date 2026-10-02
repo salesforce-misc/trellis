@@ -61,6 +61,9 @@ pub use model::{
 };
 pub use parser::{parse, parse_statement, statement_kind};
 pub use pg_type::PgType;
+// The crate validates through `validate::validate`; the integration tests
+// reach it here.
+#[cfg(any(test, feature = "internals"))]
 pub use validate::validate;
 
 // Reached from `crate::dev` (ADR-0012's sanctioned exception) by `generative`

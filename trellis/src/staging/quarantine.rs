@@ -38,15 +38,12 @@ use std::time::SystemTime;
 
 #[cfg(any(test, feature = "internals"))]
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::types::ToSql;
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ast::{KeySpace, ValueType};
+use crate::defs::ast::KeySpace;
 use crate::defs::catalog;
-use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::eval::{self, RelationshipContext, Row};
+use crate::defs::ddl::{self, DdlError};
 use crate::defs::model::{Definition, TransformStatus};
-use crate::defs::validate;
 use crate::pool::{Pool, quote_ident};
 
 #[cfg(any(test, feature = "internals"))]
@@ -2636,39 +2633,31 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     Ok(())
 }
 
-/// Re-derives `column`'s value across every current row of `def.def.source`
-/// and writes it into `def.def.target`, freshly evaluated against live
-/// source data — [`resume_column`]'s "re-run the backfill for just this
-/// column's formula against already-built rows" (ADR-0003's amendment).
+/// Re-derives every current row of `def`'s source with `column` written
+/// again — [`resume_column`]'s "re-run the backfill for just this column's
+/// formula against already-built rows" (ADR-0003's amendment).
 ///
-/// **Judgment call, flagged rather than silently made**: this deliberately
-/// does *not* reuse the chunked/durable `backfill_chunks` queue
-/// (ADR-0007's amendment) or `defs::oracle::render_expr_sql`'s pure-SQL
-/// rendering. A resume is a rare, operator-driven action (not a hot path,
-/// and not something correctness elsewhere depends on completing
-/// quickly), so a single straightforward pass — read every row, evaluate
-/// this one definition's fields in Rust (reusing the exact evaluator the
-/// live apply path already trusts, relationships included), write back only
-/// `column` — is a much smaller, lower-risk surface than either
-/// alternative: the chunk queue is built for *initial* backfill's
-/// crash-resumability at billion-row scale, over-built for a single-column
-/// recompute; and `render_expr_sql`'s bare-identifier rendering is only
-/// safe in a plain `select ... from source` (its one real caller,
-/// `defs::backfill::write_one_to_one_range`) — reusing it inside an `update
-/// target ... from source` would risk an ambiguous-column error whenever a
-/// passthrough field shares its name with a source column that also exists
-/// on the target. Trade-off: no durable chunking, so a resume against a very
-/// large source table runs as one pass rather than resumable steps —
-/// acceptable for a rare, bounded, operator-invoked action; flagged here as
-/// a follow-up if that ever stops being true. (The write-back itself is
-/// split into short transactions of [`RECOMPUTE_COLUMN_CHUNK`] keys, so the
-/// pass never holds row locks across the whole target.)
+/// Each chunk of [`RECOMPUTE_COLUMN_CHUNK`] keys is one Re-derive on the
+/// target's ledger (`apply::DirectRederive`, #623 D6), in its own short
+/// transaction, as a page Re-derives a key: the chunk's entries are locked
+/// in key order, the rows are read with the snapshot that stamps each
+/// entry's `basis`, and only a row whose values change is written, through
+/// the target-mutation seam (issue #315). A concurrent page's Apply of a
+/// change the read already saw is then refused (ADR-0002 I2), so a resume
+/// can't be overwritten by an older image, nor overwrite a newer one.
 ///
-/// A row that still fails to evaluate (the underlying data problem isn't
-/// actually fixed for it) is skipped rather than aborting the whole resume —
-/// its column stays at whatever it was frozen to, and it remains eligible to
-/// re-trip the fuse later via ordinary live CDC if it keeps failing.
+/// Every other column still paused is left as it is: `column` itself is
+/// still paused in `column_status` here (`resume_column` deletes that row
+/// after this returns), so it is taken out of the exclusion. A quarantined
+/// key, and a key with a `NULL` part (only an aggregate target, keyed by a
+/// nullable unique index, has those; no 1-1 target row can represent one,
+/// issue #205), are left out, as a first build leaves them out. A row that
+/// still fails to evaluate is left as it is rather than aborting the resume,
+/// and can re-trip the fuse later through live CDC.
 async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result<(), ApplyError> {
+    /// A chunk's attempts while the tombstone GC keeps collecting an entry
+    /// the chunk locks (#712), before the error is returned.
+    const ATTEMPTS: usize = 8;
     if !def.def.fields.iter().any(|f| f.name == column) {
         return Err(ApplyError::ColumnNotPaused {
             transform: def.def.target.clone(),
@@ -2679,297 +2668,67 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     // aggregate apply path never honors a column pause (only a 1-1 plan
     // drops paused columns — see `apply::compute`), so the column was never
     // frozen, and the catch-up marker `resume_column` parks re-derives every
-    // group through the ordinary drain path anyway. The per-row write-back
-    // below keys on the *source* primary key, which an aggregate target
-    // doesn't have: it used to fail the whole resume.
+    // group through the ordinary drain path anyway.
     if matches!(def.def.key_space, KeySpace::Aggregate { .. }) {
         return Ok(());
     }
 
-    // Issue #121: this resume path's write-back below now keys on the
-    // *target*'s full (possibly composite) primary key, through the shared,
-    // arity-generic key-contract text ([`ddl::pk_key_sql_expr`]) rather than
-    // a single named column — the same generalization every other 1-1
-    // consumer (`staging::apply`, `defs::backfill`, `staging::self_check`)
-    // makes. This is still only meaningful for a 1-1 definition regardless
-    // of arity: an Aggregate target's primary key is its `GROUP BY` columns,
-    // unrelated to the source's primary key.
     let pk = ddl::source_primary_key(pool, &def.source_table).await?;
-    let source_ident = ddl::qualified_source_table(&def.source_table);
     let pk_key_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
-    // A row belonging to a NULL-keyed group (only reachable when `source` is
-    // itself an aggregate target with a nullable `GROUP BY` column — see the
-    // loop below's own comment) can't be told apart from a real value by
-    // `pk_key_expr` alone: issue #110's NULL-component encoding folds a real
-    // SQL `NULL` into a sentinel *string*, precisely so it round-trips
-    // through this crate's shared key contract, which means it is never
-    // itself a SQL `NULL` for `db_row.get`'s `Option` check to catch. Select
-    // the "any component NULL" test directly instead.
-    let null_check = pk
+    let not_null = pk
         .iter()
-        .map(|c| format!("t.{} is null", quote_ident(&c.name)))
+        .map(|c| format!("t.{} is not null", quote_ident(&c.name)))
         .collect::<Vec<_>>()
-        .join(" or ");
-
-    let mut client = pool.get().await?;
-    // Issue #248: an explicit per-column `jsonb_build_object`, not
-    // `to_jsonb(t.*)` — see `apply::row_as_text_jsonb_sql`'s doc comment for
-    // why: `to_jsonb`'s own ISO-8601 writer renders `timestamp`/`timestamptz`
-    // differently than the `::text` cast this same recompute's evaluator
-    // uses everywhere else, which this rare, operator-driven path is not
-    // exempt from just because it isn't the hot CDC path.
-    let row_columns = apply::live_row_columns(&**client, &def.source_table).await?;
-    let doc_expr = apply::row_as_text_jsonb_sql("t", &row_columns);
-    let db_rows = client
+        .join(" and ");
+    let client = pool.get().await?;
+    let keys: Vec<String> = client
         .query(
             &format!(
-                "select {pk_key_expr} as pk_text, ({null_check}) as pk_has_null, \
-                 e.key, e.value \
-                 from {source_ident} t \
-                 cross join lateral jsonb_each_text({doc_expr}) e"
+                "select {pk_key_expr} from {} t where {not_null} and not exists \
+                 (select 1 from poison p where p.src_table = $1 and p.key = {pk_key_expr})",
+                ddl::qualified_source_table(&def.source_table),
             ),
-            &[],
+            &[&def.source_table],
         )
-        .await?;
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    drop(client);
 
-    let mut order: Vec<String> = Vec::new();
-    let mut rows_by_pk: HashMap<String, Row> = HashMap::new();
-    for db_row in db_rows {
-        // Issue #211/#121: `pk_text` here is built from this crate's shared
-        // key-contract text (`ddl::pk_key_sql_expr`), which routes a nullable
-        // column's part through issue #110's `NULL_KEY_SENTINEL`/escape
-        // treatment before it's ever bound anywhere — so, unlike a raw
-        // `{col}::text` cast, it is never itself a SQL `NULL`, even for a
-        // source row belonging to a NULL-keyed group. `pk_has_null` (selected
-        // separately, above) is what actually detects that case. A NULL
-        // component is only reachable when `source` is itself an aggregate
-        // target: `pk` (`ddl::source_primary_key`) is that aggregate's
-        // `GROUP BY` grouping-column PK, which `create_aggregate_target_table`
-        // declares `UNIQUE NULLS NOT DISTINCT` rather than a real `PRIMARY
-        // KEY` specifically so it *can* hold NULL (issue #110's whole
-        // subject) — a genuine, never-NULL source primary key can never
-        // produce this.
-        //
-        // `def` (this recompute's own target — always a 1-1, regardless of
-        // its primary key's arity) can never hold a row for that NULL-keyed
-        // group either way: `ddl::create_target_table` always
-        // declares its own primary key column a real `primary key`, which
-        // Postgres makes NOT NULL unconditionally regardless of whether the
-        // *source* column this target's key was narrowed from is itself
-        // nullable. That's exactly the reasoning issue #205 used to drop a
-        // NULL-keyed group from `apply::apply_target`'s write path instead
-        // of storing a literal sentinel/NULL as a target PK value, and the
-        // same outcome `defs::backfill::discover_pk_ranges`'s ordered
-        // `(lo, hi]` PK-range walk already produces structurally (a
-        // NULL-keyed row is `unknown` against every `<=`/`>` chunk bound, so
-        // it's never selected by any chunk, and a from-scratch backfill of
-        // this same target never attempts to insert it either).
-        //
-        // So a NULL-keyed group's row has nothing to recompute *and* nothing
-        // to write back — there is no target row `column`'s new value could
-        // ever land in — and is dropped here before it ever reaches
-        // `rows_by_pk`/`order`: it never gets an entry in the relationship
-        // context this function builds below (`build_relationship_context`,
-        // for any definition that reads relationships), and the row loop
-        // further down (which walks `order` and issues one `UPDATE ...
-        // where {pk_key_expr} = $2` per entry) never attempts a write for
-        // it — the same "no representable row" answer a from-scratch
-        // backfill already gives this group, kept consistent here via the
-        // explicit `pk_has_null` test above (see the query's own comment for
-        // why this can't simply check `pk_text` for a SQL `NULL`).
-        let pk_has_null: bool = db_row.get(1);
-        if pk_has_null {
-            continue;
-        }
-        let pk_text: String = db_row.get(0);
-        let key: String = db_row.get(2);
-        let value: Option<String> = db_row.get(3);
-        rows_by_pk
-            .entry(pk_text.clone())
-            .or_insert_with(|| {
-                order.push(pk_text.clone());
-                Row::new()
-            })
-            .insert(key, value);
-    }
-
-    let rel_refs = eval::relationship_references(&def.def);
-    let rel_ctx = if rel_refs.is_empty() {
-        RelationshipContext::default()
-    } else {
-        let rows: Vec<Option<Row>> = order
-            .iter()
-            .map(|pk_text| Some(rows_by_pk[pk_text].clone()))
-            .collect();
-        // This resume path is an ad hoc, non-transactional, per-row pass
-        // over every current source row — not part of the staging ring's
-        // claim/fold/compute/apply pipeline `build_relationship_context`'s
-        // gen-bump signal exists to guard (issue #130, epic #127), so
-        // `old_rows: None`/`changes: None` here: there is no folded change
-        // (with an old image, or a #133 `group_key`) to widen the
-        // touched-key set from, and the returned gen-bump map is discarded
-        // rather than applied in any transaction (there isn't one spanning
-        // this whole function to apply it in).
-        let (ctx, _gen_bumps) =
-            apply::build_relationship_context(pool, &def.source_table, &def.def, &rows, None, None)
-                .await?;
-        ctx
-    };
-
-    let field_type = if rel_refs.is_empty() {
-        let inferred = validate::infer_field_types(&def.def, &def.source_columns, &HashMap::new())?;
-        inferred.get(column).copied().unwrap_or(ValueType::Numeric)
-    } else {
-        // Broader sweep, reviewer follow-up to issue #74 (epic #78's own
-        // whole-branch review): `def.def.target` is always bare, even for an
-        // explicitly `schema.target`-qualified `TRANSFORM` (issue #76) — see
-        // `staging::apply::compute`'s identical fix, right above this
-        // function's own `apply::to_column_types` call, for the full
-        // reasoning. `def.target_table` (already the persisted, qualified
-        // identity) is available here the same way.
-        let col_names = vec![column.to_string()];
-        let types = apply::to_column_types(pool, &def.target_table, &col_names).await?;
-        types.get(column).copied().unwrap_or(ValueType::Numeric)
-    };
-    let pg_type = ddl::pg_type_name(field_type);
-
-    // `def.target_table` (issue #73's persisted, qualified identity), not a
-    // bare `quote_ident(&def.def.target)` — reviewer follow-up to issue #74
-    // (epic #78's own whole-branch review): a target explicitly qualified
-    // into a non-default schema (issue #76) isn't necessarily on this
-    // connection's pinned `search_path`. See
-    // `staging::apply::apply_target`'s identical fix for the live CDC-apply
-    // write path this recompute UPDATE shares the same bug class with.
-    let target_ident = ddl::qualified_target_table_ident(&def.target_table);
-    let col_ident = quote_ident(column);
-    let mut regex_cache = eval::RegexCache::new();
-
-    // Exclude every *other* column of this same definition that's still
-    // paused (a sibling with its own independent, still-broken formula) from
-    // this evaluation — `column` itself is still marked paused in
-    // `column_status` at this point (`resume_column` only deletes that row
-    // *after* this call returns), so a plain `paused_columns_for` read would
-    // otherwise exclude `column` too and this recompute would silently
-    // evaluate nothing for it. Without this exclusion, a still-broken
-    // sibling's formula throwing on some row would fail the whole
-    // `evaluate_with_relationships` call for that row (the un-excluding
-    // form used to be called here), and the `let Ok(...) else { continue; }`
-    // guard below would then skip recomputing `column` for that row too —
-    // silently leaving it frozen even though `column`'s own formula is fine.
     let mut excluded = paused_columns_for(pool, &def.def.target).await?;
     excluded.remove(column);
-
-    // Evaluate first (pure, no database), so each write-back transaction
-    // below holds its row locks only for its own statements.
-    let mut values: Vec<(&String, Option<String>)> = Vec::with_capacity(order.len());
-    for pk_text in &order {
-        let row = &rows_by_pk[pk_text];
-        let Ok(mut evaluated) = eval::evaluate_with_relationships_excluding(
+    for chunk in keys.chunks(RECOMPUTE_COLUMN_CHUNK) {
+        let rederive = apply::DirectRederive::new(
+            pool,
             &def.def,
-            row,
+            &def.source_table,
+            &def.target_table,
             &def.source_columns,
-            &rel_ctx,
-            &mut regex_cache,
-            &excluded,
-        ) else {
-            continue;
-        };
-        let value: Option<String> = evaluated.remove(column).flatten().map(|v| v.to_string());
-        values.push((pk_text, value));
-    }
-
-    // Issue #315: the write-back goes through the target-mutation seam, so a
-    // definition chained off this target hears about every row whose value
-    // actually changed (the `is distinct from` guard leaves an unchanged row
-    // untouched and unreported).
-    //
-    // One bounded transaction per chunk of keys, not one for the whole
-    // target: a transaction holding row locks has an xid, and a long-lived
-    // xid holds the ring's seal gate (docs/staging-and-claiming/03) shut for
-    // every definition until it commits, besides blocking this target's own
-    // drains the whole time. Each chunk row-locks its existing target rows in
-    // ascending key order, the order a drain's own pre-lock takes
-    // (`apply::apply_target`), so it can't deadlock against one; the same
-    // statement captures each row's prior image when something reads the
-    // target, and its `ctid`, which the lock keeps stable until commit and
-    // which lets each update find its row without re-scanning the table.
-    let update_sql = format!(
-        "update {target_ident} t set {col_ident} = $1::text::{pg_type} \
-         where t.ctid = $2::text::tid and t.{col_ident} is distinct from $1::text::{pg_type}",
-    );
-    for chunk in values.chunks(RECOMPUTE_COLUMN_CHUNK) {
-        // Every key here decodes to real values: a NULL-keyed row was already
-        // dropped (`pk_has_null`, above) before it reached `values`.
-        let mut key_parts: Vec<Vec<String>> = Vec::with_capacity(chunk.len());
-        for (pk_text, _) in chunk {
-            if let Some(parts) = apply::decode_target_pk_parts(&pk, &def.def.target, pk_text)? {
-                key_parts.push(parts);
+            excluded.clone(),
+            true,
+            chunk,
+        )
+        .await?;
+        let mut client = pool.get().await?;
+        for attempt in 1.. {
+            let txn = client.transaction().await?;
+            let mut mutations = TargetMutations::new();
+            match rederive.settle(&txn, &mut mutations).await {
+                Ok(()) => {}
+                Err(ApplyError::LedgerEntryCollected { .. }) if attempt < ATTEMPTS => continue,
+                Err(err) => return Err(err),
             }
+            mutations.flush(&txn).await?;
+            txn.commit().await?;
+            break;
         }
-        let key_refs: Vec<&Vec<String>> = key_parts.iter().collect();
-        let arrays = apply::transpose_pk_parts(pk.len(), &key_refs);
-        let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
-
-        let txn = client.transaction().await?;
-        let mut mutations = TargetMutations::new();
-        let image_expr = mutations.image_sql(&txn, &def.target_table, "t").await?;
-        let image_select = match &image_expr {
-            Some(expr) => format!("({expr})::text"),
-            None => "null::text".to_string(),
-        };
-        let locked = txn
-            .query(
-                &recompute_lock_sql(&target_ident, &pk, &image_select),
-                &params,
-            )
-            .await?;
-        let mut locked_rows: HashMap<String, (String, Option<String>)> = locked
-            .into_iter()
-            .map(|row| (row.get(0), (row.get(1), row.get(2))))
-            .collect();
-        for (pk_text, value) in chunk {
-            // No target row for this key (nothing to update, as before).
-            let Some((ctid, prior)) = locked_rows.remove(pk_text.as_str()) else {
-                continue;
-            };
-            if txn.execute(&update_sql, &[value, &ctid]).await? > 0 {
-                mutations.record(&def.target_table, (*pk_text).clone(), prior, 0, None, None);
-            }
-        }
-        mutations.flush(&txn).await?;
-        txn.commit().await?;
     }
-
     Ok(())
 }
 
-/// How many keys [`recompute_column`] writes back per transaction.
+/// How many keys [`recompute_column`] re-derives per transaction.
 const RECOMPUTE_COLUMN_CHUNK: usize = 1000;
-
-/// The statement each [`recompute_column`] write-back chunk locks its target
-/// rows with, in ascending key order: every row's key-contract text, `ctid`
-/// and `image_select`, bound to `pk.len()` per-column key arrays
-/// ([`apply::transpose_pk_parts`]).
-///
-/// Issue #377: the chunk's keys are matched through a bound keyset relation
-/// joined on the target's own primary-key columns, so each key is an index
-/// probe. The earlier `pk_key_sql_expr(...) = any($1::text[])` compared a
-/// computed text expression that no index covers, which made every chunk a
-/// full scan of the target.
-fn recompute_lock_sql(target_ident: &str, pk: &[PrimaryKeyColumn], image_select: &str) -> String {
-    let target_pk_expr = ddl::pk_key_sql_expr(pk, Some("t"));
-    let lock_order = pk
-        .iter()
-        .map(|c| format!("t.{}", quote_ident(&c.name)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "select {target_pk_expr}, t.ctid::text, {image_select} from {target_ident} t \
-         join {} on ({}) order by {lock_order} for update of t",
-        apply::pk_keyset_unnest(pk, 1),
-        apply::pk_keyset_match(pk, "t"),
-    )
-}
 
 // ---------------------------------------------------------------------
 // Release
@@ -4311,110 +4070,6 @@ mod unit_tests {
             "57P01 admin shutdown"
         );
     }
-    /// `EXPLAIN`'s plan text for `sql` with `params` bound, one line per row.
-    async fn explain_plan(
-        client: &tokio_postgres::Client,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> String {
-        client
-            .query(&format!("explain {sql}"), params)
-            .await
-            .expect("explain")
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Issue #377: a `recompute_column` write-back chunk locks its target rows
-    /// through an index, at both a single-column and a composite primary key,
-    /// for a full chunk of keys. The pre-#377 shape, matching the computed
-    /// key-contract text, run against the same tables and keys, can only plan
-    /// a sequential scan (proving the plan difference is real, not just that
-    /// both shapes happen to allow an index).
-    #[tokio::test]
-    async fn recompute_lock_matches_a_chunk_of_keys_through_the_primary_key_index() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-            .batch_execute(
-                "create table single_pk (id bigint primary key, v integer); \
-                 insert into single_pk select g, g from generate_series(1, 1000000) g; \
-                 analyze single_pk; \
-                 create table composite_pk (a bigint, b text, v integer, primary key (a, b)); \
-                 insert into composite_pk select g, 'k' || g, g from generate_series(1, 1000000) g; \
-                 analyze composite_pk;",
-            )
-            .await
-            .expect("seed large indexed targets");
-
-        let col = |name: &str, data_type: &str| PrimaryKeyColumn {
-            name: name.to_string(),
-            data_type: data_type.to_string(),
-            nullable: false,
-        };
-        // A full chunk of keys spread across the table, as a resume would bind.
-        let ids: Vec<i64> = (0..RECOMPUTE_COLUMN_CHUNK as i64)
-            .map(|i| i * 997 + 1)
-            .collect();
-        let cases = [
-            (
-                "single_pk",
-                vec![col("id", "bigint")],
-                ids.iter().map(|i| vec![i.to_string()]).collect::<Vec<_>>(),
-            ),
-            (
-                "composite_pk",
-                vec![col("a", "bigint"), col("b", "text")],
-                ids.iter()
-                    .map(|i| vec![i.to_string(), format!("k{i}")])
-                    .collect::<Vec<_>>(),
-            ),
-        ];
-        for (table, pk, keys) in cases {
-            let target_ident = quote_ident(table);
-            let key_refs: Vec<&Vec<String>> = keys.iter().collect();
-            let arrays = apply::transpose_pk_parts(pk.len(), &key_refs);
-            let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
-            let plan = explain_plan(
-                &client,
-                &recompute_lock_sql(&target_ident, &pk, "null::text"),
-                &params,
-            )
-            .await;
-            assert!(
-                plan.contains("Index") && !plan.contains("Seq Scan"),
-                "{table}: the keyset match should probe the primary-key index, got:\n{plan}"
-            );
-
-            let key_texts: Vec<String> = keys
-                .iter()
-                .map(|parts| ddl::join_pk_key(parts.iter().map(|s| s.as_str())))
-                .collect();
-            let old_plan = explain_plan(
-                &client,
-                &format!(
-                    "select 1 from {target_ident} t where {} = any($1::text[])",
-                    ddl::pk_key_sql_expr(&pk, Some("t"))
-                ),
-                &[&key_texts],
-            )
-            .await;
-            assert!(
-                old_plan.contains("Seq Scan"),
-                "{table}: sanity check, the pre-#377 key-text match can't use an index, \
-                 got:\n{old_plan}"
-            );
-        }
-    }
-
     /// A raw connection onto `db` with `search_path` on trellis's schema.
     async fn connect_raw(db: &testkit::TestDatabase) -> tokio_postgres::Client {
         let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
@@ -4446,9 +4101,9 @@ mod unit_tests {
         )
         .await
         .expect("seed source table");
-        let columns: HashMap<String, ValueType> = ["id", "price", "tax"]
+        let columns: HashMap<String, crate::defs::ast::ValueType> = ["id", "price", "tax"]
             .iter()
-            .map(|name| (name.to_string(), ValueType::Numeric))
+            .map(|name| (name.to_string(), crate::defs::ast::ValueType::Numeric))
             .collect();
         catalog::create_definition(
             &pool,

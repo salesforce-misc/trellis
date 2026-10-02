@@ -181,6 +181,21 @@ async fn stored(raw: &Client, target: &str) -> String {
     .get(0)
 }
 
+/// The ledger a 1-1 target gets with its production DDL (#623 D6,
+/// `defs::ledger::one_to_one_ledger_ddl`), for each of `targets` this file
+/// creates by hand in `public`.
+async fn one_to_one_ledgers(raw: &Client, targets: &[&str]) {
+    for target in targets {
+        raw.batch_execute(&format!(
+            "create table public.{target}__ledger (\"__from_key\" text primary key, \
+             \"__applied_lsn\" pg_lsn, \"__applied_seg\" bigint, \"__basis\" pg_snapshot, \
+             \"__tombstone\" boolean not null default false)"
+        ))
+        .await
+        .expect("create a hand-made 1-1 target's ledger");
+    }
+}
+
 async fn setup() -> (TestCluster, TestDatabase, Client) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -240,6 +255,7 @@ async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
     raw.batch_execute("create table public.t (id integer primary key, doubled numeric)")
         .await
         .expect("create t");
+    one_to_one_ledgers(&raw, &["t"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -253,6 +269,7 @@ async fn a_chained_target_is_never_captured_even_as_a_relationship_endpoint() {
     raw.batch_execute("create table public.report_view (id integer primary key, doubled numeric)")
         .await
         .expect("create report_view");
+    one_to_one_ledgers(&raw, &["report_view"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.report_view FROM public.reports SELECT rollup.doubled AS doubled",
@@ -375,6 +392,7 @@ async fn resuming_a_column_propagates_each_changed_row_to_a_chained_reader() {
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["t", "d"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -576,6 +594,7 @@ async fn an_altered_column_propagates_to_a_chained_reader() {
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["t", "d"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS w",
@@ -720,6 +739,7 @@ async fn a_target_write_racing_a_chained_definitions_creation_is_caught_up() {
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["t", "d"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -779,6 +799,7 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["t", "d"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -857,6 +878,7 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["order_doubles", "report_view"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
@@ -985,6 +1007,7 @@ async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["order_doubles", "report_view"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
@@ -1136,6 +1159,7 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client) {
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(raw, &["t", "d"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -1336,6 +1360,7 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["order_doubles"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
@@ -1573,6 +1598,7 @@ async fn only_a_rewrites_catch_up_refreshes_the_projection() {
     )
     .await
     .expect("create tables");
+    one_to_one_ledgers(&raw, &["order_doubles"]).await;
     create_definition(
         &db.pool,
         "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",

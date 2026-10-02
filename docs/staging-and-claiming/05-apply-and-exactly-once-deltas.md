@@ -38,7 +38,7 @@ sequenceDiagram
     Note over W,DB: Phase 3 — apply ∪ mark (ONE transaction)
     W->>DB: BEGIN
     W->>DB: 1. version fence (FOR SHARE on each computed source)
-    W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: per-key ordering lock + basis check)
+    W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: sorted entry lock + I2 test)
     W->>DB: 3. aggregate + join maintenance (delta arithmetic)
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
@@ -153,7 +153,7 @@ exactly the state batch *k−1*'s new side left.**
 Because the deltas are invertible they also **commute**, so an out-of-order drain
 converges to the same total.
 
-## Absolute writes do not commute: the basis check
+## Absolute writes do not commute: the 1-1 ledger
 
 Batches drain out of `seg_seq` order, and key-routing does not order a key's
 writes *across* batches ([04](04-claiming-and-the-fold.md)). The argument above
@@ -162,9 +162,9 @@ table:
 
 | Write kind | Commutes? | Idempotent? | What makes an out-of-order drain safe |
 |---|---|---|---|
-| Aggregate deltas (`+new − old`) | yes | **no** | exactly-once (the three properties above), plus the recompute horizon below whenever a group was also re-derived |
-| Aggregate forced recomputes and extinction deletes (a live `GROUP BY` read) | **no** | yes | the recompute horizon, below |
-| 1-1 field writes and deletes, from an image or a live recompute read | **no** | yes | the per-key ordering lock and basis check, below |
+| Aggregate deltas (`+new − old`) | yes | **no** | exactly-once (the three properties above); on the ledger, also the entry's I2 test; off it, the recompute horizon below whenever a group was also re-derived |
+| Aggregate forced recomputes and extinction deletes (a live `GROUP BY` read), off the ledger | **no** | yes | the recompute horizon, below |
+| 1-1 field writes and deletes, from an image or a Re-derive read | **no** | yes | the 1-1 ledger's entry lock and I2 test, below |
 | Relationship projection writes | no | yes | the per-row `prev_lsn` ordering guard |
 | Truncate | no | yes | the drain barrier (full serialization) |
 
@@ -173,37 +173,54 @@ for one key in two batches don't commute. If the batch computed from the older
 source state reaches Phase 3 last, its value overwrites the newer one, and nothing
 is left staged to correct it. That is the same **permanent staleness** the version
 fence exists for, caused by ordinary data changes instead of a definition change
-(issue #344). It needs no crash or retry to happen. It only needs one worker to
-stall between Phase 2 and Phase 3, e.g. over a large catch-up batch.
+(issues #344, #392). It needs no crash or retry to happen. It only needs one
+worker to stall between Phase 2 and Phase 3, e.g. over a large catch-up batch.
 
-So every 1-1 write and delete carries its **basis**: the source row it was
-computed from (the staged image, or Phase 2's live read), or "no source row" for a
-delete. Phase 3 applies it only if that basis is still the source's current state:
+So a 1-1 target is on its ledger (`staging::one_to_one_ledger`, #623 D6),
+whose entry for a key holds only the ordering state ([below](#the-ledger)); the
+target row holds the values. A change is an **Apply** when it carries the
+image of the commit it came from (its `lsn` and source `txid`), and a
+**Re-derive** when it was staged as a `recompute` or folded with one. Phase 2
+evaluates an Apply's image; Phase 3 settles each 1-1 target's records in one
+pass:
 
-1. **The ordering lock.** Before writing any 1-1 target, Phase 3 takes a
-   transaction-scoped advisory lock on every `(target, stripe)` its keys fall in,
-   in ascending order. A stripe is the key's claim bucket (`route % 8`), so the
-   workers draining one batch's buckets in parallel never contend. Only batches from
-   different segments that share a bucket serialize. It can't be the target row's
-   `FOR UPDATE` alone: a stale insert racing a delete has no row to lock.
-2. **The basis check**, under that lock, in one statement: re-read each key's
-   source row and compare. A write's basis holds if the current row contains
-   every column of it with the same text (containment, since an image omits an
-   unchanged TOASTed column). A delete's basis holds if the row is gone.
-3. **A change whose basis no longer holds** is re-evaluated against the current
-   row, when its definition reads no relationship: written if the row exists,
-   deleted if not. Otherwise (or if evaluation fails) it is re-staged as a bare
-   recompute, which a later batch reads live.
+1. **The entry lock (I5).** Insert a placeholder entry for every key with none,
+   then lock every entry `for update`, sorted by key. Every writer of the
+   key's target row holds it, so every Phase 3 for a key runs one at a time.
+   It can't be the target row's `FOR UPDATE`: a stale insert racing a delete
+   has no row to lock. A key whose tombstone the GC collects between the two
+   statements fails the page transiently and it is retried (#712).
+2. **The Re-derive read (I1).** The Re-derived keys' source rows and
+   `pg_current_snapshot()`, in one statement, after the lock. A key with no
+   row is a delete.
+3. **The entries (I2).** A Re-derive sets the entry's `__basis` to the read's
+   snapshot and leaves `__applied_lsn` alone (#623 Q1). An Apply applies only
+   if its transaction is not visible in `__basis`, its `lsn` is above
+   `__applied_lsn`, and it is above the target's truncate floor (#623 Q6); it
+   then sets `__applied_lsn`. Either raises `__applied_seg` and marks a
+   tombstone when the key has no row after it. The statement returns the keys
+   it changed.
+4. **The target rows** of exactly those keys are upserted or deleted.
 
-Why that converges: every Phase 3 for a key runs one at a time, and each one
-writes only a value computed from the source's state *at that moment*. A source
-change that commits after the check has a batch of its own still to come, and
-that batch waits on the lock and then sees the change. So the last Phase 3 for a
-key always writes that key's final state.
+Why that converges: an Apply the test refuses is either already reflected by
+a Re-derive whose snapshot saw its commit, or older than the change last
+applied. Anything a Re-derive's snapshot did not see commits after it and has
+a change of its own still to come, which waits on the entry lock and then
+applies. So the last Phase 3 for a key always leaves its final state.
 
-Re-evaluating instead of skipping matters for a hot key. If the source changes
-faster than a batch drains, every batch's basis is stale by the time it applies.
-Skipping would leave the target frozen until the key went quiet.
+Nothing has to be re-read for a hot key: an Apply is judged by its own
+position, so a key whose source changes faster than a batch drains still
+gets each batch's newest image.
+
+A relationship-enriched 1-1 target evaluates a Re-derive against the
+relationship projection Phase 2 read, as an Apply is. A Re-derived row that
+now joins through a key Phase 2 did not resolve is re-staged as a bare
+recompute instead, which a later page reads.
+
+`ALTER TRANSFORM`'s column backfill (`defs::backfill::backfill_altered_columns`)
+and a column resume (`staging::quarantine::recompute_column`) write target
+rows outside a page. Each is a Re-derive of a range of keys, settled the same
+way in its own short transaction.
 
 ### Aggregate groups: the recompute horizon
 
@@ -264,7 +281,7 @@ So the live read records its basis as a WAL position, and a delta checks it:
    one, and whatever removed it since was a live read that found the group
    without the key.
 
-This is the same "re-evaluate, never skip" choice as the 1-1 basis check. An LSN
+This is a "re-evaluate, never skip" choice. An LSN
 at or below the horizon only *may* have been read, so skipping the delta would be
 unsound. Re-deriving is correct either way. The cost is that a group keeps being
 re-derived while rows staged before its horizon keep draining for it. In steady
@@ -279,9 +296,10 @@ commit whose captured rows are still pending
 ### The ledger
 
 ADR-0002 replaces the horizon with a per-key ledger. Apply maintains it for
-plain aggregate targets since #623 D3 (next section). Every other target's
-ledger is only written by its build, and goes stale after the target's first
-change until its own part of #623 moves it.
+plain aggregate targets since #623 D3 (next section) and for 1-1 targets since
+D6 ([above](#absolute-writes-do-not-commute-the-1-1-ledger)). Every other
+target's ledger is only written by its build, and goes stale after the
+target's first change until its own part of #623 moves it.
 
 Every target has one, `<target>__ledger` in the target's schema, created in the
 registration transaction and dropped with the target (`defs::ledger`). It holds
@@ -312,7 +330,9 @@ target row holds the values.
 
 The one-pass aggregate build writes the ledger. It empties it, reads the source
 into it in one statement whose snapshot becomes every entry's basis, and then
-writes the group rows as a `GROUP BY` over it. The 1-1 build writes no entries.
+writes the group rows as a `GROUP BY` over it. The 1-1 build writes no entries:
+a key's first change after it inserts the key's placeholder, and the go-live
+catch-up's Re-derives stamp every key's basis.
 
 ### Aggregate groups: the ledger
 
@@ -469,8 +489,8 @@ The design:
   by a batch already claimed.
 
 The fence covers definition changes only. The same staleness caused by two
-batches for one key draining out of order is closed separately, by the per-key
-ordering lock and basis check ([above](#absolute-writes-do-not-commute-the-basis-check)).
+batches for one key draining out of order is closed separately, by the 1-1
+ledger ([above](#absolute-writes-do-not-commute-the-1-1-ledger)).
 
 **The fence runs first in Phase 3**, so a superseded batch rolls back before
 touching a derived row. The fence set must include tables that are *evaluated* but
@@ -662,7 +682,7 @@ identical from outside otherwise.
    commute with other deltas still has to check it
    ([the recompute horizon](#aggregate-groups-the-recompute-horizon)). See the
    classification table under
-   [the basis check](#absolute-writes-do-not-commute-the-basis-check).
+   [the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger).
 8. **No Trellis transaction waits for a lock longer than `lock_timeout`**, and a
    timed-out transaction is retried from outside any transaction, never
    waited out inside one. Every connection caps the setting when it connects

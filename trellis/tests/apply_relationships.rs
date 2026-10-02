@@ -1046,13 +1046,13 @@ async fn reverse_recompute_fan_in_keeps_the_earliest_src_changed() {
     drain_to_quiescence(&db.pool, &mut client).await;
 }
 
-/// Issue #344's fallback path: a batch computed from a source row that
-/// changed before its Phase 3 ran can't be re-evaluated there when its
-/// definition reads a relationship (the related rows are only loaded in
-/// Phase 2). It must neither write its stale value over the newer batch's
-/// nor drop the key: it is re-staged as a recompute instead.
+/// A Re-derive of a relationship-enriched 1-1 key reads its row in Phase 3
+/// (#623 D6), but the related rows are only loaded in Phase 2. When the row
+/// read now joins through a parent Phase 2 didn't load, the key can be
+/// neither written from a stale parent nor dropped: it is re-staged as a
+/// recompute instead.
 #[tokio::test]
-async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
+async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1107,8 +1107,8 @@ async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
         .await
         .expect("settle the parent projection");
 
-    // Batch 1: article 1 is inserted pointing at 'Tech', and computed but
-    // not applied.
+    // Batch 1: article 1 is inserted pointing at 'Tech', and a Re-derive of
+    // it is computed (Phase 2 loads 'Tech') but not applied.
     client
         .execute(
             "insert into articles (id, category_id, title) values (1, 10, 'a1')",
@@ -1116,15 +1116,7 @@ async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
         )
         .await
         .expect("insert article");
-    stage_cdc(
-        &client,
-        "articles",
-        "1",
-        "insert",
-        None,
-        Some(r#"{"id":"1","category_id":"10","title":"a1"}"#),
-    )
-    .await;
+    stage_cdc(&client, "articles", "1", "recompute", None, None).await;
     let seg1 = seal_active_segment(&mut client).await;
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
@@ -1187,12 +1179,12 @@ async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
     assert_eq!(
         target_to_one(&client).await,
         sci,
-        "the stale batch must not overwrite the newer value"
+        "the Re-derive must not write from a parent it didn't load"
     );
     assert_eq!(
         staged_recompute_count(&client, "articles", "1").await,
         1,
-        "the stale batch must re-stage its key rather than drop it"
+        "the Re-derive must re-stage its key rather than drop it"
     );
     retire_drained_segments(&mut client)
         .await

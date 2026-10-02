@@ -76,10 +76,11 @@ pub enum Plant {
     /// apply transaction already holds. Only two workers applying one group
     /// at once can trip it. Found by #557 part 1's review.
     DropRacingGroupDelta,
-    /// Issue #344: a 1-1 write whose source row changed after Phase 2 read
-    /// it applies anyway, instead of being settled against the current row
-    /// (`staging::apply::reconcile_with_source`). A batch that drains after
-    /// a newer one for the same key then leaves the older value behind.
+    /// Issues #344/#392 (#623 D6): a 1-1 target applies every change without
+    /// ADR-0002's I2 (`staging::one_to_one_ledger::update_entries`): not
+    /// skipped when a Re-derive already read it, nor when a newer change
+    /// already applied. A page that drains after a newer one for the same key
+    /// then leaves the older value behind.
     StaleOneToOneWrite,
     /// Issue #321: an aggregate delta at or below its group's recompute
     /// horizon applies as a delta, instead of re-deriving the group

@@ -25,7 +25,7 @@ use trellis::defs::{
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
 use trellis::staging::{
-    ChargedKey, FoldedChange, IsolationOutcome, StagedWatermark, isolate_and_evict,
+    ChargedKey, FoldedChange, IsolationOutcome, LastChange, StagedWatermark, isolate_and_evict,
 };
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -1884,7 +1884,11 @@ fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
         has_recompute: false,
         vanished_images: Vec::new(),
         ends_in_delete: false,
-        last_change: None,
+        // #623 D6: an Apply (its image is the change), not a Re-derive.
+        last_change: Some(LastChange {
+            lsn: PgLsn::from(1),
+            row_txid: "1".to_string(),
+        }),
     }
 }
 
