@@ -212,7 +212,8 @@ What it does there is one append.
   alone, on its reconcile pass: a table gains triggers when something
   registers a reader of it and loses them when its last reader is dropped.
   Registration itself does no source reads and no capture work; it writes
-  the definition, its ledger tables and its chunk plan
+  the definition and its ledger tables, and the staging worker starts its
+  build once capture covers it
   ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
   Registering processes need catalog access and the right to create target
   tables, nothing on the sources.
@@ -411,10 +412,14 @@ set-based pass with its changes withheld and recovered afterwards. It is
 built by the same operation apply uses, over chunks of the source, while
 applying.
 
-- **Must:** registration writes the definition, its ledger tables and a
-  chunk plan (primary-key ranges over the source, discovered by `max()` over
-  `LIMIT` so every row falls in exactly one range), and the definition is
-  **applying from that commit**. Every drain worker claims chunks. A chunk
+- **Must:** registration writes the definition and its ledger tables. Once
+  capture covers it, the staging worker starts its build in one transaction
+  that moves it to `backfilling` and enqueues a plan job, and the definition
+  is **applying from that commit** (amended by #625 F3: registration does no
+  more than register, 622 Q1). The plan job enqueues the chunk plan
+  (primary-key ranges over the source, discovered by `max()` over `LIMIT` so
+  every row falls in exactly one range) in batches, on a drain worker. Every
+  drain worker claims chunks. A chunk
   is one short transaction: lock its entries in key order (placeholders for
   keys with no entry), one statement that takes the snapshot and reads the
   range, replace the entries, record the group deltas (next bullet). "No

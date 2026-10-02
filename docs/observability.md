@@ -172,7 +172,14 @@ quarantine are two arcs of one lifecycle:
   `Trellis::status` reports its error meanwhile (`backfill_failure`).
 * **`backfilling`** — the backfill discharge has captured the source and
   enqueued the transform's build, which is running: chunks, or one direct
-  set-based build job, on drain threads. The target is partial. A ring enumeration
+  set-based build job, on drain threads. The target is partial. A plain
+  invertible aggregate (every field `SUM`, `AVG` or `COUNT` of plain source
+  columns, on a captured source) is built by the Re-derive build instead
+  (#625, [data-flow — Re-derive-built definitions](data-flow.md#re-derive-built-definitions)):
+  the staging worker starts it with no marker, and it is maintained from that
+  start, so it goes from `backfilling` straight to `live` once its last
+  chunk and group merge have committed, with no `catching_up`. Its resume
+  rebuilds it the same way, over the ledger the freeze left. A ring enumeration
   (the fallback for a shape neither build can render) never shows this: it
   goes from `waiting_to_backfill` straight to `live` in the discharge's own
   transaction (or to `catching_up`, when its source is another transform's
@@ -204,7 +211,12 @@ quarantine are two arcs of one lifecycle:
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
 source only once a conservative transaction fence settles (`now.xmin >
-fence`, `trellis/src/intake/markers.rs`). Because `xmin` is
+fence`, `trellis/src/intake/markers.rs`), except a plain invertible
+aggregate's Re-derive build: it starts with no fence, and each of its chunks
+reads under its own short snapshot after locking the ledger entries it
+rewrites, so a long transaction elsewhere doesn't hold it, and it holds no
+long snapshot of its own
+([data-flow — Re-derive-built definitions](data-flow.md#re-derive-built-definitions)). Because `xmin` is
 **cluster-global**, any unrelated long-running transaction *anywhere in the
 cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
 until that transaction ends. Since every new transform goes through this wait

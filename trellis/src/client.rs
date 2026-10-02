@@ -140,18 +140,6 @@ pub struct ClientOptions {
     /// headroom under the server's `max_connections`: without it, an
     /// oversized share fails to connect, is released, and retries each poll.
     pub drain_batch_cap: usize,
-    /// Whether the staging worker builds a qualifying definition with the
-    /// Re-derive build (#625 F2, `staging::build`) instead of parking it a
-    /// registration marker for the old build. Off by default. A definition
-    /// qualifies when the ledger maintains its target by increments over
-    /// plain source columns (`SUM`/`AVG` over an exact column, `COUNT`), its
-    /// source is captured rather than another definition's target, and its
-    /// ledger is empty (a fresh definition, not a resumed one).
-    ///
-    /// Only the staging worker reads it: it is the one process that starts
-    /// builds. Every drain worker runs a started build's work whatever its
-    /// own setting, after its segments.
-    pub rederive_build: bool,
     /// Source rows per Re-derive build chunk (#625 Q4), read by the drain
     /// worker that runs a build's plan job. Defaults to
     /// [`staging::build::DEFAULT_CHUNK_ROWS`]. Zero is treated as one.
@@ -171,7 +159,6 @@ impl Default for ClientOptions {
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
-            rederive_build: false,
             build_chunk_rows: staging::build::DEFAULT_CHUNK_ROWS,
         }
     }
@@ -511,7 +498,7 @@ async fn run(
 
     let mut staging_session = None;
     if options.staging_worker {
-        match setup_staging(&dsn, &config, &pool, options.rederive_build).await {
+        match setup_staging(&dsn, &config, &pool).await {
             Ok(session) => staging_session = Some(session),
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
@@ -539,7 +526,6 @@ async fn run(
             reconcile_interval: options.reconcile_interval,
             watermark: watermark.clone(),
             backfill_catch_up_timeout: BACKFILL_CATCH_UP_TIMEOUT,
-            rederive_build: options.rederive_build,
         };
         maintenance_task = Some(tokio::spawn(maintenance_loop(
             maintenance_config,
@@ -663,10 +649,9 @@ async fn setup_staging(
     dsn: &str,
     config: &Config,
     pool: &Pool,
-    rederive_build: bool,
 ) -> Result<ProducerSession, ClientError> {
     let mut session = ProducerSession::connect(dsn, config.schema()).await?;
-    match first_capture_pass(&mut session, config, pool, rederive_build).await {
+    match first_capture_pass(&mut session, config, pool).await {
         Ok(()) => Ok(session),
         Err(err) => {
             release_singleton(Some(session)).await;
@@ -680,7 +665,6 @@ async fn first_capture_pass(
     session: &mut ProducerSession,
     config: &Config,
     pool: &Pool,
-    rederive_build: bool,
 ) -> Result<(), ClientError> {
     let tables = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
@@ -688,11 +672,9 @@ async fn first_capture_pass(
         capture::reconcile::reconcile(session.client_mut(), config.schema(), &tables, deadline)
             .await
             .map_err(capture_pass_error)?;
-    if rederive_build {
-        let taken =
-            staging::build::start_ready_builds(session.client_mut(), pool, &outcome.ready).await?;
-        outcome.ready.retain(|id| !taken.contains(id));
-    }
+    let taken =
+        staging::build::start_ready_builds(session.client_mut(), pool, &outcome.ready).await?;
+    outcome.ready.retain(|id| !taken.contains(id));
     intake::markers::park_ready_registration_markers(session.client(), &outcome.ready).await?;
     Ok(())
 }
@@ -733,8 +715,6 @@ struct MaintenanceConfig {
     watermark: staging::StagedWatermark,
     /// [`BACKFILL_CATCH_UP_TIMEOUT`] outside tests.
     backfill_catch_up_timeout: Duration,
-    /// [`ClientOptions::rederive_build`].
-    rederive_build: bool,
 }
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
@@ -764,7 +744,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         reconcile_interval,
         watermark,
         backfill_catch_up_timeout,
-        rederive_build,
     } = config;
 
     let seal_config = SealConfig::default();
@@ -880,7 +859,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     &watermark,
                     backfill_catch_up_timeout,
                     &shutting_down,
-                    rederive_build,
                 )
                 .await;
                 failed = failures
@@ -921,20 +899,6 @@ pub async fn reconcile_pass(
     wake_channel: &str,
     catch_up_timeout: Duration,
 ) -> Result<(), String> {
-    reconcile_pass_with(client, pool, schema, wake_channel, catch_up_timeout, false).await
-}
-
-/// [`reconcile_pass`] with [`ClientOptions::rederive_build`] set to
-/// `rederive_build` (#625 F2).
-#[cfg(feature = "internals")]
-pub async fn reconcile_pass_with(
-    client: &mut tokio_postgres::Client,
-    pool: &Pool,
-    schema: &str,
-    wake_channel: &str,
-    catch_up_timeout: Duration,
-    rederive_build: bool,
-) -> Result<(), String> {
     reconcile_source_tables(
         client,
         pool,
@@ -943,7 +907,6 @@ pub async fn reconcile_pass_with(
         &staging::StagedWatermark::saturated(),
         catch_up_timeout,
         &|| false,
-        rederive_build,
     )
     .await
     .map_err(|err| err.to_string())
@@ -1278,17 +1241,14 @@ async fn reconcile_source_tables(
     watermark: &staging::StagedWatermark,
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
-    rederive_build: bool,
 ) -> Result<(), ReconcileError> {
     let desired = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let mut outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
-    // #625 F2: a ready definition the Re-derive build takes gets no
+    // #625 F2/F3: a ready definition the Re-derive build takes gets no
     // registration marker, and the discharge below doesn't dispatch it.
-    if rederive_build {
-        let taken = staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
-        outcome.ready.retain(|id| !taken.contains(id));
-    }
+    let taken = staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
+    outcome.ready.retain(|id| !taken.contains(id));
     intake::markers::park_ready_registration_markers(&*client, &outcome.ready).await?;
     // The markers whose discharge failed are already logged and backed off on
     // their own rows (issue #407). Only a failure of the pass itself errors,
@@ -1467,14 +1427,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         )
         .await;
 
-        // Claim and execute pending direct-build backfill chunks before this
-        // iteration's ring-segment work, so a fleet running only backfill (no
-        // sealed segments yet) still makes progress every tick rather than
-        // getting stuck behind the segment path's own early `continue`s
-        // below.
-        let backfill_progress =
-            drain_backfill_chunks(&pool, &claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
-
         // `register_drainer` doubles as the liveness refresh
         // `count_live_drainers` reads below (see its own doc comment), so it
         // does need to run on every iteration — `drainers.last_seen` decays
@@ -1510,13 +1462,18 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             Ok(seqs) if !seqs.is_empty() => seqs,
             Ok(_) | Err(_) => {
                 // No claimable segment this tick (or the lookup itself
-                // failed): a Re-derive build's work comes next (#625 B6).
-                // Only actually wait if neither it nor the backfill-chunk
-                // claim above made progress — otherwise loop straight back
-                // around to claim more without an idle wait.
-                let build_progress = rederive_build_step(&pool, &claimed_by, &build_options).await;
-                if !backfill_progress
-                    && !build_progress
+                // failed): build work comes next (#625 B6). Only actually
+                // wait if it made no progress — otherwise loop straight
+                // back around without an idle wait.
+                let build_progress = build_step(
+                    &pool,
+                    &claimed_by,
+                    chunk_heartbeat_interval,
+                    reclaim_ttl,
+                    &build_options,
+                )
+                .await;
+                if !build_progress
                     && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await
                 {
                     break;
@@ -1582,16 +1539,40 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // Only `Ok(Some(_))` re-loops immediately, to grab the next batch
         // promptly. The poll floor (or a wake/shutdown) bounds the idle wait.
         let drained = matches!(outcome, Ok(Some(_)));
-        // #625 B6: segments first. A worker that drained loops straight back
-        // to the ring; one that won nothing there takes a Re-derive build's
-        // merge or chunk instead.
-        let build_progress =
-            !drained && rederive_build_step(&pool, &claimed_by, &build_options).await;
-        let made_progress = drained || backfill_progress || build_progress;
+        // #625 B6: segments first, for every kind of build work. A worker
+        // that drained loops straight back to the ring; one that won nothing
+        // there takes build work instead.
+        let build_progress = !drained
+            && build_step(
+                &pool,
+                &claimed_by,
+                chunk_heartbeat_interval,
+                reclaim_ttl,
+                &build_options,
+            )
+            .await;
+        let made_progress = drained || build_progress;
         if !made_progress && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
             break;
         }
     }
+}
+
+/// A drain worker's build work for one pass of its loop, after its segments
+/// (#625 B6, global since F3): one old-build chunk (a plain 1-1 range or a
+/// direct-build job, [`drain_backfill_chunks`]), then one step of the
+/// Re-derive builds' work ([`rederive_build_step`]). Returns whether either
+/// did work.
+async fn build_step(
+    pool: &Pool,
+    claimed_by: &str,
+    chunk_heartbeat_interval: Duration,
+    reclaim_ttl: Duration,
+    build_options: &staging::build::WorkerOptions,
+) -> bool {
+    let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
+    let rederive = rederive_build_step(pool, claimed_by, build_options).await;
+    old || rederive
 }
 
 /// One step of the running Re-derive builds' work
@@ -2281,7 +2262,6 @@ mod maintenance_failure_tests {
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::new(),
             backfill_catch_up_timeout: Duration::from_secs(1),
-            rederive_build: false,
         };
         let seal_warning = || {
             captured.0.lock().unwrap().iter().any(|e| {
@@ -3350,7 +3330,6 @@ mod backfill_shutdown_tests {
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::saturated(),
             backfill_catch_up_timeout: Duration::from_secs(600),
-            rederive_build: false,
         };
         let task = tokio::spawn(maintenance_loop(config, shutdown_rx));
 
@@ -3494,7 +3473,6 @@ mod reconcile_tests {
             &staging::StagedWatermark::saturated(),
             Duration::from_millis(200),
             &|| false,
-            false,
         )
         .await
         .expect("reconcile pass");
@@ -3529,7 +3507,7 @@ mod reconcile_tests {
         let schema = "no_trellis_here";
         let config = Config::with_schema(db.dsn(), schema).expect("valid config");
         let pool = Pool::new(&config).expect("build a same-crate pool");
-        let err = setup_staging(db.dsn(), &config, &pool, false)
+        let err = setup_staging(db.dsn(), &config, &pool)
             .await
             .expect_err("the pass can't read a catalog that isn't there");
         assert!(err.to_string().contains("does not exist"), "{err}");

@@ -51,7 +51,7 @@
 //!   staged row, killed at 13.8 GB for 20M rows); the `converge` peak is the
 //!   number #620's batch cap has to bound.
 //!
-//! - with `--rederive-build` (#625 F2), the Re-derive build's profile
+//! - the Re-derive build's profile (#625 F2)
 //!   ([`build_profile`]): worker-seconds per build statement class, chunk
 //!   transaction p50/p99/max, delta rows appended and merged and the delta
 //!   table's peak, chunks that gave up on their entry lock, seal refusals,
@@ -153,11 +153,10 @@ impl WriterTally {
 pub struct BuildUnderLoadResult {
     pub cfg: BuildUnderLoad,
     pub application_threads: usize,
-    /// The engine's `rederive_build` and `build_chunk_rows` (#625 F2).
-    pub rederive_build: bool,
+    /// The engine's `build_chunk_rows` (#625 F2).
     pub build_chunk_rows: i64,
     /// The Re-derive build's profile columns ([`build_profile`]), over the
-    /// same window as `disk`. All zero for the old build.
+    /// same window as `disk`.
     pub build: BuildProfile,
     pub load_secs: f64,
     pub load_rows_per_sec: f64,
@@ -331,7 +330,7 @@ impl BuildUnderLoadResult {
         let w = &self.writes;
         format!(
             "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"writers\":{},\"write_rate\":{},\
-             \"application_threads\":{},\"rederive_build\":{},\"build_chunk_rows\":{},\
+             \"application_threads\":{},\"build_chunk_rows\":{},\
              \"load_secs\":{:.3},\"load_rows_per_sec\":{:.0},\
              \"index_secs\":{:.3},\"build_secs\":{:.3},\"chunks\":{},\"first_claim_secs\":{},\
              \"first_chunk_secs\":{},\"chunks_per_sec\":{},\"define_to_live_secs\":{:.3},\
@@ -353,7 +352,6 @@ impl BuildUnderLoadResult {
             self.cfg.writers,
             self.cfg.write_rate,
             self.application_threads,
-            self.rederive_build,
             self.build_chunk_rows,
             self.load_secs,
             self.load_rows_per_sec,
@@ -999,7 +997,6 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     BuildUnderLoadResult {
         cfg,
         application_threads: tuning.application_threads,
-        rederive_build: tuning.rederive_build,
         build_chunk_rows: tuning.build_chunk_rows,
         build,
         load_secs,

@@ -424,6 +424,11 @@ impl LedgerTargetPlan {
         &self.source_table
     }
 
+    /// The ledger's quoted, qualified identity.
+    pub(super) fn ledger_ident(&self) -> &str {
+        &self.ledger_ident
+    }
+
     /// The source's primary key.
     pub(super) fn source_pk(&self) -> &[PrimaryKeyColumn] {
         &self.source_pk
@@ -951,6 +956,78 @@ fn ledger_statement(
 /// is older than the fence of the newest one it does see: that fence sees
 /// every change the snapshot sees.
 pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: &str) -> String {
+    let k_expr = ddl::pk_key_sql_expr(&plan.source_pk, Some("s"));
+    rederive_statement(
+        plan,
+        &format!(
+            "join unnest({keys}::text[]) as u(__trellis_k) on u.__trellis_k = {k_expr} \
+             where {range_where}"
+        ),
+        keys,
+    )
+}
+
+/// A rebuild's sweep batch's one statement (#625 F3; called from
+/// [`super::build`]): [`chunk_statement`] for a set of keys rather than a
+/// range, the keys of live entries the build's chunks didn't re-derive.
+/// The source is read by its typed key columns, so the read is one index
+/// probe per key: `$1` is the keys' `text[]`, and `$2..` one `text[]` per
+/// primary-key column holding that column of each key, in key order
+/// ([`sweep_key_params`]).
+///
+/// A key with a `NULL` part matches no row, so its entry becomes a
+/// tombstone. Only a source keyed by a nullable unique index (another
+/// aggregate's target) has such keys, and the Re-derive build doesn't take
+/// those (#625 F6).
+pub(super) fn sweep_statement(plan: &LedgerTargetPlan) -> String {
+    let on: Vec<String> = plan
+        .source_pk
+        .iter()
+        .enumerate()
+        .map(|(i, column)| format!("s.{} = u.__trellis_p{i}", quote_ident(&column.name)))
+        .collect();
+    let arrays: Vec<String> = plan
+        .source_pk
+        .iter()
+        .enumerate()
+        .map(|(i, column)| format!("${}::text[]::{}[]", i + 2, column.data_type))
+        .collect();
+    let columns: Vec<String> = (0..plan.source_pk.len())
+        .map(|i| format!("__trellis_p{i}"))
+        .collect();
+    rederive_statement(
+        plan,
+        &format!(
+            "join unnest({}) as u({}) on {}",
+            arrays.join(", "),
+            columns.join(", "),
+            on.join(" and ")
+        ),
+        "$1",
+    )
+}
+
+/// [`sweep_statement`]'s `$2..` parameters for `keys`: per primary-key
+/// column, that column's part of each key, as text (`None` for a `NULL`
+/// part).
+pub(super) fn sweep_key_params(
+    plan: &LedgerTargetPlan,
+    keys: &[&str],
+) -> Result<Vec<Vec<Option<String>>>, ApplyError> {
+    let mut columns = vec![Vec::with_capacity(keys.len()); plan.source_pk.len()];
+    for key in keys {
+        let parts = ddl::split_pk_key(&plan.source_pk, &plan.source_table, key)?;
+        for (column, part) in columns.iter_mut().zip(parts) {
+            column.push(part.map(|p| p.into_owned()));
+        }
+    }
+    Ok(columns)
+}
+
+/// [`chunk_statement`] and [`sweep_statement`]'s shared body. `src_from` is
+/// what follows `from <source> s` in the source read: the join and filter
+/// that pick the keys' rows. `keys` is the locked keys' `text[]` parameter.
+fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> String {
     let shape = &plan.shape;
     let q = |c: &str| quote_ident(c);
     let (groups, args) = entry_columns(shape);
@@ -978,10 +1055,7 @@ pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: 
                     (select max(seg_seq) from segments) as __seg \
          ), \
          src as ( \
-             select {k_expr} as __k, {src_cols} \
-             from {source} s join unnest({keys}::text[]) as u(__trellis_k) \
-                  on u.__trellis_k = {k_expr} \
-             where {range_where} \
+             select {k_expr} as __k, {src_cols} from {source} s {src_from} \
          ), \
          v as ( \
              select u.__k, r.__k is not null as __present, {r_cols} \
@@ -1034,7 +1108,14 @@ pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: 
 /// planner then expects one claimed row, and joins the upsert's result back
 /// to the group sums (`up join d`) in a nested loop that is quadratic in the
 /// batch (#625 F2b: 1.8 s instead of 25 ms for 5,000 rows).
-pub(super) fn merge_statement(plan: &LedgerTargetPlan, image_columns: Option<&[String]>) -> String {
+///
+/// `keep_claimed` renders the `merge_without_delete` plant: the claimed rows
+/// are read and locked but not deleted (see `crate::plant`).
+pub(super) fn merge_statement(
+    plan: &LedgerTargetPlan,
+    image_columns: Option<&[String]>,
+    keep_claimed: bool,
+) -> String {
     let shape = &plan.shape;
     let (groups, _) = entry_columns(shape);
     let mut sums = vec![format!(
@@ -1053,13 +1134,20 @@ pub(super) fn merge_statement(plan: &LedgerTargetPlan, image_columns: Option<&[S
         }
     }
     let upsert = group_upsert_sql(plan, image_columns, "");
+    let claim = format!(
+        "{deltas} where ctid = any(array( \
+             select ctid from {deltas} order by {seq} limit $1 \
+             for update skip locked))",
+        deltas = plan.deltas_ident,
+        seq = quote_ident(schema::DELTA_SEQ_COLUMN),
+    );
+    let gone = if keep_claimed {
+        format!("select * from {claim}")
+    } else {
+        format!("delete from {claim} returning *")
+    };
     format!(
-        "with gone as ( \
-             delete from {deltas} where ctid = any(array( \
-                 select ctid from {deltas} order by {seq} limit $1 \
-                 for update skip locked)) \
-             returning * \
-         ), \
+        "with gone as ({gone}), \
          d as ( \
              select {g_groups}, {g_gk} as __gk, {sums}, '{{}}'::text[] as __ks \
              from gone g group by {g_groups} \
@@ -1069,8 +1157,6 @@ pub(super) fn merge_statement(plan: &LedgerTargetPlan, image_columns: Option<&[S
          select c.__claimed, w.* \
          from (select count(*) as __claimed from gone) c \
          left join ({select}) w on true",
-        deltas = plan.deltas_ident,
-        seq = quote_ident(schema::DELTA_SEQ_COLUMN),
         g_groups = prefixed(&groups, "g"),
         g_gk = ddl::pk_key_sql_expr(&plan.identity, Some("g")),
         sums = sums.join(", "),

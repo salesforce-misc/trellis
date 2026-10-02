@@ -14,6 +14,9 @@
 //! `apply_aggregate.rs` covers the same fold deterministically, without a
 //! build.
 //!
+//! The aggregate is a `MAX`, which still takes the direct build: a plain
+//! `SUM` is the Re-derive build's since #625 F3, which has no horizon.
+//!
 //! The build is held with event triggers on advisory locks the test holds, at
 //! the two `ALTER TABLE`s around the aggregate build's ledger load (#623 D2),
 //! told apart by their text: the one dropping the ledger's key (before the
@@ -154,7 +157,7 @@ fn cdc(op: CdcOp, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -> StagedCha
     }
 }
 
-/// Registers `sku_totals` over `public.sales` (`sku = 'a'` totalling `12`)
+/// Registers `sku_totals` over `public.sales` (`sku = 'a'` peaking at `7`)
 /// and starts its build, returning once the build is parked between its
 /// coverage fence and its read.
 async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task::JoinHandle<()> {
@@ -174,7 +177,7 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     }
     install_definition(
         pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("sku".to_string(), ValueType::Text),
@@ -251,5 +254,5 @@ async fn a_group_emptied_across_the_build_horizon_is_removed_even_by_an_enumerat
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
     discharge_markers(&db.pool, &mut client).await;
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
+    assert_eq!(totals(&client).await, expected(&[("a", "7"), ("b", "2")]));
 }

@@ -536,7 +536,7 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 |---|---|---|
 | `waiting_to_backfill` | Defined; the source's existing rows haven't been read yet. | Keep polling. |
 | `backfilling` | The target is being built. | Keep polling. |
-| `catching_up` | Built and maintained, but may still be missing changes made while it was building. | Keep polling. |
+| `catching_up` | Built and maintained, but may still be missing changes made while it was building. A plain invertible aggregate (only `SUM`, `AVG` and `COUNT` of plain columns) never reports it: its build goes from `backfilling` straight to `live`. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
 | `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis after a column it reads was renamed or dropped, or its source's primary key was redefined (`capture_failure`). | Stop and report it. |
@@ -547,9 +547,10 @@ The lifecycle behind these words is in
 Three things a poll needs to handle:
 
 * **`waiting_to_backfill` has no deadline of its own.** A long-running
-  transaction anywhere in the cluster holds every backfill back until it ends
-  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat)),
-  and Trellis reports nothing but the status meanwhile. So poll with a
+  transaction anywhere in the cluster holds most backfills back until it ends
+  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat);
+  a plain invertible aggregate's build doesn't wait on it), and Trellis
+  reports nothing but the status meanwhile. So poll with a
   deadline of your own, and from somewhere that can wait (a deploy check, a
   background job), not a web request.
 * **A failing build doesn't fail the poll.** While a build keeps failing,

@@ -102,6 +102,16 @@ pub enum Plant {
     /// to its key is still in an undrained segment, which then applies to
     /// the fresh entry and brings the deleted row back.
     EarlyTombstoneGc,
+    /// #625 F3 (ADR-0002 I1 for the build): a Re-derive build's chunk, or
+    /// its sweep, reads and rewrites its keys' entries without first taking
+    /// their entry locks (`staging::build`), so it reads an entry a page is
+    /// between reading and writing, and its group deltas move the key from
+    /// a state the page already moved it out of.
+    ChunkWithoutEntryLock,
+    /// #625 F3 (B3): the build's merger (`staging::build::merge_deltas`)
+    /// applies the group-delta rows it claims without deleting them, so the
+    /// next merge applies them again.
+    MergeWithoutDelete,
 }
 
 impl Plant {
@@ -114,6 +124,8 @@ impl Plant {
         Plant::SkipLedgerLock,
         Plant::LsnOnlySkip,
         Plant::EarlyTombstoneGc,
+        Plant::ChunkWithoutEntryLock,
+        Plant::MergeWithoutDelete,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -126,6 +138,8 @@ impl Plant {
             Plant::SkipLedgerLock => "skip_ledger_lock",
             Plant::LsnOnlySkip => "lsn_only_skip",
             Plant::EarlyTombstoneGc => "early_tombstone_gc",
+            Plant::ChunkWithoutEntryLock => "chunk_without_entry_lock",
+            Plant::MergeWithoutDelete => "merge_without_delete",
         }
     }
 

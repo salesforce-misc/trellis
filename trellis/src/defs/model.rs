@@ -53,29 +53,16 @@ pub struct Definition {
     /// `staging::apply::compute`'s `downstream_readers` check for the one
     /// call site that needs exactly this).
     pub target_table: String,
-    /// Whether a Re-derive build is running for it
-    /// (`transform_definitions.build = 'rederive'`, #625 F2; see
-    /// `crate::staging::build`). Such a definition applies from the commit
-    /// that moved it to `backfilling` ([`Self::applies`]).
-    pub rederive_build: bool,
 }
 
-impl Definition {
-    /// Whether Apply maintains this definition: it folds every change to
-    /// what it reads into its target, and the target-mutation seam stages
-    /// its source's writes for it. A [`TransformStatus::is_applying`]
-    /// status, or `backfilling` under a Re-derive build (#625 B1), which
-    /// applies from its start. [`APPLYING_SQL`] is the same test in SQL.
-    pub fn applies(&self) -> bool {
-        self.status.is_applying()
-            || (self.status == TransformStatus::Backfilling && self.rederive_build)
-    }
-}
-
-/// [`Definition::applies`] as a SQL predicate over a `transform_definitions`
-/// row, unqualified: a status [`TransformStatus::is_applying`] holds for, or
-/// `backfilling` under a Re-derive build. Qualify the columns with
-/// [`applying_sql`] where the row has an alias.
+/// Whether Apply maintains a definition, as a SQL predicate over its
+/// `transform_definitions` row, unqualified: it folds every change to what
+/// it reads into its target, and the target-mutation seam stages its
+/// source's writes for it. A status [`TransformStatus::is_applying`] holds
+/// for, or `backfilling` under a Re-derive build (#625 B1,
+/// `transform_definitions.build = 'rederive'`), which applies from the
+/// commit that started it. Qualify the columns with [`applying_sql`] where
+/// the row has an alias.
 pub const APPLYING_SQL: &str =
     "(status in ('live', 'catching_up') or (status = 'backfilling' and build = 'rederive'))";
 
@@ -99,6 +86,14 @@ pub fn applying_sql(alias: &str) -> String {
 /// the go-live catch-up that build parked has been discharged (issue #476).
 /// A ring-built definition goes straight to `live`, or to `catching_up` when
 /// its source is another definition's target.
+///
+/// A plain invertible aggregate (a target the ledger maintains by increments
+/// alone, on a captured source) has no discharge, catch-up or `catching_up`
+/// (#625 F3, `crate::staging::build`): the staging worker moves it to
+/// [`TransformStatus::Backfilling`] with its Re-derive build's plan job, it
+/// applies from that commit ([`APPLYING_SQL`]), and the transaction that
+/// finishes its build (the plan, every chunk and every group-delta merge)
+/// moves it to [`TransformStatus::Live`]. Its resume rebuilds it the same way.
 ///
 /// Apply maintains a definition that is [`TransformStatus::is_applying`]:
 /// `live` or `catching_up`. Only `live` tells an operator the target is in

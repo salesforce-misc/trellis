@@ -69,6 +69,8 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // A plain invertible aggregate is the Re-derive build's (#625 F3).
+            trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
             trellis::intake::markers::discharge_registrations(pool)
@@ -805,8 +807,9 @@ async fn resume_drops_orphans_from_mixed_case_targets() {
 /// The failure is a trigger on `pending_backfill` that refuses the marker's
 /// delete, which runs after the sweep, the dispatch and the enumeration's
 /// staging. A lock timeout, a conflict or a lost connection there rolls back
-/// the same way. The resumed aggregate's rebuild is a direct-build job, so a
-/// live 1-1 sibling on the same source is what makes this discharge
+/// the same way. The resumed aggregate is a `MAX`, so its rebuild is still a
+/// direct-build job behind a marker (a `SUM` is the Re-derive build's since
+/// #625 F3, and parks none), and a live 1-1 sibling on the same source is what makes this discharge
 /// enumerate (its catch-up) and stage.
 #[tokio::test]
 async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
@@ -818,7 +821,7 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
     apply_all(
         &operator,
         &[
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT max(a) AS total",
             "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
         ],
     )
@@ -866,7 +869,7 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
     let rollup = "select g::text, total::text from order_rollup order by g";
     assert_eq!(
         text_rows(&client, rollup).await,
-        text(&[&[Some("0"), Some("12")], &[Some("1"), Some("9")]]),
+        text(&[&[Some("0"), Some("6")], &[Some("1"), Some("5")]]),
         "the rolled-back discharge deleted nothing"
     );
     assert!(
@@ -891,7 +894,7 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
     settle(&db.pool, &mut client).await;
     assert_eq!(
         text_rows(&client, rollup).await,
-        text(&[&[Some("1"), Some("9")]]),
+        text(&[&[Some("1"), Some("5")]]),
         "the retry drops group 0"
     );
     assert_eq!(
@@ -900,7 +903,7 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
             "select g::text, total::text from rollup_echo order by g"
         )
         .await,
-        text(&[&[Some("1"), Some("9")]]),
+        text(&[&[Some("1"), Some("5")]]),
     );
     operator.shutdown().await.expect("shut down");
 }

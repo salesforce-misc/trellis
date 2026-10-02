@@ -2545,7 +2545,6 @@ async fn create_definition_inner(
         status,
         source_table: qualified_source,
         target_table: qualified_target,
-        rederive_build: false,
     })
 }
 
@@ -5704,7 +5703,6 @@ struct PendingDefinition {
     source_columns: HashMap<String, ValueType>,
     source_table: String,
     target_table: String,
-    rederive_build: bool,
 }
 
 /// The transform definitions that depend on `node_table` via a `kind` edge
@@ -5767,7 +5765,7 @@ pub async fn dependents_of(
         .query(
             &format!(
                 "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                        t.target_table, e.key, e.value, t.build is not distinct from 'rederive'
+                        t.target_table, e.key, e.value
                  from schema_nodes from_node
                  join schema_edges se on se.from_node_id = from_node.id and se.kind = $2
                  join schema_nodes to_node on to_node.id = se.to_node_id
@@ -5804,7 +5802,6 @@ pub async fn dependents_of(
                 source_columns: HashMap::new(),
                 source_table: row.get(4),
                 target_table: row.get(5),
-                rederive_build: row.get(8),
             }
         });
 
@@ -5831,7 +5828,6 @@ pub async fn dependents_of(
             status: pending.status,
             source_table: pending.source_table,
             target_table: pending.target_table,
-            rederive_build: pending.rederive_build,
         });
     }
     Ok(result)
@@ -6096,13 +6092,21 @@ pub(crate) async fn definition_by_id(
     id: i64,
 ) -> Result<Option<Definition>, CatalogError> {
     let client = pool.get().await?;
+    definition_by_id_in(&**client, id).await
+}
+
+/// [`definition_by_id`] on `client`.
+pub(crate) async fn definition_by_id_in(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<Option<Definition>, CatalogError> {
     // `left join lateral jsonb_each_text(...)` — same "decode JSON via SQL, no
     // serde_json dependency" convention `dependents_of` uses, just for one
     // row instead of a batch.
     let rows = client
         .query(
             "select t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value, t.build is not distinct from 'rederive' \
+                    t.target_table, e.key, e.value \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where t.id = $1",
@@ -6118,7 +6122,6 @@ pub(crate) async fn definition_by_id(
     let status_text: String = rows[0].get(2);
     let source_table: String = rows[0].get(3);
     let target_table: String = rows[0].get(4);
-    let rederive_build: bool = rows[0].get(7);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
@@ -6147,7 +6150,6 @@ pub(crate) async fn definition_by_id(
         status,
         source_table,
         target_table,
-        rederive_build,
     }))
 }
 
@@ -6177,7 +6179,7 @@ pub async fn definition_by_target(
     let rows = client
         .query(
             "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value, t.build is not distinct from 'rederive' \
+                    t.target_table, e.key, e.value \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where split_part(t.target_table, '.', 2) = $1",
@@ -6194,7 +6196,6 @@ pub async fn definition_by_target(
     let status_text: String = rows[0].get(3);
     let source_table: String = rows[0].get(4);
     let qualified_target_table: String = rows[0].get(5);
-    let rederive_build: bool = rows[0].get(8);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
@@ -6223,7 +6224,6 @@ pub async fn definition_by_target(
         status,
         source_table,
         target_table: qualified_target_table,
-        rederive_build,
     }))
 }
 

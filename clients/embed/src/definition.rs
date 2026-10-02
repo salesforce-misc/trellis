@@ -230,7 +230,6 @@ mod tests {
             status: TransformStatus::Backfilling,
             source_table: "public.orders".to_string(),
             target_table: "public.order_totals".to_string(),
-            rederive_build: false,
         };
 
         let plain = PlainDefinition::from(&definition);

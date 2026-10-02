@@ -86,8 +86,8 @@ pub enum ChunkQueueError {
     /// `staging::build`).
     Build(Box<crate::staging::ApplyError>),
     /// A claimed row's `kind` and bounds were not one this build knows
-    /// (`backfill_chunks_kind_bounds` rules out a mismatch; `sweep` is
-    /// #625 F3's and never claimed here).
+    /// (`backfill_chunks_kind_bounds` rules out a mismatch), or a Re-derive
+    /// build's row reached the old build's runner.
     UnknownKind { kind: String },
 }
 
@@ -207,6 +207,12 @@ pub enum ChunkWork {
     Plan { cursor: Option<String> },
     /// One `(lo, hi]` range of a Re-derive build (`staging::build::run_chunk`).
     Rederive { lo: Option<String>, hi: String },
+    /// A rebuilt Re-derive build's sweep (#625 F3, `staging::build`): walks
+    /// the target's ledger from `cursor`, the last entry key it has passed
+    /// (`None` before the first), and re-derives every live entry the
+    /// build's chunks didn't. It is claimed only once its build's plan job
+    /// and every chunk are done ([`claim_chunks_of`]).
+    Sweep { cursor: Option<String> },
 }
 
 impl ChunkWork {
@@ -217,6 +223,7 @@ impl ChunkWork {
             ChunkWork::DirectBuild => KIND_DIRECT,
             ChunkWork::Plan { .. } => KIND_PLAN,
             ChunkWork::Rederive { .. } => KIND_REDERIVE,
+            ChunkWork::Sweep { .. } => KIND_SWEEP,
         }
     }
 }
@@ -229,10 +236,12 @@ pub const KIND_DIRECT: &str = "direct";
 pub const KIND_PLAN: &str = "plan";
 /// `backfill_chunks.kind` of a Re-derive build's chunk.
 pub const KIND_REDERIVE: &str = "rederive";
+/// `backfill_chunks.kind` of a rebuild's sweep job (#625 F3).
+pub const KIND_SWEEP: &str = "sweep";
 
-/// The kinds the old builds' path claims ([`claim_chunks`]): a drain worker
-/// runs these before its segments, as it always has. The Re-derive build's
-/// kinds are claimed after them (`staging::build`, #625 B6).
+/// The kinds the old builds' path claims ([`claim_chunks`]). A drain worker
+/// runs these after its segments, as it does the Re-derive build's kinds
+/// (`staging::build`, #625 B6).
 pub const OLD_BUILD_KINDS: [&str; 2] = [KIND_RANGE, KIND_DIRECT];
 
 /// Dispatches a plain (non-relationship) 1-1 definition's build onto the
@@ -563,6 +572,10 @@ pub async fn claim_chunks_of(
             //
             // A chunk whose last run failed waits out its backoff
             // (`next_attempt_at`, #616) before it is handed out again.
+            //
+            // A Re-derive build's sweep (#625 F3) waits for its build's plan
+            // job and every chunk: it re-derives what they didn't, so it
+            // reads their bases. A row held across a resume doesn't hold it.
             "with candidate as ( \
                  select bc.id from backfill_chunks bc \
                  where not bc.done and bc.claimed_by is null and bc.kind = any($4) \
@@ -571,6 +584,13 @@ pub async fn claim_chunks_of(
                        select 1 from transform_definitions d \
                        where d.id = bc.definition_id and d.status = any($3) \
                    ) \
+                   and (bc.kind <> 'sweep' or not exists ( \
+                       select 1 from backfill_chunks o \
+                       join transform_definitions od on od.id = o.definition_id \
+                       where o.definition_id = bc.definition_id \
+                         and o.kind in ('plan', 'rederive') and not o.done \
+                         and o.fuse_rearmed_at is not distinct from od.fuse_rearmed_at \
+                   )) \
                  order by bc.id \
                  for update skip locked \
                  limit $2 \
@@ -592,6 +612,7 @@ pub async fn claim_chunks_of(
                 (KIND_DIRECT, None) => ChunkWork::DirectBuild,
                 (KIND_PLAN, None) => ChunkWork::Plan { cursor: lo },
                 (KIND_REDERIVE, Some(hi)) => ChunkWork::Rederive { lo, hi },
+                (KIND_SWEEP, None) => ChunkWork::Sweep { cursor: lo },
                 (kind, _) => {
                     return Err(ChunkQueueError::UnknownKind {
                         kind: kind.to_string(),
@@ -892,6 +913,23 @@ pub async fn fail_chunk(
             )
             .await?;
             (outcome, attempts, "the re-derive build's plan".to_string())
+        }
+        ChunkWork::Sweep { cursor } => {
+            let (outcome, attempts) = fail_range_chunk(
+                pool,
+                chunk,
+                None,
+                claimed_by,
+                kind,
+                &message,
+                REDERIVE_RETRY_CAP,
+            )
+            .await?;
+            let location = format!(
+                "the re-derive build's sweep after {}",
+                cursor.as_deref().unwrap_or("-infinity")
+            );
+            (outcome, attempts, location)
         }
         ChunkWork::DirectBuild => {
             let (outcome, attempts) =
@@ -1353,7 +1391,7 @@ pub async fn run_claimed_chunk(
         ChunkWork::DirectBuild => run_direct_build(pool, &definition, target_schema, fence).await,
         // A Re-derive build's work runs through `staging::build`, which
         // claims it itself; `claim_chunks` never hands it out.
-        work @ (ChunkWork::Plan { .. } | ChunkWork::Rederive { .. }) => {
+        work @ (ChunkWork::Plan { .. } | ChunkWork::Rederive { .. } | ChunkWork::Sweep { .. }) => {
             Err(ChunkQueueError::UnknownKind {
                 kind: work.kind().to_string(),
             })
