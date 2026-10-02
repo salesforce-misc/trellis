@@ -1173,7 +1173,8 @@ impl Trellis {
     /// trellis
     ///     .await_converged(token, std::time::Duration::from_secs(30))
     ///     .await?;
-    /// // Every target fed by that write is now guaranteed to reflect it.
+    /// // Every `live` target fed by that write is now guaranteed to reflect
+    /// // it; one still building may not yet (see `Trellis::await_converged`).
     /// # Ok(())
     /// # }
     /// ```

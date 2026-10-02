@@ -727,9 +727,9 @@ async fn integer_text_rendering_is_byte_identical_to_postgres() {
 /// `numeric`, so its `SUM` targets stay `numeric` too.
 ///
 /// Run through the public `Trellis` facade against the full live pipeline
-/// (real capture triggers, real ring, real drain workers), with
-/// convergence awaited via `watermark_token`/`await_converged` rather than
-/// slept for. The comparison at the end is a symmetric difference against a
+/// (real capture triggers, real ring, real drain workers). The workload
+/// starts once the target reports `live`, and convergence is awaited via
+/// `watermark_token`/`await_converged` rather than slept for. The comparison at the end is a symmetric difference against a
 /// hand-written `GROUP BY`, per ADR-0013.
 #[tokio::test]
 async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
@@ -770,6 +770,11 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     )
     .await
     .expect("connect running trellis");
+
+    // Wait out the build first (#728): `await_converged` covers a definition
+    // only once it is `live`, and from then on every statement below goes
+    // through Apply, the incremental path this test is about.
+    wait_for_live(&trellis, "t").await;
 
     // A workload that moves rows *between* groups, empties a group, and
     // pushes a running sum well past `int4` — so a delta that silently
@@ -885,4 +890,28 @@ async fn oid_and_the_integer_widths_are_accepted_as_relationship_join_keys() {
         err.to_string().contains("numeric"),
         "the rejection must name the offending type: {err}"
     );
+}
+
+/// Polls `Trellis::status` until `target` reports `live`. `await_converged`
+/// waits for the ring only, never a definition's status, so a token awaited
+/// before `live` can leave a build's own deltas unmerged (#728; ADR-0002,
+/// "What `live` promises").
+async fn wait_for_live(trellis: &Trellis, target: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = trellis
+            .status(target)
+            .await
+            .expect("read status")
+            .expect("the definition is registered")
+            .status;
+        if status == trellis::TransformStatus::Live {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{target} never reported live (last: {status:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
