@@ -755,12 +755,19 @@ async fn dump_mismatches(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str) 
             &format!(
                 "with o as ({oracle}) \
                  select coalesce(t.grp::text, o.grp::text), t.total::text, o.total::text, \
-                        t.n::text, o.n::text \
+                        t.n::text, o.n::text, {extremes} \
                  from o full outer join public.{terminal} t on t.grp::numeric = o.grp::numeric \
                  where {differs} \
                  order by 1 limit 20",
                 oracle = cfg.oracle(),
                 differs = cfg.differs(),
+                // `--min-max` runs' extremes, so a group that differs only in
+                // its `MIN`/`MAX` shows how.
+                extremes = if cfg.min_max {
+                    "format('lo=%s hi=%s', t.lo, t.hi), format('lo=%s hi=%s', o.lo, o.hi)"
+                } else {
+                    "'', ''"
+                },
             ),
             &[],
         )
@@ -768,12 +775,14 @@ async fn dump_mismatches(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str) 
         .expect("list mismatched groups");
     for r in rows {
         eprintln!(
-            "build-under-load: MISMATCH grp={} target total={:?} n={:?} oracle total={:?} n={:?}",
+            "build-under-load: MISMATCH grp={} target total={:?} n={:?} {} oracle total={:?} n={:?} {}",
             r.get::<_, String>(0),
             r.get::<_, Option<String>>(1),
             r.get::<_, Option<String>>(3),
+            r.get::<_, String>(5),
             r.get::<_, Option<String>>(2),
             r.get::<_, Option<String>>(4),
+            r.get::<_, String>(6),
         );
     }
 }

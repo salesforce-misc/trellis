@@ -880,8 +880,20 @@ pub async fn fail_chunk(
         }
         // A Re-derive chunk narrows a data failure to a key as a 1-1 range
         // chunk does (#625 F5, F-A5): its range holds the same keys, and
-        // it leaves a quarantined key out the same way. A transient failure
-        // (the chunk's short entry-lock timeout, mostly) backs off for at
+        // it leaves a quarantined key out the same way.
+        //
+        // "The same keys" holds only while every source is captured, keyed
+        // by a genuine `PRIMARY KEY`: `narrow_one_to_one_chunk` never counts
+        // a key with a `NULL` part (`key_not_null`), and a Re-derive chunk
+        // does re-derive one. A seam-fed source (another aggregate's target,
+        // keyed by its nullable grouping columns) isn't the Re-derive
+        // build's yet (`staging::build::qualifies`); once #625 F6 takes it,
+        // a failing `NULL`-keyed row would narrow to `Empty` (charged, then
+        // paused) or be pinned on an innocent key beside it. F6 must narrow
+        // by the chunk's own key predicate before it widens `qualifies`.
+        //
+        // A transient failure (the chunk's short entry-lock timeout, mostly)
+        // backs off for at
         // most [`REDERIVE_RETRY_CAP`], so a chunk that keeps meeting drain
         // pages isn't left out for minutes.
         ChunkWork::Rederive { lo, hi } => {

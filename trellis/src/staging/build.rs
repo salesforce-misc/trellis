@@ -677,11 +677,13 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     ledger::route(&definition.def, &definition.source_columns)
 }
 
-/// Whether a Re-derive build may take `definition` (#625 F2): a target the
-/// ledger maintains by increments over plain source columns
-/// ([`buildable_shape`]), on a captured source. A source that is another
-/// definition's target is fed by the target-mutation seam, whose writer can
-/// commit after a chunk's snapshot; it needs a fence first (#625 F6).
+/// Whether a Re-derive build may take `definition` (#625 F2, F5): a target
+/// the ledger maintains ([`buildable_shape`]), on a captured source. A
+/// source that is another definition's target is fed by the target-mutation
+/// seam, whose writer can commit after a chunk's snapshot; it needs a fence
+/// first (#625 F6). Taking one also changes what a failing chunk's
+/// narrowing must count: see `defs::chunk_queue::fail_chunk`'s Re-derive
+/// arm.
 pub async fn qualifies(
     client: &impl GenericClient,
     definition: &Definition,

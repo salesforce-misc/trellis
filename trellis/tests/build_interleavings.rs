@@ -863,6 +863,119 @@ async fn a_fresh_builds_later_merges_fold() {
     }
 }
 
+/// A fold over a float `MIN`/`MAX` and the `NULL` group (#625 F5): the
+/// first merge creates each group's row and recomputes it, and the second
+/// only adds entries, so it folds every group, the `NULL` one included.
+/// The fold is exact because `min`/`max` order floats by Postgres's own
+/// order (`NaN` above `Infinity`), the same order a full recompute uses:
+/// `-Infinity` and `NaN` arriving in the second merge replace the stored
+/// extremes, and an `Infinity` arriving after a `NaN` doesn't. The `NULL`
+/// group's delta rows meet their keys by the group columns' own equality
+/// (`NULL` matching `NULL`); a plain `=` would leave its keys out, and the
+/// fold would skip the group as unchanged.
+#[tokio::test]
+async fn a_fold_takes_float_extremes_and_the_null_group() {
+    const DEFINITION: &str = "TRANSFORM agg FROM public.src GROUP BY g \
+         SELECT MIN(f) AS lo, MAX(f) AS hi, COUNT(*) AS n";
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, f float8); \
+         insert into public.src values \
+             (1, null, 1.5), (2, null, 2), (3, 1, 0.5), (4, 1, 'Infinity'), (5, 2, 'NaN'), \
+             (6, null, 'NaN'), (7, null, '-Infinity'), (8, 1, '-Infinity'), (9, 1, 3), \
+             (10, 2, 'Infinity'), (11, 2, -1);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("f", ValueType::Float(trellis::FloatWidth::Float8)),
+        ],
+        &[DEFINITION],
+        &["public.src"],
+    )
+    .await;
+    d.ctl
+        .batch_execute("truncate public.agg__ledger, public.agg__deltas, public.agg")
+        .await
+        .expect("empty what the build writes");
+    let plan = d.build_plan("agg").await;
+    d.chunk(&plan, None, "5").await;
+    let first = d.merge(&plan, 100).await;
+    assert_eq!((first.folded, first.recomputed), (0, 3));
+    d.chunk(&plan, Some("5"), "11").await;
+    let second = d.merge(&plan, 100).await;
+    assert_eq!(
+        (second.folded, second.recomputed),
+        (3, 0),
+        "every group, the NULL one included, only gained entries"
+    );
+    d.settle().await;
+    let actual = d
+        .rows("select g, lo, hi, n from public.agg order by g")
+        .await;
+    assert_eq!(
+        actual,
+        d.rows("select g, min(f), max(f), count(*) from public.src group by g order by g")
+            .await
+    );
+    assert_eq!(
+        actual,
+        [
+            "(1,-Infinity,Infinity,4)",
+            "(2,-1,NaN,3)",
+            "(,-Infinity,NaN,4)"
+        ]
+    );
+}
+
+/// A fold over expression arguments of mixed types (#625 F5): the stored
+/// field (the target column's type) and the entries' aggregate (the
+/// ledger's contribution column's) meet in one `min`/`max`/`bool_or`, whose
+/// result is written back with the value a full recompute would write.
+#[tokio::test]
+async fn a_fold_takes_expression_arguments() {
+    const DEFINITION: &str = "TRANSFORM agg FROM public.src GROUP BY g \
+         SELECT MAX(v + w) AS hi, MIN(w + w) AS lo, BOOL_OR(v > 1) AS any_big, \
+                MIN(i + 1) AS small, COUNT(*) AS n";
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v numeric, w bigint, \
+                                  i integer); \
+         insert into public.src values \
+             (1, 1, 0.5, 7, 3), (2, 2, 1.25, -3, 2147483646), (3, 1, null, null, null), \
+             (4, 1, 2.50, 4000000000000000000, -2147483648), (5, 2, -1, 9, 0), \
+             (6, 1, 1, -4000000000000000000, 5);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("v", ValueType::Numeric),
+            ("w", ValueType::Numeric),
+            ("i", ValueType::Numeric),
+        ],
+        &[DEFINITION],
+        &["public.src"],
+    )
+    .await;
+    d.ctl
+        .batch_execute("truncate public.agg__ledger, public.agg__deltas, public.agg")
+        .await
+        .expect("empty what the build writes");
+    let plan = d.build_plan("agg").await;
+    d.chunk(&plan, None, "3").await;
+    let first = d.merge(&plan, 100).await;
+    assert_eq!((first.folded, first.recomputed), (0, 2));
+    d.chunk(&plan, Some("3"), "6").await;
+    let second = d.merge(&plan, 100).await;
+    assert_eq!((second.folded, second.recomputed), (2, 0));
+    d.settle().await;
+    assert_eq!(
+        d.rows("select g, hi, lo, any_big, small, n from public.agg order by g")
+            .await,
+        d.rows(
+            "select g, max(v + w), min(w + w), bool_or(v > 1), min(i::bigint + 1), count(*) \
+             from public.src group by g order by g"
+        )
+        .await
+    );
+}
+
 /// Expression arguments are rendered to SQL once (`defs::oracle`), and
 /// computed twice: a chunk over the source table, a page over its change's
 /// image cast to the source's row type (#623 D4). The two agree to the text
