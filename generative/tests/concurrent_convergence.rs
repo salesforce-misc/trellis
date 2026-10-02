@@ -1401,8 +1401,25 @@ struct SweepTier {
 /// an older batch for that key. Their hot keys keep changing until the burst
 /// ends, so a later batch nearly always rewrites the key. It was caught once
 /// in about 390 cases (#557 part 3a's PR). The cooling-key tier is the shape
-/// that catches it.
-const HOT_KEY_MISSES: &[&str] = &["stale_one_to_one_write"];
+/// that catches it. The hot-key tier also runs no build over existing data,
+/// so the build plants never fire there ([`NO_BUILD_MISSES`]).
+const HOT_KEY_MISSES: &[&str] = &[
+    "stale_one_to_one_write",
+    "chunk_without_entry_lock",
+    "merge_without_delete",
+];
+
+/// The mid-burst tier runs Re-derive builds under load, but never catches
+/// `chunk_without_entry_lock` (#625 F3): its race needs a page holding an
+/// existing entry's lock between its lock and its write, and the tier almost
+/// never puts a chunk's range under one (0 of 47 cases, fired in 23). The
+/// deterministic `a_chunk_reads_an_entry_only_once_the_page_holding_it_commits`
+/// pins it meanwhile. #720 widens the tier; it must be fixed before release.
+const MID_BURST_MISSES: &[&str] = &["stale_one_to_one_write", "chunk_without_entry_lock"];
+
+/// The cooling-key and hot-key tiers run no build over existing data, so the
+/// build plants never fire there (#720 decides whether they should).
+const NO_BUILD_MISSES: &[&str] = &["chunk_without_entry_lock", "merge_without_delete"];
 
 /// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
 ///
@@ -1418,7 +1435,7 @@ fn sweep_tier() -> SweepTier {
         Err(_) | Ok("cooling_key") => SweepTier {
             name: "cooling_key",
             strategy: cooling_key_case().boxed(),
-            known_misses: &[],
+            known_misses: NO_BUILD_MISSES,
             max_baseline_failure_share: 8,
         },
         Ok("hot_key") => SweepTier {
@@ -1430,7 +1447,7 @@ fn sweep_tier() -> SweepTier {
         Ok("mid_burst") => SweepTier {
             name: "mid_burst",
             strategy: mid_burst_case().boxed(),
-            known_misses: HOT_KEY_MISSES,
+            known_misses: MID_BURST_MISSES,
             max_baseline_failure_share: 20,
         },
         Ok(other) => {
