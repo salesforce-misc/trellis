@@ -608,15 +608,15 @@ fn in_turn(mut partitions: Vec<i16>) -> Vec<i16> {
 /// of the delta table `deltas` (quoted, qualified) without waiting, and
 /// returns whether it got it (#717).
 ///
-/// The key is two `int4`s, `(hashtext(deltas), -1 - partition)`. Its second
-/// key is negative, and Apply's key-order stripes, the other two-key
-/// advisory locks a page takes (`super::apply`, `(hashtext(target),
-/// stripe)`), never are: a stripe is in `[0, KEY_ORDER_STRIPES)`. So a
-/// merger never holds a page's stripe, whatever the hashes. Two targets
-/// whose delta tables' names hash alike share their partitions' locks, which
+/// The key is two `int4`s, `(hashtext(deltas), -1 - partition)`. No other
+/// production code takes a two-key advisory lock (Apply's key-order stripes
+/// went with #623 D6). The only others are the test-only planted bugs'
+/// (`crate::plant`), `(hashtext(target), hashtext(group key))` over a
+/// target's unquoted name, and like this one they never wait. So a key that
+/// two of them share, or two targets whose delta tables' names hash alike,
 /// costs only parallelism: a merger skips a partition it can't lock. The
-/// single-`bigint` locks (the producer's, `super::session`) are another key
-/// space altogether.
+/// single-`bigint` locks (the producer's, `super::session`, and the test
+/// pause points') are another key space altogether.
 async fn try_lock_partition(
     txn: &Transaction<'_>,
     deltas: &str,
