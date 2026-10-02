@@ -165,11 +165,62 @@ async fn seed_sales(raw: &Client) {
     .expect("create and seed sales");
 }
 
+/// `sku_totals` over `sales`, relationship-fed: `weight` reads the to-one
+/// relationship `item` to `skus`, which keeps it on the old direct build
+/// until #625 F9 (every plain aggregate is the Re-derive build's since #625
+/// F5).
+const SKU_TOTALS_RELATED: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku \
+     SELECT sum(amount) AS total, max(item.weight) AS weight";
+
+/// Creates `public.skus`, relates `sales.sku` to it, and registers
+/// [`SKU_TOTALS_RELATED`].
+async fn register_related_sku_totals(dsn: &str) {
+    let trellis = define_only(dsn).await;
+    connect_raw(dsn)
+        .await
+        .batch_execute(
+            "create table public.skus (sku text primary key, weight integer); \
+             insert into public.skus values ('a', 1), ('b', 2)",
+        )
+        .await
+        .expect("create and seed skus");
+    trellis
+        .apply("RELATIONSHIP item FROM sales.sku TO skus.sku")
+        .await
+        .expect("register the relationship");
+    trellis
+        .apply(SKU_TOTALS_RELATED)
+        .await
+        .expect("register the aggregate");
+}
+
+/// The held build is the old direct-build job, not a Re-derive build
+/// (#625 F5): the definition records no `build`, and a `direct` chunk is
+/// building it.
+async fn assert_direct_build(raw: &Client) {
+    let row = raw
+        .query_one(
+            "select d.build is null, \
+                    (select count(*) from backfill_chunks c \
+                     where c.definition_id = d.id and c.kind = 'direct') \
+             from transform_definitions d where d.target_table = 'public.sku_totals'",
+            &[],
+        )
+        .await
+        .expect("read the definition's build");
+    assert!(
+        row.get::<_, bool>(0),
+        "a relationship-fed aggregate takes the old build"
+    );
+    assert_eq!(row.get::<_, i64>(1), 1, "a direct-build job is building it");
+}
+
 /// The issue's repro, end to end: an aggregate's direct build reads
 /// `sales`, a change commits and drains while it is held before its write,
-/// then the build finishes. At `live` the change is folded in (`1000`);
-/// before #476 the target read `7` there. A `MAX`, which still takes the
-/// direct build: a plain `SUM` is the Re-derive build's since #625 F3 (see
+/// then the build finishes. At `live` the change is folded in (`1012`);
+/// before #476 the target read `12` there. The aggregate is relationship-fed
+/// ([`SKU_TOTALS_RELATED`]), which still takes the direct build until #625
+/// F9: every plain aggregate is the Re-derive build's since #625 F5 (see
 /// [`a_rederive_build_applies_while_backfilling_and_is_steady_at_live`]).
 #[tokio::test]
 async fn an_aggregate_build_is_live_only_with_a_change_drained_during_it_folded_in() {
@@ -183,13 +234,10 @@ async fn an_aggregate_build_is_live_only_with_a_change_drained_during_it_folded_
         .await
         .expect("take the hold");
 
-    define_only(db.dsn())
-        .await
-        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total")
-        .await
-        .expect("register the aggregate");
+    register_related_sku_totals(db.dsn()).await;
     let engine = running(db.dsn()).await;
     wait_until_held(&raw, HOLD).await;
+    assert_direct_build(&raw).await;
 
     raw.execute("insert into public.sales values (4, 'a', 1000)", &[])
         .await
@@ -213,7 +261,7 @@ async fn an_aggregate_build_is_live_only_with_a_change_drained_during_it_folded_
         .expect("read sku_totals")
         .get(0);
     assert_eq!(
-        total, "1000",
+        total, "1012",
         "live, and caught up to a token taken after the change"
     );
     engine.shutdown().await.expect("shut down");
@@ -345,8 +393,9 @@ async fn a_ring_build_on_another_definitions_target_is_live_only_once_caught_up(
 /// deleted and its delete drains while the build is held before its write,
 /// so apply skips it and the build then writes the group. The go-live
 /// re-read has no key in that group left to re-derive it from; the orphan
-/// sweep that runs with the flip removes it. At `live` it is gone. A `MAX`,
-/// for the direct build (#625 F3).
+/// sweep that runs with the flip removes it. At `live` it is gone. The
+/// aggregate is relationship-fed ([`SKU_TOTALS_RELATED`]), for the direct
+/// build (until #625 F9).
 #[tokio::test]
 async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
     const HOLD: i64 = 4851;
@@ -362,13 +411,10 @@ async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
         .await
         .expect("take the hold");
 
-    define_only(db.dsn())
-        .await
-        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total")
-        .await
-        .expect("register the aggregate");
+    register_related_sku_totals(db.dsn()).await;
     let engine = running(db.dsn()).await;
     wait_until_held(&raw, HOLD).await;
+    assert_direct_build(&raw).await;
 
     raw.execute("delete from public.sales where id = 4", &[])
         .await
@@ -396,7 +442,7 @@ async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
     assert_eq!(
         totals,
         vec![
-            ("a".to_string(), "7".to_string()),
+            ("a".to_string(), "12".to_string()),
             ("b".to_string(), "2".to_string())
         ],
         "live, and the group the build wrote from a deleted row is gone"

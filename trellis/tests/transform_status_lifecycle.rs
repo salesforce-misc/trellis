@@ -232,7 +232,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
-            // A plain invertible aggregate is the Re-derive build's (#625 F3).
+            // A plain aggregate is the Re-derive build's (#625 F3, F5).
             trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
@@ -975,8 +975,9 @@ async fn resume_transform_reports_not_found_for_an_unregistered_target() {
 
 /// Regression coverage (this issue's items 2/3): with no unsettled marker at
 /// creation time, every background build reaches `live`: a plain 1-1
-/// definition's chunks and a `MAX` aggregate's direct-build job through the
-/// discharge, and a plain `SUM`'s Re-derive build (#625 F3) through its
+/// definition's chunks and a relationship-fed aggregate's direct-build job
+/// (the old build until #625 F9) through the discharge, and a plain `SUM`'s
+/// Re-derive build (#625 F3, every plain aggregate since F5) through its
 /// start, with three stored states and no `catching_up` between them.
 #[tokio::test]
 async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() {
@@ -988,7 +989,9 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
         "create table plain_s (id bigint primary key, a numeric); \
          insert into plain_s (id, a) select g, g from generate_series(1, 10) g; \
          create table agg_s (id bigint primary key, grp bigint, a numeric); \
-         insert into agg_s (id, grp, a) select g, g % 3, g from generate_series(1, 10) g;",
+         insert into agg_s (id, grp, a) select g, g % 3, g from generate_series(1, 10) g; \
+         create table grp_s (id bigint primary key, w numeric); \
+         insert into grp_s (id, w) select g, g * 10 from generate_series(0, 2) g;",
     )
     .await
     .expect("seed source tables");
@@ -1007,11 +1010,16 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 
-    // Direct/set-based path: an aggregate the Re-derive build doesn't take.
+    // Direct/set-based path: an aggregate the Re-derive build doesn't take,
+    // a relationship-fed one (until #625 F9).
+    trellis::defs::create_relationship(&db.pool, "RELATIONSHIP grp_row FROM agg_s.grp TO grp_s.id")
+        .await
+        .expect("create the to-one relationship");
     let agg_cols = numeric(&["grp", "a"]);
     let agg = install_definition(
         &db.pool,
-        "TRANSFORM agg_t FROM agg_s GROUP BY grp SELECT grp AS grp, MAX(a) AS top",
+        "TRANSFORM agg_t FROM agg_s GROUP BY grp \
+         SELECT grp AS grp, MAX(a) AS top, MAX(grp_row.w) AS w",
         &agg_cols,
         "public",
     )
@@ -1021,6 +1029,23 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
         agg.status,
         TransformStatus::WaitingToBackfill,
         "the direct/set-based path registers without building (ADR-0016, #419)"
+    );
+    trellis::intake::markers::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the build");
+    let direct: i64 = raw
+        .query_one(
+            "select count(*) from backfill_chunks c \
+             join transform_definitions d on d.id = c.definition_id \
+             where d.target_table = 'public.agg_t' and c.kind = 'direct' and d.build is null",
+            &[],
+        )
+        .await
+        .expect("count the direct-build jobs")
+        .get(0);
+    assert_eq!(
+        direct, 1,
+        "the discharge dispatched the old direct-build job"
     );
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "agg_t").await, TransformStatus::Live);

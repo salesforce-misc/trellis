@@ -311,7 +311,11 @@ state that orders its writes.
   are recomputed from the ledger's contributions by an index scan on
   `group_key` under the group's lock, never from the source. This is the one
   place a group value is written absolutely, and it is ordered by the same
-  ledger locks as every increment.
+  ledger locks as every increment. A build's merger folds a group it only
+  added entries to instead: each `MIN`/`MAX`/`BOOL_AND`/`BOOL_OR` becomes
+  itself over the stored value and those entries' current contributions,
+  read by key under the same group lock (#625 F5). A group a value may have
+  left, or whose row the merge creates, is recomputed.
 - **Cost to state.** Hot path with the prototype (the existence probe and
   pre-lock still in place): 1–9% at 8 workers on 400 and 4k groups, 19% with
   one worker; WAL 1.6–1.7x from the heap tuple and PK index entry per source

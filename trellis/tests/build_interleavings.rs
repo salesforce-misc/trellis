@@ -35,10 +35,28 @@ enum Flavour {
     Sum,
     /// `AVG` beside a `SUM` sharing its hidden count, and `COUNT(x)`.
     Avg,
+    /// `MIN` and `MAX`, recomputed fields that fold (#625 F5).
+    MinMax,
+    /// `BOOL_AND` and `BOOL_OR` of a generated column, and a `MAX`: the
+    /// other folding fields (#625 F5).
+    Bool,
+    /// A composed field and expression arguments: recomputed from every
+    /// entry of the group, never folded (#625 F5).
+    Composed,
 }
 
 impl Flavour {
+    /// The flavours whose target has a `total` ([`group`]).
     const ALL: [Flavour; 2] = [Flavour::Sum, Flavour::Avg];
+
+    /// Every flavour, the recomputing ones included.
+    const EVERY: [Flavour; 5] = [
+        Flavour::Sum,
+        Flavour::Avg,
+        Flavour::MinMax,
+        Flavour::Bool,
+        Flavour::Composed,
+    ];
 
     fn definition(self) -> &'static str {
         match self {
@@ -49,6 +67,19 @@ impl Flavour {
                 "TRANSFORM agg FROM public.src GROUP BY g \
                  SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n"
             }
+            Flavour::MinMax => {
+                "TRANSFORM agg FROM public.src GROUP BY g \
+                 SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"
+            }
+            Flavour::Bool => {
+                "TRANSFORM agg FROM public.src GROUP BY g \
+                 SELECT BOOL_AND(b) AS all_b, BOOL_OR(b) AS any_b, MAX(v) AS hi, COUNT(*) AS n"
+            }
+            Flavour::Composed => {
+                "TRANSFORM agg FROM public.src GROUP BY g \
+                 SELECT MAX(v) + MIN(v) AS ends, MAX(v + v + 1) AS top, \
+                        SUM(v + 3) AS plus3, COUNT(*) AS n"
+            }
         }
     }
 
@@ -56,6 +87,9 @@ impl Flavour {
         match self {
             Flavour::Sum => "select g, total, n from public.agg order by g",
             Flavour::Avg => "select g, total, mean, nv, n from public.agg order by g",
+            Flavour::MinMax => "select g, lo, hi, n from public.agg order by g",
+            Flavour::Bool => "select g, all_b, any_b, hi, n from public.agg order by g",
+            Flavour::Composed => "select g, ends, top, plus3, n from public.agg order by g",
         }
     }
 
@@ -65,7 +99,43 @@ impl Flavour {
             Flavour::Avg => {
                 "select g, sum(v), avg(v), count(v), count(*) from public.src group by g order by g"
             }
+            Flavour::MinMax => {
+                "select g, min(v), max(v), count(*) from public.src group by g order by g"
+            }
+            Flavour::Bool => {
+                "select g, bool_and(b), bool_or(b), max(v), count(*) \
+                 from public.src group by g order by g"
+            }
+            Flavour::Composed => {
+                "select g, max(v) + min(v), max(v + v + 1), sum(v + 3), count(*) \
+                 from public.src group by g order by g"
+            }
         }
+    }
+
+    /// The source table's DDL: `(id, g, v)`, and for [`Flavour::Bool`] a
+    /// `b` generated from `v`, so every seed and write here stays three
+    /// values.
+    fn create_source(self) -> &'static str {
+        match self {
+            Flavour::Bool => {
+                "create table public.src (id integer primary key, g integer, v numeric, \
+                 b boolean generated always as (v > 3) stored);"
+            }
+            _ => "create table public.src (id integer primary key, g integer, v numeric);",
+        }
+    }
+
+    fn columns(self) -> Vec<(&'static str, ValueType)> {
+        let mut columns = vec![
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("v", ValueType::Numeric),
+        ];
+        if matches!(self, Flavour::Bool) {
+            columns.push(("b", ValueType::Boolean));
+        }
+        columns
     }
 }
 
@@ -76,12 +146,8 @@ impl Flavour {
 /// and the target's build plan.
 async fn start_build_with(flavour: Flavour, seed: &str) -> (Driver, BuildPlan) {
     let d = Driver::start(
-        &format!("create table public.src (id integer primary key, g integer, v numeric); {seed}"),
-        &[
-            ("id", ValueType::Numeric),
-            ("g", ValueType::Numeric),
-            ("v", ValueType::Numeric),
-        ],
+        &format!("{} {seed}", flavour.create_source()),
+        &flavour.columns(),
         &[flavour.definition()],
         &["public.src"],
     )
@@ -198,7 +264,7 @@ impl Op {
 /// - **Chunk first.** The chunk counts the key into the group deltas, and
 ///   the Apply moves it from the entry the chunk wrote.
 async fn chunk_against_apply(op: Op) {
-    for flavour in Flavour::ALL {
+    for flavour in Flavour::EVERY {
         for chunk_first in [true, false] {
             let (mut d, plan) =
                 start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 2, 4)]).await;
@@ -243,7 +309,7 @@ async fn a_chunk_and_an_apply_agree_on_a_delete() {
 /// row, before or after the first run's deltas are merged.
 #[tokio::test]
 async fn a_chunk_run_again_writes_no_deltas() {
-    for flavour in Flavour::ALL {
+    for flavour in Flavour::EVERY {
         let rows = [
             (1, 1, 1),
             (2, 1, 2),
@@ -472,6 +538,434 @@ async fn a_transiently_negative_group_goes_once_merged() {
     }
 }
 
+// ------------------------------------------- recomputed fields (#625 F5)
+
+/// Group `g`'s `lo`, `hi` (as text) and `n` under [`Flavour::MinMax`], or
+/// `None` without a row.
+async fn min_max(d: &Driver, g: i32) -> Option<(Option<String>, Option<String>, i64)> {
+    d.ctl
+        .query_opt(
+            &format!("select lo::text, hi::text, n from public.agg where g = {g}"),
+            &[],
+        )
+        .await
+        .expect("read the group")
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+}
+
+fn mm(lo: i32, hi: i32, n: i64) -> Option<(Option<String>, Option<String>, i64)> {
+    Some((Some(lo.to_string()), Some(hi.to_string()), n))
+}
+
+/// Exp 2 scenario 5's `MIN`/`MAX` variant during a build (#494; #623 D4,
+/// #625 F5). Key 1 is counted into group a by an early chunk and merged.
+/// A chunk over keys 5 (group z) and 6 (group b) is frozen after its
+/// read-and-write. Meanwhile key 1 moves a → z (C1) and then z → b (C2),
+/// and the folded record, a → b, drains while the chunk is still open: the
+/// page writes b from its entries, which can't see the chunk's key 6 yet.
+/// The chunk commits, and the merge folds key 6 into b's stored values and
+/// creates z. Every group ends equal to the oracle: z without key 1, and b
+/// with both keys.
+#[tokio::test]
+async fn exp2_5_min_max_during_a_build() {
+    let flavour = Flavour::MinMax;
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (5, 2, 50), (6, 3, 60)]).await;
+    d.chunk(&plan, None, "1").await;
+    d.merge_all(&plan).await;
+    assert_eq!(min_max(&d, 1).await, mm(10, 10, 1));
+
+    let user = d.user().await;
+    let mut chunk = d
+        .chunk_frozen(
+            &plan,
+            Some("1"),
+            "6",
+            &[(PausePoint::AfterRederiveRead, TARGET)],
+        )
+        .await;
+    chunk.reached(PausePoint::AfterRederiveRead).await;
+    user.batch_execute("update public.src set g = 2 where id = 1")
+        .await
+        .expect("C1");
+    user.batch_execute("update public.src set g = 3 where id = 1")
+        .await
+        .expect("C2");
+    let batch = d.seal().await;
+    d.drain(batch, "page").await;
+    assert_eq!(min_max(&d, 1).await, None, "a is empty");
+    assert_eq!(
+        min_max(&d, 3).await,
+        mm(10, 10, 1),
+        "the page's b sees only key 1: the chunk's key 6 isn't committed"
+    );
+    d.release(&mut chunk, PausePoint::AfterRederiveRead).await;
+    chunk.finish().await;
+
+    let merged = d.merge(&plan, 100).await;
+    assert_eq!(
+        (
+            merged.claimed,
+            merged.written,
+            merged.folded,
+            merged.recomputed
+        ),
+        (2, 2, 1, 1),
+        "b folds key 6 into its row; z is created, so recomputed"
+    );
+    assert_eq!(min_max(&d, 2).await, mm(50, 50, 1), "z without key 1");
+    assert_eq!(min_max(&d, 3).await, mm(10, 60, 2));
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// Deleting a group's current `MIN` and `MAX` forces a real recompute
+/// while a build runs (generative `convergence.rs`'s
+/// `deleting_a_groups_current_min_and_max_forces_a_real_recompute`, #625
+/// F5), through either channel:
+///
+/// - **A page.** The group's extremes, keys 2 (20) and 3 (1), are deleted
+///   by captured writes while a chunk's delta for key 4 (10) is pending: the
+///   page recomputes the group from its entries, key 4's included, and the
+///   merge then folds key 4 in again, which changes nothing.
+/// - **A chunk.** The same deletes, uncaptured, are only seen by a rebuild's
+///   chunk, which retires keys 2 and 3: its delta row says values left the
+///   group, so the merge recomputes it rather than fold.
+#[tokio::test]
+async fn deleting_a_groups_current_min_and_max_recomputes_it_during_a_build() {
+    let flavour = Flavour::MinMax;
+    let rows = [(1, 0, 5), (2, 0, 20), (3, 0, 1), (4, 0, 10)];
+
+    let (mut d, plan) = start_build(flavour, &rows).await;
+    d.chunk(&plan, None, "3").await;
+    d.merge_all(&plan).await;
+    assert_eq!(min_max(&d, 0).await, mm(1, 20, 3));
+    d.chunk(&plan, Some("3"), "4").await;
+    let user = d.user().await;
+    user.batch_execute("delete from public.src where id in (2, 3)")
+        .await
+        .expect("delete the extremes");
+    let batch = d.seal().await;
+    d.drain(batch, "page").await;
+    assert_eq!(
+        min_max(&d, 0).await,
+        mm(5, 10, 1),
+        "the page recomputed the group from its entries, the chunk's key 4 among them"
+    );
+    let merged = d.merge(&plan, 100).await;
+    assert_eq!((merged.folded, merged.recomputed), (1, 0));
+    assert_eq!(min_max(&d, 0).await, mm(5, 10, 2));
+    assert_oracle(&mut d, &plan, flavour).await;
+
+    let (mut d, plan) = start_build(flavour, &rows).await;
+    d.chunk(&plan, None, "4").await;
+    d.merge_all(&plan).await;
+    assert_eq!(min_max(&d, 0).await, mm(1, 20, 4));
+    write_uncaptured(&d, "delete from public.src where id in (2, 3)").await;
+    // The keys are gone from the source, so a chunk of the range leaves
+    // their entries alone: the rebuild's sweep is what retires them.
+    let start_xid: String = d
+        .ctl
+        .query_one("select pg_current_xact_id()::text", &[])
+        .await
+        .expect("a start xid")
+        .get(0);
+    let pool = d.pool().clone();
+    let mut client = pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let swept = build::sweep_batch(&txn, &plan, &start_xid, None, 100)
+        .await
+        .expect("sweep");
+    txn.commit().await.expect("commit the sweep");
+    assert_eq!(swept.rederived, 4);
+    let merged = d.merge(&plan, 100).await;
+    assert_eq!(
+        (merged.claimed, merged.folded, merged.recomputed),
+        (1, 0, 1),
+        "values left the group: recomputed, not folded"
+    );
+    assert_eq!(min_max(&d, 0).await, mm(5, 10, 2));
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// A rebuild's sweep leaves a quarantined key alone, as a chunk does and as
+/// the drain does (#625 F-A5): keys 2 and 3 are deleted past capture, and
+/// key 2 is quarantined. The sweep re-derives keys 1 and 3 and retires key
+/// 3, and key 2's entry stays as it was until `release_key` re-derives it.
+#[tokio::test]
+async fn a_sweep_leaves_a_quarantined_key_alone() {
+    let flavour = Flavour::Sum;
+    let (d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 1, 3)]).await;
+    d.chunk(&plan, None, "3").await;
+    d.merge_all(&plan).await;
+    write_uncaptured(&d, "delete from public.src where id in (2, 3)").await;
+    d.ctl
+        .batch_execute(
+            "insert into poison (src_table, key, last_error) values ('public.src', '2', 'test')",
+        )
+        .await
+        .expect("quarantine key 2");
+    let start_xid: String = d
+        .ctl
+        .query_one("select pg_current_xact_id()::text", &[])
+        .await
+        .expect("a start xid")
+        .get(0);
+    let pool = d.pool().clone();
+    let mut client = pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let swept = build::sweep_batch(&txn, &plan, &start_xid, None, 100)
+        .await
+        .expect("sweep");
+    txn.commit().await.expect("commit the sweep");
+    assert_eq!((swept.scanned, swept.rederived), (3, 2));
+    d.merge_all(&plan).await;
+    assert_eq!(
+        group(&d, 1).await,
+        Some((Some("3".to_string()), 2)),
+        "key 3 retired; quarantined key 2 still counted"
+    );
+}
+
+/// A fold reads the entries' current values, not the values the chunk saw
+/// (#625 F5): a chunk counts key 2 (100) into group 1, whose row already
+/// holds key 1 (5), and a page then updates key 2 to 7 before the merge.
+/// The page recomputes group 1 from its entries (key 2 at 7). The merge's
+/// delta row is add-only, so it folds, reading key 2's entry as it is now:
+/// a fold of the chunk's 100 would leave the group's `MAX` at 100 for good.
+#[tokio::test]
+async fn a_fold_reads_the_entry_a_page_changed_after_its_chunk() {
+    let flavour = Flavour::MinMax;
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 5), (2, 1, 100)]).await;
+    d.chunk(&plan, None, "1").await;
+    d.merge_all(&plan).await;
+    d.chunk(&plan, Some("1"), "2").await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 7 where id = 2")
+        .await
+        .expect("the page's update");
+    let batch = d.seal().await;
+    d.drain(batch, "page").await;
+    assert_eq!(
+        min_max(&d, 1).await,
+        mm(5, 7, 1),
+        "the page's recompute; the chunk's member is still owed"
+    );
+    let merged = d.merge(&plan, 100).await;
+    assert_eq!((merged.folded, merged.recomputed), (1, 0));
+    assert_eq!(min_max(&d, 1).await, mm(5, 7, 2));
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// F1's review note (B5): a page can bring a group's accumulators to 0 while
+/// the group still has live entries, because a delta it is owed is pending.
+/// The row is deleted, and the merge that owes it creates it again: that
+/// row is recomputed from the group's entries, not folded from the delta's
+/// keys, which no longer name a member of the group.
+///
+/// Key K′ (2, v 3) is counted into group 1 by a pending chunk delta. One
+/// page deletes key 3 (group 1's only counted member), inserts key 1 (v 5)
+/// and moves K′ to group 2: group 1's row goes to members 0 and is deleted,
+/// with key 1 live in it. The merge's delta for group 1 names K′ only.
+#[tokio::test]
+async fn a_group_deleted_with_live_entries_is_recomputed_by_the_merge() {
+    // Not `Flavour::Composed`: its `SUM(v + 3)` keeps the row at a sum of 2,
+    // and it recomputes every group anyway.
+    for flavour in [Flavour::MinMax, Flavour::Bool] {
+        let (mut d, plan) = start_build(flavour, &[(2, 1, 3), (3, 1, 1)]).await;
+        d.chunk(&plan, Some("2"), "3").await;
+        d.merge_all(&plan).await;
+        d.chunk(&plan, None, "2").await;
+        let user = d.user().await;
+        user.batch_execute(
+            "begin; \
+             delete from public.src where id = 3; \
+             insert into public.src values (1, 1, 5); \
+             update public.src set g = 2 where id = 2; \
+             commit",
+        )
+        .await
+        .expect("the page's writes");
+        let batch = d.seal().await;
+        d.drain(batch, "page").await;
+        let group_1 = d.rows("select g from public.agg where g = 1").await;
+        assert_eq!(
+            group_1,
+            Vec::<String>::new(),
+            "{flavour:?}: the page deleted group 1 at all zeros, with key 1 live in it"
+        );
+        let merged = d.merge(&plan, 100).await;
+        assert_eq!(
+            (merged.claimed, merged.folded, merged.recomputed),
+            (1, 0, 1),
+            "{flavour:?}"
+        );
+        assert_oracle(&mut d, &plan, flavour).await;
+    }
+}
+
+/// The other channel's B5 case (#625 F5): the merger itself empties a group
+/// whose entries are live. Keys K′ (2) and K (3) are counted into group 1 by
+/// two chunks' pending deltas, and a page moves K′ to group 2, taking group
+/// 1 to -1. Merging K′'s delta alone takes it to 0, and the merger deletes
+/// it with K live in it. Merging K's delta then creates the row again, and
+/// recomputes it.
+#[tokio::test]
+async fn a_group_the_merger_empties_with_live_entries_is_recomputed_when_recreated() {
+    let flavour = Flavour::MinMax;
+    let (mut d, plan) = start_build(flavour, &[(2, 1, 3), (3, 1, 9)]).await;
+    d.chunk(&plan, None, "2").await;
+    d.chunk(&plan, Some("2"), "3").await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set g = 2 where id = 2")
+        .await
+        .expect("move K′");
+    let batch = d.seal().await;
+    d.drain(batch, "page").await;
+    assert_eq!(min_max(&d, 1).await, mm(9, 9, -1));
+    let merged = d.merge(&plan, 1).await;
+    assert_eq!((merged.claimed, merged.deleted), (1, 1));
+    assert_eq!(min_max(&d, 1).await, None);
+    let merged = d.merge(&plan, 1).await;
+    assert_eq!(
+        (merged.claimed, merged.written, merged.recomputed),
+        (1, 1, 1)
+    );
+    assert_eq!(min_max(&d, 1).await, mm(9, 9, 1));
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// A fresh build's merges fold (#625 F5, #698): the first merge of a group
+/// creates its row and recomputes it, and every later one only adds
+/// entries to it, so it folds them without re-reading the group. A float
+/// `SUM` or a composed field doesn't fold, so every merge recomputes.
+#[tokio::test]
+async fn a_fresh_builds_later_merges_fold() {
+    for (flavour, folds) in [
+        (Flavour::MinMax, true),
+        (Flavour::Bool, true),
+        (Flavour::Composed, false),
+    ] {
+        let (mut d, plan) = start_build_with(
+            flavour,
+            "insert into public.src select i, i % 3, i % 11 from generate_series(1, 60) i;",
+        )
+        .await;
+        d.chunk(&plan, None, "30").await;
+        let first = d.merge(&plan, 100).await;
+        assert_eq!((first.folded, first.recomputed), (0, 3), "{flavour:?}");
+        d.chunk(&plan, Some("30"), "60").await;
+        let second = d.merge(&plan, 100).await;
+        assert_eq!(
+            (second.folded, second.recomputed),
+            if folds { (3, 0) } else { (0, 3) },
+            "{flavour:?}"
+        );
+        assert_oracle(&mut d, &plan, flavour).await;
+    }
+}
+
+/// Expression arguments are rendered to SQL once (`defs::oracle`), and
+/// computed twice: a chunk over the source table, a page over its change's
+/// image cast to the source's row type (#623 D4). The two agree to the text
+/// of every contribution (#625 F5): a chunk builds keys 1–8, a page applies
+/// the same rows inserted again as keys 1001–1008, and each pair of entries
+/// holds the same contributions. The values take in `NULL`s, negatives,
+/// scales that differ (`1.50`), a large `bigint` sum and a boolean argument.
+#[tokio::test]
+async fn a_chunk_and_a_page_compute_expression_arguments_alike() {
+    const DEFINITION: &str = "TRANSFORM agg FROM public.src GROUP BY g \
+         SELECT SUM(v + v + 1) AS a, MAX(v + w) AS b, MIN(w + w) AS c, \
+                BOOL_OR(v > 1) AS d, AVG(v + 0.5) AS e, COUNT(w + 1) AS f";
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v numeric, w bigint); \
+         insert into public.src values \
+             (1, 1, 1.50, 7), (2, 1, -2.25, null), (3, 2, null, -5), \
+             (4, 2, 0, 3000000000), (5, 3, 123456789.123456789, 4000000000000000000), \
+             (6, 3, 1, 1), (7, 1, 2.000, -4000000000000000000), (8, 2, -0.5, 0);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("v", ValueType::Numeric),
+            ("w", ValueType::Numeric),
+        ],
+        &[DEFINITION],
+        &["public.src"],
+    )
+    .await;
+    d.ctl
+        .batch_execute("truncate public.agg__ledger, public.agg__deltas, public.agg")
+        .await
+        .expect("empty what the build writes");
+    let plan = d.build_plan("agg").await;
+    let built = d.chunk(&plan, None, "8").await;
+    assert_eq!(built.keys, 8);
+    let user = d.user().await;
+    user.batch_execute(
+        "insert into public.src select id + 1000, g, v, w from public.src where id <= 8",
+    )
+    .await
+    .expect("the twins");
+    let batch = d.seal().await;
+    d.drain(batch, "page").await;
+
+    let args: Vec<String> = d
+        .ctl
+        .query(
+            "select column_name::text from information_schema.columns \
+             where table_schema = 'public' and table_name = 'agg__ledger' \
+               and column_name like '\\_\\_arg%' order by column_name",
+            &[],
+        )
+        .await
+        .expect("the contribution columns")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(args.len(), 6, "{args:?}");
+    let contributions = args
+        .iter()
+        .map(|c| format!("l.{c}::text"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pairs: Vec<(String, String)> = d
+        .ctl
+        .query(
+            &format!(
+                "select array[{contributions}]::text, \
+                        (select array[{contributions}]::text from public.agg__ledger l \
+                         where l.__from_key = ((c.__from_key::int) + 1000)::text) \
+                 from public.agg__ledger c cross join lateral (select c.*) l \
+                 where c.__from_key::int <= 8 order by c.__from_key::int"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the entry pairs")
+        .iter()
+        .map(|row| {
+            (
+                row.get(0),
+                row.get::<_, Option<String>>(1).unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(pairs.len(), 8);
+    for (chunk, page) in &pairs {
+        assert_eq!(chunk, page, "a chunk's contributions against a page's");
+    }
+    d.merge_all(&plan).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select g, a, b, c, d, e, f from public.agg order by g")
+            .await,
+        d.rows(
+            "select g, sum(v + v + 1), max(v + w), min(w + w), bool_or(v > 1), \
+                    avg(v + 0.5), count(w + 1) \
+             from public.src group by g order by g"
+        )
+        .await
+    );
+}
+
 // --------------------------------------------------------------- deadlocks
 
 /// Mergers and pages on the same groups never deadlock: a merger claims
@@ -588,6 +1082,8 @@ async fn a_second_merger_skips_a_target_being_merged() {
             claimed: 0,
             written: 0,
             deleted: 0,
+            folded: 0,
+            recomputed: 0,
             skipped: true,
         }
     );
@@ -777,18 +1273,11 @@ async fn the_one_pass_build_discards_the_pending_deltas() {
 /// its entry is the sweep's (#625 F3), so this leaves deletes out.
 #[tokio::test]
 async fn a_rebuild_over_stale_entries_converges_through_deltas_alone() {
-    for flavour in Flavour::ALL {
+    for flavour in Flavour::EVERY {
         let rows = [(1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 2, 4), (5, 1, 5)];
         let d = Driver::start(
-            &format!(
-                "create table public.src (id integer primary key, g integer, v numeric); {}",
-                seed(&rows)
-            ),
-            &[
-                ("id", ValueType::Numeric),
-                ("g", ValueType::Numeric),
-                ("v", ValueType::Numeric),
-            ],
+            &format!("{} {}", flavour.create_source(), seed(&rows)),
+            &flavour.columns(),
             &[flavour.definition()],
             &["public.src"],
         )
@@ -1070,9 +1559,20 @@ type Range = (Option<String>, String);
 /// that gives up on a key a page holds goes back on the queue.
 #[tokio::test]
 async fn a_build_by_eight_chunk_runners_under_writers_equals_the_oracle() {
+    eight_chunk_runners_under_writers(Flavour::Avg).await;
+}
+
+/// [`a_build_by_eight_chunk_runners_under_writers_equals_the_oracle`] for
+/// `MIN`/`MAX` (#625 F5): every merge folds or recomputes its groups while
+/// pages recompute theirs.
+#[tokio::test]
+async fn a_min_max_build_by_eight_chunk_runners_under_writers_equals_the_oracle() {
+    eight_chunk_runners_under_writers(Flavour::MinMax).await;
+}
+
+async fn eight_chunk_runners_under_writers(flavour: Flavour) {
     const ROWS: i64 = 200_000;
     const CHUNK_ROWS: i64 = 10_000;
-    let flavour = Flavour::Avg;
     let (mut d, plan) = start_build_with(
         flavour,
         &format!(

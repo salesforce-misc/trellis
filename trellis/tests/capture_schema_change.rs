@@ -152,7 +152,7 @@ async fn run_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
-            // A plain invertible aggregate is the Re-derive build's (#625 F3).
+            // A plain aggregate is the Re-derive build's (#625 F3, F5).
             trellis::staging::build::settle_builds(pool).await;
             return;
         }

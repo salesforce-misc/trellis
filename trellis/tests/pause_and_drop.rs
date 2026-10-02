@@ -134,7 +134,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
-            // A plain invertible aggregate is the Re-derive build's (#625 F3).
+            // A plain aggregate is the Re-derive build's (#625 F3, F5).
             trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
@@ -538,14 +538,38 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 6).await;
 
+    raw.batch_execute(
+        "create table grps (id bigint primary key, w numeric); \
+         insert into grps values (0, 10), (1, 11)",
+    )
+    .await
+    .expect("seed the relationship's to-side");
+
     let trellis = define_only(db.dsn()).await;
-    // A `MAX`, so the direct build (not the Re-derive build, #625 F3)
-    // stamps the extinct horizon the drop must take.
+    // Relationship-fed, so the old direct build (not the Re-derive build,
+    // #625 F5) stamps the extinct horizon the drop must take, until #625 F9.
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT max(a) AS total")
+        .apply("RELATIONSHIP grp FROM orders.g TO grps.id")
+        .await
+        .expect("relate");
+    trellis
+        .apply(
+            "TRANSFORM order_rollup FROM orders GROUP BY g \
+             SELECT sum(a) AS total, max(grp.w) AS w",
+        )
         .await
         .expect("define");
     markers::settle_registrations(&db.pool).await;
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from transform_definitions \
+             where split_part(target_table, '.', 2) = 'order_rollup' and build is null"
+        )
+        .await,
+        1,
+        "precondition: the old direct build built it, not a Re-derive build"
+    );
     assert!(
         table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup").await,
         "precondition: the target table exists"
@@ -575,10 +599,10 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
          where target_table = '{DEFAULT_TARGET_SCHEMA}.order_rollup'"
     );
     assert_eq!(count(&raw, &horizons).await, 1, "precondition: a horizon");
-    assert!(
-        table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__deltas").await,
-        "precondition: a ledger-routed target has its group deltas (#625 F1)"
-    );
+    // A relationship-fed target has no group deltas (#625 F1 gives them only
+    // to a ledger-routed one); `rederive_build.rs`'s
+    // `a_drop_during_the_build_takes_its_work_with_it` pins that a drop
+    // takes them.
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -591,10 +615,6 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     assert!(
         !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__ledger").await,
         "the drop takes the target's ledger with it"
-    );
-    assert!(
-        !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__deltas").await,
-        "and its group deltas"
     );
     assert_eq!(
         count(&raw, &horizons).await,

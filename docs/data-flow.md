@@ -74,7 +74,7 @@ counted once.
 
 There is one capture path, and every definition's initial build goes through
 it ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)), except a
-plain invertible aggregate's, which is the Re-derive build
+plain aggregate's, which is the Re-derive build
 ([below](#re-derive-built-definitions), #625). Resumes,
 explicit `request_backfill` calls and go-live catch-ups use it too. Two
 rebuilds of some columns of a `live` transform don't yet: a column resume and an
@@ -236,12 +236,16 @@ drain threads.
 
 ### Re-derive-built definitions
 
-A plain invertible aggregate is built differently (#625,
+A plain aggregate is built differently (#625,
 [ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
-That is a target the ledger maintains by increments alone: every field is
-`SUM` or `AVG` of an exact numeric column or `COUNT`, grouped by plain source
-columns, with no relationship, on a captured source (not another definition's
-target). Its build (`staging::build`) uses no marker, no fence wait, no
+That is a target the ledger maintains: grouped by plain source columns, with
+no relationship, no `MIN`/`MAX` of text and no `json`/`jsonb` argument, on a
+captured source (not another definition's target). Its fields may be kept by
+increments (`SUM` or `AVG` of an exact numeric argument, `COUNT`) or
+recomputed from the group's entries (`MIN`/`MAX`, `BOOL_AND`/`BOOL_OR`, a
+float `SUM`/`AVG`, a composed field like `SUM(a) + COUNT(*)`), and their
+arguments may be expressions (`SUM(v + 1)`), which a chunk computes in SQL over
+the source exactly as Apply does over a change's row. Its build (`staging::build`) uses no marker, no fence wait, no
 direct build and no go-live catch-up:
 
 1. **Start.** Once the reconcile pass finds the definition ready (its source
@@ -263,10 +267,21 @@ direct build and no go-live catch-up:
    entry the chunk wrote.
 4. **Merges.** A drain thread claims delta rows, deletes them and upserts
    their sums into the groups in one transaction, one merger per target at a
-   time.
+   time. A target with recomputed fields gets a delta row for every group an
+   entry moved into or out of, even when the sums net to 0, and the merge
+   then rewrites those fields: a group whose rows only added entries folds
+   their current values into its stored `MIN`/`MAX` or `BOOL_AND`/`BOOL_OR`
+   (reading just those entries); any other group, and any group row the
+   merge creates, is recomputed from all of its entries, as Apply does.
 5. **Live.** The transaction that leaves the plan done, every chunk done
    and the delta table empty moves the definition to `live`, under its row
    lock. There is no `catching_up` in between.
+
+A chunk that fails on its data (an expression that overflows on one row,
+say) is narrowed as a 1-1 build's chunk is: it splits until the key fails
+alone, the key is quarantined as a drain eviction would quarantine it, and
+the chunk runs again without it. Chunks and the sweep leave every
+quarantined key out, as the drain does, until it is released.
 
 Drain threads take this work only after their segments, and claim a chunk
 only while the ring's undrained backlog is small and the next seal has a

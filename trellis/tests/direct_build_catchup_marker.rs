@@ -24,11 +24,11 @@
 //! the late delta arrives (still in the ring, or released from quarantine),
 //! and whether it is on the source or on a relationship's to-side table.
 //!
-//! The source-keyed aggregate here is `sum(amount + 0)`: an expression
-//! argument keeps it on the direct build and its go-live catch-up until
-//! #625 F5, where a plain `sum(amount)` is the Re-derive build's since F3,
-//! with no catch-up and no horizon. A `SUM` still shows a change counted
-//! twice.
+//! The source-keyed aggregate here ([`SKU_TOTALS`]) is relationship-fed: an
+//! extra field reads a to-one relationship's column, which keeps it on the
+//! direct build and its go-live catch-up until #625 F9. Every plain aggregate
+//! is the Re-derive build's since #625 F5, with no catch-up and no horizon.
+//! Its `SUM` still shows a change counted twice.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -48,6 +48,12 @@ const TEST_NAME: &str = "direct_build_catchup_marker_test";
 const WAKE: &str = "direct_build_catchup_marker_wake";
 /// The advisory lock the event trigger blocks the build on.
 const HOLD_LOCK: i64 = 430;
+
+/// The source-keyed aggregate. `weight` reads [`relate_sales_to_skus`]'s
+/// relationship, which keeps the definition on the old direct build until
+/// #625 F9.
+const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku \
+     SELECT sum(amount) AS total, max(item.weight) AS weight";
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -233,6 +239,7 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
         )
         .await
         .expect("create + seed sales");
+    relate_sales_to_skus(&db.pool, &client).await;
     install_build_hold(&client).await;
     client
         .query_one("select pg_advisory_lock($1)", &[&HOLD_LOCK])
@@ -241,7 +248,7 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
+        SKU_TOTALS,
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -287,8 +294,9 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
     );
     assert_eq!(
         pending_markers(&client).await,
-        vec!["public.sales".to_string()],
-        "the build parks a catch-up marker on the source, as the chunked path does"
+        vec!["public.sales".to_string(), "public.skus".to_string()],
+        "the build parks a catch-up marker on the source (and the to-side it \
+         read), as the chunked path does"
     );
 
     discharge_markers(&db.pool, &mut client).await;
@@ -300,8 +308,9 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
     );
 }
 
-/// `public.sales`, seeded with `sku = 'a'` totalling `12`.
-async fn seed_sales(client: &Client) {
+/// `public.sales`, seeded with `sku = 'a'` totalling `12`, related to
+/// `public.skus` ([`relate_sales_to_skus`]).
+async fn seed_sales(pool: &trellis::Pool, client: &Client) {
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
@@ -309,6 +318,22 @@ async fn seed_sales(client: &Client) {
         )
         .await
         .expect("create + seed sales");
+    relate_sales_to_skus(pool, client).await;
+}
+
+/// Creates `public.skus` and the to-one relationship `item` from
+/// `sales.sku` to it, which [`SKU_TOTALS`]'s `weight` reads.
+async fn relate_sales_to_skus(pool: &trellis::Pool, client: &Client) {
+    client
+        .batch_execute(
+            "create table public.skus (sku text primary key, weight integer); \
+             insert into public.skus values ('a', 1), ('b', 2)",
+        )
+        .await
+        .expect("create + seed skus");
+    create_relationship(pool, "RELATIONSHIP item FROM sales.sku TO skus.sku")
+        .await
+        .expect("create the to-one relationship");
 }
 
 /// Registers `sku_totals` over `public.sales` and runs its direct build to
@@ -317,7 +342,7 @@ async fn seed_sales(client: &Client) {
 async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
     let definition = install_definition(
         pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
+        SKU_TOTALS,
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -371,7 +396,7 @@ async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
-    seed_sales(&client).await;
+    seed_sales(&db.pool, &client).await;
     commit_and_stage_insert(
         &mut client,
         "insert into public.sales values (4, 'a', 1000)",
@@ -395,7 +420,7 @@ async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_release
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
-    seed_sales(&client).await;
+    seed_sales(&db.pool, &client).await;
     client
         .batch_execute(
             "insert into public.sales values (4, 'a', 1000); \
@@ -784,9 +809,10 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
         )
         .await
         .expect("create + seed sales");
+    relate_sales_to_skus(&db.pool, &client).await;
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
+        SKU_TOTALS,
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -854,6 +880,11 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
             .expect("claim the first rebuild")
     };
     assert_eq!(superseded.len(), 1);
+    assert_eq!(
+        superseded[0].work,
+        chunk_queue::ChunkWork::DirectBuild,
+        "a relationship-fed aggregate's rebuild is the old direct-build job"
+    );
     let pool = db.pool.clone();
     let job = superseded[0].clone();
     let old_build = tokio::spawn(async move {

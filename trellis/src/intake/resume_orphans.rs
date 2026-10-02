@@ -907,8 +907,10 @@ mod db_tests {
     //! cost one hashed anti-join per target, not a probe of the source per
     //! target row.
     //!
-    //! The aggregates here are `MAX`es: a plain `SUM` is built by the
-    //! Re-derive build since #625 F3, which never reaches this sweep.
+    //! The aggregates here are relationship-fed ([`BY_G`]): every plain
+    //! aggregate is built by the Re-derive build since #625 F5, which never
+    //! reaches this sweep, and a relationship-fed one keeps the old build
+    //! until #625 F9.
 
     use super::*;
     use crate::defs::ValueType;
@@ -933,6 +935,26 @@ mod db_tests {
         .await
         .expect("set search_path");
         (pool, raw)
+    }
+
+    /// `orders_by_g`, relationship-fed: `w` reads [`relate_orders`]'s to-one
+    /// relationship, so it still takes the old build (and reaches this sweep)
+    /// until #625 F9.
+    const BY_G: &str = "TRANSFORM orders_by_g FROM orders GROUP BY g \
+         SELECT max(a) AS total, max(gs.w) AS w";
+
+    /// Creates `public.gs` (keyed by `orders.g`'s text values) and the to-one
+    /// relationship `gs` from `orders.g` to it, which [`BY_G`] reads.
+    async fn relate_orders(pool: &Pool, raw: &tokio_postgres::Client) {
+        raw.batch_execute(
+            "create table public.gs (g text primary key, w numeric); \
+             insert into public.gs values ('a', 1), ('b', 2)",
+        )
+        .await
+        .expect("seed gs");
+        crate::defs::catalog::create_relationship(pool, "RELATIONSHIP gs FROM orders.g TO gs.g")
+            .await
+            .expect("create the to-one relationship");
     }
 
     /// Runs `ids`' sweep on its own: the discharge's read with nothing to
@@ -986,15 +1008,13 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
+        relate_orders(&pool, &raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
             ("a".to_string(), ValueType::Numeric),
         ]);
-        for text in [
-            "TRANSFORM orders_copy FROM orders SELECT a AS a",
-            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT max(a) AS total",
-        ] {
+        for text in ["TRANSFORM orders_copy FROM orders SELECT a AS a", BY_G] {
             crate::defs::catalog::install_definition(&pool, text, &columns, "public")
                 .await
                 .expect("register");
@@ -1015,11 +1035,9 @@ mod db_tests {
         let (catch_all, hashable): (Vec<&str>, Vec<&str>) = planned
             .branches()
             .partition(|sql| sql.contains("is not distinct from"));
-        assert_eq!(
-            hashable.len(),
-            3,
-            "one branch per target, and the ledger target's entry sweep (#623 D3): {hashable:?}"
-        );
+        // A relationship-fed target isn't ledger-routed, so it has no entry
+        // sweep or ledger guard (#623 D3).
+        assert_eq!(hashable.len(), 2, "one branch per target: {hashable:?}");
         assert_eq!(catch_all.len(), 1, "the aggregate's catch-all");
         for sql in hashable {
             let plan: Vec<String> = txn
@@ -1030,13 +1048,8 @@ mod db_tests {
                 .map(|row| row.get(0))
                 .collect();
             let plan = plan.join("\n");
-            // The one nested loop allowed is a ledger target's live-entry
-            // check (#623 D3), which probes the ledger's group index per
-            // group row rather than scanning anything.
-            let nested_ok = !plan.contains("Nested Loop")
-                || (plan.contains("__ledger_g_idx") && plan.matches("Nested Loop").count() == 1);
             assert!(
-                plan.contains("Anti Join") && nested_ok,
+                plan.contains("Anti Join") && !plan.contains("Nested Loop"),
                 "the sweep must plan as a set-based anti-join:\n{plan}"
             );
         }
@@ -1056,15 +1069,11 @@ mod db_tests {
             .into_iter()
             .map(|row| row.get(0))
             .collect();
-        // A ledger target's catch-all (#623 D3) probes its ledger rather than
-        // the source.
-        let source_scans: Vec<&String> = plan
-            .iter()
-            .filter(|l| l.contains(" on orders ") || l.contains(" on orders_by_g__ledger "))
-            .collect();
+        let source_scans: Vec<&String> =
+            plan.iter().filter(|l| l.contains(" on orders ")).collect();
         assert!(
             !source_scans.is_empty() && source_scans.iter().all(|l| l.contains("never executed")),
-            "the catch-all must not scan the source or ledger when no row has a new pattern:\n{}",
+            "the catch-all must not scan the source when no row has a new pattern:\n{}",
             plan.join("\n")
         );
         let swept = sweep(&txn, &ids).await;
@@ -1104,19 +1113,15 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
+        relate_orders(&pool, &raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
             ("a".to_string(), ValueType::Numeric),
         ]);
-        crate::defs::catalog::install_definition(
-            &pool,
-            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT max(a) AS total",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("register");
+        crate::defs::catalog::install_definition(&pool, BY_G, &columns, "public")
+            .await
+            .expect("register");
         crate::intake::markers::settle_builds(&pool).await;
         let ids = catching_up(&raw).await;
         raw.batch_execute("delete from public.orders where g = 'a'")
@@ -1216,19 +1221,15 @@ mod db_tests {
         )
         .await
         .expect("seed orders");
+        relate_orders(&pool, &raw).await;
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("g".to_string(), ValueType::Text),
             ("a".to_string(), ValueType::Numeric),
         ]);
-        crate::defs::catalog::install_definition(
-            &pool,
-            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT max(a) AS total",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("register");
+        crate::defs::catalog::install_definition(&pool, BY_G, &columns, "public")
+            .await
+            .expect("register");
         crate::intake::markers::settle_builds(&pool).await;
         let ids = catching_up(&raw).await;
         raw.batch_execute(

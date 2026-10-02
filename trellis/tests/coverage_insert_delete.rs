@@ -14,8 +14,10 @@
 //! `apply_aggregate.rs` covers the same fold deterministically, without a
 //! build.
 //!
-//! The aggregate is a `MAX`, which still takes the direct build: a plain
-//! `SUM` is the Re-derive build's since #625 F3, which has no horizon.
+//! The aggregate is relationship-fed (an extra field reads a to-one
+//! relationship's column), so it still takes the old build, with its horizon,
+//! until #625 F9: every plain aggregate is the Re-derive build's since #625
+//! F5, which has none.
 //!
 //! The build is held with event triggers on advisory locks the test holds, at
 //! the two `ALTER TABLE`s around the aggregate build's ledger load (#623 D2),
@@ -32,7 +34,7 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, install_definition};
+use trellis::defs::{ValueType, create_relationship, install_definition};
 use trellis::intake::markers;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -164,10 +166,15 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
-             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
+             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2); \
+             create table public.skus (sku text primary key, weight integer); \
+             insert into public.skus values ('a', 1), ('b', 2)",
         )
         .await
-        .expect("create + seed sales");
+        .expect("create + seed sales and skus");
+    create_relationship(pool, "RELATIONSHIP item FROM sales.sku TO skus.sku")
+        .await
+        .expect("create the to-one relationship");
     install_build_holds(client).await;
     for lock in [BEFORE_READ, AFTER_READ] {
         client
@@ -177,7 +184,8 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     }
     install_definition(
         pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku \
+         SELECT max(amount) AS total, max(item.weight) AS weight",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("sku".to_string(), ValueType::Text),
@@ -190,7 +198,29 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     let pool = pool.clone();
     let build = tokio::spawn(async move { markers::settle_registrations(&pool).await });
     wait_for_hold(client, BEFORE_READ).await;
+    assert_old_build(client).await;
     build
+}
+
+/// The build parked at the hold is the old direct build's job, not a
+/// Re-derive build (#625 F5): the definition records no `build`, and its
+/// build is a `direct` chunk.
+async fn assert_old_build(client: &Client) {
+    let row = client
+        .query_one(
+            "select d.build is null, \
+                    (select count(*) from backfill_chunks c \
+                     where c.definition_id = d.id and c.kind = 'direct') \
+             from transform_definitions d",
+            &[],
+        )
+        .await
+        .expect("read the definition's build");
+    assert!(
+        row.get::<_, bool>(0),
+        "a relationship-fed aggregate takes the old build"
+    );
+    assert_eq!(row.get::<_, i64>(1), 1, "its build is a direct-build job");
 }
 
 async fn release(client: &Client, lock: i64) {

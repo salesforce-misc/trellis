@@ -2161,10 +2161,10 @@ mod tests {
 
 #[cfg(test)]
 mod catch_up_tests {
-    //! The rollups that need the old build and its go-live catch-up sum
-    //! `a + 0`: an expression argument keeps them there until #625 F5, where
-    //! a plain `SUM` is the Re-derive build's since F3, which parks no
-    //! marker. The Re-derive build's own interleavings are in
+    //! The rollups that need the old build and its go-live catch-up are
+    //! [`ROLLUP`], relationship-fed: that keeps them there until #625 F9,
+    //! where every plain aggregate is the Re-derive build's since F5, which
+    //! parks no marker. The Re-derive build's own interleavings are in
     //! `tests/build_interleavings.rs` and `tests/rederive_build.rs`.
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3504,6 +3504,29 @@ mod catch_up_tests {
         panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
     }
 
+    /// The rollup of `public.orders` these tests build: `w` reads
+    /// [`relate_orders`]'s to-one relationship, so it still takes the old
+    /// direct build and its go-live catch-up until #625 F9 (every plain
+    /// aggregate is the Re-derive build's since #625 F5). Its `SUM` shows a
+    /// change counted twice.
+    const ROLLUP: &str = "TRANSFORM order_rollup FROM orders GROUP BY g \
+         SELECT sum(a) AS total, max(grp.w) AS w";
+
+    /// Creates `public.grps` and the to-one relationship `grp` from
+    /// `orders.g` to it, which [`ROLLUP`]'s `w` reads.
+    async fn relate_orders(pool: &crate::pool::Pool, client: &tokio_postgres::Client) {
+        client
+            .batch_execute(
+                "create table public.grps (id bigint primary key, w numeric); \
+                 insert into public.grps values (0, 10), (1, 11)",
+            )
+            .await
+            .expect("seed grps");
+        crate::defs::create_relationship(pool, "RELATIONSHIP grp FROM orders.g TO grps.id")
+            .await
+            .expect("create the to-one relationship");
+    }
+
     /// `public.orders` (group `g = 0` holds ids 2, 4, 6 and group 1 holds 1,
     /// 3, 5, with `a = id`) summed by `order_rollup`, built, paused, changed
     /// by `gap`, and resumed, with the resume's marker settled and ready to
@@ -3522,6 +3545,7 @@ mod catch_up_tests {
             )
             .await
             .expect("seed orders");
+        relate_orders(&pool, &client).await;
         let columns = [
             ("id", crate::defs::ValueType::Numeric),
             ("g", crate::defs::ValueType::Numeric),
@@ -3530,14 +3554,9 @@ mod catch_up_tests {
         .into_iter()
         .map(|(name, ty)| (name.to_string(), ty))
         .collect();
-        crate::defs::install_definition(
-            &pool,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("install order_rollup");
+        crate::defs::install_definition(&pool, ROLLUP, &columns, "public")
+            .await
+            .expect("install order_rollup");
         settle_registrations(&pool).await;
         drain_all(&pool, &mut client).await;
         crate::defs::lifecycle::pause_transform(&pool, "order_rollup")
@@ -3625,6 +3644,21 @@ mod catch_up_tests {
             .expect("read status")
             .get(0);
         assert_eq!(status, "backfilling", "the rebuild is a direct-build job");
+        let direct: i64 = discharger
+            .query_one(
+                "select count(*) from backfill_chunks c \
+                 join transform_definitions d on d.id = c.definition_id \
+                 where d.target_table = 'public.order_rollup' and c.kind = 'direct' \
+                   and not c.done",
+                &[],
+            )
+            .await
+            .expect("count direct-build jobs")
+            .get(0);
+        assert_eq!(
+            direct, 1,
+            "the old direct build's job, not a Re-derive build"
+        );
         discharger.batch_execute(race).await.expect("race the job");
         stage_order_cdc(discharger, key, op, old_image, new_image).await;
         settle_registrations(pool).await;
@@ -3786,6 +3820,24 @@ mod catch_up_tests {
         txn.commit().await.expect("commit cdc");
     }
 
+    /// Holds back [`ROLLUP`]'s go-live catch-up on its relationship's to-side
+    /// (`public.grps`), so the discharge a test drives next is
+    /// `public.orders`' alone. That discharge sweeps the rollup as a
+    /// `catching_up` reader of the table either way; it just doesn't flip it
+    /// `live`. Discharging `public.grps` first instead would re-derive every
+    /// group it reaches, the stale ones included.
+    async fn defer_grps_catch_up(client: &tokio_postgres::Client) {
+        let deferred = client
+            .execute(
+                "update pending_backfill set next_attempt_at = now() + interval '1 hour' \
+                 where table_name = 'public.grps'",
+                &[],
+            )
+            .await
+            .expect("defer the to-side's catch-up");
+        assert_eq!(deferred, 1, "the rollup's build parked a catch-up on grps");
+    }
+
     /// Fences `public.orders`' pending marker and waits for the fence to
     /// settle, so the discharge a test runs next takes no fence of its own.
     /// A fresh fence would wait out the test's own lock-holding transaction.
@@ -3908,6 +3960,7 @@ mod catch_up_tests {
             )
             .await
             .expect("seed orders");
+        relate_orders(&pool, &client).await;
         let columns: std::collections::HashMap<String, crate::defs::ValueType> = [
             ("id", crate::defs::ValueType::Numeric),
             ("g", crate::defs::ValueType::Numeric),
@@ -3988,11 +4041,7 @@ mod catch_up_tests {
     async fn a_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) = orders_with_rollup_and_copy(
-            &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
-        )
-        .await;
+        let (pool, mut discharger) = orders_with_rollup_and_copy(&db, ROLLUP).await;
         park_registration_markers(&discharger, &["public.orders".to_string()])
             .await
             .expect("park the registrations' marker");
@@ -4020,6 +4069,7 @@ mod catch_up_tests {
             "the build counted id 3, and its delete was skipped"
         );
 
+        defer_grps_catch_up(&discharger).await;
         settle_orders_marker(&discharger).await;
         let mut writer = connect(&db).await;
         let locker = connect(&db).await;
@@ -4062,7 +4112,7 @@ mod catch_up_tests {
     /// Issue #436 on a resume, #391's reproduction made deterministic. The
     /// rollup is paused at group 1 = 9 (ids 1, 3, 5), and id 3 is deleted
     /// meanwhile. The resume's discharge keeps group 1 (ids 1 and 5 still
-    /// back it; on the ledger it takes id 3 out, leaving 6); they are deleted
+    /// back it); they are deleted
     /// before the rebuild reads, so it writes nothing for group 1 and that
     /// stale row survives it; id 7 lands after
     /// the read. Every one of those changes drains while the rollup is
@@ -4075,11 +4125,7 @@ mod catch_up_tests {
      {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let (pool, mut discharger) = orders_with_rollup_and_copy(
-            &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
-        )
-        .await;
+        let (pool, mut discharger) = orders_with_rollup_and_copy(&db, ROLLUP).await;
         settle_registrations(&pool).await;
         drain_all(&pool, &mut discharger).await;
         for name in ["order_rollup", "order_copy"] {
@@ -4132,15 +4178,17 @@ mod catch_up_tests {
         .await;
         drain_all(&pool, &mut discharger).await;
         finish_builds(&pool, &chunks).await;
-        // The rollup is on the ledger (#623 D3), so the dispatch's sweep
-        // re-derived id 3's entry, which the source no longer backed, and took
-        // it out of group 1: the stale row the rebuild leaves is ids 1 and 5.
+        // The rollup is relationship-fed, so Apply doesn't route it through
+        // the ledger (#623 D3 takes plain aggregates only) and the dispatch's
+        // sweep re-derives no entry of it: the stale row the rebuild leaves is
+        // the pause's, ids 1, 3 and 5.
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "12".to_string()), (1, "6".to_string())],
-            "group 1 still holds its pre-rebuild value"
+            vec![(0, "12".to_string()), (1, "9".to_string())],
+            "group 1 still holds its pre-pause value"
         );
 
+        defer_grps_catch_up(&discharger).await;
         settle_orders_marker(&discharger).await;
         let mut writer = connect(&db).await;
         let locker = connect(&db).await;

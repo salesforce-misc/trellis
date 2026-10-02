@@ -1748,10 +1748,17 @@ async fn registration_reads_no_source_rows() {
 /// ADR-0016 (#419): the direct set-based build of an aggregate and of a
 /// relationship-enriched 1-1 definition runs as a background job the
 /// discharge dispatches, not inside registration. Registering each succeeds
-/// while another session holds the source and the relationship's to-side
-/// `ACCESS EXCLUSIVE`, so registration latency doesn't depend on either
-/// table's size. Both go live, built directly (nothing enumerated into the
-/// ring), once the lock is released and the discharge and a drain worker run.
+/// while another session holds the source and the to-many relationship's
+/// to-side `ACCESS EXCLUSIVE`, so registration latency doesn't depend on
+/// either table's size. Both go live, built directly (nothing enumerated into
+/// the ring), once the lock is released and the discharge and a drain worker
+/// run.
+///
+/// The aggregate is relationship-fed (an extra field reads a to-one
+/// relationship's column), so it still takes the old direct build until
+/// #625 F9: every plain aggregate is the Re-derive build's since #625 F5.
+/// That to-one's to-side (`q`) stays unlocked: registration seeds its
+/// settled parent projection from it (#129), which is no part of the build.
 #[tokio::test]
 async fn registering_a_direct_build_shape_reads_no_source_rows() {
     let cluster = TestCluster::start();
@@ -1761,20 +1768,25 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         .batch_execute(
             "create table s (id bigint primary key, g bigint, a numeric); \
              create table p (id bigint primary key, s_id bigint); \
+             create table q (id bigint primary key, w numeric); \
              insert into s (id, g, a) select i, i % 5, i from generate_series(1, 50) i; \
-             insert into p (id, s_id) select i, i % 10 + 1 from generate_series(1, 30) i",
+             insert into p (id, s_id) select i, i % 10 + 1 from generate_series(1, 30) i; \
+             insert into q (id, w) select i, i * 10 from generate_series(0, 4) i",
         )
         .await
-        .expect("seed source and to-side");
+        .expect("seed source and to-sides");
     create_relationship(&db.pool, "RELATIONSHIP kids FROM s.id TO p.s_id")
         .await
-        .expect("create the relationship");
+        .expect("create the to-many relationship");
+    create_relationship(&db.pool, "RELATIONSHIP grp FROM s.g TO q.id")
+        .await
+        .expect("create the to-one relationship");
 
     let locker = connect_raw(db.dsn()).await;
     locker
         .batch_execute("begin; lock table s, p in access exclusive mode")
         .await
-        .expect("lock the source and the to-side against reads");
+        .expect("lock the source and the to-many's to-side against reads");
 
     let columns: HashMap<String, ValueType> = numeric(&["id", "g", "a"]);
     let register = |text: &'static str| {
@@ -1790,8 +1802,9 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
             .unwrap_or_else(|e| panic!("register {text:?}: {e}"))
         }
     };
-    // A `MAX`: a plain `SUM` is the Re-derive build's since #625 F3.
-    let aggregate = register("TRANSFORM v FROM s GROUP BY g SELECT g AS g, MAX(a) AS total").await;
+    let aggregate =
+        register("TRANSFORM v FROM s GROUP BY g SELECT g AS g, SUM(a) AS total, MAX(grp.w) AS w")
+            .await;
     assert_eq!(aggregate.status, TransformStatus::WaitingToBackfill);
     let enriched = register("TRANSFORM w FROM s SELECT COUNT(kids.id) AS n").await;
     assert_eq!(enriched.status, TransformStatus::WaitingToBackfill);
@@ -1815,6 +1828,17 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
         ["backfilling", "backfilling"],
         "the discharge hands each build to a background job"
     );
+    let direct_jobs: i64 = client
+        .query_one(
+            "select count(*) from backfill_chunks c \
+             join transform_definitions d on d.id = c.definition_id \
+             where c.kind = 'direct' and d.build is null",
+            &[],
+        )
+        .await
+        .expect("count the direct-build jobs")
+        .get(0);
+    assert_eq!(direct_jobs, 2, "each build is an old direct-build job");
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
         0,
@@ -1833,8 +1857,11 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
     assert_eq!(statuses, ["live", "live"]);
     let aggregate_mismatches: i64 = client
         .query_one(
-            "select count(*) from (select g, max(a) as total from s group by g) e \
-             full join v on v.g = e.g where v.total is distinct from e.total",
+            "select count(*) from ( \
+                 select s.g, sum(s.a) as total, max(q.w) as w \
+                 from s left join q on q.id = s.g group by s.g \
+             ) e full join v on v.g = e.g \
+             where v.total is distinct from e.total or v.w is distinct from e.w",
             &[],
         )
         .await

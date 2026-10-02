@@ -178,6 +178,10 @@ pub enum BuildStatement {
     MergeSetup,
     /// The merger's claim, delete, sum and group upsert (one statement).
     MergeUpsert,
+    /// The merger's rewrite of the recomputed fields of the groups it wrote
+    /// (#625 F5): a fold of the entries that entered each, or a recompute
+    /// from all of its entries.
+    MergeRecompute,
     /// The merger's all-zero group delete and the seam.
     MergeFinish,
     /// The merger's commit.
@@ -191,7 +195,7 @@ pub enum BuildStatement {
 
 impl BuildStatement {
     /// Every class, in label order.
-    pub const ALL: [BuildStatement; 11] = [
+    pub const ALL: [BuildStatement; 12] = [
         BuildStatement::ChunkSetup,
         BuildStatement::ChunkKeys,
         BuildStatement::ChunkLock,
@@ -199,6 +203,7 @@ impl BuildStatement {
         BuildStatement::ChunkCommit,
         BuildStatement::MergeSetup,
         BuildStatement::MergeUpsert,
+        BuildStatement::MergeRecompute,
         BuildStatement::MergeFinish,
         BuildStatement::MergeCommit,
         BuildStatement::MergeVacuum,
@@ -215,6 +220,7 @@ impl BuildStatement {
             BuildStatement::ChunkCommit => "chunk_commit",
             BuildStatement::MergeSetup => "merge_setup",
             BuildStatement::MergeUpsert => "merge_upsert",
+            BuildStatement::MergeRecompute => "merge_recompute",
             BuildStatement::MergeFinish => "merge_finish",
             BuildStatement::MergeCommit => "merge_commit",
             BuildStatement::MergeVacuum => "merge_vacuum",

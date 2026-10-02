@@ -732,12 +732,38 @@ async fn a_drop_during_the_build_takes_its_work_with_it() {
 }
 
 /// Two definitions on one source: the one a Re-derive build serves takes
-/// it, the other (a recomputed `MAX`) the old direct build with its go-live
-/// catch-up, and both end equal to their oracles.
+/// it, the other (relationship-fed, which the Re-derive build doesn't take
+/// until #625 F9) the old direct build with its go-live catch-up, and both
+/// end equal to their oracles.
 #[tokio::test]
 async fn two_definitions_on_one_source_take_one_build_path_each() {
-    const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g SELECT MAX(v) AS top";
-    let mut f = Fixture::new(150, &[AGG, MAXES]).await;
+    const MAXES: &str = "TRANSFORM agg_max FROM public.src GROUP BY g \
+         SELECT MAX(v) AS top, MAX(grp.w) AS w";
+    let mut f = Fixture::new(150, &[AGG]).await;
+    f.raw
+        .batch_execute(
+            "create table public.grps (id integer primary key, w integer); \
+             insert into public.grps select i, i * 10 from generate_series(0, 6) i",
+        )
+        .await
+        .expect("seed the relationship's to-side");
+    trellis::defs::create_relationship(&f.db.pool, "RELATIONSHIP grp FROM src.g TO grps.id")
+        .await
+        .expect("create the to-one relationship");
+    let columns = [
+        ("id".to_string(), ValueType::Numeric),
+        ("g".to_string(), ValueType::Numeric),
+        ("v".to_string(), ValueType::Numeric),
+    ]
+    .into_iter()
+    .collect();
+    trellis::defs::install_definition(&f.db.pool, MAXES, &columns, "public")
+        .await
+        .expect("register the relationship-fed definition");
+    // The first pass installs `grps`'s capture, whose gated marker keeps a
+    // definition reading it waiting (`capture::reconcile`'s rule 3) until
+    // that pass's own discharge; the second dispatches it.
+    f.pass().await;
     f.pass().await;
     assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
     assert_eq!(f.build("agg_max").await, None);
@@ -797,10 +823,13 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
     assert_eq!(f.status("agg_max").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
     assert_eq!(
-        f.rows("select (g, top)::text from public.agg_max order by g")
+        f.rows("select (g, top, w)::text from public.agg_max order by g")
             .await,
-        f.rows("select (g, max(v))::text from public.src group by g order by g")
-            .await,
+        f.rows(
+            "select (s.g, max(s.v), max(p.w))::text from public.src s \
+             left join public.grps p on p.id = s.g group by s.g order by s.g"
+        )
+        .await,
         "the old build's target equals its oracle"
     );
 }

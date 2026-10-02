@@ -10,7 +10,8 @@
 //! single-row load at `--write-rate` statements/sec in total (70% `amt`
 //! updates, 15% group moves, 10% inserts above the loaded ids, 5% deletes)
 //! `--pre-define-secs` **before** `GROUP BY grp SELECT SUM(amt) AS total,
-//! COUNT(*) AS n` is defined, and keep it up through the build and for
+//! COUNT(*) AS n` is defined (with `--min-max`, also `MIN(amt) AS lo,
+//! MAX(amt) AS hi`: recomputed fields, #625 F5), and keep it up through the build and for
 //! `--duration-secs` after the definition reads `live`. Once they stop, the
 //! target must equal a from-scratch `GROUP BY` over the source (the SQL
 //! oracle) within `--grace-secs`. That comparison is a full scan, so it only
@@ -115,6 +116,52 @@ pub struct BuildUnderLoad {
     pub oracle_poll_min: Duration,
     /// How often the run prints its RSS progress line (`None`: never).
     pub progress: Option<Duration>,
+    /// `--min-max`: the definition also has `MIN(amt)` and `MAX(amt)`,
+    /// recomputed fields (#625 F5), and the oracle compares them too.
+    pub min_max: bool,
+}
+
+impl BuildUnderLoad {
+    /// The definition's text over `target` and `source`.
+    fn definition(&self) -> String {
+        let extremes = if self.min_max {
+            ", MIN(amt) AS lo, MAX(amt) AS hi"
+        } else {
+            ""
+        };
+        format!(
+            "TRANSFORM {TARGET} FROM public.{SOURCE} GROUP BY grp \
+             SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n{extremes}"
+        )
+    }
+
+    /// The oracle's `GROUP BY` over the source, as `o`'s columns.
+    fn oracle(&self) -> String {
+        let extremes = if self.min_max {
+            ", min(amt) as lo, max(amt) as hi"
+        } else {
+            ""
+        };
+        format!(
+            "select grp, sum(amt) as total, count(*) as n{extremes} \
+             from public.{SOURCE} group by grp"
+        )
+    }
+
+    /// The predicate over target `t` and oracle `o` that a group differs.
+    fn differs(&self) -> &'static str {
+        if self.min_max {
+            "t.grp is null or o.grp is null \
+             or t.total::numeric is distinct from o.total::numeric \
+             or t.n::bigint is distinct from o.n \
+             or t.lo::numeric is distinct from o.lo::numeric \
+             or t.hi::numeric is distinct from o.hi::numeric"
+        } else {
+            "t.grp is null or o.grp is null \
+             or t.total::numeric is distinct from o.total::numeric \
+             or t.n::bigint is distinct from o.n"
+        }
+    }
 }
 
 /// Writer statement kinds, in [`WriterTally::issued`] order.
@@ -329,7 +376,7 @@ impl BuildUnderLoadResult {
             .join(",");
         let w = &self.writes;
         format!(
-            "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"writers\":{},\"write_rate\":{},\
+            "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"min_max\":{},\"writers\":{},\"write_rate\":{},\
              \"application_threads\":{},\"build_chunk_rows\":{},\
              \"load_secs\":{:.3},\"load_rows_per_sec\":{:.0},\
              \"index_secs\":{:.3},\"build_secs\":{:.3},\"chunks\":{},\"first_claim_secs\":{},\
@@ -349,6 +396,7 @@ impl BuildUnderLoadResult {
             scenario,
             self.cfg.rows,
             self.cfg.groups,
+            self.cfg.min_max,
             self.cfg.writers,
             self.cfg.write_rate,
             self.application_threads,
@@ -701,19 +749,18 @@ async fn is_live(raw: &RawClient, terminal: &str) -> bool {
 
 /// On a failed run: up to 20 mismatched groups, target vs oracle (stderr),
 /// so the log carries the shape.
-async fn dump_mismatches(raw: &RawClient, terminal: &str) {
+async fn dump_mismatches(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str) {
     let rows = raw
         .query(
             &format!(
-                "with o as (select grp, sum(amt) as total, count(*) as n \
-                     from public.{SOURCE} group by grp) \
+                "with o as ({oracle}) \
                  select coalesce(t.grp::text, o.grp::text), t.total::text, o.total::text, \
                         t.n::text, o.n::text \
                  from o full outer join public.{terminal} t on t.grp::numeric = o.grp::numeric \
-                 where t.grp is null or o.grp is null \
-                    or t.total::numeric is distinct from o.total::numeric \
-                    or t.n::bigint is distinct from o.n \
-                 order by 1 limit 20"
+                 where {differs} \
+                 order by 1 limit 20",
+                oracle = cfg.oracle(),
+                differs = cfg.differs(),
             ),
             &[],
         )
@@ -774,15 +821,14 @@ async fn dump_pending(raw: &RawClient, token: trellis::PgLsn) {
 
 /// Groups where the target disagrees with a from-scratch `GROUP BY` over the
 /// source, computed entirely on the server.
-async fn mismatched_groups(raw: &RawClient, terminal: &str) -> i64 {
+async fn mismatched_groups(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str) -> i64 {
     raw.query_one(
         &format!(
-            "select count(*) from \
-                 (select grp, sum(amt) as total, count(*) as n from public.{SOURCE} group by grp) o \
+            "select count(*) from ({oracle}) o \
              full outer join public.{terminal} t on t.grp::numeric = o.grp::numeric \
-             where t.grp is null or o.grp is null \
-                or t.total::numeric is distinct from o.total::numeric \
-                or t.n::bigint is distinct from o.n"
+             where {differs}",
+            oracle = cfg.oracle(),
+            differs = cfg.differs(),
         ),
         &[],
     )
@@ -879,10 +925,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     tokio::time::sleep(cfg.pre_define).await;
 
     let columns = numeric_columns(&["id", "grp", "amt"]);
-    let source_text = format!(
-        "TRANSFORM {TARGET} FROM public.{SOURCE} GROUP BY grp \
-         SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n"
-    );
+    let source_text = cfg.definition();
     let xmin_stop = Arc::new(AtomicBool::new(false));
     let xmin_task = tokio::spawn(sample_xmin(connect_raw(db.dsn()).await, xmin_stop.clone()));
     let define_at = Instant::now();
@@ -951,7 +994,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
             }
         };
         if observed >= next_oracle && settled && is_live(&raw, &terminal).await {
-            let m = mismatched_groups(&raw, &terminal).await;
+            let m = mismatched_groups(&raw, &cfg, &terminal).await;
             let took = observed.elapsed();
             oracle_checks += 1;
             oracle_check_secs = Some(took.as_secs_f64());
@@ -984,10 +1027,10 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     // and not counted in oracle_checks.
     let mismatched = match mismatched {
         Some(m) if converged_at.is_some() => m,
-        _ => mismatched_groups(&raw, &terminal).await,
+        _ => mismatched_groups(&raw, &cfg, &terminal).await,
     };
     if mismatched != 0 {
-        dump_mismatches(&raw, &terminal).await;
+        dump_mismatches(&raw, &cfg, &terminal).await;
         dump_pending(&raw, token).await;
     }
 

@@ -36,7 +36,9 @@
 //! A Re-derive build's chunks (`super::build`, #625 F1) rewrite entries with
 //! [`lock_entries`] and [`chunk_statement`] but leave the groups to the
 //! merger ([`merge_statement`]), which upserts their deltas with the same
-//! [`group_upsert_sql`] a page uses.
+//! [`group_upsert_sql`] a page uses, and then rewrites the recomputed fields
+//! of the groups it wrote, folding a group it only added entries to
+//! ([`recompute_written`], #625 F5).
 //!
 //! # One page, one target ([`apply_ledger_target`])
 //!
@@ -126,8 +128,17 @@ enum LedgerField {
     /// `SUM`/`AVG`, a composed field): recomputed from the group's live
     /// member entries after the upsert ([`recompute_statement`]). `sql` is the
     /// field over the ledger's columns ([`schema::over_ledger`]), the
-    /// expression the one-pass build writes it with.
-    Recompute { column: String, sql: String },
+    /// expression the one-pass build writes it with. `fold` is the aggregate
+    /// itself when the field is one `MIN`, `MAX`, `BOOL_AND` or `BOOL_OR`:
+    /// the field over a set of entries is then that aggregate of its value
+    /// over each part, so a merge that only adds entries to a group folds
+    /// theirs into the stored value instead of re-reading the group (#625
+    /// F5, #698).
+    Recompute {
+        column: String,
+        sql: String,
+        fold: Option<&'static str>,
+    },
 }
 
 /// Where a contribution's value comes from in a change's image.
@@ -183,22 +194,23 @@ impl LedgerShape {
         self.contribs.iter().map(|c| c.summed).collect()
     }
 
-    pub(super) fn recomputes(&self) -> bool {
+    /// Whether some field is recomputed from the group's entries
+    /// ([`LedgerField::Recompute`]), which the group deltas then carry what
+    /// the merger's recompute reads for ([`schema::aggregate_deltas_ddl`]).
+    pub(crate) fn recomputes(&self) -> bool {
         self.fields
             .iter()
             .any(|f| matches!(f, LedgerField::Recompute { .. }))
     }
 
-    /// Whether a Re-derive build serves this shape yet (#625 F2): every
-    /// field is maintained by increments (no recompute) over plain source
-    /// columns (no expression argument). #625 F5 widens it to the rest of
-    /// what [`route`] takes.
-    pub(super) fn rederive_buildable(&self) -> bool {
-        !self.recomputes()
-            && self
-                .contribs
-                .iter()
-                .all(|c| matches!(c.source, ContribSource::Column(_)))
+    /// Whether every recomputed field folds ([`LedgerField::Recompute`]'s
+    /// `fold`), so a merge that only adds entries to a group can skip the
+    /// re-read of the group's entries (#625 F5).
+    fn folds(&self) -> bool {
+        self.fields.iter().all(|f| match f {
+            LedgerField::Recompute { fold, .. } => fold.is_some(),
+            _ => true,
+        })
     }
 }
 
@@ -315,6 +327,7 @@ pub(crate) fn route(
                 },
                 _ => LedgerField::Recompute {
                     sql: render_expr_sql(&schema::over_ledger(expr, &contributions, group_by)),
+                    fold: fold_of(expr),
                     column,
                 },
             }
@@ -325,6 +338,27 @@ pub(crate) fn route(
         contribs,
         fields,
     })
+}
+
+/// The aggregate a recomputed field `expr` folds by ([`LedgerField::Recompute`]),
+/// as SQL names it: `expr` is one `MIN`, `MAX`, `BOOL_AND` or `BOOL_OR` of an
+/// argument. Each ignores `NULL`s and is its own combiner (the max of the
+/// maxes of the parts is the max of the whole), and orders by the type's own
+/// btree comparison, `NaN` above every number included.
+fn fold_of(expr: &Expr) -> Option<&'static str> {
+    let Expr::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    match name.as_str() {
+        "MIN" => Some("min"),
+        "MAX" => Some("max"),
+        "BOOL_AND" => Some("bool_and"),
+        "BOOL_OR" => Some("bool_or"),
+        _ => None,
+    }
 }
 
 /// Whether `expr` has a `MIN`/`MAX` over a text argument.
@@ -543,8 +577,17 @@ fn upd_returning(plan: &LedgerTargetPlan) -> String {
 /// increments. `d` has the `GROUP BY` columns, `__gk` (the group's identity
 /// key), `__dm` (members), per argument `i` `__dc<i>` (its non-null count)
 /// and, for a summed one, `__ds<i>` (its sum), and `__ks` (the keys that
-/// moved it). A group whose increments are all 0 is left out.
-fn moves_and_deltas(plan: &LedgerTargetPlan) -> String {
+/// moved it). A group whose increments are all 0 is left out, unless (for a
+/// target with a recomputed field) some entry in it changed at all.
+///
+/// `build` adds what a build chunk's delta row carries for the merger's
+/// recompute when the target has a recomputed field (#625 F5):
+/// [`schema::DELTA_OUT_COLUMN`], whether a changed entry counted in the
+/// group before (a value may have left it), and
+/// [`schema::DELTA_KEYS_COLUMN`], the changed entries that count in it now.
+/// An entry re-derived unchanged moves out and back in with the same values,
+/// and is in neither.
+fn moves_and_deltas(plan: &LedgerTargetPlan, build: bool) -> String {
     let shape = &plan.shape;
     let (groups, args) = entry_columns(shape);
     let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
@@ -559,6 +602,16 @@ fn moves_and_deltas(plan: &LedgerTargetPlan) -> String {
     // shows whichever spelling it picks.
     if shape.recomputes() {
         nonzero.push("bool_or(m.__rc)".to_string());
+        if build {
+            deltas.push(format!(
+                "bool_or(m.__sign < 0 and m.__rc) as {}",
+                schema::DELTA_OUT_COLUMN
+            ));
+            deltas.push(format!(
+                "array_agg(m.__k) filter (where m.__sign > 0 and m.__rc) as {}",
+                schema::DELTA_KEYS_COLUMN
+            ));
+        }
     }
     for (i, a) in args.iter().enumerate() {
         deltas.push(format!(
@@ -613,8 +666,10 @@ fn moves_and_deltas(plan: &LedgerTargetPlan) -> String {
 /// [`moves_and_deltas`] renders it): the `up` CTE, and the query that
 /// returns each written group's identity key, whether the upsert created
 /// it, its `ctid`, `d.__ks`, its prior image for the seam (`null` with no
-/// `image_columns`) and whether every accumulator on it is now 0 (#625 F1's
-/// B5), in that order.
+/// `image_columns`), whether every accumulator on it is now 0 (#625 F1's
+/// B5) and whether its recomputed fields may be folded rather than
+/// recomputed (the `folds` expression over `d`; see
+/// [`recompute_written`]), in that order.
 struct GroupUpsert {
     cte: String,
     select: String,
@@ -626,6 +681,7 @@ fn group_upsert_sql(
     plan: &LedgerTargetPlan,
     image_columns: Option<&[String]>,
     racing: &str,
+    folds: &str,
 ) -> GroupUpsert {
     let shape = &plan.shape;
     let q = |c: &str| quote_ident(c);
@@ -803,7 +859,7 @@ fn group_upsert_sql(
         ),
         select: format!(
             "select up.__trellis_gk, up.__trellis_inserted, up.__trellis_ctid, d.__ks, \
-                    {prior_image}, up.__trellis_empty \
+                    {prior_image}, up.__trellis_empty, {folds} \
              from up join d on {up_d}",
             // Each upserted group back to its increments by the group
             // columns' own equality, not by their text: equal values can
@@ -888,7 +944,7 @@ fn ledger_statement(
     } else {
         ""
     };
-    let upsert = group_upsert_sql(plan, image_columns, racing);
+    let upsert = group_upsert_sql(plan, image_columns, racing, "false");
 
     format!(
         "with b as ( \
@@ -923,7 +979,7 @@ fn ledger_statement(
         set_values = set_values.join(", "),
         predicate = apply_predicate(visibility),
         returning = upd_returning(plan),
-        moves_and_deltas = moves_and_deltas(plan),
+        moves_and_deltas = moves_and_deltas(plan, false),
         up = upsert.cte,
         select = upsert.select,
     )
@@ -1049,6 +1105,10 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
             delta_cols.push(schema::delta_sum_column(i));
         }
     }
+    if shape.recomputes() {
+        delta_cols.push(schema::DELTA_OUT_COLUMN.to_string());
+        delta_cols.push(schema::DELTA_KEYS_COLUMN.to_string());
+    }
     format!(
         "with snap as ( \
              select pg_catalog.pg_current_snapshot() as __snap, \
@@ -1087,7 +1147,7 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
         seg = q(schema::APPLIED_SEG_COLUMN),
         key = q(schema::KEY_COLUMN),
         returning = upd_returning(plan),
-        moves_and_deltas = moves_and_deltas(plan),
+        moves_and_deltas = moves_and_deltas(plan, true),
         deltas = plan.deltas_ident,
         delta_cols = delta_cols.join(", "),
     )
@@ -1133,7 +1193,6 @@ pub(super) fn merge_statement(
             nonzero.push(format!("sum(g.{ds}) <> 0"));
         }
     }
-    let upsert = group_upsert_sql(plan, image_columns, "");
     let claim = format!(
         "{deltas} where ctid = any(array( \
              select ctid from {deltas} order by {seq} limit $1 \
@@ -1146,21 +1205,69 @@ pub(super) fn merge_statement(
     } else {
         format!("delete from {claim} returning *")
     };
+    let g_groups = prefixed(&groups, "g");
+    let g_gk = ddl::pk_key_sql_expr(&plan.identity, Some("g"));
+    // A target with a recomputed field (#625 F5): every group a delta row
+    // names is written, even with its increments netting to 0 (an entry
+    // whose `MAX` value moved from 10 to 50), so that its recompute runs.
+    // `d.__ks` is the keys the rows say entered the group, and `d.__out`
+    // whether a value may have left it; the two decide whether the
+    // recompute folds or re-reads ([`recompute_written`]).
+    let (d, folds) = if shape.recomputes() {
+        let out = quote_ident(schema::DELTA_OUT_COLUMN);
+        let keys = quote_ident(schema::DELTA_KEYS_COLUMN);
+        (
+            format!(
+                "d0 as ( \
+                     select {g_groups}, {g_gk} as __gk, {sums}, bool_or(g.{out}) as __out \
+                     from gone g group by {g_groups} \
+                 ), \
+                 kk as ( \
+                     select {g_groups}, array_agg(k.k) as __ks \
+                     from gone g cross join lateral unnest(g.{keys}) as k(k) \
+                     group by {g_groups} \
+                 ), \
+                 d as ( \
+                     select d0.*, coalesce(kk.__ks, '{{}}'::text[]) as __ks \
+                     from d0 left join kk on {d0_kk} \
+                 ),",
+                sums = sums.join(", "),
+                // As the upsert joins its groups back to `d`: by each
+                // column's own equality, `NULL` matching `NULL`.
+                d0_kk = if groups.is_empty() {
+                    "true".to_string()
+                } else {
+                    groups
+                        .iter()
+                        .map(|c| format!("array[d0.{c}] = array[kk.{c}]"))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                },
+            ),
+            "not d.__out",
+        )
+    } else {
+        (
+            format!(
+                "d as ( \
+                     select {g_groups}, {g_gk} as __gk, {sums}, '{{}}'::text[] as __ks \
+                     from gone g group by {g_groups} \
+                     having {nonzero} \
+                 ),",
+                sums = sums.join(", "),
+                nonzero = nonzero.join(" or "),
+            ),
+            "false",
+        )
+    };
+    let upsert = group_upsert_sql(plan, image_columns, "", folds);
     format!(
         "with gone as ({gone}), \
-         d as ( \
-             select {g_groups}, {g_gk} as __gk, {sums}, '{{}}'::text[] as __ks \
-             from gone g group by {g_groups} \
-             having {nonzero} \
-         ), \
+         {d} \
          {up} \
          select c.__claimed, w.* \
          from (select count(*) as __claimed from gone) c \
          left join ({select}) w on true",
-        g_groups = prefixed(&groups, "g"),
-        g_gk = ddl::pk_key_sql_expr(&plan.identity, Some("g")),
-        sums = sums.join(", "),
-        nonzero = nonzero.join(" or "),
         up = upsert.cte,
         select = upsert.select,
     )
@@ -1194,7 +1301,7 @@ fn recompute_statement(plan: &LedgerTargetPlan) -> Option<String> {
         .fields
         .iter()
         .filter_map(|f| match f {
-            LedgerField::Recompute { column, sql } => Some((quote_ident(column), sql.as_str())),
+            LedgerField::Recompute { column, sql, .. } => Some((quote_ident(column), sql.as_str())),
             _ => None,
         })
         .unzip();
@@ -1250,6 +1357,140 @@ fn recompute_statement(plan: &LedgerTargetPlan) -> Option<String> {
     ))
 }
 
+/// The merger's fold of its add-only groups' recomputed fields (#625 F5,
+/// #698), or `None` if the target has a recomputed field that doesn't fold
+/// ([`LedgerShape::folds`]) or none at all. Binds `$1` a group's `ctid` per
+/// key and `$2` the keys (both `text[]`, pairwise): each group's fields
+/// become their own aggregate over the stored value and the field over
+/// those keys' entries that are live members of the group now.
+///
+/// The entries are read by key, so the statement costs the batch's keys,
+/// not the groups' sizes. It runs after the merge statement, whose upsert
+/// holds each group's row lock, under a snapshot of its own, as
+/// [`recompute_statement`] does: an entry it reads is current, and one
+/// that a later page or chunk changes is that writer's to account for.
+fn fold_statement(plan: &LedgerTargetPlan) -> Option<String> {
+    let shape = &plan.shape;
+    if !shape.recomputes() || !shape.folds() {
+        return None;
+    }
+    let mut columns = Vec::new();
+    let mut exprs = Vec::new();
+    let mut folded = Vec::new();
+    for (i, field) in shape.fields.iter().enumerate() {
+        let LedgerField::Recompute {
+            column,
+            sql,
+            fold: Some(fold),
+        } = field
+        else {
+            continue;
+        };
+        let c = quote_ident(column);
+        exprs.push(format!("{sql} as __f{i}"));
+        folded.push(format!(
+            "(select {fold}(w.v) from (values (t.{c}), (a.__f{i})) as w(v))"
+        ));
+        columns.push(c);
+    }
+    let matched: Vec<String> = shape
+        .group_cols
+        .iter()
+        .map(|c| {
+            let c = quote_ident(c);
+            format!("l.{c} is not distinct from t.{c}")
+        })
+        .chain([format!(
+            "l.{} and not l.{}",
+            quote_ident(schema::MEMBER_COLUMN),
+            quote_ident(schema::TOMBSTONE_COLUMN)
+        )])
+        .collect();
+    Some(format!(
+        "update {target} t set ({columns}) = ( \
+             select {folded} from ( \
+                 select {exprs} from {ledger} l \
+                 where l.{key} = any(x.__keys) and {matched} \
+             ) a \
+         ) \
+         from ( \
+             select u.c::tid as __c, array_agg(u.k) as __keys \
+             from unnest($1::text[], $2::text[]) as u(c, k) group by u.c \
+         ) x \
+         where t.ctid = x.__c",
+        target = plan.target_ident,
+        columns = columns.join(", "),
+        folded = folded.join(", "),
+        exprs = exprs.join(", "),
+        ledger = plan.ledger_ident,
+        key = quote_ident(schema::KEY_COLUMN),
+        matched = matched.join(" and "),
+    ))
+}
+
+/// Rewrites the recomputed fields of the groups a merge statement kept
+/// (#625 F5), between the upsert and [`finish_groups`], as a page does
+/// after its own (see [`apply_ledger_target`]). Returns how many it folded
+/// and how many it recomputed from all of their entries.
+///
+/// A kept group folds ([`fold_statement`]) when every one of its delta rows
+/// only added entries to it (`folds`) and the upsert found its row (not
+/// `inserted`); every other group is recomputed ([`recompute_statement`]):
+///
+/// - A value may have left the group (an entry moved out of it, became a
+///   tombstone, or changed its values inside it), and the stored extreme
+///   may be that value.
+/// - The upsert created the row, so it has no stored value to fold into,
+///   though its group can have live entries all the same: B5 deletes a row
+///   whose accumulators reach 0 while a delta it is owed is pending, and
+///   every entry the deleted row counted is still live (#625 F1's review).
+///
+/// Folding is exact because every write of a group's recomputed fields
+/// leaves them equal to the field over a set of entries that were live in
+/// the group, and every change that takes an entry's value out of the group
+/// is followed by a recompute that sees the change: a page's own, after its
+/// upsert, or the merge of the chunk's delta row that carries `__out`. A
+/// fold reads the entries' current values, never the values a chunk saw: a
+/// page may have changed the entry since, and recomputed the group then.
+pub(super) async fn recompute_written(
+    txn: &Transaction<'_>,
+    plan: &LedgerTargetPlan,
+    groups: &[WrittenGroup],
+) -> Result<(usize, usize), ApplyError> {
+    let Some(recompute) = recompute_statement(plan) else {
+        return Ok((0, 0));
+    };
+    let fold = fold_statement(plan);
+    let mut full: Vec<&str> = Vec::new();
+    let mut fold_ctids: Vec<&str> = Vec::new();
+    let mut fold_keys: Vec<&str> = Vec::new();
+    let mut folded = 0;
+    for group in groups.iter().filter(|g| !g.empty) {
+        if fold.is_none() || group.inserted || !group.folds {
+            full.push(&group.ctid);
+            continue;
+        }
+        // Nothing entered and nothing left: every value is the same.
+        if group.keys.is_empty() {
+            continue;
+        }
+        folded += 1;
+        for key in &group.keys {
+            fold_ctids.push(&group.ctid);
+            fold_keys.push(key);
+        }
+    }
+    if let Some(fold) = &fold
+        && !fold_ctids.is_empty()
+    {
+        txn.execute(fold, &[&fold_ctids, &fold_keys]).await?;
+    }
+    if !full.is_empty() {
+        txn.execute(&recompute, &[&full]).await?;
+    }
+    Ok((folded, full.len()))
+}
+
 /// One group a statement wrote, from [`GroupUpsert`]'s columns.
 pub(super) struct WrittenGroup {
     key: String,
@@ -1260,6 +1501,9 @@ pub(super) struct WrittenGroup {
     /// Every accumulator on the row is 0 (#625 F1's B5): the row is
     /// equivalent to no row, and is deleted.
     empty: bool,
+    /// Its recomputed fields may be folded from `keys` rather than
+    /// recomputed ([`recompute_written`]).
+    folds: bool,
 }
 
 impl WrittenGroup {
@@ -1273,6 +1517,7 @@ impl WrittenGroup {
             keys: row.get(at + 3),
             prior: row.get(at + 4),
             empty: row.get(at + 5),
+            folds: row.get(at + 6),
         })
     }
 }
@@ -1761,22 +2006,23 @@ mod tests {
                 },
             ]
         );
-        let recompute = |column: &str, sql: &str| LedgerField::Recompute {
+        let recompute = |column: &str, sql: &str, fold| LedgerField::Recompute {
             column: column.to_string(),
             sql: sql.to_string(),
+            fold,
         };
         assert_eq!(
             s.fields,
             vec![
-                recompute("lo", r#"min("__arg0")"#),
-                recompute("fs", r#"sum("__arg1")"#),
-                recompute("every", r#"bool_and("__arg2")"#),
+                recompute("lo", r#"min("__arg0")"#, Some("min")),
+                recompute("fs", r#"sum("__arg1")"#, None),
+                recompute("every", r#"bool_and("__arg2")"#, Some("bool_and")),
                 LedgerField::Sum {
                     column: "total".to_string(),
                     count: "__total_count".to_string(),
                     arg: 3
                 },
-                recompute("x", r#"(sum("__arg0") + count(*))"#),
+                recompute("x", r#"(sum("__arg0") + count(*))"#, None),
             ]
         );
     }

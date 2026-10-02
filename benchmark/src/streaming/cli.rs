@@ -103,7 +103,9 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 ///   `--oracle-poll-min-secs` (5) between full-source oracle comparisons after
 ///   a mismatch;
 /// - `--progress-secs` (30; 0 turns it off): how often stderr gets an RSS
-///   progress line.
+///   progress line;
+/// - `--min-max`: the definition also has `MIN(amt)` and `MAX(amt)`,
+///   recomputed fields (#625 F5).
 ///
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
@@ -138,6 +140,7 @@ fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad 
         grace: secs(args, "--grace-secs").unwrap_or(Duration::from_secs(600)),
         oracle_poll_min: secs(args, "--oracle-poll-min-secs").unwrap_or(Duration::from_secs(5)),
         progress: (progress > 0.0).then(|| Duration::from_secs_f64(progress)),
+        min_max: args.iter().any(|a| a == "--min-max"),
     }
 }
 
@@ -1180,6 +1183,11 @@ mod tests {
         assert_eq!(d.grace, Duration::from_secs(600));
         assert_eq!(d.oracle_poll_min, Duration::from_secs(5));
         assert_eq!(d.progress, Some(Duration::from_secs(30)));
+        assert!(!d.min_max);
+        assert!(
+            build_under_load_config(&argv(&["build-under-load", "--min-max"])).min_max,
+            "--min-max adds MIN and MAX fields"
+        );
         let c = build_under_load_config(&argv(&[
             "build-under-load",
             "--rows",

@@ -1944,6 +1944,7 @@ pub(crate) async fn aggregate_target_table_ddl(
             &super::ledger::qualified_deltas_table(target_schema, &def.target),
             &group_columns,
             &shape.summed(),
+            shape.recomputes(),
         ));
     }
     Ok(sql)

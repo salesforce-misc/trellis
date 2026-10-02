@@ -46,7 +46,8 @@
 //! A chunk re-derives every source key in a `(lo, hi]` range of the source's
 //! primary key, in the caller's one transaction:
 //!
-//! 1. read the keys in the range;
+//! 1. read the keys in the range, leaving out the quarantined ones
+//!    (`poison`), as the drain does;
 //! 2. lock their ledger entries as a page does
 //!    ([`super::ledger::lock_entries`]: placeholders for keys with no entry,
 //!    then a sorted `for update`), under the short [`CHUNK_LOCK_TIMEOUT`] so
@@ -114,11 +115,29 @@
 //!
 //! # Shapes
 //!
-//! Only targets [`super::ledger::route`] sends to the ledger with every field
-//! maintained by increments: `SUM`/`AVG` over an exact argument and `COUNT`.
-//! A recomputed field (`MIN`/`MAX` and the rest) needs the merger to
-//! recompute the groups it writes, which is #625 F5. [`BuildPlan::load`]
-//! returns `None` for anything else.
+//! Every target [`super::ledger::route`] sends to the ledger: a plain
+//! aggregate, its fields maintained by increments (`SUM`/`AVG` over an exact
+//! argument, `COUNT`) or recomputed from the group's entries (`MIN`/`MAX`,
+//! `BOOL_AND`/`BOOL_OR`, a float `SUM`/`AVG`, a composed field), its
+//! arguments plain columns or expressions (#625 F5). An expression argument
+//! is the SQL `defs::oracle` renders, which a chunk computes over the source
+//! table and a page over its change's image cast to the source's row type.
+//! A source that is another definition's target waits for #625 F6, and a
+//! relationship-fed aggregate for F9. [`BuildPlan::load`] returns `None` for
+//! anything else.
+//!
+//! **Recomputed fields (F5).** A chunk writes a delta row for every group an
+//! entry it changed moved into or out of, even when the increments net to 0,
+//! with whether a changed entry counted in the group before (`__out`) and
+//! the changed entries that count in it now (`__keys`). The merger writes
+//! every group a row names, and then rewrites the groups' recomputed fields
+//! (`ledger::recompute_written`): a group whose rows only added entries,
+//! and whose row the upsert found, folds those entries' current values into
+//! each `MIN`/`MAX`/`BOOL_AND`/`BOOL_OR`; every other group is recomputed
+//! from all of its entries, as a page does. B5 can delete a group's row
+//! while entries it counted are still live (a page brought its accumulators
+//! to 0 with a delta pending), so a row the merger's upsert creates is
+//! always recomputed.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -238,16 +257,23 @@ pub async fn run_chunk(
     let range_where = crate::defs::backfill::pk_range_where(&pk_idents, pk, &lo);
     let mut params = crate::defs::backfill::range_params(&lo, &hi);
 
-    // 1. The keys in the range.
+    // 1. The keys in the range, but for the quarantined ones (#625 F-A5):
+    // the drain leaves a `poison` key out of every page, and so does the
+    // build, until `release_key` re-derives it.
     let started = Instant::now();
+    let source_param = format!("${}", params.len() + 1);
+    let mut key_params = params.clone();
+    key_params.push(&source_table);
     let keys: Vec<String> = txn
         .query(
             &format!(
-                "select {} from {} s where {range_where}",
-                ddl::pk_key_sql_expr(pk, Some("s")),
+                "select {k} from {} s where {range_where} \
+                 and not exists (select 1 from poison p \
+                                 where p.src_table = {source_param} and p.key = {k})",
                 ddl::qualified_source_table(source_table),
+                k = ddl::pk_key_sql_expr(pk, Some("s")),
             ),
-            &params,
+            &key_params,
         )
         .await?
         .into_iter()
@@ -351,7 +377,8 @@ pub struct SweepOutcome {
 /// them from the first with `None`), and picks the live ones the build
 /// hasn't re-derived: those whose `basis` is null (written by Apply alone)
 /// or is a snapshot taken before the build's start, `start_xid` (the
-/// snapshot's `xmax` is at or before it). Then it locks them as a chunk does
+/// snapshot's `xmax` is at or before it). A quarantined key (`poison`) is
+/// left as it is, as a chunk leaves it (#625 F-A5). Then it locks them as a chunk does
 /// ([`lock_chunk_entries`]) and re-derives them in one statement
 /// ([`ledger::sweep_statement`]), which reads the source by each key: a key
 /// with no row any more (deleted while the definition was frozen) becomes a
@@ -378,6 +405,7 @@ pub async fn sweep_batch(
     } else {
         "where $3::text is null".to_string()
     };
+    let source_table = ledger.source_table();
     let started = Instant::now();
     let row = txn
         .query_one(
@@ -391,10 +419,13 @@ pub async fn sweep_batch(
                  ) \
                  select (select count(*) from w), \
                         (select k from w order by k desc limit 1), \
-                        array(select k from w where stale order by k)",
+                        array(select k from w where stale \
+                                and not exists (select 1 from poison p \
+                                                where p.src_table = $4 and p.key = w.k) \
+                              order by k)",
                 ledger_ident = ledger.ledger_ident(),
             ),
-            &[&start_xid, &scan, &cursor],
+            &[&start_xid, &scan, &cursor, &source_table],
         )
         .await?;
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
@@ -450,6 +481,12 @@ pub struct MergeOutcome {
     pub written: usize,
     /// The groups it emptied and deleted.
     pub deleted: usize,
+    /// The kept groups whose recomputed fields it folded from the entries
+    /// that entered them (#625 F5; `ledger::recompute_written`).
+    pub folded: usize,
+    /// The kept groups whose recomputed fields it recomputed from all of
+    /// their entries.
+    pub recomputed: usize,
     /// Another transaction was merging the target, so this one claimed
     /// nothing and touched nothing (#625 F2b).
     pub skipped: bool,
@@ -533,6 +570,8 @@ pub async fn merge_deltas(
             claimed: 0,
             written: 0,
             deleted: 0,
+            folded: 0,
+            recomputed: 0,
             skipped: true,
         });
     }
@@ -576,6 +615,9 @@ pub async fn merge_deltas(
         .filter_map(|row| WrittenGroup::from_row(row, 1))
         .collect();
     let started = Instant::now();
+    let (folded, recomputed) = ledger::recompute_written(txn, ledger, &groups).await?;
+    metrics::record_build_statement(BuildStatement::MergeRecompute, started.elapsed());
+    let started = Instant::now();
     let (written, deleted) =
         ledger::finish_groups(txn, ledger, groups, &mut mutations, |_| (0, None, None)).await?;
     mutations.flush(txn).await?;
@@ -584,6 +626,8 @@ pub async fn merge_deltas(
         claimed,
         written,
         deleted,
+        folded,
+        recomputed,
         skipped: false,
     })
 }
@@ -631,7 +675,6 @@ const BUILD_REDERIVE: &str = "rederive";
 /// module doc's "Shapes").
 fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     ledger::route(&definition.def, &definition.source_columns)
-        .filter(ledger::LedgerShape::rederive_buildable)
 }
 
 /// Whether a Re-derive build may take `definition` (#625 F2): a target the
@@ -1518,6 +1561,149 @@ pub async fn settle_builds(pool: &Pool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #625 F-A5 for a Re-derive chunk (#616): a plain aggregate's build over
+    /// a source of several chunks, whose `SUM(x + x)` overflows on one row.
+    /// (The grammar has no `/`, so this is the overflow #616's own repro
+    /// uses, not a division by zero: the same class 22 data failure.) The
+    /// failing chunk is on the definition's status and in a warn line, it
+    /// splits until the key fails alone, the key is quarantined, and the
+    /// build goes `live` without it: the chunks and the merges leave it out.
+    #[tokio::test]
+    async fn a_chunk_that_fails_on_its_data_quarantines_the_key_and_the_build_goes_live() {
+        use crate::client::log_capture::install_capture;
+        use crate::defs::ast::ValueType;
+        use crate::integer::IntWidth;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let trellis = crate::app::Trellis::connect(config, crate::app::TrellisOptions::default())
+            .await
+            .expect("connect");
+        let (mut raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public; \
+             create table public.nums (id bigint primary key, g integer, x integer); \
+             insert into public.nums select i, i % 3, i from generate_series(1, 300) i; \
+             update public.nums set x = 2147483647 where id = 150",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("seed the source");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+            ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        let def = crate::defs::install_definition(
+            &pool,
+            "TRANSFORM sums FROM nums GROUP BY g SELECT SUM(x + x) AS doubled, COUNT(*) AS n",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install_definition");
+        crate::client::reconcile_pass(
+            &mut raw,
+            &pool,
+            crate::config::DEFAULT_SCHEMA,
+            "f5_wake",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("start the build");
+        let status = || async {
+            trellis
+                .status("sums")
+                .await
+                .expect("status")
+                .expect("the definition exists")
+        };
+        assert_eq!(status().await.status, TransformStatus::Backfilling);
+
+        let (_guard, captured) = install_capture();
+        let options = WorkerOptions {
+            chunk_rows: 100,
+            drain_batch_cap: 100_000,
+            heartbeat_interval: Duration::from_secs(1),
+            reclaim_ttl: Duration::from_secs(30),
+        };
+        let mut failure = None;
+        for _ in 0..200 {
+            let step = work_once(&pool, "worker", &options)
+                .await
+                .expect("a build step");
+            if failure.is_none() {
+                failure = status().await.backfill_failure;
+            }
+            if !step.progressed() {
+                break;
+            }
+        }
+        let failure = failure.expect("the failing chunk was on the status while it narrowed");
+        assert!(
+            failure.last_error.contains("out of range"),
+            "{}",
+            failure.last_error
+        );
+        assert_eq!(failure.source_table, "public.nums");
+        let status = status().await;
+        assert_eq!(
+            status.status,
+            TransformStatus::Live,
+            "the build finished without the key"
+        );
+        assert_eq!(status.backfill_failure, None, "no chunk is left failing");
+
+        let rows = |sql: &'static str| {
+            let raw = &raw;
+            async move {
+                raw.query(sql, &[])
+                    .await
+                    .expect(sql)
+                    .into_iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            rows("select (g, doubled, n)::text from public.sums order by g").await,
+            rows(
+                "select (g, sum(x + x), count(*))::text from public.nums \
+                 where id <> 150 group by g order by g"
+            )
+            .await,
+            "the target is the source without the quarantined key"
+        );
+        let quarantined = trellis
+            .sample_quarantined("sums", None, 10)
+            .await
+            .expect("sample the quarantined keys");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].key, "150");
+        assert!(quarantined[0].error_message.contains("out of range"));
+
+        let events = captured.0.lock().unwrap().clone();
+        let warned = |message: &str| {
+            events.iter().any(|event| {
+                event.level == tracing::Level::WARN
+                    && event
+                        .fields
+                        .get("message")
+                        .is_some_and(|m| m.contains(message))
+                    && event.fields.get("definition_id") == Some(&def.id.to_string())
+            })
+        };
+        assert!(warned("split it in two"), "{events:#?}");
+        assert!(warned("quarantined the key"), "{events:#?}");
+    }
 
     #[test]
     fn a_process_vacuums_a_target_every_vacuum_every_merged_rows() {

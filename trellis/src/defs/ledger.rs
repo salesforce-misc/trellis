@@ -132,6 +132,16 @@ pub(crate) fn delta_sum_column(i: usize) -> String {
     format!("__ds{i}")
 }
 
+/// A recomputing target's delta row's flag (#625 F5): some entry the chunk
+/// changed counted in the group before it, so a value may have left the
+/// group and the merger recomputes it from all of its entries.
+pub(crate) const DELTA_OUT_COLUMN: &str = "__out";
+
+/// A recomputing target's delta row's keys (#625 F5): the entries the chunk
+/// changed into the group, which an add-only merge folds into the group's
+/// `MIN`/`MAX`-style fields by their current values.
+pub(crate) const DELTA_KEYS_COLUMN: &str = "__keys";
+
 /// A target's ledger, schema-qualified and quoted for SQL text, from the
 /// target's schema and bare name.
 pub(crate) fn qualified_ledger_table(target_schema: &str, target: &str) -> String {
@@ -380,7 +390,9 @@ pub(crate) fn aggregate_ledger_index_ddl(
 /// them into the groups. Rows are only ever appended and claimed. Each is
 /// numbered by an identity, [`DELTA_SEQ_COLUMN`], indexed so the merger's
 /// claim reads the oldest live rows through the index instead of walking
-/// the heap's dead or emptied pages from block 0 (#625 F2b). No primary key:
+/// the heap's dead or emptied pages from block 0 (#625 F2b). A target with a
+/// recomputed field (`recomputes`) also gets [`DELTA_OUT_COLUMN`] and
+/// [`DELTA_KEYS_COLUMN`], what the merger's recompute reads (#625 F5). No primary key:
 /// the claim locks rows by `ctid`. Logged: a delta row records an entry move
 /// that already committed, so losing it on a crash would lose the move for
 /// good.
@@ -388,6 +400,7 @@ pub(crate) fn aggregate_deltas_ddl(
     qualified_deltas: &str,
     group_columns: &[LedgerColumn],
     summed: &[bool],
+    recomputes: bool,
 ) -> String {
     let seq = quote_ident(DELTA_SEQ_COLUMN);
     let mut columns = vec![format!("{seq} bigint generated always as identity")];
@@ -407,6 +420,13 @@ pub(crate) fn aggregate_deltas_ddl(
                 quote_ident(&delta_sum_column(i))
             ));
         }
+    }
+    if recomputes {
+        columns.push(format!(
+            "{} boolean not null",
+            quote_ident(DELTA_OUT_COLUMN)
+        ));
+        columns.push(format!("{} text[]", quote_ident(DELTA_KEYS_COLUMN)));
     }
     format!(
         "; create table {qualified_deltas} ({}); create index on {qualified_deltas} ({seq})",
@@ -615,8 +635,24 @@ mod tests {
                     collation: None,
                 }],
                 &[true, false],
+                false,
             ),
             r#"; create table "public"."t__deltas" ("__seq" bigint generated always as identity, "g" integer, "__dm" bigint not null, "__dc0" bigint not null, "__ds0" numeric not null, "__dc1" bigint not null); create index on "public"."t__deltas" ("__seq")"#
+        );
+        assert_eq!(
+            aggregate_deltas_ddl(
+                r#""public"."t__deltas""#,
+                &[LedgerColumn {
+                    name: "g".to_string(),
+                    pg_type: "integer".to_string(),
+                    collation: None,
+                }],
+                &[false],
+                true,
+            ),
+            r#"; create table "public"."t__deltas" ("__seq" bigint generated always as identity, "g" integer, "__dm" bigint not null, "__dc0" bigint not null, "__out" boolean not null, "__keys" text[]); create index on "public"."t__deltas" ("__seq")"#,
+            "a recomputing target's delta rows say whether a value left the group, and \
+             which keys entered it (#625 F5)"
         );
     }
 }

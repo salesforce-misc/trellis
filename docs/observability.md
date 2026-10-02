@@ -211,7 +211,7 @@ quarantine are two arcs of one lifecycle:
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
 source only once a conservative transaction fence settles (`now.xmin >
-fence`, `trellis/src/intake/markers.rs`), except a plain invertible
+fence`, `trellis/src/intake/markers.rs`), except a plain
 aggregate's Re-derive build: it starts with no fence, and each of its chunks
 reads under its own short snapshot after locking the ledger entries it
 rewrites, so a long transaction elsewhere doesn't hold it, and it holds no
