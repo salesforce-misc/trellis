@@ -233,6 +233,29 @@ impl Fixture {
             .get(0)
     }
 
+    /// Merges every one of `plan`'s delta rows by hand, a committed pass per
+    /// merge partition (#717), until a pass merges nothing.
+    async fn merge_all(&self, plan: &BuildPlan) {
+        loop {
+            let mut client = self.db.pool.get().await.expect("pool");
+            let txn = client.transaction().await.expect("begin");
+            let outcome = build::merge_deltas(&txn, plan, 10_000)
+                .await
+                .expect("merge");
+            txn.commit().await.expect("commit the merge");
+            assert!(!outcome.skipped, "no other merger runs: {outcome:?}");
+            if outcome.claimed == 0 {
+                return;
+            }
+        }
+    }
+
+    /// The merge partitions `agg`'s delta rows are in (#717).
+    async fn partitions(&self) -> i64 {
+        self.count("select count(distinct __part) from public.agg__deltas")
+            .await
+    }
+
     async fn assert_agg_oracle(&self) {
         assert_eq!(
             self.rows(AGG_ACTUAL).await,
@@ -396,6 +419,13 @@ async fn the_flip_happens_only_after_the_last_merge() {
         "no group yet"
     );
 
+    assert!(f.partitions().await > 1, "the deltas span partitions");
+    // A step merges one partition (#717): every merge but the last leaves
+    // deltas in another partition, so the definition stays `backfilling`.
+    while f.partitions().await > 1 {
+        assert_eq!(f.step(&OPTIONS).await, Step::Merged);
+        assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    }
     assert_eq!(f.step(&OPTIONS).await, Step::Merged);
     assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
     assert_eq!(
@@ -406,14 +436,16 @@ async fn the_flip_happens_only_after_the_last_merge() {
     f.assert_agg_oracle().await;
 }
 
-/// The strict flip still waits for a merge in flight (#625 F2b, B7): a
-/// merge that has claimed and deleted the last delta rows but not committed
+/// The strict flip still waits for every merge in flight (#625 F2b, B7,
+/// #717): a merge that has claimed and deleted delta rows but not committed
 /// leaves the table non-empty to everyone else, so neither `try_complete`
-/// nor a worker's step flips the build until it commits. The worker skips
-/// the merge (another holds the target), finds nothing else to do and
-/// reports idle without waiting on it.
+/// nor a worker's step flips the build until the last of them commits. Two
+/// merges are left in flight, on the last two partitions with rows: the
+/// worker skips the merge (others hold every partition with rows), finds
+/// nothing else to do and reports idle without waiting on them, and the
+/// flip comes only once both committed.
 #[tokio::test]
-async fn the_flip_waits_for_a_merge_in_flight() {
+async fn the_flip_waits_for_every_merge_in_flight() {
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     let pool = &f.db.pool;
@@ -423,39 +455,62 @@ async fn the_flip_waits_for_a_merge_in_flight() {
         .await
         .expect("load the plan")
         .expect("a buildable target");
+    while f.partitions().await > 2 {
+        let mut client = pool.get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        build::merge_deltas(&txn, &plan, i64::MAX)
+            .await
+            .expect("merge a partition");
+        txn.commit().await.expect("commit the merge");
+    }
+    assert_eq!(f.partitions().await, 2);
 
-    let mut client = pool.get().await.expect("pool");
-    let merge = client.transaction().await.expect("begin the merge");
-    let outcome = build::merge_deltas(&merge, &plan, i64::MAX)
+    let mut client_a = pool.get().await.expect("pool");
+    let merge_a = client_a.transaction().await.expect("begin merge A");
+    let a = build::merge_deltas(&merge_a, &plan, i64::MAX)
         .await
-        .expect("merge every delta row");
-    assert!(outcome.claimed > 0 && !outcome.skipped, "{outcome:?}");
+        .expect("merge A");
+    let mut client_b = pool.get().await.expect("pool");
+    let merge_b = client_b.transaction().await.expect("begin merge B");
+    let b = build::merge_deltas(&merge_b, &plan, i64::MAX)
+        .await
+        .expect("merge B");
+    assert!(a.claimed > 0 && b.claimed > 0, "{a:?} {b:?}");
+    assert_ne!(
+        a.partition, b.partition,
+        "B takes the partition A doesn't hold"
+    );
 
     assert!(
         !build::try_complete(pool, id).await.expect("try_complete"),
-        "not live while the last merge is uncommitted"
+        "not live while both merges are uncommitted"
     );
     assert_eq!(
         f.step(&OPTIONS).await,
         Step::Idle,
-        "a worker skips the busy target, and has nothing else to do"
+        "a worker skips the busy partitions, and has nothing else to do"
+    );
+    merge_a.commit().await.expect("commit merge A");
+    assert!(
+        !build::try_complete(pool, id).await.expect("try_complete"),
+        "not live while B is uncommitted"
     );
     assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
 
-    merge.commit().await.expect("commit the merge");
+    merge_b.commit().await.expect("commit merge B");
     assert!(
         build::try_complete(pool, id).await.expect("try_complete"),
-        "the flip once the merge committed"
+        "the flip once both merges committed"
     );
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
 }
 
-/// A worker that finds its target's merger busy takes a chunk instead of
-/// waiting for the merge or reporting idle (#625 F2b): one merger per
-/// target, and the rest of the workers build.
+/// A worker that finds every partition with rows being merged takes a chunk
+/// instead of waiting for a merge or reporting idle (#625 F2b, #717): one
+/// merger per partition, and the rest of the workers build.
 #[tokio::test]
-async fn a_worker_takes_a_chunk_while_another_merges() {
+async fn a_worker_takes_a_chunk_while_others_merge() {
     let mut f = Fixture::new(60, &[AGG]).await;
     f.pass().await;
     let pool = &f.db.pool;
@@ -466,28 +521,42 @@ async fn a_worker_takes_a_chunk_while_another_merges() {
         .await
         .expect("load the plan")
         .expect("a buildable target");
-    let mut client = pool.get().await.expect("pool");
-    let merge = client.transaction().await.expect("begin the merge");
-    // One row: its group's other row is left for a second merger, which
-    // would wait on this merge's group row if it took it.
-    assert_eq!(
-        build::merge_deltas(&merge, &plan, 1)
-            .await
-            .expect("merge")
-            .claimed,
-        1
-    );
+    // A merge in flight on every partition, of one row each: its group's
+    // other row is left for a second merger of the partition, which would
+    // wait on this merge's group row if it took it.
+    let partitions = usize::try_from(f.partitions().await).expect("a count");
+    let mut clients = Vec::new();
+    for _ in 0..=partitions {
+        clients.push(pool.get().await.expect("pool"));
+    }
+    let mut merges = Vec::new();
+    for client in &mut clients {
+        merges.push(client.transaction().await.expect("begin a merge"));
+    }
+    for (i, merge) in merges.iter().enumerate() {
+        let outcome = build::merge_deltas(merge, &plan, 1).await.expect("merge");
+        if i < partitions {
+            assert_eq!(
+                (outcome.claimed, outcome.skipped),
+                (1, false),
+                "{outcome:?}"
+            );
+        } else {
+            assert!(
+                outcome.skipped,
+                "every partition is being merged: {outcome:?}"
+            );
+        }
+    }
 
     let step = tokio::time::timeout(Duration::from_secs(30), f.step(&OPTIONS))
         .await
-        .expect("the step doesn't wait on the merge in flight");
+        .expect("the step doesn't wait on the merges in flight");
     assert_eq!(step, Step::Chunk);
-    assert!(
-        f.count("select count(*) from public.agg__deltas").await > 0,
-        "the chunk appended deltas the busy merger can't take"
-    );
-    merge.commit().await.expect("commit the merge");
-    drop(client);
+    for merge in merges {
+        merge.commit().await.expect("commit a merge");
+    }
+    drop(clients);
 
     let (steps, _) = f.run("agg").await;
     assert!(steps.contains(&Step::Merged), "{steps:?}");
@@ -876,14 +945,7 @@ async fn a_flip_missed_by_a_dead_worker_is_made_by_the_next_idle_step() {
         .expect("mark the chunk done");
         txn.commit().await.expect("commit the chunk");
     }
-    {
-        let mut client = pool.get().await.expect("pool");
-        let txn = client.transaction().await.expect("begin");
-        build::merge_deltas(&txn, &plan, 10_000)
-            .await
-            .expect("merge");
-        txn.commit().await.expect("commit the merge");
-    }
+    f.merge_all(&plan).await;
     assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
     assert_eq!(
         f.status("agg").await.as_deref(),
@@ -1165,14 +1227,7 @@ async fn a_sweep_batch_rederives_stale_live_entries_in_bounded_windows() {
         "a re-derived entry's basis is past the start, and a tombstone isn't live"
     );
 
-    {
-        let mut client = pool.get().await.expect("pool");
-        let txn = client.transaction().await.expect("begin");
-        build::merge_deltas(&txn, &plan, 10_000)
-            .await
-            .expect("merge");
-        txn.commit().await.expect("commit the merge");
-    }
+    f.merge_all(&plan).await;
     // The deletes' captured changes are visible in the sweep's bases, so
     // they drain to nothing.
     f.drain().await;
@@ -1328,14 +1383,7 @@ async fn a_rebuild_sweeps_a_composite_typed_key() {
         30,
         "the sweep found every live key's row"
     );
-    {
-        let mut client = pool.get().await.expect("pool");
-        let txn = client.transaction().await.expect("begin");
-        build::merge_deltas(&txn, &plan, 10_000)
-            .await
-            .expect("merge");
-        txn.commit().await.expect("commit the merge");
-    }
+    f.merge_all(&plan).await;
     assert_eq!(f.rows(actual).await, f.rows(expected).await);
 }
 

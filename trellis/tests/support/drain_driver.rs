@@ -351,16 +351,19 @@ impl Driver {
         }
     }
 
-    /// Merges until no delta row is left, returning the rows merged.
+    /// Merges until no delta row is left, returning the rows merged. A pass
+    /// merges one partition (#717), so it stops at the first pass that
+    /// merges nothing.
     pub async fn merge_all(&self, plan: &BuildPlan) -> i64 {
         const LIMIT: i64 = 5_000;
         let mut merged = 0;
         loop {
             let outcome = self.merge(plan, LIMIT).await;
-            merged += outcome.claimed;
-            if outcome.claimed < LIMIT {
+            assert!(!outcome.skipped, "no other merger runs: {outcome:?}");
+            if outcome.claimed == 0 {
                 return merged;
             }
+            merged += outcome.claimed;
         }
     }
 

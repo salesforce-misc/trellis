@@ -266,8 +266,10 @@ direct build and no go-live catch-up:
    saw is skipped when it drains, and one it didn't see applies over the
    entry the chunk wrote.
 4. **Merges.** A drain thread claims delta rows, deletes them and upserts
-   their sums into the groups in one transaction, one merger per target at a
-   time. A target with recomputed fields gets a delta row for every group an
+   their sums into the groups in one transaction. Each delta row carries its
+   group's merge partition, a hash of the group, so several drain threads
+   merge one target at once, one per partition, and never write the same
+   group row. A target with recomputed fields gets a delta row for every group an
    entry moved into or out of, even when the sums net to 0, and the merge
    then rewrites those fields: a group whose rows only added entries folds
    their current values into its stored `MIN`/`MAX` or `BOOL_AND`/`BOOL_OR`

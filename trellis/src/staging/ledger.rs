@@ -1154,9 +1154,10 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
 }
 
 /// The merger's one statement (#625 F1; called from [`super::build`]):
-/// claims up to `$1` of the target's delta rows that no other merger holds,
-/// oldest first through the claim key's index (F2b), deletes them, sums them
-/// per group and upserts the sums in group order, as Apply's statement does.
+/// claims up to `$1` of the target's delta rows in merge partition `$2`
+/// (`smallint`, #717) that no other merger holds, oldest first through the
+/// claim key's index (F2b), deletes them, sums them per group and upserts
+/// the sums in group order, as Apply's statement does.
 /// Returns one row per written group, each [`GroupUpsert`]'s columns after
 /// the count of rows claimed, or one row with only that count when no group
 /// was written.
@@ -1195,9 +1196,10 @@ pub(super) fn merge_statement(
     }
     let claim = format!(
         "{deltas} where ctid = any(array( \
-             select ctid from {deltas} order by {seq} limit $1 \
+             select ctid from {deltas} where {part} = $2 order by {seq} limit $1 \
              for update skip locked))",
         deltas = plan.deltas_ident,
+        part = quote_ident(schema::DELTA_PART_COLUMN),
         seq = quote_ident(schema::DELTA_SEQ_COLUMN),
     );
     let gone = if keep_claimed {

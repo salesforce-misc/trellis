@@ -196,6 +196,33 @@ async fn deltas(d: &Driver) -> i64 {
         .get(0)
 }
 
+/// Merges every delta row, a partition per pass (#717), and returns the
+/// passes' outcomes summed: each of `claimed`, `written`, `deleted`,
+/// `folded` and `recomputed` over every group of every partition.
+async fn merge_every(d: &Driver, plan: &BuildPlan) -> MergeOutcome {
+    let mut total = MergeOutcome {
+        partition: None,
+        claimed: 0,
+        written: 0,
+        deleted: 0,
+        folded: 0,
+        recomputed: 0,
+        skipped: false,
+    };
+    loop {
+        let pass = d.merge(plan, 1_000).await;
+        assert!(!pass.skipped, "no other merger runs: {pass:?}");
+        if pass.claimed == 0 {
+            return total;
+        }
+        total.claimed += pass.claimed;
+        total.written += pass.written;
+        total.deleted += pass.deleted;
+        total.folded += pass.folded;
+        total.recomputed += pass.recomputed;
+    }
+}
+
 /// Group `g`'s visible `total`, as text, and its hidden member count, or
 /// `None` without a row.
 async fn group(d: &Driver, g: i32) -> Option<(Option<String>, i64)> {
@@ -531,7 +558,7 @@ async fn a_transiently_negative_group_goes_once_merged() {
             Some((Some("-3".to_string()), -1)),
             "{flavour:?}: group 1 is negative until the merge"
         );
-        let merged = d.merge(&plan, 100).await;
+        let merged = merge_every(&d, &plan).await;
         assert_eq!((merged.claimed, merged.written, merged.deleted), (1, 0, 1));
         assert_eq!(group(&d, 1).await, None);
         assert_oracle(&mut d, &plan, flavour).await;
@@ -601,7 +628,7 @@ async fn exp2_5_min_max_during_a_build() {
     d.release(&mut chunk, PausePoint::AfterRederiveRead).await;
     chunk.finish().await;
 
-    let merged = d.merge(&plan, 100).await;
+    let merged = merge_every(&d, &plan).await;
     assert_eq!(
         (
             merged.claimed,
@@ -650,7 +677,7 @@ async fn deleting_a_groups_current_min_and_max_recomputes_it_during_a_build() {
         mm(5, 10, 1),
         "the page recomputed the group from its entries, the chunk's key 4 among them"
     );
-    let merged = d.merge(&plan, 100).await;
+    let merged = merge_every(&d, &plan).await;
     assert_eq!((merged.folded, merged.recomputed), (1, 0));
     assert_eq!(min_max(&d, 0).await, mm(5, 10, 2));
     assert_oracle(&mut d, &plan, flavour).await;
@@ -676,7 +703,7 @@ async fn deleting_a_groups_current_min_and_max_recomputes_it_during_a_build() {
         .expect("sweep");
     txn.commit().await.expect("commit the sweep");
     assert_eq!(swept.rederived, 4);
-    let merged = d.merge(&plan, 100).await;
+    let merged = merge_every(&d, &plan).await;
     assert_eq!(
         (merged.claimed, merged.folded, merged.recomputed),
         (1, 0, 1),
@@ -749,7 +776,7 @@ async fn a_fold_reads_the_entry_a_page_changed_after_its_chunk() {
         mm(5, 7, 1),
         "the page's recompute; the chunk's member is still owed"
     );
-    let merged = d.merge(&plan, 100).await;
+    let merged = merge_every(&d, &plan).await;
     assert_eq!((merged.folded, merged.recomputed), (1, 0));
     assert_eq!(min_max(&d, 1).await, mm(5, 7, 2));
     assert_oracle(&mut d, &plan, flavour).await;
@@ -792,7 +819,7 @@ async fn a_group_deleted_with_live_entries_is_recomputed_by_the_merge() {
             Vec::<String>::new(),
             "{flavour:?}: the page deleted group 1 at all zeros, with key 1 live in it"
         );
-        let merged = d.merge(&plan, 100).await;
+        let merged = merge_every(&d, &plan).await;
         assert_eq!(
             (merged.claimed, merged.folded, merged.recomputed),
             (1, 0, 1),
@@ -850,10 +877,10 @@ async fn a_fresh_builds_later_merges_fold() {
         )
         .await;
         d.chunk(&plan, None, "30").await;
-        let first = d.merge(&plan, 100).await;
+        let first = merge_every(&d, &plan).await;
         assert_eq!((first.folded, first.recomputed), (0, 3), "{flavour:?}");
         d.chunk(&plan, Some("30"), "60").await;
-        let second = d.merge(&plan, 100).await;
+        let second = merge_every(&d, &plan).await;
         assert_eq!(
             (second.folded, second.recomputed),
             if folds { (3, 0) } else { (0, 3) },
@@ -898,10 +925,10 @@ async fn a_fold_takes_float_extremes_and_the_null_group() {
         .expect("empty what the build writes");
     let plan = d.build_plan("agg").await;
     d.chunk(&plan, None, "5").await;
-    let first = d.merge(&plan, 100).await;
+    let first = merge_every(&d, &plan).await;
     assert_eq!((first.folded, first.recomputed), (0, 3));
     d.chunk(&plan, Some("5"), "11").await;
-    let second = d.merge(&plan, 100).await;
+    let second = merge_every(&d, &plan).await;
     assert_eq!(
         (second.folded, second.recomputed),
         (3, 0),
@@ -959,10 +986,10 @@ async fn a_fold_takes_expression_arguments() {
         .expect("empty what the build writes");
     let plan = d.build_plan("agg").await;
     d.chunk(&plan, None, "3").await;
-    let first = d.merge(&plan, 100).await;
+    let first = merge_every(&d, &plan).await;
     assert_eq!((first.folded, first.recomputed), (0, 2));
     d.chunk(&plan, Some("3"), "6").await;
-    let second = d.merge(&plan, 100).await;
+    let second = merge_every(&d, &plan).await;
     assert_eq!((second.folded, second.recomputed), (2, 0));
     d.settle().await;
     assert_eq!(
@@ -1084,13 +1111,13 @@ async fn a_chunk_and_a_page_compute_expression_arguments_alike() {
 /// Mergers and pages on the same groups never deadlock: a merger claims
 /// delta rows without waiting (`skip locked`) and upserts its groups in group
 /// order, and a page locks its entries and then its groups in the same
-/// order. A second merger of the target skips it (#625 F2b) rather than
-/// queue on the first's groups.
+/// order. A second merger of the target takes another partition (#717), so
+/// it writes other groups, rather than queue on the first's.
 ///
-/// First forced: merger A is frozen holding every group, merger B skips the
-/// target, and a page queues on A's groups. Then a free-running round:
-/// chunk runners, two merger loops and pages at once, with the source moving
-/// under them.
+/// First forced: merger A is frozen holding its partition's groups, merger
+/// B merges another partition beside it, and a page over every group queues
+/// on A's groups. Then a free-running round: chunk runners, two mergers and
+/// pages at once, with the source moving under them.
 ///
 /// A deadlock shows as the `deadlock detected` error in this test's own
 /// cluster log ([`Driver::deadlocks_logged`]), which the aborted backend
@@ -1116,8 +1143,8 @@ async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
     d.chunk(&plan, Some("100"), "200").await;
     let merger_b = d.merge(&plan, 1_000).await;
     assert!(
-        merger_b.skipped && merger_b.claimed == 0,
-        "B skips the target A is merging: {merger_b:?}"
+        !merger_b.skipped && merger_b.claimed > 0,
+        "B merges another partition beside A: {merger_b:?}"
     );
     let user = d.user().await;
     user.batch_execute("update public.src set v = v + 1 where id <= 200")
@@ -1127,9 +1154,11 @@ async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
     let page = d.drain_frozen(batch, "page", &[]).await;
     d.wait_blocked_behind(frozen.backend_pid).await;
     d.release(&mut merger_a, PausePoint::AfterGroupUpsert).await;
-    assert_eq!(merger_a.finish().await.claimed, 20);
+    let merger_a = merger_a.finish().await;
+    assert!(merger_a.claimed > 0, "{merger_a:?}");
+    assert_ne!(merger_a.partition, merger_b.partition);
     page.finish().await;
-    assert_eq!(d.merge(&plan, 1_000).await.claimed, 20, "B's rows, after A");
+    assert!(d.merge_all(&plan).await > 0, "the rest, after A");
 
     // Free-running: per round, three chunks and two mergers at once, with a
     // write across every group drained on a page beside them.
@@ -1166,13 +1195,29 @@ async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
 
 // ---------------------------------------------------------------- mergers
 
-/// At most one merger works on a target at a time (#625 F2b): a second one
-/// returns at once, skipped, with nothing claimed, instead of waiting on the
-/// first's group rows; once the first commits, the next merger takes what
-/// is left. A merge that blocked here would hang the test rather than pass
-/// it, and the timeout turns that into a failure.
+/// The merge partitions the target's delta rows are in (#717), in order.
+async fn partitions(d: &Driver) -> Vec<i16> {
+    d.ctl
+        .query(
+            "select distinct __part from public.agg__deltas order by 1",
+            &[],
+        )
+        .await
+        .expect("read the delta rows' partitions")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// Mergers of different partitions merge side by side (#717): merger A is
+/// frozen after its upsert, holding its partition's lock and its groups'
+/// rows, and further mergers take every other partition, one each, without
+/// waiting on A. A merge that waited on A's group rows or lock would hang
+/// the test rather than pass it, and the timeout turns that into a failure.
+/// Once only A's partition has rows, a merger skips the target. A commits,
+/// and the target equals the oracle.
 #[tokio::test]
-async fn a_second_merger_skips_a_target_being_merged() {
+async fn mergers_of_different_partitions_merge_side_by_side() {
     let flavour = Flavour::Sum;
     let (mut d, plan) = start_build_with(
         flavour,
@@ -1181,8 +1226,68 @@ async fn a_second_merger_skips_a_target_being_merged() {
     .await;
     d.chunk(&plan, None, "100").await;
     d.chunk(&plan, Some("100"), "200").await;
+    let before = partitions(&d).await;
+    assert!(
+        before.len() > 2,
+        "20 groups spread over partitions: {before:?}"
+    );
+
+    let mut a = d
+        .merge_frozen(&plan, 1_000, &[(PausePoint::AfterGroupUpsert, TARGET)])
+        .await;
+    a.reached(PausePoint::AfterGroupUpsert).await;
+    let mut merged = Vec::new();
+    loop {
+        let outcome = tokio::time::timeout(Duration::from_secs(30), d.merge(&plan, 1_000))
+            .await
+            .expect("a merger never waits on another partition's merger");
+        if outcome.skipped {
+            assert_eq!(outcome.claimed, 0, "{outcome:?}");
+            break;
+        }
+        assert!(outcome.claimed > 0, "{outcome:?}");
+        merged.push(outcome.partition.expect("a merge names its partition"));
+    }
+    let remaining = partitions(&d).await;
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only A's partition is left: {remaining:?}"
+    );
+    let a_partition = remaining[0];
+    merged.sort_unstable();
+    let mut others = before.clone();
+    others.retain(|p| *p != a_partition);
+    assert_eq!(
+        merged, others,
+        "each other partition merged once, apart from A's"
+    );
+
+    d.release(&mut a, PausePoint::AfterGroupUpsert).await;
+    let a = a.finish().await;
+    assert_eq!(a.partition, Some(a_partition));
+    assert_eq!(deltas(&d).await, 0);
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// Two mergers never hold one partition (#717, as F2b's one merger per
+/// target): with every delta row in one group, so one partition, a second
+/// merger returns at once, skipped, with nothing claimed, instead of waiting
+/// on the first's group row; once the first commits, the next merger takes
+/// what is left.
+#[tokio::test]
+async fn a_second_merger_skips_a_partition_being_merged() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan) = start_build_with(
+        flavour,
+        "insert into public.src select i, 1, i from generate_series(1, 200) i;",
+    )
+    .await;
+    d.chunk(&plan, None, "100").await;
+    d.chunk(&plan, Some("100"), "200").await;
+    assert_eq!(partitions(&d).await.len(), 1);
     let mut first = d
-        .merge_frozen(&plan, 20, &[(PausePoint::AfterGroupUpsert, TARGET)])
+        .merge_frozen(&plan, 1, &[(PausePoint::AfterGroupUpsert, TARGET)])
         .await;
     first.reached(PausePoint::AfterGroupUpsert).await;
 
@@ -1192,6 +1297,7 @@ async fn a_second_merger_skips_a_target_being_merged() {
     assert_eq!(
         second,
         MergeOutcome {
+            partition: None,
             claimed: 0,
             written: 0,
             deleted: 0,
@@ -1200,13 +1306,14 @@ async fn a_second_merger_skips_a_target_being_merged() {
             skipped: true,
         }
     );
-    assert_eq!(deltas(&d).await, 40, "nothing is merged until A commits");
+    assert_eq!(deltas(&d).await, 2, "nothing is merged until A commits");
 
     d.release(&mut first, PausePoint::AfterGroupUpsert).await;
     let first = first.finish().await;
-    assert_eq!((first.claimed, first.skipped), (20, false));
+    assert_eq!((first.claimed, first.skipped), (1, false));
     let after = d.merge(&plan, 1_000).await;
-    assert_eq!((after.claimed, after.skipped), (20, false));
+    assert_eq!((after.claimed, after.skipped), (1, false));
+    assert_eq!(after.partition, first.partition);
     assert_oracle(&mut d, &plan, flavour).await;
 }
 
@@ -1238,7 +1345,15 @@ async fn the_merge_plan_survives_empty_statistics() {
 
     let mut client = d.db.pool.get().await.expect("pool");
     let txn = client.transaction().await.expect("begin");
-    let explained = build::explain_merge(&txn, &plan, 5_000)
+    let partition: i16 = txn
+        .query_one(
+            "select __part from public.agg__deltas group by 1 order by count(*) desc limit 1",
+            &[],
+        )
+        .await
+        .expect("the fullest partition")
+        .get(0);
+    let explained = build::explain_merge(&txn, &plan, 5_000, partition)
         .await
         .expect("explain the merge");
     let inner_nested_loops: Vec<&str> = explained
@@ -1255,7 +1370,7 @@ async fn the_merge_plan_survives_empty_statistics() {
         "the upsert joins the sums by hash:\n{explained}"
     );
     assert!(
-        explained.contains("Index Scan using agg__deltas___seq_idx"),
+        explained.contains("Index Scan using agg__deltas___part___seq_idx"),
         "the claim reads the claim key's index:\n{explained}"
     );
 }
@@ -1276,7 +1391,7 @@ async fn the_merge_plan_settings_end_with_the_merge_statement() {
     let outcome = build::merge_deltas(&txn, &plan, 1_000)
         .await
         .expect("merge");
-    assert_eq!((outcome.claimed, outcome.skipped), (20, false));
+    assert!(outcome.claimed > 0 && !outcome.skipped, "{outcome:?}");
     let row = txn
         .query_one(
             "select current_setting('enable_nestloop'), current_setting('enable_seqscan')",
@@ -1292,36 +1407,49 @@ async fn the_merge_plan_settings_end_with_the_merge_statement() {
     txn.commit().await.expect("commit");
 }
 
-/// The merger claims the oldest delta rows first, in append order, through
-/// the claim key's index (#625 F2b), not in the heap's physical order. A
-/// delta row rewritten in place keeps its claim key but moves to the end of
-/// the heap, so a physical-order claim would take the newer rows first.
+/// The delta rows' claim keys, in the heap's order.
+async fn seqs(d: &Driver) -> Vec<i64> {
+    d.ctl
+        .query("select __seq from public.agg__deltas order by ctid", &[])
+        .await
+        .expect("read the delta rows")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// The merger claims a partition's oldest delta rows first, in append
+/// order, through the claim key's index (#625 F2b, #717), not in the heap's
+/// physical order. A delta row rewritten in place keeps its claim key but
+/// moves to the end of the heap, so a physical-order claim would take the
+/// newer rows first. One group, so every row is in one partition.
 #[tokio::test]
 async fn the_merger_claims_the_oldest_delta_rows_first() {
     let flavour = Flavour::Sum;
-    let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (2, 2, 20), (3, 3, 30)]).await;
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).await;
     d.chunk(&plan, None, "1").await;
     d.chunk(&plan, Some("1"), "2").await;
     d.chunk(&plan, Some("2"), "3").await;
+    let appended = seqs(&d).await;
+    assert_eq!(appended.len(), 3);
     d.ctl
-        .batch_execute("update public.agg__deltas set __dm = __dm where g = 1")
+        .batch_execute(&format!(
+            "update public.agg__deltas set __dm = __dm where __seq = {}",
+            appended[0]
+        ))
         .await
         .expect("move the oldest delta row to the end of the heap");
-    let physical = d
-        .rows("select g from public.agg__deltas order by ctid")
-        .await;
-    assert_eq!(physical, ["(2)", "(3)", "(1)"], "the heap's order");
+    assert_eq!(
+        seqs(&d).await,
+        [appended[1], appended[2], appended[0]],
+        "the heap's order"
+    );
 
-    for (merged, expected) in [(1, "(1)"), (2, "(2)"), (3, "(3)")] {
-        let outcome = d.merge(&plan, 1).await;
-        assert_eq!(outcome.claimed, 1);
-        let groups = d.rows("select g from public.agg order by g").await;
-        assert_eq!(
-            groups.len(),
-            merged,
-            "merge {merged} wrote one more group: {groups:?}"
-        );
-        assert_eq!(groups.last().map(String::as_str), Some(expected));
+    for left in [&appended[1..], &appended[2..], &[]] {
+        assert_eq!(d.merge(&plan, 1).await.claimed, 1);
+        let mut remaining = seqs(&d).await;
+        remaining.sort_unstable();
+        assert_eq!(remaining, left, "the oldest row went first");
     }
     assert_oracle(&mut d, &plan, flavour).await;
 }

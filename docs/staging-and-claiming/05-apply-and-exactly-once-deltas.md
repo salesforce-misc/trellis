@@ -398,13 +398,17 @@ page), and then one statement reads the range's locked rows with
 `pg_current_snapshot()` and the active segment, rewrites their entries
 (stamping `__applied_seg` with that segment, so the tombstone GC can collect a
 chunk's tombstones), and appends each group's increments to
-`<target>__deltas`. It never writes a group row. A merger claims delta rows
-oldest first through an index on their identity key `__seq` (`for update skip
-locked`), deletes them, and upserts their sums per group with the page's
-upsert, in group order. Only one merger works on a target at a time: it takes
-a transaction-scoped advisory lock on the target without waiting, and a second
-merger skips the target instead of queueing on the first's group rows (#625
-F2b). The delta table is a queue, so its statistics are unreliable: the merge
+`<target>__deltas`, where each row's generated `__part` is its group's merge
+partition: `hash_record_extended` of the group, so equal groups (`1.5` and
+`1.50`, or every `NULL` group) share one. It never writes a group row. A
+merger claims one partition's delta rows oldest first through an index on
+`(__part, __seq)` (`for update skip locked`), deletes them, and upserts their
+sums per group with the page's upsert, in group order. Only one merger works
+on a partition at a time: it takes a transaction-scoped advisory lock on the
+partition without waiting, trying the partitions with rows in turn, and
+skips the target only when another merger holds each of them (#625 F2b,
+#717). Mergers of different partitions write different groups, so they run
+side by side without queueing on each other's group rows. The delta table is a queue, so its statistics are unreliable: the merge
 statement runs with nested loops and sequential scans off, and a merger
 vacuums the table every 100,000 rows it merges. The delta rows are discarded
 only with the ledger: by a truncate, a drop, or the one-pass build.
