@@ -184,12 +184,14 @@ image of the commit it came from (its `lsn` and source `txid`), and a
 evaluates an Apply's image; Phase 3 settles each 1-1 target's records in one
 pass:
 
-1. **The entry lock (I5).** Insert a placeholder entry for every key with none,
-   then lock every entry `for update`, sorted by key. Every writer of the
-   key's target row holds it, so every Phase 3 for a key runs one at a time.
-   It can't be the target row's `FOR UPDATE`: a stale insert racing a delete
-   has no row to lock. A key whose tombstone the GC collects between the two
-   statements fails the page transiently and it is retried (#712).
+1. **The entry lock (I5).** Insert an entry for every key with none, then
+   lock every other entry `for update`, sorted by key. A new key's Apply is
+   settled by its insert, since with no entry I2 is only the truncate floor;
+   a Re-derive's entry is a placeholder until step 3. Every writer of the
+   key's target row holds the entry, so every Phase 3 for a key runs one at a
+   time. It can't be the target row's `FOR UPDATE`: a stale insert racing a
+   delete has no row to lock. A key whose tombstone the GC collects between
+   the two statements fails the page transiently and it is retried (#712).
 2. **The Re-derive read (I1).** The Re-derived keys' source rows and
    `pg_current_snapshot()`, in one statement, after the lock. A key with no
    row is a delete.
@@ -331,7 +333,7 @@ target row holds the values.
 The one-pass aggregate build writes the ledger. It empties it, reads the source
 into it in one statement whose snapshot becomes every entry's basis, and then
 writes the group rows as a `GROUP BY` over it. The 1-1 build writes no entries:
-a key's first change after it inserts the key's placeholder, and the go-live
+a key's first change after it inserts the key's entry, and the go-live
 catch-up's Re-derives stamp every key's basis.
 
 ### Aggregate groups: the ledger

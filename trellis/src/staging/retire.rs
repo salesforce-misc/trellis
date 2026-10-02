@@ -215,7 +215,7 @@ const TOMBSTONE_BATCHES_PER_PASS: usize = 4;
 /// page has just revived is no longer a tombstone. A delete that lands
 /// between a page's placeholder insert and its lock fails the page's entry
 /// lock with a transient error, and the page retries
-/// (`ledger::lock_entries`, #712).
+/// (`ledger::lock_entries` and `one_to_one_ledger::lock_entries`, #712).
 pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError> {
     let row = client.query_one(DRAINED_PREFIX_SQL, &[]).await?;
     let prefix: Option<i64> = row.get(0);

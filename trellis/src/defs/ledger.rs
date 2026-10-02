@@ -421,7 +421,9 @@ pub(crate) fn aggregate_deltas_ddl(
 /// index is the tombstone GC's (`staging::retire::collect_tombstones`). It
 /// indexes the key, not `applied_seg`, so that an Apply to a live entry,
 /// which only moves `applied_seg` and `applied_lsn`, changes no indexed
-/// column and can be a HOT update. The key sorts in `"C"`: every lock is
+/// column and can be a HOT update. The GC then filters `applied_seg` over
+/// every tombstone rather than seeking it, which a 1-1 ledger's few
+/// tombstones keep cheap. The key sorts in `"C"`: every lock is
 /// taken in key order, and a byte comparison is far cheaper than a locale's.
 pub(crate) fn one_to_one_ledger_ddl(qualified_ledger: &str) -> String {
     format!(
