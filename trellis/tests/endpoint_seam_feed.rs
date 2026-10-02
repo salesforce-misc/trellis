@@ -46,7 +46,7 @@ async fn connect_raw(dsn: &str) -> Client {
 async fn one_to_one_ledgers(raw: &Client, targets: &[&str]) {
     for target in targets {
         raw.batch_execute(&format!(
-            "create table public.{target}__ledger (\"__from_key\" text primary key, \
+            "create table public.{target}__ledger (\"__from_key\" text collate \"C\" primary key, \
              \"__applied_lsn\" pg_lsn, \"__applied_seg\" bigint, \"__basis\" pg_snapshot, \
              \"__tombstone\" boolean not null default false)"
         ))

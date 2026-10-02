@@ -7538,8 +7538,31 @@ async fn settle_one_to_one_target(
     if by_key.is_empty() {
         return Ok((0, 0, Vec::new()));
     }
-    let keys: Vec<&str> = by_key.keys().copied().collect();
-    one_to_one_ledger::lock_entries(txn, &plan.qualified_target, &keys).await?;
+    // Planted bug (#557): #344/#392, apply every change without ADR-0002's
+    // I2. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let predicate = !crate::plant::fires(
+        crate::plant::Plant::StaleOneToOneWrite,
+        by_key.values().any(|r| r.apply.is_some()),
+    );
+    #[cfg(not(any(test, feature = "test-util")))]
+    let predicate = true;
+    // A Re-derive's `present` is unknown before its read; the lock ignores
+    // it.
+    let to_lock: Vec<one_to_one_ledger::EntryChange<'_>> = by_key
+        .values()
+        .map(|r| one_to_one_ledger::EntryChange {
+            key: &r.pk_text,
+            apply: r.apply.as_ref().map(|(lsn, txid, _)| (*lsn, txid.as_str())),
+            present: r
+                .apply
+                .as_ref()
+                .is_none_or(|(_, _, values)| values.is_some()),
+        })
+        .collect();
+    let inserted =
+        one_to_one_ledger::lock_entries(txn, &plan.qualified_target, &to_lock, seg_seq, predicate)
+            .await?;
 
     let rederive_keys: Vec<&str> = by_key
         .values()
@@ -7596,6 +7619,10 @@ async fn settle_one_to_one_target(
 
     let mut changes: Vec<one_to_one_ledger::EntryChange<'_>> = Vec::with_capacity(by_key.len());
     for record in by_key.values() {
+        // A new key's Apply was settled by its insert.
+        if record.apply.is_some() && inserted.keys.contains(&record.pk_text) {
+            continue;
+        }
         let present = match &record.apply {
             Some((_, _, values)) => values.is_some(),
             None => match rederived.get(record.pk_text.as_str()) {
@@ -7612,16 +7639,7 @@ async fn settle_one_to_one_target(
             present,
         });
     }
-    // Planted bug (#557): #344/#392, apply every change without ADR-0002's
-    // I2. See `crate::plant`.
-    #[cfg(any(test, feature = "test-util"))]
-    let predicate = !crate::plant::fires(
-        crate::plant::Plant::StaleOneToOneWrite,
-        changes.iter().any(|c| c.apply.is_some()),
-    );
-    #[cfg(not(any(test, feature = "test-util")))]
-    let predicate = true;
-    let changed = one_to_one_ledger::update_entries(
+    let mut changed = one_to_one_ledger::update_entries(
         txn,
         &plan.qualified_target,
         &changes,
@@ -7630,6 +7648,7 @@ async fn settle_one_to_one_target(
         predicate,
     )
     .await?;
+    changed.extend(inserted.applied);
 
     let mut writes = Vec::new();
     let mut deletes = Vec::new();

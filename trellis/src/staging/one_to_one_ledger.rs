@@ -7,10 +7,12 @@
 //! A page settles each 1-1 target's records in four steps
 //! (`super::apply::apply_page`, step 3):
 //!
-//! 1. **Lock** ([`lock_entries`], I5): a placeholder for every key with no
-//!    entry, then every entry `for update`, sorted by key. A key whose
-//!    tombstone the GC collects between the two fails the page transiently,
-//!    as on an aggregate ledger (`super::ledger::lock_entries`, #712).
+//! 1. **Lock** ([`lock_entries`], I5): an entry for every key with no
+//!    entry, then every other entry `for update`, sorted by key. A new key's
+//!    Apply is settled by its insert, since with no entry I2 is only the
+//!    truncate floor; a Re-derive's is a placeholder. A key whose tombstone
+//!    the GC collects between the two fails the page transiently, as on an
+//!    aggregate ledger (`super::ledger::lock_entries`, #712).
 //! 2. **Re-derive read** ([`read_rows`], I1): the Re-derived keys' source
 //!    rows and `pg_current_snapshot()` in one statement, after the lock. The
 //!    rows are evaluated in Rust, as Phase 2 evaluates an Apply's image.
@@ -19,7 +21,7 @@
 //!    an Apply sets `applied_lsn`, but only if its transaction is not visible
 //!    in `basis`, its `lsn` is above `applied_lsn` and it is above the
 //!    target's truncate floor. Either makes a tombstone when the key has no
-//!    row. Returns the keys it changed.
+//!    row. Returns the keys it changed. Step 1's settled Applies skip it.
 //! 4. The target rows of exactly those keys are upserted or deleted, as
 //!    before (`super::apply::apply_target`).
 //!
@@ -52,28 +54,81 @@ pub(crate) fn ledger_ident(target: &str) -> String {
     ddl::qualified_target_table_ident(&schema::ledger_table_name(target))
 }
 
-/// Locks the entries of `keys` on `target`'s ledger, sorted, inserting a
-/// placeholder for a key with none first; see the module doc. `target` is
-/// the target's qualified identity.
+/// The keys [`lock_entries`] inserted an entry for.
+#[derive(Debug, Default)]
+pub(crate) struct Inserted {
+    /// Every key that had no entry. Its entry is this transaction's own
+    /// row, so it is locked already.
+    pub keys: HashSet<String>,
+    /// The Apply keys among them whose change the insert recorded, as
+    /// [`update_entries`] would have: with no entry, I2 holds unless the
+    /// change is at or below the truncate floor.
+    pub applied: HashSet<String>,
+}
+
+/// Locks the entries of `changes`' keys on `target`'s ledger, sorted; see
+/// the module doc. A key with no entry gets one: an Apply's records its
+/// change (`seg_seq` and the tombstone as [`update_entries`] sets them), and
+/// a Re-derive's, or that of an Apply below the truncate floor, is a
+/// placeholder, and a Re-derive's `present` is ignored. That spares a new
+/// key's entry a second version and a lock (#623 D6's throughput miss).
+/// Only the keys that had an entry are then locked `for update`. `target`
+/// is the target's qualified identity; `predicate` is as for
+/// [`update_entries`].
 pub(crate) async fn lock_entries(
     txn: &Transaction<'_>,
     target: &str,
-    keys: &[&str],
-) -> Result<(), ApplyError> {
+    changes: &[EntryChange<'_>],
+    seg_seq: i64,
+    predicate: bool,
+) -> Result<Inserted, ApplyError> {
     let ledger = ledger_ident(target);
-    let key_col = quote_ident(schema::KEY_COLUMN);
-    let mut distinct = keys.to_vec();
-    distinct.sort_unstable();
-    distinct.dedup();
-    txn.execute(
-        &format!(
-            "insert into {ledger} ({key_col}) \
-             select k from unnest($1::text[]) as k order by k \
-             on conflict do nothing"
-        ),
-        &[&distinct],
-    )
-    .await?;
+    let q = |c: &str| quote_ident(c);
+    let (key_col, applied, seg, tombstone) = (
+        q(schema::KEY_COLUMN),
+        q(schema::APPLIED_LSN_COLUMN),
+        q(schema::APPLIED_SEG_COLUMN),
+        q(schema::TOMBSTONE_COLUMN),
+    );
+    let keys: Vec<&str> = changes.iter().map(|c| c.key).collect();
+    let lsns: Vec<Option<String>> = changes
+        .iter()
+        .map(|c| c.apply.map(|(lsn, _)| lsn.to_string()))
+        .collect();
+    let present: Vec<bool> = changes.iter().map(|c| c.present).collect();
+    let above_floor = if predicate {
+        "not exists (select 1 from fl where v.__lsn <= fl.floor)"
+    } else {
+        "true"
+    };
+    let rows = txn
+        .query(
+            &format!(
+                "with v as ( \
+                     select u.__k, u.__lsn::pg_lsn as __lsn, u.__present \
+                     from unnest($1::text[], $2::text[], $3::bool[]) as u(__k, __lsn, __present) \
+                 ), \
+                 fl as (select floor from ledger_truncate_floor where target_table = $4) \
+                 insert into {ledger} ({key_col}, {applied}, {seg}, {tombstone}) \
+                 select v.__k, case when o.ok then v.__lsn end, \
+                        case when o.ok then $5::bigint end, o.ok and not v.__present \
+                 from v cross join lateral \
+                      (select v.__lsn is not null and {above_floor}) as o(ok) \
+                 order by v.__k collate \"C\" \
+                 on conflict do nothing \
+                 returning {key_col}, {applied} is not null"
+            ),
+            &[&keys, &lsns, &present, &target, &seg_seq],
+        )
+        .await?;
+    let mut inserted = Inserted::default();
+    for row in rows {
+        let key: String = row.get(0);
+        if row.get::<_, bool>(1) {
+            inserted.applied.insert(key.clone());
+        }
+        inserted.keys.insert(key);
+    }
     // Test-only pause point (#623 D7). See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -82,24 +137,31 @@ pub(crate) async fn lock_entries(
         target,
     )
     .await?;
-    let locked = txn
-        .execute(
-            &format!(
-                "select 1 from {ledger} where {key_col} = any($1::text[]) \
-                 order by {key_col} for update"
-            ),
-            &[&distinct],
-        )
-        .await?;
-    if (locked as usize) < distinct.len() {
-        return Err(ApplyError::LedgerEntryCollected {
-            target: target.to_string(),
-        });
+    let existing: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|k| !inserted.keys.contains(*k))
+        .collect();
+    if !existing.is_empty() {
+        let locked = txn
+            .execute(
+                &format!(
+                    "select 1 from {ledger} where {key_col} = any($1::text[]) \
+                     order by {key_col} for update"
+                ),
+                &[&existing],
+            )
+            .await?;
+        if (locked as usize) < existing.len() {
+            return Err(ApplyError::LedgerEntryCollected {
+                target: target.to_string(),
+            });
+        }
     }
     // Test-only pause point (#623 D1). See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(txn, super::interleave::PausePoint::AfterEntryLock, target).await?;
-    Ok(())
+    Ok(inserted)
 }
 
 /// The Re-derive read: the current source rows of `keys` (each `columns`

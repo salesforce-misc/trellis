@@ -404,14 +404,18 @@ pub(crate) fn aggregate_deltas_ddl(
 /// with no values (the target row holds them), as a statement to append to
 /// the target's own. Created empty: the 1-1 build's writes are absolute, and
 /// the Re-derives that follow it stamp the entries (#623 D6). The partial
-/// index is the tombstone GC's (`staging::retire::collect_tombstones`).
+/// index is the tombstone GC's (`staging::retire::collect_tombstones`). It
+/// indexes the key, not `applied_seg`, so that an Apply to a live entry,
+/// which only moves `applied_seg` and `applied_lsn`, changes no indexed
+/// column and can be a HOT update. The key sorts in `"C"`: every lock is
+/// taken in key order, and a byte comparison is far cheaper than a locale's.
 pub(crate) fn one_to_one_ledger_ddl(qualified_ledger: &str) -> String {
     format!(
-        "; create table {qualified_ledger} ({} text primary key, {}); \
+        "; create table {qualified_ledger} ({} text collate \"C\" primary key, {}); \
          create index on {qualified_ledger} ({}) where {}",
         quote_ident(KEY_COLUMN),
         ordering_state_columns(),
-        quote_ident(APPLIED_SEG_COLUMN),
+        quote_ident(KEY_COLUMN),
         quote_ident(TOMBSTONE_COLUMN),
     )
 }
@@ -575,7 +579,7 @@ mod tests {
     fn the_one_to_one_ledger_holds_only_the_key_and_the_ordering_state() {
         assert_eq!(
             one_to_one_ledger_ddl(r#""public"."t__ledger""#),
-            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
+            r#"; create table "public"."t__ledger" ("__from_key" text collate "C" primary key, "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("__from_key") where "__tombstone""#
         );
     }
 
