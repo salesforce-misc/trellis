@@ -1,13 +1,13 @@
-//! Plain aggregate targets on the ledger (#623 parts D3 and D4; epic #556,
+//! Aggregate targets on the ledger (#623 parts D3, D4 and D5; epic #556,
 //! ADR-0002 invariants I1, I2, I3 and I5).
 //!
 //! # Which targets
 //!
-//! [`route`] sends an aggregate target here iff it reads no relationship,
-//! every `GROUP BY` key is a plain source column, no aggregate argument reads
-//! a `json`/`jsonb` column, and no `MIN`/`MAX` orders text (refused until
-//! #575). (The grammar has no definition filter yet.) Its fields are of two
-//! kinds:
+//! [`route`] sends an aggregate target here iff every relationship it reads
+//! is to-one, every `GROUP BY` key is a source column or a to-one
+//! relationship path, no aggregate argument reads a `json`/`jsonb` column,
+//! and no `MIN`/`MAX` orders text (refused until #575). (The grammar has no
+//! definition filter yet.) Its fields are of two kinds:
 //!
 //! - **Maintained**: `SUM`/`AVG` over an exact numeric argument, and
 //!   `COUNT`, kept by increments in the upsert.
@@ -19,9 +19,11 @@
 //!
 //! An argument may be an expression (`SUM(v + 1)`): its value is evaluated
 //! per change, over the image as the source's row type, into its ledger
-//! column. Relationship-fed targets stay on `super::apply_aggregate`'s path,
-//! with its pre-lock, probe and recompute horizons, until #623 D5 moves them.
-//! A target is entirely on one path or the other.
+//! column. A relationship's parent is read live, by a left join to its
+//! to-side in the same statement (D5); a parent change re-derives each child
+//! it reaches. Every other target stays on `super::apply_aggregate`'s path,
+//! with its pre-lock, probe and recompute horizons. A target is entirely on
+//! one path or the other.
 //!
 //! # The ledger
 //!

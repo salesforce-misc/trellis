@@ -228,8 +228,9 @@ way in its own short transaction.
 
 This section covers aggregate targets that are not on the ledger yet: any
 target with a `MIN`/`MAX` (or other recompute-only) or composed field, an
-aggregate argument that is an expression, a float `SUM`/`AVG`, or a
-relationship. A plain `SUM`/`AVG`/`COUNT` target is on the ledger instead
+aggregate argument that is an expression, or a float `SUM`/`AVG`. A plain
+`SUM`/`AVG`/`COUNT` target is on the ledger instead, a relationship-fed one
+included since #623 D5
 (see [Aggregate groups: the ledger](#aggregate-groups-the-ledger), #623 D3),
 with no horizon, pre-lock or probe.
 
@@ -322,7 +323,6 @@ An aggregate target's entries also hold:
 - `__member`;
 - one column per distinct aggregate argument (`__arg0`, …), holding the
   argument's value, with the argument's collation when it is text;
-- `__join_key` for a relationship-fed target (written from D5).
 
 Every group row is then a pure function of its live members' entries: `SUM(x)`
 is `sum(__argN)` over them, its hidden count `count(__argN)`, `COUNT(*)` the
@@ -341,7 +341,12 @@ catch-up's Re-derives stamp every key's basis.
 An aggregate target whose every field is `SUM(x)` or `AVG(x)` over an exact
 numeric source column, `COUNT(*)`, or `COUNT(x)` over a source column of any
 type but `json`/`jsonb`, grouped by plain source columns, is on the ledger
-(`staging::ledger`, #623 D3). `AVG(x)` keeps its hidden running sum and count
+(`staging::ledger`, #623 D3). So is one that reads such a value, or groups by
+one, through a to-one relationship (#623 D5). Its statements left-join each
+relationship's to-side and read the parent live, after the entry lock and in
+the same statement as the child's read. A parent change re-derives every
+child it reaches; a child that has since moved off the parent has a change
+of its own pending, whose write reads its new parent. `AVG(x)` keeps its hidden running sum and count
 as today and writes `sum / count::numeric`, which is Postgres's own `avg()`
 over an exact numeric argument. Each page applies its records for such a
 target in one transaction, in four steps:

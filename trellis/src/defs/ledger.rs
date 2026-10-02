@@ -63,9 +63,6 @@ pub(crate) const KEY_COLUMN: &str = "__from_key";
 /// definition's filter excludes (no definition has one yet, so every entry
 /// the build writes is a member).
 pub(crate) const MEMBER_COLUMN: &str = "__member";
-/// The row's relationship join values, for a relationship-fed target's
-/// reverse lookups. Written from #623 part D5; null until then.
-pub(crate) const JOIN_KEY_COLUMN: &str = "__join_key";
 /// The `lsn` of the last change applied to the entry. A Re-derive leaves it
 /// unchanged (#623 Q1), so the build writes null.
 pub(crate) const APPLIED_LSN_COLUMN: &str = "__applied_lsn";
@@ -377,7 +374,6 @@ pub(crate) fn aggregate_ledger_ddl(
     qualified_ledger: &str,
     group_columns: &[LedgerColumn],
     contribution_columns: &[LedgerColumn],
-    reads_relationships: bool,
 ) -> String {
     let mut columns = vec![format!("{} text primary key", quote_ident(KEY_COLUMN))];
     columns.extend(group_columns.iter().map(LedgerColumn::render));
@@ -386,22 +382,20 @@ pub(crate) fn aggregate_ledger_ddl(
         quote_ident(MEMBER_COLUMN)
     ));
     columns.extend(contribution_columns.iter().map(LedgerColumn::render));
-    columns.push(format!("{} text[]", quote_ident(JOIN_KEY_COLUMN)));
     columns.push(ordering_state_columns());
     let group_idents: Vec<String> = group_columns.iter().map(|c| quote_ident(&c.name)).collect();
     format!(
         "; create table {qualified_ledger} ({}){}",
         columns.join(", "),
-        aggregate_ledger_index_ddl(qualified_ledger, &group_idents, reads_relationships),
+        aggregate_ledger_index_ddl(qualified_ledger, &group_idents),
     )
 }
 
 /// An aggregate ledger's secondary indexes, as statements each prefixed with
 /// `; `: the `GROUP BY` index, partial on live members (the only entries a
-/// group is a sum of), the tombstones by `applied_seg` (what
-/// `staging::retire::collect_tombstones` reads, #623 D7), and, on a target that reads a relationship (the only
-/// kind whose entries carry a join key), the join-key index. `group_idents`
-/// are the quoted `GROUP BY` columns.
+/// group is a sum of) and the tombstones by `applied_seg` (what
+/// `staging::retire::collect_tombstones` reads, #623 D7). `group_idents` are
+/// the quoted `GROUP BY` columns.
 ///
 /// Shared by the ledger's DDL and the aggregate build, which drops them for
 /// its load and builds them again after it. They are left for Postgres to
@@ -410,7 +404,6 @@ pub(crate) fn aggregate_ledger_ddl(
 pub(crate) fn aggregate_ledger_index_ddl(
     qualified_ledger: &str,
     group_idents: &[String],
-    reads_relationships: bool,
 ) -> String {
     let mut sql = format!(
         "; create index on {qualified_ledger} ({}) where {} and not {}",
@@ -423,12 +416,6 @@ pub(crate) fn aggregate_ledger_index_ddl(
         quote_ident(APPLIED_SEG_COLUMN),
         quote_ident(TOMBSTONE_COLUMN),
     ));
-    if reads_relationships {
-        sql.push_str(&format!(
-            "; create index on {qualified_ledger} using gin ({})",
-            quote_ident(JOIN_KEY_COLUMN),
-        ));
-    }
     sql
 }
 
@@ -657,17 +644,10 @@ mod tests {
                     collation: Some(r#""C""#.to_string()),
                 },
             ],
-            false,
         );
         assert_eq!(
             ddl,
-            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__join_key" text[], "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
-        );
-        let with_join = aggregate_ledger_ddl(r#""public"."t__ledger""#, &[], &[], true);
-        assert!(
-            with_join
-                .ends_with(r#"; create index on "public"."t__ledger" using gin ("__join_key")"#),
-            "{with_join}"
+            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
         );
     }
 
