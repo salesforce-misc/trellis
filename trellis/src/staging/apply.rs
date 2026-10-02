@@ -1886,6 +1886,12 @@ async fn build_reverse_relationship_shape(
 
         let relationships =
             catalog::resolve_relationships(pool, &def.def, &def.source_table).await?;
+        // #623 D5: a target on the ledger re-derives each child the parent
+        // change reaches, reading the parent live.
+        if super::ledger::route(&def.def, &def.source_columns, &relationships).is_some() {
+            needs_recompute_fallback = true;
+            continue;
+        }
         let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
         let field_plans = apply_aggregate::classify_fields(
             &def.def,
@@ -6010,10 +6016,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // Re-derives in Phase 3 (`super::ledger`), so a source read only by
         // such definitions, and by no relationship, decodes and re-reads
         // nothing here.
-        let ledger_shapes: Vec<Option<super::ledger::LedgerShape>> = defs
-            .iter()
-            .map(|def| super::ledger::route(&def.def, &def.source_columns))
-            .collect();
+        let mut ledger_shapes: Vec<Option<super::ledger::LedgerShape>> =
+            Vec::with_capacity(defs.len());
+        for def in &defs {
+            ledger_shapes.push(super::ledger::route_definition(pool, def).await?);
+        }
         let ledger_only = inbound_rels.is_empty() && ledger_shapes.iter().all(Option::is_some);
         // #623 D6: so does a relationship-free 1-1 definition's Re-derive,
         // so a source read only by those re-reads nothing here either.
@@ -6812,7 +6819,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 pk,
                                 src_changed: change.src_changed,
                                 origin_lsn: change.origin_lsn,
-                                on_ledger: super::ledger::route(&def.def, &def.source_columns)
+                                on_ledger: super::ledger::route_definition(pool, def)
+                                    .await?
                                     .is_some(),
                                 truncate_lsn: change.lsn,
                             },

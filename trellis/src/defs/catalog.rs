@@ -3299,14 +3299,39 @@ pub(crate) async fn resolve_relationships(
     def: &TransformDef,
     qualified_source: &str,
 ) -> Result<HashMap<String, ResolvedRelationship>, CatalogError> {
+    if super::eval::relationship_references(def).is_empty() {
+        return Ok(HashMap::new());
+    }
+    let resolved;
+    let qualified_source = if qualified_source.contains('.') {
+        qualified_source
+    } else {
+        resolved = resolve_relationship_endpoint(pool, qualified_source).await?;
+        resolved.as_str()
+    };
+    let client = pool.get().await?;
+    resolve_relationships_in(&**client, def, qualified_source).await
+}
+
+/// [`resolve_relationships`] on the caller's own connection or transaction
+/// (`intake::resume_orphans`, which runs in a discharge transaction), for a
+/// qualified `qualified_source` only: a bare one names no relationship.
+pub(crate) async fn resolve_relationships_in(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    qualified_source: &str,
+) -> Result<HashMap<String, ResolvedRelationship>, CatalogError> {
     let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
     for (rel, column) in super::eval::relationship_references(def) {
         cols_by_rel.entry(rel).or_default().push(column);
     }
+    let Some((schema, table)) = qualified_source.split_once('.') else {
+        return Ok(HashMap::new());
+    };
 
     let mut resolved = HashMap::with_capacity(cols_by_rel.len());
     for (rel, columns) in cols_by_rel {
-        let Some(reldef) = relationship_on_source(pool, qualified_source, &rel).await? else {
+        let Some(reldef) = relationship_by_name_in(client, schema, table, &rel).await? else {
             // Unknown name: leave it out; the validator names the offending
             // field in `ValidationError::UnknownRelationship`.
             continue;
@@ -3317,21 +3342,14 @@ pub(crate) async fn resolve_relationships(
         // re-resolved through this session's `search_path` (which may find a
         // different same-named table, or none).
         let query_to_table = reldef.qualified_to_table();
-        // Issue #117: a to-side enum column now needs a connection to
-        // classify (see `pg_type::value_type_for_oid`'s own doc comment) —
-        // acquired once per relationship here rather than per column, since
-        // a relationship's enrichment columns are typically few. Also now
-        // the connection `column_type_oid` itself queries on (review fix:
-        // it used to independently `pool.get()` per column, which meant
-        // holding two connections from this same pool at once for the
-        // whole loop below — see `column_type_oid`'s own doc comment).
-        let client = pool.get().await?;
+        // Issue #117: a to-side enum column needs a connection to classify
+        // (see `pg_type::value_type_for_oid`'s own doc comment).
         let mut column_types = HashMap::with_capacity(columns.len());
         for column in columns {
-            let type_oid = column_type_oid(&**client, &query_to_table, &to_table, &column).await?;
+            let type_oid = column_type_oid(client, &query_to_table, &to_table, &column).await?;
             column_types.insert(
                 column,
-                super::pg_type::value_type_for_oid(&**client, type_oid).await?,
+                super::pg_type::value_type_for_oid(client, type_oid).await?,
             );
         }
         resolved.insert(
@@ -3341,6 +3359,8 @@ pub(crate) async fn resolve_relationships(
                 to_table,
                 to_col: reldef.def.to_col.clone(),
                 column_types,
+                from_col: reldef.def.from_col.clone(),
+                qualified_to_table: query_to_table,
             },
         );
     }

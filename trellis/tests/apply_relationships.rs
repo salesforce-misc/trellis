@@ -1557,6 +1557,9 @@ impl ToSideChange {
 
 /// Which reverse path a [`to_side_change_scenario`] drives the change down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Since #623 D5 the target is on the ledger, so both stage the fallback's
+/// Re-derives; the two still differ in how order 12 reached the target.
 enum ReversePath {
     /// Issue #131's delta: nothing in the ring touches the changed user's
     /// orders, so `relationship_fast_path_precondition_holds` passes.
@@ -1707,10 +1710,11 @@ async fn to_side_change_scenario(case: &AggregateCase, change: ToSideChange, pat
 
     change.apply(&client).await;
     let recomputed = reverse_keys_for_to_side_change(&db.pool, &mut client, "orders").await;
-    assert_eq!(
+    // #623 D5: the target is on the ledger, which re-derives the children of
+    // every parent change, down either path.
+    assert!(
         !recomputed.is_empty(),
-        path == ReversePath::Fallback,
-        "{label}: the change took the other reverse path (fallback recomputes: {recomputed:?})"
+        "{label}: the change re-derived none of the changed user's orders"
     );
     assert_eq!(
         case.target(&client).await,
@@ -2662,7 +2666,9 @@ async fn two_relationship_columns_with_the_same_joined_name_group_apart() {
 
 /// A source column literally named `__trellis_rev_name` was overwritten by
 /// the reverse fast path's splice of `buyer.name`, so a rename summed the
-/// user's name in place of the column's value.
+/// user's name in place of the column's value. Since #623 D5 the target is
+/// on the ledger, so the rename re-derives the orders instead; the column
+/// must still read as itself.
 #[tokio::test]
 async fn a_source_column_named_like_a_reverse_synthetic_column_is_read_as_itself() {
     let cluster = TestCluster::start();
@@ -2722,9 +2728,10 @@ async fn a_source_column_named_like_a_reverse_synthetic_column_is_read_as_itself
     )
     .await;
     let recomputed = reverse_keys_for_to_side_change(&db.pool, &mut client, "orders").await;
-    assert!(
-        recomputed.is_empty(),
-        "the rename should take the fast path, not recompute {recomputed:?}"
+    assert_eq!(
+        recomputed,
+        ["10", "12"],
+        "the rename re-derives user 1's orders"
     );
     assert_eq!(
         text_pairs(&client, target).await,

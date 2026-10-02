@@ -462,9 +462,9 @@ async fn to_side_update_advances_the_projection_lsn_via_the_delta_path() {
 
 /// Issue #392 on the reverse path: a `recompute` of parent `posts` row 1,
 /// folded with that row's own CDC update, still re-derives the from-side
-/// groups that read it. Without it the fold leaves a plain parent update,
-/// whose reverse delta lands on whatever stale value the recompute was
-/// staged to repair (here `rust`'s total, 1000 too high).
+/// rows that read it. Here row 10's ledger entry and its group, `rust`, are
+/// both 1000 too high (#623 D5: a group is the sum of its entries, so only
+/// a stale entry is repairable), which only a Re-derive of row 10 repairs.
 #[tokio::test]
 async fn a_parent_recompute_folded_with_its_update_still_rederives_the_from_side_groups() {
     let cluster = TestCluster::start();
@@ -486,11 +486,12 @@ async fn a_parent_recompute_folded_with_its_update_still_rederives_the_from_side
 
     client
         .batch_execute(
-            "update tag_totals set total_words = total_words + 1000 where tag = 'rust'; \
+            "update tag_totals__ledger set __arg0 = __arg0 + 1000 where __from_key = '10'; \
+             update tag_totals set total_words = total_words + 1000 where tag = 'rust'; \
              update posts set word_count = 400 where id = 1",
         )
         .await
-        .expect("make rust stale, then update post 1");
+        .expect("make row 10 and rust stale, then update post 1");
     // Above the build's recompute horizon, so the delta isn't re-derived
     // on that account.
     let lsn: PgLsn = client
@@ -1748,13 +1749,12 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
 /// Positive case: an ordinary parent update where all four guards
 /// genuinely pass — including guard (a), proven with a real
 /// [`StagedWatermark`] advanced to (not merely defaulted past) the current
-/// `pg_current_wal_lsn()`, not [`StagedWatermark::saturated`]. A direct
-/// positive signal that the true-delta path ran (the projection's lsn
-/// advances to this record's own lsn) rather than an indirect "the final
-/// total happens to be right" check, and that *no* fallback recompute was
-/// staged — the fast path fully covered this record.
+/// `pg_current_wal_lsn()`, not [`StagedWatermark::saturated`]. The record is
+/// processed (the projection's lsn advances to this record's own lsn), and,
+/// the target being on the ledger (#623 D5), each of post 1's children is
+/// staged for a Re-derive, which reads the new parent once it drains.
 #[tokio::test]
-async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
+async fn all_four_guards_pass_and_the_children_are_rederived_in_the_ordinary_case() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1824,12 +1824,14 @@ async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
         "all four guards passed, so the true-delta path must have advanced \
          the projection to this record's own lsn"
     );
+    let mut recompute_keys = staged_recompute_keys(&client, "post_tags").await;
+    recompute_keys.sort();
     assert_eq!(
-        staged_recompute_keys(&client, "post_tags").await,
-        Vec::<String>::new(),
-        "all four guards passed, so no fallback recompute should have been \
-         staged for post 1's children"
+        recompute_keys,
+        vec!["10".to_string(), "12".to_string()],
+        "a ledger target re-derives each of post 1's children"
     );
+    drain_to_quiescence(&db.pool, &mut client).await;
     let totals = target_totals(&client).await;
     assert_eq!(
         totals.get("rust"),
@@ -3102,6 +3104,12 @@ async fn each_guard_increments_its_own_deferral_metric() {
 /// trace it can find (this test deliberately never calls
 /// `retire_drained_segments`, so that trace survives — see that function's
 /// own doc comment for the residual gap once retirement *does* run).
+///
+/// **#623 D5:** the target is now on the ledger, which reads parents live
+/// again (in the ledger statement, after the entry lock) and always
+/// re-derives the children of a parent change, so the sibling's Apply
+/// counts the live 400 and the fast path's precondition is never asked.
+/// The scenario stays as an end-to-end check that it converges.
 #[tokio::test]
 async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_does_not_corrupt_a_first_attempt()
  {
@@ -3197,11 +3205,10 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     let totals_before_parent_cdc = target_totals(&client).await;
     assert_eq!(
         totals_before_parent_cdc.get("rust"),
-        Some(&(Some("4".to_string()), Some("450".to_string()))),
-        "sanity: the sibling's own forward delta must have resolved post 1's \
-         relationship value from the settled projection (still 100, via row \
-         10 + the new row 40) + 250 via post 2's row 11 + null via post \
-         999's row 13 = 450 — *not* the live-updated 400 — before the \
+        Some(&(Some("4".to_string()), Some("750".to_string()))),
+        "sanity: the sibling's own Apply reads post 1 live (#623 D5): 100 via \
+         row 10 (not yet re-derived) + the live 400 via the new row 40 + 250 \
+         via post 2's row 11 + null via post 999's row 13 = 750, before the \
          parent's own CDC is ever staged"
     );
 
@@ -3248,9 +3255,7 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     assert_eq!(
         recompute_keys,
         vec!["10".to_string(), "12".to_string(), "40".to_string()],
-        "the fast path's own extra precondition must have found the \
-         already-drained sibling and routed this first attempt to the \
-         fallback instead of trusting a stale diff"
+        "every child of post 1 is re-derived"
     );
     assert!(
         staged_deferred_reverses(&client, relationship.id)
@@ -3270,7 +3275,7 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     let totals_after = target_totals(&client).await;
     assert_eq!(
         totals_after.get("rust"),
-        Some(&(Some("4".to_string()), Some("450".to_string()))),
+        Some(&(Some("4".to_string()), Some("750".to_string()))),
         "the fallback's own image-less Recomputes haven't drained yet (that \
          happens below), so the group must still read exactly the same as \
          it did right after the sibling's own forward apply — no partial or \
@@ -3287,7 +3292,7 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     );
 
     // The re-staged `Recompute`s for rows 10/12/40 must still drain
-    // cleanly — idempotent for 'rust' (already correct) and the actual
+    // cleanly — row 10's brings 'rust' to its true total, and the actual
     // correction for 'db' (row 12, untouched by anything until now).
     retire_drained_segments(&mut client)
         .await

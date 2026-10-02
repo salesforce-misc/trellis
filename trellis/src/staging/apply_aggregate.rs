@@ -4928,6 +4928,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToOne,
                 to_table: "posts".to_string(),
                 to_col: "id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "posts".to_string(),
                 column_types: HashMap::from([("word_count".to_string(), ValueType::Numeric)]),
             },
         )]);
@@ -5204,6 +5206,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToOne,
                 to_table: "posts".to_string(),
                 to_col: "id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "posts".to_string(),
                 column_types: to_columns.clone(),
             },
         )]);

@@ -2177,3 +2177,216 @@ async fn an_alter_backfill_racing_a_change_to_the_same_key() {
             .await,
     );
 }
+
+// ------------------------------------------------- relationship-fed (D5)
+
+/// A target fed through a to-one relationship (#623 D5): the ledger write
+/// reads the parent live, after the entry lock, and a parent change
+/// re-derives every child it reaches.
+#[derive(Clone, Copy, Debug)]
+enum RelFlavour {
+    /// The parent's value as a field: `SUM(parent.w)`.
+    Field,
+    /// The parent's value as the group key: `GROUP BY parent.w`.
+    GroupKey,
+}
+
+impl RelFlavour {
+    fn definition(self) -> &'static str {
+        match self {
+            RelFlavour::Field => {
+                "TRANSFORM agg FROM public.src GROUP BY g \
+                 SELECT SUM(parent.w) AS total, COUNT(*) AS n"
+            }
+            RelFlavour::GroupKey => {
+                "TRANSFORM agg FROM public.src GROUP BY parent.w \
+                 SELECT SUM(g) AS total, COUNT(*) AS n"
+            }
+        }
+    }
+
+    fn actual(self) -> &'static str {
+        match self {
+            RelFlavour::Field => "select g, total, n from public.agg order by g",
+            RelFlavour::GroupKey => "select w, total, n from public.agg order by w",
+        }
+    }
+
+    fn expected(self) -> &'static str {
+        match self {
+            RelFlavour::Field => {
+                "select s.g, sum(p.w), count(*) from public.src s \
+                 left join public.par p on p.id = s.p group by s.g order by s.g"
+            }
+            RelFlavour::GroupKey => {
+                "select p.w, sum(s.g), count(*) from public.src s \
+                 left join public.par p on p.id = s.p group by p.w order by p.w"
+            }
+        }
+    }
+}
+
+const PAR: &str = "public.par";
+
+/// `public.par (id, w)` with parents 1 (10) and 2 (20), `public.src (id, g,
+/// p)` with children 1, 2 and 4 of parent 1 and 3 of parent 2, the
+/// relationship `parent` from `src.p` to `par.id`, one live `flavour`
+/// target, both tables captured, drained to quiescence.
+async fn start_rel(flavour: RelFlavour) -> Driver {
+    let d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.par values (1, 10), (2, 20); \
+         insert into public.src values (1, 1, 1), (2, 1, 1), (3, 2, 2), (4, 2, 1);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &["RELATIONSHIP parent FROM src.p TO par.id"],
+        &[flavour.definition()],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(flavour.actual()).await,
+        d.rows(flavour.expected()).await,
+        "{flavour:?}: before the scenario"
+    );
+    d
+}
+
+async fn assert_rel_oracle(d: &mut Driver, flavour: RelFlavour) {
+    d.settle().await;
+    assert_eq!(
+        d.rows(flavour.actual()).await,
+        d.rows(flavour.expected()).await,
+        "{flavour:?} target (left) differs from the oracle (right)"
+    );
+}
+
+/// A child's change is frozen after its entry lock, before its read, while
+/// its parent changes. The parent's change drains in one batch with the
+/// Re-derives its fallback stages for the children (staged by hand here, so
+/// the frozen page's segment doesn't run the ring full), and the Re-derive
+/// of the frozen child queues behind the frozen page. The page reads the new
+/// parent live, and the Re-derive after it reads the same.
+async fn a_child_apply_racing_its_parents_change(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    write(&d, "update public.src set g = 2 where id = 1").await;
+    let c_batch = d.seal().await;
+    let mut a = d
+        .drain_frozen(c_batch, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
+        .await;
+    let frozen = a.reached(PausePoint::AfterEntryLock).await;
+    write(&d, "update public.par set w = 15 where id = 1").await;
+    d.stage_recomputes(SRC, &["1", "2", "4"]).await;
+    let p_batch = d.seal().await;
+    let b = d.drain_frozen(p_batch, "b", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut a, PausePoint::AfterEntryLock).await;
+    a.finish().await;
+    b.finish().await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_child_apply_racing_its_parents_change_field() {
+    a_child_apply_racing_its_parents_change(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_child_apply_racing_its_parents_change_group_key() {
+    a_child_apply_racing_its_parents_change(RelFlavour::GroupKey).await;
+}
+
+/// A child's Re-derive is frozen after its read of the old parent while the
+/// parent changes and drains. The parent change stages its own Re-derive of
+/// the child, which reads the new parent.
+async fn a_child_rederive_racing_its_parents_change(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    d.stage_recomputes(SRC, &["1"]).await;
+    let r_batch = d.seal().await;
+    let mut a = d
+        .drain_frozen(
+            r_batch,
+            "a",
+            &[(PausePoint::AfterRederiveRead, "public.agg")],
+        )
+        .await;
+    a.reached(PausePoint::AfterRederiveRead).await;
+    write(&d, "update public.par set w = 15 where id = 1").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.release(&mut a, PausePoint::AfterRederiveRead).await;
+    a.finish().await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_child_rederive_racing_its_parents_change_field() {
+    a_child_rederive_racing_its_parents_change(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_child_rederive_racing_its_parents_change_group_key() {
+    a_child_rederive_racing_its_parents_change(RelFlavour::GroupKey).await;
+}
+
+/// Child 1 moves from parent 1 to parent 2, frozen after its entry lock,
+/// while parent 1 changes and drains. Parent 1's live scan no longer finds
+/// child 1; child 1's own write reads parent 2.
+async fn a_child_moving_off_a_changing_parent(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    write(&d, "update public.src set p = 2 where id = 1").await;
+    let c_batch = d.seal().await;
+    let mut a = d
+        .drain_frozen(c_batch, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
+        .await;
+    a.reached(PausePoint::AfterEntryLock).await;
+    write(&d, "update public.par set w = 15 where id = 1").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.release(&mut a, PausePoint::AfterEntryLock).await;
+    a.finish().await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_child_moving_off_a_changing_parent_field() {
+    a_child_moving_off_a_changing_parent(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_child_moving_off_a_changing_parent_group_key() {
+    a_child_moving_off_a_changing_parent(RelFlavour::GroupKey).await;
+}
+
+/// A child's change is frozen after its entry lock while the to-side is
+/// truncated. The truncate commits before the page reads, so the page reads
+/// no parent, and the truncate's drain re-derives the rest.
+async fn a_to_side_truncate_racing_a_child(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    write(&d, "update public.src set g = 2 where id = 1").await;
+    let c_batch = d.seal().await;
+    let mut a = d
+        .drain_frozen(c_batch, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
+        .await;
+    a.reached(PausePoint::AfterEntryLock).await;
+    write(&d, "truncate public.par").await;
+    let t_batch = d.seal().await;
+    d.drain(t_batch, "b").await;
+    d.release(&mut a, PausePoint::AfterEntryLock).await;
+    a.finish().await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_to_side_truncate_racing_a_child_field() {
+    a_to_side_truncate_racing_a_child(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_to_side_truncate_racing_a_child_group_key() {
+    a_to_side_truncate_racing_a_child(RelFlavour::GroupKey).await;
+}

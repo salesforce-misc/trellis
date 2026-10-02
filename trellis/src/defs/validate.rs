@@ -39,6 +39,11 @@ pub struct ResolvedRelationship {
     pub to_table: String,
     pub to_col: String,
     pub column_types: HashMap<String, ValueType>,
+    /// The from-side column the relationship joins on.
+    pub from_col: String,
+    /// The to-side as the relationship recorded it, `"schema.table"`, for
+    /// a live join to it (#623 D5).
+    pub qualified_to_table: String,
 }
 
 /// Which key a [`ValidationError::NondeterministicKeyCollation`] column
@@ -3200,6 +3205,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToMany,
                 to_table: "comments".to_string(),
                 to_col: "order_id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "comments".to_string(),
                 column_types: HashMap::from([("word_count".to_string(), ValueType::Numeric)]),
             },
         )]);
@@ -3245,6 +3252,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToMany,
                 to_table: "items".to_string(),
                 to_col: "order_id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "items".to_string(),
                 column_types: HashMap::from([("priority".to_string(), priority)]),
             },
         )]);
@@ -3299,6 +3308,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToOne,
                 to_table: "assignees".to_string(),
                 to_col: "id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "assignees".to_string(),
                 column_types: HashMap::from([("priority".to_string(), priority)]),
             },
         )]);
@@ -3364,6 +3375,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToMany,
                 to_table: "items".to_string(),
                 to_col: "order_id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "items".to_string(),
                 column_types: HashMap::from([("label".to_string(), ValueType::Text)]),
             },
         )]);
@@ -3499,6 +3512,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToOne,
                 to_table: to_table.to_string(),
                 to_col: "id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: to_table.to_string(),
                 column_types: HashMap::from([(column.to_string(), ValueType::Numeric)]),
             },
         )])
@@ -3802,6 +3817,8 @@ mod tests {
                 cardinality: RelationshipCardinality::ToMany,
                 to_table: "comments".to_string(),
                 to_col: "post_id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "comments".to_string(),
                 column_types: HashMap::from([("author".to_string(), ValueType::Text)]),
             },
         )]);

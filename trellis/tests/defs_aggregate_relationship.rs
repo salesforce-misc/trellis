@@ -370,22 +370,15 @@ async fn inserting_a_from_side_row_updates_its_groups_total() {
     );
 }
 
-/// Issue #136 (epic #127): an ordinary from-side insert into a
-/// relationship-reading aggregate resolves the relationship's value from the
-/// *settled parent projection* (issue #130's mechanism), never a live read
-/// of the to-side table — mirroring
-/// `apply_relationship_forward.rs`'s `forward_to_one_resolves_from_the_projection_not_live_parent_state`
-/// for the analogous `KeySpace::OneToOne` case, but for a `KeySpace::Aggregate`
-/// field wrapped in `SUM`. Before #136, this went through `accumulate_changes`'s
-/// now-removed `force_every_group`, which forced a **live** `LEFT JOIN`
-/// recompute for the whole touched group — so this exact scenario (a live
-/// rename with no reverse recompute in between) would have picked up the
-/// *new* live value immediately. Proved by manufacturing the same
-/// projection/live desync `apply_relationship_forward.rs` uses: renaming
-/// post 1's `word_count` live, with no CDC staged and no reverse recompute
-/// run, then inserting a brand-new `post_tags` row pointing at it.
+/// #623 D5: a relationship-reading aggregate is on the ledger, whose write
+/// reads the parent live, after the entry lock and the child's read. Issue
+/// #136 read it from the settled projection instead. Proved with the same
+/// projection/live desync: post 1's `word_count` changes live with no CDC
+/// staged, then a brand-new `post_tags` row points at it. The new row reads
+/// 999; the rows already entered keep the 100 they read, since no parent
+/// change was staged to re-derive them.
 #[tokio::test]
-async fn inserting_a_from_side_row_resolves_from_the_projection_not_live_parent_state() {
+async fn inserting_a_from_side_row_reads_the_parent_live() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -454,11 +447,9 @@ async fn inserting_a_from_side_row_resolves_from_the_projection_not_live_parent_
     let totals = target_totals(&client).await;
     assert_eq!(
         totals.get("rust"),
-        Some(&(Some("4".to_string()), Some("450".to_string()))),
-        "the new row's contribution must come from the settled projection \
-         (still 100: 100 via row 10 + 250 via row 11 + null via row 13 + 100 \
-         via the new row 15), not the live post row (renamed to 999 after \
-         the projection settled)"
+        Some(&(Some("4".to_string()), Some("1349".to_string()))),
+        "the new row reads the live post (100 via row 10 + 250 via row 11 + \
+         null via row 13 + 999 via the new row 15)"
     );
 }
 

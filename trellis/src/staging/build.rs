@@ -786,8 +786,16 @@ const BUILD_REDERIVE: &str = "rederive";
 
 /// The shape a Re-derive build serves, if `definition` has one (see the
 /// module doc's "Shapes").
+///
+/// A relationship-fed target has none: with no relationships resolved,
+/// [`ledger::route`] refuses one, so it keeps the one-pass build until #625
+/// F9.
 fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
-    ledger::route(&definition.def, &definition.source_columns)
+    ledger::route(
+        &definition.def,
+        &definition.source_columns,
+        &std::collections::HashMap::new(),
+    )
 }
 
 /// Whether a Re-derive build may take `definition` (#625 F2, F5): a target

@@ -91,8 +91,10 @@ use crate::defs::backfill::{FieldKind, classify_field};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::eval;
 use crate::defs::ledger as schema;
+use crate::defs::model::RelationshipCardinality;
 use crate::defs::oracle::render_expr_sql;
 use crate::defs::pg_type::PgType;
+use crate::defs::validate::ResolvedRelationship;
 use crate::pool::{quote_ident, quote_literal};
 
 use super::apply::ApplyError;
@@ -178,15 +180,62 @@ struct Contrib {
 /// What a ledger-routed definition's target looks like ([`route`]).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LedgerShape {
-    /// The `GROUP BY` columns: each is a source column of the same name, and
-    /// the target's and the ledger's column of that name.
+    /// The `GROUP BY` columns: the target's and the ledger's column of that
+    /// name.
     group_cols: Vec<String>,
+    /// Per `GROUP BY` column, in order, `None` for the source column of the
+    /// same name, or a to-one relationship path's value (#623 D5): SQL over
+    /// the source row `s` and [`Self::joins`].
+    group_paths: Vec<Option<String>>,
+    /// One live `left join` per to-one relationship the definition reads,
+    /// onto the source row `s` (#623 D5), or empty. Each path reads its
+    /// parent's row as the statement finds it, after the child's: see
+    /// [`route`].
+    joins: String,
+    /// The source columns [`Self::joins`] read (each relationship's
+    /// from-column), which a Re-derive must read too.
+    join_reads: Vec<String>,
     /// The contribution columns, in [`schema::contributions`]' order.
     contribs: Vec<Contrib>,
     fields: Vec<LedgerField>,
 }
 
 impl LedgerShape {
+    /// The `GROUP BY` columns read from the source row under their own
+    /// names: every one but a relationship path.
+    fn plain_group_cols(&self) -> impl Iterator<Item = &String> {
+        self.group_cols
+            .iter()
+            .zip(&self.group_paths)
+            .filter_map(|(c, path)| path.is_none().then_some(c))
+    }
+
+    /// Whether an entry's values need the image as the source's own row
+    /// type `s` (an expression argument, or a relationship's join).
+    fn reads_typed_row(&self) -> bool {
+        !self.joins.is_empty()
+            || self
+                .contribs
+                .iter()
+                .any(|c| matches!(c.source, ContribSource::Expr { .. }))
+    }
+
+    /// The source columns a Re-derive reads.
+    fn source_reads(&self) -> Vec<String> {
+        let mut columns: Vec<String> = self.plain_group_cols().cloned().collect();
+        let reads = self
+            .contribs
+            .iter()
+            .flat_map(|c| c.source.reads())
+            .chain(&self.join_reads);
+        for column in reads {
+            if !columns.contains(column) {
+                columns.push(column.clone());
+            }
+        }
+        columns
+    }
+
     /// Per contribution, in order, whether a maintained `SUM`/`AVG` sums it:
     /// the contributions whose group-delta row carries a sum increment
     /// ([`schema::aggregate_deltas_ddl`]).
@@ -215,31 +264,78 @@ impl LedgerShape {
 }
 
 /// Whether `def` is a target the ledger path maintains (see the module doc),
-/// and its shape if so.
+/// and its shape if so. `relationships` are `def`'s, resolved
+/// (`catalog::resolve_relationships`): a definition reading one that isn't
+/// there, or isn't to-one, is refused.
+///
+/// A relationship path's value is read from the to-side's live row, joined
+/// in the ledger statement after the entry lock and after the child's own
+/// read (an Apply's image, or a Re-derive's read), never from the parent
+/// projection (#623 D5). So when a parent changes, the reverse path's
+/// Re-derive of each child that points at it reads the new parent; a child
+/// that pointed at it but has since moved has a change of its own still to
+/// come, whose write reads its new parent.
 pub(crate) fn route(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
 ) -> Option<LedgerShape> {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         return None;
     };
-    if !eval::relationship_references(def).is_empty() {
-        return None;
-    }
-    let mut group_cols = Vec::with_capacity(group_by.len());
-    for key in group_by {
-        let GroupByKey::Column(column) = key else {
-            return None;
-        };
-        if !source_columns.contains_key(column) {
+    let mut joined: Vec<&str> = Vec::new();
+    for (rel, column) in eval::relationship_references(def) {
+        let resolved = relationships.get(&rel)?;
+        if resolved.cardinality != RelationshipCardinality::ToOne
+            || !resolved.column_types.contains_key(&column)
+        {
             return None;
         }
-        group_cols.push(column.clone());
+        let (name, _) = relationships.get_key_value(&rel)?;
+        if !joined.contains(&name.as_str()) {
+            joined.push(name);
+        }
+    }
+    joined.sort_unstable();
+    let mut group_cols = Vec::with_capacity(group_by.len());
+    let mut group_paths = Vec::with_capacity(group_by.len());
+    for key in group_by {
+        match key {
+            GroupByKey::Column(column) => {
+                if !source_columns.contains_key(column) {
+                    return None;
+                }
+                group_paths.push(None);
+            }
+            GroupByKey::RelationshipPath { .. } => {
+                group_paths.push(Some(render_over_source(&key.as_expr())));
+            }
+        }
+        group_cols.push(key.target_column_name().to_string());
+    }
+    let aliases: Vec<String> = joined.iter().map(|rel| join_alias(rel)).collect();
+    let joins = crate::defs::oracle::to_one_join_clauses(
+        joined.iter().zip(&aliases).map(|(rel, alias)| {
+            let r = &relationships[*rel];
+            (
+                alias.as_str(),
+                r.qualified_to_table.as_str(),
+                r.to_col.as_str(),
+                r.from_col.as_str(),
+            )
+        }),
+        "s",
+    );
+    let mut join_reads: Vec<String> = Vec::new();
+    for rel in &joined {
+        let from_col = &relationships[*rel].from_col;
+        if !join_reads.contains(from_col) {
+            join_reads.push(from_col.clone());
+        }
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
-    let no_relationships = HashMap::new();
     let field_types =
-        crate::defs::validate::infer_field_types(def, source_columns, &no_relationships).ok()?;
+        crate::defs::validate::infer_field_types(def, source_columns, relationships).ok()?;
     let value_fields: Vec<&FieldDef> = def
         .fields
         .iter()
@@ -252,7 +348,7 @@ pub(crate) fn route(
     // `MIN`/`MAX` over text stays on the old path (the handoff's scope for
     // D4; #575 revisits text ordering).
     for field in &value_fields {
-        if orders_text(&substituted[&field.name], source_columns) {
+        if orders_text(&substituted[&field.name], source_columns, relationships) {
             return None;
         }
     }
@@ -283,7 +379,7 @@ pub(crate) fn route(
         let source = match &contribution.arg {
             Expr::Column(column) => ContribSource::Column(column.clone()),
             arg => ContribSource::Expr {
-                sql: crate::defs::oracle::render_to_one_rel_expr_sql(arg, "s"),
+                sql: render_over_source(arg),
                 reads,
             },
         };
@@ -335,9 +431,54 @@ pub(crate) fn route(
         .collect();
     Some(LedgerShape {
         group_cols,
+        group_paths,
+        joins,
+        join_reads,
         contribs,
         fields,
     })
+}
+
+/// [`route`] for the stored definition `def`, its relationships resolved
+/// first (a catalog read only for a definition that reads one).
+pub(crate) async fn route_definition(
+    pool: &crate::pool::Pool,
+    def: &crate::defs::model::Definition,
+) -> Result<Option<LedgerShape>, crate::defs::catalog::CatalogError> {
+    let relationships =
+        crate::defs::catalog::resolve_relationships(pool, &def.def, &def.source_table).await?;
+    Ok(route(&def.def, &def.source_columns, &relationships))
+}
+
+/// The alias a relationship's join takes in [`LedgerShape::joins`]:
+/// prefixed, so a relationship named like one of the statement's own
+/// aliases (`s`, `b`, `r`) can't shadow it.
+fn join_alias(rel: &str) -> String {
+    format!("__trellis_rel_{rel}")
+}
+
+/// `expr` as SQL over the source row `s` and [`LedgerShape::joins`]: a
+/// source column as `s.<column>`, a relationship path as its join's column.
+fn render_over_source(expr: &Expr) -> String {
+    fn aliased(expr: &Expr) -> Expr {
+        match expr {
+            Expr::RelationshipPath { rel, column } => Expr::RelationshipPath {
+                rel: join_alias(rel),
+                column: column.clone(),
+            },
+            Expr::FunctionCall { name, args } => Expr::FunctionCall {
+                name: name.clone(),
+                args: args.iter().map(aliased).collect(),
+            },
+            Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
+                op: *op,
+                lhs: Box::new(aliased(lhs)),
+                rhs: Box::new(aliased(rhs)),
+            },
+            other => other.clone(),
+        }
+    }
+    crate::defs::oracle::render_to_one_rel_expr_sql(&aliased(expr), "s")
 }
 
 /// The aggregate a recomputed field `expr` folds by ([`LedgerField::Recompute`]),
@@ -362,19 +503,26 @@ fn fold_of(expr: &Expr) -> Option<&'static str> {
 }
 
 /// Whether `expr` has a `MIN`/`MAX` over a text argument.
-fn orders_text(expr: &Expr, source_columns: &HashMap<String, ValueType>) -> bool {
+fn orders_text(
+    expr: &Expr,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> bool {
     match expr {
         Expr::FunctionCall { name, args }
             if (name == "MIN" || name == "MAX") && args.len() == 1 =>
         {
             matches!(
-                crate::defs::validate::infer_expr_type(&args[0], source_columns, &HashMap::new()),
+                crate::defs::validate::infer_expr_type(&args[0], source_columns, relationships),
                 Ok(ValueType::Text)
             )
         }
-        Expr::FunctionCall { args, .. } => args.iter().any(|a| orders_text(a, source_columns)),
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .any(|a| orders_text(a, source_columns, relationships)),
         Expr::BinaryOp { lhs, rhs, .. } => {
-            orders_text(lhs, source_columns) || orders_text(rhs, source_columns)
+            orders_text(lhs, source_columns, relationships)
+                || orders_text(rhs, source_columns, relationships)
         }
         _ => false,
     }
@@ -902,11 +1050,10 @@ fn ledger_statement(
 
     // An image's plain-column values keyed by ledger column, for
     // `jsonb_populate_record`, and each value `v` carries: the record's
-    // column, or an expression argument computed over the image as a source
-    // row `s`.
+    // column, or an expression argument or relationship path computed over
+    // the image as a source row `s` and the live parent rows its joins find.
     let plain = shape
-        .group_cols
-        .iter()
+        .plain_group_cols()
         .map(|c| (c, c))
         .chain(shape.contribs.iter().filter_map(|c| match &c.source {
             ContribSource::Column(source) => Some((&c.column, source)),
@@ -921,20 +1068,29 @@ fn ledger_statement(
             )
         })
         .collect();
-    let mut v_cols: Vec<String> = groups.iter().map(|c| format!("r.{c}")).collect();
-    let mut typed_row = String::new();
+    let mut v_cols: Vec<String> = groups
+        .iter()
+        .zip(&shape.group_paths)
+        .map(|(c, path)| match path {
+            None => format!("r.{c}"),
+            Some(sql) => format!("{sql} as {c}"),
+        })
+        .collect();
     for contrib in &shape.contribs {
         v_cols.push(match &contrib.source {
             ContribSource::Column(_) => format!("r.{}", q(&contrib.column)),
-            ContribSource::Expr { sql, .. } => {
-                typed_row = format!(
-                    " cross join lateral jsonb_populate_record(null::{}, b.__img) s",
-                    ddl::qualified_source_table(&plan.source_table)
-                );
-                format!("{sql} as {}", q(&contrib.column))
-            }
+            ContribSource::Expr { sql, .. } => format!("{sql} as {}", q(&contrib.column)),
         });
     }
+    let typed_row = if shape.reads_typed_row() {
+        format!(
+            " cross join lateral jsonb_populate_record(null::{}, b.__img) s{}",
+            ddl::qualified_source_table(&plan.source_table),
+            shape.joins
+        )
+    } else {
+        String::new()
+    };
     let set_values: Vec<String> = values.iter().map(|c| format!("{c} = v.{c}")).collect();
 
     // Planted bug (#557): drop the increments of a group another apply
@@ -1089,7 +1245,14 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
     let (groups, args) = entry_columns(shape);
     let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
     let k_expr = ddl::pk_key_sql_expr(&plan.source_pk, Some("s"));
-    let mut src_cols: Vec<String> = groups.iter().map(|c| format!("s.{c} as {c}")).collect();
+    let mut src_cols: Vec<String> = groups
+        .iter()
+        .zip(&shape.group_paths)
+        .map(|(c, path)| match path {
+            None => format!("s.{c} as {c}"),
+            Some(sql) => format!("{sql} as {c}"),
+        })
+        .collect();
     for contrib in &shape.contribs {
         src_cols.push(match &contrib.source {
             ContribSource::Column(source) => format!("s.{} as {}", q(source), q(&contrib.column)),
@@ -1115,7 +1278,7 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
                     (select max(seg_seq) from segments) as __seg \
          ), \
          src as ( \
-             select {k_expr} as __k, {src_cols} from {source} s {src_from} \
+             select {k_expr} as __k, {src_cols} from {source} s{joins} {src_from} \
          ), \
          v as ( \
              select u.__k, r.__k is not null as __present, {r_cols} \
@@ -1136,6 +1299,7 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
          ) \
          select (select count(*) from upd), (select count(*) from d)",
         source = ddl::qualified_source_table(&plan.source_table),
+        joins = shape.joins,
         src_cols = src_cols.join(", "),
         r_cols = prefixed(&values, "r"),
         old = old_cte(plan, keys),
@@ -1701,12 +1865,7 @@ pub(crate) async fn apply_ledger_target(
     let mut read_images: HashMap<String, String> = HashMap::new();
     let mut snapshot: Option<String> = None;
     if !rederive.is_empty() {
-        let mut columns: Vec<String> = plan.shape.group_cols.clone();
-        for column in plan.shape.contribs.iter().flat_map(|c| c.source.reads()) {
-            if !columns.contains(column) {
-                columns.push(column.clone());
-            }
-        }
+        let columns = plan.shape.source_reads();
         let query = super::apply::live_rows_query(
             &plan.source_table,
             &plan.source_pk,
@@ -1868,7 +2027,7 @@ mod tests {
             .iter()
             .map(|(c, t)| ((*c).to_string(), *t))
             .collect();
-        route(&def, &source_columns)
+        route(&def, &source_columns, &HashMap::new())
     }
 
     const INT: ValueType = ValueType::Integer(crate::integer::IntWidth::Int4);

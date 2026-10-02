@@ -322,7 +322,10 @@ impl Sweep {
             // deleted directly: a row a rebuild's build (which empties the
             // ledger) found no source rows for.
             let source_columns = crate::defs::catalog::source_columns_in(txn, id).await?;
-            let ledger = match crate::staging::ledger::route(&def, &source_columns) {
+            let relationships =
+                crate::defs::catalog::resolve_relationships_in(txn, &def, &source_table).await?;
+            let ledger = match crate::staging::ledger::route(&def, &source_columns, &relationships)
+            {
                 Some(shape) => {
                     let source_pk = ddl::identity_key_columns(txn, &source_table).await?;
                     let tag =

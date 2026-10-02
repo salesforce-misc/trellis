@@ -22,7 +22,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, Progress};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, install_definition};
+use trellis::defs::{ValueType, create_relationship, install_definition};
 use trellis::intake::markers;
 use trellis::staging::build::{self, BuildPlan, ChunkOutcome, MergeOutcome};
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
@@ -71,11 +71,28 @@ impl Driver {
         definitions: &[&str],
         captured: &[&str],
     ) -> Self {
+        Self::start_with_relationships(source_ddl, columns, &[], definitions, captured).await
+    }
+
+    /// [`Self::start`], with `relationships` declared before the
+    /// definitions are installed.
+    pub async fn start_with_relationships(
+        source_ddl: &str,
+        columns: &[(&str, ValueType)],
+        relationships: &[&str],
+        definitions: &[&str],
+        captured: &[&str],
+    ) -> Self {
         let cluster = TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let mut ctl = connect(db.dsn()).await;
         let gate = connect(db.dsn()).await;
         ctl.batch_execute(source_ddl).await.expect("source DDL");
+        for relationship in relationships {
+            create_relationship(&db.pool, relationship)
+                .await
+                .expect("declare relationship");
+        }
         let columns: HashMap<String, ValueType> = columns
             .iter()
             .map(|(name, ty)| (name.to_string(), *ty))
