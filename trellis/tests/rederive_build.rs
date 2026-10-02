@@ -365,6 +365,186 @@ async fn changes_drained_while_backfilling_are_applied() {
     f.assert_agg_oracle().await;
 }
 
+/// `SUM`, `MAX` (a recomputed field that folds), `AVG` and `COUNT(*)` by `g`.
+const AGG_WIDE: &str = "TRANSFORM agg FROM public.src GROUP BY g \
+     SELECT SUM(v) AS total, MAX(v) AS biggest, AVG(v) AS mean, COUNT(*) AS n";
+
+/// The read-your-writes contract over a build (#728; ADR-0002, "What `live`
+/// promises"): a workload runs while the target builds, and the moment the
+/// definition reports `live`, with no step past the flip, a watermark token
+/// taken after a later write is already met and the target equals a
+/// from-scratch `GROUP BY`.
+///
+/// The workload covers what the facade-level oracle tests in
+/// `defs_exact_integers.rs` and `defs_floats.rs` raced against the build
+/// before #728: group moves, the `NULL` group (entered by Apply before any
+/// chunk and by chunks after), a group emptied mid-build across chunked and
+/// unchunked keys, a group created and emptied within the build, and groups
+/// losing their `MAX`. Each round's write is read by the next chunks before
+/// it drains, and by later chunks after it drains.
+///
+/// Group 50 loses its `MAX` through the merger alone: Apply counts keys 7
+/// (v 10000) and 8 into it before the plan, and the first chunk then reads
+/// key 7 lowered to 1 before that change drains, so only its delta row says
+/// a value left the group. The merge must recompute the group rather than
+/// fold, and no later page writes it to cover for a fold.
+#[tokio::test]
+async fn a_target_reporting_live_meets_a_token_and_the_oracle_after_a_build_under_writes() {
+    let mut f = Fixture::new(200, &[AGG_WIDE]).await;
+    f.pass().await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+
+    // Before any chunk, by Apply alone: two keys into the `NULL` group, a
+    // new group 99, and keys 7 and 8 into group 50 with 7 its `MAX`.
+    f.raw
+        .batch_execute(
+            "update public.src set g = null where id in (2, 150); \
+             insert into public.src values (5000, 99, 5); \
+             update public.src set g = 50, v = 10000 where id = 7; \
+             update public.src set g = 50 where id = 8",
+        )
+        .await
+        .expect("write before the plan");
+    f.drain().await;
+    assert_eq!(f.step(&OPTIONS).await, Step::Planned);
+
+    // Group 50's `MAX` leaves through the first chunk (keys 1 to 10), which
+    // reads the change before it drains.
+    f.raw
+        .batch_execute("update public.src set v = 1 where id = 7")
+        .await
+        .expect("lower group 50's MAX");
+    assert_eq!(f.step(&OPTIONS).await, Step::Chunk);
+    assert_eq!(
+        f.count("select count(*) from public.agg__deltas where g = 50")
+            .await,
+        1,
+        "the chunk's delta row for group 50"
+    );
+    f.drain().await;
+
+    let mut steps = Vec::new();
+    for round in 0..6 {
+        let base = round * 30;
+        // The moves and the `+ 1`s reach a key in every chunk, so the next
+        // chunk to run reads one of each before it drains. None touches
+        // group 50.
+        let mut sql = format!(
+            "update public.src set g = null where id = {null}; \
+             update public.src set g = (g + 1) % 6 where id % 10 = {round} and g <> 50; \
+             update public.src set v = v + 1 where id % 10 = {plus} and g is distinct from 50; \
+             update public.src set v = v + 1000 where id = {raised}; \
+             delete from public.src where id = {deleted};",
+            null = base + 3,
+            plus = round + 5,
+            raised = base + 20,
+            deleted = base + 26,
+        );
+        sql.push_str(match round {
+            // Group 6 emptied, over keys chunked and not; nothing moves
+            // into it again (`% 6`).
+            2 => "delete from public.src where g = 6;",
+            // Out of the `NULL` group again.
+            3 => "update public.src set g = 4 where id = 2;",
+            // The group created before the plan, emptied.
+            4 => "delete from public.src where g = 99;",
+            // Group 1 loses its `MAX`.
+            5 => {
+                "delete from public.src where id = \
+                 (select id from public.src where g = 1 order by v desc, id limit 1);"
+            }
+            _ => "",
+        });
+        f.raw.batch_execute(&sql).await.expect("write");
+        // Chunks (and merges) read the write before it drains, then more
+        // after.
+        for _ in 0..2 {
+            steps.push(f.step(&OPTIONS).await);
+        }
+        f.drain().await;
+        steps.push(f.step(&OPTIONS).await);
+    }
+
+    // Step only until the flip, and not one step past it.
+    let mut live = false;
+    for _ in 0..MAX_STEPS {
+        f.drain().await;
+        let step = f.step(&OPTIONS).await;
+        steps.push(step);
+        if f.status("agg").await.as_deref() == Some("live") {
+            live = true;
+            break;
+        }
+        assert!(
+            step.progressed(),
+            "the build stalled before live: {steps:?}"
+        );
+    }
+    assert!(
+        live,
+        "the build did not reach live within {MAX_STEPS} steps"
+    );
+    assert!(
+        steps.contains(&Step::Chunk) && steps.contains(&Step::Merged),
+        "the build went through chunks and the merger: {steps:?}"
+    );
+
+    // Once `live`, a write's token covers it (ADR-0002): drained, a token
+    // taken after it is already met, with no wait.
+    f.raw
+        .batch_execute(
+            "update public.src set g = null where id = 199; \
+             delete from public.src where id = 33",
+        )
+        .await
+        .expect("write after live");
+    f.drain().await;
+    let trellis = f.trellis().await;
+    let token = trellis.watermark_token().await.expect("watermark_token");
+    trellis
+        .await_converged(token, Duration::ZERO)
+        .await
+        .expect("a drained ring meets the token at once");
+    trellis.shutdown().await.expect("shutdown");
+
+    assert_eq!(
+        f.count("select count(*) from public.agg__deltas").await,
+        0,
+        "live leaves no delta behind"
+    );
+    let differences = f
+        .count(
+            "with expected as ( \
+                 select g, sum(v) as total, max(v) as biggest, avg(v) as mean, count(*) as n \
+                 from public.src group by g \
+             ), \
+             actual as (select g, total, biggest, mean, n from public.agg) \
+             select (select count(*) from (table expected except table actual) missing) \
+                  + (select count(*) from (table actual except table expected) extra)",
+        )
+        .await;
+    assert_eq!(differences, 0, "the live target equals the oracle");
+    // The cases the workload is for are really in the outcome.
+    assert_eq!(
+        f.count("select count(*) from public.agg where g is null")
+            .await,
+        1,
+        "the NULL group is there"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.agg where g in (6, 99)")
+            .await,
+        0,
+        "the emptied groups are gone"
+    );
+    assert_eq!(
+        f.count("select biggest::bigint from public.agg where g = 50")
+            .await,
+        8,
+        "group 50's MAX is key 8's, after key 7 left it"
+    );
+}
+
 /// The flip waits for the last merge (B7): with every chunk done but deltas
 /// still pending, the definition stays `backfilling`, and the merge that
 /// empties the delta table moves it to `live`.

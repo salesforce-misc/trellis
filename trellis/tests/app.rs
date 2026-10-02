@@ -4,6 +4,9 @@
 
 use std::collections::HashMap;
 
+#[path = "support/wait_live.rs"]
+mod wait_live;
+
 use testkit::TestCluster;
 use trellis::defs::{all_source_tables, create_definition, create_relationship};
 use trellis::{Config, Trellis, TrellisOptions};
@@ -409,6 +412,7 @@ async fn the_background_client_runs_in_the_configured_schema_not_the_process_def
     )
     .await
     .expect("connect running trellis in the configured schema");
+    wait_live::wait_for_live(&running, "widget_prices").await;
 
     pool.get()
         .await
