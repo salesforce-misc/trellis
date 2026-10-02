@@ -24,12 +24,11 @@
 //! the late delta arrives (still in the ring, or released from quarantine),
 //! and whether it is on the source or on a relationship's to-side table.
 //!
-//! The source-keyed aggregate here is a `MAX`, which still takes the direct
-//! build: a plain `SUM` is the Re-derive build's since #625 F3, which has
-//! no catch-up and no horizon. A `MAX` can't show a change counted twice, so
-//! #442's source-keyed tests now pin only the old path's flow; the
-//! relationship-keyed one (`region_totals`, a `SUM` grouped through a
-//! relationship, still on the old build until #625 F9) keeps its teeth.
+//! The source-keyed aggregate here is `sum(amount + 0)`: an expression
+//! argument keeps it on the direct build and its go-live catch-up until
+//! #625 F5, where a plain `sum(amount)` is the Re-derive build's since F3,
+//! with no catch-up and no horizon. A `SUM` still shows a change counted
+//! twice.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -220,7 +219,7 @@ fn cdc_insert(src_table: &str, key: &str, lsn: PgLsn, new_image: &str) -> Staged
 /// Issue #476's repro is the same schedule read at the moment the definition
 /// reports `live`: that used to be the build's completion, with the target
 /// still at `12`. Now the build leaves it `catching_up`, and only the
-/// catch-up's discharge, with `1000` in the target once its enumeration
+/// catch-up's discharge, with `1012` in the target once its enumeration
 /// drains, takes it `live`.
 #[tokio::test]
 async fn aggregate_build_recovers_a_change_drained_during_the_build() {
@@ -242,7 +241,7 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -278,7 +277,7 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
         total_of_sku_a(&client).await,
-        "7",
+        "12",
         "the build's own read misses the change that drained while it ran"
     );
     assert_eq!(
@@ -296,7 +295,7 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     assert_eq!(
         total_of_sku_a(&client).await,
-        "1000",
+        "1012",
         "at live, the change drained while the build was running is folded in"
     );
 }
@@ -318,7 +317,7 @@ async fn seed_sales(client: &Client) {
 async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
     let definition = install_definition(
         pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -354,12 +353,12 @@ async fn assert_the_read_change_is_counted_once(pool: &trellis::Pool, client: &m
     drain_to_quiescence(pool, client).await;
     assert_eq!(
         total_of_sku_a(client).await,
-        "1000",
+        "1012",
         "the change the build read is counted once, not again by its drained delta"
     );
     discharge_markers(pool, client).await;
     assert_eq!(status_of(client, "public.sku_totals").await, "live");
-    assert_eq!(total_of_sku_a(client).await, "1000");
+    assert_eq!(total_of_sku_a(client).await, "1012");
 }
 
 /// Issue #442: a change committed *before* the build reads the source, whose
@@ -787,7 +786,7 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
         .expect("create + seed sales");
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -893,7 +892,7 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
             .expect("read sku_totals")
             .get(0)
     };
-    assert_eq!(read_a(&client).await, "1007", "the rebuild read the change");
+    assert_eq!(read_a(&client).await, "1012", "the rebuild read the change");
 
     // The superseded job now reaches its writes, is fenced out of them, and
     // gives up its claim, which discards it.
@@ -914,7 +913,7 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
         .expect("drop the build hold");
     assert_eq!(
         read_a(&client).await,
-        "1007",
+        "1012",
         "the superseded job didn't overwrite the rebuild's read"
     );
     assert!(

@@ -2161,11 +2161,10 @@ mod tests {
 
 #[cfg(test)]
 mod catch_up_tests {
-    //! The rollups here are `MAX`es, so they still take the old build and its
-    //! go-live catch-up: a plain `SUM` is the Re-derive build's since #625
-    //! F3, which parks no marker. A `MAX` can't show a change counted twice,
-    //! so the tests that named a double count now pin the old path's flow and
-    //! its orphan sweeps; the Re-derive build's own interleavings are in
+    //! The rollups that need the old build and its go-live catch-up sum
+    //! `a + 0`: an expression argument keeps them there until #625 F5, where
+    //! a plain `SUM` is the Re-derive build's since F3, which parks no
+    //! marker. The Re-derive build's own interleavings are in
     //! `tests/build_interleavings.rs` and `tests/rederive_build.rs`.
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3506,7 +3505,7 @@ mod catch_up_tests {
     }
 
     /// `public.orders` (group `g = 0` holds ids 2, 4, 6 and group 1 holds 1,
-    /// 3, 5, with `a = id`) maxed by `order_rollup`, built, paused, changed
+    /// 3, 5, with `a = id`) summed by `order_rollup`, built, paused, changed
     /// by `gap`, and resumed, with the resume's marker settled and ready to
     /// discharge. Returns a same-crate pool and the discharging connection.
     async fn resumed_rollup(
@@ -3533,7 +3532,7 @@ mod catch_up_tests {
         .collect();
         crate::defs::install_definition(
             &pool,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT max(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
             &columns,
             "public",
         )
@@ -3658,7 +3657,7 @@ mod catch_up_tests {
 
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "100".to_string()), (1, "5".to_string())],
+            vec![(0, "100".to_string()), (1, "9".to_string())],
             "group 0 is rebuilt from its new row alone, counted once"
         );
     }
@@ -3688,7 +3687,7 @@ mod catch_up_tests {
 
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "6".to_string())],
+            vec![(0, "12".to_string())],
             "group 1 went extinct after the dispatch sweep ran; the go-live sweep drops it"
         );
     }
@@ -3743,7 +3742,7 @@ mod catch_up_tests {
 
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "100".to_string()), (1, "5".to_string())],
+            vec![(0, "100".to_string()), (1, "9".to_string())],
             "group 0 holds only its new row: the deletes the build already read don't reach it"
         );
     }
@@ -3892,7 +3891,7 @@ mod catch_up_tests {
     }
 
     /// `public.orders` (group 0 holds ids 2, 4, 6 and group 1 holds 1, 3, 5,
-    /// with `a = id`), rolled up by `order_rollup` and copied 1-1 by
+    /// with `a = id`), summed by `order_rollup` and copied 1-1 by
     /// `order_copy`, registered in that order. Returns a same-crate pool and
     /// a connection.
     async fn orders_with_rollup_and_copy(
@@ -3991,7 +3990,7 @@ mod catch_up_tests {
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) = orders_with_rollup_and_copy(
             &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT max(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
         )
         .await;
         park_registration_markers(&discharger, &["public.orders".to_string()])
@@ -4017,7 +4016,7 @@ mod catch_up_tests {
         finish_builds(&pool, &chunks).await;
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "6".to_string()), (1, "5".to_string())],
+            vec![(0, "12".to_string()), (1, "9".to_string())],
             "the build counted id 3, and its delete was skipped"
         );
 
@@ -4054,7 +4053,7 @@ mod catch_up_tests {
 
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "6".to_string()), (1, "100".to_string())],
+            vec![(0, "12".to_string()), (1, "100".to_string())],
             "group 1 holds only its new row"
         );
         assert_eq!(copy_ids(&discharger).await, vec![2, 4, 6, 10]);
@@ -4078,7 +4077,7 @@ mod catch_up_tests {
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) = orders_with_rollup_and_copy(
             &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT max(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
         )
         .await;
         settle_registrations(&pool).await;
@@ -4138,7 +4137,7 @@ mod catch_up_tests {
         // it out of group 1: the stale row the rebuild leaves is ids 1 and 5.
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "6".to_string()), (1, "5".to_string())],
+            vec![(0, "12".to_string()), (1, "6".to_string())],
             "group 1 still holds its pre-rebuild value"
         );
 
@@ -4177,7 +4176,7 @@ mod catch_up_tests {
 
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "6".to_string()), (1, "100".to_string())],
+            vec![(0, "12".to_string()), (1, "100".to_string())],
             "group 1 holds only its new row"
         );
         assert_eq!(copy_ids(&discharger).await, vec![2, 4, 6, 10]);
