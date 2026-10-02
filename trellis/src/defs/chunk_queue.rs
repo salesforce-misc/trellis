@@ -315,7 +315,7 @@ pub(crate) async fn dispatch_one_to_one(
 ///
 /// Clears `build`: a definition paused during a Re-derive build and resumed
 /// onto this path is no longer under one, so it must not apply while this
-/// build runs (`Definition::applies`, #625 F2).
+/// build runs (`defs::model::APPLYING_SQL`, #625 F2).
 async fn start_backfilling(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,

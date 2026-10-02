@@ -1149,3 +1149,210 @@ async fn a_sweep_batch_rederives_stale_live_entries_in_bounded_windows() {
     f.drain().await;
     f.assert_agg_oracle().await;
 }
+
+/// The sweep picks an entry Apply alone wrote (#625 F3, review): a key
+/// inserted after the build is counted by its insert's change, with no
+/// `basis`, and no chunk of a rebuild reaches it once its row is deleted
+/// while the definition is frozen. The sweep's `basis is null` arm retires
+/// it.
+#[tokio::test]
+async fn a_rebuild_sweeps_a_deleted_key_only_apply_had_counted() {
+    let mut f = Fixture::new(30, &[AGG]).await;
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.raw
+        .batch_execute("insert into public.src values (100, 3, 1000), (101, 4, 2000)")
+        .await
+        .expect("insert after the build");
+    f.drain().await;
+    assert_eq!(
+        f.count(
+            "select count(*) from public.agg__ledger \
+             where __from_key in ('100', '101') and __basis is null \
+               and __member and not __tombstone"
+        )
+        .await,
+        2,
+        "Apply alone counted the new keys"
+    );
+
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM agg").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.src where id = 100")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+    f.pass().await;
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// The sweep reads the source by a composite key's typed parts (#625 F3,
+/// review): text parts holding the key encoding's separator, its NULL
+/// sentinel, a backslash and a quote, beside a `timestamptz` part. A live
+/// key the sweep re-derives is found and kept; a key deleted while frozen
+/// is retired.
+#[tokio::test]
+async fn a_rebuild_sweeps_a_composite_typed_key() {
+    let mut f = Fixture::new(0, &[]).await;
+    f.raw
+        .batch_execute(
+            "create table public.csrc (a text, t timestamptz, g integer, v bigint, \
+                 primary key (a, t)); \
+             insert into public.csrc \
+             select k, timestamptz '2024-01-01 00:00:00+00' + i * interval '1 hour 0.5 seconds', \
+                    i % 3, i \
+             from generate_series(1, 40) i, \
+                  lateral (select (array['x', 'y' || chr(31) || 'z', 'q' || chr(1), \
+                                         'b\\s', 'o''q', ''])[1 + i % 6] || i as k) s",
+        )
+        .await
+        .expect("seed the composite source");
+    let columns = [
+        ("a".to_string(), ValueType::Text),
+        ("g".to_string(), ValueType::Numeric),
+        ("v".to_string(), ValueType::Numeric),
+    ]
+    .into_iter()
+    .collect();
+    trellis::defs::install_definition(
+        &f.db.pool,
+        "TRANSFORM cagg FROM public.csrc GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("register");
+    let actual = "select (g, total, n)::text from public.cagg order by g";
+    let expected = "select (g, sum(v), count(*))::text from public.csrc group by g order by g";
+    f.pass().await;
+    f.run("cagg").await;
+    assert_eq!(f.status("cagg").await.as_deref(), Some("live"));
+    assert_eq!(f.rows(actual).await, f.rows(expected).await);
+
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM cagg").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.csrc where v % 4 = 0")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis
+        .apply("RESUME TRANSFORM cagg")
+        .await
+        .expect("resume");
+    f.pass().await;
+    assert_eq!(f.build("cagg").await.as_deref(), Some("rederive"));
+    f.run("cagg").await;
+    assert_eq!(f.status("cagg").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.count("select count(*) from public.cagg__ledger where __member and not __tombstone")
+            .await,
+        30,
+        "every live row's entry is live, and only those"
+    );
+    assert_eq!(f.rows(actual).await, f.rows(expected).await);
+
+    // The rebuild's chunks re-derived every live key, so its sweep picked
+    // only the deleted ones. A sweep from a later start picks the live ones
+    // too, and must find each one's row by its typed parts.
+    let pool = f.db.pool.clone();
+    let plan = BuildPlan::load(&pool, "cagg")
+        .await
+        .expect("load")
+        .expect("a re-derive shape");
+    let start_xid: String = f
+        .raw
+        .query_one("select pg_current_xact_id()::text", &[])
+        .await
+        .expect("a start xid")
+        .get(0);
+    let mut cursor: Option<String> = None;
+    let mut rederived = 0;
+    loop {
+        let mut client = pool.get().await.expect("pool");
+        let txn = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await
+            .expect("begin");
+        let outcome = build::sweep_batch(&txn, &plan, &start_xid, cursor.as_deref(), 7)
+            .await
+            .expect("sweep batch");
+        txn.commit().await.expect("commit");
+        rederived += outcome.rederived;
+        cursor = outcome.next.clone();
+        if outcome.finished {
+            break;
+        }
+    }
+    assert_eq!(rederived, 30, "every live entry predates the later start");
+    assert_eq!(
+        f.count("select count(*) from public.cagg__ledger where __member and not __tombstone")
+            .await,
+        30,
+        "the sweep found every live key's row"
+    );
+    {
+        let mut client = pool.get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        build::merge_deltas(&txn, &plan, 10_000)
+            .await
+            .expect("merge");
+        txn.commit().await.expect("commit the merge");
+    }
+    assert_eq!(f.rows(actual).await, f.rows(expected).await);
+}
+
+/// The backfill discharge never dispatches a definition the Re-derive build
+/// takes (#625 F3, `plan_waiting_builds`' skip), even a discharge with no
+/// `ready` list over a marker on its source: it is left
+/// `waiting_to_backfill` for the staging worker's start.
+#[tokio::test]
+async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
+    let mut f = Fixture::new(20, &[AGG]).await;
+    f.raw
+        .batch_execute("insert into pending_backfill (table_name) values ('public.src')")
+        .await
+        .expect("park a marker on the source");
+    for _ in 0..100 {
+        trellis::intake::markers::run_pending_backfills(
+            &mut f.raw,
+            WAKE,
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("discharge");
+        if f.count("select count(*) from pending_backfill").await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        f.count("select count(*) from pending_backfill").await,
+        0,
+        "the marker discharged"
+    );
+    assert_eq!(
+        f.status("agg").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks").await,
+        0,
+        "no old build was dispatched"
+    );
+
+    f.pass().await;
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}

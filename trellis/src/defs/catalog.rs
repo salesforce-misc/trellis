@@ -5722,7 +5722,7 @@ struct PendingDefinition {
 /// lateral`) matters: a definition whose `source_columns` is `{}` must still
 /// come back with zero entries, not disappear from the result entirely.
 ///
-/// **Applying definitions only** ([`super::model::Definition::applies`]:
+/// **Applying definitions only** ([`super::model::APPLYING_SQL`]:
 /// `live` or `catching_up`, or `backfilling` under a Re-derive build, which
 /// applies from its start, #625 F2; the public API design's ADR-0007 amendment,
 /// closing the CDC race commit 1fa8570 reopened): a `waiting_to_backfill`/
