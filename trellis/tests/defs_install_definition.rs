@@ -59,6 +59,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // #625 F8a: a plain 1-1 over a captured table is the Re-derive
+            // build's, which the drain workers run to `live` on their own.
+            trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
             trellis::intake::markers::discharge_registrations(pool)
@@ -306,6 +309,11 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
 /// `backfill_definition` never persists to `backfill_chunks`), so it alone
 /// would not have caught the #121 over-chunking bug; this test is the one
 /// that does, for the durable-queue path `install_definition` actually uses.
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// which plans no `range` chunks, so `widgets` is made to read as another
+/// definition's target (`feed_from_a_test_definition`): the shape the
+/// chunked build still owns.
 #[tokio::test]
 async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_exactly_two_chunks()
 {
@@ -321,6 +329,12 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
         )
         .await
         .expect("seed widgets with a composite primary key");
+    trellis::intake::markers::feed_from_a_test_definition(
+        &client,
+        &qualify_fixture_table("widgets"),
+    )
+    .await
+    .expect("make widgets read as a seam-fed source");
 
     let cols = numeric(&["a", "b"]);
     let def = install_definition(
@@ -411,9 +425,30 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
 /// that reconstruction actually carries the persisted qualified source
 /// through rather than re-deriving a bare one from re-parsed
 /// `definition_text`.
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's
+/// (whose plan and chunks also read the definition back from the catalog),
+/// so the chunked build is kept on the decoy by making `custom.orders` read
+/// as a seam-fed source (`feed_from_a_test_definition`), the shape it still
+/// owns; the sibling below runs the same check through the Re-derive build.
 #[tokio::test]
 async fn install_definition_fast_path_reads_the_explicitly_qualified_source_not_a_same_named_decoy()
 {
+    explicitly_qualified_source_is_read_not_a_same_named_decoy(true).await;
+}
+
+/// #625 F8a: [`install_definition_fast_path_reads_the_explicitly_qualified_source_not_a_same_named_decoy`]'s
+/// check through the Re-derive build, which builds a plain 1-1 over a
+/// captured table: its plan and chunk SQL must read `custom.orders`, not the
+/// `public.orders` decoy.
+#[tokio::test]
+async fn rederive_build_reads_the_explicitly_qualified_source_not_a_same_named_decoy() {
+    explicitly_qualified_source_is_read_not_a_same_named_decoy(false).await;
+}
+
+/// The decoy tests' body: `seam_fed` makes `custom.orders` read as another
+/// definition's target, which keeps the definition on the chunked build.
+async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bool) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -428,6 +463,11 @@ async fn install_definition_fast_path_reads_the_explicitly_qualified_source_not_
         )
         .await
         .expect("seed the public.orders decoy and the real custom.orders");
+    if seam_fed {
+        trellis::intake::markers::feed_from_a_test_definition(&client, "custom.orders")
+            .await
+            .expect("make custom.orders read as a seam-fed source");
+    }
 
     let cols = numeric(&["price"]);
     install_definition(
@@ -438,6 +478,25 @@ async fn install_definition_fast_path_reads_the_explicitly_qualified_source_not_
     )
     .await
     .expect("install_definition against the explicitly-qualified source");
+
+    // The shape picks the build under test: the dispatch starts a Re-derive
+    // build (`build = 'rederive'`) or plans the chunked build's ranges.
+    trellis::intake::markers::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the build");
+    let build: Option<String> = client
+        .query_one(
+            "select build from transform_definitions where target_table = 'public.order_totals'",
+            &[],
+        )
+        .await
+        .expect("read which build runs")
+        .get(0);
+    assert_eq!(
+        build.as_deref() == Some("rederive"),
+        !seam_fed,
+        "the shape picks the build under test: {build:?}"
+    );
 
     // The fast path's chunk work is enumerated, not executed in-call
     // (docs/decisions/0007's amendment) — drive it to completion the way a

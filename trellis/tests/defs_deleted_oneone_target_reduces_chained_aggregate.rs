@@ -48,6 +48,8 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// chunk. Both `order_view` (this file's 1-1 mirror) and `customer_totals`
 /// (an aggregate, whose direct build is a background job since #419) need
 /// this. Mirrors `defs_install_definition.rs`'s helper of the same name.
+/// #625 F8a: `order_view`, a plain 1-1 over a captured table, is the
+/// Re-derive build's, which this runs to `live` once the chunks are done.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
@@ -62,6 +64,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            trellis::staging::build::settle_builds(pool).await;
             return;
         }
         for chunk in &claimed {

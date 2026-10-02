@@ -49,7 +49,8 @@ use testkit::crash::OpenTransaction;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{
-    TransformStatus, ValueType, chunk_queue, create_definition, install_definition,
+    TransformStatus, ValueType, chunk_queue, create_definition, create_relationship,
+    install_definition,
 };
 use trellis::intake::markers;
 use trellis::staging::apply;
@@ -402,6 +403,12 @@ async fn evict_keys_for_real(
 /// `backfilling`/`live` once the straggler commits and the staging worker's
 /// reconcile pass discharges the marker, with the target correctly
 /// populated from every pre-existing source row.
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// which applies from its start and takes no fence
+/// ([`a_plain_one_to_one_is_not_held_by_the_xmin_fence`]). The fenced
+/// discharge is kept by a 1-1 that also counts over a to-many relationship,
+/// which still takes the old direct build and its go-live catch-up.
 #[tokio::test]
 async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     let cluster = TestCluster::start();
@@ -410,10 +417,15 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 
     raw.batch_execute(
         "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 25) g",
+         insert into s (id, a) select g, g from generate_series(1, 25) g; \
+         create table kids (id bigint primary key, s_id bigint); \
+         insert into kids (id, s_id) select g, g % 5 + 1 from generate_series(1, 20) g",
     )
     .await
     .expect("seed source table");
+    create_relationship(&db.pool, "RELATIONSHIP kids FROM s.id TO kids.s_id")
+        .await
+        .expect("a to-many relationship");
 
     // A straggler holds an xid open before the table is captured, so the
     // marker the reconcile pass parks must name it as in-flight.
@@ -426,7 +438,7 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     let cols = numeric(&["a"]);
     let def = install_definition(
         &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x",
+        "TRANSFORM t FROM s SELECT a + a AS x, COUNT(kids.id) AS n",
         &cols,
         "public",
     )
@@ -470,10 +482,14 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 
     // A reconcile pass while the straggler is still open installs the
     // capture and parks the marker, and must leave the definition exactly
-    // where it was — no flicker, no partial progress.
+    // where it was — no flicker, no partial progress. (`kids`, captured for
+    // the relationship, gets a marker of its own.)
     reconcile_pass(&db.pool, &mut raw).await;
     let markers: i64 = raw
-        .query_one("select count(*) from pending_backfill", &[])
+        .query_one(
+            "select count(*) from pending_backfill where table_name = $1",
+            &[&qualify_fixture_table("s")],
+        )
         .await
         .expect("count markers")
         .get(0);
@@ -492,9 +508,9 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 
     reconcile_pass(&db.pool, &mut raw).await;
 
-    // The pass only *dispatches* the build (for this plain
-    // 1-1 definition, its chunks); running the chunks is what actually
-    // populates the target and takes the definition `live`.
+    // The pass only *dispatches* the build (for this definition, its
+    // direct-build job); running the job is what actually populates the
+    // target, and its go-live catch-up takes the definition `live`.
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
@@ -506,7 +522,8 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     let mismatches: i64 = raw
         .query_one(
             "select count(*) from s left join t on t.id = s.id \
-             where t.id is null or t.x is distinct from s.a + s.a",
+             where t.id is null or t.x is distinct from s.a + s.a \
+                or t.n is distinct from (select count(*) from kids where kids.s_id = s.id)",
             &[],
         )
         .await
@@ -516,6 +533,73 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
         mismatches, 0,
         "the deferred backfill must populate every pre-existing source row correctly"
     );
+}
+
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// which applies from the commit that starts it and reads its chunks under
+/// the key's ledger entry, so it takes no fence: a straggler open from
+/// before the source was captured doesn't hold it in `waiting_to_backfill`
+/// (contrast [`a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live`]).
+/// It starts on the reconcile pass and builds to `live` while the straggler
+/// is still open, with every pre-existing source row.
+#[tokio::test]
+async fn a_plain_one_to_one_is_not_held_by_the_xmin_fence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+
+    raw.batch_execute(
+        "create table s (id bigint primary key, a numeric); \
+         insert into s (id, a) select g, g from generate_series(1, 25) g",
+    )
+    .await
+    .expect("seed source table");
+    let straggler = OpenTransaction::begin(db.dsn()).await;
+    straggler.execute("select txid_current()").await;
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &numeric(&["a"]),
+        "public",
+    )
+    .await
+    .expect("install_definition");
+    reconcile_pass(&db.pool, &mut raw).await;
+    let build: Option<String> = raw
+        .query_one(
+            &format!(
+                "select build from transform_definitions \
+                 where target_table = '{DEFAULT_TARGET_SCHEMA}.t'"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the build")
+        .get(0);
+    assert_eq!(
+        (status_of(&raw, "t").await, build.as_deref()),
+        (TransformStatus::Backfilling, Some("rederive")),
+        "the reconcile pass starts the Re-derive build under the open straggler"
+    );
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        status_of(&raw, "t").await,
+        TransformStatus::Live,
+        "the build goes live while the straggler is still open"
+    );
+    let mismatches: i64 = raw
+        .query_one(
+            "select count(*) from s left join t on t.id = s.id \
+             where t.id is null or t.x is distinct from s.a + s.a",
+            &[],
+        )
+        .await
+        .expect("compare s and t")
+        .get(0);
+    assert_eq!(mismatches, 0, "the build populates every source row");
+    straggler.commit().await;
 }
 
 /// Whole-transform quarantine resume (ADR-0003's coarser fuse tier):
@@ -1111,14 +1195,22 @@ async fn backfill_failures_listed(
 /// attempt count, last error and next attempt. Once the cause is fixed, a
 /// fresh `request_backfill` resets the backoff, the next attempt goes through
 /// and the failure clears.
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// whose start reads no key (a failing plan job shows through status as a
+/// failing chunk, #616). The marker discharge that fails on the missing key
+/// is the old paths', which a 1-1 that also reads through a to-one
+/// relationship still takes (its source is enumerated into the ring), so
+/// both readers do.
 #[tokio::test]
 async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(
-        "create table public.widgets (id bigint primary key, price numeric); \
-         insert into public.widgets values (1, 2);",
+        "create table public.makers (id bigint primary key, name text); \
+         create table public.widgets (id bigint primary key, price numeric, maker_id bigint); \
+         insert into public.widgets values (1, 2, null);",
     )
     .await
     .expect("seed the source");
@@ -1129,16 +1221,23 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     .await
     .expect("connect a define-only Trellis");
     trellis
-        .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
+        .apply("RELATIONSHIP maker FROM widgets.maker_id TO makers.id")
         .await
-        .expect("register a plain 1-1 transform");
+        .expect("a to-one relationship");
+    trellis
+        .apply(
+            "TRANSFORM widget_totals FROM widgets \
+             SELECT price + price AS total, maker.name AS maker",
+        )
+        .await
+        .expect("register a 1-1 transform");
     // A second reader of the same source, so the listing shows the one
     // marker's failure on both (issue #461).
     trellis
-        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price, maker.name AS maker")
         .await
         .expect("register a second transform on the same source");
-    // Their build plans chunks over the source's primary key, so without one
+    // Their build enumerates the source by its primary key, so without one
     // every discharge of the source's marker fails.
     raw.batch_execute("alter table public.widgets drop constraint widgets_pkey")
         .await
@@ -1217,7 +1316,7 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     assert_eq!(status.backfill_failure, None);
     assert_eq!(
         status.status,
-        TransformStatus::Backfilling,
-        "the retry dispatched the build"
+        TransformStatus::Live,
+        "the retry enumerated the source into the ring, which takes it live"
     );
 }

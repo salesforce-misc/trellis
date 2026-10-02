@@ -1749,6 +1749,12 @@ mod tests {
         ))
         .await
         .expect("seed source");
+        // The old chunked build is a seam-fed source's since #625 F8a: over
+        // a captured table, a plain 1-1 is the Re-derive build's, and a
+        // resume would park it no marker.
+        crate::intake::markers::feed_from_a_test_definition(raw, &format!("public.{source}"))
+            .await
+            .expect("make the source another definition's target");
         let id: i64 = raw
             .query_one(
                 "insert into transform_definitions \

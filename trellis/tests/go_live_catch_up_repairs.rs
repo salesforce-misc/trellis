@@ -34,7 +34,9 @@
 //! no xid when the trigger fires, so the build held there doesn't hold back
 //! the seal gate; the first runs in the load's transaction, and the tests
 //! seal nothing while it's held. The chunked 1-1 test drives
-//! `claim_chunks` / `run_claimed_chunk` / `finish_chunk` by hand.
+//! `claim_chunks` / `run_claimed_chunk` / `finish_chunk` by hand, over a
+//! seam-fed source: over a captured one a plain 1-1 is the Re-derive
+//! build's since #625 F8a.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -402,6 +404,12 @@ async fn a_group_emptied_during_the_build_is_gone_at_live() {
 /// chunk finishes, and its delete drains while the definition is
 /// `backfilling`, so apply skips it. The go-live re-read only visits keys
 /// the source still has, so only the orphan sweep removes key `4`.
+///
+/// `sales` is made to read as another definition's target
+/// ([`markers::feed_from_a_test_definition`]; no staging worker runs here):
+/// #625 F8a gives a plain 1-1 over a captured table to the Re-derive build,
+/// which applies from its start and has no catch-up, and the chunked build
+/// and go-live catch-up this pins survive for a seam-fed source.
 #[tokio::test]
 async fn a_one_to_one_row_deleted_during_the_build_is_gone_at_live() {
     use trellis::defs::chunk_queue;
@@ -416,6 +424,9 @@ async fn a_one_to_one_row_deleted_during_the_build_is_gone_at_live() {
         )
         .await
         .expect("create + seed sales");
+    markers::feed_from_a_test_definition(&client, "public.sales")
+        .await
+        .expect("make sales another definition's target");
     install_definition(
         &db.pool,
         "TRANSFORM sales_copy FROM sales SELECT amount AS amt",

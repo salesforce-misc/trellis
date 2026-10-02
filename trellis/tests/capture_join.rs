@@ -1236,8 +1236,10 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
     assert_eq!(paused, 0, "b2 unpaused once its capture covered it");
 }
 
-/// Claims, runs and finishes every pending backfill chunk: the hand-driven
-/// stand-in for a drain worker's build half (as in `capture_schema_change.rs`).
+/// Claims, runs and finishes every pending backfill chunk, then runs every
+/// Re-derive build to its end (a plain 1-1 over a captured table is one
+/// since #625 F8a): the hand-driven stand-in for a drain worker's build half
+/// (as in `capture_schema_change.rs`).
 async fn run_backfill_chunks(pool: &trellis::Pool) {
     use trellis::defs::chunk_queue;
     const CLAIMED_BY: &str = "capture_join_backfill";
@@ -1248,6 +1250,7 @@ async fn run_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            trellis::staging::build::settle_builds(pool).await;
             return;
         }
         for chunk in &claimed {

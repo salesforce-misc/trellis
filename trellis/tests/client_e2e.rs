@@ -170,6 +170,14 @@ async fn oracle_snapshot(
         .collect()
 }
 
+/// The kinds of a Re-derive build's work rows (#625), which
+/// `chunk_queue::claim_chunks` (the old builds' kinds only) never claims.
+const REDERIVE_BUILD_KINDS: [&str; 3] = [
+    chunk_queue::KIND_PLAN,
+    chunk_queue::KIND_REDERIVE,
+    chunk_queue::KIND_SWEEP,
+];
+
 /// Ages every claim the simulated `"dead-worker"` holds an hour into the
 /// past, so it's stale under any `reclaim_ttl` and the client's first chunk
 /// sweep frees it. The reclaim tests below do this instead of running the
@@ -716,6 +724,10 @@ async fn staging_and_application_threads_are_independent_knobs() {
 /// finished build. The workers poll every 10ms, far below the 200ms default,
 /// so that interleaving happens on almost every run instead of only when load
 /// slows the discharge loop down, and the wait is shown to handle it.
+///
+/// #625 F8a: over a captured table a plain 1-1 is the Re-derive build's, so
+/// the discharge enqueues its plan job, the drain workers plan and run its
+/// chunks, and the build ends `live` with no catch-up.
 #[tokio::test]
 async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     let cluster = TestCluster::start();
@@ -829,14 +841,19 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
 /// else in a fleet running *no* `staging_worker: true` client anywhere would
 /// ever sweep it.
 ///
-/// This simulates exactly that crash: a chunk is claimed by a `"dead-worker"`
-/// that never executes or finishes it — *before* any `Client` exists at
-/// all — then a single `staging_worker: false` client is started and must,
-/// entirely on its own, reclaim that stale claim, execute it, and complete
-/// the definition's build (`catching_up`: with no staging worker, its go-live
-/// catch-up isn't discharged, issue #476). The dead claim is backdated past the default
-/// `reclaim_ttl` (see [`backdate_dead_claims`]) rather than the client being
-/// given a tiny TTL, so the client's first sweep frees it at once.
+/// This simulates exactly that crash: a build's work row is claimed by a
+/// `"dead-worker"` that never executes or finishes it — *before* any
+/// `Client` exists at all — then a single `staging_worker: false` client is
+/// started and must, entirely on its own, reclaim that stale claim, execute
+/// it, and complete the definition's build. The dead claim is backdated past
+/// the default `reclaim_ttl` (see [`backdate_dead_claims`]) rather than the
+/// client being given a tiny TTL, so the client's first sweep frees it at
+/// once.
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
+/// the dead claim is on its one `plan` job (the only row the discharge
+/// enqueues), and the build ends `live` (it has no go-live catch-up). Until
+/// the claim is freed nothing plans the chunks, so the build can't finish.
 #[tokio::test]
 async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker_anywhere() {
     let cluster = TestCluster::start();
@@ -861,19 +878,20 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
-    // discharge, which dispatches the chunked build (ADR-0016, #418).
+    // discharge, which starts the Re-derive build (#625 F8a).
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
-        .expect("dispatch the chunked build");
+        .expect("start the re-derive build");
 
-    // Simulate a drain worker that claimed this definition's one chunk and
+    // Simulate a drain worker that claimed this definition's plan job and
     // then crashed before ever executing or finishing it. No `Client` is
     // running yet at all, so this really is durable state a crashed process
     // left behind, not an artifact of racing a live worker.
-    let claimed = chunk_queue::claim_chunks(&raw, "dead-worker", 10)
+    let claimed = chunk_queue::claim_chunks_of(&raw, "dead-worker", 10, &REDERIVE_BUILD_KINDS)
         .await
-        .expect("claim_chunks (simulating a crashed worker)");
-    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+        .expect("claim_chunks_of (simulating a crashed worker)");
+    assert_eq!(claimed.len(), 1, "the build's one plan job");
+    assert_eq!(claimed[0].work.kind(), chunk_queue::KIND_PLAN);
     backdate_dead_claims(&raw).await;
 
     // A drain-only client — no staging worker anywhere in this test, and
@@ -898,7 +916,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
         Duration::from_secs(20),
         Duration::from_millis(100),
         "a drain-only client (staging_worker: false) never reclaimed and finished the stale \
-         chunk claim left behind by a simulated crashed worker",
+         plan-job claim left behind by a simulated crashed worker",
         async || {
             let status: Option<String> = raw
                 .query_opt(
@@ -912,7 +930,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
                 .await
                 .expect("read status")
                 .map(|row| row.get(0));
-            status.as_deref() == Some("catching_up")
+            status.as_deref() == Some("live")
         },
     )
     .await;
@@ -957,13 +975,16 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
 /// a small, bounded (not open-ended) integration check per #297.
 /// `defs_backfill_chunk_queue.rs`'s
 /// `a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker`
-/// proves the identical reclaim-then-build behavior against the bare
-/// `chunk_queue` functions directly (no client, no wait), so this test's own
-/// workload only needs to be just large enough to force `install_definition`
-/// to plan more than one chunk — not a realistic-sized or boundary-precise
-/// dataset — since the boundary-discovery correctness itself is someone
-/// else's job now. 50_005 rows (one over the 50_000-row chunk size) is the
-/// minimum that still yields two chunks.
+/// proves the same reclaim-then-build behavior for the old chunked build
+/// against the bare `chunk_queue` functions directly (no client, no wait).
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
+/// the reclaimed chunks are its `rederive` chunks, whose `lo`/`hi` carry the
+/// same composite text encoding. The test runs the build's plan job by hand
+/// at two source rows a chunk, so nine rows over three `a` groups plan five
+/// chunks whose boundaries land inside a group, then a dead worker claims
+/// every one of them. The client's reclaim sweep must free them, and its
+/// drain workers run them and take the build `live`.
 ///
 /// This test kept timing out on CI after #297's split, and the cause was not
 /// load alone. It ran the client with a 200ms `reclaim_ttl` next to the
@@ -984,7 +1005,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     raw.batch_execute(
         "create table widgets (a bigint, b bigint, primary key (a, b)); \
          insert into widgets (a, b) \
-         select (g - 1) / 3 + 1, (g - 1) % 3 + 1 from generate_series(1, 50005) g",
+         select (g - 1) / 3 + 1, (g - 1) % 3 + 1 from generate_series(1, 9) g",
     )
     .await
     .expect("seed widgets with a composite primary key");
@@ -1000,30 +1021,44 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
-    // discharge, which dispatches the chunked build (ADR-0016, #418).
+    // discharge, which starts the Re-derive build (#625 F8a).
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
-        .expect("dispatch the chunked build");
+        .expect("start the re-derive build");
 
-    let chunk_count: i64 = raw
-        .query_one(
-            "select count(*) from backfill_chunks where definition_id = $1",
-            &[&def.id],
-        )
+    // Plan the build's chunks by hand, two source rows each.
+    let plan = chunk_queue::claim_chunks_of(&raw, "planner", 10, &[chunk_queue::KIND_PLAN])
         .await
-        .expect("count persisted chunks")
-        .get(0);
+        .expect("claim the plan job");
+    assert_eq!(plan.len(), 1, "the build's one plan job");
+    trellis::staging::build::run_claimed(
+        &db.pool,
+        &plan[0],
+        "planner",
+        &trellis::staging::build::WorkerOptions {
+            chunk_rows: 2,
+            drain_batch_cap: 1000,
+            heartbeat_interval: Duration::from_secs(5),
+            reclaim_ttl: Duration::from_secs(60),
+        },
+    )
+    .await;
+
+    let claimed = chunk_queue::claim_chunks_of(&raw, "dead-worker", 10, &REDERIVE_BUILD_KINDS)
+        .await
+        .expect("claim_chunks_of (simulating a crashed worker)");
     assert_eq!(
-        chunk_count, 2,
-        "50005 rows at 50k rows/chunk must plan two chunks for this test's crash-and-reclaim \
-         setup to exercise a running client against — the boundary-discovery correctness of \
-         that count is proven elsewhere (see this test's doc comment)"
+        claimed.len(),
+        5,
+        "nine rows at two rows a chunk plan five chunks, all claimed by the dead worker"
     );
-
-    let claimed = chunk_queue::claim_chunks(&raw, "dead-worker", 10)
-        .await
-        .expect("claim_chunks (simulating a crashed worker)");
-    assert_eq!(claimed.len(), 2);
+    assert!(
+        claimed.iter().all(|chunk| matches!(
+            &chunk.work,
+            chunk_queue::ChunkWork::Rederive { hi, .. } if hi.contains('\u{1f}')
+        )),
+        "every claimed chunk is a re-derive chunk bounded by a composite key: {claimed:?}"
+    );
     backdate_dead_claims(&raw).await;
 
     // Default `reclaim_ttl` and heartbeat: a live worker's claim can't be
@@ -1056,7 +1091,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
                 .await
                 .expect("read status")
                 .map(|row| row.get(0));
-            status.as_deref() == Some("catching_up")
+            status.as_deref() == Some("live")
         },
     )
     .await;

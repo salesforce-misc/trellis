@@ -119,11 +119,20 @@ pub struct BuildUnderLoad {
     /// `--min-max`: the definition also has `MIN(amt)` and `MAX(amt)`,
     /// recomputed fields (#625 F5), and the oracle compares them too.
     pub min_max: bool,
+    /// `--one-to-one`: the definition is the 1-1 `SELECT grp AS grp, amt +
+    /// amt AS dbl` instead of the aggregate (#625 F8a), and the oracle
+    /// compares it row by row.
+    pub one_to_one: bool,
 }
 
 impl BuildUnderLoad {
     /// The definition's text over `target` and `source`.
     fn definition(&self) -> String {
+        if self.one_to_one {
+            return format!(
+                "TRANSFORM {TARGET} FROM public.{SOURCE} SELECT grp AS grp, amt + amt AS dbl"
+            );
+        }
         let extremes = if self.min_max {
             ", MIN(amt) AS lo, MAX(amt) AS hi"
         } else {
@@ -137,6 +146,9 @@ impl BuildUnderLoad {
 
     /// The oracle's `GROUP BY` over the source, as `o`'s columns.
     fn oracle(&self) -> String {
+        if self.one_to_one {
+            return format!("select id, grp, amt + amt as dbl from public.{SOURCE}");
+        }
         let extremes = if self.min_max {
             ", min(amt) as lo, max(amt) as hi"
         } else {
@@ -148,9 +160,19 @@ impl BuildUnderLoad {
         )
     }
 
+    /// The column the target and the oracle join on: the group, or the
+    /// source key for `--one-to-one`.
+    fn key(&self) -> &'static str {
+        if self.one_to_one { "id" } else { "grp" }
+    }
+
     /// The predicate over target `t` and oracle `o` that a group differs.
     fn differs(&self) -> &'static str {
-        if self.min_max {
+        if self.one_to_one {
+            "t.id is null or o.id is null \
+             or t.grp::numeric is distinct from o.grp::numeric \
+             or t.dbl::numeric is distinct from o.dbl::numeric"
+        } else if self.min_max {
             "t.grp is null or o.grp is null \
              or t.total::numeric is distinct from o.total::numeric \
              or t.n::bigint is distinct from o.n \
@@ -376,7 +398,7 @@ impl BuildUnderLoadResult {
             .join(",");
         let w = &self.writes;
         format!(
-            "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"min_max\":{},\"writers\":{},\"write_rate\":{},\
+            "{{\"scenario\":\"{}\",\"rows\":{},\"groups\":{},\"min_max\":{},\"one_to_one\":{},\"writers\":{},\"write_rate\":{},\
              \"application_threads\":{},\"build_chunk_rows\":{},\
              \"load_secs\":{:.3},\"load_rows_per_sec\":{:.0},\
              \"index_secs\":{:.3},\"build_secs\":{:.3},\"chunks\":{},\"first_claim_secs\":{},\
@@ -397,6 +419,7 @@ impl BuildUnderLoadResult {
             self.cfg.rows,
             self.cfg.groups,
             self.cfg.min_max,
+            self.cfg.one_to_one,
             self.cfg.writers,
             self.cfg.write_rate,
             self.application_threads,
@@ -750,6 +773,34 @@ async fn is_live(raw: &RawClient, terminal: &str) -> bool {
 /// On a failed run: up to 20 mismatched groups, target vs oracle (stderr),
 /// so the log carries the shape.
 async fn dump_mismatches(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str) {
+    if cfg.one_to_one {
+        let rows = raw
+            .query(
+                &format!(
+                    "with o as ({oracle}) \
+                     select coalesce(t.id::text, o.id::text), \
+                            case when t.id is not null then format('(%s,%s)', t.grp, t.dbl) end, \
+                            case when o.id is not null then format('(%s,%s)', o.grp, o.dbl) end \
+                     from o full outer join public.{terminal} t on t.id::numeric = o.id::numeric \
+                     where {differs} \
+                     order by 1 limit 20",
+                    oracle = cfg.oracle(),
+                    differs = cfg.differs(),
+                ),
+                &[],
+            )
+            .await
+            .expect("list mismatched rows");
+        for r in rows {
+            eprintln!(
+                "build-under-load: MISMATCH id={} target={:?} oracle={:?}",
+                r.get::<_, String>(0),
+                r.get::<_, Option<String>>(1),
+                r.get::<_, Option<String>>(2),
+            );
+        }
+        return;
+    }
     let rows = raw
         .query(
             &format!(
@@ -834,10 +885,11 @@ async fn mismatched_groups(raw: &RawClient, cfg: &BuildUnderLoad, terminal: &str
     raw.query_one(
         &format!(
             "select count(*) from ({oracle}) o \
-             full outer join public.{terminal} t on t.grp::numeric = o.grp::numeric \
+             full outer join public.{terminal} t on t.{key}::numeric = o.{key}::numeric \
              where {differs}",
             oracle = cfg.oracle(),
             differs = cfg.differs(),
+            key = cfg.key(),
         ),
         &[],
     )

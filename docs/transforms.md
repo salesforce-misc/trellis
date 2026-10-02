@@ -292,9 +292,10 @@ Every defined transform carries an observable **status**:
   is read ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 * **`backfilling`** — those rows have been read and the target is being built.
   A plain aggregate (grouped by plain columns of a table, not of another
-  transform's target, with no relationship and no `MIN`/`MAX` of text) is
-  built while its live changes are applied, and goes from here straight to
-  `live`
+  transform's target, with no relationship and no `MIN`/`MAX` of text), and a
+  plain 1-1 transform (no relationship, over a table rather than another
+  transform's target), is built while its live changes are applied, and goes
+  from here straight to `live`
   ([data-flow — Re-derive-built definitions](data-flow.md#re-derive-built-definitions)).
 * **`catching_up`** — the build is done and live changes are applied, but the
   target may still be missing changes made while it was building. A catch-up

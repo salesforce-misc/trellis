@@ -593,6 +593,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // #625 F8a: a plain 1-1 over a captured table is the Re-derive
+            // build's, which the drain workers run to `live` on their own.
+            trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
             trellis::intake::markers::discharge_registrations(pool)
@@ -859,8 +862,9 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
         Some("live"),
         "ALTER TRANSFORM requires a live target"
     );
-    // Drain the go-live catch-up's enumeration before the gate goes in, or
-    // its re-derive of GATE_ID would wait on the gate.
+    // Drain anything the build left in the ring before the gate goes in, or
+    // its re-derive of GATE_ID would wait on the gate (a Re-derive build
+    // parks no go-live catch-up, #625 F8a, so this is belt and braces).
     let mut ring = connect_raw(db.dsn()).await;
     drain_to_quiescence(&db.pool, &mut ring).await;
 

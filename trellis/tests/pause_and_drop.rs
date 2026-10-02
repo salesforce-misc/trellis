@@ -78,6 +78,14 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
+/// The kinds of a Re-derive build's work rows (#625), which
+/// `chunk_queue::claim_chunks` (the old builds' kinds only) never claims.
+const REDERIVE_KINDS: [&str; 3] = [
+    chunk_queue::KIND_PLAN,
+    chunk_queue::KIND_REDERIVE,
+    chunk_queue::KIND_SWEEP,
+];
+
 /// A define-only facade connection: no staging worker, no drain threads.
 async fn define_only(dsn: &str) -> Trellis {
     Trellis::connect(
@@ -134,7 +142,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
-            // A plain aggregate is the Re-derive build's (#625 F3, F5).
+            // A plain aggregate or plain 1-1 is the Re-derive build's (#625 F3, F5, F8a).
             trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
@@ -697,14 +705,17 @@ async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
         "the new target is built from the source as it is now"
     );
     // #623 D2: the drop took the old ledger, so registering again could
-    // create a new, empty one (a 1-1 build writes none).
+    // create a new one. The Re-derive build of a plain 1-1 (#625 F8a) puts
+    // every key it writes on the 1-1 slim ledger (#623 D6), so the new
+    // ledger holds the 30 surviving keys and none of the 40 the dropped
+    // target's build entered.
     assert_eq!(
         count(
             &raw,
             &format!("select count(*) from {DEFAULT_TARGET_SCHEMA}.order_doubles__ledger")
         )
         .await,
-        0,
+        30,
         "the new target has a ledger of its own"
     );
 }
@@ -1172,6 +1183,10 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band(
 /// it rides the drop out on `backfill_chunks`' own `on delete cascade`. A
 /// paused definition also stops being handed new chunks — the pause is what
 /// quiesces the durable backfill queue, exactly as it quiesces the fold.
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
+/// the queue holds its plan job, claimed through `claim_chunks_of` with the
+/// Re-derive build's kinds; the dispatch gate under test is the same one.
 #[tokio::test]
 async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     let cluster = TestCluster::start();
@@ -1180,16 +1195,16 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     seed_source(&raw, "orders", 40).await;
 
     let trellis = define_only(db.dsn()).await;
-    // A plain 1-1 transform's discharge enumerates a durable chunk queue
-    // before it is built, which is exactly the in-flight backfill state under
-    // test here.
+    // A plain 1-1 transform's discharge starts its build with a durable
+    // plan job before it is built, which is exactly the in-flight backfill
+    // state under test here.
     trellis
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
-        .expect("define a chunked 1-1 transform");
+        .expect("define a 1-1 transform");
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
-        .expect("the discharge dispatches the chunked build");
+        .expect("the discharge starts the re-derive build");
     assert!(
         count(&raw, "select count(*) from backfill_chunks").await > 0,
         "precondition: the chunk queue was enumerated"
@@ -1200,7 +1215,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     // what that clause becomes. Claim for real first, so "zero after the
     // pause" is a difference this call can actually see — then release, so the
     // pause is the only reason the next call comes back empty.
-    let before = chunk_queue::claim_chunks(&raw, "issue-231-worker", 100)
+    let before = chunk_queue::claim_chunks_of(&raw, "issue-231-worker", 100, &REDERIVE_KINDS)
         .await
         .expect("claim chunks from a backfilling definition");
     assert!(
@@ -1217,7 +1232,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
         .apply("PAUSE TRANSFORM order_doubles")
         .await
         .expect("a backfilling definition pauses too — that is what stopping a runaway build is");
-    let after = chunk_queue::claim_chunks(&raw, "issue-231-worker", 100)
+    let after = chunk_queue::claim_chunks_of(&raw, "issue-231-worker", 100, &REDERIVE_KINDS)
         .await
         .expect("claiming against a paused definition is a success that yields nothing");
     assert!(
@@ -1257,6 +1272,12 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
 /// exactly where it is, while still retiring the chunk — a paused definition's
 /// finished chunks are done, not re-queued, and resume rebuilds it by a fresh
 /// backfill of its own regardless.
+///
+/// `orders` is made to read as another definition's target
+/// ([`markers::feed_from_a_test_definition`]; no staging worker runs here):
+/// #625 F8a gives a plain 1-1 over a captured table to the Re-derive build,
+/// and the chunked build whose `finish_chunk` completion this pins survives
+/// for a seam-fed source.
 #[tokio::test]
 async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
     const WORKER: &str = "issue-331-worker";
@@ -1264,6 +1285,9 @@ async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 40).await;
+    markers::feed_from_a_test_definition(&raw, &format!("{DEFAULT_SCHEMA}.orders"))
+        .await
+        .expect("make orders another definition's target");
 
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -1345,6 +1369,12 @@ async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
 /// become claimable again once it is unfrozen. A chunk a worker still holds
 /// is left alone: its completion is what parks the catch-up marker that
 /// repairs the target should its write land after the rebuild (#331).
+///
+/// Both sources are made to read as another definition's target
+/// ([`markers::feed_from_a_test_definition`]; no staging worker runs here):
+/// #625 F8a gives a plain 1-1 over a captured table to the Re-derive build,
+/// and the chunked build whose range chunks this pins survives for a
+/// seam-fed source.
 #[tokio::test]
 async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
     let cluster = TestCluster::start();
@@ -1356,6 +1386,11 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
     // A sibling definition's queue, which resuming `order_doubles` must not
     // touch.
     seed_source(&raw, "items", 10).await;
+    for source in ["orders", "items"] {
+        markers::feed_from_a_test_definition(&raw, &format!("{DEFAULT_SCHEMA}.{source}"))
+            .await
+            .expect("make the source another definition's target");
+    }
 
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -1861,6 +1896,10 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
 /// rebuild re-deriving them to the same values stages nothing either. So a
 /// reader through the relationship never saw them, where the captured
 /// endpoint this replaced got them over CDC.
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
+/// the work held across the pause is its plan job, whose chunks write the
+/// target outside the seam just the same.
 #[tokio::test]
 async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
     let cluster = TestCluster::start();
@@ -1877,9 +1916,9 @@ async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
         .expect("define the upstream target");
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
-        .expect("the discharge dispatches the chunked build");
+        .expect("the discharge starts the re-derive build");
     let client = db.pool.get().await.expect("acquire connection");
-    let held = chunk_queue::claim_chunks(&**client, "held_across_pause", 1000)
+    let held = chunk_queue::claim_chunks_of(&**client, "held_across_pause", 1000, &REDERIVE_KINDS)
         .await
         .expect("claim the build's chunk");
     drop(client);

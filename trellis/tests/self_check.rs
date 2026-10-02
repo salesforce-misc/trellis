@@ -177,13 +177,13 @@ async fn converged_fixture(
     .expect("connect");
     trellis.apply(transform).await.expect("define");
     // No staging worker runs here: stand in for its capture pass, which
-    // installs the source's capture triggers, and for its discharge, which
-    // takes a definition over an empty source straight to `live`.
+    // installs the source's capture triggers, and for its build, which
+    // takes a definition over an empty source straight to `live` (#625 F8a:
+    // a plain 1-1 over a captured table is the Re-derive build's, whose plan
+    // job finds no rows).
     let src_table = format!("{DEFAULT_SCHEMA}.{source}");
     capture(&mut raw, &src_table).await;
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("dispatch the build");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
     let status: String = raw
         .query_one(
             "select status from transform_definitions \

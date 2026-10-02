@@ -932,9 +932,9 @@ async fn a_schema_pre_created_by_another_role_still_captures_writes() {
         .apply("TRANSFORM t_copy FROM public.t SELECT a AS a")
         .await
         .expect("define a reader of public.t");
-    markers::discharge_registrations(&pool)
-        .await
-        .expect("dispatch the build");
+    // A plain 1-1 over a captured table is the Re-derive build's (#625
+    // F8a), which the discharge only starts: run it to `live`.
+    markers::settle_registrations(&pool).await;
     let def = trellis::defs::catalog::definition_by_target(&pool, "t_copy")
         .await
         .expect("read the definition")

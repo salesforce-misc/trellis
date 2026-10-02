@@ -1046,6 +1046,12 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
 /// paused column's value must survive a re-executed chunk write untouched,
 /// while a sibling, non-paused column in the very same row must still pick
 /// up the re-executed chunk's freshly computed value.
+///
+/// The source is made to read as another definition's target
+/// (`markers::feed_from_a_test_definition`; no staging worker runs here):
+/// #625 F8a gives a plain 1-1 over a captured table to the Re-derive build,
+/// whose chunk commits with its done mark and so never re-executes, and the
+/// chunked build this test exercises survives for a seam-fed source.
 #[tokio::test]
 async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
     let cluster = TestCluster::start();
@@ -1059,6 +1065,9 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
         )
         .await
         .expect("seed source");
+    trellis::intake::markers::feed_from_a_test_definition(&client, &format!("{DEFAULT_SCHEMA}.s"))
+        .await
+        .expect("make s another definition's target");
 
     let cols = numeric_columns(&["a", "b"]);
     let def = install_definition(

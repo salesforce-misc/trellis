@@ -2,7 +2,8 @@
 //! (`trellis::defs::chunk_queue`, docs/decisions/0007's "Backgrounding and
 //! resumability" amendment): the claim/reclaim-stale idiom a drain worker
 //! uses to finish a plain (non-relationship) 1-1 direct-build definition's
-//! backfill in the background, and the CDC-race closure that makes excluding
+//! backfill in the background (over a seam-fed source since #625 F8a: see
+//! `install_and_dispatch`), and the CDC-race closure that makes excluding
 //! a non-`live` definition from the apply path ([`transforms_for_source`])
 //! safe rather than lossy.
 //!
@@ -24,12 +25,29 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// definition's chunked build (ADR-0016, #418): this file tests the chunk
 /// queue, which only fills once the discharge has run. Returns the definition
 /// with its status as of then.
+///
+/// The source is first made to read as another definition's target
+/// (`markers::feed_from_a_test_definition`): #625 F8a gives a plain 1-1 over
+/// a captured table to the Re-derive build, and the chunked build (and its
+/// go-live catch-up) these tests exercise survives for a seam-fed source. No
+/// staging worker runs here, so nothing else reads that feeding definition.
 async fn install_and_dispatch(
     pool: &trellis::Pool,
     text: &str,
     cols: &std::collections::HashMap<String, ValueType>,
     target_schema: &str,
 ) -> Result<trellis::defs::Definition, trellis::defs::CatalogError> {
+    let source = text
+        .split_whitespace()
+        .skip_while(|word| *word != "FROM")
+        .nth(1)
+        .expect("a TRANSFORM names its source after FROM");
+    markers::feed_from_a_test_definition(
+        &**pool.get().await.expect("acquire connection"),
+        &format!("{DEFAULT_SCHEMA}.{source}"),
+    )
+    .await
+    .expect("make the source another definition's target");
     let mut def = install_definition(pool, text, cols, target_schema).await?;
     markers::discharge_registrations(pool)
         .await

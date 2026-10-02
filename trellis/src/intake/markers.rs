@@ -1872,6 +1872,47 @@ pub async fn settle_builds(pool: &crate::pool::Pool) {
     }
 }
 
+/// Test harness (#625 F8a): records a `live` definition whose target is
+/// `table` (a schema-qualified identity, as `transform_definitions` holds
+/// it), feeding it from a table named `<table>__feed` that doesn't exist.
+/// Nothing runs that definition; it only makes `table` read as another
+/// definition's target, which is what a build's shape choice reads
+/// (`staging::build::qualifies`). A plain 1-1 definition over `table` is
+/// then built by the old chunked build (`backfill_chunks` ranges and the
+/// go-live catch-up), which survives for a seam-fed source until #625 F6:
+/// over a captured table it is the Re-derive build's. For a test of the old
+/// build's machinery with no staging worker running (a running one would
+/// treat `table` as a target, and never capture it). Idempotent.
+#[cfg(any(test, feature = "internals"))]
+pub async fn feed_from_a_test_definition(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<(), IntakeError> {
+    let feed = format!("{table}__feed");
+    let bare = table.rsplit('.').next().unwrap_or(table);
+    client
+        .execute(
+            "insert into source_table_versions (source_table, version) values ($1, 1) \
+             on conflict do nothing",
+            &[&feed],
+        )
+        .await?;
+    client
+        .execute(
+            "insert into transform_definitions \
+             (target_table, source_table, source_version, definition_text, status) \
+             values ($1, $2, 1, $3, $4) on conflict (target_table) do nothing",
+            &[
+                &table,
+                &feed,
+                &format!("TRANSFORM {bare} FROM {bare}__feed SELECT 0 AS feed"),
+                &TransformStatus::Live.as_str(),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Test stand-in for the staging worker's maintenance pass over newly
 /// registered definitions (ADR-0016), for a test with no staging worker and no
 /// capture triggers: starts the Re-derive build of every `waiting_to_backfill`
@@ -2428,6 +2469,20 @@ mod catch_up_tests {
             .await
             .expect("seed a deferred definition")
             .get(0);
+        // Another definition's target, so the plain 1-1 `d` is still the
+        // old chunked build's, whose planning reads the key (#625 F8a: over
+        // a captured table it would be the Re-derive build's).
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.nokey_raw', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.nokey', 'public.nokey_raw', 1, \
+                         'TRANSFORM nokey FROM nokey_raw SELECT id AS y', 'live')",
+            )
+            .await
+            .expect("make the source another definition's target");
         async fn status(client: &tokio_postgres::Client, id: i64) -> String {
             client
                 .query_one(
@@ -3969,6 +4024,13 @@ mod catch_up_tests {
         .into_iter()
         .map(|(name, ty)| (name.to_string(), ty))
         .collect();
+        // The copy's build is the old chunked one, with its go-live
+        // catch-up, only while `orders` reads as another definition's
+        // target: over a captured table a plain 1-1 is the Re-derive
+        // build's (#625 F8a), which has no catch-up.
+        feed_from_a_test_definition(&client, "public.orders")
+            .await
+            .expect("make orders read as another definition's target");
         for text in [rollup, "TRANSFORM order_copy FROM orders SELECT a AS a"] {
             crate::defs::install_definition(&pool, text, &columns, "public")
                 .await
@@ -4451,15 +4513,38 @@ mod dispatch_tests {
         );
     }
 
-    /// A plain 1-1 definition is built by `backfill_chunks`: the discharge
-    /// enqueues them and moves it to `backfilling` in the same transaction,
-    /// and stages no ring enumeration when nothing else reads the table.
+    /// Makes `public.orders` another definition's target, as a seam-fed
+    /// source is: a plain 1-1 definition over it is still the old chunked
+    /// build's (#625 F8a leaves seam-fed sources to F6).
+    async fn feed_orders_from_another_definition(client: &tokio_postgres::Client) {
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.orders_raw', 1)",
+            )
+            .await
+            .expect("seed the feeding source's version row");
+        define(
+            client,
+            "public.orders_raw",
+            "public.orders",
+            "TRANSFORM orders FROM orders_raw SELECT g AS g, a AS a",
+            "live",
+        )
+        .await;
+    }
+
+    /// A plain 1-1 definition over a seam-fed source is built by
+    /// `backfill_chunks`: the discharge enqueues them and moves it to
+    /// `backfilling` in the same transaction, and stages no ring enumeration
+    /// when nothing else reads the table.
     #[tokio::test]
-    async fn a_plain_one_to_one_definition_is_dispatched_as_chunks() {
+    async fn a_plain_one_to_one_definition_on_a_seam_fed_source_is_dispatched_as_chunks() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let mut client = connect(&db).await;
         seed(&client).await;
+        feed_orders_from_another_definition(&client).await;
         let id = define(
             &client,
             "public.orders",
@@ -4478,6 +4563,30 @@ mod dispatch_tests {
             markers(&client).await.is_empty(),
             "the marker is discharged"
         );
+    }
+
+    /// A plain 1-1 definition over a captured table is the Re-derive
+    /// build's (#625 F8a): the discharge leaves it `waiting_to_backfill`,
+    /// with no chunk, for the staging worker's start.
+    #[tokio::test]
+    async fn the_discharge_leaves_a_plain_one_to_one_definition_to_the_rederive_start() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT a + a AS x",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "waiting_to_backfill");
+        assert_eq!(chunks(&client, id).await, 0, "no old build was dispatched");
     }
 
     /// A shape the direct build can't render (here a cyclic field-alias
@@ -4637,6 +4746,7 @@ mod dispatch_tests {
         let db = cluster.create_isolated_database().await;
         let mut client = connect(&db).await;
         seed(&client).await;
+        feed_orders_from_another_definition(&client).await;
         define(
             &client,
             "public.orders",

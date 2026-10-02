@@ -7568,9 +7568,15 @@ async fn settle_one_to_one_target(
                 .is_none_or(|(_, _, values)| values.is_some()),
         })
         .collect();
-    let inserted =
-        one_to_one_ledger::lock_entries(txn, &plan.qualified_target, &to_lock, seg_seq, predicate)
-            .await?;
+    let inserted = one_to_one_ledger::lock_entries(
+        txn,
+        &plan.qualified_target,
+        &to_lock,
+        seg_seq,
+        predicate,
+        false,
+    )
+    .await?;
 
     let rederive_keys: Vec<&str> = by_key
         .values()

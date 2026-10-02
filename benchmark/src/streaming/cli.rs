@@ -105,7 +105,9 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 /// - `--progress-secs` (30; 0 turns it off): how often stderr gets an RSS
 ///   progress line;
 /// - `--min-max`: the definition also has `MIN(amt)` and `MAX(amt)`,
-///   recomputed fields (#625 F5).
+///   recomputed fields (#625 F5);
+/// - `--one-to-one`: the definition is a 1-1 target, `SELECT grp AS grp,
+///   amt + amt AS dbl`, instead of the aggregate (#625 F8a).
 ///
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
@@ -141,6 +143,7 @@ fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad 
         oracle_poll_min: secs(args, "--oracle-poll-min-secs").unwrap_or(Duration::from_secs(5)),
         progress: (progress > 0.0).then(|| Duration::from_secs_f64(progress)),
         min_max: args.iter().any(|a| a == "--min-max"),
+        one_to_one: args.iter().any(|a| a == "--one-to-one"),
     }
 }
 
@@ -1187,6 +1190,11 @@ mod tests {
         assert!(
             build_under_load_config(&argv(&["build-under-load", "--min-max"])).min_max,
             "--min-max adds MIN and MAX fields"
+        );
+        assert!(!d.one_to_one);
+        assert!(
+            build_under_load_config(&argv(&["build-under-load", "--one-to-one"])).one_to_one,
+            "--one-to-one builds a 1-1 target"
         );
         let c = build_under_load_config(&argv(&[
             "build-under-load",

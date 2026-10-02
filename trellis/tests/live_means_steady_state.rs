@@ -267,50 +267,76 @@ async fn an_aggregate_build_is_live_only_with_a_change_drained_during_it_folded_
     engine.shutdown().await.expect("shut down");
 }
 
-/// The chunked path: a plain 1-1 definition's chunk reads `orders` and is
-/// held (by a row trigger on the target) before its write, while an update
-/// to a row it read commits and drains. The chunk then writes the old value.
-/// At `live` the update is there.
+/// `public.orders (id, a)` seeded with `rows`, `public.lines` with a line
+/// for each of orders 1 and 2, and the 1-1 `order_view` over `orders`
+/// registered with a field that counts its lines through the to-many
+/// relationship `lines`. Such a 1-1 target is still the old direct build's,
+/// with its go-live catch-up, until milestone E: a plain 1-1 target is the
+/// Re-derive build's since #625 F8a (see
+/// [`a_one_to_one_rederive_build_applies_while_backfilling_and_is_steady_at_live`]).
+async fn register_related_order_view(raw: &Client, dsn: &str, rows: &str) {
+    raw.batch_execute(&format!(
+        "create table public.orders (id integer primary key, a integer); \
+         insert into public.orders values {rows}; \
+         create table public.lines (id integer primary key, order_id integer); \
+         insert into public.lines values (1, 1), (2, 2)"
+    ))
+    .await
+    .expect("create and seed orders and lines");
+    let trellis = define_only(dsn).await;
+    trellis
+        .apply("RELATIONSHIP lines FROM orders.id TO lines.order_id")
+        .await
+        .expect("register the relationship");
+    trellis
+        .apply("TRANSFORM order_view FROM orders SELECT a AS a, COUNT(lines.id) AS n")
+        .await
+        .expect("register the 1-1 transform");
+}
+
+/// The held 1-1 build is the old direct-build job: no `build`, and a
+/// `direct` chunk is building it.
+async fn assert_direct_one_to_one_build(raw: &Client) {
+    let row = raw
+        .query_one(
+            "select d.build is null, \
+                    (select count(*) from backfill_chunks c \
+                     where c.definition_id = d.id and c.kind = 'direct') \
+             from transform_definitions d where d.target_table = 'public.order_view'",
+            &[],
+        )
+        .await
+        .expect("read the definition's build");
+    assert!(
+        row.get::<_, bool>(0),
+        "a relationship-enriched 1-1 takes the old build"
+    );
+    assert_eq!(row.get::<_, i64>(1), 1, "a direct-build job is building it");
+}
+
+/// The old 1-1 build (relationship-enriched, [`register_related_order_view`]):
+/// the build reads `orders` and is held before its write, while an update
+/// to a row it read commits and drains. The build then writes the old
+/// value. At `live` the update is there.
 #[tokio::test]
-async fn a_chunked_build_is_live_only_with_a_change_drained_during_it_folded_in() {
+async fn a_one_to_one_direct_build_is_live_only_with_a_change_drained_during_it_folded_in() {
     const HOLD: i64 = 4762;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
-    raw.batch_execute(
-        "create table public.orders (id integer primary key, a integer); \
-         insert into public.orders values (1, 1), (2, 2)",
-    )
-    .await
-    .expect("create and seed orders");
-
-    define_only(db.dsn())
-        .await
-        .apply("TRANSFORM order_view FROM orders SELECT a AS a")
-        .await
-        .expect("register the 1-1 transform");
-    raw.batch_execute(&format!(
-        "create function hold_chunk() returns trigger language plpgsql as $$ \
-         begin \
-           perform pg_advisory_lock({HOLD}); \
-           perform pg_advisory_unlock({HOLD}); \
-           return new; \
-         end $$; \
-         create trigger hold_chunk before insert on order_view \
-           for each row execute function hold_chunk()"
-    ))
-    .await
-    .expect("install the chunk hold");
+    hold_direct_builds(&raw, HOLD).await;
     raw.execute("select pg_advisory_lock($1)", &[&HOLD])
         .await
         .expect("take the hold");
+    register_related_order_view(&raw, db.dsn(), "(1, 1), (2, 2)").await;
 
     let engine = running(db.dsn()).await;
     wait_until_held(&raw, HOLD).await;
+    assert_direct_one_to_one_build(&raw).await;
 
     raw.execute("update public.orders set a = 100 where id = 1", &[])
         .await
-        .expect("update a row the chunk already read");
+        .expect("update a row the build already read");
     converge(&engine).await;
     assert_eq!(
         status(&engine, "order_view").await,
@@ -320,7 +346,7 @@ async fn a_chunked_build_is_live_only_with_a_change_drained_during_it_folded_in(
 
     raw.execute("select pg_advisory_unlock($1)", &[&HOLD])
         .await
-        .expect("release the chunk");
+        .expect("release the build");
     wait_for_live(&engine, "order_view").await;
     converge(&engine).await;
 
@@ -335,6 +361,119 @@ async fn a_chunked_build_is_live_only_with_a_change_drained_during_it_folded_in(
         rows,
         vec![(1, 100), (2, 2)],
         "live, and caught up to a token taken after the update"
+    );
+    engine.shutdown().await.expect("shut down");
+}
+
+/// #625 F8a, the Re-derive build of a plain 1-1 target: there is no
+/// `catching_up`. The definition applies from its start, so a row inserted
+/// while the build's chunk is held before its write is applied while it is
+/// still `backfilling`; once the chunk commits it goes straight to `live`,
+/// and a token taken after `live` covers every commit before it. The chunk
+/// is held by a row trigger on the target, for the rows it read, after its
+/// entry lock and its read.
+#[tokio::test]
+async fn a_one_to_one_rederive_build_applies_while_backfilling_and_is_steady_at_live() {
+    const HOLD: i64 = 6254;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, a integer); \
+         insert into public.orders values (1, 1), (2, 2)",
+    )
+    .await
+    .expect("create and seed orders");
+    define_only(db.dsn())
+        .await
+        .apply("TRANSFORM order_view FROM orders SELECT a + a AS a2")
+        .await
+        .expect("register the 1-1 transform");
+    raw.batch_execute(&format!(
+        "create function hold_chunk() returns trigger language plpgsql as $$ \
+         begin \
+           perform pg_advisory_lock({HOLD}); \
+           perform pg_advisory_unlock({HOLD}); \
+           return new; \
+         end $$; \
+         create trigger hold_chunk before insert on order_view \
+           for each row when (new.id <= 2) execute function hold_chunk()"
+    ))
+    .await
+    .expect("install the chunk hold");
+    raw.execute("select pg_advisory_lock($1)", &[&HOLD])
+        .await
+        .expect("take the hold");
+
+    let engine = running(db.dsn()).await;
+    wait_until_held(&raw, HOLD).await;
+    let build: Option<String> = raw
+        .query_one(
+            "select build from transform_definitions where target_table = 'public.order_view'",
+            &[],
+        )
+        .await
+        .expect("read the build")
+        .get(0);
+    assert_eq!(build.as_deref(), Some("rederive"));
+
+    raw.execute("insert into public.orders values (3, 30)", &[])
+        .await
+        .expect("commit a change while the chunk is held");
+    converge(&engine).await;
+    assert_eq!(
+        status(&engine, "order_view").await,
+        TransformStatus::Backfilling,
+        "the chunk hasn't committed"
+    );
+    let applied: Vec<(i32, i32)> = raw
+        .query("select id, a2 from order_view order by id", &[])
+        .await
+        .expect("read order_view")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        applied,
+        vec![(3, 60)],
+        "the change was applied while backfilling; the chunk's rows are still owed"
+    );
+
+    raw.execute("select pg_advisory_unlock($1)", &[&HOLD])
+        .await
+        .expect("release the chunk");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let current = status(&engine, "order_view").await;
+        assert_ne!(
+            current,
+            TransformStatus::CatchingUp,
+            "a re-derive build never reports catching_up"
+        );
+        if current == TransformStatus::Live {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never reported live");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    raw.batch_execute(
+        "update public.orders set a = 5 where id = 1; delete from public.orders where id = 2",
+    )
+    .await
+    .expect("commit after live");
+    converge(&engine).await;
+
+    let rows: Vec<(i32, i32)> = raw
+        .query("select id, a2 from order_view order by id", &[])
+        .await
+        .expect("read order_view")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(1, 10), (3, 60)],
+        "live, and caught up to a token taken after the last change"
     );
     engine.shutdown().await.expect("shut down");
 }
@@ -450,51 +589,31 @@ async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
     engine.shutdown().await.expect("shut down");
 }
 
-/// Issue #485, chunked 1-1: a row the chunk read is deleted and its delete
-/// drains while the chunk is held before its write, so apply skips it and
-/// the chunk then writes the row. The go-live re-read only visits keys the
-/// source still has; the orphan sweep that runs with the flip removes the
-/// row. At `live` it is gone.
+/// Issue #485, the old 1-1 build (relationship-enriched,
+/// [`register_related_order_view`]): a row the build read is deleted and its
+/// delete drains while the build is held before its write, so apply skips
+/// it and the build then writes the row. The go-live re-read only visits
+/// keys the source still has; the orphan sweep that runs with the flip
+/// removes the row. At `live` it is gone.
 #[tokio::test]
-async fn a_chunked_row_deleted_during_its_build_is_gone_at_live() {
+async fn a_one_to_one_direct_build_row_deleted_during_its_build_is_gone_at_live() {
     const HOLD: i64 = 4852;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
-    raw.batch_execute(
-        "create table public.orders (id integer primary key, a integer); \
-         insert into public.orders values (1, 1), (2, 2), (3, 3)",
-    )
-    .await
-    .expect("create and seed orders");
-
-    define_only(db.dsn())
-        .await
-        .apply("TRANSFORM order_view FROM orders SELECT a AS a")
-        .await
-        .expect("register the 1-1 transform");
-    raw.batch_execute(&format!(
-        "create function hold_chunk() returns trigger language plpgsql as $$ \
-         begin \
-           perform pg_advisory_lock({HOLD}); \
-           perform pg_advisory_unlock({HOLD}); \
-           return new; \
-         end $$; \
-         create trigger hold_chunk before insert on order_view \
-           for each row execute function hold_chunk()"
-    ))
-    .await
-    .expect("install the chunk hold");
+    hold_direct_builds(&raw, HOLD).await;
     raw.execute("select pg_advisory_lock($1)", &[&HOLD])
         .await
         .expect("take the hold");
+    register_related_order_view(&raw, db.dsn(), "(1, 1), (2, 2), (3, 3)").await;
 
     let engine = running(db.dsn()).await;
     wait_until_held(&raw, HOLD).await;
+    assert_direct_one_to_one_build(&raw).await;
 
     raw.execute("delete from public.orders where id = 2", &[])
         .await
-        .expect("delete a row the chunk already read");
+        .expect("delete a row the build already read");
     converge(&engine).await;
     assert_eq!(
         status(&engine, "order_view").await,
@@ -504,7 +623,7 @@ async fn a_chunked_row_deleted_during_its_build_is_gone_at_live() {
 
     raw.execute("select pg_advisory_unlock($1)", &[&HOLD])
         .await
-        .expect("release the chunk");
+        .expect("release the build");
     wait_for_live(&engine, "order_view").await;
     converge(&engine).await;
 
@@ -518,7 +637,7 @@ async fn a_chunked_row_deleted_during_its_build_is_gone_at_live() {
     assert_eq!(
         rows,
         vec![(1, 1), (3, 3)],
-        "live, and the row the chunk copied from a deleted source row is gone"
+        "live, and the row the build copied from a deleted source row is gone"
     );
     engine.shutdown().await.expect("shut down");
 }

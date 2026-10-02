@@ -74,13 +74,16 @@ pub(crate) struct Inserted {
 /// key's entry a second version and a lock (#623 D6's throughput miss).
 /// Only the keys that had an entry are then locked `for update`. `target`
 /// is the target's qualified identity; `predicate` is as for
-/// [`update_entries`].
+/// [`update_entries`]. `skip_lock` is the `chunk_without_entry_lock`
+/// plant's (#625 F3, a build chunk's only): the existing entries are read
+/// without the lock.
 pub(crate) async fn lock_entries(
     txn: &Transaction<'_>,
     target: &str,
     changes: &[EntryChange<'_>],
     seg_seq: i64,
     predicate: bool,
+    skip_lock: bool,
 ) -> Result<Inserted, ApplyError> {
     let ledger = ledger_ident(target);
     let q = |c: &str| quote_ident(c);
@@ -142,7 +145,7 @@ pub(crate) async fn lock_entries(
         .copied()
         .filter(|k| !inserted.keys.contains(*k))
         .collect();
-    if !existing.is_empty() {
+    if !existing.is_empty() && !skip_lock {
         let locked = txn
             .execute(
                 &format!(

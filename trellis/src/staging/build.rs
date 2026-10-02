@@ -1,8 +1,9 @@
 //! The Re-derive build (#625; epic #556, ADR-0002 "A build is Re-derive over
 //! chunks, and applies from its first chunk"): its primitives, a build chunk
-//! ([`run_chunk`]) and the group-delta merger ([`merge_deltas`]) (F1), and
-//! their scheduling (F2). Since F3 it is the only build of the shapes it
-//! serves (see "Shapes"): a fresh definition's and a resumed one's alike.
+//! ([`run_chunk`], and [`one_to_one::run_chunk`] for a 1-1 target) and the
+//! group-delta merger ([`merge_deltas`]) (F1), and their scheduling (F2).
+//! Since F3 it is the only build of the shapes it serves (see "Shapes"): a
+//! fresh definition's and a resumed one's alike.
 //!
 //! # The scheduled build (F2, F3)
 //!
@@ -132,6 +133,14 @@
 //! relationship-fed aggregate for F9. [`BuildPlan::load`] returns `None` for
 //! anything else.
 //!
+//! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target with no
+//! relationship path, on a captured source, takes the same scheduled build:
+//! the start, the plan job, the sweep on a rebuild and the strict flip. Its
+//! chunk writes the target rows themselves, ordered against pages by the
+//! keys' entries on the 1-1 slim ledger (#623 D6), so it appends no group
+//! deltas, its target has no delta table, and nothing merges for it. A
+//! relationship-enriched 1-1 target waits for milestone E.
+//!
 //! **Recomputed fields (F5).** A chunk writes a delta row for every group an
 //! entry it changed moved into or out of, even when the increments net to 0,
 //! with whether a changed entry counted in the group before (`__out`) and
@@ -161,6 +170,8 @@ use crate::pool::{Pool, quote_ident};
 use super::apply::ApplyError;
 use super::ledger::{self, LedgerTargetPlan, WrittenGroup};
 use super::target_mutations::TargetMutations;
+
+pub mod one_to_one;
 
 /// How long a chunk waits for its entry lock before giving up (#625 Q4).
 /// A drain page waits up to `locks::LOCK_TIMEOUT` for the same locks, so a
@@ -798,8 +809,9 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
     )
 }
 
-/// Whether a Re-derive build may take `definition` (#625 F2, F5): a target
-/// the ledger maintains ([`buildable_shape`]), on a captured source. A
+/// Whether a Re-derive build may take `definition` (#625 F2, F5, F8a): a
+/// target the ledger maintains ([`buildable_shape`]) or a plain 1-1 target
+/// ([`one_to_one::buildable`]), on a captured source. A
 /// source that is another definition's target is fed by the target-mutation
 /// seam, whose writer can commit after a chunk's snapshot; it needs a fence
 /// first (#625 F6). Taking one also changes what a failing chunk's
@@ -809,7 +821,7 @@ pub async fn qualifies(
     client: &impl GenericClient,
     definition: &Definition,
 ) -> Result<bool, catalog::CatalogError> {
-    if buildable_shape(definition).is_none() {
+    if buildable_shape(definition).is_none() && !one_to_one::buildable(definition) {
         return Ok(false);
     }
     Ok(!catalog::is_definition_target(client, &definition.source_table).await?)
@@ -1006,11 +1018,12 @@ pub async fn work_once(
     if building.is_empty() {
         return Ok(Step::Idle);
     }
-    for (id, target) in &building {
+    for (id, target, merges) in &building {
         // A target whose every partition with rows another worker is
         // merging is skipped (#625 F2b, #717): a pass that claims none falls
-        // through to the next target, then to a chunk.
-        if has_deltas(pool, target).await? && merge_once(pool, *id).await? > 0 {
+        // through to the next target, then to a chunk. A 1-1 target has no
+        // delta table, so nothing merges for it (#625 F8a).
+        if *merges && has_deltas(pool, target).await? && merge_once(pool, *id).await? > 0 {
             return Ok(Step::Merged);
         }
     }
@@ -1049,7 +1062,7 @@ pub async fn work_once(
     // done. Each of those checks after its own commit; this catches a worker
     // that died between the two.
     let mut completed = false;
-    for (id, _) in &building {
+    for (id, ..) in &building {
         completed |= try_complete(pool, *id).await?;
     }
     Ok(if completed {
@@ -1062,19 +1075,34 @@ pub async fn work_once(
 }
 
 /// Every definition a Re-derive build is running for that isn't frozen,
-/// with its target, in id order.
-async fn building(pool: &Pool) -> Result<Vec<(i64, String)>, ChunkQueueError> {
+/// with its target and whether the target has a group-delta table to merge
+/// (a 1-1 target has none, #625 F8a), in id order.
+async fn building(pool: &Pool) -> Result<Vec<(i64, String, bool)>, ChunkQueueError> {
     let client = pool.get().await?;
     Ok(client
         .query(
-            "select id, target_table from transform_definitions \
-             where build = $1 and status = $2 order by id",
+            &format!(
+                "select id, target_table, {} from transform_definitions \
+                 where build = $1 and status = $2 order by id",
+                deltas_exist_sql("target_table")
+            ),
             &[&BUILD_REDERIVE, &TransformStatus::Backfilling.as_str()],
         )
         .await?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
         .collect())
+}
+
+/// SQL over a `transform_definitions` row: whether the target `column`
+/// names has a group-delta table. Only a ledger aggregate's target has one;
+/// a 1-1 target's build writes its rows directly (#625 F8a).
+fn deltas_exist_sql(column: &str) -> String {
+    format!(
+        "pg_catalog.to_regclass(pg_catalog.format('%I.%I', \
+             split_part({column}, '.', 1), split_part({column}, '.', 2) || '{}')) is not null",
+        crate::defs::ledger::DELTAS_SUFFIX
+    )
 }
 
 /// Whether `target`'s group-delta table has a row. A table dropped since the
@@ -1180,14 +1208,7 @@ async fn run_rederive(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
-    let plan = BuildPlan::for_definition(pool, &definition)
-        .await
-        .map_err(build_error)?
-        .ok_or_else(|| {
-            build_error(crate::defs::backfill::BackfillError::Unsupported(
-                "the definition's shape no longer takes a re-derive build".to_string(),
-            ))
-        })?;
+    let plan = AnyPlan::for_definition(pool, &definition).await?;
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
         chunk.id,
@@ -1211,7 +1232,18 @@ async fn run_rederive(
         return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
     }
     metrics::record_build_statement(BuildStatement::ChunkSetup, setup_started.elapsed());
-    let outcome = run_chunk(&txn, &plan, lo, hi).await.map_err(build_error)?;
+    let (keys, delta_rows) = match &plan {
+        AnyPlan::Ledger(plan) => {
+            let outcome = run_chunk(&txn, plan, lo, hi).await.map_err(build_error)?;
+            (outcome.keys, outcome.delta_rows)
+        }
+        AnyPlan::OneToOne(plan) => {
+            let outcome = one_to_one::run_chunk(&txn, plan, lo, hi)
+                .await
+                .map_err(build_error)?;
+            (outcome.keys, 0)
+        }
+    };
     let commit_started = Instant::now();
     txn.execute(
         "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
@@ -1223,11 +1255,45 @@ async fn run_rederive(
     metrics::record_build_statement(BuildStatement::ChunkCommit, commit_started.elapsed());
     metrics::record_build_chunk(
         started.elapsed(),
-        outcome.keys as u64,
-        u64::try_from(outcome.delta_rows).unwrap_or(0),
+        keys as u64,
+        u64::try_from(delta_rows).unwrap_or(0),
     );
     try_complete(pool, chunk.definition_id).await?;
     Ok(())
+}
+
+/// The plan of either kind of target a Re-derive build serves.
+enum AnyPlan {
+    /// A ledger aggregate's: chunks append group deltas a merger folds.
+    Ledger(Box<BuildPlan>),
+    /// A plain 1-1 target's (#625 F8a): chunks write the target rows.
+    OneToOne(one_to_one::OneToOnePlan),
+}
+
+impl AnyPlan {
+    /// `definition`'s plan, or [`BackfillError::Unsupported`] when its shape
+    /// no longer takes a Re-derive build.
+    ///
+    /// [`BackfillError::Unsupported`]: crate::defs::backfill::BackfillError::Unsupported
+    async fn for_definition(pool: &Pool, definition: &Definition) -> Result<Self, ChunkQueueError> {
+        if let Some(plan) = BuildPlan::for_definition(pool, definition)
+            .await
+            .map_err(build_error)?
+        {
+            return Ok(AnyPlan::Ledger(Box::new(plan)));
+        }
+        if let Some(plan) = one_to_one::OneToOnePlan::for_definition(pool, definition)
+            .await
+            .map_err(build_error)?
+        {
+            return Ok(AnyPlan::OneToOne(plan));
+        }
+        Err(build_error(
+            crate::defs::backfill::BackfillError::Unsupported(
+                "the definition's shape no longer takes a re-derive build".to_string(),
+            ),
+        ))
+    }
 }
 
 /// Runs a claimed plan job (#625 F2, Q13): walks the source's primary key
@@ -1340,14 +1406,7 @@ async fn run_sweep(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
-    let plan = BuildPlan::for_definition(pool, &definition)
-        .await
-        .map_err(build_error)?
-        .ok_or_else(|| {
-            build_error(crate::defs::backfill::BackfillError::Unsupported(
-                "the definition's shape no longer takes a re-derive build".to_string(),
-            ))
-        })?;
+    let plan = AnyPlan::for_definition(pool, &definition).await?;
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
         chunk.id,
@@ -1378,14 +1437,15 @@ async fn run_sweep(
             txn.rollback().await?;
             return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
         }
-        let outcome = sweep_batch(
-            &txn,
-            &plan,
-            &start_xid,
-            cursor.as_deref(),
-            options.chunk_rows.max(1),
-        )
-        .await
+        let scan = options.chunk_rows.max(1);
+        let outcome = match &plan {
+            AnyPlan::Ledger(plan) => {
+                sweep_batch(&txn, plan, &start_xid, cursor.as_deref(), scan).await
+            }
+            AnyPlan::OneToOne(plan) => {
+                one_to_one::sweep_batch(&txn, plan, &start_xid, cursor.as_deref(), scan).await
+            }
+        }
         .map_err(build_error)?;
         let next = outcome.next.clone().or(cursor.clone());
         txn.execute(
@@ -1571,9 +1631,10 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
     Ok(true)
 }
 
-/// [`try_complete`]'s test, in one statement: `id` is under a Re-derive
-/// build, no current chunk of it is undone, and its target's group-delta
-/// table is empty. A dropped target reads as not done.
+/// [`try_complete`]'s test: `id` is under a Re-derive build, no current
+/// chunk of it is undone, and its target's group-delta table is empty. A
+/// 1-1 target has no delta table (#625 F8a), so the chunks are the whole
+/// test. A dropped target reads as not done.
 async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQueueError> {
     let Some(row) = client
         .query_opt(
@@ -1582,10 +1643,11 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
                      select 1 from backfill_chunks bc \
                      where bc.definition_id = d.id and not bc.done \
                        and not ({}) \
-                 ) \
+                 ), {} \
                  from transform_definitions d \
                  where d.id = $1 and d.status = $2 and d.build = $3",
-                chunk_queue::STALE
+                chunk_queue::STALE,
+                deltas_exist_sql("d.target_table"),
             ),
             &[&id, &TransformStatus::Backfilling.as_str(), &BUILD_REDERIVE],
         )
@@ -1596,6 +1658,11 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
     let target: String = row.get(0);
     if !row.get::<_, bool>(1) {
         return Ok(false);
+    }
+    if !row.get::<_, bool>(2) {
+        // A 1-1 target, whose definition row the same statement read, so
+        // its target wasn't dropped.
+        return Ok(true);
     }
     let deltas =
         ddl::qualified_target_table_ident(&crate::defs::ledger::deltas_table_name(&target));
@@ -1642,8 +1709,9 @@ pub async fn settle_builds(pool: &Pool) {
             return;
         }
         let mut progressed = false;
-        for (id, target) in &building {
-            while has_deltas(pool, target).await.expect("read a delta table")
+        for (id, target, merges) in &building {
+            while *merges
+                && has_deltas(pool, target).await.expect("read a delta table")
                 && merge_once(pool, *id).await.expect("merge group deltas") > 0
             {
                 progressed = true;
@@ -1668,7 +1736,7 @@ pub async fn settle_builds(pool: &Pool) {
             run_claimed(pool, chunk, CLAIMED_BY, &options).await;
             progressed = true;
         }
-        for (id, _) in &building {
+        for (id, ..) in &building {
             progressed |= try_complete(pool, *id).await.expect("complete a build");
         }
         if progressed {
@@ -1828,6 +1896,114 @@ mod tests {
         };
         assert!(warned("split it in two"), "{events:#?}");
         assert!(warned("quarantined the key"), "{events:#?}");
+    }
+
+    /// #625 F-A5 for a 1-1 target's Re-derive chunk (F8a): #616's own
+    /// repro, a plain 1-1 `x + x` over a source of several chunks that
+    /// overflows on one row. The failing chunk splits until the key fails
+    /// alone, the key is quarantined, and the build goes `live` without it.
+    #[tokio::test]
+    async fn a_one_to_one_chunk_that_fails_on_its_data_quarantines_the_key() {
+        use crate::defs::ast::ValueType;
+        use crate::integer::IntWidth;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let trellis = crate::app::Trellis::connect(config, crate::app::TrellisOptions::default())
+            .await
+            .expect("connect");
+        let (mut raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public; \
+             create table public.nums (id bigint primary key, x integer); \
+             insert into public.nums select i, i from generate_series(1, 300) i; \
+             update public.nums set x = 2147483647 where id = 150",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("seed the source");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+            ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        crate::defs::install_definition(
+            &pool,
+            "TRANSFORM doubles FROM nums SELECT x + x AS doubled",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install_definition");
+        crate::client::reconcile_pass(
+            &mut raw,
+            &pool,
+            crate::config::DEFAULT_SCHEMA,
+            "f8a_wake",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("start the build");
+        let status = || async {
+            trellis
+                .status("doubles")
+                .await
+                .expect("status")
+                .expect("the definition exists")
+        };
+        assert_eq!(status().await.status, TransformStatus::Backfilling);
+
+        let options = WorkerOptions {
+            chunk_rows: 100,
+            drain_batch_cap: 100_000,
+            heartbeat_interval: Duration::from_secs(1),
+            reclaim_ttl: Duration::from_secs(30),
+        };
+        let mut failure = None;
+        for _ in 0..200 {
+            let step = work_once(&pool, "worker", &options)
+                .await
+                .expect("a build step");
+            if failure.is_none() {
+                failure = status().await.backfill_failure;
+            }
+            if !step.progressed() {
+                break;
+            }
+        }
+        let failure = failure.expect("the failing chunk was on the status while it narrowed");
+        assert!(
+            failure.last_error.contains("out of range"),
+            "{}",
+            failure.last_error
+        );
+        let status = status().await;
+        assert_eq!(status.status, TransformStatus::Live);
+        assert_eq!(status.backfill_failure, None);
+        let target = raw
+            .query_one(
+                "select count(*), count(*) filter (where id = 150), \
+                        count(*) filter (where doubled = 2 * id) \
+                 from public.doubles",
+                &[],
+            )
+            .await
+            .expect("read the target");
+        assert_eq!(target.get::<_, i64>(0), 299);
+        assert_eq!(target.get::<_, i64>(1), 0, "the failing key is left out");
+        assert_eq!(target.get::<_, i64>(2), 299);
+        let quarantined = trellis
+            .sample_quarantined("doubles", None, 10)
+            .await
+            .expect("sample the quarantined keys");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].key, "150");
     }
 
     #[test]

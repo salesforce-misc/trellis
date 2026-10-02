@@ -2653,6 +2653,10 @@ mod backfill_chunk_claim_tests {
         )
         .await
         .expect("seed source");
+        // A seam-fed source keeps the old chunked build (#625 F8a).
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.gated")
+            .await
+            .expect("make gated another definition's target");
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("price".to_string(), ValueType::Numeric),
@@ -2855,6 +2859,13 @@ mod backfill_chunk_failure_tests {
             .await
             .expect("seed the bad row");
         }
+        // The old chunked build these tests exercise is a seam-fed
+        // source's since #625 F8a (over a captured table, a plain 1-1 is
+        // the Re-derive build's, whose failures `staging::build`'s own
+        // tests cover).
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.nums")
+            .await
+            .expect("make nums another definition's target");
         let columns = HashMap::from([
             ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
             ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
@@ -3285,8 +3296,10 @@ mod backfill_shutdown_tests {
             .await
             .expect("connect");
         raw.batch_execute(
-            "create table public.s (id bigint primary key, a numeric); \
-             insert into public.s (id, a) select g, g from generate_series(1, 5) g;",
+            "create table public.s (id bigint primary key, a numeric, r bigint); \
+             insert into public.s (id, a, r) select g, g, 1 from generate_series(1, 5) g; \
+             create table public.r (id bigint primary key, w numeric); \
+             insert into public.r values (1, 10);",
         )
         .await
         .expect("seed source table");
@@ -3300,10 +3313,17 @@ mod backfill_shutdown_tests {
         let columns = std::collections::HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("a".to_string(), ValueType::Numeric),
+            ("r".to_string(), ValueType::Numeric),
         ]);
+        // A relationship-enriched 1-1 still waits on the discharge's fence
+        // (until milestone E); a plain 1-1 is the Re-derive build's, which
+        // takes no fence (#625 F8a).
+        crate::defs::create_relationship(&pool, "RELATIONSHIP rel FROM s.r TO r.id")
+            .await
+            .expect("create the to-one relationship");
         crate::defs::install_definition(
             &pool,
-            "TRANSFORM t FROM s SELECT a + 1 AS f",
+            "TRANSFORM t FROM s SELECT a + 1 AS f, rel.w AS w",
             &columns,
             "public",
         )
@@ -3371,7 +3391,10 @@ mod backfill_shutdown_tests {
             "a shutdown mid-wait leaves the definition for the next pass"
         );
         let markers: i64 = raw
-            .query_one("select count(*) from pending_backfill", &[])
+            .query_one(
+                "select count(*) from pending_backfill where table_name = 'public.s'",
+                &[],
+            )
             .await
             .expect("count markers")
             .get(0);

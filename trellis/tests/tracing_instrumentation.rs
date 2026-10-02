@@ -601,39 +601,88 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
 
 /// Issue #56's backfill status transition events (#55's lifecycle):
 /// `waiting_to_backfill` -> `backfilling` from the staging worker's
-/// reconcile pass (`trellis::client::reconcile_pass`) dispatching a
-/// plain 1-1 definition's chunks (ADR-0016), then `backfilling` ->
-/// `catching_up` from its last chunk finishing and `catching_up` -> `live`
-/// from its go-live catch-up's discharge (issue #476) — mirrors `transform_status_lifecycle.rs`'s
+/// reconcile pass (`trellis::client::reconcile_pass`) dispatching the
+/// definition's build (ADR-0016), then `backfilling` -> `catching_up` from
+/// the build finishing and `catching_up` -> `live` from its go-live
+/// catch-up's discharge (issue #476) — mirrors `transform_status_lifecycle.rs`'s
 /// `a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live`'s straggler
 /// setup, trimmed to just the settle-and-discharge half this test cares
 /// about (that file already covers the full status/data correctness story;
 /// this one only adds the tracing assertion).
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// which goes `backfilling` -> `live` with no catch-up
+/// ([`rederive_build_status_transitions_emit_info_events`]); a 1-1 that also
+/// counts over a to-many relationship keeps the old direct build and its
+/// go-live catch-up.
 #[tokio::test]
 async fn backfill_status_transitions_emit_info_events() {
+    assert_eq!(
+        backfill_status_transitions(
+            "create table kids (id bigint primary key, s_id bigint); \
+             insert into kids (id, s_id) values (1, 1), (2, 1), (3, 2)",
+            Some("RELATIONSHIP kids FROM s.id TO kids.s_id"),
+            "TRANSFORM t FROM s SELECT a + a AS x, COUNT(kids.id) AS n",
+        )
+        .await,
+        [
+            ("waiting_to_backfill", "backfilling"),
+            ("backfilling", "catching_up"),
+            ("catching_up", "live"),
+        ]
+        .map(|(from, to)| (from.to_string(), to.to_string())),
+    );
+}
+
+/// #625 F8a: the Re-derive build of a plain 1-1 over a captured table
+/// reports its start (`waiting_to_backfill` -> `backfilling`) and its
+/// finish (`backfilling` -> `live`), and nothing else: it parks no go-live
+/// catch-up, so it is never `catching_up`.
+#[tokio::test]
+async fn rederive_build_status_transitions_emit_info_events() {
+    assert_eq!(
+        backfill_status_transitions("", None, "TRANSFORM t FROM s SELECT a + a AS x").await,
+        [
+            ("waiting_to_backfill", "backfilling"),
+            ("backfilling", "live")
+        ]
+        .map(|(from, to)| (from.to_string(), to.to_string())),
+    );
+}
+
+/// The body of the backfill transition tests: seeds `s`, runs `extra_ddl`,
+/// defines `relationship` (if any) and registers `transform` under a
+/// straggler that commits before the settled pass, then returns the `(from,
+/// to)` of every INFO "transform status transition" event the settled
+/// reconcile pass and `settle_registrations` emitted, in order.
+async fn backfill_status_transitions(
+    extra_ddl: &str,
+    relationship: Option<&str>,
+    transform: &str,
+) -> Vec<(String, String)> {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
 
-    raw.batch_execute(
+    raw.batch_execute(&format!(
         "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 5) g",
-    )
+         insert into s (id, a) select g, g from generate_series(1, 5) g; {extra_ddl}"
+    ))
     .await
     .expect("seed source table");
+    if let Some(relationship) = relationship {
+        trellis::defs::create_relationship(&db.pool, relationship)
+            .await
+            .expect("create the relationship");
+    }
 
     let straggler = OpenTransaction::begin(db.dsn()).await;
     straggler.execute("select txid_current()").await;
 
     let cols = numeric_columns(&["a"]);
-    let def = install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x",
-        &cols,
-        "public",
-    )
-    .await
-    .expect("install_definition defers instead of racing the fence");
+    let def = install_definition(&db.pool, transform, &cols, "public")
+        .await
+        .expect("install_definition defers instead of racing the fence");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
 
     straggler.commit().await;
@@ -654,55 +703,29 @@ async fn backfill_status_transitions_emit_info_events() {
     trellis::intake::markers::settle_registrations(&db.pool).await;
 
     let events = captured.events();
-    let to_backfilling = events.iter().find(|e| {
-        e.level == tracing::Level::INFO
-            && e.message().contains("transform status transition")
-            && e.fields.get("to").map(String::as_str) == Some("backfilling")
-    });
-    assert!(
-        to_backfilling.is_some(),
-        "expected an info event for waiting_to_backfill -> backfilling: {events:#?}"
-    );
-    assert_eq!(
-        to_backfilling
-            .unwrap()
-            .fields
-            .get("from")
-            .map(String::as_str),
-        Some("waiting_to_backfill")
-    );
-
-    // Issue #476: the build's completion leaves it `catching_up`, and the
-    // discharge of its go-live catch-up takes it `live`.
-    let to_catching_up = events.iter().find(|e| {
-        e.level == tracing::Level::INFO
-            && e.message().contains("transform status transition")
-            && e.fields.get("to").map(String::as_str) == Some("catching_up")
-    });
-    assert!(
-        to_catching_up.is_some(),
-        "expected an info event for backfilling -> catching_up: {events:#?}"
-    );
-    assert_eq!(
-        to_catching_up
-            .unwrap()
-            .fields
-            .get("from")
-            .map(String::as_str),
-        Some("backfilling")
-    );
-
-    let to_live = events.iter().find(|e| {
-        e.level == tracing::Level::INFO
-            && e.message().contains("transform status transition")
-            && e.fields.get("to").map(String::as_str) == Some("live")
-    });
-    assert!(
-        to_live.is_some(),
-        "expected an info event for catching_up -> live: {events:#?}"
-    );
-    assert_eq!(
-        to_live.unwrap().fields.get("from").map(String::as_str),
-        Some("catching_up")
-    );
+    let transitions: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| {
+            e.level == tracing::Level::INFO && e.message().contains("transform status transition")
+        })
+        .map(|e| {
+            let field = |name: &str| {
+                e.fields
+                    .get(name)
+                    .unwrap_or_else(|| panic!("a transition event names `{name}`: {e:#?}"))
+                    .clone()
+            };
+            (field("from"), field("to"))
+        })
+        .collect();
+    let status: String = raw
+        .query_one(
+            "select status from transform_definitions where target_table = 'public.t'",
+            &[],
+        )
+        .await
+        .expect("read the status")
+        .get(0);
+    assert_eq!(status, "live", "the definition ends live: {events:#?}");
+    transitions
 }

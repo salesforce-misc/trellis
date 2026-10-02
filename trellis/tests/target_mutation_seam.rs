@@ -1150,7 +1150,10 @@ async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
 }
 
 /// `src -> t -> d`, `d` reading `t`'s target as its source, both `live`.
-async fn chained_pair(db: &TestDatabase, raw: &mut Client) {
+/// With `seam_fed_src`, `src` reads as another definition's target
+/// (`feed_from_a_test_definition`), so `t` takes the old chunked build and
+/// its go-live catch-up rather than the Re-derive build (#625 F8a).
+async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
     raw.batch_execute(
         "create table public.src (id integer primary key, v numeric); \
          insert into public.src values (1, 1), (2, 2); \
@@ -1160,6 +1163,11 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client) {
     .await
     .expect("create tables");
     one_to_one_ledgers(raw, &["t", "d"]).await;
+    if seam_fed_src {
+        markers::feed_from_a_test_definition(&*raw, "public.src")
+            .await
+            .expect("make src read as a seam-fed source");
+    }
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -1186,10 +1194,14 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client) {
 /// reports `catching_up` while that upstream is paused and while it
 /// rebuilds after the resume, applying throughout, and reports `live` again
 /// once the upstream is `live` and its own catch-up has run.
+///
+/// #625 F8a: the catch-up the rebuild parks for its readers is the old
+/// chunked build's, so `t` reads a seam-fed `src`; a Re-derive-built `t` is
+/// [`a_chained_reader_reports_catching_up_while_its_upstream_rederives`].
 #[tokio::test]
 async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live() {
     let (_cluster, db, mut raw) = setup().await;
-    chained_pair(&db, &mut raw).await;
+    chained_pair(&db, &mut raw, true).await;
     let trellis = trellis::Trellis::connect(
         trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
         trellis::TrellisOptions::default(),
@@ -1210,6 +1222,7 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
         .await
         .expect("list definitions")
         .into_iter()
+        .filter(|d| d.target_table != "public.src")
         .map(|d| (d.target_table, d.status))
         .collect();
     assert_eq!(
@@ -1269,13 +1282,83 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
     );
 }
 
+/// Issue #497 under the Re-derive build (#625 F8a): a reader of a plain 1-1
+/// over a captured table reports `catching_up` while that upstream waits
+/// for its rebuild after the resume and while the rebuild runs
+/// (`backfilling`, applying), and `live` once the rebuild takes the upstream
+/// `live`. The rebuild writes `t` through the seam and parks nothing for `d`,
+/// which stays `live` underneath and follows `t` as those seam rows drain.
+#[tokio::test]
+async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
+    let (_cluster, db, mut raw) = setup().await;
+    chained_pair(&db, &mut raw, false).await;
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+
+    trellis
+        .apply("PAUSE TRANSFORM t")
+        .await
+        .expect("pause the upstream");
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+    raw.execute("update public.src set v = 100 where id = 1", &[])
+        .await
+        .expect("update the source while paused");
+    trellis
+        .apply("RESUME TRANSFORM t")
+        .await
+        .expect("resume the upstream");
+    assert_eq!(
+        reported(&trellis, "t").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+
+    // The start: `t` rebuilds under the Re-derive build.
+    markers::discharge_registrations(&db.pool)
+        .await
+        .expect("start the rebuild");
+    let build: Option<String> = raw
+        .query_one(
+            "select build from transform_definitions where target_table = 'public.t'",
+            &[],
+        )
+        .await
+        .expect("read t's build")
+        .get(0);
+    assert_eq!(
+        (stored(&raw, "t").await.as_str(), build.as_deref()),
+        ("backfilling", Some("rederive")),
+        "precondition: the Re-derive build runs t's rebuild"
+    );
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+    assert_eq!(stored(&raw, "d").await, "live", "d keeps applying");
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(stored(&raw, "t").await, "live");
+    assert_eq!(stored(&raw, "d").await, "live", "nothing was parked for d");
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::Live);
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, "select id::text, doubled::text from public.d").await,
+        BTreeMap::from([
+            ("1".to_string(), "200".to_string()),
+            ("2".to_string(), "4".to_string()),
+        ]),
+        "d follows the rebuilt upstream through the seam"
+    );
+}
+
 /// Issue #497: a `live` reader of an upstream that is catching up (here on a
 /// resumed column's catch-up) reports `catching_up` though nothing was parked
 /// for the reader itself, and `live` once the upstream's catch-up discharges.
 #[tokio::test]
 async fn a_chained_reader_reports_catching_up_while_its_upstream_catches_up() {
     let (_cluster, db, mut raw) = setup().await;
-    chained_pair(&db, &mut raw).await;
+    chained_pair(&db, &mut raw, false).await;
     let trellis = trellis::Trellis::connect(
         trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
         trellis::TrellisOptions::default(),
@@ -1349,7 +1432,22 @@ enum Consumer {
 /// the rows were deferred and re-staged: they land on a consumer already
 /// re-derived from the refreshed projection. The test stages them again at
 /// their original write token once the rest is quiescent.
-async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stale_last: bool) {
+///
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// whose rebuild writes the target through the seam and parks no catch-up.
+/// The go-live catch-up's refresh this pins is the old chunked build's,
+/// which a plain 1-1 over a seam-fed source still takes, so `orders` is made
+/// to read as another definition's target (`feed_from_a_test_definition`)
+/// unless `rederive`. With `rederive` (only with `stale_last`: the rebuild's
+/// own seam rows land after the sealed stale ones, so only a replay can
+/// drain a stale row after them), the rebuild's seam rows are what refresh
+/// the projection, and the replayed stale rows must not undo them either.
+async fn stale_seam_rows_drain_after_a_rebuilds_refresh(
+    consumer: Consumer,
+    stale_last: bool,
+    rederive: bool,
+) {
+    assert!(stale_last || !rederive, "see the doc comment");
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, a numeric); \
@@ -1361,6 +1459,11 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
     .await
     .expect("create tables");
     one_to_one_ledgers(&raw, &["order_doubles"]).await;
+    if !rederive {
+        markers::feed_from_a_test_definition(&raw, "public.orders")
+            .await
+            .expect("make orders read as a seam-fed source");
+    }
     create_definition(
         &db.pool,
         "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
@@ -1526,10 +1629,21 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
         rebuilt,
         "precondition: the rebuild read the paused changes"
     );
+    if rederive {
+        // No catch-up refreshed the projection: the rebuild's seam rows are
+        // still in the ring, and they refresh it.
+        assert_ne!(
+            rows(&raw, &projection_rows).await,
+            rebuilt,
+            "precondition: the Re-derive build ran the rebuild, parking no catch-up"
+        );
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    }
     assert_eq!(
         rows(&raw, &projection_rows).await,
         rebuilt,
-        "precondition: the catch-up refreshed the projection"
+        "precondition: the catch-up (or, Re-derive built, the rebuild's seam rows) \
+         refreshed the projection"
     );
 
     // The pre-pause seam rows drain now, after the refresh.
@@ -1565,22 +1679,32 @@ async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stal
 
 #[tokio::test]
 async fn stale_seam_rows_after_a_rebuilds_refresh_leave_a_to_one_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, false).await;
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, false, false).await;
 }
 
 #[tokio::test]
 async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, false).await;
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, false, false).await;
 }
 
 #[tokio::test]
 async fn stale_seam_rows_drained_last_leave_a_to_one_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, true).await;
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, true, false).await;
 }
 
 #[tokio::test]
 async fn stale_seam_rows_drained_last_leave_an_aggregate_consumer_correct() {
-    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, true).await;
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, true, false).await;
+}
+
+#[tokio::test]
+async fn stale_seam_rows_drained_after_a_rederive_rebuild_leave_a_to_one_consumer_correct() {
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, true, true).await;
+}
+
+#[tokio::test]
+async fn stale_seam_rows_drained_after_a_rederive_rebuild_leave_an_aggregate_consumer_correct() {
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, true, true).await;
 }
 
 /// Issue #507: the projection refresh diffs the whole target, so only a

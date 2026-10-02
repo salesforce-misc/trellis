@@ -1019,6 +1019,13 @@ mod db_tests {
             ("g".to_string(), ValueType::Text),
             ("a".to_string(), ValueType::Numeric),
         ]);
+        // The copy's build is the old one, with a go-live catch-up to
+        // sweep, only while `orders` reads as another definition's target:
+        // over a captured table a plain 1-1 is the Re-derive build's
+        // (#625 F8a).
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.orders")
+            .await
+            .expect("make orders read as another definition's target");
         for text in ["TRANSFORM orders_copy FROM orders SELECT a AS a", BY_G] {
             crate::defs::catalog::install_definition(&pool, text, &columns, "public")
                 .await

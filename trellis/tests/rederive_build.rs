@@ -25,6 +25,12 @@ const WAKE: &str = "rederive_wake";
 /// `SUM` and `COUNT(*)` by `g`: a shape the Re-derive build takes.
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
 
+/// A plain 1-1 target: the Re-derive build takes it since #625 F8a.
+const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
+
+const ONE_ACTUAL: &str = "select (id, g, dbl)::text from public.one order by id";
+const ONE_EXPECTED: &str = "select (id, g, v + v)::text from public.src order by id";
+
 const AGG_ACTUAL: &str = "select (g, total, n)::text from public.agg order by g";
 const AGG_EXPECTED: &str =
     "select (g, sum(v), count(*))::text from public.src group by g order by g";
@@ -254,6 +260,14 @@ impl Fixture {
     async fn partitions(&self) -> i64 {
         self.count("select count(distinct __part) from public.agg__deltas")
             .await
+    }
+
+    async fn assert_one_oracle(&self) {
+        assert_eq!(
+            self.rows(ONE_ACTUAL).await,
+            self.rows(ONE_EXPECTED).await,
+            "the 1-1 target equals its source"
+        );
     }
 
     async fn assert_agg_oracle(&self) {
@@ -1612,4 +1626,322 @@ async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
     f.run("agg").await;
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
+}
+
+// ------------------------------------------------------- 1-1 targets (F8a)
+
+/// A plain 1-1 target's build (#625 F8a) is `waiting_to_backfill ->
+/// backfilling -> live`, with no `catching_up`, no marker, and no group
+/// deltas: its chunks write the target rows, so no step merges, and it has
+/// no delta table.
+#[tokio::test]
+async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
+    let mut f = Fixture::new(200, &[ONE]).await;
+    assert_eq!(
+        f.status("one").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    f.pass().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
+    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
+
+    let (steps, seen) = f.run("one").await;
+    assert_eq!(steps.first(), Some(&Step::Planned));
+    assert!(steps.contains(&Step::Chunk));
+    assert!(!steps.contains(&Step::Merged), "a 1-1 build never merges");
+    assert_eq!(
+        seen,
+        BTreeSet::from(["backfilling".to_string(), "live".to_string()]),
+        "the build never passes through catching_up"
+    );
+    assert_eq!(f.build("one").await, None);
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'rederive'")
+            .await,
+        20,
+        "200 rows in chunks of 10"
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind in ('range', 'direct')")
+            .await,
+        0,
+        "no old build ran"
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep'")
+            .await,
+        0
+    );
+    assert_eq!(
+        f.count("select count(*) from pg_class where relname = 'one__deltas'")
+            .await,
+        0,
+        "a 1-1 target has no delta table"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one__ledger where __basis is null")
+            .await,
+        0,
+        "every entry was re-derived by a chunk"
+    );
+    f.assert_one_oracle().await;
+}
+
+/// A started 1-1 definition applies at once (B1), and every kind of write
+/// made while its build runs, on keys whose chunks have and haven't run,
+/// ends up in the target exactly as the source has it.
+#[tokio::test]
+async fn changes_drained_while_a_one_to_one_builds_are_applied() {
+    let mut f = Fixture::new(200, &[ONE]).await;
+    f.pass().await;
+    f.raw
+        .batch_execute("insert into public.src values (1000, 99, 5)")
+        .await
+        .expect("insert");
+    f.drain().await;
+    assert_eq!(
+        f.rows("select (id, g, dbl)::text from public.one").await,
+        vec!["(1000,99,10)".to_string()],
+        "the change was applied while backfilling, before any chunk"
+    );
+
+    assert_eq!(f.step(&OPTIONS).await, Step::Planned);
+    for round in 0..6 {
+        let base = round * 30;
+        f.raw
+            .batch_execute(&format!(
+                "update public.src set v = v + 100 where id in ({}, {}); \
+                 update public.src set g = (g + 3) % 7 where id = {}; \
+                 delete from public.src where id = {}; \
+                 insert into public.src values ({}, {}, 7)",
+                base + 1,
+                base + 25,
+                base + 12,
+                base + 18,
+                2000 + round,
+                round % 7,
+            ))
+            .await
+            .expect("write");
+        f.drain().await;
+        for _ in 0..3 {
+            f.step(&OPTIONS).await;
+        }
+    }
+    let (_, seen) = f.run("one").await;
+    assert!(!seen.contains("catching_up"));
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    f.assert_one_oracle().await;
+}
+
+/// A 1-1 definition paused part-way through its build, with keys deleted,
+/// updated and inserted while frozen, is rebuilt over the entries it kept
+/// (#625 F3, F8a): no marker, a sweep, and the sweep deletes the target
+/// rows of the keys deleted meanwhile, which no chunk reaches.
+#[tokio::test]
+async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
+    let mut f = Fixture::new(100, &[ONE]).await;
+    f.pass().await;
+    // The plan job and three chunks (ids 1..=30).
+    assert_eq!(f.run_chunks_by_hand(4).await, 4);
+    assert_eq!(f.count("select count(*) from public.one").await, 30);
+    let trellis = f.trellis().await;
+    trellis
+        .apply("PAUSE TRANSFORM one")
+        .await
+        .expect("pause the building transform");
+    f.raw
+        .batch_execute(
+            "delete from public.src where id <= 15 or id = 95; \
+             update public.src set v = v + 1000, g = g + 1 where id in (20, 50); \
+             insert into public.src values (200, 3, 7)",
+        )
+        .await
+        .expect("write while paused");
+    f.drain().await;
+    assert_eq!(
+        f.count("select count(*) from public.one where id <= 15")
+            .await,
+        15,
+        "the frozen target still has the deleted keys' rows"
+    );
+
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+    assert_eq!(
+        f.status("one").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
+    f.pass().await;
+    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep' and not done")
+            .await,
+        1,
+        "a rebuild over a non-empty ledger enqueues one sweep"
+    );
+
+    let (_, seen) = f.run("one").await;
+    assert_eq!(
+        seen,
+        BTreeSet::from(["backfilling".to_string(), "live".to_string()])
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where not done")
+            .await,
+        0
+    );
+    assert_eq!(
+        f.count(
+            "select count(*) from public.one__ledger \
+             where not __tombstone and __from_key::bigint <= 15"
+        )
+        .await,
+        0,
+        "the sweep retired the deleted keys' entries"
+    );
+    f.assert_one_oracle().await;
+}
+
+/// The sweep is what removes a key deleted while paused: with the rebuild's
+/// sweep job dropped, the chunks alone leave its target row behind. (So the
+/// test above isn't passing for a reason other than the sweep.)
+#[tokio::test]
+async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
+    let mut f = Fixture::new(30, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.src where id = 5")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+    f.pass().await;
+    f.raw
+        .batch_execute("delete from backfill_chunks where kind = 'sweep'")
+        .await
+        .expect("drop the sweep");
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.count("select count(*) from public.one where id = 5")
+            .await,
+        1,
+        "only the sweep reaches a key with no source row"
+    );
+}
+
+/// A 1-1 build leaves a quarantined key out (#625 F-A5): the build goes
+/// `live` without its row, and its entry is never taken.
+#[tokio::test]
+async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
+    let mut f = Fixture::new(50, &[ONE]).await;
+    f.raw
+        .batch_execute(
+            "insert into poison (src_table, key, last_error) values ('public.src', '17', 'test')",
+        )
+        .await
+        .expect("quarantine key 17");
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.rows(ONE_ACTUAL).await,
+        f.rows("select (id, g, v + v)::text from public.src where id <> 17 order by id")
+            .await
+    );
+    assert_eq!(
+        f.count("select count(*) from public.one__ledger where __from_key = '17'")
+            .await,
+        0
+    );
+}
+
+/// A plain 1-1 whose source loses its primary key once captured (#625
+/// F8a): the start reads no key, so it isn't what fails; the plan job is
+/// what needs the key. That job fails, unnarrowable, and is charged and
+/// retried while status reports the error (#616); its last charge pauses
+/// the definition with the error on status. The build never goes `live`
+/// and nothing is written to the target.
+#[tokio::test]
+async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
+    // `chunk_queue::MAX_CHARGED_ATTEMPTS`, which is crate-private.
+    const MAX_CHARGED_ATTEMPTS: u32 = 5;
+    let mut f = Fixture::new(50, &[ONE]).await;
+    // Capture needs the key, so it goes after the pass that installs the
+    // capture and starts the build, and before the plan job runs.
+    f.pass().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
+    f.raw
+        .batch_execute("alter table public.src drop constraint src_pkey")
+        .await
+        .expect("drop the source's primary key");
+
+    let trellis = f.trellis().await;
+    for charge in 1..MAX_CHARGED_ATTEMPTS {
+        f.raw
+            .batch_execute("update backfill_chunks set next_attempt_at = now()")
+            .await
+            .expect("make the plan job due");
+        assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job is claimed");
+        let status = trellis
+            .status("one")
+            .await
+            .expect("status")
+            .expect("the transform is registered");
+        assert_eq!(status.status, trellis::TransformStatus::Backfilling);
+        let failure = status
+            .backfill_failure
+            .expect("status reports the failing plan job");
+        assert_eq!(failure.attempts, charge);
+        assert!(
+            failure.last_error.contains("no primary key"),
+            "the error names the cause, got {:?}",
+            failure.last_error
+        );
+        assert!(
+            failure.next_attempt_at > std::time::SystemTime::now(),
+            "the retry is backed off"
+        );
+    }
+    f.raw
+        .batch_execute("update backfill_chunks set next_attempt_at = now()")
+        .await
+        .expect("make the plan job due");
+    assert_eq!(f.run_chunks_by_hand(1).await, 1);
+
+    let status = trellis
+        .status("one")
+        .await
+        .expect("status")
+        .expect("the transform is registered");
+    assert_eq!(status.status, trellis::TransformStatus::Paused);
+    let failure = status
+        .backfill_failure
+        .expect("the pause carries the error");
+    assert_eq!(failure.attempts, MAX_CHARGED_ATTEMPTS);
+    assert!(failure.last_error.contains("no primary key"));
+
+    // Nothing more runs: no chunk was planned, a paused definition's plan
+    // job isn't claimed, and the target is empty.
+    f.raw
+        .batch_execute("update backfill_chunks set next_attempt_at = now()")
+        .await
+        .expect("make every job due");
+    assert_eq!(f.run_chunks_by_hand(4).await, 0);
+    let (steps, _) = f.run("one").await;
+    assert!(steps.iter().all(|step| !step.progressed()), "{steps:?}");
+    assert_eq!(f.status("one").await.as_deref(), Some("paused"));
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'rederive'")
+            .await,
+        0
+    );
+    assert_eq!(f.count("select count(*) from public.one").await, 0);
 }

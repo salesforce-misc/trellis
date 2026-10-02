@@ -74,7 +74,7 @@ counted once.
 
 There is one capture path, and every definition's initial build goes through
 it ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)), except a
-plain aggregate's, which is the Re-derive build
+plain aggregate's and a plain 1-1 definition's, which is the Re-derive build
 ([below](#re-derive-built-definitions), #625). Resumes,
 explicit `request_backfill` calls and go-live catch-ups use it too. Two
 rebuilds of some columns of a `live` transform don't yet: a column resume and an
@@ -137,7 +137,7 @@ drain threads.
    | Build | Used for | How it runs |
    |---|---|---|
    | Ring enumeration | any shape; the fallback for a shape the direct build can't render | one cursor inside the discharge transaction appends an image-less `Recompute` per source row, which drain workers fold like any batch |
-   | Plain 1-1 chunks | plain (no relationship) 1-1 definitions | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
+   | Plain 1-1 chunks | plain (no relationship) 1-1 definitions whose source is another definition's target (one on a captured table is the Re-derive build's, [below](#re-derive-built-definitions)) | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
    | Direct set-based build | aggregates other than the Re-derive build's ([below](#re-derive-built-definitions)), and relationship-enriched 1-1 definitions | the discharge enqueues one job (a `backfill_chunks` row with no bounds), and a drain thread runs ADR-0007's whole `INSERT … SELECT` build ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
 
    The discharge checks against the catalog that the direct build can render
@@ -245,7 +245,9 @@ increments (`SUM` or `AVG` of an exact numeric argument, `COUNT`) or
 recomputed from the group's entries (`MIN`/`MAX`, `BOOL_AND`/`BOOL_OR`, a
 float `SUM`/`AVG`, a composed field like `SUM(a) + COUNT(*)`), and their
 arguments may be expressions (`SUM(v + 1)`), which a chunk computes in SQL over
-the source exactly as Apply does over a change's row. Its build (`staging::build`) uses no marker, no fence wait, no
+the source exactly as Apply does over a change's row. A plain 1-1 definition
+(no relationship in any field, on a captured source) takes the same build,
+with the difference set out [after the steps](#a-1-1-definitions-chunks). Its build (`staging::build`) uses no marker, no fence wait, no
 direct build and no go-live catch-up:
 
 1. **Start.** Once the reconcile pass finds the definition ready (its source
@@ -291,6 +293,22 @@ slot, so a build never starves the drain or holds off a seal. Each chunk's
 transaction is short, so the build holds no long snapshot: the `xmin` caveat
 below doesn't apply to it.
 
+#### A 1-1 definition's chunks
+
+A 1-1 target's rows are absolute: each is the evaluation of one source row.
+So a 1-1 chunk writes the target rows itself, and there are no group deltas
+and no merges (step 4). It locks its keys' entries on the target's 1-1
+ledger, the per-key ordering state Apply keeps there, under the same short
+lock timeout. Then one statement reads the rows and `pg_current_snapshot()`,
+stamps each entry's basis with that snapshot, upserts the target row of
+every key that has a source row (when its values changed), and deletes the
+target row of a key whose source row is gone. Every field is computed in SQL
+over the source, as the old 1-1 chunks computed it. Apply and a chunk agree
+the same way: a change the chunk's snapshot saw is skipped when it drains,
+and one it didn't see is newer than the row the chunk wrote. A paused column
+is left as it is. Writes reach a definition that reads the target through
+the target-mutation seam, as Apply's do.
+
 **A resume rebuilds over what the freeze left.** A paused or quarantined
 definition keeps its ledger, its groups and the group deltas still owed to
 them. Its resume parks no marker: the next reconcile pass starts a Re-derive
@@ -298,7 +316,8 @@ build over the existing entries, with no truncate. Its start also enqueues a
 **sweep**, which runs once every chunk is done. It walks the ledger in key
 order, in bounded windows, and re-derives each live entry no chunk did,
 which is a key deleted while the definition was frozen: the entry becomes a
-tombstone and its group sheds it through the deltas.
+tombstone and its group sheds it through the deltas (a 1-1 target's row is
+deleted).
 
 ### Re-reading a table for applying readers
 

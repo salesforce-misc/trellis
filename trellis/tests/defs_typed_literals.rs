@@ -149,7 +149,8 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 
 /// Drives the durable backfill chunk queue to completion, standing in for a
 /// running `application_threads` drain worker (copied from
-/// `defs_install_definition.rs`).
+/// `defs_install_definition.rs`), then runs the Re-derive builds to `live`
+/// (#625 F8a: a plain 1-1 over a captured table is the Re-derive build's).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
@@ -164,6 +165,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            trellis::staging::build::settle_builds(pool).await;
             return;
         }
         for chunk in &claimed {
@@ -406,9 +408,11 @@ async fn evaluator_and_sql_oracle_agree_on_every_literal() {
 // ---------------------------------------------------------------------
 
 /// parse -> install -> **backfill/direct build** -> read. `install_definition`
-/// is the real front door, so this covers the SQL the direct build actually
-/// emits for a typed literal (`defs::backfill`'s renderer), plus the DDL that
-/// decides the target column's type.
+/// is the real front door, so this covers the SQL the build actually emits
+/// for a typed literal, plus the DDL that decides the target column's type.
+/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// whose chunk renders each field through `defs::oracle` as the old range
+/// build did.
 #[tokio::test]
 async fn install_and_backfill_produce_real_typed_columns() {
     let cluster = TestCluster::start();
