@@ -98,7 +98,7 @@ async fn the_aggregate_build_writes_one_ledger_entry_per_source_row_and_the_grou
             &client,
             "select count(*)::text, count(distinct __basis::text)::text, \
                  bool_and(__member)::text, bool_or(__tombstone)::text, \
-                 count(__applied_lsn)::text, count(__applied_seg)::text, count(__join_key)::text \
+                 count(__applied_lsn)::text, count(__applied_seg)::text \
              from t__ledger"
         )
         .await,
@@ -107,7 +107,6 @@ async fn the_aggregate_build_writes_one_ledger_entry_per_source_row_and_the_grou
             Some("1".to_string()),
             Some("true".to_string()),
             Some("false".to_string()),
-            Some("0".to_string()),
             Some("0".to_string()),
             Some("0".to_string()),
         ]],

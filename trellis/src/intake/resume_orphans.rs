@@ -994,8 +994,10 @@ mod db_tests {
 
     /// A `catching_up` 1-1 and aggregate over a 20k-row source, with no
     /// orphans: the sweep deletes nothing, and each target's branch of the
-    /// read plans as a set-based anti-join (hash or merge), never a nested
-    /// loop that probes the source once per target row. The aggregate's
+    /// read plans as an anti-join, and each that reads the source plans as a
+    /// set-based one (hash or merge), never a nested loop that probes the
+    /// source once per target row. (The ledger guard probes the ledger's
+    /// group index once per target group.) The aggregate's
     /// catch-all branch, for a `NULL` pattern that turned up after the sweep
     /// read the patterns, is the exception: it only scans rows no other
     /// branch covers. A planted orphan shows the sweep isn't vacuous.
@@ -1038,9 +1040,13 @@ mod db_tests {
         let (catch_all, hashable): (Vec<&str>, Vec<&str>) = planned
             .branches()
             .partition(|sql| sql.contains("is not distinct from"));
-        // A relationship-fed target isn't ledger-routed, so it has no entry
-        // sweep or ledger guard (#623 D3).
-        assert_eq!(hashable.len(), 2, "one branch per target: {hashable:?}");
+        // The copy's branch, and the aggregate's entry sweep and ledger
+        // guard: a relationship-fed aggregate is on the ledger (#623 D5).
+        assert_eq!(
+            hashable.len(),
+            3,
+            "the copy's and the ledger's branches: {hashable:?}"
+        );
         assert_eq!(catch_all.len(), 1, "the aggregate's catch-all");
         for sql in hashable {
             let plan: Vec<String> = txn
@@ -1051,14 +1057,15 @@ mod db_tests {
                 .map(|row| row.get(0))
                 .collect();
             let plan = plan.join("\n");
+            let reads_source = sql.contains(r#""public"."orders" as s"#);
             assert!(
-                plan.contains("Anti Join") && !plan.contains("Nested Loop"),
+                plan.contains("Anti Join") && !(reads_source && plan.contains("Nested Loop")),
                 "the sweep must plan as a set-based anti-join:\n{plan}"
             );
         }
         // The catch-all's nested loop costs nothing while no target row has
-        // an unlisted pattern: its filter rejects every row, so the source
-        // side never runs.
+        // an unlisted pattern: its filter rejects every row, so the side it
+        // checks against, the ledger for a ledger-routed target, never runs.
         let plan: Vec<String> = txn
             .query(
                 &format!(
@@ -1072,11 +1079,13 @@ mod db_tests {
             .into_iter()
             .map(|row| row.get(0))
             .collect();
-        let source_scans: Vec<&String> =
-            plan.iter().filter(|l| l.contains(" on orders ")).collect();
+        let ledger_scans: Vec<&String> = plan
+            .iter()
+            .filter(|l| l.contains(" on orders_by_g__ledger "))
+            .collect();
         assert!(
-            !source_scans.is_empty() && source_scans.iter().all(|l| l.contains("never executed")),
-            "the catch-all must not scan the source when no row has a new pattern:\n{}",
+            !ledger_scans.is_empty() && ledger_scans.iter().all(|l| l.contains("never executed")),
+            "the catch-all must not scan the ledger when no row has a new pattern:\n{}",
             plan.join("\n")
         );
         let swept = sweep(&txn, &ids).await;

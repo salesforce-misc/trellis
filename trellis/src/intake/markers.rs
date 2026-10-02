@@ -4178,14 +4178,13 @@ mod catch_up_tests {
         .await;
         drain_all(&pool, &mut discharger).await;
         finish_builds(&pool, &chunks).await;
-        // The rollup is relationship-fed, so Apply doesn't route it through
-        // the ledger (#623 D3 takes plain aggregates only) and the dispatch's
-        // sweep re-derives no entry of it: the stale row the rebuild leaves is
-        // the pause's, ids 1, 3 and 5.
+        // The rollup is on the ledger (#623 D5), so the dispatch's sweep
+        // re-derived the entry of id 3, deleted during the pause, away: the
+        // stale row the rebuild leaves is ids 1 and 5's.
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "12".to_string()), (1, "9".to_string())],
-            "group 1 still holds its pre-pause value"
+            vec![(0, "12".to_string()), (1, "6".to_string())],
+            "group 1 still holds ids 1 and 5"
         );
 
         defer_grps_catch_up(&discharger).await;
