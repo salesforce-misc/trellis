@@ -906,6 +906,9 @@ mod db_tests {
     //! at every build's go-live, so a target with nothing to delete must
     //! cost one hashed anti-join per target, not a probe of the source per
     //! target row.
+    //!
+    //! The aggregates here are `MAX`es: a plain `SUM` is built by the
+    //! Re-derive build since #625 F3, which never reaches this sweep.
 
     use super::*;
     use crate::defs::ValueType;
@@ -990,7 +993,7 @@ mod db_tests {
         ]);
         for text in [
             "TRANSFORM orders_copy FROM orders SELECT a AS a",
-            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT max(a) AS total",
         ] {
             crate::defs::catalog::install_definition(&pool, text, &columns, "public")
                 .await
@@ -1108,7 +1111,7 @@ mod db_tests {
         ]);
         crate::defs::catalog::install_definition(
             &pool,
-            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT max(a) AS total",
             &columns,
             "public",
         )
@@ -1220,7 +1223,7 @@ mod db_tests {
         ]);
         crate::defs::catalog::install_definition(
             &pool,
-            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT max(a) AS total",
             &columns,
             "public",
         )

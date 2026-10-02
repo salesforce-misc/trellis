@@ -23,6 +23,12 @@
 //! the go-live catch-up runs: the horizon alone must keep it right, however
 //! the late delta arrives (still in the ring, or released from quarantine),
 //! and whether it is on the source or on a relationship's to-side table.
+//!
+//! The source-keyed aggregate here is `sum(amount + 0)`: an expression
+//! argument keeps it on the direct build and its go-live catch-up until
+//! #625 F5, where a plain `sum(amount)` is the Re-derive build's since F3,
+//! with no catch-up and no horizon. A `SUM` still shows a change counted
+//! twice.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -235,7 +241,7 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -311,7 +317,7 @@ async fn seed_sales(client: &Client) {
 async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
     let definition = install_definition(
         pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),
@@ -780,7 +786,7 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
         .expect("create + seed sales");
     install_definition(
         &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount + 0) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
             ("sku", ValueType::Text),

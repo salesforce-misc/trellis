@@ -114,6 +114,11 @@ pub(crate) async fn truncate_deltas(
         .await
 }
 
+/// A delta row's claim key: an identity, so rows are numbered in insert
+/// order, with a btree index the merger claims through, oldest first (#625
+/// F2b; see `staging::ledger::merge_statement`).
+pub(crate) const DELTA_SEQ_COLUMN: &str = "__seq";
+
 /// A delta row's member-count increment column.
 pub(crate) const DELTA_MEMBERS_COLUMN: &str = "__dm";
 
@@ -372,15 +377,21 @@ pub(crate) fn aggregate_ledger_index_ddl(
 ///
 /// A build chunk appends one row per group it moved instead of writing the
 /// group row, and the merger (`staging::build`) claims, deletes and sums
-/// them into the groups. No primary key: rows are only ever appended and
-/// claimed. Logged: a delta row records an entry move that already
-/// committed, so losing it on a crash would lose the move for good.
+/// them into the groups. Rows are only ever appended and claimed. Each is
+/// numbered by an identity, [`DELTA_SEQ_COLUMN`], indexed so the merger's
+/// claim reads the oldest live rows through the index instead of walking
+/// the heap's dead or emptied pages from block 0 (#625 F2b). No primary key:
+/// the claim locks rows by `ctid`. Logged: a delta row records an entry move
+/// that already committed, so losing it on a crash would lose the move for
+/// good.
 pub(crate) fn aggregate_deltas_ddl(
     qualified_deltas: &str,
     group_columns: &[LedgerColumn],
     summed: &[bool],
 ) -> String {
-    let mut columns: Vec<String> = group_columns.iter().map(LedgerColumn::render).collect();
+    let seq = quote_ident(DELTA_SEQ_COLUMN);
+    let mut columns = vec![format!("{seq} bigint generated always as identity")];
+    columns.extend(group_columns.iter().map(LedgerColumn::render));
     columns.push(format!(
         "{} bigint not null",
         quote_ident(DELTA_MEMBERS_COLUMN)
@@ -397,7 +408,10 @@ pub(crate) fn aggregate_deltas_ddl(
             ));
         }
     }
-    format!("; create table {qualified_deltas} ({})", columns.join(", "))
+    format!(
+        "; create table {qualified_deltas} ({}); create index on {qualified_deltas} ({seq})",
+        columns.join(", ")
+    )
 }
 
 /// A 1-1 target's ledger DDL (#623 Q2 (c)): the key and the ordering state,
@@ -599,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn the_deltas_table_holds_the_group_and_one_increment_per_accumulator() {
+    fn the_deltas_table_holds_a_claim_key_the_group_and_one_increment_per_accumulator() {
         assert_eq!(
             aggregate_deltas_ddl(
                 r#""public"."t__deltas""#,
@@ -610,7 +624,7 @@ mod tests {
                 }],
                 &[true, false],
             ),
-            r#"; create table "public"."t__deltas" ("g" integer, "__dm" bigint not null, "__dc0" bigint not null, "__ds0" numeric not null, "__dc1" bigint not null)"#
+            r#"; create table "public"."t__deltas" ("__seq" bigint generated always as identity, "g" integer, "__dm" bigint not null, "__dc0" bigint not null, "__ds0" numeric not null, "__dc1" bigint not null); create index on "public"."t__deltas" ("__seq")"#
         );
     }
 }

@@ -232,6 +232,8 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // A plain invertible aggregate is the Re-derive build's (#625 F3).
+            trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
             trellis::intake::markers::discharge_registrations(pool)
@@ -972,10 +974,12 @@ async fn resume_transform_reports_not_found_for_an_unregistered_target() {
 }
 
 /// Regression coverage (this issue's items 2/3): with no unsettled marker at
-/// creation time, both background builds (a plain 1-1 definition's chunks and
-/// an aggregate's direct-build job) reach `live` through the discharge.
+/// creation time, every background build reaches `live`: a plain 1-1
+/// definition's chunks and a `MAX` aggregate's direct-build job through the
+/// discharge, and a plain `SUM`'s Re-derive build (#625 F3) through its
+/// start, with three stored states and no `catching_up` between them.
 #[tokio::test]
-async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
+async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -1003,11 +1007,11 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 
-    // Direct/set-based path: an aggregate definition.
+    // Direct/set-based path: an aggregate the Re-derive build doesn't take.
     let agg_cols = numeric(&["grp", "a"]);
     let agg = install_definition(
         &db.pool,
-        "TRANSFORM agg_t FROM agg_s GROUP BY grp SELECT grp AS grp, SUM(a) AS total",
+        "TRANSFORM agg_t FROM agg_s GROUP BY grp SELECT grp AS grp, MAX(a) AS top",
         &agg_cols,
         "public",
     )
@@ -1020,6 +1024,47 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
     );
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "agg_t").await, TransformStatus::Live);
+
+    // The Re-derive build (#625 F3): a plain `SUM`.
+    let summed = install_definition(
+        &db.pool,
+        "TRANSFORM sum_t FROM agg_s GROUP BY grp SELECT grp AS grp, SUM(a) AS total",
+        &agg_cols,
+        "public",
+    )
+    .await
+    .expect("install_definition (re-derive path)");
+    assert_eq!(summed.status, TransformStatus::WaitingToBackfill);
+    trellis::intake::markers::discharge_registrations(&db.pool)
+        .await
+        .expect("start the build");
+    assert_eq!(
+        status_of(&raw, "sum_t").await,
+        TransformStatus::Backfilling,
+        "the start moves it straight to backfilling, applying from there"
+    );
+    let markers: i64 = raw
+        .query_one("select count(*) from pending_backfill", &[])
+        .await
+        .expect("count markers")
+        .get(0);
+    assert_eq!(markers, 0, "a re-derive build parks no marker");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        status_of(&raw, "sum_t").await,
+        TransformStatus::Live,
+        "the build's last merge moves it from backfilling to live"
+    );
+    let mismatches: i64 = raw
+        .query_one(
+            "select count(*) from (select grp, sum(a) as total from agg_s group by grp) e \
+             full join sum_t t on t.grp = e.grp where t.total is distinct from e.total",
+            &[],
+        )
+        .await
+        .expect("compare with the source")
+        .get(0);
+    assert_eq!(mismatches, 0);
 }
 
 /// Every definition's [`trellis::DefinitionSummary::backfill_failure`], in

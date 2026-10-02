@@ -18,11 +18,12 @@
 mod drain_driver;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
 use trellis::staging::apply::ApplyError;
-use trellis::staging::build::{BuildPlan, ChunkOutcome};
+use trellis::staging::build::{self, BuildPlan, ChunkOutcome, MergeOutcome};
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine::{FailureClass, classify};
 
@@ -473,15 +474,16 @@ async fn a_transiently_negative_group_goes_once_merged() {
 
 // --------------------------------------------------------------- deadlocks
 
-/// Two mergers on overlapping groups, and a page on the same groups, never
-/// deadlock: a merger claims delta rows without waiting (`skip locked`) and
-/// upserts its groups in group order, and a page locks its entries and then
-/// its groups in the same order.
+/// Mergers and pages on the same groups never deadlock: a merger claims
+/// delta rows without waiting (`skip locked`) and upserts its groups in group
+/// order, and a page locks its entries and then its groups in the same
+/// order. A second merger of the target skips it (#625 F2b) rather than
+/// queue on the first's groups.
 ///
-/// First forced: merger A is frozen holding every group, merger B claims
-/// the rows A didn't and queues on A's groups, and a page queues on them
-/// too. Then a free-running round: chunk runners, two merger loops and pages
-/// at once, with the source moving under them.
+/// First forced: merger A is frozen holding every group, merger B skips the
+/// target, and a page queues on A's groups. Then a free-running round:
+/// chunk runners, two merger loops and pages at once, with the source moving
+/// under them.
 ///
 /// A deadlock shows as the `deadlock detected` error in this test's own
 /// cluster log ([`Driver::deadlocks_logged`]), which the aborted backend
@@ -505,19 +507,22 @@ async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
         .await;
     let frozen = merger_a.reached(PausePoint::AfterGroupUpsert).await;
     d.chunk(&plan, Some("100"), "200").await;
-    let merger_b = d.merge_frozen(&plan, 1_000, &[]).await;
-    d.wait_blocked_behind(frozen.backend_pid).await;
+    let merger_b = d.merge(&plan, 1_000).await;
+    assert!(
+        merger_b.skipped && merger_b.claimed == 0,
+        "B skips the target A is merging: {merger_b:?}"
+    );
     let user = d.user().await;
     user.batch_execute("update public.src set v = v + 1 where id <= 200")
         .await
         .expect("touch every group");
     let batch = d.seal().await;
     let page = d.drain_frozen(batch, "page", &[]).await;
-    d.wait_blocked(2).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
     d.release(&mut merger_a, PausePoint::AfterGroupUpsert).await;
     assert_eq!(merger_a.finish().await.claimed, 20);
-    assert_eq!(merger_b.finish().await.claimed, 20);
     page.finish().await;
+    assert_eq!(d.merge(&plan, 1_000).await.claimed, 20, "B's rows, after A");
 
     // Free-running: per round, three chunks and two mergers at once, with a
     // write across every group drained on a page beside them.
@@ -549,6 +554,166 @@ async fn mergers_and_pages_on_the_same_groups_never_deadlock() {
     }
 
     assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+// ---------------------------------------------------------------- mergers
+
+/// At most one merger works on a target at a time (#625 F2b): a second one
+/// returns at once, skipped, with nothing claimed, instead of waiting on the
+/// first's group rows; once the first commits, the next merger takes what
+/// is left. A merge that blocked here would hang the test rather than pass
+/// it, and the timeout turns that into a failure.
+#[tokio::test]
+async fn a_second_merger_skips_a_target_being_merged() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan) = start_build_with(
+        flavour,
+        "insert into public.src select i, i % 20, i from generate_series(1, 200) i;",
+    )
+    .await;
+    d.chunk(&plan, None, "100").await;
+    d.chunk(&plan, Some("100"), "200").await;
+    let mut first = d
+        .merge_frozen(&plan, 20, &[(PausePoint::AfterGroupUpsert, TARGET)])
+        .await;
+    first.reached(PausePoint::AfterGroupUpsert).await;
+
+    let second = tokio::time::timeout(Duration::from_secs(30), d.merge(&plan, 1_000))
+        .await
+        .expect("the second merger returns without waiting on the first");
+    assert_eq!(
+        second,
+        MergeOutcome {
+            claimed: 0,
+            written: 0,
+            deleted: 0,
+            skipped: true,
+        }
+    );
+    assert_eq!(deltas(&d).await, 40, "nothing is merged until A commits");
+
+    d.release(&mut first, PausePoint::AfterGroupUpsert).await;
+    let first = first.finish().await;
+    assert_eq!((first.claimed, first.skipped), (20, false));
+    let after = d.merge(&plan, 1_000).await;
+    assert_eq!((after.claimed, after.skipped), (20, false));
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// The merge statement's plan doesn't hang on the delta table's statistics
+/// (#625 F2b). A queue's churn lets an analyze record `reltuples = 0` for a
+/// table that has rows by the time a merger claims them; the planner then
+/// expects one claimed row and joins the upsert's result back to the group
+/// sums in an inner nested loop, quadratic in the batch (the F2 profile's
+/// 10M merges: 1.8 s against 25 ms for 5,000 rows). Under the merger's plan
+/// settings the join is hashed and the claim reads the claim key's index.
+#[tokio::test]
+async fn the_merge_plan_survives_empty_statistics() {
+    let (d, plan) = start_build_with(
+        Flavour::Sum,
+        "insert into public.src select i, i, i from generate_series(1, 300) i;",
+    )
+    .await;
+    d.ctl
+        .batch_execute(
+            "insert into public.agg__deltas (g, __dm, __dc0, __ds0) \
+                 select i, 1, 1, 1 from generate_series(1, 5000) i; \
+             delete from public.agg__deltas; \
+             analyze public.agg__deltas",
+        )
+        .await
+        .expect("leave the delta table statistics of an emptied queue");
+    d.chunk(&plan, None, "300").await;
+    assert_eq!(deltas(&d).await, 300);
+
+    let mut client = d.db.pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let explained = build::explain_merge(&txn, &plan, 5_000)
+        .await
+        .expect("explain the merge");
+    let inner_nested_loops: Vec<&str> = explained
+        .lines()
+        .filter(|line| line.contains("Nested Loop") && !line.contains("Left Join"))
+        .collect();
+    assert_eq!(
+        inner_nested_loops,
+        Vec::<&str>::new(),
+        "no inner nested loop:\n{explained}"
+    );
+    assert!(
+        explained.contains("Hash Join"),
+        "the upsert joins the sums by hash:\n{explained}"
+    );
+    assert!(
+        explained.contains("Index Scan using agg__deltas___seq_idx"),
+        "the claim reads the claim key's index:\n{explained}"
+    );
+}
+
+/// The merge statement's plan settings end with the statement (#625 F2b):
+/// the rest of the merger's transaction, the empty-group delete and the
+/// seam's statements, plans as usual.
+#[tokio::test]
+async fn the_merge_plan_settings_end_with_the_merge_statement() {
+    let (d, plan) = start_build_with(
+        Flavour::Sum,
+        "insert into public.src select i, i % 20, i from generate_series(1, 200) i;",
+    )
+    .await;
+    d.chunk(&plan, None, "200").await;
+    let mut client = d.db.pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let outcome = build::merge_deltas(&txn, &plan, 1_000)
+        .await
+        .expect("merge");
+    assert_eq!((outcome.claimed, outcome.skipped), (20, false));
+    let row = txn
+        .query_one(
+            "select current_setting('enable_nestloop'), current_setting('enable_seqscan')",
+            &[],
+        )
+        .await
+        .expect("read the plan settings");
+    assert_eq!(
+        (row.get::<_, String>(0), row.get::<_, String>(1)),
+        ("on".to_string(), "on".to_string()),
+        "the merger's transaction plans as usual after its merge statement"
+    );
+    txn.commit().await.expect("commit");
+}
+
+/// The merger claims the oldest delta rows first, in append order, through
+/// the claim key's index (#625 F2b), not in the heap's physical order. A
+/// delta row rewritten in place keeps its claim key but moves to the end of
+/// the heap, so a physical-order claim would take the newer rows first.
+#[tokio::test]
+async fn the_merger_claims_the_oldest_delta_rows_first() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (2, 2, 20), (3, 3, 30)]).await;
+    d.chunk(&plan, None, "1").await;
+    d.chunk(&plan, Some("1"), "2").await;
+    d.chunk(&plan, Some("2"), "3").await;
+    d.ctl
+        .batch_execute("update public.agg__deltas set __dm = __dm where g = 1")
+        .await
+        .expect("move the oldest delta row to the end of the heap");
+    let physical = d
+        .rows("select g from public.agg__deltas order by ctid")
+        .await;
+    assert_eq!(physical, ["(2)", "(3)", "(1)"], "the heap's order");
+
+    for (merged, expected) in [(1, "(1)"), (2, "(2)"), (3, "(3)")] {
+        let outcome = d.merge(&plan, 1).await;
+        assert_eq!(outcome.claimed, 1);
+        let groups = d.rows("select g from public.agg order by g").await;
+        assert_eq!(
+            groups.len(),
+            merged,
+            "merge {merged} wrote one more group: {groups:?}"
+        );
+        assert_eq!(groups.last().map(String::as_str), Some(expected));
+    }
     assert_oracle(&mut d, &plan, flavour).await;
 }
 
@@ -708,6 +873,49 @@ async fn a_chunk_gives_up_on_a_key_a_page_holds() {
     d.release(&mut page, PausePoint::AfterEntryLock).await;
     page.finish().await;
     assert_eq!(d.chunk(&plan, None, "3").await.keys, 3);
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
+/// A chunk takes its entry lock before it reads (ADR-0002 I1 for the build,
+/// #625 F3's `chunk_without_entry_lock` plant). Key 2 already has an entry
+/// (an Apply counted it before its chunk ran), and a page applying a later
+/// change to it is frozen after its entry lock, before it writes. The chunk
+/// over key 2 queues behind it in its entry lock, and its read sees the
+/// page's commit. Read before the lock, it would see the entry as it was
+/// before the page, then wait on the page's row lock in its write and move
+/// key 2 from that stale entry, counting the page's change twice. (A page
+/// frozen after its write would hold the chunk anyway: the chunk's
+/// placeholder insert waits on the entry's in-progress update.) A chunk
+/// that gives up at its short lock timeout runs again.
+#[tokio::test]
+async fn a_chunk_reads_an_entry_only_once_the_page_holding_it_commits() {
+    let flavour = Flavour::Sum;
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = v + 10 where id = 2")
+        .await
+        .expect("update key 2");
+    let batch = d.seal().await;
+    d.drain(batch, "apply").await;
+    user.batch_execute("update public.src set v = v + 100 where id = 2")
+        .await
+        .expect("update key 2 again");
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterEntryLock, TARGET)])
+        .await;
+    let frozen = page.reached(PausePoint::AfterEntryLock).await;
+    let chunk = d.chunk_frozen(&plan, None, "3", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut page, PausePoint::AfterEntryLock).await;
+    page.finish().await;
+    match chunk.finish_result().await {
+        Ok(outcome) => assert_eq!(outcome.keys, 3),
+        Err(err) if trellis::locks::is_lock_not_available(&err) => {
+            assert_eq!(d.chunk(&plan, None, "3").await.keys, 3);
+        }
+        Err(err) => panic!("the chunk failed: {err}"),
+    }
     assert_oracle(&mut d, &plan, flavour).await;
 }
 

@@ -73,7 +73,9 @@ seen by the read or captured by the triggers, and a commit that both see is
 counted once.
 
 There is one capture path, and every definition's initial build goes through
-it ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)). Resumes,
+it ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)), except a
+plain invertible aggregate's, which is the Re-derive build
+([below](#re-derive-built-definitions), #625). Resumes,
 explicit `request_backfill` calls and go-live catch-ups use it too. Two
 rebuilds of some columns of a `live` transform don't yet: a column resume and an
 `ALTER TRANSFORM` that adds columns read those columns' values in-call, then
@@ -136,7 +138,7 @@ drain threads.
    |---|---|---|
    | Ring enumeration | any shape; the fallback for a shape the direct build can't render | one cursor inside the discharge transaction appends an image-less `Recompute` per source row, which drain workers fold like any batch |
    | Plain 1-1 chunks | plain (no relationship) 1-1 definitions | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
-   | Direct set-based build | aggregates and relationship-enriched 1-1 definitions | the discharge enqueues one job (a `backfill_chunks` row with no bounds), and a drain thread runs ADR-0007's whole `INSERT … SELECT` build ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
+   | Direct set-based build | aggregates other than the Re-derive build's ([below](#re-derive-built-definitions)), and relationship-enriched 1-1 definitions | the discharge enqueues one job (a `backfill_chunks` row with no bounds), and a drain thread runs ADR-0007's whole `INSERT … SELECT` build ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
 
    The discharge checks against the catalog that the direct build can render
    a definition before it dispatches one; a shape it can't
@@ -231,6 +233,55 @@ drain threads.
   it (a `catching_up` definition applies CDC), so the discharge raises the
   target's extinct horizon (#321) too, and such a delta re-derives the group
   from the source instead of subtracting from nothing.
+
+### Re-derive-built definitions
+
+A plain invertible aggregate is built differently (#625,
+[ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
+That is a target the ledger maintains by increments alone: every field is
+`SUM` or `AVG` of an exact numeric column or `COUNT`, grouped by plain source
+columns, with no relationship, on a captured source (not another definition's
+target). Its build (`staging::build`) uses no marker, no fence wait, no
+direct build and no go-live catch-up:
+
+1. **Start.** Once the reconcile pass finds the definition ready (its source
+   captured with the columns it reads, and no change staged before the last
+   widen still pending), one transaction moves it `waiting_to_backfill ->
+   backfilling` and enqueues its plan job. From that commit it **applies**:
+   Apply folds every change to the source into its ledger and groups, as for
+   a `live` definition. The discharge never dispatches it.
+2. **Plan.** A drain thread walks the source's primary key and enqueues
+   chunks of `build_chunk_rows` rows (10,000 by default), committing them in
+   batches, so chunks run while the walk goes on.
+3. **Chunks.** Each chunk re-derives its key range: it locks the keys'
+   ledger entries as a page does, then one statement reads the rows and
+   `pg_current_snapshot()`, rewrites the entries (their basis is that
+   snapshot) and appends the moves' per-group increments to the target's
+   group-delta table. A chunk never writes a group row. Apply and a chunk
+   agree through the entry lock and the basis: a change the chunk's snapshot
+   saw is skipped when it drains, and one it didn't see applies over the
+   entry the chunk wrote.
+4. **Merges.** A drain thread claims delta rows, deletes them and upserts
+   their sums into the groups in one transaction, one merger per target at a
+   time.
+5. **Live.** The transaction that leaves the plan done, every chunk done
+   and the delta table empty moves the definition to `live`, under its row
+   lock. There is no `catching_up` in between.
+
+Drain threads take this work only after their segments, and claim a chunk
+only while the ring's undrained backlog is small and the next seal has a
+slot, so a build never starves the drain or holds off a seal. Each chunk's
+transaction is short, so the build holds no long snapshot: the `xmin` caveat
+below doesn't apply to it.
+
+**A resume rebuilds over what the freeze left.** A paused or quarantined
+definition keeps its ledger, its groups and the group deltas still owed to
+them. Its resume parks no marker: the next reconcile pass starts a Re-derive
+build over the existing entries, with no truncate. Its start also enqueues a
+**sweep**, which runs once every chunk is done. It walks the ledger in key
+order, in bounded windows, and re-derives each live entry no chunk did,
+which is a key deleted while the definition was frozen: the entry becomes a
+tombstone and its group sheds it through the deltas.
 
 ### Re-reading a table for applying readers
 

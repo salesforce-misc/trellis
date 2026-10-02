@@ -1,9 +1,9 @@
-//! The scheduled Re-derive build (#625 F2, epic #556; ADR-0002 "A build is
-//! Re-derive over chunks, and applies from its first chunk"), with
-//! `ClientOptions::rederive_build` on.
+//! The scheduled Re-derive build (#625 F2/F3, epic #556; ADR-0002 "A build
+//! is Re-derive over chunks, and applies from its first chunk"): the only
+//! build of a plain invertible aggregate since F3.
 //!
 //! Every test steps the engine by hand: the staging worker's reconcile pass
-//! (`trellis::client::reconcile_pass_with`), a drain worker's build step
+//! (`trellis::client::reconcile_pass`), a drain worker's build step
 //! (`trellis::staging::build::work_once`), and the ring's seal and drain. No
 //! background worker runs and nothing waits for convergence (#297); a loop
 //! here runs a bounded number of deterministic steps.
@@ -91,17 +91,15 @@ impl Fixture {
         }
     }
 
-    /// One staging-worker reconcile pass with the knob on: installs the
-    /// source's capture, starts every qualifying definition, and discharges
-    /// the markers.
+    /// One staging-worker reconcile pass: installs the source's capture,
+    /// starts every qualifying definition, and discharges the markers.
     async fn pass(&mut self) {
-        trellis::client::reconcile_pass_with(
+        trellis::client::reconcile_pass(
             &mut self.raw,
             &self.db.pool,
             DEFAULT_SCHEMA,
             WAKE,
             Duration::from_secs(5),
-            true,
         )
         .await
         .expect("reconcile pass");
@@ -112,6 +110,39 @@ impl Fixture {
         build::work_once(&self.db.pool, "worker", options)
             .await
             .expect("build step")
+    }
+
+    /// Claims and runs up to `max` plan jobs and chunks by hand, with no
+    /// merge between them. Returns how many it ran.
+    async fn run_chunks_by_hand(&self, max: usize) -> usize {
+        let pool = &self.db.pool;
+        for ran in 0..max {
+            let claimed = {
+                let client = pool.get().await.expect("pool");
+                chunk_queue::claim_chunks_of(
+                    &**client,
+                    "hand",
+                    1,
+                    &[chunk_queue::KIND_PLAN, chunk_queue::KIND_REDERIVE],
+                )
+                .await
+                .expect("claim")
+            };
+            let Some(chunk) = claimed.into_iter().next() else {
+                return ran;
+            };
+            build::run_claimed(pool, &chunk, "hand", &OPTIONS).await;
+        }
+        max
+    }
+
+    /// The one definition's id.
+    async fn definition_id(&self) -> i64 {
+        self.raw
+            .query_one("select id from transform_definitions", &[])
+            .await
+            .expect("definition id")
+            .get(0)
     }
 
     /// Seals and drains the ring until nothing is pending.
@@ -268,6 +299,12 @@ async fn a_rederive_build_goes_from_waiting_to_live_with_no_catch_up() {
         "200 rows in chunks of 10"
     );
     assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep'")
+            .await,
+        0,
+        "a fresh build's ledger is empty at its start, so it gets no sweep"
+    );
+    assert_eq!(
         f.count("select count(*) from backfill_chunks where not done")
             .await,
         0
@@ -338,23 +375,7 @@ async fn the_flip_happens_only_after_the_last_merge() {
     let pool = &f.db.pool;
 
     // Run the plan and every chunk by hand, with no merge between them.
-    loop {
-        let claimed = {
-            let client = pool.get().await.expect("pool");
-            chunk_queue::claim_chunks_of(
-                &**client,
-                "hand",
-                1,
-                &[chunk_queue::KIND_PLAN, chunk_queue::KIND_REDERIVE],
-            )
-            .await
-            .expect("claim")
-        };
-        let Some(chunk) = claimed.into_iter().next() else {
-            break;
-        };
-        build::run_claimed(pool, &chunk, "hand", &OPTIONS).await;
-    }
+    f.run_chunks_by_hand(usize::MAX).await;
     assert_eq!(
         f.count("select count(*) from backfill_chunks where not done")
             .await,
@@ -364,12 +385,7 @@ async fn the_flip_happens_only_after_the_last_merge() {
     let pending = f.count("select count(*) from public.agg__deltas").await;
     assert!(pending > 0, "the chunks left deltas for the merger");
     assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    let id: i64 = f
-        .raw
-        .query_one("select id from transform_definitions", &[])
-        .await
-        .expect("definition id")
-        .get(0);
+    let id = f.definition_id().await;
     assert!(
         !build::try_complete(pool, id).await.expect("try_complete"),
         "not live while deltas are pending"
@@ -387,6 +403,95 @@ async fn the_flip_happens_only_after_the_last_merge() {
         Some("live"),
         "the merge that emptied the delta table flipped it"
     );
+    f.assert_agg_oracle().await;
+}
+
+/// The strict flip still waits for a merge in flight (#625 F2b, B7): a
+/// merge that has claimed and deleted the last delta rows but not committed
+/// leaves the table non-empty to everyone else, so neither `try_complete`
+/// nor a worker's step flips the build until it commits. The worker skips
+/// the merge (another holds the target), finds nothing else to do and
+/// reports idle without waiting on it.
+#[tokio::test]
+async fn the_flip_waits_for_a_merge_in_flight() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    f.pass().await;
+    let pool = &f.db.pool;
+    f.run_chunks_by_hand(usize::MAX).await;
+    let id = f.definition_id().await;
+    let plan = BuildPlan::load(pool, "agg")
+        .await
+        .expect("load the plan")
+        .expect("a buildable target");
+
+    let mut client = pool.get().await.expect("pool");
+    let merge = client.transaction().await.expect("begin the merge");
+    let outcome = build::merge_deltas(&merge, &plan, i64::MAX)
+        .await
+        .expect("merge every delta row");
+    assert!(outcome.claimed > 0 && !outcome.skipped, "{outcome:?}");
+
+    assert!(
+        !build::try_complete(pool, id).await.expect("try_complete"),
+        "not live while the last merge is uncommitted"
+    );
+    assert_eq!(
+        f.step(&OPTIONS).await,
+        Step::Idle,
+        "a worker skips the busy target, and has nothing else to do"
+    );
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+
+    merge.commit().await.expect("commit the merge");
+    assert!(
+        build::try_complete(pool, id).await.expect("try_complete"),
+        "the flip once the merge committed"
+    );
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// A worker that finds its target's merger busy takes a chunk instead of
+/// waiting for the merge or reporting idle (#625 F2b): one merger per
+/// target, and the rest of the workers build.
+#[tokio::test]
+async fn a_worker_takes_a_chunk_while_another_merges() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    f.pass().await;
+    let pool = &f.db.pool;
+    // The plan job and two chunks, so every group has two delta rows, and
+    // chunks are left.
+    assert_eq!(f.run_chunks_by_hand(3).await, 3);
+    let plan = BuildPlan::load(pool, "agg")
+        .await
+        .expect("load the plan")
+        .expect("a buildable target");
+    let mut client = pool.get().await.expect("pool");
+    let merge = client.transaction().await.expect("begin the merge");
+    // One row: its group's other row is left for a second merger, which
+    // would wait on this merge's group row if it took it.
+    assert_eq!(
+        build::merge_deltas(&merge, &plan, 1)
+            .await
+            .expect("merge")
+            .claimed,
+        1
+    );
+
+    let step = tokio::time::timeout(Duration::from_secs(30), f.step(&OPTIONS))
+        .await
+        .expect("the step doesn't wait on the merge in flight");
+    assert_eq!(step, Step::Chunk);
+    assert!(
+        f.count("select count(*) from public.agg__deltas").await > 0,
+        "the chunk appended deltas the busy merger can't take"
+    );
+    merge.commit().await.expect("commit the merge");
+    drop(client);
+
+    let (steps, _) = f.run("agg").await;
+    assert!(steps.contains(&Step::Merged), "{steps:?}");
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
 }
 
@@ -818,33 +923,35 @@ async fn the_start_waits_for_the_widens_capture_gate() {
     f.assert_agg_oracle().await;
 }
 
-/// A definition paused part-way through its Re-derive build and resumed has
-/// ledger entries, some for keys deleted while it was paused, which only
-/// #625 F3's sweep would retire. So it goes to the old build, which empties
-/// the ledger and the delta table, and `build` is cleared at the resume.
+/// A definition paused part-way through its Re-derive build, with keys
+/// deleted, updated and inserted while it was frozen, is rebuilt by a
+/// Re-derive build over the entries it kept (#625 F3): the resume parks no
+/// marker and keeps the group deltas still owed (B4), the next pass starts
+/// a rebuild with a sweep, the sweep waits for every chunk, and it retires
+/// the entries of the keys deleted meanwhile, which no chunk reaches.
 #[tokio::test]
-async fn a_build_resumed_with_entries_takes_the_old_build() {
+async fn a_resumed_build_rebuilds_over_its_entries_and_sweeps_the_deleted_keys() {
     let mut f = Fixture::new(100, &[AGG]).await;
     f.pass().await;
-    for _ in 0..4 {
-        f.drain().await;
-        f.step(&OPTIONS).await;
-    }
-    assert!(
-        f.count("select count(*) from public.agg__ledger").await > 0,
-        "some chunks ran"
-    );
+    // The plan job and three chunks (ids 1..=30), and no merge.
+    assert_eq!(f.run_chunks_by_hand(4).await, 4);
+    let owed = f.count("select count(*) from public.agg__deltas").await;
+    assert!(owed > 0, "the chunks left deltas to merge");
     let trellis = f.trellis().await;
     trellis
         .apply("PAUSE TRANSFORM agg")
         .await
         .expect("pause the building transform");
-    // Deleted while paused: the entries of the keys the first chunks re-derived
-    // stay live.
+    // Ids 1..=15 have live entries, which no chunk of the rebuild reaches;
+    // 95 has none yet.
     f.raw
-        .batch_execute("delete from public.src where id <= 15")
+        .batch_execute(
+            "delete from public.src where id <= 15 or id = 95; \
+             update public.src set v = v + 1000, g = g + 1 where id in (20, 50); \
+             insert into public.src values (200, 3, 7)",
+        )
         .await
-        .expect("delete while paused");
+        .expect("write while paused");
     f.drain().await;
 
     trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
@@ -853,43 +960,399 @@ async fn a_build_resumed_with_entries_takes_the_old_build() {
         Some("waiting_to_backfill")
     );
     assert_eq!(f.build("agg").await, None, "a resume clears `build`");
+    assert_eq!(
+        f.count("select count(*) from pending_backfill").await,
+        0,
+        "a resume of a re-derive shape parks no marker"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.agg__deltas").await,
+        owed,
+        "a resume keeps the deltas still owed to the groups (B4)"
+    );
 
     f.pass().await;
     assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
-    assert_eq!(f.build("agg").await, None, "the old build took it");
-    let pool = f.db.pool.clone();
-    let job = {
-        let client = pool.get().await.expect("pool");
-        chunk_queue::claim_chunks(&**client, "old", 1)
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    assert_eq!(
+        f.count(
+            "select count(*) from backfill_chunks \
+             where kind = 'sweep' and not done and start_xid is not null"
+        )
+        .await,
+        1,
+        "a rebuild over a non-empty ledger enqueues one sweep"
+    );
+    let early = {
+        let client = f.db.pool.get().await.expect("pool");
+        chunk_queue::claim_chunks_of(&**client, "early", 1, &[chunk_queue::KIND_SWEEP])
             .await
-            .expect("claim the direct build")
-            .into_iter()
-            .next()
-            .expect("the direct build job")
+            .expect("claim")
     };
-    assert_eq!(job.work, ChunkWork::DirectBuild);
-    chunk_queue::run_claimed_chunk(
-        &pool,
-        &job,
-        "old",
-        Duration::from_secs(1),
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("run the direct build");
-    chunk_queue::finish_chunk(&pool, &job, "old")
-        .await
-        .expect("finish the direct build");
-    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
-    for _ in 0..3 {
-        f.pass().await;
-        f.drain().await;
-    }
+    assert!(
+        early.is_empty(),
+        "the sweep isn't claimed before its plan job and chunks are done"
+    );
+
+    let (_, seen) = f.run("agg").await;
+    assert_eq!(
+        seen,
+        BTreeSet::from(["backfilling".to_string(), "live".to_string()])
+    );
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     assert_eq!(
-        f.step(&OPTIONS).await,
-        Step::Idle,
-        "nothing of the re-derive build is left"
+        f.count("select count(*) from backfill_chunks where not done")
+            .await,
+        0,
+        "the sweep ran to its end"
     );
+    assert_eq!(
+        f.count(
+            "select count(*) from public.agg__ledger \
+             where __member and not __tombstone and __from_key::bigint <= 15"
+        )
+        .await,
+        0,
+        "the sweep retired the deleted keys' entries"
+    );
+    assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
+    f.assert_agg_oracle().await;
+}
+
+/// A quarantined definition resumes the same way (#625 F3): through the
+/// start, with a sweep, and no marker.
+#[tokio::test]
+async fn a_quarantined_build_resumes_through_the_start() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    // The fuse's own write, as `quarantine_if_crossed` makes it.
+    f.raw
+        .batch_execute(
+            "update transform_definitions set status = 'quarantined' \
+             where target_table = 'public.agg'",
+        )
+        .await
+        .expect("quarantine");
+    f.raw
+        .batch_execute("delete from public.src where id between 10 and 19")
+        .await
+        .expect("delete while quarantined");
+    f.drain().await;
+
+    f.trellis()
+        .await
+        .apply("RESUME TRANSFORM agg")
+        .await
+        .expect("resume");
+    assert_eq!(f.count("select count(*) from pending_backfill").await, 0);
+    f.pass().await;
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep'")
+            .await,
+        1
+    );
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// The sweep's batch (#625 F3), by hand: it reads a bounded window of
+/// entries per call, re-derives the live ones whose basis is older than its
+/// start, tombstones the keys whose rows are gone, and a second pass over
+/// entries it already re-derived finds nothing to do.
+#[tokio::test]
+async fn a_sweep_batch_rederives_stale_live_entries_in_bounded_windows() {
+    let mut f = Fixture::new(50, &[AGG]).await;
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    let pool = f.db.pool.clone();
+    let plan = BuildPlan::load(&pool, "agg")
+        .await
+        .expect("load")
+        .expect("a re-derive shape");
+
+    // Captured and left in the ring: the sweep reads the source as it is.
+    f.raw
+        .batch_execute("delete from public.src where id % 5 = 0")
+        .await
+        .expect("delete");
+    let start_xid: String = f
+        .raw
+        .query_one("select pg_current_xact_id()::text", &[])
+        .await
+        .expect("a start xid")
+        .get(0);
+
+    let sweep = |start_xid: String| {
+        let pool = pool.clone();
+        let plan = plan.clone();
+        async move {
+            let mut outcomes = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut client = pool.get().await.expect("pool");
+                let txn = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .expect("begin");
+                let outcome = build::sweep_batch(&txn, &plan, &start_xid, cursor.as_deref(), 7)
+                    .await
+                    .expect("sweep batch");
+                txn.commit().await.expect("commit");
+                cursor = outcome.next.clone();
+                let finished = outcome.finished;
+                outcomes.push(outcome);
+                if finished {
+                    return outcomes;
+                }
+            }
+        }
+    };
+    let first = sweep(start_xid.clone()).await;
+    assert!(first.iter().all(|o| o.scanned <= 7), "bounded windows");
+    assert_eq!(first.iter().map(|o| o.scanned).sum::<i64>(), 50);
+    assert_eq!(
+        first.iter().map(|o| o.rederived).sum::<usize>(),
+        50,
+        "every live entry predates the start"
+    );
+    assert_eq!(
+        f.count("select count(*) from public.agg__ledger where __tombstone")
+            .await,
+        10,
+        "the deleted keys are tombstones"
+    );
+
+    let second = sweep(start_xid).await;
+    assert_eq!(
+        second.iter().map(|o| o.rederived).sum::<usize>(),
+        0,
+        "a re-derived entry's basis is past the start, and a tombstone isn't live"
+    );
+
+    {
+        let mut client = pool.get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        build::merge_deltas(&txn, &plan, 10_000)
+            .await
+            .expect("merge");
+        txn.commit().await.expect("commit the merge");
+    }
+    // The deletes' captured changes are visible in the sweep's bases, so
+    // they drain to nothing.
+    f.drain().await;
+    f.assert_agg_oracle().await;
+}
+
+/// The sweep picks an entry Apply alone wrote (#625 F3, review): a key
+/// inserted after the build is counted by its insert's change, with no
+/// `basis`, and no chunk of a rebuild reaches it once its row is deleted
+/// while the definition is frozen. The sweep's `basis is null` arm retires
+/// it.
+#[tokio::test]
+async fn a_rebuild_sweeps_a_deleted_key_only_apply_had_counted() {
+    let mut f = Fixture::new(30, &[AGG]).await;
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.raw
+        .batch_execute("insert into public.src values (100, 3, 1000), (101, 4, 2000)")
+        .await
+        .expect("insert after the build");
+    f.drain().await;
+    assert_eq!(
+        f.count(
+            "select count(*) from public.agg__ledger \
+             where __from_key in ('100', '101') and __basis is null \
+               and __member and not __tombstone"
+        )
+        .await,
+        2,
+        "Apply alone counted the new keys"
+    );
+
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM agg").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.src where id = 100")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+    f.pass().await;
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// The sweep reads the source by a composite key's typed parts (#625 F3,
+/// review): text parts holding the key encoding's separator, its NULL
+/// sentinel, a backslash and a quote, beside a `timestamptz` part. A live
+/// key the sweep re-derives is found and kept; a key deleted while frozen
+/// is retired.
+#[tokio::test]
+async fn a_rebuild_sweeps_a_composite_typed_key() {
+    let mut f = Fixture::new(0, &[]).await;
+    f.raw
+        .batch_execute(
+            "create table public.csrc (a text, t timestamptz, g integer, v bigint, \
+                 primary key (a, t)); \
+             insert into public.csrc \
+             select k, timestamptz '2024-01-01 00:00:00+00' + i * interval '1 hour 0.5 seconds', \
+                    i % 3, i \
+             from generate_series(1, 40) i, \
+                  lateral (select (array['x', 'y' || chr(31) || 'z', 'q' || chr(1), \
+                                         'b\\s', 'o''q', ''])[1 + i % 6] || i as k) s",
+        )
+        .await
+        .expect("seed the composite source");
+    let columns = [
+        ("a".to_string(), ValueType::Text),
+        ("g".to_string(), ValueType::Numeric),
+        ("v".to_string(), ValueType::Numeric),
+    ]
+    .into_iter()
+    .collect();
+    trellis::defs::install_definition(
+        &f.db.pool,
+        "TRANSFORM cagg FROM public.csrc GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("register");
+    let actual = "select (g, total, n)::text from public.cagg order by g";
+    let expected = "select (g, sum(v), count(*))::text from public.csrc group by g order by g";
+    f.pass().await;
+    f.run("cagg").await;
+    assert_eq!(f.status("cagg").await.as_deref(), Some("live"));
+    assert_eq!(f.rows(actual).await, f.rows(expected).await);
+
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM cagg").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.csrc where v % 4 = 0")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis
+        .apply("RESUME TRANSFORM cagg")
+        .await
+        .expect("resume");
+    f.pass().await;
+    assert_eq!(f.build("cagg").await.as_deref(), Some("rederive"));
+    f.run("cagg").await;
+    assert_eq!(f.status("cagg").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.count("select count(*) from public.cagg__ledger where __member and not __tombstone")
+            .await,
+        30,
+        "every live row's entry is live, and only those"
+    );
+    assert_eq!(f.rows(actual).await, f.rows(expected).await);
+
+    // The rebuild's chunks re-derived every live key, so its sweep picked
+    // only the deleted ones. A sweep from a later start picks the live ones
+    // too, and must find each one's row by its typed parts.
+    let pool = f.db.pool.clone();
+    let plan = BuildPlan::load(&pool, "cagg")
+        .await
+        .expect("load")
+        .expect("a re-derive shape");
+    let start_xid: String = f
+        .raw
+        .query_one("select pg_current_xact_id()::text", &[])
+        .await
+        .expect("a start xid")
+        .get(0);
+    let mut cursor: Option<String> = None;
+    let mut rederived = 0;
+    loop {
+        let mut client = pool.get().await.expect("pool");
+        let txn = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await
+            .expect("begin");
+        let outcome = build::sweep_batch(&txn, &plan, &start_xid, cursor.as_deref(), 7)
+            .await
+            .expect("sweep batch");
+        txn.commit().await.expect("commit");
+        rederived += outcome.rederived;
+        cursor = outcome.next.clone();
+        if outcome.finished {
+            break;
+        }
+    }
+    assert_eq!(rederived, 30, "every live entry predates the later start");
+    assert_eq!(
+        f.count("select count(*) from public.cagg__ledger where __member and not __tombstone")
+            .await,
+        30,
+        "the sweep found every live key's row"
+    );
+    {
+        let mut client = pool.get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        build::merge_deltas(&txn, &plan, 10_000)
+            .await
+            .expect("merge");
+        txn.commit().await.expect("commit the merge");
+    }
+    assert_eq!(f.rows(actual).await, f.rows(expected).await);
+}
+
+/// The backfill discharge never dispatches a definition the Re-derive build
+/// takes (#625 F3, `plan_waiting_builds`' skip), even a discharge with no
+/// `ready` list over a marker on its source: it is left
+/// `waiting_to_backfill` for the staging worker's start.
+#[tokio::test]
+async fn the_discharge_leaves_a_rederive_shape_to_the_start() {
+    let mut f = Fixture::new(20, &[AGG]).await;
+    f.raw
+        .batch_execute("insert into pending_backfill (table_name) values ('public.src')")
+        .await
+        .expect("park a marker on the source");
+    for _ in 0..100 {
+        trellis::intake::markers::run_pending_backfills(
+            &mut f.raw,
+            WAKE,
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("discharge");
+        if f.count("select count(*) from pending_backfill").await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        f.count("select count(*) from pending_backfill").await,
+        0,
+        "the marker discharged"
+    );
+    assert_eq!(
+        f.status("agg").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks").await,
+        0,
+        "no old build was dispatched"
+    );
+
+    f.pass().await;
+    assert_eq!(f.build("agg").await.as_deref(), Some("rederive"));
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
 }

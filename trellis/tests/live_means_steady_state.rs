@@ -167,8 +167,10 @@ async fn seed_sales(raw: &Client) {
 
 /// The issue's repro, end to end: an aggregate's direct build reads
 /// `sales`, a change commits and drains while it is held before its write,
-/// then the build finishes. At `live` the change is folded in (`1012`);
-/// before #476 the target read `12` there.
+/// then the build finishes. At `live` the change is folded in (`1000`);
+/// before #476 the target read `7` there. A `MAX`, which still takes the
+/// direct build: a plain `SUM` is the Re-derive build's since #625 F3 (see
+/// [`a_rederive_build_applies_while_backfilling_and_is_steady_at_live`]).
 #[tokio::test]
 async fn an_aggregate_build_is_live_only_with_a_change_drained_during_it_folded_in() {
     const HOLD: i64 = 4761;
@@ -183,7 +185,7 @@ async fn an_aggregate_build_is_live_only_with_a_change_drained_during_it_folded_
 
     define_only(db.dsn())
         .await
-        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total")
+        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total")
         .await
         .expect("register the aggregate");
     let engine = running(db.dsn()).await;
@@ -211,7 +213,7 @@ async fn an_aggregate_build_is_live_only_with_a_change_drained_during_it_folded_
         .expect("read sku_totals")
         .get(0);
     assert_eq!(
-        total, "1012",
+        total, "1000",
         "live, and caught up to a token taken after the change"
     );
     engine.shutdown().await.expect("shut down");
@@ -343,7 +345,8 @@ async fn a_ring_build_on_another_definitions_target_is_live_only_once_caught_up(
 /// deleted and its delete drains while the build is held before its write,
 /// so apply skips it and the build then writes the group. The go-live
 /// re-read has no key in that group left to re-derive it from; the orphan
-/// sweep that runs with the flip removes it. At `live` it is gone.
+/// sweep that runs with the flip removes it. At `live` it is gone. A `MAX`,
+/// for the direct build (#625 F3).
 #[tokio::test]
 async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
     const HOLD: i64 = 4851;
@@ -361,7 +364,7 @@ async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
 
     define_only(db.dsn())
         .await
-        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total")
+        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total")
         .await
         .expect("register the aggregate");
     let engine = running(db.dsn()).await;
@@ -393,7 +396,7 @@ async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
     assert_eq!(
         totals,
         vec![
-            ("a".to_string(), "12".to_string()),
+            ("a".to_string(), "7".to_string()),
             ("b".to_string(), "2".to_string())
         ],
         "live, and the group the build wrote from a deleted row is gone"
@@ -470,6 +473,104 @@ async fn a_chunked_row_deleted_during_its_build_is_gone_at_live() {
         rows,
         vec![(1, 1), (3, 3)],
         "live, and the row the chunk copied from a deleted source row is gone"
+    );
+    engine.shutdown().await.expect("shut down");
+}
+
+/// #625 F3, the Re-derive build (a plain `SUM`): there is no `catching_up`.
+/// The definition applies from its start, so a change that drains while a
+/// chunk is held before its write is folded in while it is still
+/// `backfilling`; once the chunk and its merge commit it goes straight to
+/// `live`, and a token taken after `live` covers every commit before it.
+/// The chunk is held by a row trigger on the target's group-delta table,
+/// after its entry lock and its read.
+#[tokio::test]
+async fn a_rederive_build_applies_while_backfilling_and_is_steady_at_live() {
+    const HOLD: i64 = 6253;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_sales(&raw).await;
+
+    define_only(db.dsn())
+        .await
+        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total")
+        .await
+        .expect("register the aggregate");
+    raw.batch_execute(&format!(
+        "create function hold_chunk() returns trigger language plpgsql as $$ \
+         begin \
+           perform pg_advisory_lock({HOLD}); \
+           perform pg_advisory_unlock({HOLD}); \
+           return new; \
+         end $$; \
+         create trigger hold_chunk before insert on sku_totals__deltas \
+           for each row execute function hold_chunk()"
+    ))
+    .await
+    .expect("install the chunk hold");
+    raw.execute("select pg_advisory_lock($1)", &[&HOLD])
+        .await
+        .expect("take the hold");
+
+    let engine = running(db.dsn()).await;
+    wait_until_held(&raw, HOLD).await;
+
+    raw.execute("insert into public.sales values (4, 'a', 1000)", &[])
+        .await
+        .expect("commit a change while the chunk is held");
+    converge(&engine).await;
+    assert_eq!(
+        status(&engine, "sku_totals").await,
+        TransformStatus::Backfilling,
+        "the chunk hasn't committed"
+    );
+    let applied: String = raw
+        .query_one("select total::text from sku_totals where sku = 'a'", &[])
+        .await
+        .expect("read sku_totals")
+        .get(0);
+    assert_eq!(
+        applied, "1000",
+        "the change was applied while backfilling; the chunk's rows are still owed"
+    );
+
+    raw.execute("select pg_advisory_unlock($1)", &[&HOLD])
+        .await
+        .expect("release the chunk");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let current = status(&engine, "sku_totals").await;
+        assert_ne!(
+            current,
+            TransformStatus::CatchingUp,
+            "a re-derive build never reports catching_up"
+        );
+        if current == TransformStatus::Live {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never reported live");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    raw.execute("insert into public.sales values (5, 'b', 40)", &[])
+        .await
+        .expect("commit after live");
+    converge(&engine).await;
+
+    let totals: Vec<(String, String)> = raw
+        .query("select sku, total::text from sku_totals order by sku", &[])
+        .await
+        .expect("read sku_totals")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        totals,
+        vec![
+            ("a".to_string(), "1012".to_string()),
+            ("b".to_string(), "42".to_string())
+        ],
+        "live, and caught up to a token taken after the last change"
     );
     engine.shutdown().await.expect("shut down");
 }

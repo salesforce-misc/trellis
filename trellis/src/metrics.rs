@@ -182,13 +182,16 @@ pub enum BuildStatement {
     MergeFinish,
     /// The merger's commit.
     MergeCommit,
+    /// A merger's periodic vacuum of the target's delta table, after its
+    /// commit (#625 F2b, `staging::build::VACUUM_EVERY`).
+    MergeVacuum,
     /// The plan job's boundary walk and chunk inserts.
     Plan,
 }
 
 impl BuildStatement {
     /// Every class, in label order.
-    pub const ALL: [BuildStatement; 10] = [
+    pub const ALL: [BuildStatement; 11] = [
         BuildStatement::ChunkSetup,
         BuildStatement::ChunkKeys,
         BuildStatement::ChunkLock,
@@ -198,6 +201,7 @@ impl BuildStatement {
         BuildStatement::MergeUpsert,
         BuildStatement::MergeFinish,
         BuildStatement::MergeCommit,
+        BuildStatement::MergeVacuum,
         BuildStatement::Plan,
     ];
 
@@ -213,6 +217,7 @@ impl BuildStatement {
             BuildStatement::MergeUpsert => "merge_upsert",
             BuildStatement::MergeFinish => "merge_finish",
             BuildStatement::MergeCommit => "merge_commit",
+            BuildStatement::MergeVacuum => "merge_vacuum",
             BuildStatement::Plan => "plan",
         }
     }

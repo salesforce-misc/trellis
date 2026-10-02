@@ -1405,6 +1405,11 @@ enum Build {
 /// the build its shape gets. Runs on `client` before the discharge's
 /// transaction opens, so planning chunk boundaries (a walk of the source's
 /// primary-key index) doesn't hold that transaction open.
+///
+/// A definition the Re-derive build takes (`staging::build::qualifies`,
+/// #625 F3) is left out, whatever `ready` says: the staging worker's start
+/// builds it (`staging::build::start_ready_builds`), and nothing here
+/// touches it, its orphan sweep included.
 async fn plan_waiting_builds(
     client: &tokio_postgres::Client,
     table: &str,
@@ -1428,6 +1433,9 @@ async fn plan_waiting_builds(
         let id: i64 = row.get(0);
         let text: String = row.get(1);
         let def = crate::defs::parse(&text).map_err(CatalogError::from)?;
+        if rederive_built(client, id).await? {
+            continue;
+        }
         let chunked =
             matches!(def.key_space, KeySpace::OneToOne) && !backfill::uses_relationships(&def);
         let planned = if chunked {
@@ -1455,6 +1463,15 @@ async fn plan_waiting_builds(
         builds.push((id, build));
     }
     Ok(builds)
+}
+
+/// Whether definition `id` is the Re-derive build's (#625 F3), so no old
+/// build dispatches it.
+async fn rederive_built(client: &tokio_postgres::Client, id: i64) -> Result<bool, IntakeError> {
+    let Some(definition) = crate::defs::catalog::definition_by_id_in(client, id).await? else {
+        return Ok(false);
+    };
+    Ok(crate::staging::build::qualifies(client, &definition).await?)
 }
 
 /// Runs `marker`'s discharge in one transaction: the read (the enumeration,
@@ -1818,8 +1835,9 @@ pub async fn settle_registrations(pool: &crate::pool::Pool) {
 /// (or anything before it) enqueued until none is left: every registered
 /// build finishes, and a chunked or direct one is left `catching_up` with its
 /// go-live catch-up parked (issue #476), for a test that looks at that state
-/// before the staging worker's next pass would discharge it. Panics on any
-/// failure: it is test harness.
+/// before the staging worker's next pass would discharge it. A Re-derive
+/// build (#625) is run to `live` (`staging::build::settle_builds`). Panics
+/// on any failure: it is test harness.
 #[cfg(any(test, feature = "internals"))]
 pub async fn settle_builds(pool: &crate::pool::Pool) {
     use crate::defs::chunk_queue;
@@ -1834,6 +1852,7 @@ pub async fn settle_builds(pool: &crate::pool::Pool) {
             .expect("claim backfill chunks");
         drop(client);
         if claimed.is_empty() {
+            crate::staging::build::settle_builds(pool).await;
             return;
         }
         for chunk in &claimed {
@@ -1855,8 +1874,10 @@ pub async fn settle_builds(pool: &crate::pool::Pool) {
 
 /// Test stand-in for the staging worker's maintenance pass over newly
 /// registered definitions (ADR-0016), for a test with no staging worker and no
-/// capture triggers: parks a marker on every `waiting_to_backfill` definition's
-/// source (treating every source as captured), then discharges every settled
+/// capture triggers: starts the Re-derive build of every `waiting_to_backfill`
+/// definition it takes (`staging::build::start_ready_builds`, #625 F3), parks
+/// a marker on every other one's source (treating every source as captured),
+/// then discharges every settled
 /// marker with the watermark saturated. That includes the go-live catch-up of
 /// every `catching_up` definition, which takes it `live` (issue #476). Retries
 /// for a few seconds while a fence is still pinned by some other transaction in
@@ -1871,6 +1892,16 @@ pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), Int
         .await
         .map_err(crate::defs::catalog::CatalogError::from)?;
     for _ in 0..100 {
+        let waiting: Vec<i64> = client
+            .query(
+                "select id from transform_definitions where status = $1 order by id",
+                &[&TransformStatus::WaitingToBackfill.as_str()],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        crate::staging::build::start_ready_builds(&mut client, pool, &waiting).await?;
         let sources: Vec<String> = client
             .query(
                 "select distinct source_table from transform_definitions where status = $1",
@@ -2130,6 +2161,11 @@ mod tests {
 
 #[cfg(test)]
 mod catch_up_tests {
+    //! The rollups that need the old build and its go-live catch-up sum
+    //! `a + 0`: an expression argument keeps them there until #625 F5, where
+    //! a plain `SUM` is the Re-derive build's since F3, which parks no
+    //! marker. The Re-derive build's own interleavings are in
+    //! `tests/build_interleavings.rs` and `tests/rederive_build.rs`.
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::oneshot;
@@ -3496,7 +3532,7 @@ mod catch_up_tests {
         .collect();
         crate::defs::install_definition(
             &pool,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
             &columns,
             "public",
         )
@@ -3954,7 +3990,7 @@ mod catch_up_tests {
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) = orders_with_rollup_and_copy(
             &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
         )
         .await;
         park_registration_markers(&discharger, &["public.orders".to_string()])
@@ -4041,7 +4077,7 @@ mod catch_up_tests {
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) = orders_with_rollup_and_copy(
             &db,
-            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a + 0) AS total",
         )
         .await;
         settle_registrations(&pool).await;

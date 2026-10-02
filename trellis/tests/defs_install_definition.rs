@@ -1790,7 +1790,8 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
             .unwrap_or_else(|e| panic!("register {text:?}: {e}"))
         }
     };
-    let aggregate = register("TRANSFORM v FROM s GROUP BY g SELECT g AS g, SUM(a) AS total").await;
+    // A `MAX`: a plain `SUM` is the Re-derive build's since #625 F3.
+    let aggregate = register("TRANSFORM v FROM s GROUP BY g SELECT g AS g, MAX(a) AS total").await;
     assert_eq!(aggregate.status, TransformStatus::WaitingToBackfill);
     let enriched = register("TRANSFORM w FROM s SELECT COUNT(kids.id) AS n").await;
     assert_eq!(enriched.status, TransformStatus::WaitingToBackfill);
@@ -1832,7 +1833,7 @@ async fn registering_a_direct_build_shape_reads_no_source_rows() {
     assert_eq!(statuses, ["live", "live"]);
     let aggregate_mismatches: i64 = client
         .query_one(
-            "select count(*) from (select g, sum(a) as total from s group by g) e \
+            "select count(*) from (select g, max(a) as total from s group by g) e \
              full join v on v.g = e.g where v.total is distinct from e.total",
             &[],
         )

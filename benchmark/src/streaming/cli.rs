@@ -108,8 +108,7 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
 /// `--reconcile-interval-ms`, `--drain-batch-cap`), and #625 F2's
-/// `--rederive-build` (build the target with the Re-derive build) and
-/// `--build-chunk-rows <n>` (its chunk size, 10,000). Postgres settings for a disk
+/// `--build-chunk-rows <n>` (the Re-derive build's chunk size, 10,000). Postgres settings for a disk
 /// run go through testkit's `TRELLIS_TESTKIT_PG_OPTIONS`, e.g.
 /// `'shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB'` (#617's).
 fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
@@ -225,7 +224,6 @@ fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
         drain_batch_cap: number(args, "--drain-batch-cap")
             .map(|v| v as usize)
             .unwrap_or(default.drain_batch_cap),
-        rederive_build: args.iter().any(|a| a == "--rederive-build") || default.rederive_build,
         build_chunk_rows: number(args, "--build-chunk-rows")
             .map(|v| {
                 assert!(v >= 1.0, "--build-chunk-rows must be at least 1, got {v}");
@@ -825,25 +823,17 @@ mod tests {
     }
 
     #[test]
-    fn tuning_reads_the_rederive_build_flags_or_keeps_them_off() {
+    fn tuning_reads_the_build_chunk_rows_or_keeps_the_default() {
         let stock = tuning(&argv(&["build-under-load"]), EngineTuning::default());
-        assert!(!stock.rederive_build);
         assert_eq!(
             stock.build_chunk_rows,
             trellis::ClientOptions::default().build_chunk_rows
         );
         let t = tuning(
-            &argv(&[
-                "build-under-load",
-                "--rederive-build",
-                "--build-chunk-rows",
-                "50000",
-            ]),
+            &argv(&["build-under-load", "--build-chunk-rows", "50000"]),
             EngineTuning::default(),
         );
-        assert!(t.rederive_build);
         assert_eq!(t.build_chunk_rows, 50_000);
-        assert!(t.client_options().rederive_build);
         assert_eq!(t.client_options().build_chunk_rows, 50_000);
     }
 

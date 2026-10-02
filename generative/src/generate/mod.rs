@@ -3996,6 +3996,8 @@ mod strategy {
     /// - Three cases in four install one more `GROUP BY` definition over
     ///   the hot table mid-burst (always with `COUNT(*)`), so its build runs
     ///   while the hot table takes writes: #625's build-under-load shape.
+    ///   Half of those are invertible-only ([`install_functions`]), so the
+    ///   Re-derive build runs it (#625 F3).
     /// - One to [`MAX_ACTION_DRAWS`] operator actions ([`ActionDraw`]),
     ///   placed by [`add_burst_actions`]: `request_backfill`, a pause and
     ///   resume, or a column pause and resume.
@@ -4177,7 +4179,7 @@ mod strategy {
             });
         (
             prop::option::weighted(0.75, 0..=1000u16),
-            prop::option::weighted(0.75, (aggregate_functions(), 0..=1000u16)),
+            prop::option::weighted(0.75, (install_functions(), 0..=1000u16)),
             prop::collection::vec(action, 1..=MAX_ACTION_DRAWS),
         )
             .prop_map(|(parent_truncate, deferred, actions)| MidBurstDraws {
@@ -4185,6 +4187,30 @@ mod strategy {
                 deferred,
                 actions,
             })
+    }
+
+    /// The fields of [`mid_burst_case`]'s mid-burst install: half the time
+    /// any of [`aggregate_functions`], and half the time only `SUM`, `AVG`
+    /// and `COUNT` of plain columns, the shape the Re-derive build takes
+    /// (#625 F3). Few draws of the first kind are invertible-only, so
+    /// without the second the build (and its plants) would run in few cases.
+    fn install_functions() -> impl Strategy<Value = Vec<AggregateFn>> {
+        let invertible = (
+            proptest::sample::subsequence(vec![FnKind::Sum, FnKind::Count, FnKind::Avg], 1..=3),
+            aggregate_column(),
+            aggregate_column(),
+        )
+            .prop_map(|(kinds, sum_col, avg_col)| {
+                kinds
+                    .into_iter()
+                    .map(|kind| match kind {
+                        FnKind::Sum => AggregateFn::Sum(sum_col),
+                        FnKind::Avg => AggregateFn::Avg(avg_col),
+                        _ => AggregateFn::Count,
+                    })
+                    .collect::<Vec<_>>()
+            });
+        prop_oneof![1 => aggregate_functions(), 1 => invertible]
     }
 
     fn hot_key_case_with(

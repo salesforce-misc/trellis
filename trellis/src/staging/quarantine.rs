@@ -1711,14 +1711,11 @@ pub async fn trip_transform_fuse_if_crossed(
              source; nothing quarantined"
         );
     }
+    // An applying definition: a Re-derive build applies from its start
+    // (#625 F2), so its fuse trips from `backfilling` too.
+    let applying = crate::defs::model::applying_sql("t");
     for def in &definitions {
-        // A Re-derive build applies from its start (#625 F2), so its fuse
-        // trips from `backfilling` too.
-        let mut statuses = TransformStatus::applying();
-        if def.rederive_build {
-            statuses.push(TransformStatus::Backfilling.as_str());
-        }
-        quarantine_if_crossed(txn, src_table, def.id, &def.def.target, &statuses).await?;
+        quarantine_if_crossed(txn, src_table, def.id, &def.def.target, &applying).await?;
     }
     Ok(())
 }
@@ -1803,7 +1800,7 @@ pub(crate) async fn trip_build_fuse(
         src_table,
         definition_id,
         target,
-        &[TransformStatus::Backfilling.as_str()],
+        "t.status = 'backfilling'",
     )
     .await?;
     txn.commit().await?;
@@ -1837,15 +1834,16 @@ pub(crate) async fn trip_build_fuse(
 /// the unconditional write it replaced took, and only when the definition
 /// actually trips.
 ///
-/// `statuses` are the ones the definition may be frozen from: the applying
-/// ones for a drain's eviction, `backfilling` for a build's
-/// ([`trip_build_fuse`]).
+/// `may_freeze` is a SQL predicate over the definition's row `t` saying
+/// which states it may be frozen from: an applying one
+/// (`defs::model::applying_sql`) for a drain's eviction, `backfilling` for a
+/// build's ([`trip_build_fuse`]).
 async fn quarantine_if_crossed(
     txn: &Transaction<'_>,
     src_table: &str,
     id: i64,
     target: &str,
-    statuses: &[&str],
+    may_freeze: &str,
 ) -> Result<bool, ApplyError> {
     const WINDOWED_COUNT: &str = "(select count(*) from poison p \
          where p.src_table = $3 \
@@ -1854,14 +1852,13 @@ async fn quarantine_if_crossed(
         .query_opt(
             &format!(
                 "update transform_definitions t set status = $1 \
-                 where t.id = $2 and t.status = any($4) and {WINDOWED_COUNT} >= $5 \
+                 where t.id = $2 and {may_freeze} and {WINDOWED_COUNT} >= $4 \
                  returning {WINDOWED_COUNT}"
             ),
             &[
                 &TransformStatus::Quarantined.as_str(),
                 &id,
                 &src_table,
-                &statuses,
                 &(DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64),
             ],
         )
@@ -2464,8 +2461,13 @@ pub async fn resume_column(
 /// recoverable by replay.
 ///
 /// This function itself only schedules that reconciliation. It drops the
-/// definition to [`TransformStatus::WaitingToBackfill`] and re-parks a fresh
-/// `pending_backfill` marker for its source table
+/// definition to [`TransformStatus::WaitingToBackfill`]. A definition the
+/// Re-derive build takes (`super::build::qualifies`, #625 F3) is then
+/// rebuilt by the staging worker's next pass, which starts a Re-derive build
+/// over its ledger (`super::build::start_ready_builds`): it keeps the
+/// ledger, the groups and any group deltas still owed to them (B4), and its
+/// sweep drops the keys deleted while it was frozen. Any other definition
+/// gets a fresh `pending_backfill` marker for its source table
 /// ([`crate::intake::markers::park_marker`], which every marker goes
 /// through). The target is left exactly as
 /// the freeze left it until that marker's discharge
@@ -2606,11 +2608,24 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     )
     .await?;
 
+    // A definition the Re-derive build takes (#625 F3) gets no marker: the
+    // staging worker's next pass starts its rebuild from `waiting_to_backfill`
+    // (`super::build::start_ready_builds`), over the ledger, groups and group
+    // deltas the freeze left (B4), and its sweep drops the keys deleted
+    // meanwhile. A marker would have the discharge re-read the whole source
+    // for nothing.
+    //
     // `transform_definitions.source_table` is already the fully-qualified
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    crate::intake::markers::park_marker(&*txn, &source_table).await?;
+    let rederive_built = match catalog::definition_by_id_in(&*txn, id).await? {
+        Some(definition) => super::build::qualifies(&*txn, &definition).await?,
+        None => false,
+    };
+    if !rederive_built {
+        crate::intake::markers::park_marker(&*txn, &source_table).await?;
+    }
     // #622 C6: a transform paused by a schema change stops being reported as
     // such the moment it is resumed. Its columns count for capture again from
     // here, so the next reconcile widens the source's capture to them before
@@ -4146,7 +4161,7 @@ mod unit_tests {
             src_table,
             def.id,
             &def.def.target,
-            &TransformStatus::applying(),
+            &crate::defs::model::applying_sql("t"),
         )
         .await
         .expect("fuse write");

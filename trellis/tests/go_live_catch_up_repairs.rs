@@ -21,6 +21,11 @@
 //! Each test ends with the definition `live` after the discharge, and the
 //! target equal to the source.
 //!
+//! The aggregate is a `MAX`, which still takes the direct build and its
+//! go-live catch-up. A plain `SUM` is the Re-derive build's since #625 F3:
+//! it applies from its start and has no catch-up to repair anything
+//! (`tests/rederive_build.rs`, `tests/build_interleavings.rs`).
+//!
 //! The aggregate build is held with event triggers on advisory locks the
 //! test holds, at the two `ALTER TABLE`s around its ledger load (#623 D2),
 //! told apart by their text: the one dropping the ledger's key (before the source read) and the one
@@ -187,7 +192,7 @@ async fn start_held_build(pool: &trellis::Pool, client: &Client) -> tokio::task:
     }
     install_definition(
         pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT max(amount) AS total",
         &HashMap::from([
             ("id".to_string(), ValueType::Numeric),
             ("sku".to_string(), ValueType::Text),
@@ -271,7 +276,7 @@ async fn a_row_inserted_during_the_build_and_deleted_after_it_is_not_left_counte
     build.await.expect("build task");
     assert_eq!(
         totals(&client).await,
-        expected(&[("a", "1012"), ("b", "2")]),
+        expected(&[("a", "1000"), ("b", "2")]),
         "the build read the inserted row"
     );
     assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
@@ -286,7 +291,7 @@ async fn a_row_inserted_during_the_build_and_deleted_after_it_is_not_left_counte
     discharge_markers(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
+    assert_eq!(totals(&client).await, expected(&[("a", "7"), ("b", "2")]));
 }
 
 /// As above, but the delete lands between the build's read and its write,
@@ -321,7 +326,7 @@ async fn a_row_inserted_and_deleted_during_the_build_is_not_left_counted() {
 
     discharge_markers(&db.pool, &mut client).await;
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
+    assert_eq!(totals(&client).await, expected(&[("a", "7"), ("b", "2")]));
 }
 
 /// #485: as above, but the row was its group's only one. The go-live
@@ -354,14 +359,14 @@ async fn a_group_emptied_during_the_build_is_gone_at_live() {
     build.await.expect("build task");
     assert_eq!(
         totals(&client).await,
-        expected(&[("a", "12"), ("b", "2"), ("z", "1000")]),
+        expected(&[("a", "7"), ("b", "2"), ("z", "1000")]),
         "the build wrote the group it read"
     );
     assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
 
     discharge_markers(&db.pool, &mut client).await;
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
+    assert_eq!(totals(&client).await, expected(&[("a", "7"), ("b", "2")]));
 }
 
 /// #485 on a plain (chunked) 1-1: a row the chunk read is deleted before the
@@ -482,7 +487,7 @@ async fn a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled()
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     assert_eq!(
         totals(&client).await,
-        expected(&[("a", "12")]),
+        expected(&[("a", "7")]),
         "the sweep dropped group b before its delete drained"
     );
 
@@ -501,5 +506,5 @@ async fn a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled()
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
-    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "50")]));
+    assert_eq!(totals(&client).await, expected(&[("a", "7"), ("b", "50")]));
 }

@@ -134,6 +134,8 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // A plain invertible aggregate is the Re-derive build's (#625 F3).
+            trellis::staging::build::settle_builds(pool).await;
             // The staging worker's next pass: the builds' go-live catch-ups
             // take them `live` (issue #476).
             trellis::intake::markers::discharge_registrations(pool)
@@ -215,34 +217,6 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
         }
     }
     panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-/// Discharges every parked `pending_backfill` marker, the step a running
-/// `Client`'s maintenance loop takes. A marker only discharges once every
-/// transaction in flight when it was parked has finished (its `xmin` fence),
-/// so this retries until none remain. Nothing else runs on this test's own
-/// cluster, so that is normally the first pass; the ceiling only turns a
-/// wedged fence into a failure rather than a hang.
-async fn discharge_pending_backfills(client: &mut Client) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        markers::run_pending_backfills(
-            client,
-            "trellis_pause_and_drop_test",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("run_pending_backfills");
-        if count(client, "select count(*) from pending_backfill").await == 0 {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a pending_backfill marker never settled"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// Seeds a source table. Aggregates are this file's default
@@ -490,14 +464,22 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         "resume drops the definition back into the backfill lifecycle it was defined through"
     );
 
-    // Claim 2, mechanism continued: the resume's marker discharges into the
-    // same direct-build job a freshly registered aggregate gets (#419): one
-    // unbounded `backfill_chunks` row, the definition `backfilling`.
-    discharge_pending_backfills(&mut raw).await;
+    // Claim 2, mechanism continued: a plain `SUM` is the Re-derive build's
+    // (#625 F3). Its resume parks no marker; the staging worker's next pass
+    // starts the same build a freshly registered one gets, over the ledger
+    // the pause left: a plan job and, the ledger not being empty, a sweep.
+    assert_eq!(
+        count(&raw, "select count(*) from pending_backfill").await,
+        0,
+        "the resume of a re-derive shape parks no marker"
+    );
+    trellis::intake::markers::discharge_registrations(&db.pool)
+        .await
+        .expect("start the rebuild");
     assert_eq!(
         persisted_status(&raw, "order_rollup").await.as_deref(),
         Some("backfilling"),
-        "the discharge hands the resumed aggregate to its direct-build job"
+        "the staging worker's pass starts the resumed aggregate's rebuild"
     );
     assert_eq!(
         count(
@@ -505,11 +487,11 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
             "select count(*) from backfill_chunks c \
              join transform_definitions d on d.id = c.definition_id \
              where split_part(d.target_table, '.', 2) = 'order_rollup' \
-               and c.lo is null and c.hi is null and not c.done"
+               and c.kind in ('plan', 'sweep') and not c.done"
         )
         .await,
-        1,
-        "the rebuild is one whole-definition job, not a replay of buffered changes"
+        2,
+        "the rebuild is a plan job and a sweep, not a replay of buffered changes"
     );
 
     // Claim 2, outcome: the target comes back reconciled against the *current*
@@ -557,8 +539,10 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     seed_source(&raw, "orders", 6).await;
 
     let trellis = define_only(db.dsn()).await;
+    // A `MAX`, so the direct build (not the Re-derive build, #625 F3)
+    // stamps the extinct horizon the drop must take.
     trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT max(a) AS total")
         .await
         .expect("define");
     markers::settle_registrations(&db.pool).await;

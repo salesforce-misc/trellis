@@ -1,19 +1,30 @@
 //! The Re-derive build (#625; epic #556, ADR-0002 "A build is Re-derive over
 //! chunks, and applies from its first chunk"): its primitives, a build chunk
 //! ([`run_chunk`]) and the group-delta merger ([`merge_deltas`]) (F1), and
-//! their scheduling (F2), behind `ClientOptions::rederive_build`, which is
-//! off by default.
+//! their scheduling (F2). Since F3 it is the only build of the shapes it
+//! serves (see "Shapes"): a fresh definition's and a resumed one's alike.
 //!
-//! # The scheduled build (F2)
+//! # The scheduled build (F2, F3)
 //!
 //! - **Start** ([`start_ready_builds`]). The staging worker's reconcile pass
 //!   starts each ready definition that [`qualifies`] instead of parking it a
 //!   registration marker: once its source's capture gate is clear, one
 //!   transaction moves it `waiting_to_backfill -> backfilling` with
 //!   `transform_definitions.build = 'rederive'` and enqueues its plan job.
-//!   From that commit it applies (`Definition::applies`, B1): Apply folds its
-//!   source's changes into its ledger and groups, so nothing needs a
-//!   catch-up.
+//!   From that commit it applies (`defs::model::APPLYING_SQL`, B1): Apply
+//!   folds its source's changes into its ledger and groups, so nothing needs
+//!   a catch-up. The backfill discharge never dispatches a definition that
+//!   qualifies (`intake::markers`), and a resume leaves it to this start
+//!   (`super::quarantine::resume_transform`), so each definition is on
+//!   exactly one build path.
+//! - **Rebuild** (F3). A resumed definition keeps its ledger, its groups and
+//!   any group deltas still owed to them (B4), so its build is a Re-derive
+//!   over its existing entries, with no truncate. Its start also enqueues a
+//!   **sweep** job ([`run_sweep`]): once the plan job and every chunk are
+//!   done, it walks the ledger and re-derives each live entry the chunks
+//!   didn't (its `basis` is null or older than the start), which is a key
+//!   deleted while the definition was frozen. A fresh build's ledger is
+//!   empty at its start, so it gets no sweep.
 //! - **Plan** ([`run_plan`]). A drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
 //!   rows, [`PLAN_BATCH`] per transaction (Q13).
@@ -65,15 +76,34 @@
 //!
 //! # The merger
 //!
-//! [`merge_deltas`] claims up to `limit` delta rows no other merger holds
-//! (`for update skip locked`), deletes them, sums them per group and upserts
-//! the sums in group order, all in one statement
+//! [`merge_deltas`] claims up to `limit` delta rows, oldest first through
+//! the claim key's index (`for update skip locked`), deletes them, sums them
+//! per group and upserts the sums in group order, all in one statement
 //! ([`super::ledger::merge_statement`]), with the same upsert Apply uses.
 //! Then it deletes the groups whose every accumulator is 0 and hands every
 //! written group to the target-mutation seam, as Apply does
 //! ([`super::ledger::finish_groups`]). A merger locks only delta rows it
 //! claims without waiting and group rows in group order, so it can't
-//! deadlock with another merger or with a page.
+//! deadlock with a page.
+//!
+//! **One merger per target (F2b).** A merger first takes its target's
+//! transaction-scoped advisory lock without waiting, and skips the target if
+//! another transaction holds it: two mergers' batches almost always share a
+//! group, and the second would wait on the first's group row for the rest of
+//! the first's transaction (the F2 profile measured that at ~30% of build
+//! worker time on 8 workers). The skipping worker goes on to a chunk.
+//! The skip changes nothing [`try_complete`] reads: a merge in flight holds
+//! its claimed rows deleted but uncommitted, so the table still reads
+//! non-empty to everyone else until it commits.
+//!
+//! **The delta table is a queue (F2b).** Every row is deleted soon after
+//! it's appended, so its heap and the claim key's index fill with dead rows
+//! between vacuums, and its statistics say little about its contents. The
+//! claim and the emptiness checks read through the index, the merge
+//! statement runs with plan settings that don't depend on the statistics
+//! ([`merge_deltas`]), and a merger vacuums the table every
+//! [`VACUUM_EVERY`] rows it merges, so the walk past dead index entries
+//! stays bounded by that, not by the build's length.
 //!
 //! While a target is being built its groups have two channels, Apply and the
 //! merger, so a group can be transiently partial or even negative. B5 (a
@@ -90,6 +120,8 @@
 //! recompute the groups it writes, which is #625 F5. [`BuildPlan::load`]
 //! returns `None` for anything else.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio_postgres::{GenericClient, IsolationLevel, Transaction};
@@ -230,24 +262,8 @@ pub async fn run_chunk(
     }
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
 
-    // 2. The entry lock, under the chunk's own short lock timeout. Its time
-    // is recorded whether or not the lock is had: a chunk that gives up
-    // spent it waiting all the same.
-    let started = Instant::now();
-    let locked = async {
-        let previous: String = txn
-            .query_one("select current_setting('lock_timeout')", &[])
-            .await?
-            .get(0);
-        crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
-        ledger::lock_entries(txn, ledger, &key_refs, false).await?;
-        txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
-            .await?;
-        Ok::<_, ApplyError>(())
-    }
-    .await;
-    metrics::record_build_statement(BuildStatement::ChunkLock, started.elapsed());
-    locked?;
+    // 2. The entry lock, under the chunk's own short lock timeout.
+    lock_chunk_entries(txn, ledger, &key_refs).await?;
 
     // 3. The read, the entries and the deltas, in one statement.
     let started = Instant::now();
@@ -278,31 +294,272 @@ pub async fn run_chunk(
     })
 }
 
+/// A chunk's or a sweep batch's entry lock ([`ledger::lock_entries`]),
+/// under [`CHUNK_LOCK_TIMEOUT`], which it sets for the lock alone. Its time
+/// is recorded whether or not the lock is had: a chunk that gives up spent
+/// it waiting all the same.
+async fn lock_chunk_entries(
+    txn: &Transaction<'_>,
+    ledger: &LedgerTargetPlan,
+    keys: &[&str],
+) -> Result<(), ApplyError> {
+    // Planted bug (#625 F3): the chunk's read-and-write runs with no entry
+    // lock, so it reads an entry a page is between reading and writing.
+    // See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let skip_lock = crate::plant::fires(crate::plant::Plant::ChunkWithoutEntryLock, true);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let skip_lock = false;
+    let started = Instant::now();
+    let locked = async {
+        let previous: String = txn
+            .query_one("select current_setting('lock_timeout')", &[])
+            .await?
+            .get(0);
+        crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+        ledger::lock_entries(txn, ledger, keys, skip_lock).await?;
+        txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
+            .await?;
+        Ok::<_, ApplyError>(())
+    }
+    .await;
+    metrics::record_build_statement(BuildStatement::ChunkLock, started.elapsed());
+    locked
+}
+
+/// What one [`sweep_batch`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepOutcome {
+    /// The ledger entries the batch read past, live or not.
+    pub scanned: i64,
+    /// The live entries among them the build hadn't re-derived, which the
+    /// batch re-derived.
+    pub rederived: usize,
+    /// The group-delta rows it appended.
+    pub delta_rows: i64,
+    /// The last entry key it read past: the next batch's cursor. `None`
+    /// when it read none.
+    pub next: Option<String>,
+    /// It read fewer than it was allowed: the sweep is done.
+    pub finished: bool,
+}
+
+/// One batch of a rebuild's sweep (#625 F3; see the module doc), in `txn`,
+/// which must be `read committed` as a chunk's is. The caller commits.
+///
+/// It reads up to `scan` ledger entries in key order after `cursor` (all of
+/// them from the first with `None`), and picks the live ones the build
+/// hasn't re-derived: those whose `basis` is null (written by Apply alone)
+/// or is a snapshot taken before the build's start, `start_xid` (the
+/// snapshot's `xmax` is at or before it). Then it locks them as a chunk does
+/// ([`lock_chunk_entries`]) and re-derives them in one statement
+/// ([`ledger::sweep_statement`]), which reads the source by each key: a key
+/// with no row any more (deleted while the definition was frozen) becomes a
+/// tombstone, and its group sheds it through the group deltas. The pick is
+/// read before the lock and nothing relies on it after: a picked entry that
+/// changed meanwhile is re-derived all the same, which is idempotent.
+///
+/// Reading a bounded window of entries rather than a bounded number of
+/// picks keeps each statement short whatever the ledger holds (F-A8).
+pub async fn sweep_batch(
+    txn: &Transaction<'_>,
+    plan: &BuildPlan,
+    start_xid: &str,
+    cursor: Option<&str>,
+    scan: i64,
+) -> Result<SweepOutcome, ApplyError> {
+    let ledger = &plan.ledger;
+    let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
+    let member = quote_ident(crate::defs::ledger::MEMBER_COLUMN);
+    let tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN);
+    let basis = quote_ident(crate::defs::ledger::BASIS_COLUMN);
+    let after = if cursor.is_some() {
+        format!("where {key} > $3")
+    } else {
+        "where $3::text is null".to_string()
+    };
+    let started = Instant::now();
+    let row = txn
+        .query_one(
+            &format!(
+                "with w as ( \
+                     select {key} as k, {member} and not {tombstone} \
+                            and ({basis} is null \
+                                 or pg_catalog.pg_snapshot_xmax({basis}) <= $1::text::xid8) \
+                            as stale \
+                     from {ledger_ident} {after} order by {key} limit $2 \
+                 ) \
+                 select (select count(*) from w), \
+                        (select k from w order by k desc limit 1), \
+                        array(select k from w where stale order by k)",
+                ledger_ident = ledger.ledger_ident(),
+            ),
+            &[&start_xid, &scan, &cursor],
+        )
+        .await?;
+    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    let scanned: i64 = row.get(0);
+    let next: Option<String> = row.get(1);
+    let keys: Vec<String> = row.get(2);
+    let finished = scanned < scan;
+    if keys.is_empty() {
+        return Ok(SweepOutcome {
+            scanned,
+            rederived: 0,
+            delta_rows: 0,
+            next,
+            finished,
+        });
+    }
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    lock_chunk_entries(txn, ledger, &key_refs).await?;
+    let parts = ledger::sweep_key_params(ledger, &key_refs)?;
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&key_refs];
+    for part in &parts {
+        params.push(part);
+    }
+    let started = Instant::now();
+    let row = txn
+        .query_one(&ledger::sweep_statement(ledger), &params)
+        .await?;
+    metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
+    let delta_rows: i64 = row.get(1);
+    tracing::debug!(
+        target_table = %ledger.target,
+        scanned,
+        rederived = keys.len(),
+        delta_rows,
+        "re-derive build sweep batch re-derived its stale entries"
+    );
+    Ok(SweepOutcome {
+        scanned,
+        rederived: keys.len(),
+        delta_rows,
+        next,
+        finished,
+    })
+}
+
 /// What one [`merge_deltas`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MergeOutcome {
     /// The delta rows it claimed and deleted. Fewer than the `limit` means
-    /// none were left that no other merger held.
+    /// none were left.
     pub claimed: i64,
     /// The groups it wrote and kept.
     pub written: usize,
     /// The groups it emptied and deleted.
     pub deleted: usize,
+    /// Another transaction was merging the target, so this one claimed
+    /// nothing and touched nothing (#625 F2b).
+    pub skipped: bool,
+}
+
+/// The first key of the transaction-scoped advisory lock a merger holds on
+/// its target (#625 F2b); the second is `hashtext` of the target's quoted,
+/// qualified delta table. The two-key form keeps it apart from the
+/// single-`bigint` producer lock (`super::session`).
+const MERGER_LOCK_CLASS: i32 = 625;
+
+/// The plan settings the merge statement runs under (#625 F2b; see
+/// `ledger::merge_statement`), so its plan doesn't hang on the delta
+/// table's statistics: no nested loop, so the upsert's result joins the
+/// group sums by hash whatever the claim's row estimate, and no sequential
+/// scan, so the claim walks the claim key's index. [`MERGE_PLAN_RESET`]
+/// puts them back after the statement.
+const MERGE_PLAN_SETTINGS: &str = "set local enable_nestloop = off; set local enable_seqscan = off";
+
+/// Undoes [`MERGE_PLAN_SETTINGS`] for the rest of the transaction.
+const MERGE_PLAN_RESET: &str =
+    "set local enable_nestloop to default; set local enable_seqscan to default";
+
+/// Runs `sql`, the merge statement or an `explain` of it, binding `$1` to
+/// `limit`, under [`MERGE_PLAN_SETTINGS`], and puts the settings back after
+/// it. The one place both [`merge_deltas`] and [`explain_merge`] run it, so
+/// the plan a test explains is the plan a merger runs. An error leaves the
+/// settings on, but it also aborts `txn`, and a `set local` ends with the
+/// transaction.
+async fn query_under_merge_plan(
+    txn: &Transaction<'_>,
+    sql: &str,
+    limit: i64,
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    txn.batch_execute(MERGE_PLAN_SETTINGS).await?;
+    let rows = txn.query(sql, &[&limit]).await?;
+    txn.batch_execute(MERGE_PLAN_RESET).await?;
+    Ok(rows)
+}
+
+/// The plan [`merge_deltas`] would run for `limit` rows, as `explain`'s
+/// text, under the same settings, in `txn`. For tests of the plan's shape.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_merge(
+    txn: &Transaction<'_>,
+    plan: &BuildPlan,
+    limit: i64,
+) -> Result<String, ApplyError> {
+    let sql = ledger::merge_statement(&plan.ledger, None, false);
+    let rows = query_under_merge_plan(txn, &format!("explain {sql}"), limit).await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Folds up to `limit` of the target's group-delta rows into its groups, in
 /// `txn` (see the module doc). The caller commits.
+///
+/// At most one merger works on a target at a time (#625 F2b): this takes
+/// the target's merger lock without waiting, and if another transaction
+/// holds it returns at once with [`MergeOutcome::skipped`] set and nothing
+/// done. Two mergers of one target would upsert overlapping groups and the
+/// second would wait on the first's group rows for its whole transaction.
 pub async fn merge_deltas(
     txn: &Transaction<'_>,
     plan: &BuildPlan,
     limit: i64,
 ) -> Result<MergeOutcome, ApplyError> {
     let ledger = &plan.ledger;
+    let locked: bool = txn
+        .query_one(
+            "select pg_try_advisory_xact_lock($1, hashtext($2))",
+            &[&MERGER_LOCK_CLASS, &ledger.deltas_ident],
+        )
+        .await?
+        .get(0);
+    if !locked {
+        return Ok(MergeOutcome {
+            claimed: 0,
+            written: 0,
+            deleted: 0,
+            skipped: true,
+        });
+    }
     let mut mutations = TargetMutations::new();
     let image_columns = mutations.image_columns(txn, &ledger.target).await?;
-    let sql = ledger::merge_statement(ledger, image_columns.as_deref());
+    // Planted bug (#625 F3): the merger keeps the delta rows it applies, so
+    // the next merge applies them again. Once per target per process, so
+    // the build still ends (kept every time, the rows would be merged
+    // forever). See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let keep_claimed = if crate::plant::armed() == Some(crate::plant::Plant::MergeWithoutDelete) {
+        let database: String = txn
+            .query_one("select current_database()::text", &[])
+            .await?
+            .get(0);
+        crate::plant::fires(
+            crate::plant::Plant::MergeWithoutDelete,
+            first_planted_merge(&format!("{database}.{}", ledger.deltas_ident)),
+        )
+    } else {
+        false
+    };
+    #[cfg(not(any(test, feature = "test-util")))]
+    let keep_claimed = false;
+    let sql = ledger::merge_statement(ledger, image_columns.as_deref(), keep_claimed);
     let started = Instant::now();
-    let rows = txn.query(&sql, &[&limit]).await?;
+    let rows = query_under_merge_plan(txn, &sql, limit).await?;
     metrics::record_build_statement(BuildStatement::MergeUpsert, started.elapsed());
     // Test-only pause point, after the merger's upsert, with its claimed
     // delta rows and its groups locked. See `super::interleave`.
@@ -327,7 +584,21 @@ pub async fn merge_deltas(
         claimed,
         written,
         deleted,
+        skipped: false,
     })
+}
+
+/// Whether this is the first merge of the target `deltas` names (its
+/// database and delta table) this process makes under the
+/// `merge_without_delete` plant ([`merge_deltas`]), recording it if so.
+#[cfg(any(test, feature = "test-util"))]
+fn first_planted_merge(deltas: &str) -> bool {
+    static MERGED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(Mutex::default);
+    MERGED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(deltas.to_string())
 }
 
 // ---------------------------------------------------------------------
@@ -371,7 +642,7 @@ fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
 pub async fn qualifies(
     client: &impl GenericClient,
     definition: &Definition,
-) -> Result<bool, ApplyError> {
+) -> Result<bool, catalog::CatalogError> {
     if buildable_shape(definition).is_none() {
         return Ok(false);
     }
@@ -391,9 +662,7 @@ pub async fn qualifies(
 /// imaged without a column it reads. Such a definition is left
 /// `waiting_to_backfill` for a later pass; nothing waits here.
 ///
-/// A start is one transaction ([`start`]). A definition whose ledger isn't
-/// empty (one resumed after a pause) is left to the old path: re-deriving
-/// over its entries needs #625 F3's sweep for the keys deleted meanwhile.
+/// A start is one transaction ([`start`]).
 pub async fn start_ready_builds(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
@@ -444,12 +713,17 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// Starts `definition`'s Re-derive build in one transaction (#625 F2, B1):
 /// under its row lock, moves it `waiting_to_backfill -> backfilling` with
 /// `build = 'rederive'` and enqueues its plan job. From that commit it
-/// applies (`Definition::applies`): every page whose definition list is read
-/// after it folds the source's changes into the ledger, and a change
-/// committed before it is visible to every chunk's snapshot.
+/// applies (`defs::model::APPLYING_SQL`): every page whose definition list
+/// is read after it folds the source's changes into the ledger, and a
+/// change committed before it is visible to every chunk's snapshot.
+///
+/// A definition whose ledger isn't empty (a resumed one, F3) also gets a
+/// sweep job ([`run_sweep`]). Both rows carry the start's transaction id,
+/// which the sweep's filter reads: every chunk's snapshot is taken after
+/// the start commits, so its `xmax` is past that id.
 ///
 /// Returns `false`, writing nothing, when the definition left
-/// `waiting_to_backfill` meanwhile or its ledger isn't empty.
+/// `waiting_to_backfill` meanwhile.
 async fn start(
     client: &mut tokio_postgres::Client,
     definition: &Definition,
@@ -473,10 +747,6 @@ async fn start(
         .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
         .await?
         .get(0);
-    if !empty {
-        txn.rollback().await?;
-        return Ok(false);
-    }
     txn.execute(
         "update transform_definitions set status = $2, build = $3 where id = $1",
         &[
@@ -493,12 +763,22 @@ async fn start(
         &[&definition.id, &chunk_queue::KIND_PLAN],
     )
     .await?;
+    if !empty {
+        txn.execute(
+            "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
+             select id, $2, fuse_rearmed_at, pg_current_xact_id() \
+             from transform_definitions where id = $1",
+            &[&definition.id, &chunk_queue::KIND_SWEEP],
+        )
+        .await?;
+    }
     txn.commit().await?;
     tracing::info!(
         definition_id = definition.id,
         target = %definition.target_table,
         from = %TransformStatus::WaitingToBackfill.as_str(),
         to = %TransformStatus::Backfilling.as_str(),
+        rebuild = !empty,
         "transform status transition: re-derive build started"
     );
     Ok(true)
@@ -530,7 +810,7 @@ pub enum Step {
     Merged,
     /// Ran (some of) a plan job.
     Planned,
-    /// Ran one chunk.
+    /// Ran one chunk, or a sweep job's batches.
     Chunk,
     /// Moved a finished build's definition to `live`.
     Completed,
@@ -545,9 +825,9 @@ impl Step {
 
 /// One step of the Re-derive builds' work for a drain worker, which runs it
 /// after its segments (#625 B6): a merge when a building target has group
-/// deltas, else a plan job, else one chunk if the ring's backlog allows
-/// ([`chunk_allowed`]). A building definition with nothing left to do is
-/// moved to `live` ([`try_complete`]).
+/// deltas, else a plan job, else one chunk or a sweep batch run if the
+/// ring's backlog allows ([`chunk_allowed`]). A building definition with
+/// nothing left to do is moved to `live` ([`try_complete`]).
 ///
 /// A definition that is frozen gets nothing: neither its deltas merged nor
 /// its work claimed. Its deltas stay (#625 B4).
@@ -561,8 +841,9 @@ pub async fn work_once(
         return Ok(Step::Idle);
     }
     for (id, target) in &building {
-        // Rows other mergers hold are skipped: a pass that claims none
-        // falls through to the next target, then to a chunk.
+        // A target another worker is merging is skipped (#625 F2b): a pass
+        // that claims none falls through to the next target, then to a
+        // chunk.
         if has_deltas(pool, target).await? && merge_once(pool, *id).await? > 0 {
             return Ok(Step::Merged);
         }
@@ -584,8 +865,13 @@ pub async fn work_once(
     if allowed {
         let claimed = {
             let client = pool.get().await?;
-            chunk_queue::claim_chunks_of(&**client, claimed_by, 1, &[chunk_queue::KIND_REDERIVE])
-                .await?
+            chunk_queue::claim_chunks_of(
+                &**client,
+                claimed_by,
+                1,
+                &[chunk_queue::KIND_REDERIVE, chunk_queue::KIND_SWEEP],
+            )
+            .await?
         };
         if let Some(chunk) = claimed.into_iter().next() {
             run_claimed(pool, &chunk, claimed_by, options).await;
@@ -630,10 +916,7 @@ async fn building(pool: &Pool) -> Result<Vec<(i64, String)>, ChunkQueueError> {
 async fn has_deltas(pool: &Pool, target: &str) -> Result<bool, ChunkQueueError> {
     let deltas = ddl::qualified_target_table_ident(&crate::defs::ledger::deltas_table_name(target));
     let client = pool.get().await?;
-    match client
-        .query_one(&format!("select exists (select 1 from {deltas})"), &[])
-        .await
-    {
+    match client.query_one(&any_delta_sql(&deltas), &[]).await {
         Ok(row) => Ok(row.get(0)),
         Err(err) if super::quarantine::is_undefined_table(&err) => Ok(false),
         Err(err) => Err(err.into()),
@@ -681,6 +964,9 @@ pub async fn run_claimed(
         }
         ChunkWork::Rederive { lo, hi } => {
             run_rederive(pool, chunk, claimed_by, lo.as_deref(), hi, options).await
+        }
+        ChunkWork::Sweep { cursor } => {
+            run_sweep(pool, chunk, claimed_by, cursor.clone(), options).await
         }
         work => Err(ChunkQueueError::UnknownKind {
             kind: work.kind().to_string(),
@@ -870,6 +1156,99 @@ async fn run_plan(
     Ok(())
 }
 
+/// Runs a claimed sweep job (#625 F3; see the module doc): [`sweep_batch`]es
+/// of [`WorkerOptions::chunk_rows`] entries from the job's cursor, each in
+/// its own `read committed` transaction with the cursor's advance, fenced by
+/// the claim ([`ClaimFence`]), so a job that dies resumes after its last
+/// committed batch. The batch that reads the ledger's end marks the job done.
+/// Then [`try_complete`].
+async fn run_sweep(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+    mut cursor: Option<String>,
+    options: &WorkerOptions,
+) -> Result<(), ChunkQueueError> {
+    let definition = catalog::definition_by_id(pool, chunk.definition_id)
+        .await?
+        .ok_or(ChunkQueueError::DefinitionNotFound {
+            definition_id: chunk.definition_id,
+        })?;
+    let plan = BuildPlan::for_definition(pool, &definition)
+        .await
+        .map_err(build_error)?
+        .ok_or_else(|| {
+            build_error(crate::defs::backfill::BackfillError::Unsupported(
+                "the definition's shape no longer takes a re-derive build".to_string(),
+            ))
+        })?;
+    let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
+        pool.clone(),
+        chunk.id,
+        claimed_by.to_string(),
+        options.heartbeat_interval,
+    );
+    let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
+    let mut client = pool.get().await?;
+    let start_xid: String = client
+        .query_one(
+            "select start_xid::text from backfill_chunks where id = $1",
+            &[&chunk.id],
+        )
+        .await?
+        .get(0);
+    loop {
+        let started = Instant::now();
+        let txn = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+        txn.batch_execute(&format!(
+            "set local application_name = '{CHUNK_APPLICATION_NAME}'"
+        ))
+        .await?;
+        if !fence.hold(&*txn).await? {
+            txn.rollback().await?;
+            return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        }
+        let outcome = sweep_batch(
+            &txn,
+            &plan,
+            &start_xid,
+            cursor.as_deref(),
+            options.chunk_rows.max(1),
+        )
+        .await
+        .map_err(build_error)?;
+        let next = outcome.next.clone().or(cursor.clone());
+        txn.execute(
+            "update backfill_chunks set lo = $2, done = $3, \
+                 claimed_by = case when $3 then null else claimed_by end, \
+                 claimed_at = case when $3 then null else claimed_at end \
+             where id = $1",
+            &[&chunk.id, &next, &outcome.finished],
+        )
+        .await?;
+        txn.commit().await?;
+        metrics::record_build_chunk(
+            started.elapsed(),
+            outcome.rederived as u64,
+            u64::try_from(outcome.delta_rows).unwrap_or(0),
+        );
+        if outcome.finished {
+            tracing::debug!(
+                definition_id = chunk.definition_id,
+                "re-derive build swept the last of its ledger"
+            );
+            break;
+        }
+        cursor = next;
+    }
+    try_complete(pool, chunk.definition_id).await?;
+    Ok(())
+}
+
 /// Folds one [`MERGE_BATCH`] of definition `id`'s group deltas into its
 /// groups (#625 B3), in a transaction holding the definition row
 /// `for key share` so a pause waits for it rather than racing it: a frozen
@@ -913,14 +1292,75 @@ async fn merge_once(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
         }
         Err(err) => return Err(build_error(err)),
     };
+    if outcome.skipped {
+        // Another worker is merging this target: leave it to that one.
+        txn.rollback().await?;
+        return Ok(0);
+    }
     let started = Instant::now();
     txn.commit().await?;
     metrics::record_build_statement(BuildStatement::MergeCommit, started.elapsed());
     metrics::record_build_merge(u64::try_from(outcome.claimed).unwrap_or(0));
+    if vacuum_due(id, outcome.claimed) {
+        let started = Instant::now();
+        let deltas = &plan.ledger.deltas_ident;
+        if let Err(err) = vacuum_deltas(&**client, deltas).await {
+            tracing::debug!(table = %deltas, error = %err, "vacuuming a group-delta table failed");
+        }
+        metrics::record_build_statement(BuildStatement::MergeVacuum, started.elapsed());
+    }
     if outcome.claimed < MERGE_BATCH {
         try_complete(pool, id).await?;
     }
     Ok(outcome.claimed)
+}
+
+/// The delta rows one process merges into a target between its vacuums of
+/// the target's delta table (#625 F2b).
+///
+/// A merger's claim walks the claim key's index from its oldest entry, and
+/// every row merged since the table's last vacuum leaves a dead entry there
+/// (killed on the first walk, but still on its leaf page until a vacuum
+/// removes it). Autovacuum comes at most once per `autovacuum_naptime`, a
+/// minute by default, which at a merger's ~200,000 rows/s is ~12M dead
+/// entries and ~60 ms of walking per claim. Vacuuming every this many rows
+/// keeps the walk under ~300 leaf pages, at the cost of one vacuum (the
+/// pages changed since the last one, and the index) per 20 merges.
+pub const VACUUM_EVERY: i64 = 20 * MERGE_BATCH;
+
+/// Counts `claimed` rows merged into definition `id`'s target by this
+/// process, and says whether that brings it to [`VACUUM_EVERY`] since its
+/// last vacuum (and restarts the count if so). A per-process count: each
+/// process vacuums after its own merges, and a restart only delays the next
+/// vacuum.
+fn vacuum_due(id: i64, claimed: i64) -> bool {
+    static MERGED: LazyLock<Mutex<HashMap<i64, i64>>> = LazyLock::new(Mutex::default);
+    let mut merged = MERGED.lock().unwrap_or_else(PoisonError::into_inner);
+    let since = merged.entry(id).or_insert(0);
+    *since += claimed;
+    if *since < VACUUM_EVERY {
+        return false;
+    }
+    *since = 0;
+    true
+}
+
+/// Vacuums the delta table `deltas` (quoted, qualified), outside any
+/// transaction. The caller treats it as best-effort: a failure costs only
+/// the next claims' walk (see [`VACUUM_EVERY`]). It skips the table rather
+/// than wait if another vacuum holds it, always cleans the index (a vacuum
+/// that bypassed index cleanup would leave the dead entries the claim
+/// walks), and never truncates, so it never takes the lock that would make a
+/// chunk's delta insert wait.
+async fn vacuum_deltas(
+    client: &impl GenericClient,
+    deltas: &str,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute(&format!(
+            "vacuum (skip_locked, index_cleanup on, truncate false) {deltas}"
+        ))
+        .await
 }
 
 /// Moves definition `id` `backfilling -> live` once its Re-derive build is
@@ -992,12 +1432,131 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
     }
     let deltas =
         ddl::qualified_target_table_ident(&crate::defs::ledger::deltas_table_name(&target));
-    match client
-        .query_one(&format!("select not exists (select 1 from {deltas})"), &[])
-        .await
-    {
-        Ok(row) => Ok(row.get(0)),
+    match client.query_one(&any_delta_sql(&deltas), &[]).await {
+        Ok(row) => Ok(!row.get::<_, bool>(0)),
         Err(err) if super::quarantine::is_undefined_table(&err) => Ok(false),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// One statement: whether the delta table `deltas` (quoted, qualified) has
+/// a row visible to it. It reads the oldest row through the claim key's
+/// index (#625 F2b): an `exists` over the table would scan the heap from
+/// block 0, past every page the mergers emptied.
+fn any_delta_sql(deltas: &str) -> String {
+    let seq = quote_ident(crate::defs::ledger::DELTA_SEQ_COLUMN);
+    format!("select (select {seq} from {deltas} order by {seq} limit 1) is not null")
+}
+
+/// Runs every Re-derive build that is running to its end, in this task: a
+/// synchronous stand-in for the drain workers' build work
+/// ([`work_once`]) for a test with none running, which needs its builds
+/// `live` before it goes on. It merges, plans and runs chunks and sweeps
+/// with no backpressure (the test's ring may hold sealed segments it means
+/// to drain later), until no definition is under a Re-derive build. A
+/// frozen one is left as it is. Panics on any failure, or when the builds
+/// make no progress for a while (a chunk that keeps failing backs off): it
+/// is test harness.
+#[cfg(any(test, feature = "internals"))]
+pub async fn settle_builds(pool: &Pool) {
+    const CLAIMED_BY: &str = "settle_rederive_builds";
+    const STALL: Duration = Duration::from_secs(10);
+    let options = WorkerOptions {
+        chunk_rows: DEFAULT_CHUNK_ROWS,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    };
+    let mut last_progress = Instant::now();
+    loop {
+        let building = building(pool).await.expect("list the running builds");
+        if building.is_empty() {
+            return;
+        }
+        let mut progressed = false;
+        for (id, target) in &building {
+            while has_deltas(pool, target).await.expect("read a delta table")
+                && merge_once(pool, *id).await.expect("merge group deltas") > 0
+            {
+                progressed = true;
+            }
+        }
+        let claimed = {
+            let client = pool.get().await.expect("acquire a connection");
+            chunk_queue::claim_chunks_of(
+                &**client,
+                CLAIMED_BY,
+                1,
+                &[
+                    chunk_queue::KIND_PLAN,
+                    chunk_queue::KIND_REDERIVE,
+                    chunk_queue::KIND_SWEEP,
+                ],
+            )
+            .await
+            .expect("claim build work")
+        };
+        for chunk in &claimed {
+            run_claimed(pool, chunk, CLAIMED_BY, &options).await;
+            progressed = true;
+        }
+        for (id, _) in &building {
+            progressed |= try_complete(pool, *id).await.expect("complete a build");
+        }
+        if progressed {
+            last_progress = Instant::now();
+        } else {
+            assert!(
+                last_progress.elapsed() < STALL,
+                "the running re-derive builds {building:?} made no progress for {STALL:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_process_vacuums_a_target_every_vacuum_every_merged_rows() {
+        // Ids no other test uses: the count is process-wide.
+        let (a, b) = (-6_251, -6_252);
+        assert!(!vacuum_due(a, VACUUM_EVERY - 1));
+        assert!(!vacuum_due(b, VACUUM_EVERY - 1));
+        assert!(vacuum_due(a, 1), "a reaches the threshold");
+        assert!(!vacuum_due(a, VACUUM_EVERY - 1), "and counts again from 0");
+        assert!(vacuum_due(b, MERGE_BATCH), "b counts on its own");
+    }
+
+    #[tokio::test]
+    async fn the_delta_vacuum_runs_on_an_indexed_queue() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("pool");
+        client
+            .batch_execute(
+                "create table public.q (__seq bigint generated always as identity, g int); \
+                 create index on public.q (__seq); \
+                 insert into public.q (g) select i from generate_series(1, 1000) i; \
+                 delete from public.q where __seq <= 900",
+            )
+            .await
+            .expect("a queue with dead rows");
+        vacuum_deltas(&**client, "public.q")
+            .await
+            .expect("vacuum the queue");
+        // A vacuum records the live rows it counted in `pg_class` as it
+        // finishes (an analyze would too, and nothing ran one).
+        let reltuples: f32 = client
+            .query_one(
+                "select reltuples from pg_class where oid = 'public.q'::regclass",
+                &[],
+            )
+            .await
+            .expect("read the table's row count")
+            .get(0);
+        assert_eq!(reltuples, 100.0, "the vacuum counted the live rows");
     }
 }
