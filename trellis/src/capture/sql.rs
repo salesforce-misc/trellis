@@ -601,7 +601,7 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
     )
     .replace('\n', " ")
     .replace('%', "%%");
-    let template = (1..=5).fold(template, |t, n| {
+    let template = (1..=7).fold(template, |t, n| {
         t.replace(&placeholder(n), &format!("%{n}$s"))
     });
 
@@ -624,8 +624,8 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
     // Only the event's own transition tables have arguments; the others are
     // `null`, which `format()` never reads.
     let reads = |alias: &str| match event {
-        CaptureEvent::Insert => alias == "n",
-        CaptureEvent::Delete => alias == "o",
+        CaptureEvent::Insert => alias != "o",
+        CaptureEvent::Delete => alias != "n",
         CaptureEvent::Update => true,
         CaptureEvent::Truncate => false,
     };
@@ -652,7 +652,8 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
          using {src}, {marker_key}, l, {marker}, ts;\n        \
          if not ({key_present}) then\n            return null;\n        end if;\n        \
          execute pg_catalog.format({template},\n                {ring},\n                \
-         {img_o},\n                {img_n},\n                {gk_o},\n                {gk_n})\n            \
+         {img_o},\n                {img_n},\n                {img_t},\n                \
+         {gk_o},\n                {gk_n},\n                {gk_t})\n            \
          using l, ts;\n        \
          return null;\n    end if;\n",
         count = spec.columns.len(),
@@ -663,8 +664,10 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
         template = text_expr(&template),
         img_o = image_arg("o"),
         img_n = image_arg("n"),
+        img_t = image_arg("t"),
         gk_o = group_arg("o"),
         gk_n = group_arg("n"),
+        gk_t = group_arg("t"),
     )
 }
 
@@ -691,10 +694,22 @@ enum Render {
     /// The static inserts: every spec column named, and `l` and `ts` the
     /// function's variables.
     Static,
-    /// [`schema_changed_branch`]'s template: [`placeholder`]s for the old
-    /// image (2), new image (3), old group-key array (4) and new group-key
-    /// array (5), and `$1`/`$2` for `l` and `ts`.
+    /// [`schema_changed_branch`]'s template: [`placeholder`]s for the images
+    /// of `o`, `n` and `t` (2, 3, 4) and their group-key arrays (5, 6, 7),
+    /// and `$1`/`$2` for `l` and `ts`. It has no skip-no-op filter, so an
+    /// update in the branch stages every row it changed.
     Dynamic,
+}
+
+/// The aliases [`ring_select`] reads: the old transition table, the new one,
+/// and the live table re-read by primary key.
+const ALIASES: [&str; 3] = ["o", "n", "t"];
+
+fn alias_index(alias: &str) -> usize {
+    ALIASES
+        .iter()
+        .position(|a| *a == alias)
+        .expect("ring_select reads only o, n and t")
 }
 
 impl Render {
@@ -715,36 +730,96 @@ impl Render {
     fn image(self, spec: &CaptureSpec, alias: &str) -> String {
         match self {
             Render::Static => image_expr(spec, alias),
-            Render::Dynamic => placeholder(if alias == "o" { 2 } else { 3 }),
+            Render::Dynamic => placeholder(2 + alias_index(alias)),
         }
     }
 
     fn group_array(self, spec: &CaptureSpec, alias: &str) -> String {
         match self {
             Render::Static => group_key_array(spec, alias),
-            Render::Dynamic => placeholder(if alias == "o" { 4 } else { 5 }),
+            Render::Dynamic => placeholder(5 + alias_index(alias)),
         }
     }
 }
 
 /// The rows a capture insert writes: a `SELECT` over the event's transition
 /// tables (a `VALUES` row for truncate), in [`RING_COLUMNS`] order.
+///
+/// # The image is the live row (#623 D8a, D's Q8)
+///
+/// Every row a statement wrote is re-read from the live table `t` by primary
+/// key, and its `new_image` is that row, not the transition table's. An
+/// application `AFTER ROW` trigger that rewrites the row its own statement
+/// wrote runs its nested statement, and that statement's capture, before
+/// this statement's capture; the transition table still holds the outer
+/// statement's version, so imaging it would put the older values at the
+/// higher `lsn` (#680). The live row is the one the transaction ends the
+/// statement with. If it is gone, a nested write deleted or re-keyed it, and
+/// the row staged is a delete of the key, imaging the transition row as its
+/// `old_image`. A delete's key is re-read too: a nested write that put the
+/// key back stages it as an update to the live row.
+///
+/// The re-read never sees another transaction's change. Each row it joins
+/// was written (or deleted) by this statement, so this transaction holds its
+/// row lock, or for a new key its unique-index entry, until it commits. Under
+/// `READ COMMITTED` the re-read's snapshot is newer than the statement's,
+/// but another transaction's newer commits can only be to rows the join by
+/// primary key never reaches. `tests/capture_reread.rs` checks this at every
+/// isolation level.
+///
+/// The old image and the `group_key` are unchanged (old ∪ new, plus the live
+/// row's): the relationship readers still need the old join keys until E
+/// (#624).
+///
+/// # An update that changed nothing read stages nothing
+///
+/// A paired update row is dropped when every imaged column is the same
+/// before and after, compared by `record_image_ne` over the typed values: a
+/// binary comparison that works for every type, including those with no
+/// equality operator (`json`, `point`, `xml`), and that is never looser than
+/// the images' text, since a value's output text is a function of its
+/// binary form under the pinned settings. A statement trigger can't take a
+/// `WHEN` clause when it has transition tables, so the filter is here.
 fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> String {
     let src = text_expr(&spec.table);
     let (l, ts) = (render.lsn(), render.ts());
     let indent = "        ";
+    let table = quoted_table(&spec.table).expect("CaptureSpec::new checked the table name");
+    let first_key = quote_ident(&spec.key[0]);
+    let live = format!("t.{first_key} is not null");
+    // `t` joined by the primary key's typed equality, so the re-read is an
+    // index probe. `of` is the typed key's source per key column.
+    let live_join = |of: &dyn Fn(&str) -> String| {
+        let on: Vec<String> = spec
+            .key
+            .iter()
+            .map(|c| format!("t.{} = {}", quote_ident(c), of(&quote_ident(c))))
+            .collect();
+        format!("{indent}left join {table} t on {}", on.join(" and "))
+    };
     match event {
         CaptureEvent::Insert => format!(
-            "{indent}select {src}, {}, 'insert', {l}, null, {}, {l}, {ts}, {}\n{indent}from {NEW_ROWS} n",
+            "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
+             case when {live} then 'insert' else 'delete' end,\n{indent}    \
+             {l}, case when not ({live}) then {} end, case when {live} then {} end, \
+             {l}, {ts}, {}\n{indent}from {NEW_ROWS} n\n{}",
+            key_expr(spec, "t"),
             key_expr(spec, "n"),
             render.image(spec, "n"),
-            group_key_expr(spec, &["n"], render),
+            render.image(spec, "t"),
+            group_key_expr(spec, &["n", "t"], render),
+            live_join(&|c| format!("n.{c}")),
         ),
         CaptureEvent::Delete => format!(
-            "{indent}select {src}, {}, 'delete', {l}, {}, null, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o",
+            "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
+             case when {live} then 'update' else 'delete' end,\n{indent}    \
+             {l}, {}, case when {live} then {} end, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o\n{}",
+            key_expr(spec, "t"),
             key_expr(spec, "o"),
             render.image(spec, "o"),
-            group_key_expr(spec, &["o"], render),
+            render.image(spec, "t"),
+            group_key_expr(spec, &["o", "t"], render),
+            live_join(&|c| format!("o.{c}")),
         ),
         // A statement trigger sees the update's old and new rows as two sets
         // with no pairing, so they are paired on the key text. A row whose
@@ -753,31 +828,45 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
         // the key columns' `=` keeps the pairing on the same identity the
         // ring keys by, and `collate "C"` makes that a byte comparison.
         CaptureEvent::Update => {
-            let side = |alias: &str, rows: &str| {
-                let group = if spec.group_key.is_empty() {
-                    String::new()
-                } else {
-                    format!(", {} as gk", render.group_array(spec, alias))
-                };
-                format!(
-                    "(select {} as k, {} as img{group} from {rows} {alias})",
-                    key_expr(spec, alias),
-                    render.image(spec, alias),
-                )
-            };
-            let group = if spec.group_key.is_empty() {
-                "null::text[]".to_string()
-            } else {
-                distinct_non_null("o.gk || n.gk")
+            let old = format!("o.{first_key} is not null");
+            let new = format!("n.{first_key} is not null");
+            let changed = match render {
+                Render::Static => {
+                    let row = |alias: &str| {
+                        let cols: Vec<String> = spec
+                            .columns
+                            .iter()
+                            .map(|c| format!("{alias}.{}", quote_ident(c)))
+                            .collect();
+                        format!("row({})", cols.join(", "))
+                    };
+                    format!(
+                        "\n{indent}where not ({old}) or not ({new})\n{indent}    \
+                         or pg_catalog.record_image_ne({}, {})",
+                        row("o"),
+                        row("n")
+                    )
+                }
+                Render::Dynamic => String::new(),
             };
             format!(
-                "{indent}select {src}, coalesce(n.k, o.k),\n{indent}    \
-                 case when n.k is null then 'delete' when o.k is null then 'insert' \
+                "{indent}select {src},\n{indent}    \
+                 case when {live} then {} when {new} then {} else {} end,\n{indent}    \
+                 case when not ({live}) then 'delete' when not ({old}) then 'insert' \
                  else 'update' end,\n{indent}    \
-                 {l}, o.img, n.img, {l}, {ts}, {group}\n{indent}from {} o\n{indent}full join {} n \
-                 on o.k = n.k collate \"C\"",
-                side("o", OLD_ROWS),
-                side("n", NEW_ROWS),
+                 {l}, case when {old} then {} when not ({live}) then {} end,\n{indent}    \
+                 case when {live} then {} end, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o\n\
+                 {indent}full join {NEW_ROWS} n on {} = {} collate \"C\"\n{}{changed}",
+                key_expr(spec, "t"),
+                key_expr(spec, "n"),
+                key_expr(spec, "o"),
+                render.image(spec, "o"),
+                render.image(spec, "n"),
+                render.image(spec, "t"),
+                group_key_expr(spec, &["o", "n", "t"], render),
+                key_expr(spec, "o"),
+                key_expr(spec, "n"),
+                live_join(&|c| format!("coalesce(n.{c}, o.{c})")),
             )
         }
         CaptureEvent::Truncate => format!(
@@ -848,7 +937,7 @@ fn group_key_array(spec: &CaptureSpec, alias: &str) -> String {
     format!("array[{}]::text[]", values.join(", "))
 }
 
-/// The ring's `group_key` for rows drawn from `aliases` (old before new):
+/// The ring's `group_key` for rows drawn from `aliases` (old, new, live):
 /// the union of every non-null group-key value, in first-seen order, or
 /// `NULL` when there are none.
 fn group_key_expr(spec: &CaptureSpec, aliases: &[&str], render: Render) -> String {
@@ -1231,7 +1320,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains("'insert', l, null, jsonb_build_object("),
+            sql.contains("then 'insert' else 'delete' end,\n            l, case when "),
             "{sql}"
         );
         assert!(sql.contains(", l, ts, "), "{sql}");
@@ -1261,7 +1350,10 @@ mod tests {
     fn a_single_column_key_is_the_columns_text_verbatim() {
         let sql = ddl(&spec(), CaptureEvent::Insert);
         assert!(
-            sql.contains("select 'public.orders', format('%s', n.\"id\"), 'insert'"),
+            sql.contains(
+                "select 'public.orders', case when t.\"id\" is not null \
+                 then format('%s', t.\"id\") else format('%s', n.\"id\") end,"
+            ),
             "{sql}"
         );
     }
@@ -1280,33 +1372,88 @@ mod tests {
     #[test]
     fn an_update_full_joins_old_and_new_on_the_key() {
         let sql = ddl(&spec(), CaptureEvent::Update);
-        assert!(
-            sql.contains("(select format('%s', o.\"id\") as k, jsonb_build_object("),
-            "{sql}"
-        );
-        assert!(sql.contains("from trellis_old o) o"), "{sql}");
-        assert!(sql.contains("from trellis_new n) n"), "{sql}");
-        assert!(sql.contains("full join"), "{sql}");
-        assert!(sql.contains("on o.k = n.k collate \"C\""), "{sql}");
+        assert!(sql.contains("from trellis_old o\n"), "{sql}");
         assert!(
             sql.contains(
-                "case when n.k is null then 'delete' when o.k is null then 'insert' \
-                 else 'update' end"
+                "full join trellis_new n on format('%s', o.\"id\") = format('%s', n.\"id\") \
+                 collate \"C\""
             ),
-            "a key move is a delete plus an insert:\n{sql}"
+            "{sql}"
         );
-        assert!(sql.contains("coalesce(n.k, o.k)"), "{sql}");
+        assert!(
+            sql.contains(
+                "case when not (t.\"id\" is not null) then 'delete' \
+                 when not (o.\"id\" is not null) then 'insert' else 'update' end"
+            ),
+            "a key move is a delete plus an insert, and a key gone from the live \
+             table is a delete:\n{sql}"
+        );
+    }
+
+    /// #623 D8a: every event re-reads the rows it wrote from the live table
+    /// by the primary key's typed equality, and images the live row.
+    #[test]
+    fn every_event_images_the_live_row_read_by_primary_key() {
+        for (event, on) in [
+            (CaptureEvent::Insert, "t.\"id\" = n.\"id\""),
+            (CaptureEvent::Delete, "t.\"id\" = o.\"id\""),
+            (
+                CaptureEvent::Update,
+                "t.\"id\" = coalesce(n.\"id\", o.\"id\")",
+            ),
+        ] {
+            let sql = ddl(&spec(), event);
+            assert!(
+                sql.contains(&format!("left join \"public\".\"orders\" t on {on}")),
+                "{sql}"
+            );
+            assert!(
+                sql.contains(
+                    "case when t.\"id\" is not null then jsonb_build_object('amount', \
+                     case when num_nulls(t.\"amount\") = 1"
+                ),
+                "the new image is the live row's:\n{sql}"
+            );
+        }
+        let composite = ddl(&composite(), CaptureEvent::Insert);
+        assert!(
+            composite.contains("t on t.\"post\" = n.\"post\" and t.\"tag\" = n.\"tag\";"),
+            "{composite}"
+        );
+    }
+
+    /// #623 D8a: an update row whose imaged columns are all unchanged,
+    /// compared by binary image over the typed values, stages nothing. A key
+    /// move always stages.
+    #[test]
+    fn an_update_that_changed_no_imaged_column_stages_nothing() {
+        let sql = ddl(&spec(), CaptureEvent::Update);
+        assert!(
+            sql.contains(
+                "where not (o.\"id\" is not null) or not (n.\"id\" is not null)\n            \
+                 or pg_catalog.record_image_ne(row(o.\"amount\", o.\"customer_id\", o.\"id\"), \
+                 row(n.\"amount\", n.\"customer_id\", n.\"id\"));"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains(" is distinct from "), "{sql}");
     }
 
     #[test]
-    fn the_group_key_is_the_distinct_union_of_old_then_new() {
+    fn the_group_key_is_the_distinct_union_of_old_new_and_live() {
         let update = ddl(&spec(), CaptureEvent::Update);
         assert!(
-            update.contains(", array[case when num_nulls(o.\"customer_id\") = 1"),
+            update.contains(
+                "unnest(array[case when num_nulls(o.\"customer_id\") = 1 then null \
+                 else format('%s', o.\"customer_id\") end]::text[] || \
+                 array[case when num_nulls(n.\"customer_id\") = 1"
+            ),
             "{update}"
         );
         assert!(
-            update.contains("unnest(o.gk || n.gk) with ordinality"),
+            update.contains(
+                "]::text[] || array[case when num_nulls(t.\"customer_id\") = 1 then null"
+            ),
             "{update}"
         );
         assert!(
@@ -1319,11 +1466,7 @@ mod tests {
             "{insert}"
         );
         let plain = ddl(&composite(), CaptureEvent::Update);
-        assert!(
-            plain.contains("l, o.img, n.img, l, ts, null::text[]"),
-            "{plain}"
-        );
-        assert!(!plain.contains(" as gk"), "{plain}");
+        assert!(plain.contains(", l, ts, null::text[]\n"), "{plain}");
     }
 
     #[test]

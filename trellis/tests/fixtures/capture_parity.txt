@@ -30,7 +30,6 @@ public.comp	"2\u001fa\u001e\u001fb"	["insert", null, {"tag": "a\u001fb", "post":
 public.comp	"3\u001fc\u001e\u001ed"	["insert", null, {"tag": "c\u001ed", "post": "3", "weight": "3"}, null, 0]
 # composite updates, one touching only an unread column
 public.comp	"2\u001fa\u001e\u001fb"	["update", {"tag": "a\u001fb", "post": "2", "weight": "2"}, {"tag": "a\u001fb", "post": "2", "weight": "4"}, null, 0]
-public.comp	"3\u001fc\u001e\u001ed"	["update", {"tag": "c\u001ed", "post": "3", "weight": "3"}, {"tag": "c\u001ed", "post": "3", "weight": "3"}, null, 0]
 # a composite delete
 public.comp	"1\u001fplain"	["delete", {"tag": "plain", "post": "1", "weight": "1.5"}, null, null, 0]
 # control-character keys

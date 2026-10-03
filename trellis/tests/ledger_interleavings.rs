@@ -813,7 +813,8 @@ async fn issue_550_one_to_one() {
 
 /// C's Q7 (#680): an application `AFTER ROW` trigger rewrites the row its
 /// own statement wrote. The nested statement's capture runs first, so the
-/// ring holds key 1's images out of write order.
+/// outer statement's ring row has the higher position. Since #623 D8a it
+/// images the live row, the final one, not the transition table's.
 async fn nested_same_key(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 3, 10), (2, 3, 5)]).await;
     d.ctl
@@ -834,22 +835,18 @@ async fn nested_same_key(flavour: Flavour) {
     assert_oracle(&mut d, flavour).await;
 }
 
-/// Today: `[(3,15,2)]` against the oracle's `[(2,30,1), (3,5,1)]`: key 1
-/// never leaves group 3 and never reaches group 2. #680 tracks the
-/// limitation until D8's NEW-only capture.
+/// Before #623 D8a: `[(3,15,2)]` against the oracle's `[(2,30,1), (3,5,1)]`:
+/// key 1 never left group 3 and never reached group 2. Capture now images
+/// the live row, so the outer statement's row carries group 2.
 #[tokio::test]
-#[ignore = "#623 D8"]
 async fn nested_same_key_aggregate() {
     nested_same_key(Flavour::Aggregate).await;
 }
 
-/// Today: `[(1,1,30), (2,3,5)]` against the oracle's `[(1,2,30), (2,3,5)]`.
-/// On the ledger (D6) a 1-1 Apply writes its image, and the last captured
-/// image is key 1 in group 1, not 2; before D6 it passed only because the
-/// 1-1 apply re-read the live row (#344). #680 tracks the limitation until
-/// D8's NEW-only capture.
+/// Before #623 D8a: `[(1,1,30), (2,3,5)]` against the oracle's `[(1,2,30),
+/// (2,3,5)]`: a 1-1 Apply writes its image (D6), and the last captured image
+/// was key 1 in group 1. Capture now images the live row.
 #[tokio::test]
-#[ignore = "#623 D8"]
 async fn nested_same_key_one_to_one() {
     nested_same_key(Flavour::OneToOne).await;
 }

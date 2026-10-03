@@ -955,15 +955,13 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
     client.shutdown().await.expect("shutdown");
 }
 
-/// #680 (Requires Design Decision), #622 plan finding 10: an application
-/// `AFTER ROW` trigger that rewrites the row its own statement just wrote.
-/// The nested statement's capture runs first, so the ring holds the newer
-/// image at the lower position, and a `GROUP BY` target folds the two into
-/// the wrong group. D's NEW-only apply with a re-read image (#623) fixes it;
-/// until then this is a documented limitation
-/// (`docs/staging-and-claiming/01-capture-by-triggers.md`).
+/// #680, #622 plan finding 10: an application `AFTER ROW` trigger that
+/// rewrites the row its own statement just wrote. The nested statement's
+/// capture runs first, so the outer statement's ring row has the higher
+/// position. Before #623 D8a it imaged the transition table's older version,
+/// and a `GROUP BY` target folded the two into the wrong group; now it
+/// images the live row.
 #[tokio::test]
-#[ignore = "#680"]
 async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

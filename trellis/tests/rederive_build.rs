@@ -1167,9 +1167,10 @@ async fn the_start_waits_for_the_widens_capture_gate() {
     assert_eq!(f.status("cnt").await.as_deref(), Some("live"));
 
     // Staged by the capture function `cnt` needs, which doesn't image `v`,
-    // and left in the ring.
+    // and left in the ring. It moves `g` too: an update of only `v`, which
+    // nothing reads yet, stages nothing (#623 D8a).
     f.raw
-        .batch_execute("update public.src set v = v + 1000 where id = 3")
+        .batch_execute("update public.src set v = v + 1000, g = g + 1 where id = 3")
         .await
         .expect("write before the widen");
     let columns = [

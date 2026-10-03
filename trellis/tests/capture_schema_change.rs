@@ -600,7 +600,9 @@ async fn renaming_a_key_column_pauses_every_reader_and_never_fails_a_write() {
         (vec!["uid".to_string()], vec!["uid".to_string()])
     );
     let since = high_water(&raw).await;
-    app.batch_execute("update public.u set b = b + 1 where uid = 2")
+    // A delete: capture now images `uid` alone, and an update of an unimaged
+    // column stages nothing (#623 D8a).
+    app.batch_execute("delete from public.u where uid = 2")
         .await
         .expect("a write after the regeneration");
     assert!(markers(&raw, since).await.is_empty());
