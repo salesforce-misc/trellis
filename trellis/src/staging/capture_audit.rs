@@ -36,9 +36,10 @@
 //! - **The privileges a function's body uses, held by the role it runs
 //!   as** (its owner): `USAGE` on the instance schema, `INSERT` on every
 //!   ring segment, `USAGE` (or `UPDATE`) on `staging_change_id_seq`, which
-//!   the segments' `change_id` default draws from, and `USAGE` (or
-//!   `SELECT`) on `ring_slot_mirror`, which `pg_sequence_last_value` reads.
-//!   The ring's owner holds them all (the schema's `USAGE` through a grant
+//!   the segments' `change_id` default draws from, `USAGE` (or `SELECT`) on
+//!   `ring_slot_mirror`, which `pg_sequence_last_value` reads, and `SELECT`
+//!   on the captured table, which the function re-reads every row it
+//!   captures from (#623 D8a). The ring's owner holds them all (the schema's `USAGE` through a grant
 //!   or membership in the schema's owner, if it isn't that role) unless
 //!   someone revokes them; a superuser always does.
 //!
@@ -67,7 +68,7 @@
 //! audit reports persists only while no staging worker runs, or while the
 //! pass can't land (its lock waits and failures are on `Trellis::status`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use tokio_postgres::GenericClient;
@@ -75,6 +76,7 @@ use tokio_postgres::GenericClient;
 use crate::capture::install::RING_OWNER;
 use crate::capture::sql::{CaptureEvent, function_name, trigger_name};
 use crate::defs::catalog::{self, CatalogError};
+use crate::defs::ddl::regclass_arg;
 use crate::defs::model::{Definition, TransformStatus};
 use crate::staging::append::RING_SIZE;
 
@@ -254,18 +256,22 @@ pub async fn audit(
         return Ok(Vec::new());
     }
     let mut faults = Vec::new();
-    let mut runs_as = BTreeSet::new();
+    // Each role a capture function runs as, and the tables it captures.
+    let mut runs_as: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for table in captured_tables(client, def).await? {
         let Some(installed) = read_installed(client, schema, &table).await? else {
             // A dropped table: the recompute's own read of it reports that.
             continue;
         };
-        runs_as.extend(installed.events.iter().filter_map(|e| e.owner.clone()));
+        for owner in installed.events.iter().filter_map(|e| e.owner.clone()) {
+            runs_as.entry(owner).or_default().insert(table.clone());
+        }
         faults.extend(installed_faults(&table, &installed));
         faults.extend(hierarchy_faults(client, &table).await?);
     }
-    for role in runs_as {
-        faults.extend(privilege_faults(client, schema, &role).await?);
+    for (role, tables) in runs_as {
+        let tables: Vec<String> = tables.into_iter().collect();
+        faults.extend(privilege_faults(client, schema, &role, &tables).await?);
     }
     Ok(faults)
 }
@@ -518,12 +524,16 @@ async fn hierarchy_faults(
 }
 
 /// Each privilege a capture function's body uses that `role` lacks (see the
-/// module doc, "What the audit expects").
+/// module doc, "What the audit expects"). `tables` are the tables `role`'s
+/// functions capture, which they re-read, as unquoted `schema.table`
+/// identities.
 async fn privilege_faults(
     client: &impl GenericClient,
     schema: &str,
     role: &str,
+    tables: &[String],
 ) -> Result<Vec<CaptureFault>, CatalogError> {
+    let quoted: Vec<String> = tables.iter().map(|t| regclass_arg(t)).collect();
     let rows = client
         .query(
             &format!(
@@ -540,10 +550,15 @@ async fn privilege_faults(
                  union all \
                  select 'USAGE', o, \
                         pg_catalog.has_sequence_privilege($1::name, o, 'USAGE, SELECT') \
-                 from (select pg_catalog.format('%I.%I', $2, 'ring_slot_mirror') as o) s",
+                 from (select pg_catalog.format('%I.%I', $2, 'ring_slot_mirror') as o) s \
+                 union all \
+                 select 'SELECT', o, pg_catalog.has_table_privilege($1::name, r, 'SELECT') \
+                 from (select u.o, pg_catalog.to_regclass(u.q) as r \
+                       from unnest($3::text[], $4::text[]) as u(o, q)) s \
+                 where r is not null",
                 last = RING_SIZE - 1
             ),
-            &[&role, &schema],
+            &[&role, &schema, &tables, &quoted],
         )
         .await?;
     Ok(rows
