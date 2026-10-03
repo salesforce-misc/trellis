@@ -47,6 +47,10 @@ segment with one `INSERT … SELECT`:
   to the live row. The re-read never sees another transaction's change: each
   row it joins was written or deleted by this statement, so this transaction
   holds its row lock, or for a new key its unique-index entry, until commit.
+  The re-read is a `LATERAL … LIMIT 1` probe per row, and the function runs
+  with `enable_seqscan` off: PL/pgSQL plans once per session, often against
+  a table that was empty then, and a cached sequential scan would read the
+  whole table for every captured row once it grows.
   Under `READ COMMITTED` the re-read's snapshot is newer than the
   statement's, but another transaction's newer commits can only be to rows
   the join never reaches (`tests/capture_reread.rs`, at every isolation
@@ -255,7 +259,9 @@ The capture runs inside the application's transaction, so the writer pays for
 it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
 WAL per row (#622 C4, `local_docs/bench/622-baseline.md`). The live re-read
-(#623 D8a) adds one primary-key index probe per captured row.
+(#623 D8a) adds one primary-key index probe per captured row: about 0.65–1.0
+µs per row in batched writes (1.8–2.5× one expression index in all) and 3–10
+µs per single-row statement.
 
 ## Trellis migrations and the write path
 
