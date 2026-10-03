@@ -809,10 +809,8 @@ async fn deleting_a_relationship_to_side_row_does_clear_the_enrichment() {
 ///
 /// Whether this passes tells us whether the fix above already generalizes
 /// to the aggregate path: the reverse-recompute it stages is an ordinary
-/// image-less `Recompute` on the from-side (`t0`) row, and
-/// `apply_aggregate::accumulate_changes` always forces *any* image-less
-/// change's group onto the full-recompute path regardless of whether the
-/// touching change carries a real image — so no aggregate-specific code
+/// image-less `Recompute` on the from-side (`t0`) row, which the ledger
+/// Re-derives live like any other — so no aggregate-specific code
 /// needed to change for this to converge. This is the `AggregateIncremental`
 /// column's entry in `obligation_matrix`'s `TruncateWholeKeyspace` row.
 #[tokio::test(flavor = "multi_thread")]

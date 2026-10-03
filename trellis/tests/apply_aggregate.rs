@@ -5,9 +5,10 @@
 //!
 //! Mirrors `apply.rs`'s conventions throughout: source/target tables and
 //! definitions built by hand, changes staged directly into the ring, drains
-//! run via `apply::drain_once`. See `trellis::staging::apply_aggregate`'s
-//! module doc comment for the delta model these tests hold the
-//! implementation to.
+//! run via `apply::drain_once`. See `trellis::staging::ledger`'s module doc
+//! comment for the model these tests hold the implementation to. Docs that
+//! name `apply_aggregate` describe the old aggregate path (deleted in #623
+//! D5) a test was first written against.
 
 use std::collections::HashMap;
 
@@ -400,10 +401,8 @@ async fn drain_matches_the_oracle_for_aggregate_insert_update_delete_and_grain_m
 /// `quarantine::classify` isolated the offending row, and — because replaying
 /// it reproduced the identical violation — it could never be recovered, and
 /// `converge::converged_through` would treat the parked `poison_held` row as
-/// permanently unconverged. This test drives the exact same live-delta path
-/// (`insert_cdc_row` + `drain`, not the unit-level `apply_forced_groups_bulk`
-/// harness `apply_aggregate.rs`'s own dedicated NULL-key unit test uses) and
-/// asserts neither `poison_held` nor `key_deaths` ever gets a row.
+/// permanently unconverged. This test drives the live path
+/// (`insert_cdc_row` + `drain`) and asserts neither `poison_held` nor `key_deaths` ever gets a row.
 #[tokio::test]
 async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantine() {
     let cluster = TestCluster::start();
@@ -902,10 +901,9 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
 /// **both** touch groups 10 and 20 — with their folded changes arriving in
 /// opposite group order (batch B: group 20 then group 10; batch C: group 10
 /// then group 20) — must both complete rather than deadlock.
-/// `apply_aggregate_target`'s ascending group-key-order sequential upserts
-/// give every writer the same lock order regardless of the order its own
-/// folded changes happened to arrive in, so Postgres's deadlock detector
-/// never needs to intervene. Earlier this test only had the two concurrent
+/// The ledger's sorted entry and group writes give every writer the same lock
+/// order regardless of the order its own folded changes happened to arrive
+/// in, so Postgres's deadlock detector never needs to intervene. Earlier this test only had the two concurrent
 /// batches touch disjoint groups (one wrote group 10, the other group 20),
 /// so it passed vacuously — neither batch could ever contend with the other
 /// on the same row, regardless of lock order. This version gives both
@@ -1047,108 +1045,16 @@ async fn two_overlapping_group_writers_serialize_via_ascending_lock_order_not_de
     assert_eq!(total20, "5.00");
 }
 
-/// Issue #11 review, finding #1 (HIGH): a group forced onto the full-recompute
-/// path by an image-less change (a bare recompute trigger — see the module
-/// doc comment's "Image-less changes, and issue #180's fix for one producer
-/// of them" section) must still probe
-/// its `SUM` fields, not skip them for lack of a `field_accum` entry. Before
-/// this fix, `AggFieldKind::Sum`'s Pass-1 check skipped whenever
-/// `field_accum` had no entry for the field — checked *before* consulting
-/// `force_full_recompute` — so an image-less change into an otherwise-quiet
-/// group left its `SUM` column stale instead of re-probing it.
-#[tokio::test]
-#[ignore = "#623 D5: old aggregate path deleted"]
-async fn image_less_recompute_trigger_still_probes_a_stale_sum_field() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
-             insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
-        )
-        .await
-        .expect("seed source table");
-
-    let def = setup(&db).await;
-
-    // Seed group 10's target row via an ordinary insert batch: total = 5.00.
-    insert_cdc_row(
-        &client,
-        "seg_0",
-        "order_items",
-        "1",
-        "insert",
-        None,
-        Some(r#"{"order_id":"10","amount":"5.00"}"#),
-    )
-    .await;
-    let seg0 = seal_active_segment(&mut client).await;
-    drain(&db.pool, seg0, "worker").await;
-
-    let target = read_target(&client).await;
-    assert_eq!(target["10"].0.as_deref(), Some("5.00"), "seed total");
-
-    // A second row lands in group 10 entirely out-of-band (no CDC image for
-    // it at all — simulating a producer that only ever stages a bare
-    // recompute trigger for this key, never an insert/update image).
-    client
-        .execute(
-            "insert into order_items (id, order_id, amount) values (2, 10, 3.00)",
-            &[],
-        )
-        .await
-        .expect("out-of-band insert into group 10");
-
-    // The image-less recompute trigger: both images NULL, keyed by the
-    // pre-existing row (id 1) so `accumulate_changes`'s live re-read lands on
-    // group 10.
-    insert_cdc_row(
-        &client,
-        "seg_1",
-        "order_items",
-        "1",
-        "recompute",
-        None,
-        None,
-    )
-    .await;
-    let seg1 = seal_active_segment(&mut client).await;
-    drain(&db.pool, seg1, "worker").await;
-
-    let target = read_target(&client).await;
-    let oracle = read_oracle(&client, &def).await;
-    assert_eq!(
-        target, oracle,
-        "an image-less recompute trigger must match a fresh oracle recompute"
-    );
-    assert_eq!(
-        target["10"].0.as_deref(),
-        Some("8.00"),
-        "the SUM field must be probed (5.00 + 3.00), not left stale at 5.00, \
-         even though this batch's field_accum has no delta for it"
-    );
-}
-
 /// Issue #77 / ADR-0007's same-named-decoy regression for the *aggregate*
 /// CDC-apply path — a distinct code path from the plain 1-1 case
 /// `apply.rs`'s `explicitly_qualified_source_reads_the_right_table_on_a_live_refetch`
-/// covers. `compute`'s own qualified-source threading (that 1-1 test, and
-/// this file's `image_less_recompute_trigger_still_probes_a_stale_sum_field`
-/// above, both already exercise it) only gets an aggregate definition as far
-/// as forcing a group onto the full-recompute path; the *live re-read* for
-/// that forced group runs through `apply_aggregate`'s own probes
-/// (`probe_sum_and_count`/`probe_recompute_fields_bulk` et al., see
-/// `AggregateTargetPlan::source`'s own doc comment) via
-/// `ddl::qualified_source_table` — separate code from `compute`'s
-/// `read_live_rows_batch`, so it needs its own coverage. Mirrors
-/// `image_less_recompute_trigger_still_probes_a_stale_sum_field`'s
-/// out-of-band-insert-then-image-less-recompute shape exactly, except
-/// `order_items` now has a same-named decoy sitting in `public` (this pool's
-/// own pinned `search_path`) while the definition explicitly names
-/// `custom.order_items` as its real source — the two hold different amounts,
-/// so a wrong-table probe is unmistakable in the resulting SUM.
+/// covers. The aggregate's live read (the old path's probes, now the ledger
+/// Re-derive) is separate code from `compute`'s `read_live_rows_batch`, so it
+/// needs its own coverage. `order_items` has a same-named decoy sitting in
+/// `public` (this pool's own pinned `search_path`) while the definition
+/// explicitly names `custom.order_items` as its real source — the two hold
+/// different amounts, so a wrong-table read is unmistakable in the resulting
+/// SUM.
 #[tokio::test]
 async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same_named_decoy() {
     let cluster = TestCluster::start();
@@ -1250,20 +1156,14 @@ async fn explicitly_qualified_aggregate_source_probes_the_right_table_not_a_same
 /// half of the same bug (reviewer follow-up to issue #74, epic #78's own
 /// whole-branch review): an aggregate definition installed with an explicit
 /// non-default *target* schema (issue #76's `TRANSFORM custom.<target> FROM
-/// ...` grammar) backfills fine, but a live CDC write used to fail outright
-/// — `upsert_group`/`delete_group_row` (`staging::apply_aggregate`'s own
-/// per-group Phase 3 DML-emission functions) bound their `target: &str`
-/// parameter straight into `quote_ident` instead of
-/// [`AggregateTargetPlan::target`]'s qualified identity, so their SQL tried
-/// to write bare, unqualified `order_summary`, not on this connection's
-/// pinned `search_path`, even though `custom.order_summary` (the real,
-/// already-backfilled target) exists.
+/// ...` grammar) backfills fine, but a live CDC write used to fail outright:
+/// the old aggregate path (deleted in #623 D5) wrote bare, unqualified
+/// `order_summary`, not on this connection's pinned `search_path`, even
+/// though `custom.order_summary` (the real, already-backfilled target)
+/// exists.
 ///
-/// Drains a single-group insert (`upsert_group`'s lone-delta-group path)
-/// then that same group's extinction (`delete_group_row`'s path) — between
-/// them, and via [`apply_aggregate_target`]'s own shared pre-lock, every
-/// per-group DML-emission site this reviewer follow-up fixes runs at least
-/// once.
+/// Drains a single-group insert, then that same group's extinction, so both
+/// the group's write and its delete run at least once.
 #[tokio::test]
 async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
     let cluster = TestCluster::start();
@@ -1327,7 +1227,7 @@ async fn explicitly_qualified_aggregate_target_receives_a_live_cdc_write() {
     assert_eq!(total.as_deref(), Some("5.00"), "seed total for group 10");
 
     // Delete the only row in group 10, both physically and via CDC — the
-    // group goes extinct, routing through `delete_group_row`.
+    // group goes extinct.
     client
         .execute("delete from order_items where id = 1", &[])
         .await
@@ -1426,8 +1326,7 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
     assert_eq!(target["10"].0.as_deref(), Some("5.00"), "seed total");
 
     // Delete r1: the group keeps r2 (still NULL), so the group itself is not
-    // extinct (`probe_group_exists` is true, no target-row delete happens),
-    // but its only non-null contributor is now gone.
+    // deleted, but its only non-null contributor is now gone.
     client
         .execute("delete from order_items where id = 1", &[])
         .await
@@ -1462,18 +1361,9 @@ async fn sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null() {
 /// value for its sole `SUM`/`AVG` argument must still get a target row
 /// written — never a silent, permanent missing row.
 ///
-/// Root cause: `classify_fields` correctly excludes the `GROUP BY`-echo
-/// field from `plan.fields` (it contributes no column of its own), so a
-/// definition with only `SUM`/`AVG` fields (no `MIN`/`MAX`/`COUNT`) has no
-/// `AggFieldKind::RecomputeOnly` field to anchor a write for a group whose
-/// only activity is a NULL contribution. `add_contributions`/
-/// `sub_contributions` used to insert a `field_accum` entry *only* when a
-/// row's contribution was non-NULL, so a NULL-only group's insert produced
-/// zero `field_accum` entries; `group_has_activity` then saw neither a
-/// `RecomputeOnly` field nor any `field_accum` entry, reported "no
-/// activity," and `apply_aggregate_target` never called `upsert_group` for
-/// the group at all — even though `probe_group_exists` correctly found the
-/// group's live row moments earlier.
+/// Root cause (in the old aggregate path, deleted in #623 D5): a group whose
+/// only activity was a NULL contribution to a `SUM`/`AVG`-only definition
+/// counted as "no activity", so its row was never written.
 ///
 /// This also exercises the symmetric direction: once that lone, NULL-only
 /// row is later deleted, the group must become fully extinct again (its
@@ -1601,9 +1491,9 @@ async fn a_brand_new_null_only_group_still_gets_a_target_row_and_is_removed_when
 /// genuinely different rational number (`46.33333333333333333333`, 22
 /// digits after the point, vs. the correct `46.3333333333333333`, 16).
 ///
-/// Root cause: `apply_aggregate::row_contribution` computed each row's
-/// contribution to an `AVG` field by evaluating that field's own `AVG(...)`
-/// expression over a one-row slice — which, per `eval::reduce_numeric_aggregate`,
+/// Root cause (in the old aggregate path, deleted in #623 D5): each row's
+/// contribution to an `AVG` field was computed by evaluating that field's own
+/// `AVG(...)` expression over a one-row slice — which, per `eval::reduce_numeric_aggregate`,
 /// really does perform a `numeric` division (`row's value / 1`). Postgres's
 /// `numeric` division scale depends on the *operands'*
 /// scale/weight (`Numeric::div`'s `select_div_scale`), not merely "same
@@ -1613,17 +1503,16 @@ async fn a_brand_new_null_only_group_still_gets_a_target_row_and_is_removed_when
 /// into the hidden `__avg_amount_sum` running-sum partial via SQL `sum()`
 /// (whose result scale floats up to at least its inputs'), so the scale
 /// inflation compounded with every row this group ever accumulated — and
-/// the *final* `sum / count` division `upsert_group` performs for the
+/// the *final* `sum / count` division the group write performed for the
 /// visible `avg_amount` column inherited that already-inflated dividend
 /// scale, landing on a different (over-precise, wrongly-rounded) result
 /// than Postgres's own `avg()`, which only ever divides once, at the very
 /// end, over the group's true final sum/count.
 ///
-/// Fixed by evaluating `AVG` fields as the equivalent `SUM` for the sole
-/// purpose of computing a one-row contribution (see
-/// `apply_aggregate::contribution_def`'s doc comment): `SUM`'s reduction is
-/// pure `Numeric::add`, whose result scale for a single addend is exactly
-/// that addend's own scale — no division, no inflation.
+/// Fixed then by evaluating `AVG` fields as the equivalent `SUM` for a
+/// one-row contribution: `SUM`'s reduction is pure `Numeric::add`, whose
+/// result scale for a single addend is exactly that addend's own scale — no
+/// division, no inflation.
 #[tokio::test]
 async fn avg_maintenance_matches_the_oracle_across_three_single_row_drains_into_one_group() {
     let cluster = TestCluster::start();
@@ -2095,78 +1984,6 @@ async fn count_star_composes_with_avg_across_insert_update_delete_and_grain_migr
     );
 }
 
-/// An image-less recompute trigger (a bare key with no CDC image at all)
-/// forces `COUNT`'s full-recompute path (`probe_count_star`), the same
-/// full-recompute gap `SUM`/`AVG` already have coverage for — see
-/// `image_less_recompute_trigger_still_probes_a_stale_sum_field`.
-#[tokio::test]
-#[ignore = "#623 D5: old aggregate path deleted"]
-async fn count_star_image_less_recompute_trigger_probes_a_stale_count() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    client
-        .batch_execute(
-            "create table order_items (id integer primary key, order_id integer, amount numeric); \
-             insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
-        )
-        .await
-        .expect("seed source table");
-
-    let def = setup_counts(&db).await;
-
-    insert_cdc_row(
-        &client,
-        "seg_0",
-        "order_items",
-        "1",
-        "insert",
-        None,
-        Some(r#"{"order_id":"10","amount":"5.00"}"#),
-    )
-    .await;
-    let seg0 = seal_active_segment(&mut client).await;
-    drain(&db.pool, seg0, "worker").await;
-
-    let target = read_count_target(&client).await;
-    assert_eq!(target["10"].0.as_deref(), Some("1"), "seed count");
-
-    // A second row lands in group 10 entirely out-of-band.
-    client
-        .execute(
-            "insert into order_items (id, order_id, amount) values (2, 10, 3.00)",
-            &[],
-        )
-        .await
-        .expect("out-of-band insert into group 10");
-
-    insert_cdc_row(
-        &client,
-        "seg_1",
-        "order_items",
-        "1",
-        "recompute",
-        None,
-        None,
-    )
-    .await;
-    let seg1 = seal_active_segment(&mut client).await;
-    drain(&db.pool, seg1, "worker").await;
-
-    let target = read_count_target(&client).await;
-    let oracle = read_count_oracle(&client, &def).await;
-    assert_eq!(
-        target, oracle,
-        "an image-less recompute trigger must match a fresh oracle recompute"
-    );
-    assert_eq!(
-        target["10"].0.as_deref(),
-        Some("2"),
-        "COUNT must be probed (1 + the out-of-band row), not left stale at 1"
-    );
-}
-
 /// A from-scratch backfill (every source row staged image-less, so every
 /// group takes the full-recompute path — issue #59) over many groups must
 /// (a) land exactly the oracle's values for all of them, and (b) not scan
@@ -2387,11 +2204,8 @@ async fn backfilling_a_multi_column_group_by_matches_the_oracle() {
     );
 }
 
-/// One `apply_aggregate_target` batch that mixes a forced (image-less)
-/// group and an ordinary delta group must route each down its own path (the
-/// forced group through the bulk recompute, the delta group through the
-/// unchanged per-group `upsert_group`) and land both correctly against the
-/// oracle.
+/// One batch that mixes an image-less recompute and an ordinary delta must
+/// land both groups correctly against the oracle.
 #[tokio::test]
 async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
     let cluster = TestCluster::start();
@@ -2483,8 +2297,8 @@ async fn a_mixed_forced_and_delta_batch_matches_the_oracle() {
 ///   not apply +3 twice or use the wrong old-image and land on +3.
 /// - Group 20 is touched by *different keys* in each segment (id 4 in
 ///   segment 1, id 5 in segment 2) — no key-level merge at all, so this
-///   checks that `accumulate_changes` sums both segments' contributions into
-///   one group write rather than only seeing whichever segment's fold
+///   checks that apply sums both segments' contributions into one group
+///   write rather than only seeing whichever segment's fold
 ///   happened to run.
 /// - Group 30 is reachable *only* via an image-less recompute trigger staged
 ///   in segment 1 (id 6), with segment 2 contributing nothing to that group.
@@ -2760,16 +2574,15 @@ async fn read_order_alias_totals_oracle(
 /// only rejects a *bare source column* outside an aggregate call) and the
 /// per-row evaluator (`eval::evaluate_aggregate` resolves it recursively via
 /// `fields_by_name`), but three SQL-rendering call sites
-/// (`apply_aggregate::classify_fields`, the `staging::apply` aggregate
-/// dispatch's `field_exprs`, and `oracle::render_aggregate_select_sql`) used
-/// to render `double_total`'s raw, un-substituted `Expr::Column("total")` as
+/// (the old aggregate path's field classification, the `staging::apply`
+/// aggregate dispatch's `field_exprs`, and
+/// `oracle::render_aggregate_select_sql`) used to render `double_total`'s raw, un-substituted `Expr::Column("total")` as
 /// a bare SQL identifier — which Postgres rejects, since `total` names
 /// neither a source column nor a same-SELECT-list-visible name. This
 /// exercises the live incremental-apply path specifically (an INSERT
 /// followed by an UPDATE, both landing through the ordinary CDC/drain path,
-/// not the direct backfill), confirming `classify_fields`/
-/// `accumulate_changes`/the `RecomputeOnly` probe path (`probe_field_value`)
-/// all correctly resolve `double_total` against `total`'s current value.
+/// not the direct backfill), confirming the ledger resolves `double_total`
+/// against `total`'s current value.
 #[tokio::test]
 async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update() {
     let cluster = TestCluster::start();
@@ -2851,8 +2664,8 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
 
 /// Issue #103: chaining an ordinary 1-1 definition onto a
 /// single-`GROUP BY`-column aggregate target must not misread
-/// `derive_group_key`'s internal `HashMap`-key encoding as the target's
-/// real primary-key value.
+/// the old aggregate path's internal group-key encoding as the target's real
+/// primary-key value.
 ///
 /// `order_summary`'s real Postgres identity (its `UNIQUE NULLS NOT
 /// DISTINCT` grouping-column constraint, the same one
@@ -2864,7 +2677,7 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
 /// composite case this same encoding fix — see
 /// `defs_aggregate_chained_composite_group_key.rs`), and
 /// `defs::validate`/`create_definition` impose no primary-key-shape check
-/// of their own. Before the fix, `derive_group_key` always
+/// of their own. Before the fix, the group key was always
 /// length-prefix-encoded the group key regardless of arity, and that
 /// encoded string flowed, unchanged, into the `Recompute` this chained
 /// definition automatically gets staged
@@ -2883,12 +2696,10 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
 /// group-by column can no longer even reach `create_target_table` to
 /// reproduce the issue's exact wording. `uuid` is the other
 /// `create_aggregate_target_table`-reachable type still on that allowlist,
-/// so it's what still exercises `derive_group_key`'s live, reachable bug
-/// today: a `uuid` column's length-prefixed encoding of itself is never
+/// so it's what exercises the bug: a `uuid` column's length-prefixed encoding of itself is never
 /// itself a valid `uuid` literal, so the chained definition's live refetch
 /// still crashes the same way, on `invalid input syntax for type uuid`
-/// instead of `numeric` — same root cause, same fix, still a real (not
-/// merely historical) regression risk this test guards.
+/// instead of `numeric` — same root cause, same fix.
 ///
 /// After the fix, a single-column `GROUP BY`'s key is the plain, unencoded
 /// value, matching `order_summary`'s real PK shape exactly, so this drain
@@ -3154,95 +2965,9 @@ fn sales_image(id: i32, sku: &str, amount: i32) -> String {
     format!(r#"{{"id":"{id}","sku":"{sku}","amount":"{amount}"}}"#)
 }
 
-/// Issue #392: a `Recompute` for a key folded into the same batch as that
-/// key's CDC update must still re-derive the key's group. The fold used to
-/// take its images from the update alone, so the record became a plain
-/// delta: on a group already off by 100 (a stale 111 where the source sums
-/// to 12), `Recompute(1)` alone gives 13 but, folded with an update of row 1
-/// from 5 to 6, gave 112.
-#[tokio::test]
-#[ignore = "#623 D5: old aggregate path deleted"]
-async fn a_recompute_folded_with_a_cdc_update_still_rederives_the_group() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
-    assert_eq!(
-        sku_totals(&client).await,
-        totals(&[("a", "12"), ("b", "2")])
-    );
-
-    // The group is stale; a Recompute is what repairs it.
-    client
-        .batch_execute(
-            "update sku_totals set total = 111 where sku = 'a'; \
-             update sales set amount = 6 where id = 1",
-        )
-        .await
-        .expect("make group a stale, then update row 1");
-    let lsn = current_wal_lsn(&client).await;
-    stage_sales(&client, "1", "recompute", None, None, None).await;
-    stage_sales(
-        &client,
-        "1",
-        "update",
-        Some(lsn),
-        Some(&sales_image(1, "a", 5)),
-        Some(&sales_image(1, "a", 6)),
-    )
-    .await;
-    let seg = seal_active_segment(&mut client).await;
-    drain(&db.pool, seg, "worker").await;
-
-    assert_eq!(
-        sku_totals(&client).await,
-        totals(&[("a", "13"), ("b", "2")]),
-        "the Recompute must re-derive group a, not apply the update's +1 to the stale 111"
-    );
-}
-
-/// Issue #392, grain-migration shape: the update moves row 1 from group `a`
-/// to group `b`, and both groups are stale. The folded record's Recompute
-/// re-derives both of the groups its images name.
-#[tokio::test]
-#[ignore = "#623 D5: old aggregate path deleted"]
-async fn a_recompute_folded_with_a_grain_migration_rederives_both_groups() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
-
-    client
-        .batch_execute(
-            "update sku_totals set total = total + 100; \
-             update sales set sku = 'b' where id = 1",
-        )
-        .await
-        .expect("make both groups stale, then move row 1 to b");
-    let lsn = current_wal_lsn(&client).await;
-    stage_sales(
-        &client,
-        "1",
-        "update",
-        Some(lsn),
-        Some(&sales_image(1, "a", 5)),
-        Some(&sales_image(1, "b", 5)),
-    )
-    .await;
-    stage_sales(&client, "1", "recompute", None, None, None).await;
-    let seg = seal_active_segment(&mut client).await;
-    drain(&db.pool, seg, "worker").await;
-
-    assert_eq!(
-        sku_totals(&client).await,
-        totals(&[("a", "7"), ("b", "7")]),
-        "both groups the folded record names must be re-derived"
-    );
-}
-
-/// Puts row 4 in group `z` into the source and re-derives `z` with a
-/// forced recompute, as a build or catch-up does, so `z` counts row 4 and
-/// carries a recompute horizon. Returns that horizon.
+/// Puts row 4 in group `z` into the source and re-derives its entry with a
+/// recompute, as a build or catch-up does, so `z` counts row 4. Returns a
+/// WAL position at or above the read that counted it.
 async fn count_row_4_by_a_forced_recompute(
     db: &testkit::TestDatabase,
     client: &mut Client,
@@ -3264,39 +2989,29 @@ async fn count_row_4_by_a_forced_recompute(
         totals(&[("a", "12"), ("b", "2"), ("z", "1000")]),
         "the forced recompute counts row 4"
     );
-    client
-        .query_one(
-            "select __trellis_recompute_lsn from sku_totals where sku = 'z'",
-            &[],
-        )
-        .await
-        .expect("read z's horizon")
-        .get::<_, Option<PgLsn>>(0)
-        .expect("a forced recompute stamps its group's horizon")
+    current_wal_lsn(client).await
 }
 
-/// Issue #486: row 4's insert commits at or below group `z`'s recompute
-/// horizon (the forced recompute counted it) and its delete above it. Both
-/// CDC changes fold into one batch, which used to leave a record with
-/// neither image: it named no group, so the horizon check never ran and `z`
-/// kept the 1000 the recompute had counted.
+/// Issue #486: row 4's insert commits at or below the read that counted it
+/// and its delete above. Both CDC changes fold into one batch, which leaves a
+/// record with neither image. Row 4's ledger entry still names `z`, so the
+/// delete empties it.
 #[tokio::test]
-#[ignore = "#623 D5: old aggregate path deleted"]
 async fn an_insert_and_delete_folded_across_a_recompute_horizon_still_empty_the_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
-    let horizon = count_row_4_by_a_forced_recompute(&db, &mut client).await;
+    let counted = count_row_4_by_a_forced_recompute(&db, &mut client).await;
 
     client
         .batch_execute("delete from sales where id = 4")
         .await
         .expect("delete row 4");
     let delete_lsn = current_wal_lsn(&client).await;
-    assert!(delete_lsn > horizon);
+    assert!(delete_lsn > counted);
     let image = sales_image(4, "z", 1000);
-    stage_sales(&client, "4", "insert", Some(horizon), None, Some(&image)).await;
+    stage_sales(&client, "4", "insert", Some(counted), None, Some(&image)).await;
     stage_sales(&client, "4", "delete", Some(delete_lsn), Some(&image), None).await;
     let seg = seal_active_segment(&mut client).await;
     drain(&db.pool, seg, "worker").await;
@@ -3310,15 +3025,14 @@ async fn an_insert_and_delete_folded_across_a_recompute_horizon_still_empty_the_
 
 /// Issue #486 across two segments coalesced by `drain_many`: each segment
 /// folds to a record with an image, but merging the insert's segment with
-/// the delete's leaves neither, so the merge has to keep the group too.
+/// the delete's leaves neither, so the entry has to name the group.
 #[tokio::test]
-#[ignore = "#623 D5: old aggregate path deleted"]
 async fn an_insert_and_delete_merged_across_segments_and_a_horizon_still_empty_the_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
-    let horizon = count_row_4_by_a_forced_recompute(&db, &mut client).await;
+    let counted = count_row_4_by_a_forced_recompute(&db, &mut client).await;
 
     client
         .batch_execute("delete from sales where id = 4")
@@ -3326,7 +3040,7 @@ async fn an_insert_and_delete_merged_across_segments_and_a_horizon_still_empty_t
         .expect("delete row 4");
     let delete_lsn = current_wal_lsn(&client).await;
     let image = sales_image(4, "z", 1000);
-    stage_sales(&client, "4", "insert", Some(horizon), None, Some(&image)).await;
+    stage_sales(&client, "4", "insert", Some(counted), None, Some(&image)).await;
     let first = seal_active_segment(&mut client).await;
     stage_sales(&client, "4", "delete", Some(delete_lsn), Some(&image), None).await;
     let second = seal_active_segment(&mut client).await;
@@ -3349,11 +3063,11 @@ async fn an_insert_and_delete_merged_across_segments_and_a_horizon_still_empty_t
     );
 }
 
-/// The control for the two tests above: with no recompute horizon involved,
-/// an insert and delete that fold to nothing leave no trace, and in
-/// particular don't create a group row.
+/// The control for the two tests above: with no read that counted the key, an
+/// insert and delete that fold to nothing leave no trace, and in particular
+/// don't create a group row.
 #[tokio::test]
-async fn an_insert_and_delete_folded_below_no_horizon_leave_no_group() {
+async fn an_insert_and_delete_folded_with_no_entry_leave_no_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -3371,29 +3085,15 @@ async fn an_insert_and_delete_folded_below_no_horizon_leave_no_group() {
         sku_totals(&client).await,
         totals(&[("a", "12"), ("b", "2")])
     );
-    let extinct: i64 = client
-        .query_one("select count(*) from aggregate_extinct_horizon", &[])
-        .await
-        .expect("read extinct horizons")
-        .get(0);
-    assert_eq!(
-        extinct, 0,
-        "a group that was never there is not an extinction"
-    );
 }
 
-/// The multi-hop form of #486's gap, for an ordinary update chain: row 1
-/// moves `a -> z` at or below a forced recompute of `z` (which counts it),
+/// The multi-hop form of #486, for an ordinary update chain: row 1 moves
+/// `a -> z` at or below a recompute of its entry (which counts it in `z`),
 /// then `z -> b` above it. Both updates fold into one batch as `a -> b`, so
-/// `z` is never named and keeps the 5 the recompute counted. The same gap
-/// applies to a born-and-died key that passes through a group between its
-/// insert and delete, since `vanished_images` carries only the endpoints.
-/// Fixing it needs every intermediate image a key's rows carried (a hot key
-/// updated N times in a batch would carry N), so it is left for a design
-/// call.
+/// the images never name `z`. The old path left `z` the 5 the recompute
+/// counted; the ledger entry says the row is in `z`, so applying it moves the
+/// row out of `z` (#623 D5).
 #[tokio::test]
-#[ignore = "known gap: a fold names only a key's first and last groups, so an \
-            intermediate group a forced recompute counted keeps the key"]
 async fn an_update_chain_through_a_recomputed_group_folded_in_one_batch_leaves_it_correct() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -3405,31 +3105,27 @@ async fn an_update_chain_through_a_recomputed_group_folded_in_one_batch_leaves_i
         .await
         .expect("move row 1 to z");
     let first_lsn = current_wal_lsn(&client).await;
-    // A forced recompute of z (any producer: a build, a catch-up, a chained
-    // hop) counts row 1 and stamps z's horizon above the first move.
+    // A recompute of row 1 (any producer: a build, a catch-up, a chained
+    // hop) counts it in z above the first move.
     stage_sales(&client, "1", "recompute", None, None, None).await;
     let seg = seal_active_segment(&mut client).await;
     drain(&db.pool, seg, "worker").await;
     trellis::staging::retire_drained_segments(&mut client)
         .await
         .expect("retire drained segments");
-    let horizon: PgLsn = client
-        .query_one(
-            "select __trellis_recompute_lsn from sku_totals where sku = 'z'",
-            &[],
-        )
-        .await
-        .expect("read z's horizon")
-        .get::<_, Option<PgLsn>>(0)
-        .expect("the forced recompute stamps z's horizon");
-    assert!(first_lsn <= horizon);
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "7"), ("b", "2"), ("z", "5")]),
+        "the recompute counts row 1 in z"
+    );
+    let counted = current_wal_lsn(&client).await;
 
     client
         .batch_execute("update sales set sku = 'b' where id = 1")
         .await
         .expect("move row 1 on to b");
     let second_lsn = current_wal_lsn(&client).await;
-    assert!(second_lsn > horizon);
+    assert!(second_lsn > counted);
     stage_sales(
         &client,
         "1",
@@ -3458,14 +3154,13 @@ async fn an_update_chain_through_a_recomputed_group_folded_in_one_batch_leaves_i
     );
 }
 
-/// Issue #486 with no horizon involved: a delta drained while a key's insert
-/// was still in flight (another bucket, or an earlier batch drained later)
-/// probes the group, finds it non-empty only because of that key, and keeps
-/// its row without counting the key. When the key's insert and delete then
-/// fold together to nothing, only an existence probe can find the group
-/// empty; a horizon check alone leaves a row for a group with no source rows.
+/// Issue #486: a delta drains while another key's insert into the same group
+/// is still in flight (another bucket, or an earlier batch drained later).
+/// The old path's existence probe saw that key and kept the group's row
+/// without counting it. On the ledger the group's member count is its
+/// entries', so the row goes, and the in-flight key's insert and delete then
+/// fold to nothing and leave no row behind.
 #[tokio::test]
-#[ignore = "#623 D5: old aggregate path deleted"]
 async fn an_insert_and_delete_folded_after_a_probe_saw_the_key_still_empty_the_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -3473,7 +3168,7 @@ async fn an_insert_and_delete_folded_after_a_probe_saw_the_key_still_empty_the_g
     setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'z', 2)").await;
 
     // Row 4 joins z; its insert is not drained yet. Row 3 leaves z, and its
-    // delete drains first: the probe sees row 4, so z's row stays, summing nothing.
+    // delete drains first.
     client
         .batch_execute(
             "insert into sales (id, sku, amount) values (4, 'z', 1000); \
@@ -3495,8 +3190,8 @@ async fn an_insert_and_delete_folded_after_a_probe_saw_the_key_still_empty_the_g
     drain(&db.pool, seg, "worker").await;
     assert_eq!(
         sku_totals(&client).await,
-        totals(&[("a", "12"), ("z", "null")]),
-        "the probe saw row 4, so z's row survives without it"
+        totals(&[("a", "12")]),
+        "z's only entry is gone, so its row is too"
     );
 
     client

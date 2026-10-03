@@ -162,8 +162,8 @@ table:
 
 | Write kind | Commutes? | Idempotent? | What makes an out-of-order drain safe |
 |---|---|---|---|
-| Aggregate deltas (`+new − old`) | yes | **no** | exactly-once (the three properties above); on the ledger, also the entry's I2 test; off it, the recompute horizon below whenever a group was also re-derived |
-| Aggregate forced recomputes and extinction deletes (a live `GROUP BY` read), off the ledger | **no** | yes | the recompute horizon, below |
+| Aggregate group increments (`+new − old`, per entry) | yes | **no** | exactly-once (the three properties above), and the entry's I2 test |
+| Aggregate entry writes, from an image or a Re-derive read | **no** | yes | the ledger's entry lock and I2 test, below |
 | 1-1 field writes and deletes, from an image or a Re-derive read | **no** | yes | the 1-1 ledger's entry lock and I2 test, below |
 | Relationship projection writes | no | yes | the per-row `prev_lsn` ordering guard |
 | Truncate | no | yes | the drain barrier (full serialization) |
@@ -224,85 +224,11 @@ and a column resume (`staging::quarantine::recompute_column`) write target
 rows outside a page. Each is a Re-derive of a range of keys, settled the same
 way in its own short transaction.
 
-### Aggregate groups: the recompute horizon
-
-This section covers aggregate targets that are not on the ledger yet: any
-target with a `MIN`/`MAX` (or other recompute-only) or composed field, an
-aggregate argument that is an expression, or a float `SUM`/`AVG`. A plain
-`SUM`/`AVG`/`COUNT` target is on the ledger instead, a relationship-fed one
-included since #623 D5
-(see [Aggregate groups: the ledger](#aggregate-groups-the-ledger), #623 D3),
-with no horizon, pre-lock or probe.
-
-An aggregate group can also receive an absolute write. An image-less change
-(a catch-up enumeration, a chained hop's `Recompute`, a relationship fallback, a
-truncate) has no prior state to diff, so Phase 3 re-derives the whole group from
-a live `GROUP BY` read of the source. So does a change whose fold included a
-`Recompute`, even though it carries the CDC images it folded with (issue #392,
-see [04](04-claiming-and-the-fold.md#the-two-kinds-of-missing-image)): both
-groups its images name are re-derived rather than given the delta. The delta path's existence probe is a live
-read as well: when it finds the group empty, it deletes the group's row.
-
-Either read can see a source commit whose own CDC delta has not been applied yet.
-That delta may be in a later batch, in an earlier batch that drains later, in
-another bucket of the same batch, or on the other side of a grain migration. When
-it lands, it counts the commit a second time (issue #321). Ordering batches
-cannot prevent this, because batches do not drain in order.
-
-So the live read records its basis as a WAL position, and a delta checks it:
-
-1. **The horizon.** The forced path's recompute statement also writes
-   `pg_current_wal_insert_lsn()` into the group row's hidden
-   `__trellis_recompute_lsn`. The function is evaluated while the statement runs,
-   after its snapshot is taken. A commit visible to that snapshot wrote its
-   commit record before it became visible, and its ring rows' `lsn` (the
-   insert position when its capture trigger ran) is below that record, so at
-   or below the stamped value.
-2. **The extinct horizon.** A deleted row can't hold a horizon, so each batch
-   whose live reads find a group empty raises its target's single row in
-   `aggregate_extinct_horizon` to the insert position after those reads. That
-   includes a group with no row to delete: its delta for this batch is dropped
-   just the same, so the read may have absorbed a delete still in flight. A row
-   that the delta path later creates starts with that value as its own horizon,
-   since the empty group it grew from was the result of a live read too.
-3. **The check.** The fold keeps each key's *earliest* image-bearing `lsn`
-   (`min_image_lsn`). A folded delta telescopes every commit from that one to its
-   latest. Under the pre-lock, each delta group compares that value against its
-   row's horizon, or against the target's extinct horizon when it has no row. At
-   or below, the delta may already be counted, so the group moves to the forced
-   path and is re-derived. Above, the delta applies as usual. The check runs per
-   group, so the two sides of a grain migration are judged against their own
-   groups.
-4. **A key born and died in the batch.** Its insert and delete fold to no image
-   and a zero delta, but the fold keeps the images that name its groups
-   (`vanished_images`, issue #486). Each such group gets the same check against
-   its row's horizon, and is re-derived when it fails. Otherwise it gets the
-   delta path's existence probe but no write: an earlier probe may have kept
-   the row only because the key was live then, with its insert still in
-   flight, and nothing else will find the group empty. A group with no row is
-   left alone, because a live read that counted the key would have written
-   one, and whatever removed it since was a live read that found the group
-   without the key.
-
-This is a "re-evaluate, never skip" choice. An LSN
-at or below the horizon only *may* have been read, so skipping the delta would be
-unsound. Re-deriving is correct either way. The cost is that a group keeps being
-re-derived while rows staged before its horizon keep draining for it. In steady
-state that is a catch-up effect. A target reaches its readers through one feed
-only, the seam (a relationship-endpoint target included, since issue #375), so a
-chained aggregate sees no CDC for it at all.
-
-The same rule covers the backfill discharge's enumeration, whose read can see a
-commit whose captured rows are still pending
-([data-flow](../data-flow.md#capturing-a-tables-existing-rows)).
-
 ### The ledger
 
-ADR-0002 replaces the horizon with a per-key ledger. Apply maintains it for
-plain aggregate targets since #623 D3 (next section) and for 1-1 targets since
-D6 ([above](#absolute-writes-do-not-commute-the-1-1-ledger)). Every other
-target's ledger is only written by its build, and goes stale after the
-target's first change until its own part of #623 moves it.
+ADR-0002 gives every target a per-key ledger. Apply maintains it for every
+aggregate target since #623 D5 (plain ones since D3, next section) and for 1-1
+targets since D6 ([above](#absolute-writes-do-not-commute-the-1-1-ledger)).
 
 Every target has one, `<target>__ledger` in the target's schema, created in the
 registration transaction and dropped with the target (`defs::ledger`). It holds
@@ -516,26 +442,15 @@ parent — or a grain change mid-batch slips through.
 
 ## Lock ordering, because parallel workers will overlap
 
-Two workers whose batches touch overlapping aggregate groups will contend on the
-same group rows. That is fine; deadlocking on them is not. Every statement that
-writes group rows takes its locks in a **single consistent order — ascending
-group key** — via an ordered pre-lock ahead of the write:
-
-```sql
-WITH locked AS (
-  SELECT group_key FROM agg_target WHERE group_key = ANY(:groups)
-  ORDER BY group_key FOR UPDATE
-)
--- ... the actual merge, guarded so `locked` is genuinely referenced
-```
+Two workers whose batches touch overlapping keys or groups will contend on the
+same rows. That is fine; deadlocking on them is not. A page takes its locks in
+one consistent order: **entries, then groups, each in one sorted statement**
+([the ledger](#aggregate-groups-the-ledger)). The entry lock is ordered by key,
+and the group upsert writes its groups in group order.
 
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
 residual serialization failures (`40001`/`40P01`) is the whole deadlock story.
-
-> **The same Postgres gotcha as the claim statement:** an unreferenced `FOR
-> UPDATE` pre-lock CTE gets pruned and locks nothing. Force it with a `count(*)`
-> guard in the outer query — this is an easy bug to ship and a silent one.
 
 ### No lock wait holds a snapshot open (ADR-0002 I7)
 
@@ -555,21 +470,20 @@ retried with backoff from outside any transaction.
 - **The bound is on the session.** Every connection Trellis opens, pooled or
   dedicated, caps its `lock_timeout` at `locks::LOCK_TIMEOUT` when it
   connects (a shorter setting it was given is kept). That bounds the explicit
-  lock statements (the pre-locks above, `FOR SHARE` on the version fence,
+  lock statements (the ledger's entry locks above, `FOR SHARE` on the version fence,
   advisory stripe locks, DDL) and the implicit waits nobody writes down: an
   `INSERT ... ON CONFLICT` waiting on another transaction's uncommitted key
   (#617's wait), an `UPDATE` of a row another transaction holds. A setting
   per transaction would cover only the transactions someone remembered.
 - **The cap is two minutes, for now.** The invariant is that the wait is
   bounded, not that it is short: two minutes is 55 times shorter than #617's
-  wait. It is sized for the aggregate group pre-lock above, which queues
-  drain pages that touch the same groups one behind another. In `bench
+  wait. It was sized for the aggregate group pre-lock #623 D5 removed, which
+  queued drain pages that touch the same groups one behind another. In `bench
   fold-in-ratio` at ratio 10 (40k groups, every page touching most of them)
   the longest page transaction, its wait included, was 89 s, when eight
   ~28k-record pages queued together, and 100k-record pages ran 47 s. A 5 s
   cap fired 75 times there, and each retry lost its place in the queue. The
-  value is interim: #623 removes the group pre-lock, and with it the reason
-  a Trellis transaction waits this long on another.
+  value is interim: with the pre-lock gone, it can be re-measured.
 - **A drain keeps its claim across the retry.** A page whose transaction
   times out is classified transient; the drain backs off (50 ms, doubling to
   1 s) and retries the page, recomputing it, while the heartbeat keeps its
@@ -694,10 +608,9 @@ identical from outside otherwise.
 7. **A non-commutative write commits only if its basis is still current**, checked
    under a lock that serializes every Phase 3 for that key. A new write path must
    either commute (deltas), check its basis, or be serialized some other way
-   (the `prev_lsn` guard, the truncate barrier). An aggregate group's absolute
-   writes record their basis as a recompute horizon, and a delta that would
-   commute with other deltas still has to check it
-   ([the recompute horizon](#aggregate-groups-the-recompute-horizon)). See the
+   (the `prev_lsn` guard, the truncate barrier). A ledger entry records its
+   basis, and every change to it is checked against it, so a group's
+   increments stay exactly-once. See the
    classification table under
    [the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger).
 8. **No Trellis transaction waits for a lock longer than `lock_timeout`**, and a

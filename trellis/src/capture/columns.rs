@@ -223,7 +223,6 @@ pub async fn load_catalog(
     let bookkeeping = [
         crate::defs::ddl::PROJECTION_GEN_COLUMN,
         crate::defs::ddl::PROJECTION_LSN_COLUMN,
-        crate::defs::ddl::RECOMPUTE_LSN_COLUMN,
     ];
     let mut projection_columns: HashMap<i64, Vec<String>> = HashMap::new();
     for row in client

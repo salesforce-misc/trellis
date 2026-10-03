@@ -69,8 +69,8 @@ pub enum Plant {
     /// folds *all* of its buckets instead of the ones it won, so two workers
     /// apply the same rows. Found by #557 part 1's review.
     ClaimAllBuckets,
-    /// Aggregate apply (`staging::apply_aggregate`, and a ledger target's
-    /// group upsert in `staging::ledger` since #623 D3): each apply
+    /// Aggregate apply (a ledger target's group upsert in `staging::ledger`,
+    /// since #623 D3): each apply
     /// transaction takes a non-waiting advisory lock per group before it
     /// writes the group, and drops its delta for any group another open
     /// apply transaction already holds. Only two workers applying one group
@@ -82,11 +82,6 @@ pub enum Plant {
     /// already applied. A page that drains after a newer one for the same key
     /// then leaves the older value behind.
     StaleOneToOneWrite,
-    /// Issue #321: an aggregate delta at or below its group's recompute
-    /// horizon applies as a delta, instead of re-deriving the group
-    /// (`staging::apply_aggregate::delta_may_be_absorbed`). A commit a
-    /// forced recompute already counted is then counted again.
-    IgnoreRecomputeHorizon,
     /// ADR-0002 I1 (#623 D3): a ledger target's page takes no entry lock
     /// before its Re-derive read (`staging::ledger`), so the read can run
     /// while another page is between its own read and its write for the
@@ -124,7 +119,6 @@ impl Plant {
         Plant::ClaimAllBuckets,
         Plant::DropRacingGroupDelta,
         Plant::StaleOneToOneWrite,
-        Plant::IgnoreRecomputeHorizon,
         Plant::SkipLedgerLock,
         Plant::LsnOnlySkip,
         Plant::EarlyTombstoneGc,
@@ -138,7 +132,6 @@ impl Plant {
             Plant::ClaimAllBuckets => "claim_all_buckets",
             Plant::DropRacingGroupDelta => "drop_racing_group_delta",
             Plant::StaleOneToOneWrite => "stale_one_to_one_write",
-            Plant::IgnoreRecomputeHorizon => "ignore_recompute_horizon",
             Plant::SkipLedgerLock => "skip_ledger_lock",
             Plant::LsnOnlySkip => "lsn_only_skip",
             Plant::EarlyTombstoneGc => "early_tombstone_gc",

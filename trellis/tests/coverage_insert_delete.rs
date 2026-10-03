@@ -1,9 +1,9 @@
-//! Issue #486: an insert at or below a recompute horizon and a delete above
-//! it, folded into one batch, left a change with neither image. It named no
-//! group, so the horizon check never ran and a group the delete emptied kept
-//! the value a forced recompute had counted.
+//! Issue #486: an insert a build counted and a delete after it, folded into
+//! one batch, leave a change with neither image. On the old path it named no
+//! group, so a group the delete emptied kept the value the build had counted.
+//! On the ledger the row's entry names the group, so the delete empties it.
 //!
-//! Here the horizon is a direct aggregate build's: the row is inserted while
+//! Here the row is inserted while
 //! the build is held just before its source read, so the build's own read
 //! picks it up, then deleted after go-live, and both CDC changes drain live
 //! in one batch. The go-live catch-up always re-reads its source now
@@ -15,9 +15,8 @@
 //! build.
 //!
 //! The aggregate is relationship-fed (an extra field reads a to-one
-//! relationship's column), so it still takes the old build, with its horizon,
-//! until #625 F9: every plain aggregate is the Re-derive build's since #625
-//! F5, which has none.
+//! relationship's column), so it still takes the direct build until #625 F9:
+//! every plain aggregate is the Re-derive build's since #625 F5.
 //!
 //! The build is held with event triggers on advisory locks the test holds, at
 //! the two `ALTER TABLE`s around the aggregate build's ledger load (#623 D2),
@@ -254,12 +253,11 @@ fn row_4(sku: &str) -> String {
 
 /// The issue's probe (deleted after go-live) with a group of one row, and the
 /// catch-up's always-on enumeration (`backfill_coverage` retired, #468/#485).
-/// The insert (below the build's recompute horizon) and the delete (above it)
-/// drain live in one batch and fold to a change with neither image, which
-/// names no group, so the horizon check never runs and group `z` keeps the
-/// build's `1000`.
+/// The insert (which the build read) and the delete (after go-live) drain
+/// live in one batch and fold to a change with neither image. Row 4's ledger
+/// entry still names group `z`, so the delete removes the build's `1000`.
 #[tokio::test]
-async fn a_group_emptied_across_the_build_horizon_is_removed_even_by_an_enumerating_catch_up() {
+async fn a_group_emptied_across_the_build_is_removed_even_by_an_enumerating_catch_up() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;

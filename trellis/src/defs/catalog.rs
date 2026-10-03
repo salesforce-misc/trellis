@@ -763,10 +763,9 @@ pub async fn create_definition_without_backfill(
 /// any more, which the re-read can't reach (issue #485).
 /// The reverse, a delta for a commit the build already read that drains only
 /// after the flip, is harmless for a 1-1 target. For an aggregate, the
-/// recompute horizon the build stamps on every group row it writes (and on
-/// the target, for the groups it found empty) sends that delta to
-/// re-derive its group rather than count the commit a second time (issues
-/// #419, #442), so that correction doesn't rest on the catch-up.
+/// ledger entry's `basis` already shows the commit, so the delta is skipped
+/// rather than counted a second time (I1, #623 D5), and that correction
+/// doesn't rest on the catch-up.
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -4323,7 +4322,7 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // the way `boolean` would. `inet` is refused here for that reason;
     // its `GROUP BY` key role is still admitted, the same split `boolean`
     // got — see `validate::reject_unsupported_group_by_key_type`'s `Inet`
-    // arm and `crate::netaddr::canonicalize_group_key_text`.
+    // arm.
     "cidr",
     "macaddr",
     "macaddr8",
@@ -4368,15 +4367,9 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     //
     // The `GROUP BY` key role does *not* have this problem at the final SQL
     // layer — see `validate::reject_unsupported_group_by_key_type`'s own
-    // `Boolean` arm — because `staging::apply_aggregate`'s keyset match
-    // always goes through exactly the same native-array-cast pattern
-    // `key_array_filter` uses (`unnest($1::text[]::boolean[], ...)`), never
-    // a bare `col::text` comparison, so it never touches `pg_catalog.text
-    // (boolean)` at all. (That role *did* have a second, in-memory-only
-    // instance of this same defect, in `accumulate_changes`'s own
-    // pre-database `GroupPlan` bucketing — fixed by
-    // `apply_aggregate::canonicalize_group_key_part`, not by anything on
-    // this list; see that function's doc comment.) Extending the SQL-layer
+    // `Boolean` arm — because the ledger (`staging::ledger`) casts a group
+    // key's text to its native type, never a bare `col::text` comparison,
+    // so it never touches `pg_catalog.text (boolean)` at all. Extending the SQL-layer
     // native-array-cast pattern to the remaining scalar lookup sites (or
     // #110's typed key index, which would subsume it) is what would let
     // `boolean` join this list; until then it stays off. See
@@ -6277,8 +6270,8 @@ pub async fn definition_by_target(
 /// Filtered to [`KeySpace::OneToOne`] downstream definitions only — column-
 /// level pause/cascade/resume is explicitly scoped to the 1-1 tier (see this
 /// module's callers in `staging::quarantine` and that module's "Column-level
-/// fuse" section doc comment: `staging::apply_aggregate`'s incremental-delta
-/// path has no notion of `column_status` at all). Without this filter, a
+/// fuse" section doc comment: the aggregate ledger path has no notion of
+/// `column_status` at all). Without this filter, a
 /// downstream [`KeySpace::Aggregate`] transform whose field happens to read a
 /// just-paused upstream column would get a `column_status` row cascaded onto
 /// it that nothing in the aggregate write path ever consults or clears, and

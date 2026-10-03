@@ -532,8 +532,7 @@ async fn jsonb_agg_fold_matches_a_server_side_aggregate() {
 // ---------------------------------------------------------------------
 
 /// parse -> create -> stage CDC -> **apply** (`RecomputeOnly`, so this
-/// exercises `staging::apply_aggregate`'s `probe_recompute_fields_bulk`
-/// path, which asks Postgres directly rather than the Rust evaluator) ->
+/// exercises the ledger's live recompute, which asks Postgres directly rather than the Rust evaluator) ->
 /// read, cross-checked against the *set* of elements a live, independent
 /// `jsonb_agg` produces over the same rows — set, not sequence, because
 /// element order is this aggregate's one documented, non-corrupting

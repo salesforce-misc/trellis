@@ -72,8 +72,7 @@ pub type RegexCache = HashMap<String, Regex>;
 /// ANSI `NULL <> NULL` is the *correct* semantics (a from-row with a `NULL`
 /// join value has no related row, same as `LEFT JOIN ON from_col = to_col`
 /// would compute) — unlike an aggregate group's downstream propagation
-/// identity (`staging::apply_aggregate::derive_group_key`/
-/// `staging::apply::read_live_rows_batch`), which is a *primary-key*
+/// identity (`staging::apply::read_live_rows_batch`), which is a *primary-key*
 /// round-trip ("is this the same group as before"), not a join, and where a
 /// `NULL` component legitimately needs to resolve to itself. Confirmed by
 /// reading this module during #110's investigation: no change needed here.
@@ -144,18 +143,6 @@ impl RelationshipContext {
             by_name,
             to_many_by_name: HashMap::new(),
         }
-    }
-
-    /// The resolved to-one relationship data for `rel`, if any — the same
-    /// lookup [`eval_expr`]'s own `RelationshipPath` arm does internally
-    /// against `by_name`, exposed for issue #136's forward aggregate
-    /// substitution path (`staging::apply_aggregate`'s
-    /// `build_forward_relationship_shape`/`forward_row_contribution`), which
-    /// needs to resolve a relationship's current value from the same
-    /// settled-projection-backed context this module's own pure evaluator
-    /// already consumes, without duplicating `by_name`'s storage.
-    pub(crate) fn to_one(&self, rel: &str) -> Option<&ToOneRelationship> {
-        self.by_name.get(rel)
     }
 
     /// Every relationship's `from_col`, to-one and to-many: the from-side
@@ -357,18 +344,13 @@ pub enum EvalError {
     /// `IntervalOutOfRange`'s, though, and worth stating precisely rather
     /// than by analogy.** `bit_and`/`bit_or` are always
     /// [`super::invertibility::Invertibility::RecomputeOnly`]
-    /// (`KeySpace::Aggregate` only), so `staging::apply_aggregate` never
-    /// folds a group through this Rust evaluator at all for its own written
-    /// value — it pushes the rendered aggregate expression straight to a
-    /// live Postgres (`probe_recompute_fields_bulk`/
-    /// `apply_forced_groups_bulk`), which raises *its own* native "cannot
-    /// AND/OR bit strings of different sizes" error, surfacing as
-    /// [`crate::staging::apply::ApplyError::Db`], not this variant. The one
-    /// production caller that does invoke `evaluate_aggregate`
-    /// (`staging::apply_aggregate::row_contribution`) only ever passes a
-    /// single-row slice per call, so the ≥2-value comparison this variant
-    /// needs can never actually see two disagreeing lengths there either.
-    /// In practice this variant is exercised only by this module's own unit
+    /// (`KeySpace::Aggregate` only), and no production path folds a group
+    /// through this Rust evaluator at all: the ledger Re-derive
+    /// (`staging::ledger`) pushes the rendered aggregate expression straight
+    /// to a live Postgres, which raises *its own* native "cannot AND/OR bit
+    /// strings of different sizes" error, surfacing as
+    /// [`crate::staging::apply::ApplyError::Db`], not this variant.
+    /// This variant is exercised only by this module's own unit
     /// tests and by the test-only `defs::oracle::recompute_aggregate`
     /// cross-check (`#[cfg(any(test, feature = "test-util"))]`), which does
     /// call `evaluate_aggregate` over a whole multi-row group. It still
@@ -454,13 +436,10 @@ pub enum EvalError {
     /// for every argument type (`super::invertibility::classify`'s own
     /// unconditional `MIN`/`MAX` arm), so a `KeySpace::Aggregate` field's
     /// own `MIN`/`MAX(enum)` never folds a multi-row group through this
-    /// evaluator in production at all — `staging::apply_aggregate` always
-    /// resolves its written value with a live server-side `min()`/`max()`
-    /// push-down instead, which answers the real creation-order question
-    /// this evaluator cannot. The evaluator's own production caller for a
-    /// `KeySpace::Aggregate` field (`staging::apply_aggregate::row_contribution`)
-    /// only ever passes a single-row slice per call, which can never
-    /// disagree with itself on ordering either. The one shape that *can*
+    /// evaluator in production at all — the ledger (`staging::ledger`)
+    /// always resolves its written value with a live server-side
+    /// `min()`/`max()` instead, which answers the real creation-order
+    /// question this evaluator cannot. The one shape that *can*
     /// genuinely reach this variant in production — a `KeySpace::OneToOne`
     /// field's `MIN`/`MAX` wrapping a to-many relationship path
     /// (`eval_to_many_aggregate`, issue #29), which has no live-SQL
@@ -1204,6 +1183,7 @@ fn eval_to_many_aggregate(
     reduce_numeric_aggregate(name, values, field_name)
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Evaluates every calculated field of an [`KeySpace::Aggregate`] definition
 /// against one group's full row set — the aggregate counterpart to
 /// [`evaluate`]. `SUM`/`MIN`/`MAX`/`AVG` need every row in the group up
@@ -1234,8 +1214,7 @@ pub fn evaluate_aggregate(
     // function's module doc comment on `fold_aggregate`'s own
     // relationship-free `RelationshipContext::default()`); a caller with one
     // must first substitute it (and any field referencing it bare) for a
-    // synthetic `Column`, mirroring `staging::apply_aggregate`'s forward
-    // relationship shape for fields. Keying this set by each entry's target
+    // synthetic `Column`. Keying this set by each entry's target
     // column name keeps a plain-column `GROUP BY` (the overwhelmingly common
     // case) byte-identical to before issue #137.
     let group_by: HashSet<&str> = group_by.iter().map(|k| k.target_column_name()).collect();
@@ -1264,6 +1243,7 @@ pub fn evaluate_aggregate(
     Ok(cache)
 }
 
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 fn eval_aggregate_field(
     field: &FieldDef,
@@ -1298,6 +1278,7 @@ fn eval_aggregate_field(
     Ok(value)
 }
 
+#[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
 fn eval_aggregate_expr(
     expr: &Expr,
@@ -1383,10 +1364,7 @@ fn eval_aggregate_expr(
             // `COUNT(*)` (issue #75): counts every row in the group,
             // unconditionally — unlike `SUM`/`MIN`/`MAX`/`AVG`'s
             // `fold_aggregate`, there is no per-row argument to evaluate or
-            // skip-if-NULL, so `rows.len()` is the whole computation. This
-            // also covers `row_contribution`'s single-row-slice call in
-            // `staging::apply_aggregate` (issue #11's delta model): a lone
-            // row's "contribution" to a group's count is always exactly 1.
+            // skip-if-NULL, so `rows.len()` is the whole computation.
             //
             // Issue #120: `bigint` (`Integer(Int8)`), matching Postgres's
             // own `pg_typeof(count(*))` — see `registry::AGGREGATE_FUNCTION_SPECS`'s
@@ -1481,6 +1459,7 @@ fn eval_aggregate_expr(
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Reads a bare column reference off a single row — shared by the
 /// grouping-key case in [`eval_aggregate_expr`] (any one row is
 /// representative of the whole group) and by [`fold_aggregate`]'s per-row
@@ -1507,6 +1486,7 @@ fn eval_row_scalar(
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 /// Folds `SUM`/`MIN`/`MAX`/`AVG` over `arg_expr` evaluated against every row
 /// in the group, matching Postgres's NULL handling for these aggregates: a
 /// `NULL` row is skipped entirely (not treated as zero), and if every row's
@@ -1625,8 +1605,7 @@ fn fold_aggregate(
 /// [`super::invertibility::Invertibility::RecomputeOnly`], so this function
 /// exists for the oracle/self-check cross-validation path and the to-many
 /// relationship path, not the production apply pipeline's own recompute
-/// (which asks Postgres directly — `staging::apply_aggregate`'s
-/// `probe_recompute_fields_bulk`).
+/// (which asks Postgres directly — `staging::ledger`).
 fn fold_jsonb_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
     if row_values.is_empty() {
         return None;
@@ -1675,9 +1654,7 @@ fn fold_jsonb_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
 ///   same definition disagree before this issue.
 /// * `SUM` over `bigint` is Postgres's `numeric` sum — unbounded, so it
 ///   cannot raise — and `AVG` over any exact-integer width is likewise
-///   `numeric`. Both keep going through [`Numeric`], unchanged from before,
-///   which is what keeps `staging::apply_aggregate`'s `numeric`-partial
-///   delta model exactly as correct for them as it already was.
+///   `numeric`. Both keep going through [`Numeric`], unchanged from before.
 ///
 /// # Float arguments (issue #112)
 ///
@@ -2151,9 +2128,9 @@ fn reduce_netaddr_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Val
 /// Any group with more than one distinct value raises
 /// [`EvalError::EnumOrderingUnavailable`] — see that variant's own doc
 /// comment for exactly which production paths can and cannot reach that
-/// case (in short: never the real one, `staging::apply_aggregate`'s own
-/// `KeySpace::Aggregate` `MIN`/`MAX` handling, which always asks Postgres
-/// directly instead of calling this function over a multi-row group).
+/// case (in short: never the real one, the ledger's `KeySpace::Aggregate`
+/// `MIN`/`MAX` handling, which always asks Postgres directly instead of
+/// calling this function over a multi-row group).
 fn reduce_enum_aggregate(
     name: &str,
     values: Vec<Value>,
@@ -2208,9 +2185,8 @@ fn reduce_enum_aggregate(
 /// This is *not* the gap for the overwhelmingly common case, though: a
 /// `KeySpace::Aggregate` field's own `MIN`/`MAX(text)` is always
 /// [`super::invertibility::Invertibility::RecomputeOnly`], so
-/// `staging::apply_aggregate` never calls this function over a multi-row
-/// group at all — it always asks Postgres directly (`probe_recompute_fields_bulk`),
-/// under whatever the column's *real* collation is. This function answers
+/// the ledger (`staging::ledger`) never calls this function over a
+/// multi-row group at all — it always asks Postgres directly, under whatever the column's *real* collation is. This function answers
 /// only the one case it safely can with no connection: a group whose values
 /// are all textually identical needs no ordering at all (`MIN`/`MAX` of one
 /// repeated value is that value, regardless of what order the collation
@@ -2267,11 +2243,10 @@ fn reduce_text_aggregate(
 /// rounding or order-dependence to reproduce. `super::invertibility`'s
 /// `BOOL_AND`/`BOOL_OR` arm is `RecomputeOnly` even so — a delete cannot
 /// invert a fold whose only maintained state is its own current one-bit
-/// result — so this function is reached only via
-/// `staging::apply_aggregate`'s `RecomputeOnly` probe path (a `(bool_and(
-/// <col>))::text` rendered and run server-side) and via `defs::backfill`'s
-/// plain recompute, never via a delta; the two must and do agree because
-/// both ultimately ask Postgres the same question over the same rows.
+/// result — so a production group's value comes from the ledger's
+/// recompute (`staging::ledger`, `bool_and(<col>)` run server-side) and
+/// `defs::backfill`'s plain recompute, never a delta; this function serves
+/// the oracle and the to-many relationship path.
 fn reduce_boolean_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Value>, EvalError> {
     // Defense-in-depth, as everywhere else in this module: a non-Boolean
     // value here would mean a hand-built AST bypassed the validator's own

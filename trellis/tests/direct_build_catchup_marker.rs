@@ -18,16 +18,16 @@
 //!
 //! Issue #442 is the reverse case: a change the build read whose delta drains
 //! only after the build finishes, on top of the build's own count of it. For an
-//! aggregate the recompute horizon the build stamps on each group row sends
-//! that delta to re-derive its group. Those tests check the target before
-//! the go-live catch-up runs: the horizon alone must keep it right, however
+//! aggregate the basis the build stamps on each ledger entry already shows the
+//! change, so its delta is skipped (#623 D5). Those tests check the target
+//! before the go-live catch-up runs: the basis alone must keep it right, however
 //! the late delta arrives (still in the ring, or released from quarantine),
 //! and whether it is on the source or on a relationship's to-side table.
 //!
 //! The source-keyed aggregate here ([`SKU_TOTALS`]) is relationship-fed: an
 //! extra field reads a to-one relationship's column, which keeps it on the
 //! direct build and its go-live catch-up until #625 F9. Every plain aggregate
-//! is the Re-derive build's since #625 F5, with no catch-up and no horizon.
+//! is the Re-derive build's since #625 F5, with no catch-up.
 //! Its `SUM` still shows a change counted twice.
 
 use std::collections::HashMap;
@@ -372,8 +372,9 @@ async fn total_of_sku_a(client: &Client) -> String {
 /// Drains everything staged, then discharges the go-live catch-up, checking
 /// `sku = 'a'` counts the change the build read once at both points. The
 /// first check is the one that matters: it runs before the catch-up could
-/// re-derive anything, so only the recompute horizon the build stamped on
-/// the group can have kept the drained delta from counting the change again.
+/// re-derive anything, so only the basis the build stamped on the row's
+/// ledger entry can have kept the drained delta from counting the change
+/// again.
 async fn assert_the_read_change_is_counted_once(pool: &trellis::Pool, client: &mut Client) {
     drain_to_quiescence(pool, client).await;
     assert_eq!(
@@ -389,8 +390,8 @@ async fn assert_the_read_change_is_counted_once(pool: &trellis::Pool, client: &m
 /// Issue #442: a change committed *before* the build reads the source, whose
 /// CDC is still undrained when the definition goes live. The build counts the
 /// change, and folding its delta in as well would leave the group at `2012`.
-/// The recompute horizon the build stamps on each group row it writes (#419)
-/// is above the change's LSN, so the delta re-derives the group instead.
+/// The basis the build stamps on each ledger entry shows the change, so its
+/// delta is skipped.
 #[tokio::test]
 async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_go_live() {
     let cluster = TestCluster::start();
@@ -413,8 +414,8 @@ async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_
 /// Issue #442, the quarantine half: a change from before the build, parked in
 /// `poison_held`, has left the ring, but releasing its key after go-live
 /// replays it into the now-`live` definition. Release keeps each replayed
-/// row's original LSN (doc 06), so the replay meets the build's recompute
-/// horizon like any other late delta.
+/// row's original LSN and txid (doc 06), so the replay meets the entry's basis
+/// like any other late delta.
 #[tokio::test]
 async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_released_after_go_live() {
     let cluster = TestCluster::start();

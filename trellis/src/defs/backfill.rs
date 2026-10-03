@@ -42,9 +42,9 @@
 //!    delta the ring later applies lands on a fully-built row. The build runs
 //!    as a background job after its source's capture was installed (ADR-0016,
 //!    issue #419), so a commit it read can also be captured and drain after
-//!    the flip; for an aggregate, the recompute horizon each built group row
-//!    records makes such a delta re-derive the group instead of counting the
-//!    commit twice (see [`backfill_aggregate`]). This is deliberately *not* the
+//!    the flip; for an aggregate, each ledger entry's basis (the snapshot that
+//!    read its row) makes such a delta skip a commit the build already
+//!    counted (see [`backfill_aggregate`]). This is deliberately *not* the
 //!    additive (`col = target.col + excluded.col`) merge the issue sketches as
 //!    the aggregate default: additive merge is not idempotent (a re-run or an
 //!    overlapping CDC delta double-counts) and cannot express a
@@ -52,8 +52,7 @@
 //!    Chunking by group key lets every field kind use the safe overwrite form.
 //!
 //! 3. **Per-field-kind aggregates.** Each field is built with the same SQL the
-//!    incremental bulk path (`staging::apply_aggregate::apply_forced_groups_bulk`)
-//!    emits — `SUM` keeps its hidden `__{f}_count` partial, `AVG` its
+//!    ledger's group statements (`staging::ledger`) maintain — `SUM` keeps its hidden `__{f}_count` partial, `AVG` its
 //!    `__{f}_sum`/`__{f}_count` partials with the visible column derived as
 //!    `sum/count`, `COUNT(*)` a bare `count(*)`, and everything else
 //!    (`MIN`/`MAX`/composed) its rendered expression — so a target built here
@@ -541,8 +540,7 @@ pub(crate) fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, Bac
 
 /// [`substitute_all_fields`], reshaped into a by-field-name map. The Aggregate
 /// key-space's SQL-rendering call sites (`backfill_aggregate`,
-/// `staging::apply_aggregate::classify_fields`, `staging::apply`'s aggregate
-/// dispatch, and the test oracle's `oracle::render_aggregate_select_sql`) all
+/// `staging::ledger`'s routing, and the test oracle's `oracle::render_aggregate_select_sql`) all
 /// need to look a field's self-contained expression up by name rather than
 /// walk `def.fields` positionally — this is the one substitution pass each of
 /// them shares (issue: a `GROUP BY` field like `total + total AS
@@ -1283,10 +1281,9 @@ pub(crate) fn pk_range_where(
     }
 }
 
-/// One aggregate field's build strategy — the direct-build counterpart to
-/// `staging::apply_aggregate::AggFieldKind`, kept in lockstep with
-/// `classify_fields` there (both route through [`super::invertibility::classify`]
-/// so a field lands on the same strategy either way).
+/// One aggregate field's build strategy, shared with `staging::ledger`'s
+/// routing (both route through [`super::invertibility::classify`] so a
+/// field lands on the same strategy either way).
 ///
 /// Issue #112 note: `RecomputeOnly` is no longer reachable only for
 /// `MIN`/`MAX`. A float `SUM`/`AVG` lands here too — float addition has no
@@ -1352,9 +1349,7 @@ pub(crate) fn classify_field(expr: &Expr, value_type: ValueType) -> FieldKind {
 }
 
 /// A one-argument aggregate call's argument expression — the input to
-/// whichever renderer the caller is using, mirroring
-/// `staging::apply_aggregate::agg_arg_sql` so `SUM`/`AVG` compute the same
-/// `sum(arg)`/`count(arg)` the incremental path's probes do.
+/// whichever renderer the caller is using.
 fn agg_arg_expr(expr: &Expr) -> &Expr {
     let Expr::FunctionCall { args, .. } = expr else {
         panic!("agg_arg_expr called on a non-function-call field");
@@ -1564,16 +1559,13 @@ impl SourceScan {
 ///   counted in the entry, and one that isn't, isn't. `applied_lsn` stays
 ///   null, as a Re-derive leaves it (#623 Q1).
 ///
-/// The same statement records the WAL insert position after its snapshot, the
-/// recompute horizon every group row gets (below).
-///
 /// # The group writes
 ///
 /// Every field is its own expression over the ledger instead of the source
 /// ([`super::ledger::over_ledger`]): `SUM(x)` is `sum(<x's column>)` over the
 /// group's live member entries, and so on. Each field kind writes the same
-/// columns the incremental bulk path (`apply_forced_groups_bulk`) does, so a
-/// directly-built target matches a ring-built one, plus `__trellis_members`,
+/// columns the ledger's group statements do, so a directly-built target
+/// matches an applied one, plus `__trellis_members`,
 /// the group's member count ([`ddl::MEMBERS_COLUMN`]).
 ///
 /// Non-`NULL` group keys are partitioned into `(prev, hi]` ranges over the
@@ -1594,12 +1586,6 @@ impl SourceScan {
 /// range chunking and written afterward in one unchunked pass, matched
 /// through the target's `NULLS NOT DISTINCT` constraint, which needs no
 /// row-value comparison at all.
-///
-/// # Nothing reads the ledger yet
-///
-/// Apply doesn't maintain the ledger (#623 D3 is its first reader), so it is
-/// exact only until the definition's first change. The group rows still carry
-/// issue #419's recompute horizon for today's apply path.
 async fn backfill_aggregate(
     pool: &Pool,
     def: &TransformDef,
@@ -1647,8 +1633,8 @@ async fn backfill_aggregate(
     // Every field's inferred result type, so `classify_field` can tell a
     // float `SUM` (recompute-only) from an exact one (delta-able) — issue
     // #112. Inferred here rather than threaded in because this is the same
-    // call `staging::apply_aggregate::classify_fields` makes for the same
-    // purpose, and the two paths must agree.
+    // call `staging::ledger::route` makes for the same purpose, and the two
+    // paths must agree.
     // Inference cannot actually fail here — this path only runs for a
     // definition `validate` already accepted — so a failure declines the
     // direct build (`Unsupported`, which the caller falls back to the ring
@@ -1689,41 +1675,24 @@ async fn backfill_aggregate(
     }
     ledger_cols.push(quote_ident(super::ledger::BASIS_COLUMN));
     ledger_exprs.push("__trellis_read.basis".to_string());
-    // Issue #419: the build is a live read of the source, so each group row
-    // records its recompute horizon exactly as the forced path's re-derivation
-    // does (issue #321, [`ddl::RECOMPUTE_LSN_COLUMN`]). The build runs after
-    // its source's capture was installed, so a commit it read is captured too,
-    // and that commit's delta can drain after the definition goes live. The
-    // position is read in the ledger statement, after its snapshot is taken,
-    // so every commit that statement saw ends at or below it, and such a delta
-    // re-derives its group instead of counting the commit a second time.
     let ledger_sql = format!(
         "with __trellis_read as materialized ( \
-             select pg_catalog.pg_current_snapshot() as basis, \
-                    pg_catalog.pg_current_wal_insert_lsn() as horizon \
-         ), __trellis_entries as ( \
-             insert into {ledger} ({}) \
-             select {} from {} cross join __trellis_read \
+             select pg_catalog.pg_current_snapshot() as basis \
          ) \
-         select horizon::text from __trellis_read",
+         insert into {ledger} ({}) \
+         select {} from {} cross join __trellis_read",
         ledger_cols.join(", "),
         ledger_exprs.join(", "),
         scan.relation_sql(),
     );
 
     // Build the group-row INSERT column list and, for each, the aggregate
-    // expression over the ledger that computes it — mirroring
-    // `apply_forced_groups_bulk`'s per-field-kind construction (issue #63 M3
-    // concern #3) so a directly-built target is byte-identical to a ring-built
-    // one. Group-key columns come first.
+    // expression over the ledger that computes it (issue #63 M3 concern #3). Group-key columns come first.
     // Derived from the substituted view (not raw `def.fields`) so a field that
     // only resolves to a bare `SUM`/`AVG` call *after* alias substitution
     // (e.g. `total2 = total` where `total = SUM(amount)`) gets a count-column
     // name consistent with `classify_field`'s own (also substituted)
-    // classification in the loop below — mirrors the same
-    // classify-then-derive-count-names pattern
-    // `staging::apply_aggregate::AggregateTargetPlan::new` already uses over
-    // its own substituted `field_exprs`, rather than re-deriving names from a
+    // classification in the loop below, rather than re-deriving names from a
     // raw-shape-only pass that a purely-aliased field would never match.
     let count_cols = ddl::count_column_names_from(def.fields.iter().filter_map(|f| {
         if group_by_contains(group_by, &f.name) {
@@ -1797,8 +1766,6 @@ async fn backfill_aggregate(
     }
     insert_cols.push(quote_ident(ddl::MEMBERS_COLUMN));
     group_exprs.push("count(*)".to_string());
-    // Last, and its value appended once the ledger statement has read it.
-    insert_cols.push(quote_ident(ddl::RECOMPUTE_LSN_COLUMN));
 
     let arity = group_idents.len();
     let update_sets: Vec<String> = insert_cols
@@ -1832,26 +1799,23 @@ async fn backfill_aggregate(
 
     // The ledger write, emptying the ledger first, in one transaction that
     // holds the fence like every other write the build makes.
-    let horizon: String = {
+    {
         let txn = client.transaction().await?;
         if let Some(fence) = fence
             && !fence.hold(&*txn).await?
         {
             return Err(BackfillError::Superseded);
         }
-        let horizon = load_emptied_ledger(&txn, &ledger, &ledger_sql).await?;
+        load_emptied_ledger(&txn, &ledger, &ledger_sql).await?;
         // The group deltas recorded moves between the entries just discarded
-        // (#625 F1's B4). Only a ledger-routed target has them.
-        if crate::staging::ledger::route(def, source_columns, &relationships).is_some() {
-            super::ledger::truncate_deltas(
-                &*txn,
-                &super::ledger::qualified_deltas_table(target_schema, &def.target),
-            )
-            .await?;
-        }
+        // (#625 F1's B4).
+        super::ledger::truncate_deltas(
+            &*txn,
+            &super::ledger::qualified_deltas_table(target_schema, &def.target),
+        )
+        .await?;
         txn.commit().await?;
-        horizon
-    };
+    }
     // The ledger's key and indexes, dropped for the load, built again in a
     // transaction of their own. Its first statement starts before it takes an
     // xid, so the build paused there (a test's hook point) doesn't hold back
@@ -1875,9 +1839,7 @@ async fn backfill_aggregate(
             Err(err) => return Err(err.into()),
         }
     }
-    // An LSN Postgres itself rendered (`X/Y`), so it's inlined as a literal
-    // rather than bound, keeping `$1..` for the range bounds.
-    let group_exprs_sql = format!("{}, '{horizon}'::pg_lsn", group_exprs.join(", "));
+    let group_exprs_sql = group_exprs.join(", ");
 
     let insert_for = |condition: &str| {
         format!(
@@ -1989,7 +1951,7 @@ async fn backfill_aggregate(
 }
 
 /// Empties the aggregate build's `ledger` (quoted) and runs `load`, the
-/// statement that fills it and returns the recompute horizon, on `txn`.
+/// statement that fills it, on `txn`.
 ///
 /// The load runs with the ledger's key and indexes dropped, which the caller
 /// builds again afterward from the ledger's own DDL
@@ -2003,7 +1965,7 @@ async fn load_emptied_ledger(
     txn: &tokio_postgres::Transaction<'_>,
     ledger: &str,
     load: &str,
-) -> Result<String, BackfillError> {
+) -> Result<(), BackfillError> {
     txn.batch_execute(&format!("truncate {ledger}")).await?;
     let mut drop: Vec<String> = txn
         .query(
@@ -2033,7 +1995,8 @@ async fn load_emptied_ledger(
     if !drop.is_empty() {
         txn.batch_execute(&drop.join("; ")).await?;
     }
-    Ok(txn.query_one(load, &[]).await?.get(0))
+    txn.execute(load, &[]).await?;
+    Ok(())
 }
 
 /// Prefix for the connection-scoped staging tables the relationship build

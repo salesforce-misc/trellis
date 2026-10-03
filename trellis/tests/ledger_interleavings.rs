@@ -659,7 +659,7 @@ async fn exp2_10_one_to_one() {
 
 // ------------------------------------------------------ superseded issues
 
-/// #389: two batches each create the same new group 7, above any horizon.
+/// #389: two batches each create the same new group 7.
 /// The first worker is frozen after its group upsert, with group 7's row
 /// inserted and uncommitted; the second queues behind it. Both rows count.
 #[tokio::test]
@@ -726,8 +726,8 @@ async fn issue_392_one_to_one() {
     issue_392(Flavour::OneToOne).await;
 }
 
-/// #494, the issue body's repro: key 1 goes a → z (C1) at or below z's
-/// Re-derive horizon, then z → b (C2) above it, and C1 and C2 fold into one
+/// #494, the issue body's repro: key 1 goes a → z (C1) before z's Re-derive
+/// reads, then z → b (C2) after it, and C1 and C2 fold into one
 /// batch. The Re-derive (through z's member 5, sealed before C1 and drained
 /// after it) commits with key 1 counted in z. z must end without key 1.
 ///
@@ -876,10 +876,7 @@ async fn nested_same_key_one_to_one() {
 /// Both chunks are sealed before W_in writes, because a writer may straddle
 /// only one seal (the seal gate).
 ///
-/// On `main` it passes because the aggregate re-derives whole groups live and
-/// the horizon re-derives every later change (`ignore_recompute_horizon`
-/// fails it), not because of a per-chunk basis. Under the ledger (D3, D6) it
-/// fails if a Re-derive marks as seen a change it didn't see:
+/// It fails if a Re-derive marks as seen a change it didn't see:
 ///
 /// - `applied_lsn` advanced to the read's position drops both of W_in's
 ///   changes, because their trigger `lsn`s precede both reads;

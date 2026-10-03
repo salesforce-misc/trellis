@@ -1554,8 +1554,7 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 /// the engine's own renderer).
 ///
 /// Both fields are recompute-only, which is the point: `SUM(interval)` goes
-/// through `probe_recompute_fields_bulk`'s server-side
-/// `(sum(<col>))::text`, so the value Trellis writes is Postgres's own
+/// through a server-side `sum(<col>)`, so the value Trellis writes is Postgres's own
 /// `sum(interval)` over the group in one pass. That is what makes the
 /// infinity and overflow cases in
 /// `sum_interval_is_exact_on_finite_values_but_still_recompute_only`
@@ -1811,7 +1810,7 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
 /// Before issue #248, `staging::apply::read_live_rows_batch` decoded a
 /// live-refetched row via `to_jsonb(t.*)`, which spells a `timestamp`
 /// `2024-06-15T12:34:56` — a `T` where `::text` (and a real CDC image) renders
-/// a space. `staging::apply_aggregate::derive_group_key` reads a change's
+/// a space. The old aggregate path read a change's
 /// `GROUP BY` column straight off the decoded `Row`, so a group touched once
 /// through an ordinary image-bearing change (space-spelled) and once through
 /// a live refetch (`T`-spelled, pre-#248) staged as *two* distinct group-key

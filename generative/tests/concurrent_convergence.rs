@@ -148,8 +148,8 @@
 //! within a few cases, where the tmpfs cluster converges. It needs neither
 //! the mid-burst actions nor concurrency. It is #494's shape (a key passing
 //! through a group inside one folded batch), which disk commit timing makes
-//! common: [`group_moves_converge_on_disk`] pins it, `#[ignore]`d until
-//! #556 milestone D (#623) removes the recompute horizons.
+//! common: [`group_moves_converge_on_disk`] pins it, `#[ignore]`d since
+//! before #623 D5 removed the recompute horizons.
 //!
 //! # Pinned cases
 //!
@@ -942,15 +942,14 @@ fn group_moves() -> generative::model::Program {
 /// `live` before the first op), but it does need group moves: inserts and
 /// deletes alone converge. On the tmpfs test cluster the same run converges.
 ///
-/// It is #494's shape. A batch's forced re-derive reads the source live, so
-/// it counts a key that a later, still-undrained commit moved into group
-/// `z`, and stamps the group's recompute horizon above that commit. The key
-/// then leaves `z` in a commit above the horizon, and both moves fold into
-/// one later batch as `a -> b`. The fold keeps only the first old image and
-/// the last new one, so nothing names `z` and its count is never taken back.
-/// On disk, the drain runs far enough behind the source that most group
-/// writes are such re-derives, where on tmpfs they are rare. #556 milestone D
-/// (#623) removes the horizons and lists #494 in its acceptance.
+/// It is #494's shape. On the old aggregate path a batch's forced re-derive
+/// read the source live, so it counted a key that a later, still-undrained
+/// commit moved into group `z`, and stamped the group's recompute horizon
+/// above that commit. The key then left `z` above the horizon, and both
+/// moves folded into one later batch as `a -> b`, so nothing named `z` and
+/// its count was never taken back. On disk, the drain runs far enough behind
+/// the source that most group writes were such re-derives. #623 D5 removed
+/// the horizons; the ledger entry names `z`, which is #494's acceptance.
 ///
 /// Runs [`group_moves`] `ATTEMPTS` times, each on a fresh database, in
 /// bursts of 500 ops sealed every 85ms, and fails if any attempt diverged,
@@ -965,7 +964,7 @@ fn group_moves() -> generative::model::Program {
 ///     group_moves_converge_on_disk -- --ignored --nocapture
 /// ```
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "#494's shape diverges on a disk-backed cluster until #623 (#556 milestone D); \
+#[ignore = "#494's shape needs a disk-backed cluster (it diverged on one until #623 D5); \
             run with GENERATIVE_CLUSTER_DIR set"]
 async fn group_moves_converge_on_disk() {
     const ATTEMPTS: usize = 20;
@@ -1306,8 +1305,8 @@ fn hot_key_case_3_11_loads() {
 /// recomputes are #494's shape: a key passing through a group inside one
 /// folded batch, under a recompute horizon. And #649's review saw up to 22
 /// `deadlock detected` per run between the three definitions' aggregate
-/// pre-locks (#326's group pre-lock). #623 removes both the horizons and the
-/// pre-lock. The pin keeps the relationship fields, and `t4`'s `rel_agg` has
+/// pre-locks (#326's group pre-lock). #623 D5 removed both the horizons and
+/// the pre-lock. The pin keeps the relationship fields, and `t4`'s `rel_agg` has
 /// diverged too, so it re-checks #624's factored relationships as well.
 ///
 /// Runs the case `GENERATIVE_PIN_ATTEMPTS` times, each on a fresh database
@@ -1325,8 +1324,9 @@ fn hot_key_case_3_11_loads() {
 /// exit check wants a hundred or more attempts, split over several
 /// processes. It respects `GENERATIVE_CLUSTER_DIR`, so it runs on disk too.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "diverges or never converges in 0-19% of runs, by box load, until #623/#624 \
-            (#556 milestones D and E); run with GENERATIVE_PIN_ATTEMPTS set"]
+#[ignore = "diverged or never converged in 0-19% of runs, by box load, before #623 D5 \
+            (20/20 after it, unloaded; #624 is #556 milestone E); run with \
+            GENERATIVE_PIN_ATTEMPTS set"]
 async fn hot_key_case_3_11_converges() {
     let Some(attempts) = std::env::var(PIN_ATTEMPTS_ENV).ok().map(|v| {
         v.parse::<usize>()
@@ -1543,8 +1543,8 @@ const MID_BURST_NOT_GATED: &[(&str, &str)] = &[BUILD_UNDER_LOAD, OUT_OF_ORDER_DR
 /// [`hot_key_case_3_11_converges`]). The cooling-key tier fails a few in 100:
 /// its short seal cadence makes #494's shape (a key passing through a group
 /// inside one folded batch, pinned as [`group_moves_converge_on_disk`]) far
-/// more common, so its bar is looser until #623 removes the recompute
-/// horizons that shape needs (#557 part 3b's PR).
+/// more common, so its bar was set looser while the recompute horizons that
+/// shape needs were still there (#557 part 3b's PR; #623 D5 removed them).
 fn sweep_tier() -> SweepTier {
     match std::env::var(PLANT_TIER_ENV).as_deref() {
         Err(_) | Ok("cooling_key") => SweepTier {
@@ -1602,7 +1602,6 @@ fn plant_reaches(plant: &str, key_space: &trellis::dev::defs::ast::KeySpace) -> 
         // 1-1 target takes the Re-derive build's chunks since #625 F8a.
         Some(
             Plant::DropRacingGroupDelta
-            | Plant::IgnoreRecomputeHorizon
             | Plant::SkipLedgerLock
             | Plant::LsnOnlySkip
             | Plant::MergeWithoutDelete,

@@ -486,11 +486,11 @@ async fn a_one_to_one_row_deleted_during_the_build_is_gone_at_live() {
 /// once the definition is `catching_up`, so that delete is applied rather
 /// than skipped, but it hasn't drained when the go-live sweep finds `b`
 /// empty and drops its row. A new row lands in `b` after the discharge, and
-/// both deltas drain against a group with no row. The sweep raised the
-/// target's extinct horizon above the delete, so `b` is re-derived from the
-/// source (50). Folded as deltas from nothing instead, the delete subtracts
-/// a row the target no longer counts: `b` would be left at a count of 0 and
-/// a `NULL` total, with row 5 in the source.
+/// both deltas drain against a group with no row. Each applies to its row's
+/// ledger entry, so `b` comes out as the source has it (50). Folded as deltas
+/// onto the group row instead, the delete subtracts a row the target no
+/// longer counts: `b` would be left at a count of 0 and a `NULL` total, with
+/// row 5 in the source.
 #[tokio::test]
 async fn a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled() {
     let cluster = TestCluster::start();

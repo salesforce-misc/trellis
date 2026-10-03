@@ -190,7 +190,7 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
 
         // Issue #111: an exact-integer argument is as invertible as a
         // `numeric` one, and for the same reason — `SUM`/`AVG` fold through
-        // `staging::apply_aggregate`'s `numeric` running partials either
+        // the ledger's (`staging::ledger`) `numeric` running partials either
         // way (`sum(int2|int4)` is a `bigint` column fed by a `numeric`
         // delta, `avg(<int>)` is `numeric` outright). Enumerating it here
         // rather than leaving it to the `_ => None` fallback below is the
@@ -233,9 +233,9 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
         //    arrive, so it can raise where the recompute it is checked
         //    against succeeds.
         //
-        // Recompute-only removes both: `apply_aggregate`'s
-        // `probe_recompute_fields_bulk` renders `(sum(<col>))::text` and
-        // lets Postgres fold the group in one pass, so the engine raises
+        // Recompute-only removes both: the ledger's recompute renders
+        // `sum(<col>)` over the group's entries and lets Postgres fold the
+        // group in one pass, so the engine raises
         // exactly when and only when a server-side `sum()` over the same
         // rows would. This is the same conclusion #112 reached for float
         // `SUM`/`AVG` by a different route — there the arithmetic is total
@@ -305,13 +305,13 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
         // module's [`PartialField`] enum was never built for (`AVG`'s
         // `Sum`/`Count` partials are counting the *fold*, not one bit's
         // occurrences per value) and would need matching new plumbing in
-        // `staging::apply_aggregate`'s carrier/probe machinery — a
+        // the ledger's maintained fields (`staging::ledger`) — a
         // deliberately larger change this issue's scope (wire the two
         // aggregates up, per the epic's own framing) does not take on
         // speculatively. Recompute-only costs nothing incremental here
         // regardless: [`super::registry::aggregate_result_type`] makes
-        // `bool_and`/`bool_or` reach `staging::apply_aggregate`'s ordinary
-        // `AggFieldKind::RecomputeOnly` fallback with no further wiring, the
+        // `bool_and`/`bool_or` reach the ledger's ordinary recomputed-field
+        // path with no further wiring, the
         // same free ride `SUM(interval)` and float `SUM`/`AVG` get.
         ("BOOL_AND", AggregateArg::Column(_)) | ("BOOL_OR", AggregateArg::Column(_)) => {
             Some(Verdict::recompute_only())
@@ -346,11 +346,11 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
         // invertible (a per-bit-position true/false population count,
         // generalizing bool_and's false-count idea to `n` independent
         // per-position counters) is real but out of this issue's scope —
-        // the same `PartialField`/`staging::apply_aggregate` plumbing gap,
+        // the same `PartialField`/`staging::ledger` plumbing gap,
         // now `n`-wide instead of one bit. Recompute-only costs nothing
         // incremental to wire up: `registry::aggregate_result_type` routes
-        // `bit_and`/`bit_or` into `staging::apply_aggregate`'s ordinary
-        // `AggFieldKind::RecomputeOnly` fallback, the same free ride
+        // `bit_and`/`bit_or` into the ledger's ordinary recomputed-field
+        // path, the same free ride
         // `bool_and`/`bool_or` and float `SUM`/`AVG` get.
         ("BIT_AND", AggregateArg::Column(_)) | ("BIT_OR", AggregateArg::Column(_)) => {
             Some(Verdict::recompute_only())

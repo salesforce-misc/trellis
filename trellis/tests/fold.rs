@@ -585,57 +585,6 @@ async fn origin_lsn_least_merges_while_lsn_greatest_advances() {
     );
 }
 
-/// Issue #321: `min_image_lsn` is the LEAST `lsn` over a key's image-bearing
-/// rows only. A recompute row (NULL `lsn`) and an image-less row with a real
-/// `lsn` must not pull it down, and a key with no image-bearing row at all
-/// folds it to `None`, while `lsn` still GREATEST-advances over every row.
-#[tokio::test]
-async fn min_image_lsn_is_the_least_lsn_over_image_bearing_rows_only() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    let update = |lsn: u64, old: &'static str, new: &'static str| RawRow {
-        key: "k",
-        op: "update",
-        lsn: Some(lsn),
-        old_image: Some(old),
-        new_image: Some(new),
-        origin_lsn: None,
-        src_changed: true,
-        hop_gen: 0,
-        group_key: None,
-    };
-    insert_row(&client, "seg_0", &update(300, r#"{"v":2}"#, r#"{"v":3}"#)).await;
-    insert_row(&client, "seg_0", &update(100, r#"{"v":1}"#, r#"{"v":2}"#)).await;
-    insert_row(&client, "seg_0", &RawRow::recompute("k", 0)).await;
-    // Image-less but LSN-bearing: below every image-bearing row, so it would
-    // win a plain `min(lsn)`.
-    insert_row(
-        &client,
-        "seg_0",
-        &RawRow {
-            lsn: Some(50),
-            old_image: None,
-            new_image: None,
-            ..update(0, "", "")
-        },
-    )
-    .await;
-    insert_row(&client, "seg_0", &RawRow::recompute("bare", 0)).await;
-
-    let seg_seq = seal_active_segment(&mut client).await;
-    let txn = client.transaction().await.expect("begin fold txn");
-    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
-        .await
-        .expect("fold");
-
-    let record = find(&folded, "k");
-    assert_eq!(record.min_image_lsn, Some(PgLsn::from(100)));
-    assert_eq!(record.lsn, Some(PgLsn::from(300)));
-    assert_eq!(find(&folded, "bare").min_image_lsn, None);
-}
-
 /// A straddler — a row landing in the predecessor slot's half of the fence —
 /// folds in correctly, ties this to the both-slots window (not just the
 /// fold's own slot). Mirrors `sealing.rs`'s
@@ -1045,128 +994,6 @@ async fn has_recompute_survives_a_fold_with_the_keys_cdc_change() {
     assert!(find(&folded, "bare").has_recompute);
 }
 
-/// Issue #486: a key inserted and deleted in one batch folds to neither
-/// image, and `vanished_images` keeps the insert's post-image and the
-/// delete's pre-image so the record still names its groups. A key with an
-/// image on either side, or with no image-bearing row at all, carries none.
-#[tokio::test]
-async fn a_key_born_and_died_in_the_batch_keeps_the_images_that_name_its_groups() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    let row =
-        |key: &'static str, op: &'static str, lsn: u64, old: Option<&'static str>, new| RawRow {
-            key,
-            op,
-            lsn: Some(lsn),
-            old_image: old,
-            new_image: new,
-            origin_lsn: None,
-            src_changed: true,
-            hop_gen: 0,
-            group_key: None,
-        };
-    // Born into group a, moved to b, died there.
-    insert_row(
-        &client,
-        "seg_0",
-        &row("moved", "insert", 10, None, Some(r#"{"g":"a"}"#)),
-    )
-    .await;
-    insert_row(
-        &client,
-        "seg_0",
-        &row(
-            "moved",
-            "update",
-            20,
-            Some(r#"{"g":"a"}"#),
-            Some(r#"{"g":"b"}"#),
-        ),
-    )
-    .await;
-    insert_row(
-        &client,
-        "seg_0",
-        &row("moved", "delete", 30, Some(r#"{"g":"b"}"#), None),
-    )
-    .await;
-    // Born and died in the same group: one image, not two copies of it.
-    insert_row(
-        &client,
-        "seg_0",
-        &row("same", "insert", 10, None, Some(r#"{"g":"z"}"#)),
-    )
-    .await;
-    insert_row(
-        &client,
-        "seg_0",
-        &row("same", "delete", 20, Some(r#"{"g":"z"}"#), None),
-    )
-    .await;
-    // A recompute's prior-image hint is not a death image.
-    insert_row(
-        &client,
-        "seg_0",
-        &row("same", "recompute", 0, Some(r#"{"g":"hint"}"#), None),
-    )
-    .await;
-    // Inserted then updated: it still has a post-image.
-    insert_row(
-        &client,
-        "seg_0",
-        &row("born", "insert", 10, None, Some(r#"{"g":"a"}"#)),
-    )
-    .await;
-    insert_row(
-        &client,
-        "seg_0",
-        &row(
-            "born",
-            "update",
-            20,
-            Some(r#"{"g":"a"}"#),
-            Some(r#"{"g":"c"}"#),
-        ),
-    )
-    .await;
-    insert_row(
-        &client,
-        "seg_0",
-        &row("died", "delete", 20, Some(r#"{"g":"d"}"#), None),
-    )
-    .await;
-    insert_row(&client, "seg_0", &RawRow::recompute("bare", 0)).await;
-
-    let seg_seq = seal_active_segment(&mut client).await;
-    let txn = client.transaction().await.expect("begin fold txn");
-    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
-        .await
-        .expect("fold");
-
-    let moved = find(&folded, "moved");
-    assert_eq!((&moved.old_image, &moved.new_image), (&None, &None));
-    let mut vanished = moved.vanished_images.clone();
-    vanished.sort();
-    assert_eq!(
-        vanished,
-        vec![r#"{"g": "a"}"#.to_string(), r#"{"g": "b"}"#.to_string()]
-    );
-    assert_eq!(moved.min_image_lsn, Some(PgLsn::from(10)));
-
-    let same = find(&folded, "same");
-    assert_eq!(same.vanished_images, vec![r#"{"g": "z"}"#.to_string()]);
-    assert!(same.has_recompute);
-
-    for key in ["born", "died", "bare"] {
-        assert!(
-            find(&folded, key).vanished_images.is_empty(),
-            "{key} must carry no vanished images"
-        );
-    }
-}
-
 /// Issue #620 (ADR-0002's fold rule under I8): an image-less `delete` is the
 /// key's final state within a fold window, whatever precedes it. Under
 /// NEW-only capture a delete carries no image, and the old "latest row with
@@ -1300,7 +1127,6 @@ async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
     let born = find(&folded, "born-then-deleted");
     assert_eq!((&born.old_image, &born.new_image), (&None, &None));
     assert!(born.ends_in_delete);
-    assert_eq!(born.vanished_images, vec![r#"{"v": 4}"#.to_string()]);
 
     let reinserted = find(&folded, "deleted-then-reinserted");
     assert_eq!(reinserted.new_image, Some(r#"{"v": 5}"#.to_string()));

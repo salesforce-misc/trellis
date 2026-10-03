@@ -18,8 +18,7 @@
 //! already type-agnostic (`("MIN" | "MAX", AggregateArg::Column(_)) =>
 //! RecomputeOnly`, unconditional on type, since before this issue), and a
 //! `KeySpace::Aggregate` field's `MIN`/`MAX` was already resolved entirely
-//! by a server-side `min()`/`max()` push-down
-//! (`staging::apply_aggregate::probe_recompute_fields_bulk`/`probe_field_value`),
+//! by a server-side `min()`/`max()` push-down,
 //! never a Rust-side fold. The actual gap was purely at the *admission*
 //! layer: `registry::aggregate_result_type` fell through to `None` for
 //! `Text` because it wasn't in the numeric family and had no early-return

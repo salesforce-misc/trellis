@@ -35,24 +35,22 @@
 //!    and are not exposed (issue #125's `key_array_filter` already sidesteps
 //!    it for its own bulk lookups).
 //! 3. **The `GROUP BY` key role's *final SQL* half was already safe despite
-//!    the same divergence**, because `staging::apply_aggregate`'s keyset
-//!    match always binds the group key as a native-typed array
+//!    the same divergence**, because the old aggregate path's keyset
+//!    match bound the group key as a native-typed array
 //!    (`$1::text[]::boolean[]`), which parses *either* spelling back to the
 //!    same value via `boolin` — a permissive input function — before ever
 //!    comparing. That is why `validate::reject_unsupported_group_by_key_type`
 //!    already admitted `ValueType::Boolean` before this issue.
 //! 4. **...but that in-memory-only left a second, genuinely live bug this
-//!    issue found and fixed**: `accumulate_changes` buckets one drain
-//!    batch's touched rows into `GroupPlan`s keyed by `derive_group_key`'s
-//!    own `text` — a bare Rust `HashMap` key, compared byte-for-byte with
+//!    issue found and fixed**: the old path bucketed one drain
+//!    batch's touched rows by the group key's own `text` — a bare Rust `HashMap` key, compared byte-for-byte with
 //!    no database (and so no `boolin`) anywhere in the loop. A row that
 //!    arrived with the `'t'` spelling and one that arrived with the
-//!    `'true'` spelling used to land in *two* separate `GroupPlan`s that
+//!    `'true'` spelling used to land in *two* separate groups that
 //!    both independently wrote to the one row the SQL layer correctly
 //!    resolved them to — silently corrupting its value rather than visibly
 //!    splitting it into two rows the way #248's pre-fix `timestamp` did.
-//!    `apply_aggregate::canonicalize_group_key_part` (a no-op for every
-//!    type but `Boolean`) closes that gap;
+//!    Canonicalizing a `Boolean` key part closed that gap;
 //!    `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
 //!    below reproduces the corruption end-to-end and pins the fix.
 //!
@@ -435,9 +433,7 @@ async fn bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone() {
 /// `staging::apply::row_as_text_jsonb_sql`'s `<col>::text` cast, `'true'`/
 /// `'false'`) must still land as **one** target row, not two — proving the
 /// `GROUP BY` key role really is safe despite the renderer divergence this
-/// file's other tests establish, because `staging::apply_aggregate`'s
-/// keyset match re-parses both spellings through `boolin` before comparing
-/// natively rather than matching either spelling as raw text.
+/// file's other tests establish.
 ///
 /// This is the positive counterpart to
 /// `boolean_is_refused_as_a_relationship_join_key_and_primary_key`: the

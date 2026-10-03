@@ -17,10 +17,7 @@
 //! Either way it is a 1-1 row whose source row was deleted, or an aggregate
 //! group every one of whose source rows went away (or, for a
 //! relationship-path `GROUP BY` key, moved to another group when the to-side
-//! row changed). Nothing enumerates a key that isn't there, and an
-//! aggregate's image-less `Recompute` for a vanished key can't even say which
-//! group it left (`staging::apply_aggregate`'s module doc, "Image-less
-//! changes").
+//! row changed). Nothing enumerates a key that isn't there.
 //!
 //! So the discharge also deletes those rows directly: every target row with
 //! no source row that maps to its key, found by one anti-join per swept
@@ -49,9 +46,9 @@
 //!
 //! - **Unbacked at *S***: deleted, whatever the source holds by the time the
 //!   delete runs. A change after *S* that backs the key again drains after
-//!   the commit and re-derives it: a 1-1 upsert, or an aggregate delta onto a
-//!   group with no row, which builds it from nothing or, at or below the
-//!   extinct horizon, re-derives it (see "Pending deltas on a deleted group").
+//!   the commit and re-derives it: a 1-1 upsert, or an aggregate change onto
+//!   its ledger entry, which builds the group again from its entries (see
+//!   "Pending deltas on a deleted group").
 //! - **Backed at *S***: kept, and the source row backing it at *S* is
 //!   enumerated, so its `Recompute` re-derives the row or group from live
 //!   state. A change after *S* that empties the group folds with that
@@ -107,21 +104,12 @@
 //! committed before *S* that hasn't drained yet, which the definition
 //! applies once it drains (it is `live` or `catching_up` by then). That is
 //! routine for a `catching_up` definition, which has been applying since
-//! its build finished. Such a delta lands on a group with no row, and if
-//! the group has been refilled by then, apply's existence check keeps it,
-//! so a delete the sweep already accounted for is subtracted from nothing
-//! (the group is left at a count of 0 and a `NULL` total, with a row in the
-//! source).
-//!
-//! This is the situation issue #321's extinct horizon exists for: a live
-//! read (here, the anti-join) found a group empty while deltas for commits
-//! it saw may still be in flight. So the discharge raises the extinct
-//! horizon of every aggregate target the sweep deleted from
-//! ([`raise_extinct_horizons`]), in the same transaction, and a delta on a
-//! group with no row at or below it re-derives the group from the source.
+//! its build finished. On the ledger (#623 D5) such a change applies to its
+//! row's entry, not to the group row: the entry's basis says whether the
+//! change is already counted, and the group is written from its live
+//! entries, so a group refilled by then comes out as the source has it.
 //! `a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled`
-//! pins this. A direct-build rebuild raises it again after its read, which
-//! is at least as high.
+//! pins this.
 //!
 //! # Which definitions are swept
 //!
@@ -169,7 +157,7 @@
 //! issue #128), so the anti-join is split by which grouping columns are
 //! `NULL` in the target row: within one such pattern a `NULL` column matches
 //! a source row whose key is `IS NULL`, and every other column matches with
-//! `=`. That's the same rule `apply_aggregate::keyset_match` applies per
+//! `=`. That's the same rule [`keyset_match_cols`] applies per
 //! batch. There is one branch per pattern present in the target when the
 //! sweep is planned, usually one. The patterns are read before *S*, so one
 //! more branch catches a row with any other pattern, with `IS NOT DISTINCT
@@ -190,7 +178,6 @@ use crate::defs::model::RelationshipCardinality;
 use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
 use crate::defs::{TransformStatus, parse};
 use crate::pool::quote_ident;
-use crate::staging::apply_aggregate;
 use crate::staging::target_mutations::TargetMutations;
 
 use super::IntakeError;
@@ -224,10 +211,6 @@ struct Match {
 pub(super) struct Swept {
     /// Target rows deleted, across every swept target.
     pub(super) deleted: usize,
-    /// The aggregate targets it deleted at least one group from, whose
-    /// extinct horizons the caller must raise before it commits
-    /// ([`raise_extinct_horizons`]).
-    pub(super) emptied_aggregates: BTreeSet<String>,
 }
 
 /// The tag the discharge read's enumeration branch selects. Each swept
@@ -242,7 +225,6 @@ struct SweptTarget {
     target: String,
     target_ident: String,
     key_cols: Vec<PrimaryKeyColumn>,
-    aggregate: bool,
     /// The read's `UNION ALL` branches that find this target's unbacked
     /// rows ([`orphan_branch_sql`]).
     branches: Vec<String>,
@@ -336,7 +318,6 @@ impl Sweep {
                         target: target.clone(),
                         target_ident: target_ident.clone(),
                         key_cols: key_cols.clone(),
-                        aggregate: true,
                         branches: vec![ledger_orphan_branch_sql(
                             tag,
                             &target,
@@ -387,7 +368,6 @@ impl Sweep {
                 target,
                 target_ident,
                 key_cols,
-                aggregate: matches!(def.key_space, KeySpace::Aggregate { .. }),
                 branches,
                 returning,
                 has_image: image_expr.is_some(),
@@ -477,7 +457,7 @@ impl Sweep {
         let arrays: Vec<Vec<Option<String>>> = (0..arity)
             .map(|j| keys.iter().map(|key| key[j].clone()).collect())
             .collect();
-        let cols: Vec<String> = (0..arity).map(apply_aggregate::keyset_col).collect();
+        let cols: Vec<String> = (0..arity).map(keyset_col).collect();
         // Each value is cast back from its text on its own (rather than the
         // array as a whole), so any key type with a text input works, an
         // array-typed one included.
@@ -526,10 +506,7 @@ impl Sweep {
             typed.join(", "),
             arrays_sql.join(", "),
             cols.join(", "),
-            apply_aggregate::keyset_match_cols(
-                &target_cols,
-                &apply_aggregate::null_patterns(&arrays)
-            ),
+            keyset_match_cols(&target_cols, &null_patterns(&arrays)),
             arity + 1,
             arity + 2,
             target.returning,
@@ -553,46 +530,16 @@ impl Sweep {
             self.mutations
                 .record(&target.target, row.get(0), prior, 0, None, None);
         }
-        if target.aggregate {
-            self.swept.emptied_aggregates.insert(target.target.clone());
-        }
         self.swept.deleted += rows.len();
         Ok(())
     }
 
     /// Flushes every deleted row through the target-mutation seam, in `txn`,
-    /// and returns what the sweep deleted. The caller passes
-    /// [`Swept::emptied_aggregates`] to [`raise_extinct_horizons`] in the
-    /// same transaction ("Pending deltas on a deleted group").
+    /// and returns what the sweep deleted.
     pub(super) async fn finish(self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
         self.mutations.flush(txn).await?;
         Ok(self.swept)
     }
-}
-
-/// Raises the extinct horizon (issue #321, `aggregate_extinct_horizon`) of
-/// each of `targets` to the current WAL insert position: the sweep's
-/// counterpart of the raise apply makes after a live read finds a group
-/// empty. See "Pending deltas on a deleted group" in the module doc. The
-/// discharge calls it last, just before it commits, so it takes each
-/// horizon row's lock only for the transaction's final statements rather
-/// than across the watermark wait; a later position is still at or above every
-/// commit the sweep saw.
-pub(super) async fn raise_extinct_horizons(
-    txn: &Transaction<'_>,
-    targets: &BTreeSet<String>,
-) -> Result<(), IntakeError> {
-    for target in targets {
-        txn.execute(
-            "insert into aggregate_extinct_horizon (target_table, lsn) \
-             values ($1, pg_current_wal_insert_lsn()) \
-             on conflict (target_table) do update \
-             set lsn = greatest(aggregate_extinct_horizon.lsn, excluded.lsn)",
-            &[target],
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 /// A 1-1 target's key is the source's own key, column for column, by name
@@ -617,8 +564,8 @@ fn one_to_one_match(key_cols: &[PrimaryKeyColumn]) -> Match {
 
 /// An aggregate target's key is its grouping columns. A plain-column key
 /// reads the source column; a relationship-path key (issue #137) reads the
-/// to-side column through the same `LEFT JOIN` every other source probe of an
-/// aggregate uses (`apply_aggregate::probe_group_exists`), so a source row
+/// to-side column through a `LEFT JOIN`, as the ledger's reads do, so a
+/// source row
 /// with no matching to-side row backs the `NULL` group, exactly as the build
 /// and the live apply group it. Each value is cast to the target column's type
 /// (the build writes it through the same assignment), which also keeps both
@@ -903,6 +850,66 @@ fn ledger_orphan_branch_sql(
     )
 }
 
+/// The `k`-alias column name for the `i`th `GROUP BY` column in a keyset
+/// `unnest(...)`. Named `c0`, `c1`, … so they never
+/// collide with the source/target's own (arbitrarily-named) grouping columns
+/// when both appear in one query's join condition.
+fn keyset_col(i: usize) -> String {
+    format!("c{i}")
+}
+
+/// The distinct patterns of `NULL` `GROUP BY` columns among a keyset's groups
+/// (`arrays[j]` holding column `j`'s value for each group): `pattern[i]` is whether
+/// column `i` is `NULL`. Sorted, so the SQL [`keyset_match_cols`] renders
+/// from them is deterministic. A batch with no `NULL` key has exactly one pattern,
+/// all `false`.
+fn null_patterns(arrays: &[Vec<Option<String>>]) -> Vec<Vec<bool>> {
+    let group_count = arrays.first().map_or(0, Vec::len);
+    (0..group_count)
+        .map(|g| arrays.iter().map(|a| a[g].is_none()).collect())
+        .collect::<BTreeSet<Vec<bool>>>()
+        .into_iter()
+        .collect()
+}
+
+/// Matches `cols` against the keyset relation `k`: one arm per
+/// [`null_patterns`] entry, `or`ed together (and parenthesized) when there
+/// is more than one. Within an arm, column `i` is `<col> = k.c<i>`, or
+/// `<col> is null and k.c<i> is null` where the pattern has it `NULL`. A
+/// group matches only its own pattern's arm, so this is exactly `is not
+/// distinct from` on every column, but indexable (issue #445).
+fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
+    let arms: Vec<String> = patterns
+        .iter()
+        .map(|pattern| {
+            cols.iter()
+                .zip(pattern)
+                .enumerate()
+                .map(|(i, (col, &null))| {
+                    let k = keyset_col(i);
+                    if null {
+                        format!("{col} is null and k.{k} is null")
+                    } else {
+                        format!("{col} = k.{k}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" and ")
+        })
+        .collect();
+    debug_assert!(!arms.is_empty(), "a keyset match needs at least one group");
+    match arms.as_slice() {
+        [arm] => arm.clone(),
+        _ => format!(
+            "({})",
+            arms.iter()
+                .map(|arm| format!("({arm})"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod db_tests {
     //! The sweep against a real catalog and real targets: issue #485 runs it
@@ -1097,7 +1104,6 @@ mod db_tests {
         );
         let swept = sweep(&txn, &ids).await;
         assert_eq!(swept.deleted, 0, "nothing to delete");
-        assert!(swept.emptied_aggregates.is_empty());
 
         txn.batch_execute("insert into public.orders_copy (id, a) values (-1, 0)")
             .await
@@ -1106,10 +1112,6 @@ mod db_tests {
         assert_eq!(
             swept.deleted, 1,
             "the planted orphan is the only row deleted"
-        );
-        assert!(
-            swept.emptied_aggregates.is_empty(),
-            "a 1-1 target has no extinct horizon"
         );
     }
 
@@ -1178,7 +1180,6 @@ mod db_tests {
         txn.commit().await.expect("commit");
 
         assert_eq!(swept.deleted, 2, "group a and the NULL group");
-        assert!(swept.emptied_aggregates.contains("public.orders_by_g"));
         let groups: Vec<Option<String>> = raw
             .query("select g from public.orders_by_g order by g", &[])
             .await
@@ -1350,6 +1351,39 @@ mod db_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyset_match_renders_one_arm_per_null_pattern() {
+        let cols = vec![r#"t."g""#.to_string(), r#"t."h""#.to_string()];
+        let arrays = vec![
+            vec![Some("1".to_string()), None, Some("2".to_string())],
+            vec![Some("a".to_string()), Some("b".to_string()), None],
+        ];
+        assert_eq!(
+            null_patterns(&arrays),
+            vec![vec![false, false], vec![false, true], vec![true, false]]
+        );
+        assert_eq!(
+            null_patterns(&[vec![Some("1".to_string()), Some("2".to_string())]]),
+            vec![vec![false]],
+            "a batch with no NULL key has the one all-false pattern"
+        );
+
+        assert_eq!(
+            keyset_match_cols(&cols, &[vec![false, false]]),
+            r#"t."g" = k.c0 and t."h" = k.c1"#
+        );
+        assert_eq!(
+            keyset_match_cols(&cols, &[vec![false, true]]),
+            r#"t."g" = k.c0 and t."h" is null and k.c1 is null"#
+        );
+        assert_eq!(
+            keyset_match_cols(&cols, &null_patterns(&arrays)),
+            r#"((t."g" = k.c0 and t."h" = k.c1) or "#.to_string()
+                + r#"(t."g" = k.c0 and t."h" is null and k.c1 is null) or "#
+                + r#"(t."g" is null and k.c0 is null and t."h" = k.c1))"#
+        );
+    }
 
     fn part(col: &str, source_sql: &str, nullable: bool) -> KeyPart {
         KeyPart {

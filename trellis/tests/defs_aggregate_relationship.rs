@@ -92,10 +92,7 @@ async fn stage_cdc(
     let src_table = qualify_fixture_table(src_table);
     let table = active_seg_table(client).await;
     // The WAL position now, which is at or past the commit of the write this
-    // stands in for, as capture's own `lsn` would be. A fixed low value would
-    // sit below the recompute horizon the direct build stamps (#419), which
-    // sends the change down the live re-derive path instead of the delta
-    // path these tests exercise.
+    // stands in for, as capture's own `lsn` would be (issue #512).
     client
         .execute(
             &format!(
@@ -519,12 +516,10 @@ async fn updating_a_to_side_row_updates_every_dependent_group() {
 ///
 /// Row 10 (`post = 1`, tag `rust`) is re-pointed to `post = 2` — the same
 /// `GROUP BY` group (`tag` is unchanged, so this is a same-group in-place
-/// update, not a grain migration), but `accumulate_changes` must still
-/// resolve the row's relationship read *twice*, once per side, off each
-/// side's own `post` value (`row_contribution` under `old_row`'s `post = 1`
-/// vs. `new_row`'s `post = 2`) — exactly the case a naive single-resolution
-/// implementation (resolving once off, say, the new row only) would get
-/// wrong.
+/// update, not a grain migration), but the row's relationship read must
+/// resolve off the new `post` value while the old contribution (`post = 1`)
+/// is taken back — exactly the case a naive single-resolution implementation
+/// would get wrong.
 #[tokio::test]
 async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contributions() {
     let cluster = TestCluster::start();
@@ -602,9 +597,8 @@ async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contrib
 /// old side must still subtract its real contribution; the new side must
 /// resolve to `NULL` and contribute nothing, exactly as `to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappears`
 /// (`defs_relationship_nullability.rs`) pins for the *forward-read* path —
-/// this is that same "resolves to nothing" outcome, but reached by
-/// `accumulate_changes`'s own old/new resolution rather than the reverse
-/// path re-deriving the group from scratch.
+/// this is that same "resolves to nothing" outcome, but reached by a
+/// from-side change rather than by the reverse path.
 #[tokio::test]
 async fn a_from_side_re_point_to_a_nonexistent_parent_subtracts_the_old_contribution() {
     let cluster = TestCluster::start();
@@ -942,24 +936,14 @@ async fn two_relationships_sharing_a_to_side_column_name_resolve_independently()
 // through an *ordinary* forward delta (never image-less, so never
 // `force_full_recompute`).
 //
-// Before issue #136, every group of a relationship-reading aggregate target
-// was forced onto `apply_forced_groups_bulk` (`force_every_group`), which
-// already joined the to-side table correctly — so `upsert_group`'s
-// `probe_field_value` and `apply_delta_groups_bulk`'s
-// `probe_recompute_fields_bulk` could never actually be reached for such a
-// target, regardless of how many groups one batch touched. #136 deleted that
-// routing: `SUM`/`AVG`/`COUNT` fields (even ones reading a relationship path)
-// now fold incrementally through the ordinary ("delta") path, but a `MIN`/
-// `MAX` field on that same target is still `RecomputeOnly` and gets probed
-// live — through whichever of those two functions `apply_aggregate_target`
-// picks based on how many groups the batch touched (`upsert_group` for
-// exactly one, `apply_delta_groups_bulk` for more than one). Both functions
-// rendered the `RecomputeOnly` expression through the relationship-unaware
-// `oracle::render_expr_sql` and built no `JOIN` for it at all, so either path
-// panicked (`render_expr_sql called on an unresolved relationship path`) the
-// moment a real batch reached it — `apply_delta_groups_bulk`'s corner is what
-// the generative fuzz suite caught; `upsert_group`'s single-group corner is
-// the same defect, uncovered by close reading during this fix.
+// On the old aggregate path (deleted in #623 D5), after #136 a `MIN`/`MAX`
+// field on such a target was probed live, through a single-group or a bulk
+// probe depending on how many groups the batch touched. Both rendered the
+// expression through the relationship-unaware `oracle::render_expr_sql` with
+// no `JOIN`, so either panicked (`render_expr_sql called on an unresolved
+// relationship path`) the moment a real batch reached it — the bulk corner is
+// what the generative fuzz suite caught. On the ledger both shapes are one
+// group touched or several in one batch.
 //
 // `MIXED_TOTALS` gives every group both kinds at once: `SUM(id)` (`id` is a
 // plain, non-relationship column — invertible, folds via the delta path
@@ -1043,8 +1027,7 @@ async fn add_low_word_count_post(client: &Client) {
 }
 
 /// The single-touched-group corner: one forward insert, one group touched,
-/// so `apply_aggregate_target` routes it through `upsert_group` —
-/// `probe_field_value`'s corner of this regression.
+/// the old path's single-group probe corner of this regression.
 #[tokio::test]
 async fn sum_and_relationship_min_mixed_single_group_forward_insert() {
     let cluster = TestCluster::start();
@@ -1113,9 +1096,8 @@ async fn sum_and_relationship_min_mixed_single_group_forward_insert() {
 }
 
 /// The multi-touched-group corner: two forward inserts landing in different
-/// groups within the same drain batch, so `apply_aggregate_target` routes it
-/// through `apply_delta_groups_bulk` — `probe_recompute_fields_bulk`'s corner
-/// of this regression, and the one the generative fuzz suite's
+/// groups within the same drain batch — the old path's bulk probe corner of
+/// this regression, and the one the generative fuzz suite's
 /// `property_convergence_holds_across_a_mid_stream_scale_out` caught.
 #[tokio::test]
 async fn sum_and_relationship_min_mixed_two_groups_in_one_batch() {
@@ -1164,8 +1146,7 @@ async fn sum_and_relationship_min_mixed_two_groups_in_one_batch() {
     .await;
     // Both 'rust' and 'db' are touched in the same batch (two groups, so the
     // bulk path) — must not panic (pre-fix: same `render_expr_sql` panic as
-    // the single-group corner above, from `probe_recompute_fields_bulk`
-    // instead of `probe_field_value`).
+    // the single-group corner above).
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let totals = mixed_target_totals(&client).await;
@@ -1327,12 +1308,8 @@ async fn an_invalid_aggregate_definition_leaves_no_target_table() {
 // in `COUNT` rather than `SUM`, inside a `GROUP BY` definition.
 //
 // Before #120 this shape couldn't even parse (`COUNT` only accepted `*` in
-// an aggregate definition). The parser/validator/`apply_aggregate` fixes
-// #120 landed are all generic over *which* function wraps a relationship
-// path — `build_forward_relationship_shape`'s `substitute_relationship_path`
-// call rewrites every field's expression the same way regardless of the
-// wrapping function name (issue #94/#136 machinery, unmodified by #120) —
-// but #120's own test files only exercise `COUNT(<plain column>)`, never
+// an aggregate definition). The fixes #120 landed are all generic over
+// *which* function wraps a relationship path — but #120's own test files only exercise `COUNT(<plain column>)`, never
 // `COUNT(<rel>.<column>)`. This is the front-door regression test that
 // shape actually landed working, through all three propagation directions
 // this file's `SUM(post.word_count)` tests already cover for `SUM`.

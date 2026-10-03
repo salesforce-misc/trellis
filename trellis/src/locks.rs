@@ -42,14 +42,14 @@ use std::time::{Duration, Instant};
 /// application transaction, a stuck chunk, an operator's `LOCK TABLE`. #617's
 /// drain waited 1 h 50 min; this bounds that to two minutes.
 ///
-/// **Interim value, sized for the aggregate group pre-lock (#326).** Drain
-/// pages that touch the same groups queue on it one behind another, so the
-/// last of eight workers waits out seven pages. `bench fold-in-ratio` at
+/// **Interim value, sized for the aggregate group pre-lock (#326), which #623
+/// D5 deleted.** Drain pages that touched the same groups queued on it one
+/// behind another, so the last of eight workers waited out seven pages. `bench fold-in-ratio` at
 /// ratio 10 (40k groups, every page touching most of them) measured the
 /// longest page transaction, wait included, at 89 s (eight ~28k-record pages
 /// queued together) and 100k-record pages at 47 s in steady state; a 5 s
 /// timeout fired 75 times there, each retry losing its place in the queue.
-/// #623 deletes the pre-lock, and should bring this back down.
+/// With the pre-lock gone this can be re-measured and brought back down.
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The per-attempt `lock_timeout` for DDL on a user table whose lock

@@ -134,7 +134,9 @@ pub enum FailureClass {
 pub fn classify(err: &ApplyError) -> FailureClass {
     match innermost_apply_error(err) {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
-        ApplyError::HopBoundExceeded { .. } => FailureClass::Halting,
+        ApplyError::HopBoundExceeded { .. } | ApplyError::AggregateOffLedger { .. } => {
+            FailureClass::Halting
+        }
         // Both of these mean "this definition can never work against this
         // source's real schema" — a structural, schema-shape diagnosis
         // exactly like the hop bound, not a per-row data problem. By the
@@ -1895,9 +1897,8 @@ async fn quarantine_if_crossed(
 // [`crate::defs::ast::KeySpace::OneToOne`] definitions (plain or
 // relationship-enriched). [`crate::defs::ast::KeySpace::Aggregate`] fields
 // are never attributed here and can never be paused by the automatic fuse —
-// `staging::apply_aggregate`'s incremental delta model (recently the subject
-// of its own delicate bug fixes) has no notion of "skip this one column and
-// keep accumulating the others," and inventing one is a materially bigger
+// the aggregate ledger (`staging::ledger`) has no notion of "skip this one
+// column and keep accumulating the others," and inventing one is a materially bigger
 // project than this amendment. An aggregate transform's overall lifecycle
 // status (the existing whole-transform fuse) is completely unaffected by
 // this scope cut.
@@ -3284,7 +3285,6 @@ mod unit_tests {
             src_changed: Some(std::time::SystemTime::UNIX_EPOCH),
             origin_lsn: None,
             lsn: None,
-            min_image_lsn: None,
             hop_gen: 0,
             first_seen: std::time::SystemTime::UNIX_EPOCH,
             group_key: None,
@@ -3294,7 +3294,6 @@ mod unit_tests {
             prior_image: None,
             row_count: 1,
             has_recompute: false,
-            vanished_images: Vec::new(),
             ends_in_delete: false,
             last_change: None,
         }
@@ -3631,6 +3630,16 @@ mod unit_tests {
         let err = ApplyError::HopBoundExceeded {
             hop_gen: 40,
             tables: vec!["t".to_string()],
+        };
+        assert_eq!(classify(&err), FailureClass::Halting);
+    }
+
+    /// Every key of an off-ledger aggregate target reproduces the failure,
+    /// so isolating it would quarantine the whole target a key at a time.
+    #[test]
+    fn classify_maps_an_off_ledger_aggregate_to_halting() {
+        let err = ApplyError::AggregateOffLedger {
+            target: "t".to_string(),
         };
         assert_eq!(classify(&err), FailureClass::Halting);
     }

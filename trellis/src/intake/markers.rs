@@ -772,8 +772,7 @@ async fn enumeration_branch(txn: &Transaction<'_>, src_table: &str) -> Result<St
     // `col::text` for a NOT NULL column (every real primary key; see
     // `ddl::encode_key_part`'s "`PrimaryKeyColumn::nullable` selects the
     // encoding" for why that must stay raw), the NULL-sentinel encoding for
-    // a nullable grouping column (matching
-    // `staging::apply_aggregate::derive_group_key`, issue #110), and the
+    // a nullable grouping column (issue #110), and the
     // composite separator escape at arity > 1 (issue #200), all in declared
     // key order (issue #163).
     let key_expr = crate::defs::ddl::pk_key_sql_expr(&key_cols, None);
@@ -1550,7 +1549,7 @@ async fn discharge_marker(
     if declared {
         fetch_read(&txn, &marker.table, &mut sweep).await?;
     }
-    let swept = sweep.finish(&txn).await?;
+    sweep.finish(&txn).await?;
     // Issue #507: a target's rebuild wrote it outside the seam, so no seam
     // row carried its changes into a relationship's settled projection.
     // Issue #522: a source to-side re-read by a catch-up may have had changes
@@ -1602,9 +1601,6 @@ async fn discharge_marker(
     .await?;
     go_live(&txn, &ring).await?;
     go_live_caught_up(&txn, &marker.table, catching_up).await?;
-    // A group the sweeps deleted can still have deltas staged for it; see
-    // `resume_orphans`' "Pending deltas on a deleted group".
-    super::resume_orphans::raise_extinct_horizons(&txn, &swept.emptied_aggregates).await?;
     if enumerate {
         txn.execute("select pg_notify($1, '')", &[&wake_channel])
             .await?;
@@ -3723,9 +3719,9 @@ mod catch_up_tests {
     /// Group 0 is empty when the discharge's orphan delete runs, so its
     /// pre-pause row goes, and it is repopulated before the job reads the
     /// source. The job builds it from the new row, and that row's CDC,
-    /// draining after the flip, must not count it again: its LSN is at or
-    /// below the recompute horizon the build stamped on the group, so it
-    /// re-derives the group instead of adding 100 to it (200).
+    /// draining after the flip, must not count it again: the row's ledger
+    /// entry's basis already says the build's read counted it, so the insert
+    /// doesn't add 100 to the group (200).
     #[tokio::test]
     async fn a_group_repopulated_before_the_rebuild_reads_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
@@ -3781,14 +3777,13 @@ mod catch_up_tests {
         );
     }
 
-    /// The extinct-horizon half of the build's horizon. Group 0 is emptied
-    /// while the definition is paused, with those deletes' CDC still staged
-    /// when it goes live again, and the discharge's orphan delete drops the
-    /// group's row, so the job writes none. A new row lands in the group after
-    /// the job read, and its CDC drains in one batch with the deletes, against
-    /// a group with no row. The deletes are at or below the extinct horizon
-    /// the build raised, so the group is re-derived: 100. Folded as deltas
-    /// instead, the deletes would subtract rows the build never counted: 88.
+    /// Group 0 is emptied while the definition is paused, with those
+    /// deletes' CDC still staged when it goes live again, and the discharge's
+    /// orphan delete drops the group's row, so the job writes none. A new row
+    /// lands in the group after the job read, and its CDC drains in one batch
+    /// with the deletes, against a group with no row. The build never read
+    /// the deleted rows, so their ledger entries are non-members and the
+    /// deletes move nothing: the group is just the new row, 100, not 88.
     #[tokio::test]
     async fn a_group_emptied_before_the_rebuild_reads_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
@@ -3847,7 +3842,7 @@ mod catch_up_tests {
 
     /// Runs `sql` on `writer`, then stages `cdc` for it the way a capture trigger would,
     /// at a real LSN past the write's commit: an apply that compares it with
-    /// a recompute horizon must see it as the later commit it is.
+    /// a ledger entry's basis must see it as the later commit it is.
     async fn write_orders(writer: &mut tokio_postgres::Client, sql: &str, cdc: &[OrderCdc<'_>]) {
         writer.batch_execute(sql).await.expect("write orders");
         let lsn: PgLsn = writer

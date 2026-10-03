@@ -377,15 +377,9 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     ))
     .await?;
     // The target's ledger (#623 D2) and group deltas (#625 F1) went with it
-    // just above. Its extinct
-    // horizon and its truncate floor (#623 D3) are keyed by the target's
+    // just above. Its truncate floor (#623 D3) is keyed by the target's
     // name, so without this a later target of the same name would inherit
-    // them.
-    txn.execute(
-        "delete from aggregate_extinct_horizon where target_table = $1",
-        &[&qualified],
-    )
-    .await?;
+    // it.
     txn.execute(
         "delete from ledger_truncate_floor where target_table = $1",
         &[&qualified],

@@ -1,16 +1,14 @@
 //! Integration tests for issue #131 (epic #127): the to-one relationship
-//! reverse **delta** — a parent-keyed record carrying the parent's old/new
-//! image and a `(prev_lsn, lsn)` chain, applied as paired subtract-old/
-//! add-new over the parent's from-side rows, replacing the pre-#131
-//! image-less from-side `Recompute` for to-one relationships specifically.
-//! See `trellis/tests/spikes/issue-102-PLAN-DRAFT.md` §2 and §7 Phase 1
-//! steps 4-5, and `staging::apply`'s own module doc comment (the "Issue
-//! #131, epic #127" section) for the mechanism.
+//! reverse path — a parent-keyed record carrying the parent's old/new image
+//! and a `(prev_lsn, lsn)` chain, which advances the parent's projection
+//! under #132's guards and re-derives the parent's from-side rows. #131's
+//! true-delta fast path is gone since #623 D5: an aggregate's Re-derive
+//! reads the parent live. See `staging::apply`'s "Issue #131, epic #127"
+//! section for the mechanism.
 //!
 //! Reuses issue #94's `defs_aggregate_relationship.rs` schema/fixture
-//! (`post_tags` from-side, `posts` to-side, `SUM`/`COUNT` grouped by `tag`)
-//! since it's already exactly the fully-invertible, single-relationship
-//! shape this issue's fast path targets, and its dangling reference (a
+//! (`post_tags` from-side, `posts` to-side, `SUM`/`COUNT` grouped by `tag`),
+//! whose dangling reference (a
 //! `post_tags` row pointing at `post = 999`, which doesn't exist in the seed
 //! data) doubles as a ready-made parent-insert fixture.
 
@@ -72,11 +70,9 @@ fn qualify_fixture_table(name: &str) -> String {
 /// The tests here need distinct LSNs in a chosen order (the fold's "latest
 /// wins" rule, the reverse record's `lsn`/`prev_lsn` chain, a child commit
 /// that precedes its parent's), so they stage at `base + N` rather than at
-/// the insert position of the moment. The base still has to be real: every
-/// aggregate group the definition's build wrote carries that build's
-/// recompute horizon, and a change staged below it re-derives its group
-/// instead of applying the reverse path's delta, so the delta arithmetic
-/// these tests are about would never run.
+/// the insert position of the moment. The base still has to be real, so a
+/// staged change looks like capture's: a commit after the setup it follows
+/// (issue #512).
 async fn staging_base(client: &Client) -> u64 {
     u64::from(testkit::wal_insert_lsn(client).await)
 }
@@ -492,8 +488,7 @@ async fn a_parent_recompute_folded_with_its_update_still_rederives_the_from_side
         )
         .await
         .expect("make row 10 and rust stale, then update post 1");
-    // Above the build's recompute horizon, so the delta isn't re-derived
-    // on that account.
+    // A real commit LSN, after the build, as capture would stamp.
     let lsn: PgLsn = client
         .query_one("select pg_current_wal_insert_lsn()", &[])
         .await
@@ -955,8 +950,8 @@ async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
 
     // Apply B: prev_lsn is stale — guard (d) rejects and B is re-staged as
     // one `rel_reverse_deferred` row (issue #134), not a from-side
-    // Recompute fan-out. Neither A's fast-path delta (no downstream readers
-    // of tag_totals) nor B's own deferral branch (it `continue`s past the
+    // Recompute fan-out. Neither A's apply (no downstream readers of
+    // tag_totals) nor B's own deferral branch (it `continue`s past the
     // `needs_recompute_fallback`/projection-advance code) stages anything
     // else, so whatever lands in the now-active ring segment is exactly
     // this test's signal.
@@ -1110,9 +1105,8 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
 }
 
 /// Issue #327 review: a deferred reverse's retry must read its old and new
-/// images the right way round. A retry never takes the fast-path delta
-/// (`!fast_path_safe`), so an update's retry recomputes from live rows and
-/// can't tell them apart; a delete's can. Its retry must delete the parent's
+/// images the right way round. An update's retry recomputes from live rows
+/// and can't tell them apart; a delete's can. Its retry must delete the parent's
 /// projection row (old image only). Read backwards, it would see a keyless
 /// old side and an imageless new side, touch nothing, and leave the deleted
 /// parent's row serving its last value forever.
@@ -1348,20 +1342,11 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
 ///
 /// Deliberately uses the `articles`/`categories` `KeySpace::OneToOne`
 /// fixture (`article_cat_def`, below), **not** this file's usual
-/// `post_tags`/`posts` aggregate fixture: at the time this test was written,
-/// an aggregate definition's forward path went through `apply_aggregate`'s
-/// `rel_joins`/`force_every_group` mechanism (out of scope for this issue —
-/// see the plan doc §7 step 8 and this crate's own review notes), which
-/// never called `build_relationship_context` and so never reached the #133
-/// gen-bump code at all — a `KeySpace::OneToOne` definition reading a
-/// relationship was the only shape that exercised it on the forward path.
-/// Issue #136 (epic #127) later deleted `force_every_group` and wired the
-/// aggregate forward path through `build_relationship_context` too (see
-/// `apply_aggregate`'s module doc comment), so this distinction no longer
-/// holds — but this test's own fixture choice is left as-is rather than
-/// migrated, since it already covers the `KeySpace::OneToOne` shape
-/// correctly and `defs_aggregate_relationship.rs`/`apply_relationship_forward.rs`
-/// cover the aggregate shape.
+/// `post_tags`/`posts` aggregate fixture: when this test was written, only a
+/// `KeySpace::OneToOne` definition reached the #133 gen-bump code on the
+/// forward path. That no longer holds, but the fixture stays, since
+/// `defs_aggregate_relationship.rs`/`apply_relationship_forward.rs` cover the
+/// aggregate shape.
 #[tokio::test]
 async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_parents_gen() {
     let cluster = TestCluster::start();
@@ -1706,10 +1691,9 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
         "guard (c) must reject before ever touching the projection"
     );
     // Issue #134: guard (c) defers and re-stages the record itself, rather
-    // than falling back to a live from-side enumeration — the retry's own
-    // fast-path delta (once row 20's segment has drained and the in-flight
-    // condition clears) is what ends up picking up row 20 live, via the
-    // same `from_side_rows_for_trigger_txn` read the pre-#134 fallback used.
+    // than falling back to a live from-side enumeration — the retry (once
+    // row 20's segment has drained and the in-flight condition clears) is
+    // what ends up re-deriving row 20.
     assert_eq!(
         staged_deferred_reverses(&client, relationship.id).await,
         vec![("1".to_string(), 1, 0)],
@@ -1821,8 +1805,8 @@ async fn all_four_guards_pass_and_the_children_are_rederived_in_the_ordinary_cas
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
         Some(PgLsn::from(base + 100)),
-        "all four guards passed, so the true-delta path must have advanced \
-         the projection to this record's own lsn"
+        "all four guards passed, so the reverse must have advanced the \
+         projection to this record's own lsn"
     );
     let mut recompute_keys = staged_recompute_keys(&client, "post_tags").await;
     recompute_keys.sort();
@@ -1976,11 +1960,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
          retry round: guard (c) defers again on the very first retry\
          attempt, since row 21's own CDC shares the deferred record's \
          segment and so still reads as undrained mid-transaction; the \
-         second retry (once that segment has actually committed) passes. \
-         See issue #134's `retry_count == 0` fast-path gate (this module's \
-         own comment on it) for why this doesn't corrupt the total despite \
-         row 21's own forward apply having already folded its contribution \
-         into the group by the time the delta finally applies."
+         second retry (once that segment has actually committed) passes."
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
@@ -1988,6 +1968,179 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
         "the retried delta must eventually advance the projection to B's \
          own lsn"
     );
+}
+
+/// How [`parent_and_child_race`] drains
+/// the child's change (segment A) and the parent's (segment B).
+#[derive(Clone, Copy, Debug)]
+enum Race {
+    /// Both changes in one segment, folded into one batch.
+    OneBatch,
+    /// Two workers each claim and compute their segment before either
+    /// applies; the child's applies first.
+    ChildAppliesFirst,
+    /// As `ChildAppliesFirst`, but the parent's applies first.
+    ParentAppliesFirst,
+    /// The child's change is computed while post 1 is still 100, the parent
+    /// commits 400, and only then does the child's apply: its ledger
+    /// statement reads the parent as it is at apply, not at compute. The
+    /// parent's change is staged after that.
+    ParentCommitsMidApply,
+}
+
+/// #623 D5: a parent change and a child change landing on the same group,
+/// hand-driven through each order they can reach apply in. Row 12 (post 1)
+/// moves from `db` to `rust` while post 1 goes from 100 to 400, so the
+/// child's change reads the parent and the parent's change re-derives the
+/// child. With the fast path gone, every child Re-derive reads the parent
+/// live, so whichever order they apply in, the target must match the
+/// hand-written `GROUP BY` oracle.
+async fn parent_and_child_race(race: Race) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        target_totals(&client).await,
+        tag_totals_oracle(&client).await,
+        "precondition: the build matches the oracle"
+    );
+
+    client
+        .execute("update post_tags set tag = 'rust' where id = 12", &[])
+        .await
+        .expect("move row 12 to rust");
+    let update_post = async |client: &Client| {
+        client
+            .execute("update posts set word_count = 400 where id = 1", &[])
+            .await
+            .expect("update post 1");
+    };
+    if !matches!(race, Race::ParentCommitsMidApply) {
+        update_post(&client).await;
+    }
+    let base = staging_base(&client).await;
+    stage_cdc_with_group_key_at_lsn(
+        &client,
+        "post_tags",
+        "12",
+        "update",
+        Some(r#"{"id":12,"post":1,"tag":"db"}"#),
+        Some(r#"{"id":12,"post":1,"tag":"rust"}"#),
+        base + 100,
+        &["1"],
+    )
+    .await;
+    let seg_a = match race {
+        Race::OneBatch => None,
+        Race::ChildAppliesFirst | Race::ParentAppliesFirst => {
+            Some(seal_active_segment(&mut client).await)
+        }
+        Race::ParentCommitsMidApply => {
+            let seg_a = seal_active_segment(&mut client).await;
+            let plan_a = claim_fold_compute(&db.pool, seg_a, "worker_a").await;
+            update_post(&client).await;
+            let mut phase3 = db.pool.get().await.expect("connection");
+            let txn = phase3.transaction().await.expect("begin phase 3");
+            apply::apply_and_mark_drained(
+                &txn,
+                seg_a,
+                "worker_a",
+                &plan_a,
+                "trellis_reverse_test",
+                &StagedWatermark::saturated(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("apply worker_a: {e}"));
+            txn.commit().await.expect("commit phase 3");
+            assert_eq!(
+                target_totals(&client).await.get("rust"),
+                Some(&(Some("4".to_string()), Some("750".to_string()))),
+                "before the parent's change drains: row 12 at post 1's live 400, \
+                 row 10 still at the 100 its entry counted, row 11 at 250"
+            );
+            None
+        }
+    };
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some(r#"{"id":1,"word_count":100}"#),
+        Some(r#"{"id":1,"word_count":400}"#),
+        base + 200,
+    )
+    .await;
+
+    if let Some(seg_a) = seg_a {
+        let seg_b = seal_active_segment(&mut client).await;
+        let plan_a = claim_fold_compute(&db.pool, seg_a, "worker_a").await;
+        let plan_b = claim_fold_compute(&db.pool, seg_b, "worker_b").await;
+        let mut order = [(seg_a, "worker_a", &plan_a), (seg_b, "worker_b", &plan_b)];
+        if matches!(race, Race::ParentAppliesFirst) {
+            order.reverse();
+        }
+        for (seg, worker, plan) in order {
+            let mut phase3 = db.pool.get().await.expect("connection");
+            let txn = phase3.transaction().await.expect("begin phase 3");
+            apply::apply_and_mark_drained(
+                &txn,
+                seg,
+                worker,
+                plan,
+                "trellis_reverse_test",
+                &StagedWatermark::saturated(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("apply {worker}: {e}"));
+            txn.commit().await.expect("commit phase 3");
+        }
+        retire_drained_segments(&mut client)
+            .await
+            .expect("retire drained segments");
+    }
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(totals, tag_totals_oracle(&client).await, "{race:?}");
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("4".to_string()), Some("1050".to_string()))),
+        "{race:?}: rows 10 and 12 at post 1's 400, row 11 at 250, row 13 null"
+    );
+}
+
+#[tokio::test]
+async fn a_parent_change_racing_a_child_change_on_the_same_group_in_one_batch() {
+    parent_and_child_race(Race::OneBatch).await;
+}
+
+#[tokio::test]
+async fn a_parent_change_racing_a_child_change_on_the_same_group_child_first() {
+    parent_and_child_race(Race::ChildAppliesFirst).await;
+}
+
+#[tokio::test]
+async fn a_parent_change_racing_a_child_change_on_the_same_group_parent_first() {
+    parent_and_child_race(Race::ParentAppliesFirst).await;
+}
+
+#[tokio::test]
+async fn a_parent_committing_between_a_child_change_computing_and_applying() {
+    parent_and_child_race(Race::ParentCommitsMidApply).await;
 }
 
 // ---------------------------------------------------------------------
@@ -2030,12 +2183,10 @@ async fn target_category_name(client: &Client, id: i32) -> Option<String> {
         .get(0)
 }
 
-/// A `KeySpace::OneToOne` target reading a to-one relationship is design
-/// fork 1 in `build_reverse_relationship_shape`'s doc comment — it has no
-/// additive semantics to delta, so it stays on the pre-#131 image-less
-/// `Recompute` mechanism (`ReverseRelationshipShape::needs_recompute_fallback`)
-/// rather than being folded into the new fast path. This just proves that
-/// fallback still converges correctly post-#131 — a regression check for
+/// A `KeySpace::OneToOne` target reading a to-one relationship re-derives its
+/// from-side rows with an image-less `Recompute`
+/// (`ReverseRelationshipShape::needs_recompute_fallback`). This proves that
+/// fallback converges — a regression check for
 /// the exact scenario `apply_relationship_forward.rs`'s fixture uses.
 #[tokio::test]
 async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
@@ -2266,8 +2417,7 @@ async fn deferring_past_the_fairness_threshold_escalates_instead_of_spinning_for
         projection_lsn(&client, &projection_table, 1).await,
         Some(PgLsn::from(base + 100)),
         "escalation must advance the settled parent projection to this transition's \
-         own lsn immediately, even though guard (a) — which does not gate the \
-         projection write, only the fast-path delta — is still failing"
+         own lsn immediately, even though guard (a) is still failing"
     );
 
     retire_drained_segments(&mut client)
@@ -3061,55 +3211,18 @@ async fn each_guard_increments_its_own_deferral_metric() {
     }
 }
 
-/// Review follow-up to issue #134: the `retry_count > 0` restriction alone
-/// (this module's first attempt at closing the old `force_every_group`-vs-
-/// `diff_pass` staleness hazard) was too narrow — it only ever protected a
-/// record that was *itself* previously guard-rejected. This test originally
-/// reproduced that hazard directly: `force_every_group` (removed by issue
-/// #136, epic #127) used to make an *ordinary* sibling insert's own forward
-/// evaluation do a **live** SQL join straight back to the to-side table, so
-/// a sibling that drained between the parent's live write and the parent's
-/// own CDC being staged would settle the whole group to the *already
-/// updated* live total — an "old" era `diff_pass` could then wrongly
-/// re-add a delta on top of.
+/// Review follow-up to issue #134: a sibling insert that drained between the
+/// parent's live write and the parent's own CDC being staged. The old
+/// aggregate path once settled the sibling's group from the *already
+/// updated* live parent, and the reverse fast path then re-added the
+/// parent's delta on top; a precondition routed such a record to the
+/// fallback instead.
 ///
-/// **Post-#136**, an ordinary from-side insert to a relationship-reading
-/// aggregate never live-reads the to-side table at all: it resolves the
-/// relationship the same way a `KeySpace::OneToOne` target already did
-/// (issue #130's settled parent projection), so the sibling below now
-/// settles 'rust' using the *old*, still-unbumped projection value (100),
-/// never the live-updated one (400) — the specific staleness hazard this
-/// test used to reproduce is no longer reachable through this path at all
-/// (see `apply_aggregate`'s module doc comment's "Relationship-reading
-/// aggregates" section). What survives, and what this test now proves
-/// instead: `relationship_fast_path_precondition_holds` (issue #134's own
-/// review follow-up) does not know *why* a sibling row touched this parent
-/// key — it conservatively treats any matching CDC row in the LSN window as
-/// disqualifying, whether or not that row could actually have raced this
-/// reverse — so it still routes this record to the pre-#131 image-less
-/// fallback exactly as before, and that fallback must still converge to the
-/// true total. This is deliberately left as-is (more conservative than
-/// strictly necessary post-#136), not tightened here: doing so would need
-/// `relationship_fast_path_precondition_holds` to distinguish "a sibling
-/// that resolved via the safe settled-projection path" from "one that could
-/// have live-read a mid-flight value," which no longer exists as a
-/// distinction to draw now that no forward path does the latter — a
-/// possible follow-up simplification, not a correctness gap (the fallback
-/// this routes to is always correct, just more conservative than it now
-/// strictly needs to be).
-///
-/// `relationship_fast_path_precondition_holds` scans every physical ring
-/// row — not just still-undrained ones — for a sibling touching this key,
-/// so the *already-drained-but-not-yet-retired* sibling here still leaves a
-/// trace it can find (this test deliberately never calls
-/// `retire_drained_segments`, so that trace survives — see that function's
-/// own doc comment for the residual gap once retirement *does* run).
-///
-/// **#623 D5:** the target is now on the ledger, which reads parents live
-/// again (in the ledger statement, after the entry lock) and always
-/// re-derives the children of a parent change, so the sibling's Apply
-/// counts the live 400 and the fast path's precondition is never asked.
-/// The scenario stays as an end-to-end check that it converges.
+/// **#623 D5:** the fast path and its precondition are gone. The target is on
+/// the ledger, which reads parents live (in the ledger statement, after the
+/// entry lock) and always re-derives the children of a parent change, so the
+/// sibling's Apply counts the live 400 and the parent's change re-derives
+/// every child. The scenario stays as an end-to-end check that it converges.
 #[tokio::test]
 async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_does_not_corrupt_a_first_attempt()
  {
@@ -3132,18 +3245,9 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
 
     // This test's own lsns must be real, monotonically-increasing WAL
     // positions, not this file's usual small hand-picked placeholders
-    // (`100`, `200`, ...): `record.prev_lsn` (the lower bound
-    // `relationship_fast_path_precondition_holds` checks the sibling's own
-    // lsn against) comes from the settled parent projection's
-    // `__trellis_lsn`, which backfill stamps from a *real*
-    // `pg_current_wal_lsn()` at relationship-creation time — a large value
-    // already, by the time this test's own staging starts, from all the
-    // real WAL activity `create_schema`/`create_relationship`/
-    // `drain_to_quiescence` above generate. A hand-picked small lsn for the
-    // sibling below would (harmlessly, but misleadingly) sit *below* that
-    // baseline and never satisfy the "committed after the projection's own
-    // last-known-good position" test this function's own doc comment
-    // describes — masking the very hazard this test exists to prove closed.
+    // (`100`, `200`, ...): `record.prev_lsn` comes from the settled parent
+    // projection's `__trellis_lsn`, which backfill stamps from a *real*
+    // `pg_current_wal_lsn()`, so a small lsn would sit below it.
     let base: u64 = u64::from(
         client
             .query_one("select pg_current_wal_lsn()", &[])
@@ -3196,11 +3300,9 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     .expect("drain_once sibling_seg")
     .is_some()
     {}
-    // Deliberately *not* calling `retire_drained_segments` here: this test
-    // is the case `relationship_fast_path_precondition_holds` is meant to
-    // catch (the sibling's ring row is still physically present, just
-    // marked drained) — see that function's own doc comment for why an
-    // already-*retired* sibling is a different, still-open story.
+    // Deliberately *not* calling `retire_drained_segments` here: the
+    // sibling's ring row stays physically present, just marked drained, as
+    // in the scenario the old precondition caught.
 
     let totals_before_parent_cdc = target_totals(&client).await;
     assert_eq!(
@@ -3243,13 +3345,9 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     // Guards (a)/(b)/(c)/(d) all genuinely pass here (nothing rejects the
     // record outright — the sibling is *not* in flight by guard (c)'s own,
     // unchanged "still undrained" definition), so this never becomes a
-    // `rel_reverse_deferred` row at all. It's the fast-path-vs-fallback
-    // decision, one level deeper, that must route to the fallback: the
-    // whole `aggregate_shapes` loop is skipped for this record (not just
-    // the touched 'rust' group), so *every* from-side row matching post 1
-    // — rows 10 and 12 ('rust' and 'db' respectively) and the new row 40 —
-    // gets an image-less `Recompute`, the same shape
-    // `needs_recompute_fallback` already uses.
+    // `rel_reverse_deferred` row at all. *Every* from-side row matching
+    // post 1 — rows 10 and 12 ('rust' and 'db' respectively) and the new
+    // row 40 — gets an image-less `Recompute`.
     let mut recompute_keys = staged_recompute_keys(&client, "post_tags").await;
     recompute_keys.sort();
     assert_eq!(
@@ -3261,14 +3359,12 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
         staged_deferred_reverses(&client, relationship.id)
             .await
             .is_empty(),
-        "no guard actually rejected this record — only the fast-path's own \
-         extra precondition did — so nothing should be staged as \
+        "no guard rejected this record, so nothing should be staged as \
          rel_reverse_deferred here"
     );
 
-    // The reverse's own delta write was routed to the fallback (not
-    // `diff_pass`), so nothing has corrected 'rust' yet at this point —
-    // it's still the pre-fallback, sibling-only total from above, not yet
+    // The reverse writes no delta, so nothing has corrected 'rust' yet at
+    // this point — it's still the sibling-only total from above, not yet
     // double-corrected *or* under-corrected. The re-staged `Recompute`s
     // (rows 10/12/40, asserted above) are what bring it to the true final
     // value once they drain, below.
@@ -3279,16 +3375,14 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
         "the fallback's own image-less Recomputes haven't drained yet (that \
          happens below), so the group must still read exactly the same as \
          it did right after the sibling's own forward apply — no partial or \
-         double correction from this transaction's own reverse write, which \
-         was routed entirely to the fallback"
+         double correction from this transaction's own reverse"
     );
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
         Some(PgLsn::from(base + 100)),
         "guards all genuinely passed, so the projection must still advance \
-         to this record's own lsn — only the *fast-path write* was routed \
-         to the fallback, not the whole record"
+         to this record's own lsn"
     );
 
     // The re-staged `Recompute`s for rows 10/12/40 must still drain

@@ -22,15 +22,14 @@
 //!    type-checked at all once the grammar accepted it. Fixed with a
 //!    `COUNT`-specific early return in `infer_expr` that validates the
 //!    argument unconditionally (Postgres's own `count(x)` accepts any type).
-//! 3. **Two silently-wrong SQL renderers**: `staging::apply_aggregate`'s
-//!    forced-full-recompute paths (`upsert_group`'s single-group probe and
-//!    `apply_forced_groups_bulk`'s bulk `INSERT ... SELECT`) both hardcoded
-//!    `count(*)` for every [`AggFieldKind::Count`] field — correct for
+//! 3. **Two silently-wrong SQL renderers**: the old aggregate path's
+//!    (deleted in #623 D5) forced-full-recompute paths, single-group and
+//!    bulk, both hardcoded `count(*)` for every `COUNT` field — correct for
 //!    `COUNT(*)`, silently wrong for `COUNT(<column>)` (it would have
 //!    written the group's *row count*, not the column's non-null count, any
 //!    time an image-less recompute trigger forced that field's group onto
 //!    the full-recompute path). `count_column_forced_full_recompute_...`
-//!    below exercises exactly that path.
+//!    below now drives image-less recomputes through the ledger instead.
 //!
 //! Bundled in, since `docs/type-support.md` (#111's own "exact integer
 //! semantics" note) explicitly earmarks it for this issue: `COUNT` is now
@@ -156,11 +155,8 @@ async fn stage_delete(client: &Client, key: &str, src_table: &str, old_image: &s
         .unwrap_or_else(|e| panic!("stage delete {key} into {table}: {e}"));
 }
 
-/// A bare recompute trigger — no image at all — which
-/// `staging::apply_aggregate::accumulate_changes` cannot fold as a delta
-/// (no prior state to diff against), so it forces the touched group onto
-/// [`GroupPlan::force_full_recompute`] — the path this issue's `probe_count`
-/// fix targets.
+/// A bare recompute trigger — no image at all — which the ledger turns into a
+/// Re-derive of its own key's entry, read live.
 async fn stage_bare_recompute(client: &Client, key: &str, src_table: &str) {
     let table = active_seg_table(client).await;
     let src_table = format!("{DEFAULT_SCHEMA}.{src_table}");
@@ -436,12 +432,12 @@ async fn count_column_delta_path_tracks_null_transitions_and_deletes() {
 // 4. Forced full recompute: an image-less recompute trigger
 // ---------------------------------------------------------------------
 
-/// Targets the bug this issue's review found: `staging::apply_aggregate`'s
+/// Targets the bug this issue's review found: the old aggregate path's
 /// forced-full-recompute paths used to hardcode `count(*)` for *every*
-/// [`AggFieldKind::Count`] field — correct for `COUNT(*)`, silently wrong
+/// `COUNT` field — correct for `COUNT(*)`, silently wrong
 /// for `COUNT(<column>)` (it would have written the row count instead of
-/// the non-null count). A bare recompute trigger (no image) forces its
-/// group onto exactly that path.
+/// the non-null count). A bare recompute trigger (no image) now Re-derives
+/// its key's ledger entry.
 #[tokio::test]
 async fn count_column_forced_full_recompute_still_excludes_nulls() {
     let cluster = TestCluster::start();
@@ -459,9 +455,8 @@ async fn count_column_forced_full_recompute_still_excludes_nulls() {
 
     // A bare recompute trigger carries no image at all. Since #623 D3 this
     // target is on the ledger, where each is a Re-derive of its own key's
-    // entry, so every key is staged. (Before, `accumulate_changes` forced
-    // the whole group onto `GroupPlan::force_full_recompute` from one key,
-    // exercising `upsert_group`'s `probe_count`.)
+    // entry, so every key is staged. (Before, one key forced the whole
+    // group onto the old path's full recompute.)
     for id in ["1", "2", "3", "4"] {
         stage_bare_recompute(&client, id, "events").await;
     }
@@ -478,10 +473,9 @@ async fn count_column_forced_full_recompute_still_excludes_nulls() {
     );
 }
 
-/// The bulk counterpart of the previous test — many groups forced onto
-/// [`GroupPlan::force_full_recompute`] in the same batch, exercising
-/// `apply_forced_groups_bulk`'s own `count(<expr>)` rendering rather than
-/// `upsert_group`'s per-group probe.
+/// The bulk counterpart of the previous test — image-less recomputes for
+/// many groups in the same batch (the old path's bulk recompute, rather than
+/// its per-group probe).
 #[tokio::test]
 async fn count_column_bulk_forced_full_recompute_still_excludes_nulls() {
     let cluster = TestCluster::start();

@@ -23,7 +23,7 @@ use crate::integer::IntWidth;
 /// `schema.table` spelling — even when the definition explicitly qualified
 /// one (issue #76, ADR-0007 grammar clause 4).** That's a deliberate split,
 /// not an oversight: a huge number of call sites (`backfill.rs`, `oracle.rs`,
-/// `ddl.rs`, `apply.rs`, `apply_aggregate.rs`, `quarantine.rs`) pass
+/// `ddl.rs`, `apply.rs`, `ledger.rs`, `quarantine.rs`) pass
 /// `&def.source`/`&def.target` straight into `quote_ident`, which quotes its
 /// argument as a *single* identifier — handing it `"schema.table"` would
 /// quote the dot right along with it, producing an invalid, never-resolving
@@ -438,8 +438,7 @@ impl GroupByKey {
 /// Whether `name` is one of `group_by`'s keys' target column names — the
 /// common "is this field a `GROUP BY` passthrough" check every layer that
 /// touches an [`super::ast::KeySpace::Aggregate`] definition's fields needs
-/// (DDL's column dedup, `staging::apply_aggregate`'s field-plan skip, the
-/// reverse-relationship shape's field-expr filter, …), pulled out once here
+/// (DDL's column dedup, `staging::ledger`'s field shape, …), pulled out once here
 /// rather than re-implemented at each call site.
 pub fn group_by_contains(group_by: &[GroupByKey], name: &str) -> bool {
     group_by.iter().any(|key| key.target_column_name() == name)

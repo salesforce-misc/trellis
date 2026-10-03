@@ -74,8 +74,8 @@ use super::validate::ValidationError;
 /// The Postgres column type for a calculated field or grouping column of a
 /// given [`ValueType`] — shared by [`create_target_table`] and
 /// [`create_aggregate_target_table`] rather than duplicated. `pub(crate)`
-/// so `staging::apply_aggregate` (issue #11) can render the same casts for
-/// its own group-key/probe SQL without a second type-name table.
+/// so the rest of the crate (the ledger's DDL, the backfill) renders the
+/// same casts without a second type-name table.
 ///
 /// Returns [`Cow`] rather than a bare `&'static str` since issue #117: every
 /// family but one renders a fixed keyword and stays `Cow::Borrowed`, exactly
@@ -805,8 +805,7 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// This encoding is applied to a key component **if and only if that
 /// component's key column is nullable** ([`PrimaryKeyColumn::nullable`]) —
 /// in practice, only an aggregate target's `UNIQUE NULLS NOT DISTINCT`
-/// `GROUP BY` columns ([`create_aggregate_target_table`]) and the Rust-side
-/// group key `staging::apply_aggregate::derive_group_key` builds for them. A
+/// `GROUP BY` columns ([`create_aggregate_target_table`]). A
 /// `NOT NULL` key column — every real `PRIMARY KEY`, and the all-`NOT NULL`
 /// `UNIQUE` index [`source_primary_key`] also accepts — keeps its raw
 /// `col::text` instead, with no substitution and no escape.
@@ -829,6 +828,7 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// literal U+0001 (see `trellis/tests/one_to_one_control_char_pk.rs`). Since a not-null key can
 /// never *need* the `NULL` substitution, the only safe encoding for it is
 /// the identity one.
+#[cfg(test)]
 pub(crate) fn encode_key_part(value: Option<&str>) -> Cow<'_, str> {
     match value {
         None => Cow::Borrowed(NULL_KEY_SENTINEL),
@@ -993,10 +993,9 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 /// Every producer of an encoded key this crate has goes through either this
 /// or [`pk_key_sql_expr`] (whichever side of the wire it's on):
 /// the capture trigger's key expression (`capture::sql`, built on
-/// [`composite_key_escape_sql`]) for a captured row,
-/// `staging::apply_aggregate::derive_group_key` for an aggregate group's
-/// downstream-propagated identity (issue #171), and the SQL form for
-/// everything computed in the database — including
+/// [`composite_key_escape_sql`]) for a captured row, and the SQL form for
+/// everything computed in the database (an aggregate group's
+/// downstream-propagated identity among them, issue #171) — including
 /// `intake::markers::enumerate_and_append`'s backfill enumeration, which
 /// selects its keys through [`pk_key_sql_expr`] (issue #308). Keeping them one
 /// function each — rather than a hand-rolled `join` per site — is what makes
@@ -1327,29 +1326,10 @@ pub(crate) const PROJECTION_GEN_COLUMN: &str = "__trellis_gen";
 /// represent.
 pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
 
-/// An aggregate target row's recompute horizon (issue #321): the WAL insert
-/// position read *after* the live source read that last re-derived this
-/// group from scratch (`staging::apply_aggregate::apply_forced_groups_bulk`),
-/// or `NULL` if nothing ever has. Any source commit that read could see had
-/// its commit record written before it became visible, so its `end_lsn` is at
-/// or below this value. A folded delta whose earliest image-bearing `lsn` is
-/// at or below it may already be counted in the row, so Phase 3 re-derives
-/// the group instead of applying the delta. A row the delta path creates
-/// inherits the target's extinct horizon (`aggregate_extinct_horizon`) the
-/// same way, since the "no row" state it grew from was itself the product of
-/// a live read.
-///
-/// `__trellis_`-prefixed like [`PROJECTION_GEN_COLUMN`], and a `pg_lsn` type
-/// that `defs::pg_type` doesn't recognize, so a definition chained off an
-/// aggregate target never sees it as a readable source column.
-pub(crate) const RECOMPUTE_LSN_COLUMN: &str = "__trellis_recompute_lsn";
-
 /// The hidden member count on every aggregate group row (#623 D2): how many
 /// of the target's ledger entries are live members of the group
-/// ([`super::ledger`]). The build writes it from the ledger. Apply doesn't
-/// maintain it yet (a group the delta path creates starts at the column's
-/// default of 0), and nothing reads it until #623 part D3, which deletes a
-/// group when it reaches 0.
+/// ([`super::ledger`]). The build and Apply's group statements write it
+/// from the ledger, and a group whose count reaches 0 is deleted (#623 D3).
 pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
 
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
@@ -1387,8 +1367,8 @@ pub(crate) fn qualified_source_table(qualified: &str) -> String {
 ///
 /// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
 /// whole-branch review): the live CDC-apply write path (`staging::apply`'s
-/// `apply_target`/truncate-clears loop, `staging::apply_aggregate`'s
-/// target-write sites, `staging::quarantine`'s `recompute_column`) never got
+/// `apply_target`/truncate-clears loop, the aggregate target-write sites,
+/// `staging::quarantine`'s `recompute_column`) never got
 /// this fix on the target side, even though issue #76 already let a
 /// `TRANSFORM` clause spell an explicit non-default target schema — every
 /// one of those sites was still binding `def.def.target` (bare) straight
@@ -1610,19 +1590,16 @@ fn is_sum_field(expr: &Expr) -> bool {
 /// construction for `SUM`-vs-`AVG` pairs that also share a count (an `AVG`
 /// field always needs its own sum regardless, since `SUM`'s visible column
 /// already *is* that shared sum for the `SUM` half — there is no second
-/// consumer to fold onto). `pub(crate)` so `staging::apply_aggregate` binds
-/// against the exact same name this module creates, rather than re-deriving
-/// it.
+/// consumer to fold onto). `pub(crate)` so the backfill and
+/// `staging::ledger` bind against the exact same name this module creates,
+/// rather than re-deriving it.
 pub(crate) fn avg_sum_column(field_name: &str) -> String {
     format!("__{field_name}_sum")
 }
 
 /// The `Expr` a `SUM`/`AVG` field aggregates over — `None` for any other
 /// field shape. [`count_column_names`] uses this to decide which fields'
-/// hidden count partials can share a column; `staging::apply_aggregate`'s
-/// `AggregateTargetPlan` runs the equivalent lookup against its own
-/// already-classified fields, over the same [`Expr`] equality, to derive
-/// matching names without a second implementation of this rule.
+/// hidden count partials can share a column.
 fn count_needing_arg(expr: &Expr) -> Option<&Expr> {
     if !is_sum_field(expr) && !is_avg_field(expr) {
         return None;
@@ -1637,9 +1614,9 @@ fn count_needing_arg(expr: &Expr) -> Option<&Expr> {
 /// name of the hidden running-count partial column it maintains (issue #11's
 /// delta model: the count of non-null argument values contributing to the
 /// group, matching Postgres's own `count(<same argument>)` "skip NULLs"
-/// semantics) — `pub(crate)` so `staging::apply_aggregate`'s
-/// `AggregateTargetPlan` derives the exact same names this module's DDL
-/// creates, rather than re-deriving them independently (a divergence there
+/// semantics) — `pub(crate)` so `staging::ledger` derives the exact same
+/// names this module's DDL creates, rather than re-deriving them
+/// independently (a divergence there
 /// would mean the apply path writes to a column the DDL never created, or
 /// vice versa).
 ///
@@ -1666,7 +1643,7 @@ fn count_needing_arg(expr: &Expr) -> Option<&Expr> {
 /// model would compute the wrong "does this group still have any non-null
 /// contributor" answer for one of the two fields, producing a stale `0`/wrong
 /// number where Postgres would show `NULL`, or vice versa (see
-/// `staging::apply_aggregate`'s `sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null`
+/// `trellis/tests/apply_aggregate.rs`'s `sum_goes_null_not_zero_when_a_groups_remaining_rows_are_all_null`
 /// test for the exact failure shape this would reintroduce). Only fields
 /// that provably always agree — same argument expression — are ever merged.
 /// `substituted` maps each field name to its cross-field-alias-resolved
@@ -1689,11 +1666,8 @@ pub(crate) fn count_column_names(
 }
 
 /// The core of [`count_column_names`], generalized over any source of
-/// `(field_name, aggregated_arg)` pairs rather than a literal `&[FieldDef]` —
-/// `staging::apply_aggregate`'s `AggregateTargetPlan` has already classified
-/// its fields into [`super::ast::FieldDef`]-free `AggFieldPlan`s by the time
-/// it needs these names, so it builds its own `(name, arg)` pairs from that
-/// classification plus its `field_exprs` map and calls straight into this,
+/// `(field_name, aggregated_arg)` pairs rather than a literal `&[FieldDef]`,
+/// so the backfill can build its own pairs and call straight into this
 /// rather than re-implementing the merge rule (see [`count_column_names`]'s
 /// doc comment on why that rule's correctness matters) a second time.
 pub(crate) fn count_column_names_from<'a>(
@@ -1793,7 +1767,7 @@ pub(crate) async fn aggregate_target_table_ddl(
     // Substitute cross-field-alias references (e.g. `total2 = total` where
     // `total = SUM(amount)`) before classifying any field as `SUM`/`AVG`
     // below — `is_avg_field`/`is_sum_field`/`count_column_names` must agree
-    // with `backfill_aggregate`'s and `apply_aggregate::classify_fields`'s own
+    // with `backfill_aggregate`'s and `staging::ledger`'s own
     // (already substituted) classification of the same field, or the columns
     // this DDL creates diverge from the columns those paths later write to.
     let substituted = super::backfill::substituted_field_exprs(def)?;
@@ -1888,7 +1862,6 @@ pub(crate) async fn aggregate_target_table_ddl(
             }
         }
     }
-    sql.push_str(&format!(", {} pg_lsn", quote_ident(RECOMPUTE_LSN_COLUMN)));
     sql.push_str(&format!(
         ", {} bigint not null default 0",
         quote_ident(MEMBERS_COLUMN)
@@ -2234,8 +2207,7 @@ mod tests {
 
     /// Issue #110: a `NULL` key/group component, encoded via
     /// [`encode_key_part`] the way every real producer
-    /// (`staging::apply_aggregate::derive_group_key`, [`pk_key_sql_expr`]'s
-    /// SQL-side twin) must, round-trips back to `None` — distinguishable
+    /// ([`pk_key_sql_expr`], its SQL-side twin) must, round-trips back to `None` — distinguishable
     /// from the genuine empty string [`join_pk_key_round_trips_through_split_pk_key`]
     /// pins above, which is exactly the ambiguity the old
     /// `unwrap_or_default()`/bare-`col::text` encoding could not resolve.
@@ -2334,8 +2306,8 @@ mod tests {
         );
     }
 
-    /// The length-prefixed encoding `apply_aggregate::derive_group_key` used
-    /// to emit for a composite `GROUP BY` is exactly what issue #171's crash
+    /// The length-prefixed encoding the old aggregate path used to emit for
+    /// a composite `GROUP BY` is exactly what issue #171's crash
     /// was: one part where two were expected.
     #[test]
     fn split_pk_key_rejects_the_pre_171_length_prefixed_encoding() {

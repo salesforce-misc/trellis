@@ -473,9 +473,8 @@ pub fn render_expr_sql(expr: &Expr) -> String {
 ///
 /// This is the shared renderer for every place a to-one path has to become SQL
 /// over a real `LEFT JOIN` rather than a correlated subquery: the aggregate
-/// direct build (`super::backfill::backfill_aggregate`), the aggregate
-/// incremental recompute (`staging::apply_aggregate::apply_forced_groups_bulk`),
-/// and this module's own [`render_aggregate_relationship_select_sql`] oracle.
+/// direct build (`super::backfill::backfill_aggregate`), the ledger Re-derive
+/// (`staging::ledger`), and this module's own [`render_aggregate_relationship_select_sql`] oracle.
 /// Unlike [`render_rel_expr_sql`], an aggregate call whose sole argument is a
 /// relationship path is *not* special-cased into a correlated subquery — under
 /// a to-one join `sum(rel.col)` is an ordinary aggregate over the joined

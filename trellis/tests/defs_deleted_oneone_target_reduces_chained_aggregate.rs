@@ -13,7 +13,7 @@
 //! own primary key. Before issue #196's fix, `apply_and_mark_drained_many`'s
 //! step 3 (`apply_target`'s ordinary delete) staged a deleted `order_view`
 //! row's downstream propagation as an image-less `StagedChange::Recompute`.
-//! `customer_totals`' own `accumulate_changes` would then live-refetch that
+//! `customer_totals` would then live-refetch that
 //! key, find nothing (the row is genuinely gone), and silently drop the
 //! change instead of subtracting the deleted row's contribution — the exact
 //! same failure shape issue #180 fixed for an *aggregate* group's own
@@ -23,7 +23,7 @@
 //! row's pre-delete image (`RETURNING ...`, an explicit per-column
 //! `jsonb_build_object('<col>', <col>::text, ...)::text` since issue #248 —
 //! `to_jsonb(t.*)::text` before it — the same shape
-//! `apply_aggregate::delete_group_row`'s issue #180 fix uses), threaded
+//! the old aggregate path's issue #180 fix used), threaded
 //! through the same `ChangedKey` slot so step 4 stages a real image-bearing
 //! delete for it.
 //!

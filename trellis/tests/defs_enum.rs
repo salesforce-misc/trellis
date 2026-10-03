@@ -46,9 +46,8 @@
 //! before this issue existed (issue #11's original gate rule, unconditional
 //! on type) — so a `KeySpace::Aggregate` definition's `MIN`/`MAX(enum)`
 //! value is never accumulated or cached anywhere; it is always resolved by
-//! pushing a real `min()`/`max()` down to Postgres itself
-//! (`staging::apply_aggregate::probe_recompute_fields_bulk`), which
-//! necessarily evaluates under the type's *current* `pg_enum` shape. There is
+//! pushing a real `min()`/`max()` down to Postgres itself (the ledger's
+//! Recomputed fields), which necessarily evaluates under the type's *current* `pg_enum` shape. There is
 //! nothing for `ALTER TYPE ... ADD VALUE` to invalidate, because nothing was
 //! ever cached — demonstrated below by altering a live type's value set
 //! *between* two drains of the same definition and confirming the second
@@ -274,10 +273,8 @@ fn enum_group_by_key_is_admitted() {
 /// each pin for `boolean`/`inet`, whose two renderers genuinely disagree.
 /// This is the belt-and-suspenders check that enum's single-renderer
 /// argument (section 1, above) is actually true end-to-end, including
-/// `staging::apply_aggregate::accumulate_changes`'s in-memory `GroupPlan`
-/// bucketing (`derive_group_key`), which compares text byte-for-byte with
-/// no database in the loop and is exactly where `boolean`/`inet`'s hazard
-/// actually lived.
+/// any in-memory grouping that compares text byte-for-byte — exactly where
+/// `boolean`/`inet`'s hazard lived on the old aggregate path.
 #[tokio::test]
 async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
     const DEF_SQL: &str =
@@ -603,8 +600,7 @@ async fn enum_group_by_min_max_matches_a_server_side_recompute() {
 /// classification alone: a `MIN`/`MAX(enum)` value is never cached, so
 /// `ALTER TYPE ... ADD VALUE` between two drains of the same definition is
 /// reflected on the very next recompute with no special handling — because
-/// `staging::apply_aggregate`'s `RecomputeOnly` path for this field always
-/// asks Postgres directly, under whatever `pg_enum` shape is live *at
+/// the ledger recomputes this field live, asking Postgres directly, under whatever `pg_enum` shape is live *at
 /// recompute time*, never a value carried over from before the type
 /// changed.
 #[tokio::test]

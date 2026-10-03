@@ -1407,13 +1407,12 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
 /// its CDC was staged at real LSNs. An aggregate grouped by a to-one path
 /// (`buyer.name`); a new order for user 1 drains as an ordinary delta; then
 /// user 1 is renamed. The drained order's ring row is above the projection's
-/// LSN, so `relationship_fast_path_precondition_holds` sends the rename to
-/// the reverse fallback, which stages recomputes for orders 10 and 12. A
-/// bare recompute re-derives only the group the orders are in now (`c`), so
-/// the group they left (`a`) kept its 105 forever; the fallback now stages
+/// LSN, so the rename goes to the reverse fallback, which stages recomputes
+/// for orders 10 and 12. A bare recompute re-derives only the group the
+/// orders are in now (`c`), so the group they left (`a`) kept its 105
+/// forever; the fallback now stages
 /// each with a prior image carrying the old name, which names `a` too. At
-/// LSN 1 the drained order sat below the projection's LSN, the fast path
-/// ran, and its per-group diff emptied `a`.
+/// LSN 1 the old fast path (deleted in #623 D5) ran instead and emptied `a`.
 #[tokio::test]
 async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
     let cluster = TestCluster::start();
@@ -1562,12 +1561,10 @@ impl ToSideChange {
 /// Re-derives; the two still differ in how order 12 reached the target.
 enum ReversePath {
     /// Issue #131's delta: nothing in the ring touches the changed user's
-    /// orders, so `relationship_fast_path_precondition_holds` passes.
+    /// orders (the old fast path's precondition).
     Fast,
     /// `stage_reverse_recompute_fallback`: a drained order for the changed
-    /// user still sits in the ring above the projection's LSN, so the
-    /// precondition fails (and a `RecomputeOnly` aggregate always lands
-    /// here).
+    /// user still sits in the ring above the projection's LSN.
     Fallback,
 }
 
@@ -1724,7 +1721,7 @@ async fn to_side_change_scenario(case: &AggregateCase, change: ToSideChange, pat
 }
 
 /// Every to-side change, down both reverse paths, for an invertible
-/// aggregate (the only kind the fast path takes).
+/// aggregate (the only kind the old fast path took).
 async fn every_change_down_both_paths(case: &AggregateCase) {
     for change in ToSideChange::ALL {
         for path in [ReversePath::Fast, ReversePath::Fallback] {
@@ -2392,8 +2389,8 @@ async fn a_to_side_truncate_after_a_rename_in_the_same_batch_leaves_no_stale_gro
 /// Every parent re-inserted after the truncate in the same batch: user 1
 /// under a new name, users 2 and 3 under their old ones. Each insert's
 /// reverse record sees no old parent in the cleared projection, but the
-/// target still has the rows in the groups the truncate's images name, so a
-/// fast-path delta would come off the `NULL` group. With order 14 (the only
+/// target still has the rows in the groups the truncate's images name, so the
+/// old fast path's delta came off the `NULL` group. With order 14 (the only
 /// dangling user) deleted, nothing else re-derives that group.
 #[tokio::test]
 async fn a_to_side_truncate_then_reinsert_in_the_same_batch_leaves_no_stale_group() {
@@ -2665,7 +2662,7 @@ async fn two_relationship_columns_with_the_same_joined_name_group_apart() {
 }
 
 /// A source column literally named `__trellis_rev_name` was overwritten by
-/// the reverse fast path's splice of `buyer.name`, so a rename summed the
+/// the old reverse fast path's splice of `buyer.name`, so a rename summed the
 /// user's name in place of the column's value. Since #623 D5 the target is
 /// on the ledger, so the rename re-derives the orders instead; the column
 /// must still read as itself.

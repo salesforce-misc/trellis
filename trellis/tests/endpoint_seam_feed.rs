@@ -656,20 +656,12 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
     drain_round(&db.pool, &mut raw).await;
 
     let staged = staged_rows(&raw, "public.region_totals").await;
-    // The hidden recompute horizon is a WAL position the build and the
-    // forced re-derivations stamp (#321, #419), not part of what this pins.
-    // Nor is the member count, which only the build writes until apply
-    // maintains it (#623 D3).
-    let horizon =
-        regex::Regex::new(r#""__trellis_recompute_lsn": ("[^"]*"|null)"#).expect("valid regex");
-    let members = regex::Regex::new(r#""__trellis_members": "[0-9]*", "#).expect("valid regex");
+    // The hidden member count is not part of what this pins.
+    let members = regex::Regex::new(r#", "__trellis_members": "[0-9]*""#).expect("valid regex");
     let image = |image: &Option<String>| {
-        image.as_deref().map(|image| {
-            let image = members.replace(image, "");
-            horizon
-                .replace(&image, r#""__trellis_recompute_lsn": <lsn>"#)
-                .into_owned()
-        })
+        image
+            .as_deref()
+            .map(|image| members.replace(image, "").into_owned())
     };
     let mut shape: Vec<(&str, Option<String>, Option<String>)> = staged
         .iter()
@@ -683,18 +675,12 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
             (
                 "insert",
                 None,
-                expected(
-                    r#"{"total": "7", "region": "2", "__total_count": "1", "__trellis_recompute_lsn": <lsn>}"#
-                )
+                expected(r#"{"total": "7", "region": "2", "__total_count": "1"}"#)
             ),
             (
                 "update",
-                expected(
-                    r#"{"total": "5", "region": null, "__total_count": "1", "__trellis_recompute_lsn": <lsn>}"#
-                ),
-                expected(
-                    r#"{"total": "8", "region": null, "__total_count": "1", "__trellis_recompute_lsn": <lsn>}"#
-                )
+                expected(r#"{"total": "5", "region": null, "__total_count": "1"}"#),
+                expected(r#"{"total": "8", "region": null, "__total_count": "1"}"#)
             ),
         ],
         "{staged:?}"

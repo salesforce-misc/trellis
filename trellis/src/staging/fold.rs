@@ -108,16 +108,6 @@ pub struct FoldedChange {
     /// GREATEST `lsn` over *every* row in the group, image-less rows
     /// included, so the watermark still covers them.
     pub lsn: Option<PgLsn>,
-    /// Issue #321: LEAST `lsn` over the group's image-bearing rows only (the
-    /// same filter the image arg-extremes use), `None` when there are none.
-    /// A folded delta telescopes every source commit from this one up to
-    /// `lsn`, so this is the commit an aggregate's recompute horizon has to
-    /// be compared against: if it is at or below a group's
-    /// `__trellis_recompute_lsn`, a forced recompute may already have counted
-    /// part of this delta, and `apply_aggregate::apply_aggregate_target`
-    /// re-derives the group instead of applying it. Recompute rows carry a
-    /// NULL `lsn`, so they never pull this down.
-    pub min_image_lsn: Option<PgLsn>,
     /// Reset to 0 if any row in the group is a source change. Otherwise —
     /// underspecified by the doc for the all-non-source case — pinned to
     /// `MAX(hop_gen)`: doc 05 describes `hop_gen` as a schema-derived bound
@@ -210,25 +200,6 @@ pub struct FoldedChange {
     /// record names rather than applying the delta, which would land on
     /// whatever stale value the recompute was staged to repair.
     pub has_recompute: bool,
-    /// Issue #486: when the key was born and died inside this batch, so the
-    /// fold's first-old/last-new images are both `None` even though it
-    /// staged image-bearing rows, one insert's post-image and one delete's
-    /// pre-image (deduplicated). Empty otherwise.
-    ///
-    /// Such a record's delta is zero, which is right unless a forced
-    /// recompute counted the row in between: an insert at or below a
-    /// group's recompute horizon and a delete above it. Without an image the
-    /// record names no group, so the horizon check never runs and the group
-    /// keeps the row. These images name the groups it was born into and
-    /// died from. An aggregate checks each against its horizon
-    /// (`apply_aggregate::GroupPlan::horizon_check_only`) and re-derives it
-    /// only when the check says so (otherwise it only probes that a group
-    /// with a row still exists). A key that also moved between groups more
-    /// than once inside the batch is still only named by these two.
-    ///
-    /// Only the no-image case carries them, so the wire cost falls on
-    /// born-and-died keys alone.
-    pub vanished_images: Vec<String>,
     /// Issue #620 (ADR-0002's fold rule under I8): whether the key's latest
     /// row that speaks to its state, by `(lsn, change_id)`, is a `delete`.
     /// An image-less `delete` is such a row: it is the key's final state
@@ -373,8 +344,8 @@ const PAGE_TABLE: &str = "trellis_drain_page";
 /// page reads back from [`PAGE_TABLE`].
 const FOLDED_COLUMNS: &str = "src_table, key, new_image, old_image, src_changed, origin_lsn, \
      lsn, hop_gen, first_seen, group_key, is_truncate, relationship_reverse_deferred, \
-     retry_count, prior_image, min_image_lsn, row_count, has_recompute, vanished_images, \
-     ends_in_delete, last_lsn, last_row_txid";
+     retry_count, prior_image, row_count, has_recompute, ends_in_delete, last_lsn, \
+     last_row_txid";
 
 /// Folds `bucket`'s share of `seg_seq`, from strictly after `after` (the
 /// start when `None`), into this session's [`PAGE_TABLE`], indexed on its
@@ -452,7 +423,7 @@ pub(crate) async fn read_page(
     let sql = read_page_sql(after.is_some());
     let rows = client.query(&sql, &params).await?;
     let next = (rows.len() > cap).then(|| PageKey {
-        route: rows[cap - 1].get(21),
+        route: rows[cap - 1].get(19),
         src_table: rows[cap - 1].get(0),
         key: rows[cap - 1].get(1),
     });
@@ -527,20 +498,13 @@ fn folded_from_row(row: &tokio_postgres::Row) -> FoldedChange {
         relationship_reverse_deferred: row.get(11),
         retry_count: row.get(12),
         prior_image: row.get(13),
-        min_image_lsn: row.get(14),
         // `count(*)` is a non-negative bigint.
-        row_count: row.get::<_, i64>(15) as u64,
-        has_recompute: row.get(16),
-        vanished_images: {
-            // A key born and died in one group has one image, twice.
-            let mut images = row.get::<_, Option<Vec<String>>>(17).unwrap_or_default();
-            images.dedup();
-            images
-        },
-        ends_in_delete: row.get(18),
+        row_count: row.get::<_, i64>(14) as u64,
+        has_recompute: row.get(15),
+        ends_in_delete: row.get(16),
         last_change: row
-            .get::<_, Option<PgLsn>>(19)
-            .zip(row.get::<_, Option<String>>(20))
+            .get::<_, Option<PgLsn>>(17)
+            .zip(row.get::<_, Option<String>>(18))
             .map(|(lsn, row_txid)| LastChange { lsn, row_txid }),
     }
 }
@@ -642,14 +606,8 @@ fn fold_sql(
     // its array's length and corrupt every other aggregate here (`count`,
     // `min`/`max`, the arg-extremes).
     //
-    // Issues #392 and #486 add two columns without adding a sort or a pass.
-    // `has_recompute` is a plain `bool_or`. `vanished_images` repeats the two
-    // image arg-extremes verbatim so the planner shares them rather than
-    // computing them twice, and is non-null only when both come out NULL.
-    // Its two candidates are unordered `max`es under `"C"` collation (a
-    // byte compare, only reached when one key has several inserts or
-    // deletes), filtered to insert-shaped and delete-shaped rows so an
-    // update, the common row, never feeds them.
+    // Issue #392's `has_recompute` is a plain `bool_or`, adding no sort or
+    // pass.
     //
     // #622 C6: a `schema_changed` marker is no change to any key. The drain
     // acts on it before the fold (`staging::schema_change`), so `filtered`
@@ -663,8 +621,8 @@ fn fold_sql(
     // "latest row with any image" rule dropped such deletes under NEW-only
     // capture). The old-image arg-extreme is unchanged: a delete carries no
     // pre-state it could contribute there. `last` aggregates `(new_image,
-    // op)` pairs as one 2-D array so `new_image`, `vanished_images` and
-    // `ends_in_delete` share one ordered aggregate (identical aggregate
+    // op)` pairs as one 2-D array so `new_image` and `ends_in_delete`
+    // share one ordered aggregate (identical aggregate
     // calls are computed once) rather than sorting each group twice.
     let last = "(array_agg(array[new_image, op, lsn::text, row_txid::text] \
                                 order by lsn desc, change_id desc) \
@@ -710,22 +668,8 @@ fn fold_sql(
                  as retry_count, \
              (array_agg(old_image order by lsn asc, change_id asc) \
                  filter (where op = 'recompute' and old_image is not null))[1] as prior_image, \
-             min(lsn) filter (where (old_image is not null or new_image is not null) \
-                                and op <> 'recompute') as min_image_lsn, \
              count(*) as row_count, \
              bool_or(op = 'recompute') as has_recompute, \
-             case when {last}[1][1] is null \
-                   and (array_agg(old_image order by lsn asc, change_id asc) \
-                           filter (where (old_image is not null or new_image is not null) \
-                                     and op <> 'recompute'))[1] is null \
-                  then array_remove(array[ \
-                       max(new_image collate \"C\") \
-                           filter (where old_image is null and new_image is not null \
-                                     and op <> 'recompute'), \
-                       max(old_image collate \"C\") \
-                           filter (where new_image is null and old_image is not null \
-                                     and op <> 'recompute')], null) \
-             end as vanished_images, \
              coalesce({last}[1][2] = 'delete', false) as ends_in_delete, \
              ({last}[1][3])::pg_lsn as last_lsn, \
              {last}[1][4] as last_row_txid{extra} \
@@ -799,9 +743,6 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   "OR across the group" and "GREATEST over every row" respectively.
 /// - `origin_lsn`: the lesser of the two, where a missing side is unknown
 ///   and wins ([`earliest_origin`], issue #469).
-/// - `min_image_lsn`: the lesser of the two, ignoring a missing side —
-///   `Option::min` would wrongly let a `None` beat a real `Some` (a bare
-///   recompute trigger folded alone has no `min_image_lsn`).
 /// - `hop_gen`: 0 if the merged `src_changed` is `Some` (a source change
 ///   resets propagation depth), else the greater of the two hop generations.
 /// - `first_seen`: the earlier of the two — first append into either
@@ -832,9 +773,6 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 /// - `row_count`: the sum — [`fold`]'s `count(*)` over both segments' rows
 ///   (issue #409).
 /// - `has_recompute`: OR, as [`fold`]'s `bool_or` (issue #392).
-/// - `vanished_images`: the union of both sides', plus, when the merged
-///   record has no image at all, the two images the merge itself dropped
-///   (issue #486; see the inline comment).
 fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     let src_changed = earlier.src_changed.max(later.src_changed);
     let hop_gen = if src_changed.is_some() {
@@ -869,28 +807,13 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     // `new_image`, producing an internally-inconsistent image pair.
     //
     // **This is why this branch exists as its own case, not just a
-    // documentation note**: an inconsistent pair would corrupt not only a
-    // hypothetical direct `diff_pass` application (already blocked, today,
-    // by the *unrelated* fact that `retry_count` — see below — is always
-    // `>= 1` for a merged deferred record, which forces
-    // `apply::apply_and_mark_drained_many`'s own `retry_count == 0`
-    // fast-path gate to route every deferred reverse to the recompute
-    // fallback regardless) but *also*
+    // documentation note**: an inconsistent pair would corrupt
     // `apply::apply_projection_advance`'s write of the settled parent
-    // projection's own data columns from `new_image` — which runs
-    // unconditionally once guards pass, on *both* the fast and fallback
-    // paths, and is not protected by the `retry_count` coincidence at all.
-    // Fixed at the source instead of relying on that coincidence: order by
-    // each side's own `lsn` (`None` sorts first, matching this crate's
-    // "unknown sorts as earliest" convention elsewhere), and pick images by
-    // *that* order, not by which segment sealed first.
-    //
-    // `#135`/`#136`: if a future change ever lets a deferred reverse regain
-    // eligibility for the fast path (lifting the `retry_count == 0` gate –
-    // see that gate's own doc comment on `force_every_group` for when that
-    // could happen), this branch is what keeps folding sound regardless —
-    // it does not depend on that gate staying in place, unlike the
-    // `retry_count` coincidence above.
+    // projection's own data columns from `new_image`, which runs
+    // unconditionally once guards pass. So order by each side's own `lsn`
+    // (`None` sorts first, matching this crate's "unknown sorts as
+    // earliest" convention elsewhere), and pick images by *that* order, not
+    // by which segment sealed first.
     let (old_image, new_image) = if relationship_reverse_deferred.is_some() {
         let (chronologically_earlier, chronologically_later) = if earlier.lsn <= later.lsn {
             (&earlier, &later)
@@ -950,22 +873,6 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         earlier.last_change.clone()
     };
 
-    // Issue #486: the same "born and died" loss can happen across segments.
-    // An insert sealed into `earlier` and a delete into `later` each fold to
-    // a record with an image, but the merge drops the insert's post-image
-    // and the delete's pre-image, the state between the two segments. When
-    // that leaves no image at all, those two join whatever either side
-    // already carried, so the group they name is still checked against its
-    // horizon.
-    let mut vanished_images = earlier.vanished_images;
-    vanished_images.extend(later.vanished_images);
-    if old_image.is_none() && new_image.is_none() {
-        vanished_images.extend(earlier.new_image.clone());
-        vanished_images.extend(later.old_image.clone());
-    }
-    vanished_images.sort_unstable();
-    vanished_images.dedup();
-
     FoldedChange {
         src_table: earlier.src_table,
         key: earlier.key,
@@ -974,7 +881,6 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         src_changed,
         origin_lsn,
         lsn: earlier.lsn.max(later.lsn),
-        min_image_lsn: least_present(earlier.min_image_lsn, later.min_image_lsn),
         hop_gen,
         first_seen: earlier.first_seen.min(later.first_seen),
         group_key: merge_group_keys(earlier.group_key, later.group_key),
@@ -992,14 +898,11 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         prior_image: earlier.prior_image.or(later.prior_image),
         row_count: earlier.row_count + later.row_count,
         has_recompute: earlier.has_recompute || later.has_recompute,
-        vanished_images,
         ends_in_delete,
         last_change,
     }
 }
 
-/// The lesser of two optional LSNs, ignoring a missing side: SQL `min()`'s
-/// rule, which `Option::min` gets wrong (it lets `None` win).
 /// Merges two folded `origin_lsn`s the way [`fold`]'s SQL does: the earlier
 /// origin, where a missing one is *unknown*, not absent. `converged_through`
 /// reads an unknown origin as older than any token (issue #469), so a key
@@ -1007,42 +910,6 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
 /// must keep gating every token, not only those past its other rows' origin.
 pub(crate) fn earliest_origin(a: Option<PgLsn>, b: Option<PgLsn>) -> Option<PgLsn> {
     Some(a?.min(b?))
-}
-
-/// A running [`earliest_origin`] that can start empty. An accumulator can't
-/// start at `None`, since `None` means unknown and would win every merge;
-/// this keeps "nothing contributed yet" apart from "a contribution of
-/// unknown origin".
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) enum OriginAccum {
-    #[default]
-    Empty,
-    Merged(Option<PgLsn>),
-}
-
-impl OriginAccum {
-    pub(crate) fn add(&mut self, origin_lsn: Option<PgLsn>) {
-        *self = OriginAccum::Merged(match *self {
-            OriginAccum::Empty => origin_lsn,
-            OriginAccum::Merged(current) => earliest_origin(current, origin_lsn),
-        });
-    }
-
-    /// The merged origin; unknown (`None`) if nothing contributed, which
-    /// gates every token.
-    pub(crate) fn get(self) -> Option<PgLsn> {
-        match self {
-            OriginAccum::Empty => None,
-            OriginAccum::Merged(origin_lsn) => origin_lsn,
-        }
-    }
-}
-
-fn least_present(a: Option<PgLsn>, b: Option<PgLsn>) -> Option<PgLsn> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
 }
 
 /// Issue #133's cross-segment counterpart to [`fold`]'s own SQL
@@ -1086,7 +953,6 @@ mod merge_tests {
             src_changed: None,
             origin_lsn: None,
             lsn: None,
-            min_image_lsn: None,
             hop_gen: 0,
             first_seen: SystemTime::UNIX_EPOCH,
             group_key: None,
@@ -1096,7 +962,6 @@ mod merge_tests {
             prior_image: None,
             row_count: 1,
             has_recompute: false,
-            vanished_images: Vec::new(),
             ends_in_delete: false,
             last_change: None,
         }
@@ -1186,15 +1051,14 @@ mod merge_tests {
         assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
         assert_eq!(merged[0].new_image, None);
         assert!(merged[0].ends_in_delete);
-        assert!(merged[0].vanished_images.is_empty());
     }
 
     /// The same delete followed by a segment that re-inserts the key: the
     /// re-insert's post-image wins and the key no longer ends deleted. A key
-    /// born in the first segment and deleted image-less in the second keeps
-    /// the image of the group it was born into (#486).
+    /// born in the first segment and deleted image-less in the second ends
+    /// deleted with no image.
     #[test]
-    fn an_image_less_delete_is_superseded_by_a_later_write_and_keeps_a_born_keys_image() {
+    fn an_image_less_delete_is_superseded_by_a_later_write() {
         let mut deleted = base("1");
         deleted.ends_in_delete = true;
         let mut reinserted = base("1");
@@ -1210,7 +1074,6 @@ mod merge_tests {
         let merged = merge_folded_changes(vec![vec![born], vec![died]]);
         assert_eq!((&merged[0].old_image, &merged[0].new_image), (&None, &None));
         assert!(merged[0].ends_in_delete);
-        assert_eq!(merged[0].vanished_images, vec![r#"{"v":4}"#.to_string()]);
     }
 
     /// A genuine delete (`new_image: None`, `old_image: Some(..)`) in a
@@ -1272,43 +1135,6 @@ mod merge_tests {
         assert_eq!(merged[0].origin_lsn, None);
     }
 
-    /// Issue #486: an insert sealed into one segment and its delete into the
-    /// next each fold with an image, but merging them leaves none. The merge
-    /// keeps the two images it dropped, so the group is still named.
-    #[test]
-    fn an_insert_and_delete_merged_across_segments_keep_the_dropped_images() {
-        let mut insert = base("1");
-        insert.new_image = Some(r#"{"g":"z"}"#.to_string());
-        let mut delete = base("1");
-        delete.old_image = Some(r#"{"g":"z"}"#.to_string());
-
-        let merged = merge_folded_changes(vec![vec![insert], vec![delete]]);
-        assert_eq!((&merged[0].old_image, &merged[0].new_image), (&None, &None));
-        assert_eq!(merged[0].vanished_images, vec![r#"{"g":"z"}"#.to_string()]);
-    }
-
-    /// Issue #486: a merge that still has an image drops nothing a group
-    /// needs, and adds no vanished image of its own; a side's own vanished
-    /// images carry through either way.
-    #[test]
-    fn vanished_images_carry_through_a_merge_and_are_only_added_when_no_image_is_left() {
-        let mut update = base("1");
-        update.old_image = Some(r#"{"g":"a"}"#.to_string());
-        update.new_image = Some(r#"{"g":"b"}"#.to_string());
-        let mut delete = base("1");
-        delete.old_image = Some(r#"{"g":"b"}"#.to_string());
-        let merged = merge_folded_changes(vec![vec![update], vec![delete]]);
-        assert!(merged[0].vanished_images.is_empty());
-
-        let mut born_and_died = base("1");
-        born_and_died.vanished_images = vec![r#"{"g":"x"}"#.to_string()];
-        let mut insert = base("1");
-        insert.new_image = Some(r#"{"g":"y"}"#.to_string());
-        let merged = merge_folded_changes(vec![vec![born_and_died], vec![insert]]);
-        assert_eq!(merged[0].new_image, Some(r#"{"g":"y"}"#.to_string()));
-        assert_eq!(merged[0].vanished_images, vec![r#"{"g":"x"}"#.to_string()]);
-    }
-
     /// Issue #392: a recompute in either segment marks the merged record.
     #[test]
     fn has_recompute_is_an_or_across_segments() {
@@ -1323,24 +1149,6 @@ mod merge_tests {
         assert_eq!(merged[0].new_image, update.new_image);
         let merged = merge_folded_changes(vec![vec![update.clone()], vec![update]]);
         assert!(!merged[0].has_recompute);
-    }
-
-    /// Issue #321: `min_image_lsn` merges as the lesser present side, so a
-    /// key coalesced across segments is compared against a recompute horizon
-    /// by its *earliest* image-bearing commit, and a later segment's bare
-    /// recompute trigger (no `min_image_lsn`) never erases it.
-    #[test]
-    fn min_image_lsn_takes_the_lesser_non_null_side() {
-        let mut first = base("1");
-        first.min_image_lsn = Some(PgLsn::from(30));
-        let mut second = base("1");
-        second.min_image_lsn = Some(PgLsn::from(20));
-        let merged = merge_folded_changes(vec![vec![first.clone()], vec![second]]);
-        assert_eq!(merged[0].min_image_lsn, Some(PgLsn::from(20)));
-
-        let recompute_only = base("1");
-        let merged = merge_folded_changes(vec![vec![first], vec![recompute_only]]);
-        assert_eq!(merged[0].min_image_lsn, Some(PgLsn::from(30)));
     }
 
     /// More than two contributing segments still fold to exactly one
@@ -1441,13 +1249,9 @@ mod merge_tests {
     /// have silently picked the *later*-sealed (but chronologically
     /// *earlier*) segment's `new_image` and the *earlier*-sealed (but
     /// chronologically *later*) segment's `old_image` — an internally
-    /// inconsistent pair that (a) would corrupt a direct fast-path
-    /// application if one ever ran against it, and, more immediately
-    /// relevant since `retry_count` alone already routes every deferred
-    /// record away from the fast path, (b) would corrupt
+    /// inconsistent pair that would corrupt
     /// `apply::apply_projection_advance`'s unconditional write of the
-    /// settled parent projection's own columns, which is *not* gated by
-    /// `retry_count` at all. This pins the fix: `lsn` order wins over
+    /// settled parent projection's own columns. This pins the fix: `lsn` order wins over
     /// segment order for this op.
     #[test]
     fn relationship_reverse_deferred_cross_segment_merge_orders_images_by_lsn_not_segment_order() {

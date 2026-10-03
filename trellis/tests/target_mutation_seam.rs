@@ -107,8 +107,8 @@ async fn rows(raw: &Client, sql: &str) -> BTreeMap<String, String> {
 }
 
 /// Stages one CDC change as capture would, at the current WAL insert
-/// position: a real commit LSN, above every horizon the test set up before
-/// it (issue #512), rather than a fake one below them all. `group_key` is
+/// position: a real commit LSN, after everything the test set up before it
+/// (issue #512), rather than a fake one before them all. `group_key` is
 /// what capture stamps on a relationship from-side's change: the `from_col`
 /// values its images carry.
 async fn stage_cdc(
@@ -629,10 +629,10 @@ async fn an_altered_column_propagates_to_a_chained_reader() {
     );
 }
 
-/// A to-side change re-derives a relationship-reading aggregate through the
-/// reverse-relationship fast path, which writes the aggregate target itself.
-/// Those writes have to reach a transform chained off that target like any
-/// other: before the seam, the fast path's bookkeeping was keyed differently
+/// A to-side change re-derives a relationship-reading aggregate, writing the
+/// aggregate target itself. Those writes have to reach a transform chained
+/// off that target like any other: before the seam, the old reverse fast
+/// path's bookkeeping was keyed differently
 /// from the reader lookup, so its writes were never propagated in the
 /// applying transaction.
 #[tokio::test]
@@ -1416,7 +1416,7 @@ async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
 enum Consumer {
     /// `report_view`, one row per report: the image-less recompute path.
     OneToOne,
-    /// `report_totals`, a `SUM` over it: the reverse-delta fast path.
+    /// `report_totals`, a `SUM` over it: a ledger Re-derive.
     Aggregate,
 }
 

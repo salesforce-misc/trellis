@@ -1423,7 +1423,6 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         src_changed: None,
         origin_lsn: None,
         lsn: None,
-        min_image_lsn: None,
         hop_gen: 0,
         first_seen: SystemTime::now(),
         group_key: None,
@@ -1433,7 +1432,6 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         prior_image: None,
         row_count: 1,
         has_recompute: false,
-        vanished_images: Vec::new(),
         ends_in_delete: false,
         last_change: None,
     }];
@@ -1500,7 +1498,6 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
         src_changed: None,
         origin_lsn: None,
         lsn: Some(PgLsn::from(1u64)),
-        min_image_lsn: None,
         hop_gen: 0,
         first_seen: SystemTime::now(),
         group_key: None,
@@ -1510,7 +1507,6 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
         prior_image: None,
         row_count: 1,
         has_recompute: false,
-        vanished_images: Vec::new(),
         ends_in_delete: false,
         last_change: None,
     }];
@@ -1872,7 +1868,6 @@ fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
         src_changed: None,
         origin_lsn: None,
         lsn: None,
-        min_image_lsn: None,
         hop_gen: 0,
         first_seen: SystemTime::now(),
         group_key: None,
@@ -1882,7 +1877,6 @@ fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
         prior_image: None,
         row_count: 1,
         has_recompute: false,
-        vanished_images: Vec::new(),
         ends_in_delete: false,
         // #623 D6: an Apply (its image is the change), not a Re-derive.
         last_change: Some(LastChange {

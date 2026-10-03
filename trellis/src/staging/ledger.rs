@@ -20,9 +20,7 @@
 //! per change, over the image as the source's row type, into its ledger
 //! column. A relationship's parent is read live, by a left join to its
 //! to-side in the same statement (D5); a parent change re-derives each child
-//! it reaches. Every other target stays on `super::apply_aggregate`'s path,
-//! with its pre-lock, probe and recompute horizons. A target is entirely on
-//! one path or the other.
+//! it reaches. Since D5 every valid aggregate target routes here.
 //!
 //! # The ledger
 //!

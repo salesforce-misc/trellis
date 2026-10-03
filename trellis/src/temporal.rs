@@ -90,7 +90,7 @@
 //! `read_live_rows_batch`, `fetch_to_side_rows`, `fetch_relationship_projection_rows`
 //! and its reverse-trigger projection read, in `staging::quarantine`'s
 //! column sweep, and in the `RETURNING to_jsonb(t.*)::text` old-image
-//! captures `staging::apply`/`staging::apply_aggregate` use for issue #196.
+//! captures `staging::apply` used for issue #196.
 //! `to_jsonb` does not call the type's output function for datetimes; it uses
 //! `jsonb`'s own ISO-8601 writer. Read off a live server, one row, one
 //! session, both renderings side by side:

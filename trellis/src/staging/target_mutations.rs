@@ -12,8 +12,7 @@
 //! capture would not:
 //!
 //! - **The key is correct by construction.** Each staged key is the target's
-//!   own row identity (`ddl::pk_key_sql_expr`, or the aggregate
-//!   `derive_group_key` text that matches it), produced by the code that
+//!   own row identity (`ddl::pk_key_sql_expr`), produced by the code that
 //!   wrote the row. Nothing reconstructs a NULL-safe group key from a
 //!   captured image, which can't be done correctly for an aggregate target:
 //!   it has no primary key to capture by.
@@ -27,7 +26,7 @@
 //!
 //! # Why it is structural
 //!
-//! Every target writer (`apply::apply_target`, `apply_aggregate::apply_aggregate_target`,
+//! Every target writer (`apply::apply_target`, `ledger::apply_ledger_target`,
 //! the truncate clears (`apply::clear_target`), `quarantine::recompute_column`,
 //! `defs::backfill::backfill_altered_columns`, and a rebuild's orphan delete,
 //! `intake::resume_orphans`) takes a `&mut TargetMutations`
@@ -78,10 +77,9 @@
 //! stood before this transaction first touched it (`None` if the transaction
 //! created it). A downstream aggregate grouped by a non-key column of this
 //! target needs it. When an upstream write moves a row from group A to group
-//! B, the live re-read only names B, so without the prior image group A would
-//! keep the row's stale contribution. With it, the aggregate re-derives both
-//! A and B (see `apply_aggregate::accumulate_changes`). A deleted key's prior
-//! image is how the aggregate finds the group it left.
+//! B, the live re-read only names B; the prior image says the row was in A.
+//! (An aggregate on the ledger also has the key's entry, which names A,
+//! #623 D5.)
 //!
 //! Writers capture the prior image with the same statement that already
 //! row-locks the key before writing it (a `SELECT ... FOR UPDATE` pre-lock,
@@ -148,9 +146,8 @@
 //!   row-locked by this transaction or gone. The op follows from which
 //!   images exist; a key created and deleted in the same transaction
 //!   changed nothing any consumer saw and stages nothing.
-//! - **`lsn`** is the write token, so the fold's first/last image rules and
-//!   #321's `min_image_lsn` order one key's seam rows by the order their
-//!   writers committed.
+//! - **`lsn`** is the write token, so the fold's first/last image rules
+//!   order one key's seam rows by the order their writers committed.
 //! - **`group_key`** is the union of the target's outbound relationships'
 //!   `from_col` values across both images, the same rule a capture trigger
 //!   applies to a changed row (`capture::sql`).
@@ -443,15 +440,6 @@ impl TargetMutations {
                 src_changed,
                 origin_lsn,
             });
-    }
-
-    /// Every key recorded for `target`, in key order — for tests.
-    #[cfg(test)]
-    pub(crate) fn recorded_keys(&self, target: &str) -> Vec<String> {
-        self.touched
-            .get(target)
-            .map(|keys| keys.keys().cloned().collect())
-            .unwrap_or_default()
     }
 
     /// Turns every recorded key of a target with an applying reader into its
@@ -748,8 +736,7 @@ fn new_images_query<'a>(
 }
 
 /// The current WAL insert position, as this transaction's write token — see
-/// the module doc's "The write token". The same device #321's recompute
-/// horizon uses.
+/// the module doc's "The write token".
 async fn read_write_token(txn: &Transaction<'_>) -> Result<PgLsn, ApplyError> {
     Ok(txn
         .query_one("select pg_current_wal_insert_lsn()", &[])

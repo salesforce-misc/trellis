@@ -14,11 +14,11 @@
 //! `stock_totals`' composite `(warehouse, sku)` identity is what makes this
 //! interesting: when a group's row changes, `apply_and_mark_drained_many`'s
 //! downstream-propagation step stages a `Recompute` against `stock_totals`
-//! keyed by `apply_aggregate::derive_group_key`'s encoded text, and
+//! keyed by its encoded group-key text (`ddl::join_pk_key`), and
 //! `stock_totals_v2`'s own live re-fetch (`apply::read_live_rows_batch` →
 //! `ddl::split_pk_key`) decodes it as `stock_totals`' real (composite)
 //! primary key. Before the fix those two encodings disagreed —
-//! `derive_group_key` emitted a locally-invented length-prefixed form
+//! the old path's group-key encoder emitted a locally-invented length-prefixed form
 //! (`"2:w1" + "1:a"`), the decoder split on U+001F — so the drain failed
 //! outright with `DdlError::MalformedCompositeKey { key: "2:w11:a",
 //! expected_arity: 2, actual_arity: 1 }`, taking the whole batch with it.
@@ -300,8 +300,8 @@ async fn a_live_update_propagates_through_a_composite_group_key_into_a_chained_a
 /// cancelling out.
 ///
 /// This is the only end-to-end test that forces the Rust and SQL halves of
-/// the escape to agree against a real Postgres: `derive_group_key` →
-/// `ddl::join_pk_key` encodes the downstream `Recompute`'s key in Rust,
+/// the escape to agree against a real Postgres: `ddl::join_pk_key`
+/// encodes the downstream `Recompute`'s key in Rust,
 /// while `stock_totals_v2`'s live re-fetch re-derives that same key *in
 /// SQL* (`read_live_rows_batch`'s `ddl::pk_key_sql_expr`, whose multi-column
 /// arm wraps every column in `ddl::composite_key_escape_sql`) and then
@@ -364,25 +364,20 @@ async fn a_live_separator_valued_group_component_propagates_downstream() {
 /// one batch: a brand-new group (an `INSERT` under a `sku` that didn't exist
 /// yet) and a group that goes extinct (a `DELETE` of its only row, which
 /// stages a *deleted* group key — the other half of
-/// `apply_aggregate_target`'s `written`/`deleted` result, and so the other
-/// half of what the downstream-propagation step encodes).
+/// what the downstream-propagation step encodes).
 ///
 /// Both now propagate. Before issue #180, the extinct one did **not**: a
 /// downstream `Recompute` carried no image, so `stock_totals_v2` re-read the
 /// key live, found the row already gone, and had no way to know which of
 /// *its* groups that vanished row used to contribute to, so the change was
-/// dropped — `staging::apply_aggregate`'s module doc comment ("Image-less
-/// changes, and issue #180's fix for one producer of them") has the full
-/// story. That gap was entirely independent of issue #171's key *encoding*
+/// dropped. That gap was entirely independent of issue #171's key *encoding*
 /// (it reproduced identically for a single-column `GROUP BY` chain, whose
 /// encoding #103 already fixed — see
 /// `defs_aggregate_chained_single_column_group_key.rs`) and closing it
 /// needed the deleted group's old values threaded through the propagation
-/// step, not a different key format: `apply_aggregate_target`'s
-/// `delete_group_row`/`apply_forced_groups_bulk` now capture the extinct
-/// group's pre-delete row (`RETURNING to_jsonb(t.*)`), and downstream
-/// propagation stages it as a real image-bearing delete instead of an
-/// image-less `Recompute`. #171's own narrower fix is still exercised here
+/// step, not a different key format: the old aggregate path (deleted in
+/// #623 D5) captured the extinct group's pre-delete row and staged it as a
+/// real image-bearing delete instead of an image-less `Recompute`. #171's own narrower fix is still exercised here
 /// too: the extinct group's key still needs to *decode* correctly (rather
 /// than failing the whole batch with `MalformedCompositeKey`) for either the
 /// old gap or this fix to be reachable at all — which is why the sibling
@@ -451,8 +446,7 @@ async fn a_live_insert_and_an_extinct_composite_group_both_propagate_downstream(
 /// A grain migration on the *upstream* composite key — row 1 moves from
 /// `(w1, a)` to `(w1, b)`, changing one of the two `GROUP BY` columns — must
 /// propagate both the old and the new group key downstream. Both keys are
-/// encoded by the same `derive_group_key` call pair
-/// (`old_key`/`new_key`), so both go through issue #171's encoding on the way
+/// encoded the same way, so both go through issue #171's encoding on the way
 /// out; `stock_totals_v2`'s own key (`warehouse`) is unchanged by this move,
 /// which is precisely why its total must still be recomputed correctly from
 /// two separate upstream keys rather than one.
@@ -516,7 +510,7 @@ async fn null_sku_total(client: &Client, warehouse: &str) -> Option<String> {
 /// Issue #110's composite-key case: one component of a composite `GROUP BY`
 /// key (`sku`) is `NULL` while the other (`warehouse`) is not — exercising
 /// the `array_to_string`/`coalesce(..., chr(1))` composite encoding path
-/// (`ddl::pk_key_sql_expr`/`derive_group_key`), as opposed to
+/// (`ddl::pk_key_sql_expr`/`ddl::join_pk_key`), as opposed to
 /// `defs_aggregate_chained_single_column_group_key.rs`'s bare single-column
 /// sentinel. `stock_totals_v2` groups only by `warehouse`, so the `(w1,
 /// NULL)` group's contribution must fold into `w1`'s downstream total
@@ -600,8 +594,8 @@ async fn a_composite_group_with_a_null_component_propagates_downstream() {
 /// separator scheme (U+001F and U+001E, adjacent), while the other (`sku`)
 /// is a genuine SQL `NULL`. The encoded key therefore carries
 /// `ddl::NULL_KEY_SENTINEL` in one field and a `ddl::KEY_PART_ESCAPE` pair
-/// in the other, and the Rust producer (`derive_group_key` →
-/// `ddl::join_pk_key`) and the SQL producer (`ddl::pk_key_sql_expr`, which
+/// in the other, and the Rust producer
+/// (`ddl::join_pk_key`) and the SQL producer (`ddl::pk_key_sql_expr`, which
 /// nests `composite_key_escape_sql` *around* `null_key_escape_sql`) must
 /// agree on it byte-for-byte against a real Postgres, or the chained
 /// definition's live re-fetch either fails the drain with

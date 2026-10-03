@@ -147,11 +147,10 @@
 //! Why not the alternatives:
 //!
 //! - **Re-deriving rows below the new reader's build horizon** instead of
-//!   evaluating them would be the cheaper wait, but apply has no
-//!   per-definition horizon today (only aggregates' per-group recompute
-//!   horizon, #442), and every consumer path (1-1, aggregate, relationship
-//!   forward and reverse, settled projections) would need it. That is D's
-//!   ledger (#623), not C's.
+//!   evaluating them would be the cheaper wait, but apply had no
+//!   per-definition horizon, and every consumer path (1-1, aggregate,
+//!   relationship forward and reverse, settled projections) would need one.
+//!   That is D's ledger (#623), not C's.
 //! - **A seal after the widen** would bound the pre-widen rows to the
 //!   batches up to the widen's, but a batch drained doesn't mean every row in
 //!   it did (`poison_held`, re-staged reverses), and a phase-gap straggler

@@ -86,7 +86,7 @@ pub enum ValidationError {
     DuplicateFieldName { name: String },
     /// A field's name starts with [`RESERVED_COLUMN_PREFIX`], which is kept
     /// for the hidden columns Trellis adds to a target
-    /// ([`super::ddl::RECOMPUTE_LSN_COLUMN`], an `AVG`'s `__{field}_sum`, a
+    /// ([`super::ddl::MEMBERS_COLUMN`], an `AVG`'s `__{field}_sum`, a
     /// `SUM`'s `__{field}_count`). Without the reservation such a name could
     /// equal one of them, and install failed with a raw Postgres
     /// duplicate-column error (issue #566).
@@ -436,9 +436,9 @@ pub enum ValidationError {
     /// (`eval::eval_to_many_aggregate` -> `eval::reduce_numeric_aggregate`)
     /// with no live-Postgres fallback the way a `KeySpace::Aggregate`
     /// field's own `MIN`/`MAX` always has (it is
-    /// `Invertibility::RecomputeOnly`, so `staging::apply_aggregate` always
+    /// `Invertibility::RecomputeOnly`, so `staging::ledger` always
     /// resolves its written value with a real server-side `min()`/`max()`
-    /// push-down, never by folding a multi-row group through this
+    /// over the group's ledger entries, never by folding a multi-row group through this
     /// evaluator — see `defs::invertibility`'s own doc comment). An enum's
     /// creation-order comparison is a live, per-type, schema-defined fact
     /// (`pg_enum.enumsortorder`), not a universal property of the family
@@ -1583,35 +1583,15 @@ fn reject_unsupported_group_by_key_type(
         // `boolean` is *not* on that allowlist (the join/primary-key role
         // really does raw-text `{col}::text = $1` matching in places).
         //
-        // What saves the *final SQL* half of the `GROUP BY` role is that
-        // `staging::apply_aggregate` never does raw-text matching against
-        // the database: every keyset match (`keyset_unnest`) binds the
-        // group key as a `$1::text[]::{ty}[]` array, so whichever spelling
-        // a key arrived in gets parsed back through `boolin` — a permissive
-        // *input* function that accepts both `'t'`/`'f'` and `'true'`/
-        // `'false'` — before ever being compared, natively, against the
-        // live column. Two renderings of one value always resolve to the
-        // same physical target row.
-        //
-        // That alone was not the whole story, and issue #119's review
-        // found the second half live: before this arm's write, resolving
-        // to the same *row* was not the same as resolving to the same
-        // *value* for it. `staging::apply_aggregate::accumulate_changes`
-        // buckets a batch's touched rows into in-memory `GroupPlan`s keyed
-        // by `derive_group_key`'s own `text` — a bare Rust `HashMap` key,
-        // compared byte-for-byte with no database (and so no `boolin`) in
-        // the loop at all. An image-bearing CDC row keyed `'t'` and a bare
-        // recompute's live-read row keyed `'true'` used to land in *two*
-        // separate `GroupPlan`s that both then independently wrote to the
-        // one row the SQL layer correctly resolved them to — silently
-        // corrupting its value (a delta add stacked on an unrelated forced
-        // recompute) rather than visibly splitting it into two rows the way
-        // #248's pre-fix `timestamp` did. `derive_group_key` now runs each
-        // part through `canonicalize_group_key_part` before folding it into
-        // that dedup key (a no-op for every type but `Boolean`), closing
-        // the gap at its actual source. `trellis/tests/defs_boolean.rs`'s
+        // What saves the `GROUP BY` role is that the ledger
+        // (`staging::ledger`) never matches a group by its text: an entry's
+        // group is cast from the image's text into the ledger's own typed
+        // column, through `boolin` — a permissive *input* function that
+        // accepts both `'t'`/`'f'` and `'true'`/`'false'` — and groups are
+        // then matched natively, in SQL. Two renderings of one value always
+        // resolve to the same group. `trellis/tests/defs_boolean.rs`'s
         // `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
-        // reproduces the corruption end-to-end and pins the fix.
+        // pins it (issue #119).
         ValueType::Boolean => Ok(()),
         // Issue #112: `real`/`double precision` are rejected outright, and
         // this is a deliberate *tightening* — before the float split they
@@ -1685,20 +1665,11 @@ fn reject_unsupported_group_by_key_type(
         // `crate::netaddr`'s module doc for the live grid), the identical
         // "one value, two renderers" shape that keeps `inet` off the
         // join/primary-key allowlist. That divergence does not reach the
-        // `GROUP BY` role's *final SQL*, because `staging::apply_aggregate`'s
-        // keyset match never does raw-text comparison — it casts the *bound
-        // array* to the column's native type (`$1::text[]::inet[]`), and
-        // `inet_in` is permissive enough to parse both spellings back to the
-        // identical stored value (`'192.168.1.5'::inet =
-        // '192.168.1.5/32'::inet` is `true`, verified live). What it does
-        // reach is `staging::apply_aggregate::accumulate_changes`'s
-        // in-memory `GroupPlan` bucketing, which compares `derive_group_key`'s
-        // text byte-for-byte with no database (and so no `inet_in`) anywhere
-        // in the loop — `boolean`'s exact live bug shape (#119's review).
-        // `apply_aggregate::canonicalize_group_key_part`'s `Inet` arm (via
-        // `crate::netaddr::canonicalize_group_key_text`) closes that gap the
-        // same way it does for `Boolean`, which is what makes this an honest
-        // `Ok(())` rather than a still-open hazard.
+        // `GROUP BY` role, because the ledger (`staging::ledger`) never
+        // compares a group key's text — it casts it to the column's native
+        // type, and `inet_in` is permissive enough to parse both spellings
+        // back to the identical stored value (`'192.168.1.5'::inet =
+        // '192.168.1.5/32'::inet` is `true`, verified live).
         ValueType::Other(PgType::Inet) => Ok(()),
         // Issue #118: `bit varying` is safe here for a *different* reason
         // than every arm above it — it isn't about `::text`-vs-native-`=`
@@ -1816,9 +1787,8 @@ pub(crate) fn supported_group_by_key_types() -> String {
 ///   rendering isn't a `1.0`/`1.00` bijection; `boolean`: #119, a second
 ///   `pg_cast`-registered `::text` renderer disagrees with `boolout`). Both
 ///   are safe for this role for reasons specific to it — `boolean`'s
-///   because `staging::apply_aggregate` never does the raw-text comparison
-///   that trips it up elsewhere, once `canonicalize_group_key_part` closes
-///   the in-memory `GroupPlan`-bucketing half of the gap (issue #119).
+///   because the ledger (`staging::ledger`) never does the raw-text
+///   comparison that trips it up elsewhere (issue #119).
 /// * `inet` is admitted here for the identical reason `boolean` is (its own
 ///   `network_show`-vs-`inet_out` split, closed the same way), but stays off
 ///   the join-key list.
@@ -4027,7 +3997,7 @@ mod tests {
     fn a_field_named_like_an_aggregate_targets_hidden_columns_is_rejected() {
         // Issue #566: each of these named one of the hidden columns the
         // aggregate target DDL adds (`__{field}_count`, `__{field}_sum`,
-        // `RECOMPUTE_LSN_COLUMN`), so validation passed and install then
+        // then `__trellis_members`), so validation passed and install then
         // failed with a raw `42701 column specified more than once`.
         let source_columns = numeric_columns(&["g", "x"]);
         for (text, field) in [
@@ -4040,8 +4010,8 @@ mod tests {
                 "__a_sum",
             ),
             (
-                "TRANSFORM t FROM s GROUP BY g SELECT COUNT(*) AS __trellis_recompute_lsn",
-                "__trellis_recompute_lsn",
+                "TRANSFORM t FROM s GROUP BY g SELECT COUNT(*) AS __trellis_members",
+                "__trellis_members",
             ),
         ] {
             let err = validate(&parsed(text), &source_columns, &HashMap::new()).unwrap_err();

@@ -1179,8 +1179,8 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
 /// `column_dependents` used to scan every `transform_definitions` row with
 /// no `KeySpace` filter, so a downstream aggregate transform whose field
 /// happens to read a just-paused upstream 1-1 column would get a wrongly
-/// cascaded `column_status` row — one `staging::apply_aggregate`'s
-/// incremental-delta path has no notion of and would never clear, and one
+/// cascaded `column_status` row — one the aggregate apply path
+/// has no notion of and would never clear, and one
 /// `resume_column`'s cascade walk would later mishandle via the 1-1-only
 /// `recompute_column`. Proves the fix: pausing the upstream column must
 /// never create a `column_status` row for the aggregate, and the aggregate's

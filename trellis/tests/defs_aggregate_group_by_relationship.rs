@@ -528,7 +528,7 @@ async fn updating_a_to_side_rows_group_by_column_moves_affected_rows_to_the_new_
 /// Chaining: a further aggregate `GROUP BY tag` on top of `author_tag_totals`
 /// (itself grouped partly by a relationship path, and so keyed by a genuine
 /// **composite** `(tag, author)` pair) converges correctly — exercising
-/// `derive_group_key`'s multi-column (`author_tag_totals`'s own key) vs.
+/// the group key's multi-column (`author_tag_totals`'s own key) vs.
 /// single-column (`tag_totals2`'s own `tag` key) encoding split from issue
 /// #103, which this issue must not disturb.
 ///
@@ -539,7 +539,7 @@ async fn updating_a_to_side_rows_group_by_column_moves_affected_rows_to_the_new_
 /// propagating a *live incremental* change on a **multi-column** `GROUP BY`
 /// aggregate target *downstream* to a further chained definition was broken
 /// on `main`, independently of #137, because
-/// `apply_aggregate::derive_group_key`'s then length-prefixed composite-key
+/// the old aggregate path's then length-prefixed composite-key
 /// encoding leaked into the downstream `Recompute` marker's `key` field,
 /// which the live re-fetch path (`ddl::join_pk_key`'s U+001F-joined
 /// convention) then failed to parse (`DdlError::MalformedCompositeKey`).
@@ -761,7 +761,7 @@ const AUTHOR_TAG_TOTALS_WITH_PASSTHROUGH: &str = "TRANSFORM author_tag_totals_pt
 /// Regression pin (found in review): [`build_reverse_relationship_shape`]'s
 /// per-field `substitute_relationship_path` rewrite left
 /// `rewritten.key_space`'s own `GroupByKey::RelationshipPath` entry
-/// unrewritten, unlike `apply_aggregate::build_forward_relationship_shape`'s
+/// unrewritten, unlike the old aggregate path's
 /// matching rewrite on the forward path. `eval::evaluate_aggregate` keys its
 /// `group_by` set off each key's *target* column name (`author`), so a field
 /// substituted to `Column("__trellis_rev_author")` never matched it, and

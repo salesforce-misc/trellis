@@ -21,7 +21,7 @@
 //!    relationship/primary keys and `GROUP BY` keys. `inet` is refused as a
 //!    relationship/primary key (same reason `boolean` is) but *admitted* as
 //!    a `GROUP BY` key, the same split `boolean` got in #119, because
-//!    `staging::apply_aggregate`'s keyset match never does raw-text
+//!    the aggregate path's keyset match never does raw-text
 //!    comparison and `inet_in` reconciles both spellings — demonstrated here
 //!    with the same end-to-end CDC-vs-live-read regression shape
 //!    `defs_boolean.rs`/`defs_temporal.rs` each pin for their own family.

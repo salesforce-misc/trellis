@@ -22,7 +22,7 @@
 //! [`crate::defs::oracle::render_expr_sql`] or any of its siblings in
 //! `defs::oracle` — those are used by the *production write path*
 //! (`defs::backfill`'s direct-build backfill, and
-//! `staging::apply_aggregate`'s incremental aggregate apply), not just by
+//! `staging::ledger`'s incremental aggregate apply), not just by
 //! tests. Auditing backfilled rows with a renderer the backfill path itself
 //! uses would check the write path against itself: a rendering bug would
 //! agree with itself, and the audit would pass on a wrong answer. This

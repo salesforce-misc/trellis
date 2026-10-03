@@ -35,18 +35,16 @@
 //! # Where the points sit
 //!
 //! The names are the ledger design's steps (ADR-0002, "Apply" and
-//! "Re-derive"). A plain `SUM`/`AVG`/`COUNT` aggregate is on the ledger since #623
-//! D3 (`super::ledger`) and a 1-1 target since D6 (`super::one_to_one_ledger`);
-//! every other aggregate target has no entry lock and no ledger Re-derive
-//! yet, so each point sits at the step that plays that role now:
+//! "Re-derive"). Every aggregate target is on the ledger since #623 D5
+//! (`super::ledger`) and a 1-1 target since D6 (`super::one_to_one_ledger`):
 //!
-//! | Point | 1-1 target | Aggregate target on the ledger | Other aggregate target |
-//! |---|---|---|---|
-//! | [`PausePoint::AfterPlaceholders`] | after the placeholder insert, before the entry lock | after the placeholder insert, before the entry lock (each time it is taken) | never reached |
-//! | [`PausePoint::AfterEntryLock`] | after the sorted entry lock | after the sorted entry lock | after the group pre-lock (`prelock_sql`) |
-//! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key | directly after the one read-and-snapshot statement, when the page re-derives any key | after the forced groups' live re-read (`apply_forced_groups_bulk`), when the page forces any |
-//! | [`PausePoint::AfterGroupUpsert`] | never reached | after the entries-and-groups statement | after the delta groups' upsert |
-//! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write | after the page's last write |
+//! | Point | 1-1 target | Aggregate target |
+//! |---|---|---|
+//! | [`PausePoint::AfterPlaceholders`] | after the placeholder insert, before the entry lock | after the placeholder insert, before the entry lock (each time it is taken) |
+//! | [`PausePoint::AfterEntryLock`] | after the sorted entry lock | after the sorted entry lock |
+//! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key | directly after the one read-and-snapshot statement, when the page re-derives any key |
+//! | [`PausePoint::AfterGroupUpsert`] | never reached | after the entries-and-groups statement |
+//! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write |
 //!
 //! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
 //! column's first three points for its target too: `AfterPlaceholders` and

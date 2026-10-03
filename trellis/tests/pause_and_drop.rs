@@ -554,8 +554,8 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     .expect("seed the relationship's to-side");
 
     let trellis = define_only(db.dsn()).await;
-    // Relationship-fed, so the old direct build (not the Re-derive build,
-    // #625 F5) stamps the extinct horizon the drop must take, until #625 F9.
+    // Relationship-fed, so the direct build (not the Re-derive build, #625
+    // F5) writes the ledger the drop must take, until #625 F9.
     trellis
         .apply("RELATIONSHIP grp FROM orders.g TO grps.id")
         .await
@@ -591,8 +591,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
             > 0,
         "precondition: the target was built"
     );
-    // #623 D2: the build wrote the target's ledger, one entry per source row,
-    // and stamped the target's extinct horizon.
+    // #623 D2: the build wrote the target's ledger, one entry per source row.
     assert_eq!(
         count(
             &raw,
@@ -602,11 +601,6 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         6,
         "precondition: the build wrote the ledger"
     );
-    let horizons = format!(
-        "select count(*) from aggregate_extinct_horizon \
-         where target_table = '{DEFAULT_TARGET_SCHEMA}.order_rollup'"
-    );
-    assert_eq!(count(&raw, &horizons).await, 1, "precondition: a horizon");
     // A relationship-fed target has no group deltas (#625 F1 gives them only
     // to a ledger-routed one); `rederive_build.rs`'s
     // `a_drop_during_the_build_takes_its_work_with_it` pins that a drop
@@ -623,11 +617,6 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     assert!(
         !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__ledger").await,
         "the drop takes the target's ledger with it"
-    );
-    assert_eq!(
-        count(&raw, &horizons).await,
-        0,
-        "and its extinct horizon, which a later target of the same name would inherit"
     );
 
     assert_eq!(

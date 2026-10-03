@@ -461,9 +461,8 @@ async fn bit_and_or_fold_matches_a_server_side_aggregate() {
 /// multi-row shape `defs::oracle::recompute_aggregate`'s test-only
 /// cross-check uses. `EvalError::BitStringLengthMismatch`'s own doc
 /// comment is the authoritative account of why this is *not* the shape a
-/// live apply ever calls the evaluator with: `staging::apply_aggregate`'s
-/// production caller (`row_contribution`) only ever passes one row at a
-/// time, so a real mismatched-length group surfaces there as Postgres's
+/// live apply ever calls the evaluator with: a real mismatched-length group
+/// surfaces there as Postgres's
 /// own native error (`ApplyError::Db`) instead, never this Rust variant.
 #[tokio::test]
 async fn bit_and_or_reject_mismatched_length_bit_varying_the_same_way_postgres_does() {

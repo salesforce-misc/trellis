@@ -82,20 +82,13 @@
 //!   output function, and it joins `catalog::TEXT_STABLE_JOIN_KEY_TYPES`
 //!   the same way `bytea`/`oid` did.
 //!
-//! `inet`'s `GROUP BY` key role is nonetheless admitted (see
-//! [`canonicalize_group_key_text`] below) — the same split `boolean` got in
-//! #119, for the same mechanical reason: `staging::apply_aggregate`'s
-//! keyset match never does raw-text comparison, it casts the *bound array*
-//! to the column's native type (`$1::text[]::inet[]`), and `inet_in` is
-//! permissive enough to parse both spellings (`'192.168.1.5'` and
-//! `'192.168.1.5/32'`) back to the identical stored value — verified live:
-//! `'192.168.1.5'::inet = '192.168.1.5/32'::inet` is `true`. That reconciles
-//! the *SQL* half of the `GROUP BY` role automatically. It does not reconcile
-//! `staging::apply_aggregate::accumulate_changes`'s in-memory `GroupPlan`
-//! bucketing, which compares `derive_group_key`'s text byte-for-byte with no
-//! database in the loop — `boolean`'s exact live bug shape — so this issue
-//! adds an `inet` arm to `canonicalize_group_key_part` alongside `boolean`'s,
-//! closing the gap the same way #119 did.
+//! `inet`'s `GROUP BY` key role is nonetheless admitted — the same split
+//! `boolean` got in #119, for the same mechanical reason: the ledger
+//! (`staging::ledger`) never compares a group key's text, it casts it to the
+//! column's native type, and `inet_in` is permissive enough to parse both
+//! spellings (`'192.168.1.5'` and `'192.168.1.5/32'`) back to the identical
+//! stored value — verified live: `'192.168.1.5'::inet =
+//! '192.168.1.5/32'::inet` is `true`.
 //!
 //! ## `to_jsonb`
 //!
@@ -172,8 +165,8 @@ use crate::defs::pg_type::PgType;
 
 /// A failure to parse Postgres's canonical `inet` text (either renderer:
 /// `inet_out`'s host-elided form or `network_show`'s always-explicit one —
-/// [`parse`] accepts both, since [`compare`]/[`canonicalize_group_key_text`]
-/// both have to handle text that arrived via either path).
+/// [`parse`] accepts both, since [`compare`] has to handle text that arrived
+/// via either path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetAddrParseError;
 
@@ -307,36 +300,6 @@ pub const fn supports_min_max(pg_type: PgType) -> bool {
     matches!(pg_type, PgType::Inet)
 }
 
-/// Normalizes one `GROUP BY` key part's `inet` text to a single spelling
-/// per logical value, before it feeds `staging::apply_aggregate::
-/// derive_group_key`'s in-memory dedup key — the `inet` counterpart to
-/// issue #119's `canonicalize_group_key_part` `Boolean` arm, for the
-/// identical reason: `inet_out` (CDC) and `<col>::text`/`network_show`
-/// (this engine's own live reads, post-#248) spell a bare-host `inet` value
-/// two different ways, and `accumulate_changes`'s `GroupPlan` bucketing
-/// compares that text byte-for-byte with no database in the loop. Always
-/// appends the default netmask when the text omits one — the direction that
-/// matches `network_show`'s always-explicit spelling, since that is what
-/// every *other* renderer in the engine already produces for a live `inet`
-/// read.
-///
-/// A no-op (returns `text` unchanged) for any input that already carries an
-/// explicit `/prefixlen`, or that fails to parse at all — a malformed value
-/// reaching here is a defense-in-depth case `parse_value` would already have
-/// rejected earlier, and this function's contract (matching `Boolean`'s
-/// `canonicalize_group_key_part` arm) is to pass unparseable text through
-/// verbatim rather than guess at it.
-pub fn canonicalize_group_key_text(text: &str) -> String {
-    if text.contains('/') {
-        return text.to_string();
-    }
-    match text.parse::<IpAddr>() {
-        Ok(IpAddr::V4(_)) => format!("{text}/32"),
-        Ok(IpAddr::V6(_)) => format!("{text}/128"),
-        Err(_) => text.to_string(),
-    }
-}
-
 const INET_SHAPE: &str = "an address in Rust's canonical std::net form followed by a mandatory \
     /prefixlen, e.g. `192.168.1.5/32` or `2001:db8::1/128` — the form `<col>::text` renders \
     (`network_show`), not `inet_out`'s host-address-elided form";
@@ -352,7 +315,7 @@ pub fn canonical_inet(text: &str) -> Result<(), &'static str> {
     // [`parse`] alone is not enough: it deliberately accepts *both* live
     // renderings (a missing `/prefixlen` defaults to the family's full
     // width, exactly `inet_in`'s own rule, which is what makes it usable
-    // for [`compare`]/[`canonicalize_group_key_text`]). A typed literal's
+    // for [`compare`]). A typed literal's
     // canonical form is narrower than "parses" — it must be the one
     // spelling `network_show` actually emits, which always carries the
     // suffix explicitly.
@@ -376,8 +339,7 @@ const CIDR_SHAPE: &str = "an address in Rust's canonical std::net form followed 
 pub fn canonical_cidr(text: &str) -> Result<(), &'static str> {
     // Same reasoning as `canonical_inet`'s explicit-`/` check: without it, a
     // bare host address with no `/` at all would default to the family's
-    // full-width mask (`parse`'s rule, for `compare`/`canonicalize_group_key_text`'s
-    // benefit), which trivially has zero host bits and would otherwise slip
+    // full-width mask (`parse`'s rule, for `compare`'s benefit), which trivially has zero host bits and would otherwise slip
     // through the check below.
     if !text.contains('/') {
         return Err(CIDR_SHAPE);
@@ -494,31 +456,6 @@ mod tests {
             compare("192.168.1.5", "192.168.1.5/32").unwrap(),
             Ordering::Equal
         );
-    }
-
-    // ---------------------------------------------------------------
-    // GROUP BY canonicalization
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn canonicalize_group_key_text_appends_the_default_netmask_when_absent() {
-        assert_eq!(canonicalize_group_key_text("192.168.1.5"), "192.168.1.5/32");
-        assert_eq!(canonicalize_group_key_text("::1"), "::1/128");
-    }
-
-    #[test]
-    fn canonicalize_group_key_text_is_a_no_op_when_a_netmask_is_already_present() {
-        assert_eq!(
-            canonicalize_group_key_text("192.168.1.0/24"),
-            "192.168.1.0/24"
-        );
-    }
-
-    #[test]
-    fn canonicalize_group_key_text_reconciles_both_live_renderers_to_one_spelling() {
-        let via_cdc = canonicalize_group_key_text("192.168.1.5"); // inet_out
-        let via_live_read = canonicalize_group_key_text("192.168.1.5/32"); // network_show
-        assert_eq!(via_cdc, via_live_read);
     }
 
     // ---------------------------------------------------------------

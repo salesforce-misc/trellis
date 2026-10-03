@@ -1599,8 +1599,8 @@ async fn vacuum_deltas(
 /// plan job's last) calls this after it commits, so the last of them sees
 /// all the others committed. It checks without a lock first, and only then
 /// takes the definition row `for update` and checks again, so only a
-/// possibly-last caller takes the lock. No catch-up is parked and no horizon
-/// raised: the definition applied from its start.
+/// possibly-last caller takes the lock. No catch-up is parked: the
+/// definition applied from its start.
 pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError> {
     let mut client = pool.get().await?;
     if !build_done(&**client, id).await? {

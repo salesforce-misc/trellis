@@ -380,7 +380,7 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
       `{'2147483647 days', '1 days', '-1 days'}` raises ascending and
       returns `2147483647 days` descending.
 
-    Recompute-only removes both: `probe_recompute_fields_bulk` renders
+    Recompute-only removes both: the ledger's `recompute_statement` renders
     `(sum(<col>))::text` and lets Postgres fold the group in one pass, so
     Trellis raises exactly when a server-side `sum()` over the same rows
     would. Where #112's floats are *total but inexact*, interval is *exact
@@ -507,14 +507,16 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     refusal as deliberate, not an oversight.
   * **The `GROUP BY` key role's *final SQL* comparison was already safe**
     (`validate::reject_unsupported_group_by_key_type` admitted
-    `ValueType::Boolean` before this issue existed), because
-    `staging::apply_aggregate`'s keyset match always binds the group key as
-    a native-typed array (`$1::text[]::boolean[]`), the same `boolin`
-    reconciliation `key_array_filter` uses. That was necessary but not
+    `ValueType::Boolean` before this issue existed), because the aggregate
+    apply path's keyset match always binds the group key as a native-typed
+    array (`$1::text[]::boolean[]`), the same `boolin` reconciliation
+    `key_array_filter` uses — true of `staging::apply_aggregate` at the
+    time, and still true of its replacement, the per-key ledger
+    (`staging::ledger`, `#623` D3/D5). That was necessary but not
     sufficient: review for this issue found a **second, genuinely live**
     instance of the same defect shape one layer earlier, entirely in
-    memory. `staging::apply_aggregate::accumulate_changes` buckets one
-    drain batch's touched rows into `GroupPlan`s keyed by
+    memory. `staging::apply_aggregate::accumulate_changes` used to bucket
+    one drain batch's touched rows into `GroupPlan`s keyed by
     `derive_group_key`'s own `text` — a bare Rust `HashMap` key compared
     byte-for-byte, with no database (and so no `boolin`) anywhere in that
     comparison. A row that arrived with CDC's `'t'` spelling and a row that
@@ -527,14 +529,19 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     pre-fix `timestamp` did. That is a worse failure mode than #248's,
     precisely because it is silent. `apply_aggregate::
     canonicalize_group_key_part` — a no-op for every `ValueType` but
-    `Boolean` — now normalizes each `GROUP BY` part's text before it folds
+    `Boolean` — normalized each `GROUP BY` part's text before it folded
     into that dedup key, closing the gap at its source rather than only at
-    the SQL boundary. `trellis/tests/defs_boolean.rs`'s
+    the SQL boundary. Both that function and the in-memory `GroupPlan`
+    bucketing it patched were deleted along with `apply_aggregate` (`#623`
+    D5): the ledger resolves every `GROUP BY` value through SQL
+    (`jsonb_populate_record` into the ledger's typed row, then `GROUP BY`
+    in SQL), with no in-memory text-keyed bucketing step, so this defect
+    shape doesn't arise there.
+    `trellis/tests/defs_boolean.rs`'s
     `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
-    reproduces the corruption end-to-end and pins the fix; a matching
-    no-DB unit test
-    (`derive_group_key_normalizes_every_boolean_spelling_to_the_same_dedup_key`)
-    pins the root cause directly.
+    still reproduces the scenario end-to-end and still passes; the no-DB
+    unit test that used to pin the root cause directly was deleted along
+    with the functions it tested.
   * **`bool_and`/`bool_or` are recompute-only**, on `MIN`/`MAX`'s reasoning,
     not `SUM`'s. Both are total, commutative, associative folds over
     `{true, false}` with no overflow/rounding/partial-monoid hazard — the
@@ -553,13 +560,13 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     tracking hidden true-count/false-count partials *would* be genuinely
     invertible (`bool_and` is exactly "false-count `== 0`", decrementable on
     delete) but needs a new composite-aggregate shape `defs::invertibility::
-    PartialField` was never built for, plus matching `staging::
-    apply_aggregate` carrier/probe plumbing — considered and deferred as a
+    PartialField` was never built for, plus matching ledger carrier/probe
+    plumbing (`staging::ledger`) — considered and deferred as a
     speculative expansion beyond this issue's scope, not attempted.
     Recompute-only costs nothing extra to wire up: `registry::
     aggregate_result_type` routes `bool_and`/`bool_or` straight into
-    `staging::apply_aggregate`'s ordinary `AggFieldKind::RecomputeOnly`
-    fallback, the same free ride float `SUM`/`AVG` and `SUM(interval)` get.
+    the ledger's ordinary `LedgerField::Recompute` fallback (`staging::
+    ledger`), the same free ride float `SUM`/`AVG` and `SUM(interval)` get.
     Live-verified in `trellis/tests/defs_boolean.rs`, including the
     concrete two-deletions demonstration
     (`bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone`).
@@ -605,21 +612,25 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     joins the allowlist cleanly.
   * **`inet`'s `GROUP BY` key role is nonetheless admitted — the same split
     `boolean` got, for the same mechanical reason.**
-    `staging::apply_aggregate`'s keyset match never does raw-text
+    The aggregate apply path's keyset match never does raw-text
     comparison; it casts the *bound array* to the column's native type
     (`$1::text[]::inet[]`), and `inet_in` is permissive enough to parse both
     spellings back to the identical stored value
     (`'192.168.1.5'::inet = '192.168.1.5/32'::inet` is `true`, verified
-    live). That reconciles the SQL half automatically but not
-    `staging::apply_aggregate::accumulate_changes`'s in-memory `GroupPlan`
-    bucketing, which compares `derive_group_key`'s text byte-for-byte with
-    no database in the loop — `boolean`'s exact live bug shape. This issue
-    adds an `inet` arm to `apply_aggregate::canonicalize_group_key_part`
-    (backed by `crate::netaddr::canonicalize_group_key_text`) alongside
-    `boolean`'s, closing the gap the same way #119 did, and
+    live). That reconciled the SQL half automatically but not, at the
+    time, `staging::apply_aggregate::accumulate_changes`'s in-memory
+    `GroupPlan` bucketing, which compared `derive_group_key`'s text
+    byte-for-byte with no database in the loop — `boolean`'s exact live
+    bug shape. This issue added an `inet` arm to
+    `apply_aggregate::canonicalize_group_key_part` (backed by
+    `crate::netaddr::canonicalize_group_key_text`) alongside `boolean`'s,
+    closing the gap the same way #119 did. Both the arm and the function it
+    was added to were deleted along with `apply_aggregate` (`#623` D5); the
+    ledger's SQL-only `GROUP BY` resolution (see `boolean`'s entry above)
+    has no in-memory step for the gap to reopen in.
     `trellis/tests/defs_netaddr.rs`'s
     `an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
-    reproduces the shape end-to-end and pins the fix, the same way
+    still reproduces the shape end-to-end and still passes, the same way
     `defs_boolean.rs`'s equivalent test does for `boolean`.
   * **`MIN`/`MAX` diverge three ways, none of them the epic's original
     `⚠️` guess.** `inet` has a real `min(inet)`/`max(inet)` that keeps its
@@ -800,13 +811,15 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     that refusal as `EvalError::BitStringLengthMismatch` rather than
     silently picking a length. In the live pipeline this specific Rust
     variant never actually fires: `bit_and`/`bit_or` are always
-    `RecomputeOnly`, so `staging::apply_aggregate` folds a group's real
-    written value by pushing the rendered aggregate expression straight to
-    Postgres (`probe_recompute_fields_bulk`), which raises *its own*
+    `RecomputeOnly`, so the ledger folds a group's real written value by
+    pushing the rendered aggregate expression straight to Postgres
+    (`staging::ledger`'s `recompute_statement`), which raises *its own*
     native error — surfacing as `ApplyError::Db`, not this variant — and
-    the one production caller of the Rust evaluator itself
-    (`row_contribution`) only ever hands it a single row per call, never
-    the ≥2-value group this branch needs to compare. The variant correctly
+    the Rust evaluator has no production caller for aggregates at all any
+    more (`apply_aggregate`'s `row_contribution`, deleted by `#623` D5, was
+    the last one, and it only ever handed the evaluator a single row per
+    call anyway, never the ≥2-value group this branch needs to compare).
+    The variant correctly
     reproduces Postgres's own refusal and is exercised by `defs::eval`'s
     own unit tests and by the test-only `defs::oracle::recompute_aggregate`
     cross-check (which *does* call the evaluator over a whole multi-row
@@ -928,18 +941,19 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 * **Non-numeric & order-sensitive aggregates (#120)** — the epic's own scope
   note bundled three things together: generalize `MIN`/`MAX` past numeric,
   design order-sensitive `string_agg`/`array_agg`/`jsonb_agg` maintenance,
-  and align `COUNT(<column>)`. Read against the actual code (`staging::
-  apply_aggregate.rs`, `defs::invertibility`) rather than assumed from the
-  note, the three turned out to be very differently sized:
+  and align `COUNT(<column>)`. Read against the actual code (at the time,
+  `staging::apply_aggregate.rs`; today its replacement, `staging::ledger`,
+  and `defs::invertibility`) rather than assumed from the note, the three
+  turned out to be very differently sized:
 
   * **`MIN`/`MAX` generalization was a small, contained admission-layer
     fix, not new machinery.** `defs::invertibility::classify`'s `MIN`/`MAX`
     arm has been unconditional on argument type since before this issue
     (issue #11's original gate rule: `("MIN" | "MAX", AggregateArg::Column(_))
-    => RecomputeOnly`), and a `KeySpace::Aggregate` field's `MIN`/`MAX` was
-    already resolved entirely by a server-side `min()`/`max()` push-down
-    (`staging::apply_aggregate::probe_recompute_fields_bulk`/
-    `probe_field_value`), never a Rust-side fold. The only real gap was
+    => RecomputeOnly`), and a `KeySpace::Aggregate` field's `MIN`/`MAX` is
+    resolved entirely by a server-side `min()`/`max()` push-down
+    (`staging::ledger`'s `recompute_statement`, the `LedgerField::Recompute`
+    fallback), never a Rust-side fold. The only real gap was
     `registry::aggregate_result_type` falling through to `None` for `Text`
     (not in the numeric family, no early-return arm the way `Boolean`/the
     `Other` families have). Checked live per #111-#119's playbook rather
@@ -984,20 +998,23 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     `COUNT` row's `arg_types: &[]`, which silently produces *zero*
     iterations for a real one-element `args` — meaning the argument would
     never be recursively validated at all once the grammar accepted it, a
-    real (if latent) hole, not just a missing feature; (3) `staging::
-    apply_aggregate`'s two forced-full-recompute renderers (`upsert_group`'s
-    single-group probe and `apply_forced_groups_bulk`'s bulk `INSERT ...
-    SELECT`) both hardcoded `count(*)` for *every* `AggFieldKind::Count`
-    field — silently wrong for `COUNT(<column>)` specifically whenever an
-    image-less recompute trigger forced that field's group onto the
-    full-recompute path (it would have written the group's raw row count,
-    not the column's non-null count). A fourth, subtler gap surfaced only
-    once live tests were run: `COUNT`'s row-contribution text is `"0"`/`"1"`
-    (never absent, since `count(x)` is never `NULL`, unlike `SUM`/`AVG`),
-    so `add_contributions`/`sub_contributions`/`diff_contributions` had to
-    learn that a `Count` field's `"0"` contribution means "skip this row"
-    — the counterpart of `Sum`/`Avg`'s `None` — without also treating a
-    genuine `SUM(amount) = 0` contribution as skippable.
+    real (if latent) hole, not just a missing feature; (3) the apply
+    path's two forced-full-recompute renderers (at the time,
+    `staging::apply_aggregate`'s `upsert_group` single-group probe and
+    `apply_forced_groups_bulk`'s bulk `INSERT ... SELECT`; both are gone
+    now, along with the rest of that module, superseded by the ledger's own
+    `LedgerField::CountStar`/`CountArg` split and its `recompute_statement`
+    renderer) both hardcoded `count(*)` for *every* count field — silently
+    wrong for `COUNT(<column>)` specifically whenever an image-less
+    recompute trigger forced that field's group onto the full-recompute
+    path (it would have written the group's raw row count, not the
+    column's non-null count). A fourth, subtler gap surfaced only once live
+    tests were run: `COUNT`'s row-contribution text is `"0"`/`"1"` (never
+    absent, since `count(x)` is never `NULL`, unlike `SUM`/`AVG`), so the
+    apply path's contribution folding had to learn that a `Count` field's
+    `"0"` contribution means "skip this row" — the counterpart of
+    `Sum`/`Avg`'s `None` — without also treating a genuine
+    `SUM(amount) = 0` contribution as skippable.
     Bundled in, since #111's own "exact integer semantics" note explicitly
     earmarked it for this issue: `COUNT` (both `COUNT(*)` and
     `COUNT(<column>)`) is now declared `bigint` (`Integer(Int8)`), matching
@@ -1045,9 +1062,10 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
        `MIN`/`MAX`/float `SUM`/`AVG`/`SUM(interval)`/`bool_and`/`bool_or`/
        `bit_and`/`bit_or`/`jsonb_agg(jsonb)`) is the *only* sound design for
        these three — never an approximated delta, per this crate's own
-       standing rule.** This needs no new maintenance mechanism at all:
-       `AggFieldKind::RecomputeOnly` and `probe_recompute_fields_bulk`
-       already do exactly this for every other non-invertible aggregate.
+       standing rule.** This needs no new maintenance mechanism at all: the
+       ledger's `LedgerField::Recompute` and its `recompute_statement`
+       renderer already do exactly this for every other non-invertible
+       aggregate.
     2. **The real open design question is narrower than "how do we
        maintain it" — it's "what does `ORDER BY` inside an aggregate call
        even mean here, grammar-wise, and does recompute make it safe to
@@ -1080,7 +1098,7 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
          grammar, immediate value for a caller who doesn't need a
          guaranteed order (e.g. `array_agg(tag)` for an unordered set of
          tags). **This sub-piece is basically free** (the registry/
-         invertibility/`AggFieldKind::RecomputeOnly` plumbing already
+         invertibility/`LedgerField::Recompute` plumbing already
          exists) and was *not* done in this pass anyway, to avoid
          shipping `array_agg`/`string_agg` half-designed (with the
          `ORDER BY` question still genuinely open) in the same PR as the
@@ -1101,7 +1119,7 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
          "verify, don't assume" pass this issue applied everywhere else,
          and exactly the kind of finding #111-#120 turned up repeatedly
          for *other* roles when checked rather than assumed.
-    3. **Interaction with `defs::invertibility`/`AggFieldKind` gating**:
+    3. **Interaction with `defs::invertibility`/`LedgerField` gating**:
        none needed beyond what already exists. `array_agg`/`string_agg`/
        `jsonb_agg(<any type>)` all belong in `invertibility::classify`'s
        existing `RecomputeOnly` bucket (the same arm `jsonb_agg(jsonb)`
@@ -1217,10 +1235,11 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     `Invertibility::RecomputeOnly` for *every* argument type since before
     this issue existed — issue #11's original, unconditional-on-type gate
     rule, not something #117 had to add. A `RecomputeOnly` field's written
-    value is never accumulated from a running state; `staging::apply_aggregate`
-    always resolves it by pushing a real `min()`/`max()` down to Postgres
-    itself (`probe_recompute_fields_bulk`), which necessarily evaluates
-    under the type's *current* `pg_enum` shape at the moment it runs. There
+    value is never accumulated from a running state; the ledger
+    (`staging::ledger`) always resolves it by pushing a real
+    `min()`/`max()` down to Postgres itself (`recompute_statement`), which
+    necessarily evaluates under the type's *current* `pg_enum` shape at the
+    moment it runs. There
     is no persistent Trellis-side knowledge of an enum's value set or order
     anywhere in the engine to invalidate in the first place — verified, not
     just argued from the classification: `trellis/tests/defs_enum.rs`'s
@@ -1240,9 +1259,13 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     each one's order is knowable from the family alone. An enum's order is
     knowable only from a live `pg_enum` read of *that specific type*, which
     this evaluator structurally never has — it is a pure, synchronous
-    function, by design, so that its one production caller
-    (`staging::apply_aggregate::row_contribution`) never pays a per-row
-    database round trip. `defs::eval::reduce_enum_aggregate` answers only
+    function, by design. (At the time this issue was written, that design
+    kept `staging::apply_aggregate::row_contribution` — its one production
+    caller — from paying a per-row database round trip; `#623 D5` later
+    deleted `row_contribution` along with the rest of that module, and the
+    evaluator's only callers today are `defs::oracle`'s cross-check and its
+    own unit tests, so the synchronous design now serves that use rather
+    than a live apply path.) `defs::eval::reduce_enum_aggregate` answers only
     what it safely can without one (a single-distinct-value group needs no
     ordering at all — `MIN`/`MAX` of one repeated value is that value) and
     raises a named `EvalError::EnumOrderingUnavailable` for a genuine

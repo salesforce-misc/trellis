@@ -1430,9 +1430,7 @@ pub async fn run_claimed_chunk(
 }
 
 /// Runs a [`ChunkWork::DirectBuild`] job: the whole direct set-based build
-/// of `definition` (ADR-0007, [`backfill::backfill_definition`]). An
-/// aggregate's target then gets its extinct horizon raised (see
-/// [`raise_extinct_horizon_after_build`]).
+/// of `definition` (ADR-0007, [`backfill::backfill_definition`]).
 ///
 /// Moving the definition on to `catching_up` is [`finish_chunk`]'s job, as
 /// for every chunk.
@@ -1451,39 +1449,6 @@ async fn run_direct_build(
         Some(fence),
     )
     .await?;
-
-    if matches!(
-        definition.def.key_space,
-        super::ast::KeySpace::Aggregate { .. }
-    ) {
-        let client = pool.get().await?;
-        raise_extinct_horizon_after_build(&**client, &definition.target_table).await?;
-    }
-    Ok(())
-}
-
-/// Raises an aggregate target's extinct horizon (issue #321,
-/// `aggregate_extinct_horizon`) to the WAL insert position after its direct
-/// build read the source. The build is a live `GROUP BY` read, and it writes
-/// no row for a group it found empty, so a delta for such a group that drains
-/// after the definition goes live (the build runs after its source's capture
-/// was installed, so a commit it read is captured too) is judged against this
-/// value, the same way a delta on a group a forced recompute found empty is.
-/// Raising a horizon is always safe: the worst it does is send a delta to
-/// the re-deriving path.
-async fn raise_extinct_horizon_after_build(
-    client: &impl GenericClient,
-    target_table: &str,
-) -> Result<(), tokio_postgres::Error> {
-    client
-        .execute(
-            "insert into aggregate_extinct_horizon (target_table, lsn) \
-         values ($1, pg_current_wal_insert_lsn()) \
-         on conflict (target_table) do update \
-         set lsn = greatest(aggregate_extinct_horizon.lsn, excluded.lsn)",
-            &[&target_table],
-        )
-        .await?;
     Ok(())
 }
 
@@ -2332,10 +2297,7 @@ mod tests {
 
     /// Issue #419: a direct-build job whose worker dies is reclaimed and
     /// rerun by another worker, and finishing it moves the definition to
-    /// `catching_up` with its go-live catch-up parked. The build records its read as the recompute
-    /// horizon of every group row it writes and of the target itself, so a
-    /// streamed delta for a commit it read re-derives its group rather than
-    /// counting the commit twice.
+    /// `catching_up` with its go-live catch-up parked.
     #[tokio::test]
     async fn a_direct_build_job_held_by_a_dead_worker_is_rerun_by_another() {
         let cluster = testkit::TestCluster::start();
@@ -2374,33 +2336,23 @@ mod tests {
         assert_eq!(status_of(&raw, id).await, "catching_up");
         assert_eq!(chunk_count(&raw, id).await, 0);
         assert!(marker_generation(&raw, "public.orders").await.is_some());
-        let rows: Vec<(String, String, bool)> = raw
+        let rows: Vec<(String, String)> = raw
             .query(
-                "select g::text, total::text, __trellis_recompute_lsn is not null \
-                 from public.rollup order by g",
+                "select g::text, total::text from public.rollup order by g",
                 &[],
             )
             .await
             .expect("read the target")
             .into_iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .map(|row| (row.get(0), row.get(1)))
             .collect();
         assert_eq!(
             rows,
             [
-                ("1".to_string(), "30".to_string(), true),
-                ("2".to_string(), "5".to_string(), true)
+                ("1".to_string(), "30".to_string()),
+                ("2".to_string(), "5".to_string())
             ]
         );
-        let extinct: i64 = raw
-            .query_one(
-                "select count(*) from aggregate_extinct_horizon where target_table = 'public.rollup'",
-                &[],
-            )
-            .await
-            .expect("read the extinct horizon")
-            .get(0);
-        assert_eq!(extinct, 1);
     }
 
     /// Issue #419: a direct build that fails hands its build back to the

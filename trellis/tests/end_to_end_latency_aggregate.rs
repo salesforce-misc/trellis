@@ -1,8 +1,8 @@
 //! Issue #104 pin: the aggregate-write path's staged `Recompute` rows must
 //! carry a real `src_changed` origin, the same way issues #51/#52 already
 //! fixed for the 1-1 propagation path (`end_to_end_latency.rs`, this file's
-//! sibling, pins that one). Before this fix, `apply_aggregate`'s
-//! `AggregateTargetPlan`/written-group shape carried no origin at all, so
+//! sibling, pins that one). Before this fix, the old aggregate path's
+//! written-group shape carried no origin at all, so
 //! `apply.rs`'s "3b" step always staged an aggregate write's downstream
 //! `Recompute` with `src_changed: None` — silently blanking both the
 //! per-transform and end-to-end latency histograms for any transform
@@ -288,8 +288,8 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
     // (terminal), driven *purely* by the `Recompute` row the upstream
     // aggregate's own write staged automatically (`apply.rs`'s "3b" step +
     // downstream-propagation step 4) — no second, independently-staged
-    // change anywhere. Before issue #104's fix, `AggregateTargetPlan`'s
-    // written-group shape carried no `src_changed`, so this `Recompute` row
+    // change anywhere. Before issue #104's fix, the old aggregate
+    // path's written-group shape carried no `src_changed`, so this `Recompute` row
     // always staged with `src_changed: None` and neither histogram could
     // observe anything here.
     let seg2 = seal_active_segment(&mut client).await;

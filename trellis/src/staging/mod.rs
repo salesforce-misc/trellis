@@ -57,7 +57,6 @@
 
 pub mod append;
 pub mod apply;
-pub mod apply_aggregate;
 pub mod build;
 pub mod capture_audit;
 pub mod claim;

@@ -15,7 +15,7 @@
 //! (`defs_aggregate_chained_composite_group_key.rs`'s own front door). This
 //! file is that single-column pin: `sku_totals`' identity is a bare,
 //! unencoded primary key (issue #103's shape, not #171's U+001F-joined
-//! composite one), so it exercises a different `derive_group_key`/
+//! composite one), so it exercises a different `ddl::join_pk_key`/
 //! `ddl::split_pk_key` code path than the composite test while hitting the
 //! exact same root cause — before issue #180, deleting a group's only row
 //! removed it upstream (`sku_totals`) but the downstream `Recompute` that
@@ -32,9 +32,8 @@
 //! `defs_aggregate_chained_composite_group_key.rs` for that shape. Here, an
 //! extinct upstream group's downstream counterpart must itself go fully
 //! extinct (its `SUM` of one vanished contributor drops to nothing), which
-//! exercises the *other* branch of the fix: `apply_aggregate_target`'s own
-//! extinction check (`probe_group_exists`) against the deleted row's decoded
-//! image, not just a partial `SUM` decrement.
+//! exercises the *other* branch of the fix: the downstream group's own extinction
+//! from the deleted row's decoded image, not just a partial `SUM` decrement.
 
 use std::collections::HashMap;
 
@@ -315,7 +314,7 @@ async fn an_extinct_single_column_group_reduces_the_chained_downstream_aggregate
 /// ("a `NULL` grouping component ... same underlying gap, same failure
 /// family") — and which issue #180's fix deliberately did **not** close,
 /// because the gap was upstream of it, in the shared key contract itself:
-/// `derive_group_key` used to encode a `NULL` component as an empty part
+/// the old path's group-key encoder used to encode a `NULL` component as an empty part
 /// (indistinguishable from `''`), and the chained definition's own live
 /// re-read (`read_live_rows_batch`'s keyset join, a plain `t.col = u.c0`)
 /// could never match a `NULL` column anyway. Issue #110 closes it: a `NULL`

@@ -61,7 +61,7 @@ async fn drain(pool: &trellis::Pool, seg_seq: i64) {
 /// Stages at a made-up LSN on purpose (issue #512): capture stamps a change's
 /// `origin_lsn` with its own commit LSN, and these tests assert on exact
 /// origins, so the ring `lsn` follows the chosen origin. Only 1-1 targets
-/// read these rows, and nothing here compares them with a recompute horizon.
+/// read these rows.
 async fn stage_insert(client: &Client, key: &str, price: &str, origin_lsn: Option<u64>) {
     let lsn = PgLsn::from(origin_lsn.unwrap_or(1));
     let origin = origin_lsn.map(PgLsn::from);

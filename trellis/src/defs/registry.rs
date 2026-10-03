@@ -515,9 +515,8 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
             // Postgres's *default* typmod for a **fixed-length** `bit`
             // column declared with no length is `bit(1)`, not
             // "unconstrained": a bare `pg_type_name(Other(PgType::Bit))`
-            // target column (what `ddl::create_aggregate_target_table`/
-            // `staging::apply_aggregate` would otherwise declare and cast
-            // through) would only ever be able to hold a *1-bit* result,
+            // target column (what `ddl::create_aggregate_target_table`
+            // would otherwise declare) would only ever be able to hold a *1-bit* result,
             // failing on the very first apply for any wider group — verified
             // live (`create table t(x bit); insert into t values ('101')`
             // raises `bit string length 3 does not match type bit(1)`).
@@ -592,7 +591,7 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     // `reduce_text_aggregate`'s own doc comment. A `KeySpace::Aggregate`
     // field's own `MIN`/`MAX` never depends on the evaluator's fold at all:
     // `MIN`/`MAX` are unconditionally `Invertibility::RecomputeOnly`, so
-    // `staging::apply_aggregate` always asks Postgres directly.
+    // the ledger (`staging::ledger`) always asks Postgres directly.
     if let ValueType::Text = arg {
         return match name {
             "MIN" | "MAX" => Some(arg),
@@ -646,9 +645,9 @@ mod tests {
     /// Every aggregate maps a float argument to a float result and an exact
     /// argument to an exact one.
     ///
-    /// This is the invariant `defs::backfill::classify_field` and
-    /// `staging::apply_aggregate::classify_fields` rely on: both hold the
-    /// field's *result* type (what the validator inferred) but need to ask
+    /// This is the invariant `defs::backfill::classify_field` (and so
+    /// `staging::ledger::route`) relies on: it holds the
+    /// field's *result* type (what the validator inferred) but needs to ask
     /// `invertibility::classify` a question about the *argument*. Since the
     /// only distinction that gate draws inside the numeric family is
     /// float-vs-exact, the two are interchangeable — as long as this holds.

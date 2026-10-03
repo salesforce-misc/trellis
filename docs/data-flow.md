@@ -182,11 +182,11 @@ drain threads.
 - **A commit both see is counted once.** Commits between the join and the
   capture snapshot are read *and* captured. For a 1-1 target that's harmless,
   because apply re-evaluates the row from live state. For an aggregate, the
-  read's image-less `Recompute` re-derives the whole group, and the recompute
-  horizon keeps the captured delta from counting the commit a second time
-  ([stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)).
-  A direct build records the same horizon on every group row it writes, and
-  on the target for the groups it found empty (#419).
+  read's image-less `Recompute` re-derives the key's ledger entry from a
+  snapshot, and the entry's basis keeps the captured delta from counting the
+  commit a second time
+  ([stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-ledger)).
+  A direct build writes the same basis on every entry it writes (#419).
 - **Changes during the build aren't lost.** Apply skips a definition that
   isn't `live`, so a change that drains while the build runs doesn't reach it.
   For ring enumeration on a captured source that can't happen: the maintenance
@@ -208,8 +208,8 @@ drain threads.
   during the build leaves the table's row count and `xmin`s as they were,
   although the build counted it (#468). A commit the build read whose
   captured delta drains after the flip needs no catch-up: it's harmless for a
-  1-1 target and re-derived by the recompute horizon for an aggregate
-  (above).
+  1-1 target and kept from double counting by the entry's basis for an
+  aggregate (above).
 - **A target drops rows its source no longer backs.** The read only reaches
   keys the source still has, so a 1-1 row whose source row is gone, or an
   aggregate group with no source rows left, needs deleting outright. The
@@ -230,17 +230,16 @@ drain threads.
   `Recompute`. So the sweep is exact for aggregates as well as 1-1. Each
   deleted row goes through the target-mutation seam, so a chained reader
   re-derives from it. A deleted group can also still have deltas staged for
-  it (a `catching_up` definition applies CDC), so the discharge raises the
-  target's extinct horizon (#321) too, and such a delta re-derives the group
-  from the source instead of subtracting from nothing.
+  it (a `catching_up` definition applies CDC). Such a delta applies to its
+  key's ledger entry, whose basis says whether the read already counted it,
+  so it never subtracts from nothing (#623 D5).
 
 ### Re-derive-built definitions
 
 A plain aggregate is built differently (#625,
 [ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
-That is a target the ledger maintains: grouped by plain source columns, with
-no relationship, no `MIN`/`MAX` of text and no `json`/`jsonb` argument, on a
-captured source (not another definition's target). Its fields may be kept by
+That is an aggregate with no relationship, on a captured source (not another
+definition's target). Its fields may be kept by
 increments (`SUM` or `AVG` of an exact numeric argument, `COUNT`) or
 recomputed from the group's entries (`MIN`/`MAX`, `BOOL_AND`/`BOOL_OR`, a
 float `SUM`/`AVG`, a composed field like `SUM(a) + COUNT(*)`), and their

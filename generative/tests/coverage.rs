@@ -886,8 +886,8 @@ fn trivial_program_sometimes_draws_an_aggregate_key_space() {
     );
 }
 
-/// Regression coverage floor for a real engine bug (`apply_aggregate.rs`'s
-/// `add_contributions`/`sub_contributions`): a brand-new `Aggregate` group
+/// Regression coverage floor for a real engine bug (in the old, now-deleted
+/// aggregate apply path's contribution folding): a brand-new `Aggregate` group
 /// whose only source row has a `NULL` value for its sole `SUM`/`AVG`
 /// argument used to never get a target row written at all. The generator's
 /// existing `awkward_values` `NULL`-drawing logic (`generate::strategy::value`,
