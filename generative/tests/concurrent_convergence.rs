@@ -1463,32 +1463,11 @@ const STALE_ONE_TO_ONE_MISS: &str = "stale_one_to_one_write";
 /// meanwhile.
 const LSN_ONLY_SKIP_MISS: &str = "lsn_only_skip";
 
-/// Why no tier gates `claim_all_buckets` since #623 D5 (#736): a double
-/// claim applies a batch's rows twice, which I2 makes a no-op on every
-/// ledger target, and D5 put the relationship-fed aggregates, the targets
-/// it used to hurt, on the ledger. Every tier caught it in 0 of 48 cases
-/// after D5, though it fired in 46 to 48 of them.
-const CLAIM_ALL_BUCKETS_MISS: &str = "claim_all_buckets";
-
-/// Why no tier gates `ignore_recompute_horizon` since #623 D5 (#736): the
-/// horizon is only on the old aggregate path, and since D5 no tier's case
-/// forces a recompute there; it fired in 0 of 48 cases in every tier.
-const IGNORE_RECOMPUTE_HORIZON_MISS: &str = "ignore_recompute_horizon";
-
 /// The cooling-key tier's known misses.
-const COOLING_KEY_MISSES: &[&str] = &[
-    LSN_ONLY_SKIP_MISS,
-    CLAIM_ALL_BUCKETS_MISS,
-    IGNORE_RECOMPUTE_HORIZON_MISS,
-];
+const COOLING_KEY_MISSES: &[&str] = &[LSN_ONLY_SKIP_MISS];
 /// The known misses of the tiers built on the hot-key case: hot-key,
 /// mid-burst and steady-load.
-const HOT_KEY_BASED_MISSES: &[&str] = &[
-    STALE_ONE_TO_ONE_MISS,
-    LSN_ONLY_SKIP_MISS,
-    CLAIM_ALL_BUCKETS_MISS,
-    IGNORE_RECOMPUTE_HORIZON_MISS,
-];
+const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS, LSN_ONLY_SKIP_MISS];
 
 /// The steady-load tier's plants, which a tier without its load doesn't
 /// gate (#720, #725). The counts are on main after #623 D5.
@@ -1595,7 +1574,6 @@ fn plant_reaches(plant: &str, key_space: &trellis::dev::defs::ast::KeySpace) -> 
     );
     match Plant::from_name(plant) {
         None => true,
-        Some(Plant::ClaimAllBuckets) => true,
         // The aggregate ledger plants (#623 D3) and the merger's plant (#625
         // F3) break the aggregate ledger path and the group-delta merge; the
         // tombstone GC (D7) collects 1-1 ledgers too since D6, and a plain
@@ -1846,7 +1824,7 @@ fn run_plant_sweep_cases() {
 /// ```
 ///
 /// The properties catch a plant on their own too, one process per plant:
-/// `TRELLIS_TEST_PLANT=claim_all_buckets cargo test -p generative --test
+/// `TRELLIS_TEST_PLANT=drop_racing_group_delta cargo test -p generative --test
 /// concurrent_convergence property_hot_keys -- --ignored`.
 #[test]
 #[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]

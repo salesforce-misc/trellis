@@ -64,11 +64,6 @@ pub const PLANT_ENV: &str = "TRELLIS_TEST_PLANT";
 /// One planted ordering bug. Each breaks one invariant, at one engine site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Plant {
-    /// Claim exclusivity (the drain's bucket filter,
-    /// `staging::claim::HeldShare::filter`): every claimer of a split batch
-    /// folds *all* of its buckets instead of the ones it won, so two workers
-    /// apply the same rows. Found by #557 part 1's review.
-    ClaimAllBuckets,
     /// Aggregate apply (a ledger target's group upsert in `staging::ledger`,
     /// since #623 D3): each apply
     /// transaction takes a non-waiting advisory lock per group before it
@@ -116,7 +111,6 @@ pub enum Plant {
 impl Plant {
     /// Every plant, in the order the concurrent tier's sweep runs them.
     pub const ALL: &'static [Plant] = &[
-        Plant::ClaimAllBuckets,
         Plant::DropRacingGroupDelta,
         Plant::StaleOneToOneWrite,
         Plant::SkipLedgerLock,
@@ -129,7 +123,6 @@ impl Plant {
     /// The name [`PLANT_ENV`] takes.
     pub fn name(self) -> &'static str {
         match self {
-            Plant::ClaimAllBuckets => "claim_all_buckets",
             Plant::DropRacingGroupDelta => "drop_racing_group_delta",
             Plant::StaleOneToOneWrite => "stale_one_to_one_write",
             Plant::SkipLedgerLock => "skip_ledger_lock",
@@ -229,7 +222,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "names no plant")]
     fn an_unknown_name_panics_instead_of_running_unplanted() {
-        parse(Some("claim_all_bucket"));
+        parse(Some("drop_racing_group_delt"));
     }
 
     /// The default suite never sets [`PLANT_ENV`], so no hook is live in
@@ -238,6 +231,6 @@ mod tests {
     #[test]
     fn the_default_suite_runs_with_no_plant_armed() {
         assert_eq!(armed(), None, "{PLANT_ENV} is set in the test environment");
-        assert!(!fires(Plant::ClaimAllBuckets, true));
+        assert!(!fires(Plant::DropRacingGroupDelta, true));
     }
 }
