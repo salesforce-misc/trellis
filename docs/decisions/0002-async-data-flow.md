@@ -521,7 +521,12 @@ applying.
   stored (#497's rule).
 - **Must (I4):** tombstone GC by a per-target batch watermark: once a segment
   is fully drained, the retire path deletes every tombstone on each target
-  whose `applied_lsn` is at or below that segment's fence.
+  whose `applied_lsn` is at or below that segment's fence. *Amended by
+  #742:* the watermark is the entry's `applied_seg`, and a Re-derive's read
+  is live, so a page draining an old batch can see a later batch's delete.
+  A Re-derive therefore stamps at least the newest segment its snapshot
+  sees. Every change the snapshot saw is in that segment or an earlier one,
+  so the tombstone outlives every change its `basis` would refuse.
 - Every repair that used to be a re-read (an explicit `request_backfill`, a
   resume, a quarantine release) is a rebuild: Re-derive over the key space,
   which I2 makes safe against any pending change.

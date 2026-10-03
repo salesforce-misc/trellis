@@ -2084,3 +2084,74 @@ async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_
     );
     f.assert_one_oracle().await;
 }
+
+/// Seals the active segment after `sql`, returning the batch it sealed.
+async fn write_and_seal(f: &mut Fixture, sql: &str) -> i64 {
+    f.raw.batch_execute(sql).await.expect("write");
+    trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
+        .await
+        .expect("seal")
+        .expect("the write made the active segment non-empty")
+        .sealed_seg_seq
+}
+
+/// #742: a page's Re-derive reads the source live, so its snapshot can see
+/// changes in batches newer than the page's own. Its tombstone was stamped
+/// with the page's segment all the same, so the tombstone GC collected it
+/// while a batch its read saw was still pending, and that batch's stale
+/// change then applied to a fresh entry and brought the deleted key back.
+///
+/// Key 5 is updated in three batches and deleted in the last. The oldest
+/// batch is at the build's start segment, so its page re-derives the key
+/// (#733) after the delete: a tombstone. The newest batch's delete is
+/// refused (the read saw it), the GC runs while the middle batch is still
+/// pending, and then the middle batch's update drains. The steady-load
+/// tier's stall reorders drains this way (seed 1 case 7).
+async fn rederive_tombstone_outlives_a_batch_its_read_saw(
+    definition: &str,
+    target: &str,
+) -> Fixture {
+    let mut f = Fixture::new(20, &[definition]).await;
+    f.pass().await;
+    assert_eq!(f.status(target).await.as_deref(), Some("backfilling"));
+    let watermark = StagedWatermark::saturated();
+    let at_start = write_and_seal(&mut f, "update public.src set v = 101 where id = 5").await;
+    let middle = write_and_seal(&mut f, "update public.src set v = 102 where id = 5").await;
+    let newest = write_and_seal(&mut f, "delete from public.src where id = 5").await;
+    for seg in [at_start, newest] {
+        apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE, &watermark)
+            .await
+            .expect("drain");
+    }
+    trellis::staging::collect_tombstones(&mut f.raw)
+        .await
+        .expect("collect tombstones");
+    apply::drain_once(&f.db.pool, middle, "drainer", 1, WAKE, &watermark)
+        .await
+        .expect("drain the middle batch");
+    f.run(target).await;
+    assert_eq!(f.status(target).await.as_deref(), Some("live"));
+    f
+}
+
+#[tokio::test]
+async fn a_one_to_one_rederive_tombstone_outlives_a_batch_its_read_saw() {
+    let f = rederive_tombstone_outlives_a_batch_its_read_saw(ONE, "one").await;
+    assert_eq!(
+        f.rows(ONE_ACTUAL).await,
+        f.rows(ONE_EXPECTED).await,
+        "one equals its source"
+    );
+    f.assert_one_oracle().await;
+}
+
+#[tokio::test]
+async fn an_aggregate_rederive_tombstone_outlives_a_batch_its_read_saw() {
+    let f = rederive_tombstone_outlives_a_batch_its_read_saw(AGG, "agg").await;
+    assert_eq!(
+        f.rows(AGG_ACTUAL).await,
+        f.rows(AGG_EXPECTED).await,
+        "agg equals a from-scratch GROUP BY over the source"
+    );
+    f.assert_agg_oracle().await;
+}

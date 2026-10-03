@@ -1874,7 +1874,9 @@ pub(crate) async fn page_may_predate_build(
 /// `first_seg` and `seg_seq` are the lowest and highest segments of the
 /// page's batches: the first decides whether the page re-derives every
 /// record (step 2), and the entries take the second as their
-/// `applied_seg`.
+/// `applied_seg`, or the Re-derive read's newest segment when that is newer
+/// (#742, as `super::one_to_one_ledger::read_rows` explains for a 1-1
+/// target).
 #[tracing::instrument(
     name = "staging.apply_ledger_target",
     skip(txn, plan, mutations),
@@ -1921,6 +1923,11 @@ pub(crate) async fn apply_ledger_target(
         .collect();
     let mut read_images: HashMap<String, String> = HashMap::new();
     let mut snapshot: Option<String> = None;
+    // The entries' segment stamp: the page's latest segment, or the newest
+    // one the Re-derive read's snapshot sees when that is newer (#742). The
+    // read is live, so it sees later batches' changes, and every change it
+    // sees is in that segment or an earlier one (see `chunk_statement`).
+    let mut entry_seg = seg_seq;
     if !rederive.is_empty() {
         let columns = plan.shape.source_reads();
         let query = super::apply::live_rows_query(
@@ -1930,15 +1937,19 @@ pub(crate) async fn apply_ledger_target(
             &rederive,
         )?;
         let sql = format!(
-            "select null::text, pg_catalog.pg_current_snapshot()::text \
-             union all select m.k, m.doc::text from ({}) m",
+            "select null::text, pg_catalog.pg_current_snapshot()::text, \
+                    (select coalesce(max(seg_seq), 0) from segments) \
+             union all select m.k, m.doc::text, null::bigint from ({}) m",
             query.docs
         );
         for row in txn.query(&sql, &query.params()).await? {
             let key: Option<String> = row.get(0);
             let value: String = row.get(1);
             match key {
-                None => snapshot = Some(value),
+                None => {
+                    snapshot = Some(value);
+                    entry_seg = entry_seg.max(row.get::<_, i64>(2));
+                }
                 Some(key) => {
                     read_images.insert(key, value);
                 }
@@ -1996,7 +2007,7 @@ pub(crate) async fn apply_ledger_target(
                 &txids,
                 &images,
                 &snapshot,
-                &seg_seq,
+                &entry_seg,
                 &plan.target,
             ],
         )

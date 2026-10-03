@@ -202,10 +202,18 @@ const TOMBSTONE_BATCHES_PER_PASS: usize = 4;
 /// `early_tombstone_gc` plant).
 ///
 /// A tombstone written by a Re-derive has a `basis` that the collection
-/// forgets. A change the basis saw but a later batch carries then applies,
-/// instead of being skipped. That is only a transient: the read saw no
-/// row, so the basis also saw a later delete of the key, which is in that
-/// batch or a later one, and applies after it.
+/// forgets, so its `applied_seg` must outlast every change the basis saw,
+/// not only the batches its writer drained. A Re-derive's read is live: a
+/// page draining an old batch can see a later batch's delete. Once that
+/// delete is refused (the basis saw it), nothing else would put the
+/// tombstone back, and an older change still pending in a batch between
+/// the two would apply to a fresh entry and bring the key back (#742). So
+/// every Re-derive stamps at least the newest segment its read's snapshot
+/// sees, and every change the snapshot saw is in that segment or an earlier
+/// one (`super::ledger::chunk_statement` explains why). A page's Re-derive
+/// reads that segment with its rows (`super::one_to_one_ledger::read_rows`,
+/// `super::ledger::apply_ledger_target`), a build chunk in its one
+/// statement, and the direct Re-derives stamp the latest segment there is.
 ///
 /// **Against a page.** Each batch is a short transaction of its own. It
 /// takes the ledger's `ROW EXCLUSIVE` lock `NOWAIT`, so a build or drop of

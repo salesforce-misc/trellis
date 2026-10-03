@@ -14,14 +14,17 @@
 //!    the GC collects between the two fails the page transiently, as on an
 //!    aggregate ledger (`super::ledger::lock_entries`, #712).
 //! 2. **Re-derive read** ([`read_rows`], I1): the Re-derived keys' source
-//!    rows and `pg_current_snapshot()` in one statement, after the lock. The
-//!    rows are evaluated in Rust, as Phase 2 evaluates an Apply's image.
+//!    rows, `pg_current_snapshot()` and the newest segment in one statement,
+//!    after the lock. The rows are evaluated in Rust, as Phase 2 evaluates
+//!    an Apply's image.
 //! 3. **The entries** ([`update_entries`], I2): a Re-derive sets `basis` to
 //!    the read's snapshot and leaves `applied_lsn` alone (the D split's Q1);
 //!    an Apply sets `applied_lsn`, but only if its transaction is not visible
 //!    in `basis`, its `lsn` is above `applied_lsn` and it is above the
 //!    target's truncate floor. Either makes a tombstone when the key has no
-//!    row. Returns the keys it changed. Step 1's settled Applies skip it.
+//!    row. `applied_seg` is raised to the page's latest segment, or to the
+//!    read's segment when that is newer (#742, see [`read_rows`]). Returns
+//!    the keys it changed. Step 1's settled Applies skip it.
 //! 4. The target rows of exactly those keys are upserted or deleted, as
 //!    before (`super::apply::apply_target`).
 //!
@@ -168,10 +171,29 @@ pub(crate) async fn lock_entries(
     Ok(inserted)
 }
 
+/// What [`read_rows`] read: the rows, by key text, the snapshot, and the
+/// newest segment the snapshot sees.
+pub(crate) struct ReadRows {
+    pub rows: HashMap<String, Row>,
+    pub snapshot: String,
+    pub seg: i64,
+}
+
 /// The Re-derive read: the current source rows of `keys` (each `columns`
-/// as text, keyed by the row's key text) and `pg_current_snapshot()`, in one
-/// statement. A key with no row is absent from the map. `keys` must not be
-/// empty.
+/// as text, keyed by the row's key text), `pg_current_snapshot()` and the
+/// newest segment (`max(seg_seq)`), in one statement. A key with no row is
+/// absent from the map. `keys` must not be empty.
+///
+/// **The segment (#742).** The read is live, so its snapshot sees changes
+/// in batches newer than the page's own, and the entries it writes must be
+/// stamped with a segment at least as new as every batch holding a change
+/// the snapshot saw. Otherwise the tombstone GC
+/// (`super::retire::collect_tombstones`) can collect a Re-derive's tombstone
+/// while such a batch is still pending: the key's later delete was refused
+/// (the snapshot saw it), and the pending batch's older change then applies
+/// to a fresh entry and brings the key back. Every change the snapshot sees
+/// is in the newest segment it sees or an earlier one, as for a build
+/// chunk's stamp (`super::ledger::chunk_statement`).
 pub(crate) async fn read_rows(
     txn: &Transaction<'_>,
     // Only the pause point below reads it.
@@ -180,19 +202,27 @@ pub(crate) async fn read_rows(
     pk: &[PrimaryKeyColumn],
     columns: &[String],
     keys: &[&str],
-) -> Result<(HashMap<String, Row>, String), ApplyError> {
+) -> Result<ReadRows, ApplyError> {
     let query = super::apply::live_rows_query(source_table, pk, columns, keys)?;
     let sql = format!(
-        "select null::text, null::text, pg_catalog.pg_current_snapshot()::text \
+        "select null::text, (select coalesce(max(seg_seq), 0) from segments)::text, \
+                pg_catalog.pg_current_snapshot()::text \
          union all select m.k, e.key, e.value from ({}) m \
          cross join lateral jsonb_each_text(m.doc) e",
         query.docs
     );
     let mut rows: HashMap<String, Row> = HashMap::new();
     let mut snapshot = String::new();
+    let mut seg = 0;
     for row in txn.query(&sql, &query.params()).await? {
         match row.get::<_, Option<String>>(0) {
-            None => snapshot = row.get(2),
+            None => {
+                seg = row
+                    .get::<_, Option<String>>(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                snapshot = row.get(2);
+            }
             Some(key) => {
                 rows.entry(key).or_default().insert(row.get(1), row.get(2));
             }
@@ -207,7 +237,11 @@ pub(crate) async fn read_rows(
         target,
     )
     .await?;
-    Ok((rows, snapshot))
+    Ok(ReadRows {
+        rows,
+        snapshot,
+        seg,
+    })
 }
 
 /// One locked key's change to its entry: a Re-derive (`apply` `None`) or an

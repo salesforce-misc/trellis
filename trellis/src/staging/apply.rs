@@ -6276,7 +6276,10 @@ impl DirectRederive {
 /// change committed before the target's Re-derive build started may have
 /// had a later change drained before the start, which never reached the
 /// target, and a key deleted that way has no source row for a chunk to
-/// find. The entries take `seg_seq` as their `applied_seg`.
+/// find. The entries take `seg_seq` as their `applied_seg`, or the
+/// Re-derive read's newest segment when that is newer (#742): the read is
+/// live, so it can see a later batch's delete, and a tombstone stamped below
+/// that batch could be collected while an older change in it is pending.
 async fn settle_one_to_one_target(
     txn: &Transaction<'_>,
     target: &str,
@@ -6362,10 +6365,12 @@ async fn settle_one_to_one_target(
         .filter(|r| r.apply.is_none())
         .map(|r| r.pk_text.as_str())
         .collect();
-    let (mut read, snapshot) = if rederive_keys.is_empty() {
-        (HashMap::new(), None)
+    // The entries' segment stamp: the page's latest segment, or the
+    // Re-derive read's when that is newer (#742, see `read_rows`).
+    let (mut read, snapshot, entry_seg) = if rederive_keys.is_empty() {
+        (HashMap::new(), None, seg_seq)
     } else {
-        let (rows, snapshot) = one_to_one_ledger::read_rows(
+        let read = one_to_one_ledger::read_rows(
             txn,
             &plan.qualified_target,
             &plan.qualified_source,
@@ -6374,7 +6379,7 @@ async fn settle_one_to_one_target(
             &rederive_keys,
         )
         .await?;
-        (rows, Some(snapshot))
+        (read.rows, Some(read.snapshot), seg_seq.max(read.seg))
     };
     let mut regex_cache = eval::RegexCache::new();
     let mut restage: Vec<Restage> = Vec::new();
@@ -6437,7 +6442,7 @@ async fn settle_one_to_one_target(
         &plan.qualified_target,
         &changes,
         snapshot.as_deref(),
-        seg_seq,
+        entry_seg,
         predicate,
     )
     .await?;

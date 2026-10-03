@@ -239,7 +239,10 @@ ordering state apply will judge a change against:
 
 - `__applied_lsn` and `__applied_seg`: the `lsn` and ring segment of the last
   change applied to the entry. A Re-derive leaves `__applied_lsn` alone
-  (#623 Q1). `__applied_seg` is the tombstone GC watermark (#623 Q7).
+  (#623 Q1). `__applied_seg` is the tombstone GC watermark (#623 Q7). A
+  Re-derive's read is live, so it stamps at least the newest segment its
+  snapshot sees, not only the page's own: a tombstone must outlast every
+  change its `__basis` saw (#742).
 - `__basis`: the `pg_current_snapshot()` of the read that last wrote the entry,
   taken in the same statement as that read (I1). A change whose transaction is
   visible in it is already counted.
