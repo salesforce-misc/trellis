@@ -4,10 +4,9 @@
 //! # Which targets
 //!
 //! [`route`] sends an aggregate target here iff every relationship it reads
-//! is to-one, every `GROUP BY` key is a source column or a to-one
-//! relationship path, no aggregate argument reads a `json`/`jsonb` column,
-//! and no `MIN`/`MAX` orders text (refused until #575). (The grammar has no
-//! definition filter yet.) Its fields are of two kinds:
+//! is to-one and every `GROUP BY` key is a source column or a to-one
+//! relationship path. (The grammar has no definition filter yet.) Its fields
+//! are of two kinds:
 //!
 //! - **Maintained**: `SUM`/`AVG` over an exact numeric argument, and
 //!   `COUNT`, kept by increments in the upsert.
@@ -78,7 +77,8 @@
 //! `jsonb_populate_record` over the ledger's own row type, the same text
 //! every other image holds, so the ledger's types decide the casts. An
 //! expression argument is evaluated over the image populated as the source
-//! table's row type instead.
+//! table's row type instead. A `json`/`jsonb` column is cast from its text
+//! directly: populating would store the text as a JSON string.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -197,6 +197,11 @@ pub(crate) struct LedgerShape {
     /// The source columns [`Self::joins`] read (each relationship's
     /// from-column), which a Re-derive must read too.
     join_reads: Vec<String>,
+    /// The `json`/`jsonb` source columns a contribution reads, each with its
+    /// cast. An image holds a column's output text, which
+    /// `jsonb_populate_record` would store in a `json`/`jsonb` column as a
+    /// JSON string, so an Apply casts the text itself (#623 D5).
+    json_reads: Vec<(String, &'static str)>,
     /// The contribution columns, in [`schema::contributions`]' order.
     contribs: Vec<Contrib>,
     fields: Vec<LedgerField>,
@@ -220,6 +225,14 @@ impl LedgerShape {
                 .contribs
                 .iter()
                 .any(|c| matches!(c.source, ContribSource::Expr { .. }))
+    }
+
+    /// `column`'s cast if it is one of [`Self::json_reads`].
+    fn json_cast(&self, column: &str) -> Option<&'static str> {
+        self.json_reads
+            .iter()
+            .find(|(c, _)| c == column)
+            .map(|(_, cast)| *cast)
     }
 
     /// The source columns a Re-derive reads.
@@ -347,13 +360,6 @@ pub(crate) fn route(
         .iter()
         .map(|f| classify_field(&substituted[&f.name], field_types[&f.name]))
         .collect();
-    // `MIN`/`MAX` over text stays on the old path (the handoff's scope for
-    // D4; #575 revisits text ordering).
-    for field in &value_fields {
-        if orders_text(&substituted[&field.name], source_columns, relationships) {
-            return None;
-        }
-    }
     let contributions = schema::contributions(&def.fields, group_by, &substituted);
     let summed = |arg: &Expr| {
         value_fields.iter().zip(&kinds).any(|(f, kind)| {
@@ -363,19 +369,18 @@ pub(crate) fn route(
         })
     };
     let mut contribs = Vec::with_capacity(contributions.len());
+    let mut json_reads: Vec<(String, &'static str)> = Vec::new();
     for contribution in &contributions {
         let mut reads = Vec::new();
         source_reads(&contribution.arg, &mut reads);
-        // An image holds a column's output text, which
-        // `jsonb_populate_record` would store in a `json`/`jsonb` column as a
-        // JSON string, not the value the build reads. Every other type goes
-        // through its input function.
         for column in &reads {
-            if matches!(
-                source_columns.get(column)?,
-                ValueType::Other(PgType::Json | PgType::Jsonb)
-            ) {
-                return None;
+            let cast = match source_columns.get(column)? {
+                ValueType::Other(PgType::Json) => "json",
+                ValueType::Other(PgType::Jsonb) => "jsonb",
+                _ => continue,
+            };
+            if !json_reads.iter().any(|(c, _)| c == column) {
+                json_reads.push((column.clone(), cast));
             }
         }
         let source = match &contribution.arg {
@@ -436,6 +441,7 @@ pub(crate) fn route(
         group_paths,
         joins,
         join_reads,
+        json_reads,
         contribs,
         fields,
     })
@@ -501,32 +507,6 @@ fn fold_of(expr: &Expr) -> Option<&'static str> {
         "BOOL_AND" => Some("bool_and"),
         "BOOL_OR" => Some("bool_or"),
         _ => None,
-    }
-}
-
-/// Whether `expr` has a `MIN`/`MAX` over a text argument.
-fn orders_text(
-    expr: &Expr,
-    source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
-) -> bool {
-    match expr {
-        Expr::FunctionCall { name, args }
-            if (name == "MIN" || name == "MAX") && args.len() == 1 =>
-        {
-            matches!(
-                crate::defs::validate::infer_expr_type(&args[0], source_columns, relationships),
-                Ok(ValueType::Text)
-            )
-        }
-        Expr::FunctionCall { args, .. } => args
-            .iter()
-            .any(|a| orders_text(a, source_columns, relationships)),
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            orders_text(lhs, source_columns, relationships)
-                || orders_text(rhs, source_columns, relationships)
-        }
-        _ => false,
     }
 }
 
@@ -1026,6 +1006,40 @@ fn group_upsert_sql(
     }
 }
 
+/// The JSON an image's text for `source_col` spells, cast to `cast`
+/// (`json` or `jsonb`): see [`LedgerShape::json_reads`].
+fn json_value(source_col: &str, cast: &str) -> String {
+    format!("(b.__img ->> {})::{cast}", quote_literal(source_col))
+}
+
+/// The image `b.__img` as the source's row type `s`, for an expression
+/// argument or a relationship's join. A `json`/`jsonb` column it reads is
+/// parsed from the image's text rather than populated, which would read a
+/// JSON `null` as SQL `NULL` (#623 D5).
+fn typed_row(plan: &LedgerTargetPlan) -> String {
+    let shape = &plan.shape;
+    let populated = format!(
+        "jsonb_populate_record(null::{}, b.__img)",
+        ddl::qualified_source_table(&plan.source_table)
+    );
+    if shape.json_reads.is_empty() {
+        return format!(" cross join lateral {populated} s{}", shape.joins);
+    }
+    let columns: Vec<String> = shape
+        .source_reads()
+        .iter()
+        .map(|c| match shape.json_cast(c) {
+            Some(cast) => format!("{} as {}", json_value(c, cast), quote_ident(c)),
+            None => format!("p.{}", quote_ident(c)),
+        })
+        .collect();
+    format!(
+        " cross join lateral (select {} from {populated} p) s{}",
+        columns.join(", "),
+        shape.joins
+    )
+}
+
 /// The page's one ledger-and-groups statement (see the module doc, step 3).
 /// Binds `$1` keys, `$2` Re-derive flags, `$3` `lsn`s, `$4` `row_txid`s,
 /// `$5` images (all `text[]`, in key order), `$6` the Re-derive read's
@@ -1058,8 +1072,10 @@ fn ledger_statement(
         .plain_group_cols()
         .map(|c| (c, c))
         .chain(shape.contribs.iter().filter_map(|c| match &c.source {
-            ContribSource::Column(source) => Some((&c.column, source)),
-            ContribSource::Expr { .. } => None,
+            ContribSource::Column(source) if shape.json_cast(source).is_none() => {
+                Some((&c.column, source))
+            }
+            _ => None,
         }));
     let doc: Vec<String> = plain
         .map(|(ledger_col, source_col)| {
@@ -1080,16 +1096,15 @@ fn ledger_statement(
         .collect();
     for contrib in &shape.contribs {
         v_cols.push(match &contrib.source {
-            ContribSource::Column(_) => format!("r.{}", q(&contrib.column)),
+            ContribSource::Column(source) => match shape.json_cast(source) {
+                Some(cast) => format!("{} as {}", json_value(source, cast), q(&contrib.column)),
+                None => format!("r.{}", q(&contrib.column)),
+            },
             ContribSource::Expr { sql, .. } => format!("{sql} as {}", q(&contrib.column)),
         });
     }
     let typed_row = if shape.reads_typed_row() {
-        format!(
-            " cross join lateral jsonb_populate_record(null::{}, b.__img) s{}",
-            ddl::qualified_source_table(&plan.source_table),
-            shape.joins
-        )
+        typed_row(plan)
     } else {
         String::new()
     };
@@ -2191,22 +2206,47 @@ mod tests {
     }
 
     #[test]
-    fn text_ordering_json_arguments_and_one_to_one_targets_stay_off_the_ledger() {
+    fn invalid_and_one_to_one_targets_stay_off_the_ledger() {
+        let cols = &[
+            ("g", INT),
+            ("v", ValueType::Numeric),
+            ("name", ValueType::Text),
+        ];
+        for text in [
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(v) AS x, SUM(name) AS y",
+            "TRANSFORM t FROM s SELECT v AS x",
+        ] {
+            assert_eq!(shape(text, cols), None, "{text}");
+        }
+    }
+
+    /// #623 D5: text `MIN`/`MAX` and `json`/`jsonb` arguments route to the
+    /// ledger, the json columns parsed from the image's text.
+    #[test]
+    fn text_ordering_and_json_arguments_route_to_the_ledger() {
         let cols = &[
             ("g", INT),
             ("v", ValueType::Numeric),
             ("name", ValueType::Text),
             ("doc", ValueType::Other(PgType::Jsonb)),
+            ("raw", ValueType::Other(PgType::Json)),
         ];
         for text in [
             "TRANSFORM t FROM s GROUP BY g SELECT MIN(name) AS x",
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(v) AS n, MAX(name) AS x",
-            "TRANSFORM t FROM s GROUP BY g SELECT SUM(v) AS x, SUM(name) AS y",
-            "TRANSFORM t FROM s GROUP BY g SELECT COUNT(doc) AS x",
-            "TRANSFORM t FROM s SELECT v AS x",
         ] {
-            assert_eq!(shape(text, cols), None, "{text}");
+            let s = shape(text, cols).expect(text);
+            assert!(s.json_reads.is_empty(), "{text}");
         }
+        let s = shape(
+            "TRANSFORM t FROM s GROUP BY g SELECT COUNT(doc) AS x, COUNT(raw) AS y",
+            cols,
+        )
+        .expect("routed");
+        assert_eq!(
+            s.json_reads,
+            vec![("doc".to_string(), "jsonb"), ("raw".to_string(), "json")]
+        );
     }
 
     /// ADR-0002 I2 evaluated by Postgres: whether an Apply of a change
