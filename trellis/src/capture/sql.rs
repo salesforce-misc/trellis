@@ -578,6 +578,22 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// can only cost it its own derived data, and the re-read itself never reads
 /// another transaction's row either way.
 ///
+/// One write reaches the table without a capture call of its own: the
+/// update a foreign key's action makes on it (`ON UPDATE CASCADE`, `SET
+/// NULL` or `SET DEFAULT`, or `ON DELETE SET NULL` or `SET DEFAULT`).
+/// Postgres runs it in the trigger query level of the statement whose row
+/// fired the action, not in one of its own. So if that level already fired
+/// the table's `BEFORE UPDATE` statement trigger, it fires none, and its rows
+/// join the transition tables of the table's update queued there that hasn't
+/// fired yet: one capture call for both. A row both updates changed (a
+/// self-referencing key that cascades, or two cascading keys on one row) is
+/// then in the transition tables twice, and the join can pair an old version
+/// with an intermediate new one and emit that pair last. Such a pairing
+/// needs a key that occurs twice among the old rows, since the intermediate
+/// version is an old row too, so the update function also re-reads whenever
+/// a key does (`capture_ssi.rs` pins it). An `ON DELETE CASCADE` merges the
+/// same way, harmlessly: a row is deleted once, and no action inserts.
+///
 /// The schema-changed branch ([`schema_changed_branch`]) always re-reads:
 /// it is rare, and its `EXECUTE` builds one statement shape.
 fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
@@ -642,6 +658,18 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     ));
     if rows.is_some() {
         body.push_str(&schema_changed_branch(schema, spec, event));
+    }
+    if event == CaptureEvent::Update {
+        // After the schema-changed branch, which handles a renamed key.
+        body.push_str(&format!(
+            "    -- #623 D8a: an FK action's update shares these transition tables, and\n    \
+             -- a row updated twice leaves two old versions of one key.\n    \
+             if not reread then\n        \
+             reread := exists (select 1 from {OLD_ROWS} o\n            \
+             group by {} collate \"C\" having count(*) > 1);\n    \
+             end if;\n",
+            key_expr(spec, "o")
+        ));
     }
     body.push_str("    case slot\n");
     for slot in 0..RING_SIZE {
@@ -1610,6 +1638,25 @@ mod tests {
         assert!(begin.contains("st := array[st[1], 1, st[1]];"), "{begin}");
         assert!(!begin.contains("insert into"), "{begin}");
         assert!(!ddl(&spec(), CaptureEvent::Truncate).contains("reread"));
+
+        // An update also re-reads when a key repeats among its old rows (an
+        // FK action's merged update), checked after the schema-changed branch.
+        let update = ddl(&spec(), CaptureEvent::Update);
+        let repeated = update
+            .find("reread := exists (select 1 from trellis_old o")
+            .expect("the repeated-key check");
+        assert!(update.find("-- #622 C6: an imaged column").expect("branch") < repeated);
+        assert!(repeated < update.find("    case slot\n").expect("case"));
+        assert!(
+            update[repeated..].contains("having count(*) > 1"),
+            "{update}"
+        );
+        for event in [CaptureEvent::Insert, CaptureEvent::Delete] {
+            assert!(
+                !ddl(&spec(), event).contains("having count(*)"),
+                "{event:?}"
+            );
+        }
     }
 
     #[test]

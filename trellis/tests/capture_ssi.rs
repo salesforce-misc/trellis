@@ -14,7 +14,14 @@
 //!   statement deletes, whose insert is captured first; `INSERT … ON
 //!   CONFLICT DO UPDATE` re-keying a row and inserting its old key).
 //!   Nested trigger writes are pinned by `capture_reread.rs`,
-//!   `ledger_interleavings.rs` and `capture_join.rs`.
+//!   `ledger_interleavings.rs` and `capture_join.rs`, and here a nested
+//!   empty statement after a nested rewrite, which must not restart the
+//!   outer span.
+//! - **An FK action's update merged into one capture call re-reads** when a
+//!   row was updated twice (review): it fires no statement trigger of its
+//!   own, so only the repeated key in the old rows shows it.
+//! - **The transition path pairs updates by key text**, so a key moved
+//!   between equal `numeric` values still stages the old key's delete.
 //! - **A missing begin trigger errs towards re-reading.**
 //!
 //! Capture is installed by hand and the ring is read directly; nothing waits
@@ -90,17 +97,23 @@ async fn source_predicate_locks(client: &Client) -> Vec<String> {
 /// Every ring row for `public.t` as `(key, op, new_image)`, in `(lsn,
 /// change_id)` order.
 async fn ring(client: &Client) -> Vec<(String, String, Option<String>)> {
+    table_ring(client, "public.t").await
+}
+
+/// Every ring row for `table` as `(key, op, new_image)`, in `(lsn,
+/// change_id)` order.
+async fn table_ring(client: &Client, table: &str) -> Vec<(String, String, Option<String>)> {
     let arms: Vec<String> = (0..4)
         .map(|n| format!("select src_table, key, op, new_image, lsn, change_id from seg_{n}"))
         .collect();
     client
         .query(
             &format!(
-                "select key, op, new_image::text from ({}) r where src_table = 'public.t' \
+                "select key, op, new_image::text from ({}) r where src_table = $1 \
                  order by lsn, change_id",
                 arms.join(" union all ")
             ),
-            &[],
+            &[&table],
         )
         .await
         .expect("read the ring")
@@ -112,8 +125,13 @@ async fn ring(client: &Client) -> Vec<(String, String, Option<String>)> {
 /// The table each key's last ring row describes: its new image, or nothing
 /// for a delete.
 async fn ring_state(client: &Client) -> BTreeMap<String, String> {
+    table_ring_state(client, "public.t").await
+}
+
+/// [`ring_state`] for `table`.
+async fn table_ring_state(client: &Client, table: &str) -> BTreeMap<String, String> {
     let mut state = BTreeMap::new();
-    for (key, op, image) in ring(client).await {
+    for (key, op, image) in table_ring(client, table).await {
         match op.as_str() {
             "delete" => {
                 state.remove(&key);
@@ -372,4 +390,159 @@ async fn without_the_begin_trigger_every_capture_rereads() {
         .expect("update key 1, rewritten by rewrite()");
     txn.commit().await.expect("commit");
     assert_ring_is_live(&raw, &["1", "11"]).await;
+}
+
+/// An FK action's update runs in the trigger query level of the statement
+/// that fired it, fires no `BEFORE` statement trigger there, and shares the
+/// transition tables of the table's update already queued at that level: one
+/// capture call and no new span. A row updated twice is then in the
+/// transition tables twice, and a merge join pairs an old version with the
+/// intermediate one last. The old rows' repeated key makes capture re-read.
+/// Both shapes: two cascading keys on one row, and a self-referencing key
+/// that cascades into rows its own statement also updated.
+#[tokio::test]
+async fn an_fk_actions_update_merged_into_one_capture_is_reread() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.p (id int primary key); \
+         insert into public.p values (1), (2); \
+         create table public.c (id int primary key, \
+             a int references public.p (id) on update cascade, \
+             b int references public.p (id) on update cascade, v int); \
+         insert into public.c select i, 1, 2, i from generate_series(1, 20) i; \
+         create table public.s (id int primary key, \
+             parent int references public.s (id) on update cascade, v int); \
+         insert into public.s values (1, null, 0); \
+         insert into public.s select i, 1, 0 from generate_series(2, 20) i",
+    )
+    .await
+    .expect("create p, c and s");
+    for (table, columns) in [
+        ("public.c", ["a", "b", "v"]),
+        ("public.s", ["parent", "v", "id"]),
+    ] {
+        let spec = CaptureSpec::new(
+            table,
+            vec!["id".to_string()],
+            columns.map(str::to_string),
+            Vec::new(),
+        )
+        .expect("valid spec");
+        match install::install(&mut raw, DEFAULT_SCHEMA, &spec, None)
+            .await
+            .expect("install")
+        {
+            Progress::Done(_) => {}
+            Progress::Waiting(wait) => panic!("an install without a deadline landed: {wait}"),
+        }
+    }
+
+    // The plan the application's settings choose orders the join's output;
+    // this one emits a stale pairing last without the re-read.
+    raw.batch_execute(
+        "set enable_hashjoin = off; set enable_nestloop = off; \
+         begin isolation level serializable; \
+         update public.p set id = id + 10; \
+         update public.s set id = case id when 1 then 100 else id end, v = v + 1; \
+         commit; \
+         reset enable_hashjoin; reset enable_nestloop",
+    )
+    .await
+    .expect("cascade into c and s");
+
+    for (table, image) in [
+        (
+            "public.c",
+            "jsonb_build_object('a', a::text, 'b', b::text, 'id', id::text, 'v', v::text)",
+        ),
+        (
+            "public.s",
+            "jsonb_build_object('id', id::text, 'parent', parent::text, 'v', v::text)",
+        ),
+    ] {
+        let live: BTreeMap<String, String> = raw
+            .query(&format!("select id::text, {image}::text from {table}"), &[])
+            .await
+            .expect("read the table")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(table_ring_state(&raw, table).await, live, "{table}");
+    }
+}
+
+/// A nested statement that changes nothing, after a nested rewrite in the
+/// same span, opens and closes a span of its own while the outer statement's
+/// is still open. It must not move the outer span's start past the rewrite.
+#[tokio::test]
+async fn an_empty_nested_statement_after_a_rewrite_keeps_the_outer_span() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = captured_table(db.dsn()).await;
+    raw.batch_execute(
+        "create function public.rewrite_then_nothing() returns trigger language plpgsql as $$ \
+         begin \
+             update public.t set a = 99 where id = new.id; \
+             update public.t set a = 0 where false; \
+             return null; \
+         end $$; \
+         create trigger rewrite_then_nothing after update on public.t for each row \
+             when (pg_trigger_depth() < 1) execute function public.rewrite_then_nothing()",
+    )
+    .await
+    .expect("create the application trigger");
+
+    raw.batch_execute("update public.t set a = 2 where id = 1")
+        .await
+        .expect("update key 1, rewritten by the trigger");
+    assert_ring_is_live(&raw, &["1"]).await;
+}
+
+/// On the transition path a key moved between equal `numeric` values (`1.0`
+/// to `1.00`) still stages the old key's delete: the update pairs old and
+/// new rows by key text.
+#[tokio::test]
+async fn an_equal_valued_key_move_without_a_reread_deletes_the_old_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.n (id numeric primary key, a int); \
+         insert into public.n values (1.0, 1)",
+    )
+    .await
+    .expect("create public.n");
+    let spec = CaptureSpec::new(
+        "public.n",
+        vec!["id".to_string()],
+        ["a".to_string()],
+        Vec::new(),
+    )
+    .expect("valid spec");
+    match install::install(&mut raw, DEFAULT_SCHEMA, &spec, None)
+        .await
+        .expect("install")
+    {
+        Progress::Done(_) => {}
+        Progress::Waiting(wait) => panic!("an install without a deadline landed: {wait}"),
+    }
+
+    raw.batch_execute("update public.n set id = 1.00")
+        .await
+        .expect("move the key");
+    let mut staged = table_ring(&raw, "public.n").await;
+    staged.sort();
+    assert_eq!(
+        staged,
+        [
+            ("1.0".to_string(), "delete".to_string(), None),
+            (
+                "1.00".to_string(),
+                "insert".to_string(),
+                Some(r#"{"a": "1", "id": "1.00"}"#.to_string())
+            ),
+        ]
+    );
 }

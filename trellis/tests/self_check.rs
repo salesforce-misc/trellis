@@ -913,6 +913,7 @@ async fn a_disabled_capture_trigger_is_reported_before_any_comparison() {
     raw.batch_execute(
         "alter table widgets disable trigger trellis_capture_update; \
          alter table widgets enable trigger trellis_capture_delete; \
+         alter table widgets disable trigger trellis_capture_begin; \
          update widget_totals set total = 0",
     )
     .await
@@ -931,6 +932,12 @@ async fn a_disabled_capture_trigger_is_reported_before_any_comparison() {
                 table: WIDGETS.to_string(),
                 trigger: "trellis_capture_delete".to_string(),
                 enabled: "O".to_string(),
+            },
+            // #623 D8a: without it every capture re-reads.
+            CaptureFault::TriggerNotAlways {
+                table: WIDGETS.to_string(),
+                trigger: "trellis_capture_begin".to_string(),
+                enabled: "D".to_string(),
             },
         ]
     );

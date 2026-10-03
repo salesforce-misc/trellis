@@ -286,6 +286,17 @@ Otherwise it images the transition tables and reads no relation, so a
 statement nothing else touched takes no predicate lock on the table. The
 inexact cases all err towards re-reading: a disabled or missing begin
 trigger makes every capture re-read (and the capture audit reports it).
+
+One write isn't a statement of its own: the update a foreign key's action
+makes (`ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT`, or `ON DELETE SET
+NULL` or `SET DEFAULT`). Postgres runs it inside the trigger query level of
+the statement that fired it, where it fires no `BEFORE` statement trigger
+once one has fired, and its rows join the transition tables of the table's
+update already queued there: one capture call covers both. A row both
+updated (a self-referencing key that cascades, or two cascading keys on one
+row) is in the transition tables twice, and pairing by key can image the
+intermediate version last. So an update capture also re-reads when a key
+occurs twice among its old rows (found in review).
 `tests/capture_ssi.rs` pins the gate, and `capture::sql`'s `function_body`
 has the argument.
 
@@ -296,8 +307,11 @@ it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
 WAL per row (#622 C4, `local_docs/bench/622-baseline.md`). The begin
 trigger and the span bookkeeping (#623 D8a) add about 4.4 µs per statement,
-and nothing per row; when a statement does re-read, the probe adds about
-0.65–1.0 µs per row in batched writes and 3–10 µs per single-row statement.
+and nothing per row. An update's repeated-key check adds about 2.7 µs per
+statement and 0.3 µs per row (a rough in-transaction measurement, not
+`write-tax`, which only inserts). When a statement does re-read, the probe
+adds about 0.65–1.0 µs per row in batched writes and 3–10 µs per single-row
+statement.
 
 ## Trellis migrations and the write path
 

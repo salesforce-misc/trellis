@@ -434,20 +434,26 @@ async fn a_partial_install_is_reported_and_repaired() {
     let spec = install_t(&mut client).await;
 
     let insert_trigger = trigger_name(DEFAULT_SCHEMA, CaptureEvent::Insert);
+    let begin_trigger = trigger_name(DEFAULT_SCHEMA, CaptureEvent::Begin);
     client
         .batch_execute(&format!(
-            "alter table public.t disable trigger {insert_trigger}"
+            "alter table public.t disable trigger {insert_trigger}; \
+             drop trigger {begin_trigger} on public.t"
         ))
         .await
-        .expect("disable a trigger");
+        .expect("disable a trigger and drop the begin trigger");
     let Installed::Partial { faults } = install::installed(&client, DEFAULT_SCHEMA, "public.t")
         .await
         .expect("installed")
     else {
         panic!("a disabled trigger makes the install partial");
     };
-    assert_eq!(faults.len(), 1, "{faults:?}");
+    assert_eq!(faults.len(), 2, "{faults:?}");
     assert!(faults[0].contains("not ENABLE ALWAYS"), "{faults:?}");
+    assert!(
+        faults[1].contains("the begin trigger") && faults[1].contains("is missing"),
+        "{faults:?}"
+    );
 
     assert_eq!(
         landed(
