@@ -2007,23 +2007,20 @@ async fn an_entry_lost_to_the_gc_never_deadlocks_one_to_one() {
 }
 
 /// A GC batch reads the ledger through its tombstone index, never by a
-/// sequential scan (#738), so its cost is the tombstones it walks, not the
-/// ledger's size (#722). The statistics here are a tombstone-heavy load's,
-/// analyzed: a quarter of the entries are tombstones at or below the
-/// prefix, so a scan with the batch's `limit` looks cheap to the planner.
-/// After the GC has taken them it is the whole ledger, which is what held
-/// `xmin` for 33 s at 100M.
+/// sequential or bitmap scan (#738), so its cost is the tombstones it
+/// walks, not the ledger's size (#722). Each load is analyzed to tempt the
+/// planner away from the index:
+///
+/// - tombstone-heavy (a quarter of the entries, all at or below the
+///   prefix): left to itself the planner seq-scans, since a scan with the
+///   batch's `limit` looks cheap. After the GC has taken them it is the
+///   whole ledger, which is what held `xmin` for 33 s at 100M;
+/// - sparse (fewer collectable tombstones than a batch takes): with only
+///   sequential scans off it builds a bitmap of every one of them before the
+///   `limit` applies.
 async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10)]).await;
     let ledger = flavour.ledger();
-    d.ctl
-        .batch_execute(&format!(
-            "insert into {ledger} (__from_key, __applied_seg, __tombstone) \
-             select 'x' || i, 1 + i % 10, i % 4 = 0 from generate_series(1, 200000) i; \
-             analyze {ledger}"
-        ))
-        .await
-        .expect("load and analyze a tombstone-heavy ledger");
     let index: String = d
         .ctl
         .query_one(
@@ -2035,23 +2032,46 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index(flavour: Flavo
         .await
         .expect("the ledger's tombstone index")
         .get(0);
-    let explained = trellis::staging::retire::explain_collect(&mut d.ctl, ledger, 10)
-        .await
-        .expect("explain the GC statement");
-    let scans: Vec<&str> = explained
-        .lines()
-        .filter(|line| line.contains("Seq Scan") || line.contains("Bitmap"))
-        .collect();
-    assert_eq!(
-        scans,
-        Vec::<&str>::new(),
-        "no sequential or bitmap scan:\n{explained}"
-    );
-    let index = index.rsplit('.').next().expect("an index name");
-    assert!(
-        explained.contains(&format!("Index Scan using {index}")),
-        "the batch walks {index}:\n{explained}"
-    );
+    let index = index.rsplit('.').next().expect("an index name").to_string();
+    for (load, seg, tombstone) in [
+        ("tombstone-heavy", "1 + i % 10", "i % 4 = 0"),
+        ("sparse", "1 + (i * 7919) % 10", "i % 50 = 0"),
+    ] {
+        d.ctl
+            .batch_execute(&format!(
+                "truncate {ledger}; \
+                 insert into {ledger} (__from_key, __applied_seg, __tombstone) \
+                 select 'x' || i, {seg}, {tombstone} from generate_series(1, 200000) i; \
+                 analyze {ledger}"
+            ))
+            .await
+            .expect("load and analyze the ledger");
+        let explained = trellis::staging::retire::explain_collect(&mut d.ctl, ledger, 10)
+            .await
+            .expect("explain the GC statement");
+        let scans: Vec<&str> = explained
+            .lines()
+            .filter(|line| line.contains("Seq Scan") || line.contains("Bitmap"))
+            .collect();
+        assert_eq!(
+            scans,
+            Vec::<&str>::new(),
+            "{load}: no sequential or bitmap scan:\n{explained}"
+        );
+        assert!(
+            explained.contains(&format!("Index Scan using {index}")),
+            "{load}: the batch walks {index}:\n{explained}"
+        );
+        // The inner select locks its rows, so the index's predicate stays a
+        // filter: read committed re-checks it on a row updated under the
+        // batch, which a page reviving the entry does.
+        assert!(
+            explained
+                .lines()
+                .any(|line| line.contains("Filter:") && line.contains("__tombstone")),
+            "{load}: the batch re-checks __tombstone:\n{explained}"
+        );
+    }
 }
 
 #[tokio::test]

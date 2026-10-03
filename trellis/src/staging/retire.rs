@@ -284,21 +284,31 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
 /// partial `where __tombstone` index and stops at its `limit`. Its cost is
 /// then the tombstones it walks, not the ledger's size.
 ///
-/// Left to the statistics, the planner seq-scanned the ledger. Right after
-/// a burst of deletes, `analyze` sees many tombstones at or below the
-/// prefix, so a scan that stops at the batch's `limit` looks cheap. Once the
-/// GC has taken them, that scan reads the whole ledger to find the few that
-/// are left: up to 0.6 s a tick at 10M entries, and, by the same plan, the
-/// 33 s transaction #722 saw holding `xmin` back for every table on a
-/// 28.6 GB ledger at 100M. Under these settings it was 65 ms at most at
-/// 100M (0.4 ms mean). A bitmap scan
-/// would build the bitmap of every collectable tombstone before the
-/// `limit` applies.
+/// Left to itself, the planner seq-scanned the ledger. Whenever it expects
+/// many tombstones at or below the prefix, a scan that stops at the batch's
+/// `limit` looks cheap. A ledger a build has just filled has no column
+/// statistics until `analyze` reaches it, and the planner's defaults then
+/// put a sixth of the ledger there (a half for `__tombstone`, a third for
+/// `__applied_seg <= $1`): the benches estimated 1.7M tombstones at 10M
+/// entries and 20.7M at 100M, where the 100M run had 115 at most. An
+/// `analyze` right after a burst of deletes misleads it the same way. That
+/// scan reads the whole ledger to find the few tombstones there are: up to
+/// 0.6 s a tick at 10M entries, and, by the same plan, the 33 s transaction
+/// #722 saw holding `xmin` back for every table on a 28.6 GB ledger at
+/// 100M. Under these settings it was 65 ms at most at 100M (0.4 ms mean). A
+/// bitmap scan would build the bitmap of every collectable tombstone before
+/// the `limit` applies.
+///
+/// The index scan keeps the per-row re-check: the inner select locks its
+/// rows, so the planner keeps the index's predicate as a filter for
+/// read committed's re-check of a row updated under it.
 ///
 /// The planner can only keep to that plan while the index exists, so a
 /// batch first checks it does ([`TOMBSTONE_INDEX_SQL`]). The settings are
-/// `set local`, and the batch's transaction commits (or the explain's rolls
-/// back) right after the statement, so nothing else plans under them.
+/// `set local`, and only that check and the statement run in the batch's
+/// transaction, which commits right after the statement, or rolls back
+/// when the lock, the check or the statement stops it. Nothing else plans
+/// under them.
 const GC_PLAN_SETTINGS: &str = "set local enable_seqscan = off; set local enable_bitmapscan = off";
 
 /// Whether the ledger `$1` has its partial tombstone index (the one whose
