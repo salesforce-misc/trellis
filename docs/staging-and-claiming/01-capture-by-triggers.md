@@ -46,15 +46,25 @@ segment with one `INSERT … SELECT`:
   key is re-read too: a nested write that put the key back stages an update
   to the live row. The re-read never sees another transaction's change: each
   row it joins was written or deleted by this statement, so this transaction
-  holds its row lock, or for a new key its unique-index entry, until commit.
-  The re-read is a `LATERAL … LIMIT 1` probe per row, and the function runs
-  with `enable_seqscan` off: PL/pgSQL plans once per session, often against
-  a table that was empty then, and a cached sequential scan would read the
-  whole table for every captured row once it grows.
-  Under `READ COMMITTED` the re-read's snapshot is newer than the
-  statement's, but another transaction's newer commits can only be to rows
-  the join never reaches (`tests/capture_reread.rs`, at every isolation
-  level).
+  holds its row lock, or for a new key its unique-index entry, until commit,
+  and the key's live version is one this transaction wrote. The probe keeps
+  only such a version (`age(xmin) <= 0`): under `REPEATABLE READ` and
+  `SERIALIZABLE` a version another transaction deleted after the snapshot
+  stays visible beside the one this statement re-created. It also requires
+  the version's key to render as the row's own, because the ring keys by
+  text and a type's `=` can be looser (`numeric` `1.0 = 1.00`). The re-read
+  is a `LATERAL … LIMIT 1` probe per row, and the function runs with
+  `enable_seqscan` off: PL/pgSQL plans once per session, often against a
+  table that was empty then, and a cached sequential scan would read the
+  whole table for every captured row once it grows
+  (`tests/capture_reread.rs`, at every isolation level).
+- **The re-read needs `SELECT` on the table**, which the Trellis role holds
+  as the table's owner; the capture audit reports it missing. Two costs
+  are new with it: under `SERIALIZABLE` the probe takes predicate locks on
+  the primary key's index pages, so two serializable writers to nearby keys
+  can now fail where they didn't before; and on a table with `FORCE ROW
+  LEVEL SECURITY` whose policies hide a row from the Trellis role, the
+  re-read can't find it and stages a delete.
 - **Updates** pair the OLD and NEW transition tables by primary key. A row
   whose key changed has no partner, so it becomes a delete of the old key and
   an insert of the new one.

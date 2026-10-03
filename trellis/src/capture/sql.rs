@@ -780,11 +780,26 @@ impl Render {
 ///
 /// The re-read never sees another transaction's change. Each row it joins
 /// was written (or deleted) by this statement, so this transaction holds its
-/// row lock, or for a new key its unique-index entry, until it commits. Under
-/// `READ COMMITTED` the re-read's snapshot is newer than the statement's,
-/// but another transaction's newer commits can only be to rows the join by
-/// primary key never reaches. `tests/capture_reread.rs` checks this at every
-/// isolation level.
+/// row lock, or for a new key its unique-index entry, until it commits, and
+/// the key's live version, if any, is one this transaction wrote. Two more
+/// conditions keep the probe on that version:
+///
+/// - **It was written by this transaction**: `age(t.xmin) <= 0`. Under
+///   `REPEATABLE READ` and `SERIALIZABLE` the snapshot predates the
+///   statement, so a version of the key that another transaction deleted or
+///   re-keyed after the snapshot, and that this statement then re-created,
+///   is still visible beside this transaction's own (#623 D8a review). `age`
+///   measures against the transaction's own xid, or the next xid as of its
+///   first call in the transaction, so it is `<= 0` for every version this
+///   transaction or its subtransactions wrote, and positive for one
+///   committed before the snapshot.
+/// - **Its key renders the same**: the typed `=` finds the version through
+///   the index, but the ring keys by the key's text, and a type's `=` can be
+///   looser (`numeric` `1.0 = 1.00`). Without the text check, a key move
+///   from `1.0` to `1.00` would find the new row for the old key and never
+///   stage the old key's delete.
+///
+/// `tests/capture_reread.rs` checks this at every isolation level.
 ///
 /// The old image and the `group_key` are unchanged (old ∪ new, plus the live
 /// row's): the relationship readers still need the old join keys until E
@@ -812,15 +827,20 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
     // planned the statement (it plans once per session); see
     // [`PLANNER_SETTINGS`] for the probe's index scan. `of` is the typed
     // key's source per key column.
-    let live_join = |of: &dyn Fn(&str) -> String| {
+    // `key` is the row's own ring key, which the live version's must match
+    // as text; `age(t.xmin) <= 0` keeps the probe on a version this
+    // transaction wrote (see "The image is the live row" above).
+    let live_join = |of: &dyn Fn(&str) -> String, key: &str| {
         let on: Vec<String> = spec
             .key
             .iter()
             .map(|c| format!("t.{} = {}", quote_ident(c), of(&quote_ident(c))))
             .collect();
         format!(
-            "{indent}left join lateral (select * from {table} t where {} limit 1) t on true",
-            on.join(" and ")
+            "{indent}left join lateral (select * from {table} t where {}\n{indent}    \
+             and {} = {key} collate \"C\" and pg_catalog.age(t.xmin) <= 0 limit 1) t on true",
+            on.join(" and "),
+            key_expr(spec, "t"),
         )
     };
     match event {
@@ -834,7 +854,7 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
             render.image(spec, "n"),
             render.image(spec, "t"),
             group_key_expr(spec, &["n", "t"], render),
-            live_join(&|c| format!("n.{c}")),
+            live_join(&|c| format!("n.{c}"), &key_expr(spec, "n")),
         ),
         CaptureEvent::Delete => format!(
             "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
@@ -845,7 +865,7 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
             render.image(spec, "o"),
             render.image(spec, "t"),
             group_key_expr(spec, &["o", "t"], render),
-            live_join(&|c| format!("o.{c}")),
+            live_join(&|c| format!("o.{c}"), &key_expr(spec, "o")),
         ),
         // A statement trigger sees the update's old and new rows as two sets
         // with no pairing, so they are paired on the key text. A row whose
@@ -892,7 +912,14 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
                 group_key_expr(spec, &["o", "n", "t"], render),
                 key_expr(spec, "o"),
                 key_expr(spec, "n"),
-                live_join(&|c| format!("coalesce(n.{c}, o.{c})")),
+                live_join(
+                    &|c| format!("coalesce(n.{c}, o.{c})"),
+                    &format!(
+                        "case when {new} then {} else {} end",
+                        key_expr(spec, "n"),
+                        key_expr(spec, "o")
+                    ),
+                ),
             )
         }
         CaptureEvent::Truncate => format!(
@@ -1427,22 +1454,35 @@ mod tests {
     }
 
     /// #623 D8a: every event re-reads the rows it wrote from the live table
-    /// by the primary key's typed equality, and images the live row.
+    /// by the primary key's typed equality, keeps only a version this
+    /// transaction wrote whose key renders as the row's own, and images the
+    /// live row.
     #[test]
     fn every_event_images_the_live_row_read_by_primary_key() {
-        for (event, on) in [
-            (CaptureEvent::Insert, "t.\"id\" = n.\"id\""),
-            (CaptureEvent::Delete, "t.\"id\" = o.\"id\""),
+        for (event, on, key) in [
+            (
+                CaptureEvent::Insert,
+                "t.\"id\" = n.\"id\"",
+                "format('%s', n.\"id\")",
+            ),
+            (
+                CaptureEvent::Delete,
+                "t.\"id\" = o.\"id\"",
+                "format('%s', o.\"id\")",
+            ),
             (
                 CaptureEvent::Update,
                 "t.\"id\" = coalesce(n.\"id\", o.\"id\")",
+                "case when n.\"id\" is not null then format('%s', n.\"id\") \
+                 else format('%s', o.\"id\") end",
             ),
         ] {
             let sql = ddl(&spec(), event);
             assert!(
                 sql.contains(&format!(
                     "left join lateral (select * from \"public\".\"orders\" t \
-                     where {on} limit 1) t on true"
+                     where {on}\n            and format('%s', t.\"id\") = {key} collate \"C\" \
+                     and pg_catalog.age(t.xmin) <= 0 limit 1) t on true"
                 )),
                 "a probe per row, never a join the planner could hash:\n{sql}"
             );
@@ -1456,9 +1496,7 @@ mod tests {
         }
         let composite = ddl(&composite(), CaptureEvent::Insert);
         assert!(
-            composite.contains(
-                "where t.\"post\" = n.\"post\" and t.\"tag\" = n.\"tag\" limit 1) t on true;"
-            ),
+            composite.contains("where t.\"post\" = n.\"post\" and t.\"tag\" = n.\"tag\"\n"),
             "{composite}"
         );
     }

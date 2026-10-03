@@ -382,6 +382,156 @@ async fn an_upsert_over_another_sessions_commit_images_its_own_result() {
     );
 }
 
+/// Under `REPEATABLE READ` and `SERIALIZABLE` the snapshot predates the
+/// writer's statement, so a version of a key that another session deleted
+/// or re-keyed after the snapshot stays visible to the writer beside the row
+/// its own insert of that key writes. The re-read images the writer's row,
+/// never the other session's deleted one, and when a nested write deletes
+/// the writer's row, it stages a delete rather than imaging the stale
+/// version (#623 D8a review).
+#[tokio::test]
+async fn a_version_another_session_removed_after_the_snapshot_is_never_imaged() {
+    for level in [IsolationLevel::RepeatableRead, IsolationLevel::Serializable] {
+        for removal in [
+            "delete from public.t where id = 1",
+            "update public.t set id = 3 where id = 1",
+        ] {
+            let cluster = TestCluster::start();
+            let db = cluster.create_isolated_database().await;
+            let raw = held_table(db.dsn()).await;
+            raw.batch_execute(
+                "create function public.undo_insert() returns trigger language plpgsql as $$ \
+                 begin \
+                     if new.a = 0 then delete from public.t where id = new.id; end if; \
+                     return null; \
+                 end $$; \
+                 create trigger undo_insert after insert on public.t \
+                     for each row execute function public.undo_insert()",
+            )
+            .await
+            .expect("create the undo trigger");
+
+            let mut writer = connect(db.dsn()).await;
+            let txn = writer
+                .build_transaction()
+                .isolation_level(level)
+                .start()
+                .await
+                .expect("begin");
+            txn.query_one("select count(*) from public.t", &[])
+                .await
+                .expect("take the snapshot");
+            raw.batch_execute(removal)
+                .await
+                .expect("another session removes key 1");
+            txn.batch_execute(
+                "insert into public.t values (1, 50, 1); \
+                 delete from public.t where id = 2; \
+                 insert into public.t values (2, 0, 2)",
+            )
+            .await
+            .expect("re-create key 1, and key 2 deleted by the trigger");
+            let id = txid(txn.client()).await;
+            txn.commit().await.expect("commit");
+
+            assert_eq!(
+                staged_by(&raw, "public.t", &id).await,
+                vec![
+                    row("1", "insert", None, Some(r#"{"a": "50", "id": "1"}"#)),
+                    row("2", "delete", Some(r#"{"a": "2", "id": "2"}"#), None),
+                    row("2", "delete", Some(r#"{"a": "0", "id": "2"}"#), None),
+                    row("2", "delete", Some(r#"{"a": "0", "id": "2"}"#), None),
+                ],
+                "{level:?}, {removal}"
+            );
+        }
+    }
+}
+
+/// A key move between two values its type's `=` calls equal but that render
+/// differently (`numeric` `1.0` to `1.00`) is a delete of the old key text
+/// and an insert of the new one: the ring keys by the text, so the re-read
+/// of the old key must not find the moved row (#623 D8a review).
+#[tokio::test]
+async fn a_key_move_its_types_equality_calls_a_no_op_deletes_the_old_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.n (id numeric primary key, a int); \
+         insert into public.n values (1.0, 1)",
+    )
+    .await
+    .expect("create public.n");
+    install_spec(&mut raw, &spec("public.n", &["a"])).await;
+
+    raw.batch_execute("begin; update public.n set id = 1.00")
+        .await
+        .expect("re-scale key 1.0");
+    let id = txid(&raw).await;
+    raw.batch_execute("commit").await.expect("commit");
+    assert_eq!(
+        staged_by(&raw, "public.n", &id).await,
+        vec![
+            row("1.0", "delete", Some(r#"{"a": "1", "id": "1.0"}"#), None),
+            row("1.00", "insert", None, Some(r#"{"a": "1", "id": "1.00"}"#)),
+        ]
+    );
+}
+
+/// A nested write in a subtransaction (an `EXCEPTION` block) is this
+/// transaction's too, so the outer capture images it, also when `age()`
+/// first ran in the transaction before it had an xid.
+#[tokio::test]
+async fn a_nested_write_in_a_subtransaction_is_the_live_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = held_table(db.dsn()).await;
+    raw.batch_execute(
+        "create function public.bump() returns trigger language plpgsql as $$ \
+         begin \
+             if new.a = 200 then \
+                 begin \
+                     update public.t set a = 201 where id = new.id; \
+                 exception when others then null; \
+                 end; \
+             end if; \
+             return null; \
+         end $$; \
+         create trigger bump after update on public.t \
+             for each row execute function public.bump()",
+    )
+    .await
+    .expect("create the bump trigger");
+
+    for level in ["read committed", "repeatable read"] {
+        raw.batch_execute(&format!(
+            "begin isolation level {level}; select age('3'::xid); \
+             update public.t set a = 200 where id = 1"
+        ))
+        .await
+        .expect("update key 1, bumped by the trigger");
+        let id = txid(&raw).await;
+        raw.batch_execute(
+            "commit; update public.t set a = 1 where id = 1; \
+             update public.t set a = 1 where id = 1",
+        )
+        .await
+        .expect("commit and reset");
+        let staged = staged_by(&raw, "public.t", &id).await;
+        assert_eq!(
+            staged.last(),
+            Some(&row(
+                "1",
+                "update",
+                Some(r#"{"a": "1", "id": "1"}"#),
+                Some(r#"{"a": "201", "id": "1"}"#)
+            )),
+            "{level}: {staged:?}"
+        );
+    }
+}
+
 /// A primary-key move is a delete of the old key and an insert of the new
 /// one, the insert imaging the live row.
 #[tokio::test]
