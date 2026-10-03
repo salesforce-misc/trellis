@@ -1217,7 +1217,9 @@ async fn field_build_ready(
 
     let txn = client.transaction().await?;
     // A page that read the paused fields before this commit must not apply
-    // after it.
+    // after it. The claim's idle timeout goes first: from the bump on, a
+    // stalled worker holds up every page of the source, not just its chunk.
+    fence.arm(&*txn).await?;
     bump_version_fence(&*txn, &definition.source_table).await?;
     if !fence.hold(&*txn).await? {
         txn.rollback().await?;
