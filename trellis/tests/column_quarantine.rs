@@ -2880,3 +2880,118 @@ async fn apply_holds_out_an_alias_reader_of_a_paused_field_without_a_row_of_its_
         some(&["15", "30"])
     );
 }
+
+/// An edit that makes a field read a paused field by alias pauses it with
+/// that field, as a pause after the edit would: it is listed as paused, by
+/// a row and an edge, and the paused field's resume releases it and builds
+/// it. Here `doubled` is added while `total` is paused.
+#[tokio::test]
+async fn an_alter_adding_a_reader_of_a_paused_field_pauses_it_until_that_fields_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+    trellis
+        .apply("ALTER TRANSFORM sib ADD total + total AS doubled")
+        .await
+        .expect("add a reader of the paused field");
+    assert_eq!(
+        column_status_row(&client, "sib", "doubled").await,
+        Some((
+            false,
+            Some("paused because upstream column 'sib.total' is paused".to_string())
+        )),
+        "the new reader is paused with the field it reads"
+    );
+    assert!(cascade_edge_exists(&client, "sib", "doubled", "sib", "total").await);
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        vec![Some("15".to_string()), None],
+        "the edit's build leaves the paused reader alone"
+    );
+    assert!(column_status_row(&client, "sib", "doubled").await.is_some());
+
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+    let resumed = quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib".to_string(), "doubled".to_string()),
+        ]
+    );
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        some(&["25", "50"])
+    );
+    assert_eq!(status_named(&client, "sib").await, "live");
+}
+
+/// A definition reading a paused field's sibling reader is paused through
+/// it, and resumed with it: `sib_sum.d1` reads `sib.doubled`, which reads
+/// the paused `sib.total` by alias.
+#[tokio::test]
+async fn a_definition_reading_a_frozen_sibling_is_paused_and_resumed_through_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_items_transform(
+        &db,
+        &client,
+        "price + tax AS total, total + total AS doubled",
+    )
+    .await;
+    let sib_columns = numeric_columns(&["id", "total", "doubled"]);
+    let downstream = create_definition(
+        &db.pool,
+        "TRANSFORM sib_sum FROM sib SELECT doubled + 1 AS d1",
+        &sib_columns,
+    )
+    .await
+    .expect("create the downstream definition");
+    let pk = source_primary_key(&db.pool, &downstream.def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(
+        &db.pool,
+        &downstream.def,
+        "public",
+        &pk,
+        &sib_columns,
+        &downstream.def.source,
+    )
+    .await
+    .expect("create the downstream target table");
+
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib_sum", "d1", "sib", "doubled").await);
+    assert!(column_status_row(&client, "sib_sum", "d1").await.is_some());
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib".to_string(), "doubled".to_string()),
+            ("sib_sum".to_string(), "d1".to_string()),
+        ]
+    );
+    assert_eq!(column_status_row(&client, "sib_sum", "d1").await, None);
+}

@@ -1833,6 +1833,64 @@ pub async fn alter_transform(
         }
     }
 
+    // Issue #748: an edited field that now reads a paused field by alias,
+    // directly or through others, is paused with it, as `cascade_pause`
+    // pauses it when the pause comes after the edit: a `column_status` row,
+    // which `status` lists, and an edge, which the paused field's resume
+    // walks to release it into that resume's field build. Apply holds it
+    // out either way, since its paused set closes over alias readers. A
+    // field awaiting its capture gets no edges: the build that releases it
+    // writes its readers, whenever they were added
+    // (`staging::build::FieldPlan::for_chunk`).
+    if builds_fields {
+        let readers = super::eval::AliasReaders::of(&merged);
+        let mut frontier: Vec<String> = txn
+            .query(
+                "select column_name from column_status \
+                 where transform_table = $1 and not awaiting_capture",
+                &[&alter.target],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        while let Some(upstream) = frontier.pop() {
+            for reader in readers.direct(&upstream) {
+                if !build_fields.contains(reader) {
+                    continue;
+                }
+                let edged = txn
+                    .execute(
+                        "insert into column_pause_cascades \
+                             (downstream_transform, downstream_column, \
+                              upstream_transform, upstream_column) \
+                         values ($1, $2, $1, $3) \
+                         on conflict do nothing",
+                        &[&alter.target, reader, &upstream],
+                    )
+                    .await?;
+                txn.execute(
+                    "insert into column_status \
+                         (transform_table, column_name, paused_at, last_error, local_fuse) \
+                     values ($1, $2, now(), $3, false) \
+                     on conflict (transform_table, column_name) do nothing",
+                    &[
+                        &alter.target,
+                        reader,
+                        &format!(
+                            "paused because upstream column '{}.{upstream}' is paused",
+                            alter.target
+                        ),
+                    ],
+                )
+                .await?;
+                if edged > 0 {
+                    frontier.push(reader.clone());
+                }
+            }
+        }
+    }
+
     let new_text = render_definition_text(&merged);
     txn.execute(
         "update transform_definitions \

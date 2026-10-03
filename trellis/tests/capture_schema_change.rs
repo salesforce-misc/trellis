@@ -1178,3 +1178,46 @@ async fn a_definition_paused_for_a_missing_column_does_not_hold_the_tables_catch
         .get(0);
     assert_eq!(left, 0, "spare2 no longer waits");
 }
+
+/// Issue #748: an edit adding a field that reads, by alias, a field still
+/// awaiting its capture. Apply holds the reader out with that field, and
+/// the reader's own field build runs (and skips it) before the capture is
+/// ready, so the build that releases the awaited field must write the
+/// reader too, though the reader didn't exist when that build was
+/// registered. Each step is driven by hand, in the order that leaves it to
+/// the release: the reader's build first, then the capture pass and its
+/// drain, then the release.
+#[tokio::test]
+async fn the_release_of_a_field_awaiting_capture_builds_a_reader_added_after_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+
+    trellis
+        .apply("ALTER TRANSFORM ta ADD spare AS spare2")
+        .await
+        .expect("add a field awaiting its capture");
+    trellis
+        .apply("ALTER TRANSFORM ta ADD spare2 + 1 AS spare3")
+        .await
+        .expect("add a reader of it");
+    run_backfill_chunks(&db.pool).await;
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    run_backfill_chunks(&db.pool).await;
+    bring_live(&mut raw, &db.pool, &["ta"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, spare2::text, spare3::text from public.ta order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, spare::text, (spare + 1)::text from public.u order by id"
+        )
+        .await,
+        "the release's build writes the reader added after it was registered"
+    );
+}

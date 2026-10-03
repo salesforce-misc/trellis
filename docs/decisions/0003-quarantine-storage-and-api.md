@@ -157,7 +157,12 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   read of the paused set closes over these readers itself
   (`defs::eval::AliasReaders`), so a reader is held out even before its row
   exists. An `ALTER TRANSFORM` field build covers the readers of each field it
-  edits, and a capture wait holds them out (and lists them) with it.
+  edits, and a capture wait holds them out (and lists them) with it. An edit
+  that makes a field read a paused field pauses it with that field (a row and
+  an edge, as if the pause had come after the edit). A field build's chunks
+  take in the readers of its fields from the definition as it stands when
+  each chunk is planned, so the build that releases a field awaiting its
+  capture also writes a reader an edit added after that build was registered.
 
 ## Resume re-arms the fuse
 
