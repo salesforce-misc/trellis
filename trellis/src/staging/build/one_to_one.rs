@@ -182,8 +182,15 @@ pub async fn run_chunk(
 /// values from its snapshot. Without the lock, a page could apply a newer
 /// change between the snapshot and the write, and the chunk would put the
 /// field back behind it. Under the lock, a page that holds the key commits
-/// first and the snapshot sees its change; one that comes later writes the
-/// field from a newer image, since the field applies from the build's start.
+/// first and the snapshot sees its change. One that comes later writes the
+/// field from its own change's image, since the field applies from the
+/// build's start. A change newer than the snapshot leaves the field newer
+/// too. An older one that I2 still lets through leaves it behind only until
+/// the newer change the snapshot saw applies, which I2 lets through as
+/// well, since the chunk left the entry as it was. A page that read the
+/// field as paused can't come later: the edit, the column resume and the
+/// capture release bump the source's version fence
+/// (`super::bump_version_fence`).
 pub async fn run_field_chunk(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
