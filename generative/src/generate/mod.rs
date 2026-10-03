@@ -2448,7 +2448,10 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
             }
         })
         .collect();
-    let mut plan = ConcurrentPlan { bursts };
+    let mut plan = ConcurrentPlan {
+        bursts,
+        steady_load: None,
+    };
     for (def, &at) in program.def_install_after_op.iter().enumerate() {
         if at == 0 {
             continue;
@@ -2615,6 +2618,12 @@ pub struct ConcurrentCase {
     /// enough that one burst seals into several batches, so one hot key's
     /// changes sit in several batches at once.
     pub seal_interval_ms: u64,
+    /// The rows per Re-derive build chunk the engine plans, or `None` for
+    /// the engine's default.
+    pub build_chunk_rows: Option<i64>,
+    /// How often the engine's reconcile pass runs, which is where a build
+    /// starts, in milliseconds, or `None` for the engine's default (5s).
+    pub reconcile_interval_ms: Option<u64>,
 }
 
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
@@ -3160,7 +3169,7 @@ mod strategy {
     use super::*;
     use crate::model::{
         BackupKind, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction, NoiseEvent,
-        NoiseEventKind, NoisePlan, RestartMode, RestorePlan,
+        NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SteadyLoad,
     };
     use proptest::prelude::*;
 
@@ -4009,6 +4018,37 @@ mod strategy {
         hot_key_case_with(mid_burst_draws().prop_map(CaseExtras::MidBurst).boxed())
     }
 
+    /// The concurrent tier's steady-load case (#720, #725): a
+    /// [`mid_burst_case`] with no relationship, run under a steady load
+    /// ([`SteadyLoad`]).
+    ///
+    /// - Each lane waits a drawn [`LOAD_PACE_MICROS`] after every op, from
+    ///   an action that starts a build to the end of its burst, so the rest
+    ///   of the burst's writes trickle in while the build runs.
+    /// - Every page and build chunk stalls now and then at its entry-lock
+    ///   step, for up to [`LOAD_STALL_SEALS`] seal intervals, so some pages
+    ///   are slow next to others and segments drain out of order.
+    /// - Its builds plan [`LOAD_CHUNK_ROWS`] rows per chunk, and start at a
+    ///   reconcile pass on the seal cadence rather than the engine's 5s
+    ///   default, so they run while the burst that started them writes.
+    ///
+    /// A case with a relationship is drawn again: under the load, the
+    /// relationship-fed shapes diverged in about one case in ten (#719,
+    /// #726), more than a sweep's baseline bar, before #623 D5 put them on
+    /// the ledger, and they haven't been measured enough since to take back
+    /// in. Drawn apart from [`mid_burst_case`] so that tier's cases, seed for
+    /// seed, stay what they were.
+    pub fn steady_load_case() -> impl Strategy<Value = ConcurrentCase> {
+        let extras = (mid_burst_draws(), load_draws()).prop_map(|(mut draws, load)| {
+            draws.load = Some(load);
+            CaseExtras::MidBurst(draws)
+        });
+        hot_key_case_with(extras.boxed()).prop_filter(
+            "a steady-load case has no relationship (#719, #726)",
+            |case| case.program.relationships.is_empty(),
+        )
+    }
+
     /// The concurrent tier's cooling-key case (issue #557 part 3b): a
     /// [`hot_key_case`] plus a cooling table read by a 1-1 definition.
     ///
@@ -4153,6 +4193,49 @@ mod strategy {
         /// program it installs, in thousandths of the ops.
         deferred: Option<(Vec<AggregateFn>, u16)>,
         actions: Vec<ActionDraw>,
+        /// The steady load: a [`steady_load_case`]'s, `None` for a
+        /// [`mid_burst_case`].
+        load: Option<LoadDraws>,
+    }
+
+    /// The steady load a [`steady_load_case`] runs under (#720, #725).
+    #[derive(Debug, Clone, Copy)]
+    struct LoadDraws {
+        /// [`ConcurrentCase::build_chunk_rows`]: a few rows, so a build over
+        /// the hot table's [`HOT_KEYS`] rows runs as many chunks, each a
+        /// claim of its own, spread through the burst, as a build of a large
+        /// table does at the engine's default.
+        chunk_rows: i64,
+        /// [`SteadyLoad::pace`], in microseconds.
+        pace_micros: u64,
+        /// [`SteadyLoad::stall`], in seal intervals.
+        stall_seals: u32,
+    }
+
+    /// The range of rows per build chunk a [`steady_load_case`] draws.
+    pub const LOAD_CHUNK_ROWS: std::ops::RangeInclusive<i64> = 1..=4;
+
+    /// The range of [`SteadyLoad::pace`]s a [`steady_load_case`] draws, in
+    /// microseconds: a lane's few hundred ops take a few hundred
+    /// milliseconds, long enough for a build of the hot table to run under
+    /// them.
+    pub const LOAD_PACE_MICROS: std::ops::RangeInclusive<u64> = 500..=2_000;
+
+    /// The range of [`SteadyLoad::stall`]s a [`steady_load_case`] draws, in
+    /// multiples of its seal interval. A page that stalls before its entry
+    /// lock for over two seal intervals can still be waiting when a later
+    /// segment has sealed and drained and the maintenance tick after that
+    /// collects tombstones: the shape `early_tombstone_gc` needs.
+    pub const LOAD_STALL_SEALS: std::ops::RangeInclusive<u32> = 2..=4;
+
+    fn load_draws() -> impl Strategy<Value = LoadDraws> {
+        (LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS).prop_map(
+            |(chunk_rows, pace_micros, stall_seals)| LoadDraws {
+                chunk_rows,
+                pace_micros,
+                stall_seals,
+            },
+        )
     }
 
     fn mid_burst_draws() -> impl Strategy<Value = MidBurstDraws> {
@@ -4186,6 +4269,7 @@ mod strategy {
                 parent_truncate,
                 deferred,
                 actions,
+                load: None,
             })
     }
 
@@ -4264,6 +4348,7 @@ mod strategy {
                         parent_truncate: None,
                         deferred: None,
                         actions: Vec::new(),
+                        load: None,
                     });
                     if let (Some(at), Some(parent)) = (extras.parent_truncate, tables.get_mut(1)) {
                         let position = usize::from(at) * parent.mutates.len() / 1000;
@@ -4307,7 +4392,12 @@ mod strategy {
                         let after_op = 1 + usize::from(at) * (ops - 2) / 1000;
                         program = defer_def_install(program, def, after_op);
                     }
-                    let plan = concurrent_plan(&program, burst_size, lanes);
+                    let load = extras.load;
+                    let mut plan = concurrent_plan(&program, burst_size, lanes);
+                    plan.steady_load = load.map(|load| SteadyLoad {
+                        pace: std::time::Duration::from_micros(load.pace_micros),
+                        stall: std::time::Duration::from_millis(seal * u64::from(load.stall_seals)),
+                    });
                     let plan = add_burst_actions(plan, &program, &extras.actions);
                     ConcurrentCase {
                         program,
@@ -4315,6 +4405,11 @@ mod strategy {
                         plan,
                         workers: cooling.as_ref().map_or(workers, |c| c.workers),
                         seal_interval_ms: cooling.map_or(seal, |c| c.seal_interval_ms),
+                        build_chunk_rows: load.map(|load| load.chunk_rows),
+                        // A build starts at the reconcile pass after its
+                        // install or resume: at the engine's 5s default,
+                        // long after the burst that started it.
+                        reconcile_interval_ms: load.map(|_| seal),
                     }
                 },
             )
@@ -4646,10 +4741,11 @@ mod strategy {
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, cooling_key_case,
-    db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for, program_with_client_restart,
-    program_with_mid_stream_def_install, program_with_scale_out, restore_plan_for,
-    trivial_one_to_one_program_with, trivial_program, trivial_program_with,
+    LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS, MAX_ACTION_DRAWS, bulk_insert_program,
+    checkpoint_plan_for, cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case,
+    noise_plan_for, program_with_client_restart, program_with_mid_stream_def_install,
+    program_with_scale_out, restore_plan_for, steady_load_case, trivial_one_to_one_program_with,
+    trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]
@@ -5710,6 +5806,46 @@ mod tests {
                 "the group window must slide past its first position: highest group \
                  {highest_group}"
             );
+        }
+
+        #[cfg(feature = "proptest")]
+        /// The drawn steady-load cases (#720, #725): none has a
+        /// relationship, each has small build chunks, a reconcile pass at
+        /// its seal cadence and a stall of a few seal intervals; and the
+        /// mid-burst tier's cases stay flat out, at the engine's defaults.
+        #[test]
+        fn steady_load_cases_have_no_relationship_and_mid_burst_cases_no_load() {
+            use proptest::strategy::{Strategy, ValueTree};
+            use proptest::test_runner::TestRunner;
+
+            let mut runner = TestRunner::deterministic();
+            for _ in 0..16 {
+                let case = steady_load_case()
+                    .new_tree(&mut runner)
+                    .expect("a case")
+                    .current();
+                let load = case.plan.steady_load.expect("a steady load");
+                assert!(case.program.relationships.is_empty());
+                assert!(LOAD_CHUNK_ROWS.contains(&case.build_chunk_rows.expect("rows")));
+                assert_eq!(case.reconcile_interval_ms, Some(case.seal_interval_ms));
+                let pace = u64::try_from(load.pace.as_micros()).expect("micros");
+                assert!(LOAD_PACE_MICROS.contains(&pace));
+                let seals =
+                    u64::try_from(load.stall.as_millis()).expect("millis") / case.seal_interval_ms;
+                assert!(LOAD_STALL_SEALS.contains(&u32::try_from(seals).expect("seals")));
+            }
+            let mut related = 0usize;
+            for _ in 0..16 {
+                let case = mid_burst_case()
+                    .new_tree(&mut runner)
+                    .expect("a case")
+                    .current();
+                assert_eq!(case.plan.steady_load, None);
+                assert_eq!(case.build_chunk_rows, None);
+                assert_eq!(case.reconcile_interval_ms, None);
+                related += usize::from(!case.program.relationships.is_empty());
+            }
+            assert!(related > 0, "the mid-burst tier still draws relationships");
         }
 
         #[cfg(feature = "proptest")]

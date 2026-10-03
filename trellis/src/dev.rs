@@ -107,7 +107,7 @@ pub mod capture {
 /// a harness that freezes one worker between two steps. See
 /// `crate::staging::interleave`'s module doc.
 pub mod interleave {
-    pub use crate::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
+    pub use crate::staging::interleave::{PausePoint, PauseScope, Reached, set_stall, with_scope};
 }
 
 /// The Re-derive build's primitives (#625 F1): one build chunk and one

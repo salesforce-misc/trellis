@@ -409,6 +409,31 @@ impl NoisePlan {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConcurrentPlan {
     pub bursts: Vec<Burst>,
+    /// A steady load the whole run is issued under, or `None` to issue every
+    /// burst flat out (#720, #725).
+    pub steady_load: Option<SteadyLoad>,
+}
+
+/// A steady load on the engine, for a whole [`ConcurrentPlan`] (#720,
+/// #725). Flat out, a burst's lanes issue every op in tens of milliseconds:
+/// a build an action starts runs its chunks after the writes are over, and
+/// a page is never slow next to another, so segments drain in order. Two
+/// races the tier exists to catch then never get a window: a build chunk
+/// reading an entry that a page has locked but not yet written, and a
+/// segment draining past an older one whose page hasn't taken its entry
+/// lock yet. The pace holds only from an action that starts a build to the
+/// end of its burst: every other burst still goes flat out, so it still
+/// seals into batches large enough to split across workers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SteadyLoad {
+    /// How long each lane waits after each op, once an action has started a
+    /// build, so the rest of the burst's writes trickle in, as a steady
+    /// source's do, while the build runs.
+    pub pace: std::time::Duration,
+    /// The longest stall a page or a build chunk takes at its entry-lock
+    /// step (`trellis::dev::interleave::set_stall`), all run long, so some
+    /// pages are slow next to others, as a busy worker's are.
+    pub stall: std::time::Duration,
 }
 
 /// One burst of a [`ConcurrentPlan`]: `lanes[i]` is the `program.ops`
@@ -475,6 +500,16 @@ pub enum BurstAction {
 }
 
 impl BurstAction {
+    /// Whether the action starts a Re-derive build: an install, or a
+    /// whole-transform resume, which rebuilds over the target's existing
+    /// ledger entries.
+    pub fn starts_build(&self) -> bool {
+        matches!(
+            self,
+            BurstAction::Install { .. } | BurstAction::Resume { column: None, .. }
+        )
+    }
+
     /// The name coverage reports this action under.
     pub fn name(&self) -> &'static str {
         match self {

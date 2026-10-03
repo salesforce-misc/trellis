@@ -3,6 +3,7 @@
 //! multi-worker engine.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -43,6 +44,11 @@ pub struct ConcurrentRun {
 ///
 /// The drain audit ([`ConcurrentBackend::start_drain_audit`]) is on for the
 /// whole run, and its counts come back with the outcome.
+///
+/// With a [`ConcurrentPlan::steady_load`], the engine's pages and build
+/// chunks stall at their entry-lock step for the whole run, and once an
+/// action starts a build ([`BurstAction::starts_build`]) each lane waits
+/// its pace after every op for the rest of the burst.
 ///
 /// # Panics
 ///
@@ -113,6 +119,11 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
         .await
         .map_err(|e| RunError::Install(format!("drain audit: {e:?}")))?;
 
+    // The plan's steady load's stall, if any, holds for the whole run, and
+    // is cleared when the run ends, however it ends.
+    let _stall = plan.steady_load.map(|load| StallGuard::set(load.stall));
+    let pace = plan.steady_load.map(|load| load.pace);
+
     let lane_count = plan.bursts.iter().map(|b| b.lanes.len()).max().unwrap_or(0);
     let mut appliers = Vec::with_capacity(lane_count);
     for _ in 0..lane_count {
@@ -134,8 +145,12 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
         // is what an action waits on. A lane that stops at a failed op
         // counts the rest of its ops as applied, so no action waits forever.
         let progress = Arc::new(watch::channel(0usize).0);
+        // Set once one of the burst's actions starts a build: from then on,
+        // under a steady load, the lanes keep to its pace.
+        let building = Arc::new(AtomicBool::new(false));
         let mut tasks = JoinSet::new();
         for (lane_index, lane) in burst.lanes.iter().enumerate() {
+            let building = Arc::clone(&building);
             let mut applier = appliers[lane_index]
                 .take()
                 .expect("each lane's applier is returned before the next burst");
@@ -151,6 +166,9 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
                         break;
                     }
                     progress.send_modify(|n| *n += 1);
+                    if let Some(pace) = pace.filter(|_| building.load(Ordering::Relaxed)) {
+                        tokio::time::sleep(pace).await;
+                    }
                 }
                 (lane_index, applier, result)
             });
@@ -163,6 +181,9 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
                 .wait_for(|&n| n >= timed.after)
                 .await
                 .expect("this task holds the sender");
+            if timed.action.starts_build() {
+                building.store(true, Ordering::Relaxed);
+            }
             if let Err(e) = backend.act(program, &timed.action).await {
                 action_error = Some(RunError::BurstAction {
                     burst: index,
@@ -212,4 +233,21 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
         outcome: Outcome::Ran,
         drain,
     })
+}
+
+/// Sets a stall (`trellis::dev::interleave::set_stall`) for as long as it
+/// lives.
+struct StallGuard;
+
+impl StallGuard {
+    fn set(stall: std::time::Duration) -> Self {
+        trellis::dev::interleave::set_stall(Some(stall));
+        StallGuard
+    }
+}
+
+impl Drop for StallGuard {
+    fn drop(&mut self) {
+        trellis::dev::interleave::set_stall(None);
+    }
 }

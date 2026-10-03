@@ -58,9 +58,41 @@
 //! either inside [`with_scope`] as it would a drain.
 //!
 //! A later part that replaces a step moves its hook with it.
+//!
+//! # Stalls
+//!
+//! The generative concurrent tier can't freeze a worker by hand: its drains
+//! run on the engine's own worker tasks, outside any [`PauseScope`]. What it
+//! can do is make the entry-lock step slow now and then, the way a busy or
+//! descheduled worker is ([`set_stall`], #720 and #725). While a stall is
+//! set, every page or build chunk that reaches [`PausePoint::AfterPlaceholders`]
+//! or [`PausePoint::AfterEntryLock`] sleeps a random time up to it, mostly
+//! short (the cube of a uniform draw, so about one in five sleeps is over
+//! half the maximum). Those two points bound the windows two races need:
+//! between a page's placeholder insert and its entry lock, a tombstone it
+//! found can be collected (the `early_tombstone_gc` plant) while a later
+//! segment drains past it; between its entry lock and its write, a build
+//! chunk that skipped the lock reads the entry stale (the
+//! `chunk_without_entry_lock` plant). A stall changes when things happen,
+//! never what any step does, so a correct engine converges under it.
+//!
+//! It applies wherever the table above puts those two points, on purpose: a
+//! 1-1 page, a ledger page, another aggregate target's page (at its group
+//! pre-lock) and a build chunk alike. A busy worker is slow at whatever page
+//! it is running, and a chunk racing a 1-1 page, or a ledger page racing an
+//! old-path page of the same burst, needs that page held as much as one on
+//! its own path does.
+//!
+//! A stall is process-wide, like a plant, and an armed [`PauseScope`] point
+//! ignores it. Every page of every engine in the process takes it, so a
+//! harness that sets one runs nothing else in that process meanwhile (the
+//! generative tier runs its steady-load cases only in its planted-bug
+//! sweep's own processes) and clears it when the run ends, however it ends.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio_postgres::GenericClient;
@@ -142,6 +174,44 @@ impl PauseScope {
     }
 }
 
+/// The longest stall, in microseconds; 0 for none. See the module doc's
+/// "Stalls".
+static STALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the longest stall a page or a build chunk takes at its entry-lock
+/// step, or clears it with `None`. See the module doc's "Stalls".
+pub fn set_stall(max: Option<Duration>) {
+    let micros = max.map_or(0, |max| u64::try_from(max.as_micros()).unwrap_or(u64::MAX));
+    STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
+}
+
+/// Sleeps a random time up to the set stall, at the two points it applies
+/// to.
+async fn stall(point: PausePoint) {
+    if !matches!(
+        point,
+        PausePoint::AfterPlaceholders | PausePoint::AfterEntryLock
+    ) {
+        return;
+    }
+    let max = STALL_MAX_MICROS.load(Ordering::Relaxed);
+    if max == 0 {
+        return;
+    }
+    // A splitmix64 step over a shared counter: no RNG dependency for a
+    // test-only jitter that needs no quality beyond "spread out".
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    let unit = (x >> 11) as f64 / (1u64 << 53) as f64;
+    let micros = (unit * unit * unit * max as f64) as u64;
+    tokio::time::sleep(Duration::from_micros(micros)).await;
+}
+
 tokio::task_local! {
     static SCOPE: Arc<PauseScope>;
 }
@@ -151,9 +221,11 @@ pub async fn with_scope<F: Future>(scope: Arc<PauseScope>, drain: F) -> F::Outpu
     SCOPE.scope(scope, drain).await
 }
 
-/// The hook: a no-op unless the running task's [`PauseScope`] armed `point`
-/// for `target`. Then it reports [`Reached`] and blocks, inside the page
-/// transaction `client` is running, until the test releases the lock.
+/// The hook: unless the running task's [`PauseScope`] armed `point` for
+/// `target`, a no-op, or a stall when one is set (see the module doc's
+/// "Stalls"). When it is armed, it reports [`Reached`] and blocks, inside
+/// the page transaction `client` is running, until the test releases the
+/// lock.
 pub(crate) async fn pause_at<C: GenericClient>(
     client: &C,
     point: PausePoint,
@@ -164,6 +236,7 @@ pub(crate) async fn pause_at<C: GenericClient>(
         .ok()
         .flatten()
     else {
+        stall(point).await;
         return Ok(());
     };
     // The page's session caps every lock wait at `locks::LOCK_TIMEOUT` (I7),

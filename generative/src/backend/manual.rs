@@ -348,6 +348,16 @@ pub struct ManualBackend {
     /// "genuinely exceeds `MIN_ROWS_TO_SPLIT`" pin in
     /// `generative/tests/concurrent_convergence.rs`).
     maintenance_interval: Duration,
+    /// The rows per Re-derive build chunk the engine client plans
+    /// ([`ClientOptions::build_chunk_rows`]), when a caller sets one with
+    /// [`ManualBackend::set_build_chunk_rows`]; the engine's default
+    /// otherwise.
+    build_chunk_rows: Option<i64>,
+    /// How often the engine client's maintenance loop runs its reconcile
+    /// pass ([`ClientOptions::reconcile_interval`]), when a caller sets one
+    /// with [`ManualBackend::set_reconcile_interval`]; the engine's default
+    /// otherwise.
+    reconcile_interval: Option<Duration>,
     /// The schema this backend's transform *target* tables are created
     /// under (`trellis::Config::target_schema`; issue #234,
     /// `docs/instance-identity.md`): two instances sharing one
@@ -493,10 +503,30 @@ impl ManualBackend {
             application_threads,
             maintenance_interval: maintenance_interval
                 .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
+            build_chunk_rows: None,
+            reconcile_interval: None,
             target_schema,
             config,
             operator: None,
         })
+    }
+
+    /// Sets the rows per Re-derive build chunk ([`ClientOptions::build_chunk_rows`])
+    /// the engine client is started with. It takes effect at the first
+    /// [`Backend::install`](super::Backend::install), which starts the
+    /// client. The concurrent tier draws a few rows so that a build over its
+    /// small hot table runs as many chunks, spread through the burst, the
+    /// way a build over a large table does at the default size (#720).
+    pub fn set_build_chunk_rows(&mut self, rows: i64) {
+        self.build_chunk_rows = Some(rows);
+    }
+
+    /// Sets how often the engine client's reconcile pass runs
+    /// ([`ClientOptions::reconcile_interval`]), which is where a Re-derive
+    /// build starts. Like [`ManualBackend::set_build_chunk_rows`], it takes
+    /// effect at the first [`Backend::install`](super::Backend::install).
+    pub fn set_reconcile_interval(&mut self, interval: Duration) {
+        self.reconcile_interval = Some(interval);
     }
 
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
@@ -874,6 +904,12 @@ impl super::Backend for ManualBackend {
                 staging_worker: true,
                 application_threads: self.application_threads,
                 maintenance_interval: self.maintenance_interval,
+                build_chunk_rows: self
+                    .build_chunk_rows
+                    .unwrap_or_else(|| ClientOptions::default().build_chunk_rows),
+                reconcile_interval: self
+                    .reconcile_interval
+                    .unwrap_or_else(|| ClientOptions::default().reconcile_interval),
                 ..Default::default()
             };
             let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;

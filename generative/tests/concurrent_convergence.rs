@@ -85,6 +85,32 @@
 //! the hot-key tier's keys, busy until the burst ends, almost never offer.
 //! The coverage report counts it as `cooling_key`.
 //!
+//! The steady-load tier (#720, #725) draws `generate::steady_load_case`: a
+//! mid-burst case with no relationship, run under a steady load
+//! (`model::SteadyLoad`). Once an action starts a build, each lane waits a
+//! drawn 0.5 to 2ms after every op for the rest of the burst, so its writes
+//! trickle in while the build runs; and the engine's pages and build chunks
+//! stall now and then at their entry-lock step, for up to a few seal
+//! intervals (`trellis::dev::interleave::set_stall`). Its builds plan chunks
+//! of 1 to 4 rows and start at a reconcile pass on the seal cadence rather
+//! than the engine's 5s default. Flat out, a burst is written before the
+//! build it starts runs a chunk, and the drain keeps up with every seal, so
+//! races that need a page held mid-step never get a window: a build chunk
+//! reading an entry a page has locked but not yet written
+//! (`chunk_without_entry_lock`), a page reading an entry another holds
+//! (`skip_ledger_lock`), and a segment draining past an older one whose page
+//! hasn't taken its entry lock yet, so that a tombstone the older change
+//! needs can be collected (`early_tombstone_gc`). Cases with a relationship
+//! are left out: under the load, the relationship-fed shapes diverged in
+//! about one case in ten (#719, #726), more than a sweep's baseline bar,
+//! before #623 D5 put them on the ledger, and they haven't been measured
+//! enough since to take back in.
+//!
+//! The stall is process-wide, so the tier has no property test: it runs
+//! only in [`planted_bugs_are_caught`]'s sweep processes, one case at a time
+//! with nothing else in the process, and `run_concurrent_case` refuses a
+//! steady-load case anywhere else.
+//!
 //! # Planted ordering bugs
 //!
 //! [`planted_bugs_are_caught`] is the tier's check on itself (issue #557
@@ -94,8 +120,10 @@
 //! starts with `TRELLIS_TEST_PLANT=<name>`. The sweep runs the same seeded
 //! cases unplanted and then once per plant, each in its own process, and
 //! reports each plant's catch rate and each seed's cases-to-first-catch.
-//! It draws from the cooling-key tier by default: the only tier that
-//! catches all four plants at a useful rate.
+//! It draws from the cooling-key tier by default. Each tier gates the
+//! plants whose shapes it runs, and says why it doesn't gate the others
+//! (`SweepTier::not_gated`): the build plants, `skip_ledger_lock` and
+//! `early_tombstone_gc` are the steady-load tier's.
 //! `trellis/src/plant.rs`'s module doc says how to add a plant. Epic #556's
 //! milestones add theirs there (#623, #625), and this sweep is their gate.
 //!
@@ -210,7 +238,7 @@ use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
     cooling_key_case, defer_def_install, hot_key_case, mid_burst_case, schedule_restart,
-    schedule_scale_out, trivial_program,
+    schedule_scale_out, steady_load_case, trivial_program,
 };
 use generative::run::{
     RunError, run_convergence, run_convergence_bursty, run_convergence_concurrent,
@@ -456,6 +484,19 @@ fn run_concurrent_case(
             )
             .await
             .expect("connect concurrent backend");
+            // The load's stall is process-wide (`set_stall`): every other
+            // test in this process would run under it too. A sweep process
+            // runs one case at a time and nothing else.
+            assert!(
+                case.plan.steady_load.is_none() || std::env::var_os(PLANT_CHILD_ENV).is_some(),
+                "a steady-load case runs only in a planted-bug sweep's own process"
+            );
+            if let Some(rows) = case.build_chunk_rows {
+                backend.set_build_chunk_rows(rows);
+            }
+            if let Some(ms) = case.reconcile_interval_ms {
+                backend.set_reconcile_interval(std::time::Duration::from_millis(ms));
+            }
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
@@ -1389,37 +1430,110 @@ struct SweepTier {
     /// them, but doesn't fail when they go uncaught; it says so when one is
     /// caught, so the entry can go.
     known_misses: &'static [&'static str],
+    /// Plants the tier doesn't gate, each with why: another tier runs the
+    /// shape it needs on purpose, and this one reaches it rarely or never.
+    /// `GENERATIVE_PLANTS=all` leaves them out; named, they run and are
+    /// reported, and the sweep never fails on them.
+    not_gated: &'static [(&'static str, &'static str)],
     /// The sweep fails if the baseline fails more than one case in this
     /// many: the run is then on the wrong storage (a disk cluster fails most
     /// cases on #494), and no rate means anything.
     max_baseline_failure_share: usize,
 }
 
-/// `stale_one_to_one_write` (#344) in the hot-key and mid-burst tiers: the
+/// Why the hot-key-based tiers miss `stale_one_to_one_write` (#344): the
 /// plant fires in a third to a half of their cases, but a stale 1-1 value
 /// only survives when the batch holding a key's *last* change commits before
 /// an older batch for that key. Their hot keys keep changing until the burst
 /// ends, so a later batch nearly always rewrites the key. It was caught once
 /// in about 390 cases (#557 part 3a's PR). The cooling-key tier is the shape
-/// that catches it. The hot-key tier also runs no build over existing data,
-/// so the build plants never fire there ([`NO_BUILD_MISSES`]).
-const HOT_KEY_MISSES: &[&str] = &[
-    "stale_one_to_one_write",
-    "chunk_without_entry_lock",
-    "merge_without_delete",
+/// that catches it.
+const STALE_ONE_TO_ONE_MISS: &str = "stale_one_to_one_write";
+
+/// Why no tier gates `lsn_only_skip` (#623 D3) yet (#734): re-applying a
+/// change whose image the entry already holds is a no-op, so it diverges
+/// only when a key's last change is folded into a page's Re-derive (a staged
+/// re-read in the same batch), an older change to the key drains after that
+/// page, and nothing rewrites the key afterwards. The hot-key-based tiers'
+/// keys keep changing until the burst ends, and the cooling-key tier's
+/// cooling keys feed a 1-1 target and get no re-read. Every tier caught it
+/// in 0 or 1 of 44 to 48 cases. The deterministic
+/// `a_change_the_rederive_read_is_not_applied_again_aggregate` pins it
+/// meanwhile.
+const LSN_ONLY_SKIP_MISS: &str = "lsn_only_skip";
+
+/// Why no tier gates `claim_all_buckets` since #623 D5 (#736): a double
+/// claim applies a batch's rows twice, which I2 makes a no-op on every
+/// ledger target, and D5 put the relationship-fed aggregates, the targets
+/// it used to hurt, on the ledger. Every tier caught it in 0 of 48 cases
+/// after D5, though it fired in 46 to 48 of them.
+const CLAIM_ALL_BUCKETS_MISS: &str = "claim_all_buckets";
+
+/// Why no tier gates `ignore_recompute_horizon` since #623 D5 (#736): the
+/// horizon is only on the old aggregate path, and since D5 no tier's case
+/// forces a recompute there; it fired in 0 of 48 cases in every tier.
+const IGNORE_RECOMPUTE_HORIZON_MISS: &str = "ignore_recompute_horizon";
+
+/// The cooling-key tier's known misses.
+const COOLING_KEY_MISSES: &[&str] = &[
+    LSN_ONLY_SKIP_MISS,
+    CLAIM_ALL_BUCKETS_MISS,
+    IGNORE_RECOMPUTE_HORIZON_MISS,
+];
+/// The known misses of the tiers built on the hot-key case: hot-key,
+/// mid-burst and steady-load.
+const HOT_KEY_BASED_MISSES: &[&str] = &[
+    STALE_ONE_TO_ONE_MISS,
+    LSN_ONLY_SKIP_MISS,
+    CLAIM_ALL_BUCKETS_MISS,
+    IGNORE_RECOMPUTE_HORIZON_MISS,
 ];
 
-/// The mid-burst tier runs Re-derive builds under load, but never catches
-/// `chunk_without_entry_lock` (#625 F3): its race needs a page holding an
-/// existing entry's lock between its lock and its write, and the tier almost
-/// never puts a chunk's range under one (0 of 47 cases, fired in 23). The
-/// deterministic `a_chunk_reads_an_entry_only_once_the_page_holding_it_commits`
-/// pins it meanwhile. #720 widens the tier; it must be fixed before release.
-const MID_BURST_MISSES: &[&str] = &["stale_one_to_one_write", "chunk_without_entry_lock"];
+/// The steady-load tier's plants, which a tier without its load doesn't
+/// gate (#720, #725). The counts are on main after #623 D5.
+const BUILD_UNDER_LOAD: (&str, &str) = (
+    "chunk_without_entry_lock",
+    "its race needs a page holding an existing entry between its entry lock and \
+     its write while a build chunk reads that entry, a window of about a \
+     millisecond that flat-out bursts written before the build starts never \
+     open (the mid-burst tier caught it in 0 of 48 cases, though it fired in \
+     42); the steady-load tier gates it",
+);
+const OUT_OF_ORDER_DRAIN: (&str, &str) = (
+    "early_tombstone_gc",
+    "it fires only when a segment drains past an older one, and flat-out \
+     bursts drain every segment before the next seals, so it fires in at most \
+     1 of 48 cases (#725); the steady-load tier's entry-lock stall gates it",
+);
+const HELD_ENTRY: (&str, &str) = (
+    "skip_ledger_lock",
+    "its race needs a page between its entry lock and its write while another \
+     page reads the same entry; flat out, that window is about a millisecond, \
+     and the hot-key and mid-burst tiers caught it in 0 and 2 of 48 cases \
+     though it fired in all of them; the steady-load tier's entry-lock stall \
+     gates it",
+);
 
-/// The cooling-key and hot-key tiers run no build over existing data, so the
-/// build plants never fire there (#720 decides whether they should).
-const NO_BUILD_MISSES: &[&str] = &["chunk_without_entry_lock", "merge_without_delete"];
+/// The cooling-key and hot-key tiers also run no mid-burst install or
+/// resume, so a build there runs only when an up-front definition's build
+/// starts after the first writes.
+const NO_MID_BURST_BUILD: (&str, &str) = (
+    "merge_without_delete",
+    "no mid-burst install or resume, so a build runs only when an up-front \
+     definition's build starts after the first writes (in 0 and 3 of 48 \
+     cases in the cooling-key and hot-key tiers); the mid-burst and \
+     steady-load tiers gate it",
+);
+
+const COOLING_KEY_NOT_GATED: &[(&str, &str)] =
+    &[BUILD_UNDER_LOAD, NO_MID_BURST_BUILD, OUT_OF_ORDER_DRAIN];
+const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[
+    BUILD_UNDER_LOAD,
+    NO_MID_BURST_BUILD,
+    OUT_OF_ORDER_DRAIN,
+    HELD_ENTRY,
+];
+const MID_BURST_NOT_GATED: &[(&str, &str)] = &[BUILD_UNDER_LOAD, OUT_OF_ORDER_DRAIN, HELD_ENTRY];
 
 /// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
 ///
@@ -1435,23 +1549,36 @@ fn sweep_tier() -> SweepTier {
         Err(_) | Ok("cooling_key") => SweepTier {
             name: "cooling_key",
             strategy: cooling_key_case().boxed(),
-            known_misses: NO_BUILD_MISSES,
+            known_misses: COOLING_KEY_MISSES,
+            not_gated: COOLING_KEY_NOT_GATED,
             max_baseline_failure_share: 8,
         },
         Ok("hot_key") => SweepTier {
             name: "hot_key",
             strategy: hot_key_case().boxed(),
-            known_misses: HOT_KEY_MISSES,
+            known_misses: HOT_KEY_BASED_MISSES,
+            not_gated: HOT_KEY_NOT_GATED,
             max_baseline_failure_share: 20,
         },
         Ok("mid_burst") => SweepTier {
             name: "mid_burst",
             strategy: mid_burst_case().boxed(),
-            known_misses: MID_BURST_MISSES,
+            known_misses: HOT_KEY_BASED_MISSES,
+            not_gated: MID_BURST_NOT_GATED,
+            max_baseline_failure_share: 20,
+        },
+        Ok("steady_load") => SweepTier {
+            name: "steady_load",
+            strategy: steady_load_case().boxed(),
+            known_misses: HOT_KEY_BASED_MISSES,
+            not_gated: &[],
             max_baseline_failure_share: 20,
         },
         Ok(other) => {
-            panic!("{PLANT_TIER_ENV}={other:?}: expected cooling_key, hot_key or mid_burst")
+            panic!(
+                "{PLANT_TIER_ENV}={other:?}: expected cooling_key, hot_key, mid_burst or \
+                 steady_load"
+            )
         }
     }
 }
@@ -1707,8 +1834,9 @@ fn run_plant_sweep_cases() {
 /// and the failure is in a target the plant writes (`SweepCase::caught`);
 /// the report lists the rest apart, since every tier hits unplanted
 /// divergences on tmpfs too. Fails if the baseline fails more than the
-/// tier's `SweepTier::max_baseline_failure_share`, or if a plant not in the
-/// tier's `SweepTier::known_misses` is never caught.
+/// tier's `SweepTier::max_baseline_failure_share`, or if a plant the tier
+/// gates (not in its `SweepTier::known_misses` or `SweepTier::not_gated`) is
+/// never caught. `all` leaves out the plants the tier doesn't gate.
 ///
 /// Returns at once without [`PLANTS_ENV`], so the nightly's
 /// `--include-ignored` run of this binary pays nothing for it. Run it with:
@@ -1734,8 +1862,19 @@ fn planted_bugs_are_caught() {
         eprintln!("planted_bugs_are_caught: skipped, {PLANTS_ENV} is not set");
         return;
     };
+    let tier = sweep_tier();
     let plants: Vec<Plant> = if requested.trim() == "all" {
-        Plant::ALL.to_vec()
+        for (name, why) in tier.not_gated {
+            eprintln!(
+                "planted_bugs_are_caught: {name} not run, the {} tier doesn't gate it: {why}",
+                tier.name
+            );
+        }
+        Plant::ALL
+            .iter()
+            .copied()
+            .filter(|p| !tier.not_gated.iter().any(|(name, _)| *name == p.name()))
+            .collect()
     } else {
         requested
             .split(',')
@@ -1776,7 +1915,6 @@ fn planted_bugs_are_caught() {
         results.extend(lines);
     }
 
-    let tier = sweep_tier();
     let report = plant_sweep_report(&tier, &results);
     eprintln!("{report}");
     // A case the baseline failed says nothing about any plant, so it is left
@@ -1809,6 +1947,7 @@ fn planted_bugs_are_caught() {
         .iter()
         .map(|p| p.name())
         .filter(|name| !tier.known_misses.contains(name) && !caught(name))
+        .filter(|name| !tier.not_gated.iter().any(|(not, _)| not == name))
         .collect();
     assert!(
         missed.is_empty(),
@@ -1868,6 +2007,8 @@ fn plant_sweep_report(tier: &SweepTier, results: &[SweepCase]) -> String {
         let secs = rows.iter().map(|r| r.secs).sum::<f64>() / rows.len().max(1) as f64;
         let known = if tier.known_misses.contains(&plant) {
             " (known miss)"
+        } else if tier.not_gated.iter().any(|(name, _)| *name == plant) {
+            " (not gated here)"
         } else {
             ""
         };

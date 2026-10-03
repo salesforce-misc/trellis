@@ -1262,6 +1262,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(
             shapes(&program, &plan),
@@ -1286,6 +1287,7 @@ mod tests {
                 lanes: vec![(0..program.ops.len()).collect()],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert_eq!(
             shapes(&program, &plan),
@@ -1303,6 +1305,7 @@ mod tests {
                 lanes: vec![(0..program.ops.len()).collect()],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let program = build_program(&seeds, &[]);
         assert!(shapes(&program, &one_burst(&program)).contains(&"split_sized"));
