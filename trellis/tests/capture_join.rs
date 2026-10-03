@@ -1131,6 +1131,17 @@ async fn b2_awaits_capture(raw: &Client) -> bool {
     .get(0)
 }
 
+/// `public.u`'s version fence (`source_table_versions`).
+async fn u_version(raw: &Client) -> i64 {
+    raw.query_one(
+        "select version from source_table_versions where source_table = 'public.u'",
+        &[],
+    )
+    .await
+    .expect("read u's version fence")
+    .get(0)
+}
+
 /// `ALTER TRANSFORM ... ADD` of a field on a source column the capture
 /// doesn't image yet (#622 C5 review). The edit is `apply`'s, so it only
 /// registers: the widen that images the new column is the staging worker's,
@@ -1198,6 +1209,7 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
         .await
         .expect("write");
     drain_to_quiescence(&db.pool, &mut ring).await;
+    let before_release = u_version(&raw).await;
 
     holder
         .batch_execute("commit")
@@ -1212,6 +1224,12 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
         }
     }
     assert_eq!(status(&raw, "tu").await, TransformStatus::Live);
+    // The release bumps u's version fence, so a page that read b2 paused
+    // can't apply after it (`staging::build::bump_version_fence`).
+    assert!(
+        u_version(&raw).await > before_release,
+        "releasing b2 into its field build moves u's version fence"
+    );
     assert!(
         captured_columns(&raw, "public.u")
             .await

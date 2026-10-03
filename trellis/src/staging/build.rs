@@ -1194,6 +1194,9 @@ async fn field_build_ready(
         txn.rollback().await?;
         return Ok(FieldStart::Wait);
     }
+    // A page that read the paused fields before this commit must not apply
+    // after it ([`bump_version_fence`]).
+    bump_version_fence(&*txn, &definition.source_table).await?;
     release_awaiting_capture(&*txn, &definition.def.target, Some(fields)).await?;
     txn.commit().await?;
     tracing::info!(
@@ -1202,6 +1205,35 @@ async fn field_build_ready(
         "field build's capture is ready; its fields apply from here"
     );
     Ok(FieldStart::Go)
+}
+
+/// Bumps `source_table`'s version fence (`source_table_versions`) in `txn`,
+/// as `ALTER TRANSFORM` does, for a commit that releases a 1-1 field's
+/// `column_status` pause into a field build: a column resume, or the field
+/// build's capture release (#625 F8b).
+///
+/// A page reads the paused columns in Phase 2 and leaves them out of its
+/// writes. One that read them before the release must not apply after it:
+/// it would write a key's other columns from its change and leave the
+/// field as the page of an older change wrote it, computed after the
+/// release and drained first, out of order. I2 passes both (the older
+/// change's `lsn` is below the newer one's), the build's chunk for the key
+/// may have run already, and no catch-up follows. The bump waits for every
+/// page holding the fence `for share` (Phase 3 holds it to its commit), and
+/// a page that reaches the fence after the commit misses it and computes
+/// again, with the field.
+pub(crate) async fn bump_version_fence(
+    txn: &impl GenericClient,
+    source_table: &str,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "insert into source_table_versions (source_table, version) values ($1, 1) \
+         on conflict (source_table) \
+         do update set version = source_table_versions.version + 1",
+        &[&source_table],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Whether every row staged for `table` from now on carries `columns`

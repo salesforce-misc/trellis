@@ -964,3 +964,80 @@ async fn the_field_chunk_statement_reads_every_table_by_its_key() {
     field_chunk(&d, &plan, None, "50").await;
     assert_field_oracle(&mut d).await;
 }
+
+// ------------------------------- a column resume against a page before it
+
+/// A column resume releases its pause and registers the field build in one
+/// commit (#625 F8b), and the column applies from there. A page that read
+/// the paused columns before that commit leaves the column out of its
+/// writes, so it must not apply after it. Otherwise this happens: the build
+/// writes `dbl` of key 1; the page of an older change to key 1, computed
+/// after the resume and drained out of order, writes `dbl` from its image;
+/// and the frozen page, whose change is newer, passes I2 and writes key 1's
+/// other columns, leaving `dbl` at the older change's value for good.
+/// The resume bumps the source's version fence, as `ALTER TRANSFORM` does,
+/// so it waits for that page, and a page that reaches the fence after it
+/// misses and computes again, with the column.
+#[tokio::test]
+async fn a_page_computed_before_a_column_resume_does_not_apply_after_it() {
+    let mut d = Driver::start(
+        &format!("{CREATE} {}", seed(&[(1, 1, 1), (2, 1, 2)])),
+        &columns(),
+        &[ONE],
+        &["public.src"],
+    )
+    .await;
+    trellis::staging::quarantine::pause_column(d.pool(), "one", "dbl")
+        .await
+        .expect("pause one.dbl");
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 10 where id = 1")
+        .await
+        .expect("the older write");
+    let older = d.seal().await;
+    user.batch_execute("update public.src set v = 20, g = 2 where id = 1")
+        .await
+        .expect("the newer write");
+    let newer = d.seal().await;
+    // The newer batch's page computes with `dbl` paused, takes the version
+    // fence, and stops before its entry lock.
+    let mut page = d
+        .drain_frozen(newer, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    let frozen = page.reached(PausePoint::AfterPlaceholders).await;
+    let mut resume = tokio::spawn({
+        let pool = d.pool().clone();
+        async move { trellis::staging::quarantine::resume_column(&pool, "one", "dbl").await }
+    });
+    let waited = tokio::select! {
+        resumed = &mut resume => {
+            resumed.expect("the resume's task").expect("resume one.dbl");
+            false
+        }
+        () = d.wait_blocked_behind(frozen.backend_pid) => true,
+    };
+    if waited {
+        d.release(&mut page, PausePoint::AfterPlaceholders).await;
+        page.finish().await;
+        resume
+            .await
+            .expect("the resume's task")
+            .expect("resume one.dbl");
+        trellis::staging::build::settle_builds(d.pool()).await;
+        d.drain(older, "older").await;
+    } else {
+        // The race above, which the fence closes.
+        trellis::staging::build::settle_builds(d.pool()).await;
+        d.drain(older, "older").await;
+        d.release(&mut page, PausePoint::AfterPlaceholders).await;
+        page.finish().await;
+    }
+    assert!(
+        waited,
+        "the resume committed while a page computed with the column paused was in flight; \
+         the target is now {:?} against the source's {:?}",
+        d.rows(ACTUAL).await,
+        d.rows(EXPECTED).await,
+    );
+    assert_oracle(&mut d).await;
+}

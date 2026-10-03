@@ -2394,13 +2394,20 @@ pub async fn resume_column(
         // The unpause and the field build's registration commit together
         // (#625 F8b): the column applies from this commit, and the build's
         // chunks rewrite it under the keys' entry lock, so nothing needs a
-        // catch-up. See this function's doc comment.
+        // catch-up. See this function's doc comment. The version fence
+        // keeps a page that read the column paused from applying after this
+        // commit (`super::build::bump_version_fence`). It goes first, so the
+        // wait for the pages in flight holds no lock but the definition's.
+        let one_to_one = matches!(def.def.key_space, KeySpace::OneToOne);
+        if one_to_one {
+            super::build::bump_version_fence(&*txn, &def.source_table).await?;
+        }
         txn.execute(
             "delete from column_status where transform_table = $1 and column_name = $2",
             &[&t, &c],
         )
         .await?;
-        if matches!(def.def.key_space, KeySpace::OneToOne) {
+        if one_to_one {
             super::build::start_field_build(&*txn, def.id, status, std::slice::from_ref(&c))
                 .await?;
         }
