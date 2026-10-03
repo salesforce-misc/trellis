@@ -25,7 +25,12 @@
 //!   `--batch` sequence-id rows;
 //! - `random1`: one row with a uniformly random 62-bit id;
 //! - `update1`: `UPDATE … SET val = val + 1` of one uniformly random
-//!   preloaded id.
+//!   preloaded id;
+//! - `nested1`: `serial1` on a table with an application `AFTER INSERT` row
+//!   trigger that updates the row it was fired for (in every variant). The
+//!   nested write is what makes capture re-read (#623 D8a's gate), so this
+//!   is the case where capture still reads the table; the trigger's own
+//!   `UPDATE … WHERE id = …` reads it too, which is its no-capture rate.
 //!
 //! A failed transaction is rolled back and counted by SQLSTATE, and the writer
 //! moves on to a new one (no retry), so `failure_rate` is failed / attempted.
@@ -65,6 +70,7 @@ pub enum Workload {
     SerialBatch,
     Random1,
     Update1,
+    Nested1,
 }
 
 pub const DEFAULT_WORKLOADS: &[Workload] = &[
@@ -81,8 +87,10 @@ impl Workload {
             "serial-batch" => Workload::SerialBatch,
             "random1" => Workload::Random1,
             "update1" => Workload::Update1,
+            "nested1" => Workload::Nested1,
             other => panic!(
-                "unknown ssi-tax workload {other:?}: want serial1, serial-batch, random1 or update1"
+                "unknown ssi-tax workload {other:?}: \
+                 want serial1, serial-batch, random1, update1 or nested1"
             ),
         }
     }
@@ -93,6 +101,7 @@ impl Workload {
             Workload::SerialBatch => "serial-batch",
             Workload::Random1 => "random1",
             Workload::Update1 => "update1",
+            Workload::Nested1 => "nested1",
         }
     }
 
@@ -287,7 +296,9 @@ impl XorShift {
 
 fn statement_sql(workload: Workload, batch: usize) -> String {
     match workload {
-        Workload::Serial1 => format!("insert into public.{SOURCE_TABLE} (val) values (1)"),
+        Workload::Serial1 | Workload::Nested1 => {
+            format!("insert into public.{SOURCE_TABLE} (val) values (1)")
+        }
         Workload::SerialBatch => format!(
             "insert into public.{SOURCE_TABLE} (val) select g from generate_series(1, {batch}) g"
         ),
@@ -376,6 +387,21 @@ pub async fn run_cell(cell: Cell, opts: &Options) -> CellResult {
     raw.batch_execute(&format!("vacuum analyze public.{SOURCE_TABLE}"))
         .await
         .expect("vacuum the source table");
+    if cell.workload == Workload::Nested1 {
+        raw.batch_execute(&format!(
+            "create function public.ssi_touch() returns trigger language plpgsql as $$ \
+             begin \
+                 if pg_trigger_depth() = 1 then \
+                     update public.{SOURCE_TABLE} set val = new.val + 1 where id = new.id; \
+                 end if; \
+                 return null; \
+             end $$; \
+             create trigger ssi_touch after insert on public.{SOURCE_TABLE} \
+                 for each row execute function public.ssi_touch()"
+        ))
+        .await
+        .expect("create the application trigger");
+    }
     write_tax::set_up_variant(cell.variant, SOURCE_TABLE, &mut raw).await;
     raw.batch_execute("checkpoint").await.expect("checkpoint");
 
@@ -529,6 +555,7 @@ mod tests {
         for w in DEFAULT_WORKLOADS {
             assert_eq!(Workload::parse(w.name()), *w);
         }
+        assert_eq!(Workload::parse("nested1"), Workload::Nested1);
         assert_eq!(Isolation::parse("read-committed"), Isolation::ReadCommitted);
     }
 }
