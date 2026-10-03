@@ -1139,8 +1139,8 @@ async fn b2_awaits_capture(raw: &Client) -> bool {
 /// column. The new field must stay paused until the widen has landed and
 /// every row the old body staged has drained (the widen's capture gate), or
 /// that row fails with `MissingColumn` and its key is quarantined. The
-/// edit's catch-up marker is what unpauses it, so its discharge must hold
-/// while the capture doesn't image the column.
+/// edit's field build (#625 F8b) is what unpauses it, so its plan job must
+/// wait while the capture doesn't image the column.
 ///
 /// A running client takes the definition live; the rest is stepped by hand.
 #[tokio::test]
@@ -1178,9 +1178,10 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
         "b2 stays paused until its capture covers it"
     );
 
-    // A pass: the widen waits out the holder, and the edit's catch-up
-    // marker's discharge holds, so b2 stays paused.
+    // A pass: the widen waits out the holder, and the edit's field build
+    // waits for it, so b2 stays paused.
     full_pass(&mut raw, &db.pool).await;
+    run_backfill_chunks(&db.pool).await;
     assert_eq!(
         captured_columns(&raw, "public.u").await,
         Some(vec!["a".to_string(), "id".to_string()]),
@@ -1188,9 +1189,9 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
     );
     assert!(
         b2_awaits_capture(&raw).await,
-        "the discharge holds while b isn't imaged"
+        "the field build waits while b isn't imaged"
     );
-    assert_eq!(status(&raw, "tu").await, TransformStatus::CatchingUp);
+    assert_eq!(status(&raw, "tu").await, TransformStatus::Backfilling);
 
     // A write the old capture body images without b drains with b2 paused.
     raw.batch_execute("update public.u set b = 100 where id = 1")
@@ -1205,6 +1206,7 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
     for _ in 0..5 {
         full_pass(&mut raw, &db.pool).await;
         drain_to_quiescence(&db.pool, &mut ring).await;
+        run_backfill_chunks(&db.pool).await;
         if status(&raw, "tu").await == TransformStatus::Live {
             break;
         }
@@ -1287,7 +1289,8 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, target: &str) {
 /// `tu` over `public.u (id, a, b)`, live and reading `a` only, then an
 /// `ALTER TRANSFORM tu ADD b AS b2` whose widen of `u`'s capture waits on
 /// the returned open writer through one staging-worker pass, so `b2` stays
-/// paused awaiting capture and `tu` is catching up. Stepped by hand.
+/// paused awaiting capture and `tu`'s field build waits (#625 F8b). Stepped
+/// by hand.
 async fn edit_held_by_a_writer(
     dsn: &str,
     raw: &mut Client,
@@ -1317,15 +1320,17 @@ async fn edit_held_by_a_writer(
         Some(vec!["a".to_string(), "id".to_string()]),
         "the widen waits out the open writer"
     );
+    run_backfill_chunks(pool).await;
     assert!(b2_awaits_capture(raw).await);
-    assert_eq!(status(raw, "tu").await, TransformStatus::CatchingUp);
+    assert_eq!(status(raw, "tu").await, TransformStatus::Backfilling);
     (trellis, holder)
 }
 
 /// An edited definition whose new field waits for a widen that can't take
 /// its table's lock reports the wait, as a waiting registration does (#687,
-/// the user's Q5 decision): it is `catching_up`, not `waiting_to_backfill`,
-/// but it is stuck on the same thing. The wait goes once the widen lands.
+/// the user's Q5 decision): it is `backfilling` (its field build waits,
+/// #625 F8b), not `waiting_to_backfill`, but it is stuck on the same thing.
+/// The wait goes once the widen lands.
 #[tokio::test]
 async fn an_edit_whose_widen_waits_on_a_lock_reports_the_wait() {
     let cluster = TestCluster::start();
@@ -1335,7 +1340,7 @@ async fn an_edit_whose_widen_waits_on_a_lock_reports_the_wait() {
     let holder_pid = backend_pid(&holder).await;
 
     let reported = trellis.status("tu").await.expect("status").expect("tu");
-    assert_eq!(reported.status, TransformStatus::CatchingUp);
+    assert_eq!(reported.status, TransformStatus::Backfilling);
     let wait = reported
         .capture_wait
         .expect("the edited definition's status names what it waits on");
@@ -1364,8 +1369,8 @@ async fn an_edit_whose_widen_waits_on_a_lock_reports_the_wait() {
 /// An operator `RESUME` of a field that awaits its capture widen is refused
 /// and leaves it paused (#687). Unpausing it early would let the rows the
 /// old capture function staged, which lack the field's column, reach it and
-/// fail with `MissingColumn`. The catch-up marker's discharge unpauses it
-/// once the widened capture images the column, as it does without a resume.
+/// fail with `MissingColumn`. The field build's start unpauses it once the
+/// widened capture images the column, as it does without a resume.
 #[tokio::test]
 async fn resuming_a_field_awaiting_its_widen_is_refused() {
     let cluster = TestCluster::start();

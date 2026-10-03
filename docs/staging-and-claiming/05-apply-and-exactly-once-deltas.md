@@ -219,10 +219,12 @@ relationship projection Phase 2 read, as an Apply is. A Re-derived row that
 now joins through a key Phase 2 did not resolve is re-staged as a bare
 recompute instead, which a later page reads.
 
-`ALTER TRANSFORM`'s column backfill (`defs::backfill::backfill_altered_columns`)
-and a column resume (`staging::quarantine::recompute_column`) write target
-rows outside a page. Each is a Re-derive of a range of keys, settled the same
-way in its own short transaction.
+`ALTER TRANSFORM`'s field rebuild and a column resume are field builds
+(`staging::build`, #625 F8b): background chunks that lock a range of keys'
+entries as a page does and rewrite just the changed columns of their target
+rows from one snapshot, leaving the entries as they are. A relationship-
+enriched 1-1 target's field build re-derives each key's whole row instead,
+settled the same way as a page's Re-derive.
 
 ### The ledger
 

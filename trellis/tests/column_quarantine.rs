@@ -603,10 +603,10 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
         "the dependent must NOT be auto-resumed — it has its own independent reason"
     );
 
-    // Issue #476: the resume's catch-up re-reads the source for changes the
-    // recompute's single read missed, so until it has run the transform
-    // reports `catching_up` (it keeps applying), and its discharge takes it
-    // back to `live`.
+    // #625 F8b: the resume registers a field build of the column, so the
+    // transform reports `backfilling` (it keeps applying) until the build's
+    // chunks, driven here as the drain workers would, take it back to
+    // `live`. Nothing is parked for a catch-up.
     let status_of = async |client: &tokio_postgres::Client| -> String {
         client
             .query_one(
@@ -618,10 +618,17 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
             .expect("read order_totals' status")
             .get(0)
     };
-    assert_eq!(status_of(&client).await, "catching_up");
-    trellis::intake::markers::discharge_registrations(&db.pool)
+    assert_eq!(status_of(&client).await, "backfilling");
+    let parked: i64 = client
+        .query_one(
+            "select count(*) from pending_backfill where table_name = $1",
+            &[&format!("{DEFAULT_SCHEMA}.orders")],
+        )
         .await
-        .expect("discharge the resume's catch-up");
+        .expect("count pending_backfill")
+        .get(0);
+    assert_eq!(parked, 0, "a column resume parks no catch-up");
+    trellis::staging::build::settle_builds(&db.pool).await;
     assert_eq!(status_of(&client).await, "live");
 
     assert_eq!(
@@ -754,6 +761,7 @@ async fn resume_column_recomputes_an_explicitly_qualified_target() {
         None,
         "the column must no longer be paused after a successful resume"
     );
+    trellis::staging::build::settle_builds(&db.pool).await;
 
     let total: String = client
         .query_one(
@@ -1413,6 +1421,7 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
         column_status_row(&client, "calc", "busted").await.is_some(),
         "the still-broken sibling must remain paused — resuming `doubled` must not touch it"
     );
+    trellis::staging::build::settle_builds(&db.pool).await;
 
     for (id, expected_doubled) in [(1, "20"), (2, "40"), (3, "60")] {
         let row = client
@@ -1441,9 +1450,10 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
 /// rather than against the computed key-contract text. Resuming over a
 /// composite key, across more than one write-back chunk, with key parts that
 /// hold the key contract's own separator and escape characters, must still
-/// land every recomputed value on exactly its own row. A resume is a
-/// Re-derive of every source key (#623 D6), so a source key the target
-/// lacks gets its row too.
+/// land every recomputed value on exactly its own row. A resume is a field
+/// build (#625 F8b): it rewrites the column of the rows the target has, and
+/// writes no row the target lacks (Apply and a rebuild own a row's
+/// existence).
 #[tokio::test]
 async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
     let cluster = TestCluster::start();
@@ -1516,6 +1526,7 @@ async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
     quarantine::resume_column(&db.pool, "comp", "doubled")
         .await
         .expect("resume_column");
+    trellis::staging::build::settle_builds(&db.pool).await;
 
     let row = client
         .query_one(
@@ -1528,7 +1539,10 @@ async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
         .await
         .expect("compare target to source");
     let (total, wrong, orphans): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
-    assert_eq!(total, 2502, "the missing key's row is re-derived too");
+    assert_eq!(
+        total, 2501,
+        "the field build writes no row the target lacks"
+    );
     assert_eq!(
         wrong, 0,
         "every existing row must hold its own recomputed value"
@@ -1752,15 +1766,10 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
         .expect("seed source table");
 
     let cols = numeric_columns(&["a"]);
-    // A plain 1-1 definition's discharge persists it as `Backfilling` and
-    // enqueues its build as a `backfill_chunks` row — nothing in this test
-    // ever claims/runs/finishes that chunk, so the definition is genuinely,
-    // deterministically stuck in `Backfilling` for the rest of the test.
-    // Same "nothing is watching the queue" determinism
-    // `trellis/tests/defs_backfill_chunk_queue.rs`'s
-    // `a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker`
-    // and `trellis/tests/blocking_trellis.rs`'s
-    // `define_returns_before_backfill_completes` both rely on.
+    // Nothing in this test starts the definition's build, so it stays
+    // `waiting_to_backfill`: it doesn't apply yet. (A plain 1-1 under its
+    // Re-derive build does apply, and a column resume joins its build
+    // instead, #625 F8b.)
     let def = install_definition(
         &db.pool,
         "TRANSFORM stuck FROM stuck_src SELECT a + a AS doubled",
@@ -1770,15 +1779,6 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
     .await
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge dispatches the chunked build");
-    assert_eq!(
-        status_named(&client, def.def.target.as_str()).await,
-        "backfilling",
-        "nothing drains the chunk queue in this test, so the definition must still be \
-         backfilling"
-    );
 
     // Simulate a pause landing on `stuck.doubled` while it's mid-backfill —
     // reached past the mechanism, inserted directly (this file's own
@@ -2109,6 +2109,9 @@ async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_li
         resumed,
         vec![("article_cat".to_string(), "category_name".to_string())]
     );
+    // #625 F8b: a relationship-enriched 1-1's field build re-derives each
+    // key's whole row, as a page does.
+    trellis::staging::build::settle_builds(&db.pool).await;
 
     let recomputed: Option<String> = client
         .query_one("select category_name from article_cat where id = 1", &[])
@@ -2118,7 +2121,7 @@ async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_li
     assert_eq!(
         recomputed.as_deref(),
         Some("Tech"),
-        "recompute_column (the quarantine-replay call site) must resolve the to-one \
+        "the column's field build (the quarantine-replay call site) must resolve the to-one \
          relationship from the settled projection, exactly like normal drain's forward \
          path (#130) — not the live category row, which was renamed to 'Renamed' after \
          the projection had already settled"
@@ -2319,6 +2322,28 @@ async fn pausing_a_column_by_statement_reaches_the_fuse_s_own_state_and_cascades
         column_status_row(&client, "order_summaries", "grand_total").await,
         None
     );
+
+    // #625 F8b: each resumed column is a field build. `order_totals` was
+    // `live`, so it reads `backfilling`; `order_summaries` reads a seam-fed
+    // source, so `create_definition` left it `catching_up`, and it stays so.
+    // Its catch-up's discharge, with its field chunks still to run, hands it
+    // to the build (`backfilling`) rather than flipping it `live`, and the
+    // build's last chunk does.
+    assert_eq!(status_named(&client, "order_totals").await, "backfilling");
+    assert_eq!(
+        status_named(&client, "order_summaries").await,
+        "catching_up"
+    );
+    trellis::intake::markers::discharge_registrations(&db.pool)
+        .await
+        .expect("discharge order_summaries' catch-up");
+    assert_eq!(
+        status_named(&client, "order_summaries").await,
+        "backfilling"
+    );
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(status_named(&client, "order_totals").await, "live");
+    assert_eq!(status_named(&client, "order_summaries").await, "live");
 }
 
 /// Issue #228's decision-5 clause about "addressing something that doesn't
@@ -2367,21 +2392,14 @@ async fn pausing_a_column_that_does_not_exist_is_refused_before_anything_is_writ
     assert!(err.to_string().contains("no_such_transform"), "got {err}");
 }
 
-/// Issue #305: `resume_column` must close its single-snapshot recompute with
-/// the same parked catch-up a first `define`'s chunked build closes with
-/// (`defs::catalog::complete_direct_backfill`), not just clear
-/// `column_status` and hope nothing slipped past.
-///
-/// The race: [`quarantine::resume_column`]'s recompute reads the source once;
-/// a row changed after that read, whose delta is applied before the column
-/// unpauses, gets every *other* column updated by live CDC apply but leaves
-/// the resumed column stale forever. The interleaving can't be forced from
-/// outside `resume_column`, so this reproduces the state it leaves behind
-/// (source row changed, resumed column still at its pre-change value) and
-/// asserts the catch-up the resume parked repairs it.
+/// Issue #305, restated for #625 F8b: a row changed while a resumed
+/// column's field build runs needs no catch-up. The resume unpauses the
+/// column in the transaction that registers its build, so the column
+/// applies from there: Apply writes it for every later change, and the
+/// build's chunks rewrite it under the keys' entry lock. The resume parks
+/// no marker, and a change applied after the build's chunk is right.
 #[tokio::test]
-async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute() {
-    use trellis::intake::markers;
+async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
     use trellis::staging::{has_pending, retire_drained_segments};
 
     let cluster = TestCluster::start();
@@ -2393,8 +2411,8 @@ async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute
         .execute("insert into orders (id, price, tax) values (1, 10, 5)", &[])
         .await
         .expect("seed a source row");
-    // Stand-in for the target row live CDC apply already built for it —
-    // `resume_column`'s recompute only fills in rows that exist.
+    // Stand-in for the target row live CDC apply already built for it: a
+    // field build rewrites the column of rows that exist.
     client
         .execute("insert into public.order_totals (id) values (1)", &[])
         .await
@@ -2402,74 +2420,44 @@ async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute
     quarantine::pause_column(&db.pool, "order_totals", "total")
         .await
         .expect("pause the column");
-    let parked_before: i64 = client
-        .query_one("select count(*) from pending_backfill", &[])
-        .await
-        .expect("count pending_backfill")
-        .get(0);
-    assert_eq!(parked_before, 0, "no marker is pending before the resume");
 
     quarantine::resume_column(&db.pool, "order_totals", "total")
         .await
         .expect("resume the column");
+    let parked: i64 = client
+        .query_one("select count(*) from pending_backfill", &[])
+        .await
+        .expect("count pending_backfill")
+        .get(0);
+    assert_eq!(parked, 0, "a column resume parks no catch-up marker");
+    trellis::staging::build::settle_builds(&db.pool).await;
     let total: String = client
         .query_one(
             "select total::text from public.order_totals where id = 1",
             &[],
         )
         .await
-        .expect("read the recomputed column")
+        .expect("read the rebuilt column")
         .get(0);
-    assert_eq!(total, "15", "the recompute populated the row");
+    assert_eq!(total, "15", "the field build populated the row");
+    assert_eq!(status_named(&client, "order_totals").await, "live");
 
-    // The state the race leaves behind: `orders.price` moved 10 -> 20 after
-    // the recompute read row 1, and its delta was applied while `total` was
-    // still paused, so `total` never followed it.
+    // A change after the build: Apply writes the resumed column.
     client
         .execute("update orders set price = 20 where id = 1", &[])
         .await
         .expect("update the source row");
-
-    let parked: i64 = client
-        .query_one(
-            "select count(*) from pending_backfill where table_name = $1",
-            &[&format!("{DEFAULT_SCHEMA}.orders")],
-        )
-        .await
-        .expect("read pending_backfill")
-        .get(0);
-    assert_eq!(
-        parked, 1,
-        "resume_column must park a catch-up marker for the definition's source table when it \
-         unpauses the column, exactly as complete_direct_backfill does for a first define"
-    );
-
-    // Discharge it (retrying while the cluster-wide `xmin` fence settles) and
-    // drain the enumeration it stages.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        markers::run_pending_backfills(
-            &mut client,
-            "trellis_column_quarantine_test",
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("run_pending_backfills");
-        let remaining: i64 = client
-            .query_one("select count(*) from pending_backfill", &[])
-            .await
-            .expect("count pending_backfill")
-            .get(0);
-        if remaining == 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "pending_backfill marker never settled"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let table = active_segment_table(&client).await;
+    insert_cdc_row(
+        &client,
+        &table,
+        "orders",
+        "1",
+        "update",
+        Some(r#"{"id":"1","price":"10","tax":"5"}"#),
+        Some(r#"{"id":"1","price":"20","tax":"5"}"#),
+    )
+    .await;
     for _ in 0..16 {
         let seg_seq = seal_active_segment(&mut client).await;
         while apply::drain_once(
@@ -2498,10 +2486,10 @@ async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute
             &[],
         )
         .await
-        .expect("read the column after the catch-up")
+        .expect("read the column after the change")
         .get(0);
     assert_eq!(
         total, "25",
-        "the catch-up must re-derive the resumed column for the row that changed mid-recompute"
+        "Apply writes the resumed column for a change after its resume"
     );
 }

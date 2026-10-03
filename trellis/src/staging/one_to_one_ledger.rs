@@ -31,10 +31,11 @@
 //! the check and the write one step: every writer of a key's target row
 //! holds its entry.
 //!
-//! `ALTER TRANSFORM`'s backfill (`crate::defs::backfill::backfill_altered_columns`)
-//! and a column resume (`super::quarantine::recompute_column`) write target
+//! The Re-derive build's 1-1 chunks (`super::build::one_to_one`) write target
 //! rows outside a page; each locks the entries of the keys it writes the
-//! same way and stamps them as a Re-derive does.
+//! same way. A whole build's chunk stamps them as a Re-derive does; a field
+//! build's chunk (`ALTER TRANSFORM`, a column resume, #625 F8b) rewrites
+//! some columns only and leaves them as they are.
 
 use std::collections::{HashMap, HashSet};
 

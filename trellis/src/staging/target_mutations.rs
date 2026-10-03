@@ -27,8 +27,8 @@
 //! # Why it is structural
 //!
 //! Every target writer (`apply::apply_target`, `ledger::apply_ledger_target`,
-//! the truncate clears (`apply::clear_target`), `quarantine::recompute_column`,
-//! `defs::backfill::backfill_altered_columns`, and a rebuild's orphan delete,
+//! the truncate clears (`apply::clear_target`), the Re-derive build's chunks
+//! (`staging::build`), and a rebuild's orphan delete,
 //! `intake::resume_orphans`) takes a `&mut TargetMutations`
 //! and reports each physically-changed key into it. None of them returns the
 //! changed keys to its caller, so a caller cannot forget to propagate them:
@@ -454,8 +454,8 @@ impl TargetMutations {
     /// Also reads [`Propagation::write_token`]. The caller must not take any
     /// further row lock on a target after this (see the module doc's "The
     /// write token"). Every caller calls it after its last target write: the
-    /// drain's Phase 3, `quarantine::recompute_column` and
-    /// `defs::backfill::backfill_altered_columns` just before commit, and
+    /// drain's Phase 3 and the Re-derive build's chunks just before commit,
+    /// and
     /// `intake::resume_orphans` at the start of a discharge that then writes
     /// the ring and catalog (no target) before it commits.
     pub(crate) async fn into_staged(

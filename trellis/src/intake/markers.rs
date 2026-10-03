@@ -1147,13 +1147,6 @@ pub(crate) async fn run_pending_backfills_for(
         .await
         {
             Ok(Discharge::Committed) => {}
-            Ok(Discharge::AwaitingCapture) => {
-                tracing::debug!(
-                    table = %marker.table,
-                    "backfill marker held: an ALTER TRANSFORM field reads a column the table's \
-                     capture doesn't image yet"
-                );
-            }
             Ok(Discharge::Deferred { horizon }) => {
                 tracing::debug!(
                     table = %marker.table,
@@ -1246,144 +1239,6 @@ enum Discharge {
     /// The watermark had not reached `horizon` in time, so the transaction
     /// rolled back and the marker stays.
     Deferred { horizon: PgLsn },
-    /// An `ALTER TRANSFORM` field on the table is still paused awaiting a
-    /// capture that images its columns ([`release_columns_awaiting_capture`]),
-    /// so the transaction rolled back and the marker stays for a later pass.
-    AwaitingCapture,
-}
-
-/// Unpauses the `ALTER TRANSFORM` fields on definitions sourced from `table`
-/// that wait for a capture imaging the columns they read
-/// (`column_status.awaiting_capture`, issue #622; see
-/// `defs::catalog::alter_transform`'s "The capture widen"), if it now does.
-/// `false` means some still wait, and the discharge must not go on: its
-/// enumeration re-derives every row, which must happen with them unpaused.
-///
-/// Called by the discharge of `table`'s marker, which has already waited
-/// for the marker's capture gate, so every row a narrower capture function
-/// staged has drained. The staging worker is the only process that changes
-/// capture, and it runs this discharge after its own capture pass, so the
-/// installed capture read here can't change before this commits. It covers
-/// the fields when:
-///
-/// - `table` is another definition's target, fed by the target-mutation
-///   seam rather than captured;
-/// - nothing is installed on it: no row lacking a column can exist, and the
-///   install, from a catalog read after this edit, images them all;
-/// - or its installed functions are current and image every source column
-///   each such definition reads.
-///
-/// A definition paused by a schema change doesn't count (#705).
-///
-/// The pauses go only where the edit still owns them (issue #309's rule, as
-/// in `alter_transform`); every other one just stops waiting.
-async fn release_columns_awaiting_capture(
-    txn: &Transaction<'_>,
-    table: &str,
-) -> Result<bool, IntakeError> {
-    let awaiting: BTreeSet<String> = txn
-        .query(
-            "select distinct transform_table from column_status where awaiting_capture",
-            &[],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    if awaiting.is_empty() {
-        return Ok(true);
-    }
-    // `column_status` names a transform as its definition does (the
-    // definition's own `target`), not by the qualified `target_table`.
-    //
-    // A definition a schema change paused (a `capture_failures` row, #622
-    // C6) is left out, as it is from the capture column set
-    // (`capture::columns`): capture no longer images for it, so waiting on
-    // its columns would hold this marker for every other definition on the
-    // table until it is resumed (#705). Its pauses keep waiting; its resume
-    // parks a fresh marker whose discharge counts it again.
-    let mut targets = Vec::new();
-    let mut read = BTreeSet::new();
-    for row in txn
-        .query(
-            "select d.target_table, d.definition_text from transform_definitions d \
-             where d.source_table = $1 \
-               and not exists (select 1 from capture_failures f where f.transform_id = d.id)",
-            &[&table],
-        )
-        .await?
-    {
-        let target_table: &str = row.get(0);
-        let def = crate::defs::parse(row.get::<_, &str>(1))
-            .map_err(crate::defs::catalog::CatalogError::from)?;
-        let bare = target_table
-            .split_once('.')
-            .map_or(target_table, |(_, t)| t);
-        let named = [def.target.as_str(), bare]
-            .into_iter()
-            .find(|name| awaiting.contains(*name));
-        if let Some(name) = named {
-            targets.push(name.to_string());
-            read.extend(crate::defs::oracle::referenced_source_columns(&def));
-        }
-    }
-    if targets.is_empty() {
-        return Ok(true);
-    }
-    if !capture_images(txn, table, &read).await? {
-        return Ok(false);
-    }
-    txn.execute(
-        "delete from column_status s \
-         where s.awaiting_capture and s.transform_table = any($1) \
-           and not s.local_fuse \
-           and not exists ( \
-               select 1 from column_pause_cascades c \
-               where c.downstream_transform = s.transform_table \
-                 and c.downstream_column = s.column_name)",
-        &[&targets],
-    )
-    .await?;
-    txn.execute(
-        "update column_status set awaiting_capture = false \
-         where awaiting_capture and transform_table = any($1)",
-        &[&targets],
-    )
-    .await?;
-    Ok(true)
-}
-
-/// Whether every row staged for `table` from now on carries `columns`
-/// ([`release_columns_awaiting_capture`]'s three cases).
-async fn capture_images(
-    client: &impl GenericClient,
-    table: &str,
-    columns: &BTreeSet<String>,
-) -> Result<bool, IntakeError> {
-    use crate::capture::{CaptureError, install::Installed};
-
-    if crate::defs::catalog::is_definition_target(client, table).await? {
-        return Ok(true);
-    }
-    let schema: String = client
-        .query_one("select pg_catalog.current_schema()::text", &[])
-        .await?
-        .get(0);
-    let installed = crate::capture::install::installed(client, &schema, table)
-        .await
-        .map_err(|err| match err {
-            CaptureError::Db(err) => IntakeError::Db(err),
-            CaptureError::Catalog(err) => err.into(),
-            CaptureError::Marker(err) => err,
-            other => IntakeError::InvalidTableName(other.to_string()),
-        })?;
-    Ok(match installed {
-        Installed::Absent => true,
-        Installed::Partial { .. } => false,
-        Installed::Complete { spec, current } => {
-            current && columns.iter().all(|c| spec.columns().contains(c))
-        }
-    })
 }
 
 /// The build [`discharge_marker`] dispatches for one `waiting_to_backfill`
@@ -1505,10 +1360,6 @@ async fn discharge_marker(
         .collect();
 
     let txn = client.transaction().await?;
-    if !release_columns_awaiting_capture(&txn, &marker.table).await? {
-        txn.rollback().await?;
-        return Ok(Discharge::AwaitingCapture);
-    }
     // Issues #330, #485, #436: the targets whose unbacked rows this discharge
     // deletes, judged on its read's snapshot; see "Dropping what the source
     // no longer backs" above.
@@ -1783,22 +1634,48 @@ async fn go_live_caught_up(
 ) -> Result<Vec<i64>, IntakeError> {
     let mut flipped = Vec::new();
     for (id, tables) in candidates {
-        let went_live = txn
-            .execute(
-                "update transform_definitions set status = $1 \
-                 where id = $2 and status = $3 and not exists ( \
-                     select 1 from pending_backfill where table_name = any($4) \
-                 )",
+        // #625 F8b: a field build started while the definition was
+        // `catching_up` still has chunks to run, so the definition isn't
+        // built yet. It goes to `backfilling` under the Re-derive build
+        // instead, whose last chunk flips it `live`
+        // (`staging::build::try_complete`).
+        let moved = txn
+            .query_opt(
+                &format!(
+                    "update transform_definitions d \
+                     set status = case when f.building then $5 else $1 end, \
+                         build = case when f.building then $6 else d.build end \
+                     from (select exists ( \
+                               select 1 from backfill_chunks bc \
+                               join transform_definitions d on d.id = bc.definition_id \
+                               where bc.definition_id = $2 and not bc.done \
+                                 and bc.fields is not null and not ({})) as building) f \
+                     where d.id = $2 and d.status = $3 and not exists ( \
+                         select 1 from pending_backfill where table_name = any($4) \
+                     ) \
+                     returning f.building",
+                    crate::defs::chunk_queue::STALE
+                ),
                 &[
                     &TransformStatus::Live.as_str(),
                     &id,
                     &TransformStatus::CatchingUp.as_str(),
                     &tables,
+                    &TransformStatus::Backfilling.as_str(),
+                    &"rederive",
                 ],
             )
             .await?;
-        if went_live == 1 {
-            flipped.push(id);
+        match moved.map(|row| row.get::<_, bool>(0)) {
+            Some(false) => flipped.push(id),
+            Some(true) => tracing::info!(
+                definition_id = id,
+                table = %table,
+                from = %TransformStatus::CatchingUp.as_str(),
+                to = %TransformStatus::Backfilling.as_str(),
+                "transform status transition: catch-up discharged with a field build left"
+            ),
+            None => {}
         }
     }
     if !flipped.is_empty() {

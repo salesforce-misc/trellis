@@ -159,6 +159,50 @@ pub async fn run_chunk(
     lo: Option<&str>,
     hi: &str,
 ) -> Result<OneToOneOutcome, ApplyError> {
+    run_range(txn, plan, None, lo, hi).await
+}
+
+/// Runs one chunk of a field build (#625 F8b; see the parent module's
+/// "Field builds"), `(lo, hi]` of the target's source primary key, in `txn`,
+/// which must be `read committed`. The caller commits.
+///
+/// It reads and locks the range's keys as [`run_chunk`] does, and then one
+/// statement ([`field_statement`]) rewrites `fields` (but for any paused
+/// now) of each locked key's existing target row from the source row the
+/// statement's snapshot reads, where they differ. It inserts no row, deletes
+/// none and leaves the keys' entries alone: a row's existence and its other
+/// columns are Apply's and the whole build's.
+///
+/// Why it must leave the entries alone: a chunk that moved a key's `basis`
+/// to its snapshot would have every later page refuse a change that
+/// snapshot saw (ADR-0002 I2), and the change's other columns would be lost
+/// if no page had applied it yet, since this chunk writes only `fields`.
+///
+/// Why the entry lock is still needed: the statement's writes are absolute
+/// values from its snapshot. Without the lock, a page could apply a newer
+/// change between the snapshot and the write, and the chunk would put the
+/// field back behind it. Under the lock, a page that holds the key commits
+/// first and the snapshot sees its change; one that comes later writes the
+/// field from a newer image, since the field applies from the build's start.
+pub async fn run_field_chunk(
+    txn: &Transaction<'_>,
+    plan: &OneToOnePlan,
+    fields: &[String],
+    lo: Option<&str>,
+    hi: &str,
+) -> Result<OneToOneOutcome, ApplyError> {
+    run_range(txn, plan, Some(fields), lo, hi).await
+}
+
+/// [`run_chunk`] (`scope` `None`) or [`run_field_chunk`] (`scope` the
+/// fields).
+async fn run_range(
+    txn: &Transaction<'_>,
+    plan: &OneToOnePlan,
+    scope: Option<&[String]>,
+    lo: Option<&str>,
+    hi: &str,
+) -> Result<OneToOneOutcome, ApplyError> {
     let (lo, hi) = decode_bounds(plan, lo, hi)?;
     let pk_idents: Vec<String> = plan.pk.iter().map(|c| quote_ident(&c.name)).collect();
     let range_where = crate::defs::backfill::pk_range_where(&pk_idents, &plan.pk, &lo);
@@ -204,7 +248,7 @@ pub async fn run_chunk(
     let keys_param = format!("${}", params.len() + 1);
     params.push(&key_refs);
     let pick = chunk_pick(plan, &lo, &keys_param);
-    let outcome = rederive(txn, plan, &pick, &params, keys.len()).await?;
+    let outcome = rederive(txn, plan, scope, &pick, &params, keys.len()).await?;
     // Test-only pause point (#623 D1), directly after the chunk's one
     // read-and-write statement. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -219,6 +263,7 @@ pub async fn run_chunk(
         keys = outcome.keys,
         written = outcome.written,
         deleted = outcome.deleted,
+        fields = ?scope,
         "1-1 build chunk re-derived its range"
     );
     Ok(outcome)
@@ -275,13 +320,42 @@ pub async fn explain_chunk(
     hi: &str,
     keys: &[&str],
 ) -> Result<String, ApplyError> {
+    explain_range(txn, plan, None, lo, hi, keys).await
+}
+
+/// [`explain_chunk`] for a field build's chunk ([`run_field_chunk`]) over
+/// `fields`.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_field_chunk(
+    txn: &Transaction<'_>,
+    plan: &OneToOnePlan,
+    fields: &[String],
+    lo: Option<&str>,
+    hi: &str,
+    keys: &[&str],
+) -> Result<String, ApplyError> {
+    explain_range(txn, plan, Some(fields), lo, hi, keys).await
+}
+
+#[cfg(any(test, feature = "internals"))]
+async fn explain_range(
+    txn: &Transaction<'_>,
+    plan: &OneToOnePlan,
+    scope: Option<&[String]>,
+    lo: Option<&str>,
+    hi: &str,
+    keys: &[&str],
+) -> Result<String, ApplyError> {
     let (lo, hi) = decode_bounds(plan, lo, hi)?;
     let mut params = crate::defs::backfill::range_params(&lo, &hi);
     let keys_param = format!("${}", params.len() + 1);
     let keys = keys.to_vec();
     params.push(&keys);
     let pick = chunk_pick(plan, &lo, &keys_param);
-    let (sql, _, _) = prepare_statement(txn, plan, &pick).await?;
+    let (sql, _, _) = prepare_statement(txn, plan, scope, &pick).await?;
+    let Some(sql) = sql else {
+        return Ok("nothing to write".to_string());
+    };
     let rows = query_under_chunk_plan(txn, &format!("explain {sql}"), &params).await?;
     Ok(rows
         .iter()
@@ -393,7 +467,7 @@ pub async fn sweep_batch(
         target_where: format!("exists (select 1 from {typed} where {})", on("t")),
         keys: "$1".to_string(),
     };
-    let outcome = rederive(txn, plan, &pick, &params, keys.len()).await?;
+    let outcome = rederive(txn, plan, None, &pick, &params, keys.len()).await?;
     tracing::debug!(
         target_table = %plan.target,
         scanned,
@@ -499,14 +573,16 @@ async fn query_under_chunk_plan(
     Ok(rows)
 }
 
-/// [`rederive_statement`] for `plan`'s locked keys as `pick` picks them,
+/// [`rederive_statement`] (`scope` `None`) or [`field_statement`] (`scope`
+/// the field build's fields) for `plan`'s locked keys as `pick` picks them,
 /// with the columns paused now left out and, when the target has a reader,
 /// its prior images: the SQL, the image expression, and the seam's buffer.
 async fn prepare_statement(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
+    scope: Option<&[String]>,
     pick: &Pick,
-) -> Result<(String, Option<String>, TargetMutations), ApplyError> {
+) -> Result<(Option<String>, Option<String>, TargetMutations), ApplyError> {
     let paused: HashSet<String> = txn
         .query(
             "select column_name from column_status where transform_table = $1",
@@ -518,21 +594,33 @@ async fn prepare_statement(
         .collect();
     let mut mutations = TargetMutations::new();
     let image = mutations.image_sql(txn, &plan.target, "t").await?;
-    let sql = rederive_statement(plan, pick, &paused, image.as_deref());
+    let sql = match scope {
+        None => Some(rederive_statement(plan, pick, &paused, image.as_deref())),
+        Some(fields) => field_statement(plan, pick, fields, &paused, image.as_deref()),
+    };
     Ok((sql, image, mutations))
 }
 
-/// Runs [`rederive_statement`] for `plan`'s locked keys, reports every
+/// Runs [`rederive_statement`] (or, for a field build, [`field_statement`])
+/// for `plan`'s locked keys, reports every
 /// target row it changed to the target-mutation seam, and returns what it
 /// did. `keys` is how many keys were locked.
 async fn rederive(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
+    scope: Option<&[String]>,
     pick: &Pick,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
     keys: usize,
 ) -> Result<OneToOneOutcome, ApplyError> {
-    let (sql, image, mut mutations) = prepare_statement(txn, plan, pick).await?;
+    let (sql, image, mut mutations) = prepare_statement(txn, plan, scope, pick).await?;
+    let Some(sql) = sql else {
+        return Ok(OneToOneOutcome {
+            keys,
+            written: 0,
+            deleted: 0,
+        });
+    };
     let started = Instant::now();
     let rows = query_under_chunk_plan(txn, &sql, params).await?;
     metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
@@ -676,4 +764,86 @@ fn rederive_statement(
         insert_cols = insert_cols.join(", "),
         pk_cols = pk_idents.join(", "),
     )
+}
+
+/// A field build's chunk statement ([`run_field_chunk`]): rewrites `fields`,
+/// but for the `paused` ones, of each locked key's target row from its
+/// source row, where they differ, through the target's key (see the module
+/// doc's step 3 for the snapshot and the plan settings). It touches no
+/// ledger entry, inserts no target row and deletes none.
+///
+/// Returns one row shaped as [`rederive_statement`]'s: 0 entries rewritten,
+/// the target rows written, 0 deleted, and with `image` the changed keys and
+/// their prior images, in key order, for the seam. `None` when every one of
+/// `fields` is paused (or gone), so there is nothing to write.
+fn field_statement(
+    plan: &OneToOnePlan,
+    pick: &Pick,
+    fields: &[String],
+    paused: &HashSet<String>,
+    image: Option<&str>,
+) -> Option<String> {
+    let q = |c: &str| quote_ident(c);
+    let target = ddl::qualified_target_table_ident(&plan.target);
+    let source = ddl::qualified_source_table(&plan.source_table);
+    let k_src = ddl::pk_key_sql_expr(&plan.pk, Some("s"));
+    let k_tgt = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
+    let written: Vec<&(String, String)> = plan
+        .fields
+        .iter()
+        .filter(|(name, _)| fields.contains(name) && !paused.contains(name))
+        .collect();
+    if written.is_empty() {
+        return None;
+    }
+    let pk_idents: Vec<String> = plan.pk.iter().map(|c| q(&c.name)).collect();
+    let field_idents: Vec<String> = written.iter().map(|(name, _)| q(name)).collect();
+    let mut src_cols: Vec<String> = pk_idents.iter().map(|c| format!("s.{c} as {c}")).collect();
+    src_cols.extend(
+        written
+            .iter()
+            .map(|(name, sql)| format!("{sql} as {}", q(name))),
+    );
+    let sets: Vec<String> = field_idents
+        .iter()
+        .map(|f| format!("{f} = r.{f}"))
+        .collect();
+    let join: Vec<String> = pk_idents.iter().map(|c| format!("t.{c} = r.{c}")).collect();
+    let old: Vec<String> = field_idents.iter().map(|f| format!("t.{f}")).collect();
+    let new: Vec<String> = field_idents.iter().map(|f| format!("r.{f}")).collect();
+    let (prior, seam) = match image {
+        Some(image) => (
+            format!(
+                "prior as (select {k_tgt} as __k, {image}::text as __image \
+                 from {target} t where {target_where}), ",
+                target_where = pick.target_where
+            ),
+            ", (select array_agg(c.__k order by c.__k) from upd c), \
+             (select array_agg(p.__image order by c.__k) \
+              from upd c left join prior p on p.__k = c.__k)"
+                .to_string(),
+        ),
+        None => (String::new(), String::new()),
+    };
+    Some(format!(
+        "with src as ( \
+             select {k_src} as __k, {src_cols} from {source} s {src_from} \
+         ), \
+         {prior}\
+         upd as ( \
+             update {target} t set {sets} \
+             from src r \
+             where {join} and {target_where} \
+               and ({old}) is distinct from ({new}) \
+             returning {k_tgt} as __k \
+         ) \
+         select 0::bigint, (select count(*) from upd), 0::bigint{seam}",
+        src_cols = src_cols.join(", "),
+        src_from = pick.src_from,
+        target_where = pick.target_where,
+        sets = sets.join(", "),
+        join = join.join(" and "),
+        old = old.join(", "),
+        new = new.join(", "),
+    ))
 }

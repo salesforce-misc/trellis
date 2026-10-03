@@ -67,6 +67,16 @@ While an added column is backfilling it holds no committed value and the rest of
 target stays live — the column-granularity form of the pause state a target already has.
 A dropped column's data is removed, consistent with drop removing the data it explains.
 
+**Amended by #625 F8b (#666):** the edit returns before the backfill, which is a
+background *field build*. The edit's transaction registers it (the definition moves
+`live -> backfilling`), the changed fields apply to every live change from that commit,
+and background chunks rewrite just those fields across the existing rows, one source
+read for all of them. The definition reads `live` again once the chunks are done. So
+an added column is not held paused while it builds; `backfilling` on the definition is
+what says it isn't built yet. A field that reads a source column capture doesn't image
+yet stays paused until it does, and its build starts then. A column `RESUME` is the same
+kind of build.
+
 ### The stored schema versions monotonically; physical changes are additive
 
 Each accepted edit bumps a monotonic definition version on the target's catalog row and

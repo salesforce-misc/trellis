@@ -33,12 +33,12 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::{Driver, Running};
+use drain_driver::Driver;
 use tokio_postgres::types::PgLsn;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{Statement, ValueType, alter_transform, parse_statement};
+use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
-use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, claim, quarantine};
+use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, claim};
 
 const SRC: &str = "public.src";
 
@@ -2070,110 +2070,9 @@ async fn a_one_to_one_and_an_aggregate_in_one_page_never_deadlock() {
     assert_oracle(&mut d, Flavour::OneToOne).await;
 }
 
-// ------------------------------------------- the direct 1-1 writers (D6)
-//
-// A column resume (`staging::quarantine::recompute_column`) and an `ALTER
-// TRANSFORM`'s backfill (`defs::backfill::backfill_altered_columns`) write
-// 1-1 target rows outside a page. Each takes the entries of the keys it
-// writes before reading them, as a page's Re-derive does, so a page with a
-// CDC change to the same key, committed after the writer's read, queues
-// behind the writer and applies after it. Without the entry lock the page
-// applies first and the writer then puts its older read over it.
-
-/// The direct writer is frozen after its read; key 1 changes and commits,
-/// and its batch drains on a second worker, which must queue behind the
-/// writer. The page computed before the writer committed, so it skips the
-/// writer's still-paused field, which only the writer's parked catch-up
-/// brings up to date; every other field must already be the page's.
-async fn a_direct_writer_and_a_concurrent_change(d: &mut Driver, mut writer: Running<()>) {
-    let frozen = writer.reached(PausePoint::AfterRederiveRead).await;
-    write(d, "update public.src set g = 3, v = 30 where id = 1").await;
-    let batch = d.seal().await;
-    let page = d.drain_frozen(batch, "b", &[]).await;
-    d.wait_blocked_behind(frozen.backend_pid).await;
-    d.release(&mut writer, PausePoint::AfterRederiveRead).await;
-    writer.finish().await;
-    page.finish().await;
-}
-
-/// A column resume racing a CDC change to a key it re-derives. `v` is
-/// paused while key 1's `v` moves 10 to 15, so the target holds the old 10;
-/// the resume then re-derives every row, and key 1 changes again under it.
-#[tokio::test]
-async fn a_column_resume_racing_a_change_to_the_same_key() {
-    let flavour = Flavour::OneToOne;
-    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    d.ctl
-        .execute(
-            "insert into column_status (transform_table, column_name, last_error, local_fuse) \
-             values ('one', 'v', 'paused by the test', true)",
-            &[],
-        )
-        .await
-        .expect("pause one.v");
-    write(&d, "update public.src set v = 15 where id = 1").await;
-    let batch = d.seal().await;
-    d.drain(batch, "a").await;
-    assert_eq!(
-        d.rows(flavour.actual()).await,
-        ["(1,1,10)", "(2,1,20)"],
-        "the paused column keeps its old value"
-    );
-
-    let resume = d
-        .run_frozen(
-            &[(PausePoint::AfterRederiveRead, flavour.target())],
-            |pool| async move {
-                quarantine::resume_column(&pool, "one", "v").await?;
-                Ok(())
-            },
-        )
-        .await;
-    a_direct_writer_and_a_concurrent_change(&mut d, resume).await;
-    assert_eq!(
-        d.rows("select id, g from public.one order by id").await,
-        d.rows("select id, g from public.src order by id").await,
-        "before the catch-up, the page's change applied after the resume's older read"
-    );
-    d.catch_up().await;
-    assert_oracle(&mut d, flavour).await;
-}
-
-/// An `ALTER TRANSFORM`'s backfill racing a CDC change to a key it writes:
-/// the added `w` is paused until the backfill ends, and the backfill writes
-/// every field.
-#[tokio::test]
-async fn an_alter_backfill_racing_a_change_to_the_same_key() {
-    let flavour = Flavour::OneToOne;
-    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    let Statement::AlterTransform(alter) =
-        parse_statement("ALTER TRANSFORM one ADD v + v AS w").expect("parse")
-    else {
-        panic!("not an ALTER");
-    };
-    let backfill = d
-        .run_frozen(
-            &[(PausePoint::AfterRederiveRead, flavour.target())],
-            |pool| async move {
-                alter_transform(&pool, &alter).await.expect("alter one");
-                Ok(())
-            },
-        )
-        .await;
-    a_direct_writer_and_a_concurrent_change(&mut d, backfill).await;
-    assert_eq!(
-        d.rows(flavour.actual()).await,
-        d.rows(flavour.expected()).await,
-        "before the catch-up, the page's change applied after the backfill's older read"
-    );
-    d.catch_up().await;
-    assert_eq!(
-        d.rows("select id, g, v, w from public.one order by id")
-            .await,
-        d.rows("select id, g, v, v + v from public.src order by id")
-            .await,
-    );
-}
+// A column resume's and an `ALTER TRANSFORM`'s rewrite of a 1-1 field are
+// field builds since #625 F8b; their chunks' interleavings with pages are in
+// `one_to_one_build_interleavings.rs` ("a field build's chunk").
 
 // ------------------------------------------------- relationship-fed (D5)
 

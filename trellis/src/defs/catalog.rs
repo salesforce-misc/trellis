@@ -315,16 +315,10 @@ pub enum CatalogError {
         /// precisely.
         column_detail: Vec<String>,
     },
-    /// [`alter_transform`] was asked to edit a target that isn't currently
-    /// applying ([`TransformStatus::is_applying`]: `live`, or `catching_up`
-    /// once its build has finished; ADR-0015) — most concretely, still
-    /// `backfilling` behind its own initial build, or already frozen
-    /// (`paused`/`quarantined`). Mirrors [`crate::staging::apply::ApplyError::DefinitionNotLive`]'s
-    /// exact reasoning for [`crate::staging::quarantine::resume_column`]: a
-    /// column-add's single-pass backfill takes one read of the source table,
-    /// and a row a still-running initial-backfill chunk inserts into the
-    /// target *during* that window would never be revisited — so an edit
-    /// only ever starts from a settled, fully-built target.
+    /// [`alter_transform`] was asked to edit a target that doesn't apply
+    /// (`staging::build::takes_field_build`, #625 F8b): one still
+    /// `waiting_to_backfill`, `backfilling` behind an old-path build, or
+    /// frozen (`paused`/`quarantined`). Retry once it applies.
     ///
     /// Also returned (issue #315) when a new definition's source is another
     /// definition's target whose build hasn't finished (one that isn't
@@ -1389,14 +1383,12 @@ pub(crate) async fn is_definition_target(
 /// refused with [`CatalogError::UnsupportedAlter`]. `DROP` alone never needs
 /// this restriction in principle (it recomputes nothing), but is held to the
 /// same gate for simplicity in this first pass — a deliberate, flagged
-/// scope-down, not an oversight: the single-pass backfill this reuses
-/// ([`backfill::backfill_altered_columns`], built on
-/// [`backfill::backfill_one_to_one`]'s chunked writer) only renders a plain
-/// `INSERT ... SELECT ... FROM <source>` and has no join-aware counterpart
-/// the way [`backfill::backfill_relationship_one_to_one`] is for a first
-/// `define`; wiring column-scoped writes through that relationship-aware
-/// path, and building an aggregate-target column-add/drop path (which would
-/// need to reason about the hidden `__{f}_sum`/`__{f}_count` partials
+/// scope-down, not an oversight: the field build's chunk
+/// (`staging::build::one_to_one::run_field_chunk`) renders each field as
+/// plain SQL over the source row and has no join-aware counterpart; wiring
+/// column-scoped writes through a relationship-aware path, and building an
+/// aggregate-target column-add/drop path (which would need to reason about
+/// the hidden `__{f}_sum`/`__{f}_count` partials
 /// `ddl::create_aggregate_target_table` maintains), are both real follow-up
 /// work, not fundamental blockers.
 ///
@@ -1408,30 +1400,22 @@ pub(crate) async fn is_definition_target(
 /// DDL, nothing written — matching pause/resume/drop's own "a replayed
 /// migration must be safe in both directions" discipline.
 ///
-/// **Single-pass backfill.** Every `ADD`/`ALTER`ed field this call actually
-/// changes is populated by *one* enumeration of the source
-/// ([`backfill::backfill_altered_columns`]), never a backfill per column —
-/// the same single-pass contract a definition's initial build honors,
-/// reused rather than reimplemented.
-///
-/// **The pause-state reuse.** While a changed field's single-pass backfill
-/// runs, it is parked in `column_status` — the exact mechanism
-/// `staging::quarantine`'s operator-driven column pause already is, "the
-/// column-granularity form of the pause state a target already has" in the
-/// ADR's own words: live CDC apply already excludes any `column_status`-listed
-/// column from what it computes/writes (`staging::apply`'s
-/// `paused_columns_for`/per-batch plan construction), so the field holds no
-/// committed value and nothing but this call's own backfill touches it until
-/// the backfill completes and this call clears the row.
-///
-/// **The catch-up (issue #305).** Clearing that row is not the end of it: a
-/// source row changed after the backfill read it, with its delta applied
-/// while the field was still paused, would otherwise keep a stale value for
-/// the field forever. The unpause therefore parks a `pending_backfill`
-/// catch-up marker for the source table in the same transaction — the exact
-/// closed loop [`complete_direct_backfill`] ends a first `define`'s chunked
-/// build with, whose discharge re-derives every row once the marker's fence
-/// settles.
+/// **The field build (#625 F8b, #666).** The call only registers the edit:
+/// the DDL, the catalog row and the version fence below, and, when it adds
+/// or alters a field, a field build of every such field, in the same
+/// transaction (`staging::build::start_field_build`). It moves the
+/// definition `live -> backfilling` (one already under a Re-derive build
+/// keeps building) and enqueues one plan job for all the fields, so the
+/// source is read once however many fields change, by the drain workers in
+/// the background. `apply` returns once that commits, and the definition
+/// reads `backfilling` until the build's last chunk is done, then `live`.
+/// The changed fields apply from the commit, as a new definition does under
+/// the Re-derive build (#625 B1): every page after it writes them, and each
+/// chunk rewrites them under the keys' entry lock, so no catch-up is needed.
+/// A `catching_up` definition keeps catching up, and its catch-up's
+/// discharge hands it to the field build rather than flipping it `live`
+/// (see `staging::build::takes_field_build`). An edit that only drops fields
+/// builds nothing.
 ///
 /// **The version fence.** This call bumps both `transform_definitions
 /// .definition_version` (an audit-visible, monotonic counter on the edited
@@ -1442,11 +1426,11 @@ pub(crate) async fn is_definition_target(
 /// SHARE`, so a drain worker whose in-flight batch loaded the *old* field
 /// list before this call's transaction commits is forced to hit
 /// `ApplyError::VersionFenceMiss` and reload the catalog — landing on the
-/// *new* field list, with the just-edited columns' `column_status` rows
-/// already visible — rather than racing this call's own backfill with a
-/// half-populated column. This is the same fence every *first*
-/// `create_definition_inner` already bumps, for exactly this reason; nothing
-/// new is invented here, only reused for an edit instead of only a define.
+/// *new* field list, with any `awaiting_capture` pause already visible —
+/// rather than applying a change with a field list this edit replaced. This
+/// is the same fence every *first* `create_definition_inner` already bumps,
+/// for exactly this reason; nothing new is invented here, only reused for an
+/// edit instead of only a define.
 ///
 /// **Cycle detection.** The merged field list (existing fields, with `ADD`/
 /// `DROP`/`ALTER` applied) is run through [`validate`] — the same validator,
@@ -1473,17 +1457,15 @@ pub(crate) async fn is_definition_target(
 /// not image yet. The staging worker widens them in the background, not on
 /// this call's path, once it can take the table's lock, and a row the old
 /// capture function staged lacks the column: evaluating the field over it
-/// fails with `MissingColumn` and quarantines the key. So such an edit
-/// leaves its own pauses in place when its backfill ends, marked
-/// `column_status.awaiting_capture`, and parks its catch-up as usual. That
-/// marker's discharge clears them once the installed capture images every
-/// column the definition reads, and it waits for the widen's capture gate
-/// first, so every row the old function staged has drained through the
-/// paused field by then (`intake::markers`'s
-/// `release_columns_awaiting_capture`). The enumeration the same discharge
-/// stages re-derives every row with the field unpaused. An edit that reads
-/// only columns the definition already read unpauses at once, as before:
-/// those columns have been imaged since the definition was dispatched.
+/// fails with `MissingColumn` and quarantines the key. So such an edit holds
+/// its fields out of Apply with `column_status` rows marked
+/// `awaiting_capture`, and the field build's plan job releases them before
+/// it plans a chunk, once the installed capture images every column the
+/// definition reads and the source's capture gate is clear, so every row the
+/// old function staged has drained without the fields
+/// (`staging::build`'s "Field builds"). An edit that reads only columns the
+/// definition already read applies at once: those columns have been imaged
+/// since the definition was dispatched.
 pub async fn alter_transform(
     pool: &Pool,
     alter: &AlterTransform,
@@ -1493,7 +1475,8 @@ pub async fn alter_transform(
             transform: alter.target.clone(),
         });
     };
-    if !current.status.is_applying() {
+    // Re-checked under the row lock below, with the definition's build.
+    if !current.status.is_applying() && current.status != TransformStatus::Backfilling {
         return Err(CatalogError::TransformNotLive {
             transform: alter.target.clone(),
             status: current.status,
@@ -1659,7 +1642,8 @@ pub async fn alter_transform(
     // `lifecycle::drop_transform` applies it to its own precondition).
     let row = txn
         .query_opt(
-            "select status, definition_version from transform_definitions where id = $1 for update",
+            "select status, definition_version, build from transform_definitions \
+             where id = $1 for update",
             &[&current.id],
         )
         .await?;
@@ -1672,7 +1656,13 @@ pub async fn alter_transform(
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    if !status.is_applying() {
+    // A field build (#625 F8b) needs a definition that applies
+    // (`staging::build::takes_field_build`): `live`, `catching_up`, or
+    // already under a Re-derive build, which it joins. An edit that only
+    // drops fields builds nothing; it takes the same definitions.
+    let build: Option<String> = row.get(2);
+    let builds_fields = !real_adds.is_empty() || !real_alters.is_empty();
+    if !crate::staging::build::takes_field_build(status, build.as_deref()) {
         return Err(CatalogError::TransformNotLive {
             transform: alter.target.clone(),
             status,
@@ -1785,29 +1775,30 @@ pub async fn alter_transform(
     // above already refused (and rolled back the whole transaction without
     // issuing a single DDL statement) for any field where that isn't true.
     // A same-type `ALTER` needs no physical schema change at all; only its
-    // *data* is stale, which the single-pass backfill below recomputes —
+    // *data* is stale, which the field build registered below recomputes —
     // same as it already does for a same-type `ADD`.
 
-    // The column-granularity pause: freeze every changed field from live CDC
-    // apply (and from any other concurrent backfill) until this call's own
-    // single-pass recompute below finishes and clears it. `on conflict do
+    // The capture widen (issue #622): a field reading a source column the
+    // old formula didn't read can't apply until the source's capture images
+    // it, so it is held out of Apply, marked `awaiting_capture`, and the
+    // field build's plan job releases it once capture is ready (see "The
+    // capture widen" in this function's doc comment). `on conflict do
     // nothing`: a field already paused for some other reason (an operator
     // pause, a tripped column fuse, a cascade from a paused upstream column)
-    // simply stays paused through this edit too. Only the rows this insert
-    // actually created land in `self_paused`, and those are the only ones
-    // the unpause step at the end may clear (issue #309).
-    let mut self_paused: Vec<String> = Vec::new();
-    for field in real_adds.iter().chain(real_alters.iter()) {
-        let inserted = txn
-            .execute(
-                "insert into column_status (transform_table, column_name, paused_at, local_fuse) \
-                 values ($1, $2, now(), false) \
+    // stays paused through this edit, and its own resume rebuilds it.
+    if builds_fields
+        && reads_new_source_columns(&current.def, &merged)
+        && !is_definition_target(&*txn, &current.source_table).await?
+    {
+        for field in real_adds.iter().chain(real_alters.iter()) {
+            txn.execute(
+                "insert into column_status \
+                     (transform_table, column_name, paused_at, local_fuse, awaiting_capture) \
+                 values ($1, $2, now(), false, true) \
                  on conflict (transform_table, column_name) do nothing",
                 &[&alter.target, &field.name],
             )
             .await?;
-        if inserted > 0 {
-            self_paused.push(field.name.clone());
         }
     }
 
@@ -1820,91 +1811,19 @@ pub async fn alter_transform(
     )
     .await?;
 
-    txn.commit().await?;
-
-    // Outside the transaction (and, deliberately, holding no lock): the
-    // single-pass backfill below is the same "one enumeration of the source"
-    // shape a definition's initial build is, sized for however large the
-    // source table is, so it holds no transaction open across it either.
-    if !real_adds.is_empty() || !real_alters.is_empty() {
-        let mut written_fields: HashSet<String> =
-            real_adds.iter().map(|f| f.name.clone()).collect();
-        written_fields.extend(real_alters.iter().map(|f| f.name.clone()));
-        backfill::backfill_altered_columns(
-            pool,
-            &merged,
-            &current.source_table,
-            &current.target_table,
-            &current.source_columns,
-            &written_fields,
-        )
-        .await
-        .map_err(CatalogError::DirectBackfill)?;
-
-        // Unpause, and close the backfill's tail race in the same
-        // transaction (issue #305). Each PK-range chunk above read the
-        // source under its own snapshot, and until this commit live CDC
-        // apply skips every paused field: a row changed after its chunk read
-        // it had its delta applied to every *other* column, leaving the
-        // changed field at the chunk's pre-change value, and nothing would
-        // ever revisit it once unpaused. The parked catch-up marker is the
-        // same closed loop a first `define`'s chunked build ends with
-        // ([`complete_direct_backfill`]): once its fence settles,
-        // `run_pending_backfills` re-enumerates the source and re-derives
-        // every row with these fields unpaused. Atomic with the unpause, not
-        // after it: a marker visible before the unpause could be discharged
-        // (and its enumeration applied) while the fields were still paused,
-        // re-opening exactly this gap; a crash between two separate commits
-        // would lose the catch-up outright.
-        //
-        // Only this call's own pauses are cleared (issue #309), and only if
-        // nothing else claimed them while the backfill ran: an operator
-        // pause or fuse trip in that window upgrades the row to `local_fuse`
-        // (`staging::quarantine::pause_column`/`trip_column_fuse` upsert onto
-        // it), and an upstream pause cascading onto it records an edge in
-        // `column_pause_cascades`. Either way the row now belongs to that
-        // other reason, and its `RESUME` is what recovers the column.
-        //
-        // **The capture widen (issue #622).** A field reading a source column
-        // the old formula didn't read can't unpause here: see "The capture
-        // widen" in this function's doc comment. Its pause is marked
-        // `awaiting_capture` instead, and the catch-up marker's discharge
-        // clears it.
-        let mut client = pool.get().await?;
-        let txn = client.transaction().await?;
-        let awaits_capture = reads_new_source_columns(&current.def, &merged)
-            && !is_definition_target(&*txn, &current.source_table).await?;
-        let release = if awaits_capture {
-            "update column_status s set awaiting_capture = true"
-        } else {
-            "delete from column_status s"
-        };
-        for field in &self_paused {
-            txn.execute(
-                &format!(
-                    "{release} \
-                     where s.transform_table = $1 and s.column_name = $2 \
-                       and not s.local_fuse \
-                       and not exists ( \
-                           select 1 from column_pause_cascades c \
-                           where c.downstream_transform = s.transform_table \
-                             and c.downstream_column = s.column_name)"
-                ),
-                &[&alter.target, field],
-            )
-            .await?;
-        }
-        // Issue #476: the target is missing the changes this marker's
-        // discharge folds in, so the definition reports `catching_up` until
-        // then (it keeps applying).
-        crate::intake::markers::park_catch_up(
-            &*txn,
-            &[current.id],
-            std::slice::from_ref(&current.source_table),
-        )
-        .await?;
-        txn.commit().await?;
+    // The recompute is a field build (#625 F8b, #666): registered here, run
+    // by the drain workers. See "The field build" in this function's doc
+    // comment.
+    if builds_fields {
+        let fields: Vec<String> = real_adds
+            .iter()
+            .chain(real_alters.iter())
+            .map(|f| f.name.clone())
+            .collect();
+        crate::staging::build::start_field_build(&*txn, current.id, status, &fields).await?;
     }
+
+    txn.commit().await?;
 
     let definition = definition_by_target(pool, &alter.target)
         .await?
@@ -6276,8 +6195,7 @@ pub async fn definition_by_target(
 /// just-paused upstream column would get a `column_status` row cascaded onto
 /// it that nothing in the aggregate write path ever consults or clears, and
 /// that `resume_column`'s cascade walk would later try (and fail) to
-/// recompute via `staging::quarantine::recompute_column`'s single-row 1-1
-/// recompute path.
+/// recompute through its 1-1 field build.
 pub(crate) async fn column_dependents(
     pool: &Pool,
     upstream_table: &str,

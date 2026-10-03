@@ -11,14 +11,15 @@
 //! and blocks the calling thread on the reply. The calling thread itself
 //! never needs a runtime of its own.
 //!
-//! **Blocks only on registration, never on backfill** — for the fast path.
+//! **Blocks only on registration, never on backfill.**
 //! [`BlockingTrellis::apply`] is exactly as fast (or slow) as
-//! [`Trellis::apply`] (see `app`'s module doc): a plain (non-relationship)
-//! 1-1 transform's backfill work is enumerated and persisted, not executed,
-//! before it returns. A relationship-enriched 1-1 or an aggregate transform
-//! still builds fully synchronously today, so this wrapper simply blocks
-//! longer for those two shapes — consistent with, not a regression from,
-//! today's async behavior.
+//! [`Trellis::apply`] (see `app`'s module doc), which only registers: a new
+//! definition is built in the background from `waiting_to_backfill`
+//! (ADR-0016), and an `ALTER TRANSFORM` or a column resume starts a
+//! background field build (#666, #625 F8b). The one statement that still
+//! reads table rows inside the call is a to-one relationship's declaration
+//! (or a transform reading through one), which seeds the relationship's
+//! projection from its to-side table.
 
 use std::time::{Duration, SystemTime};
 

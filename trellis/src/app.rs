@@ -54,6 +54,16 @@
 //! anywhere, leaves the transform queued indefinitely) — then take a
 //! [`Trellis::watermark_token`] and [`Trellis::await_converged`] on it.
 //!
+//! Nor does an edit block on its rebuild (#666, #625 F8b): an `ALTER
+//! TRANSFORM` that adds or changes fields, and a column `RESUME`, register a
+//! background field build and return, the definition reading
+//! [`TransformStatus::Backfilling`] until it is done. The statements that
+//! pause, resume and drop write only the catalog. The one statement that
+//! still reads table rows inside the call is a to-one relationship's
+//! declaration (or a transform reading through one), which seeds the
+//! relationship's projection from its to-side table (milestone E, #624,
+//! replaces it).
+//!
 //! # Lifecycle
 //!
 //! ```no_run
@@ -371,8 +381,9 @@ impl Trellis {
     /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
     /// of [`apply`](Trellis::apply) (ADR-0015, issues #241/#242) — a thin
     /// facade wrapper over [`defs::alter_transform`], which does the actual
-    /// work (idempotency, validation, DDL, single-pass backfill, version
-    /// fencing); see that function's own doc comment for the full contract.
+    /// work (idempotency, validation, DDL, registering the field build,
+    /// version fencing); see that function's own doc comment for the full
+    /// contract.
     async fn apply_alter(&self, alter: &defs::AlterTransform) -> Result<Applied, TrellisError> {
         let outcome = defs::alter_transform(&self.pool, alter)
             .await
@@ -562,9 +573,10 @@ impl Trellis {
     /// [`Trellis::await_converged`] guarantees its target reflects that
     /// commit. A transform whose build has finished but whose go-live
     /// catch-up hasn't run yet reports [`TransformStatus::CatchingUp`]
-    /// instead, as does a `live` one given a catch-up of its own (an
-    /// `ALTER TRANSFORM` that added columns, a resumed column): it is applying
-    /// changes, but its target may still be missing some (issue #476). So does
+    /// instead: it is applying changes, but its target may still be missing
+    /// some (issue #476). A `live` 1-1 one rebuilding fields (an `ALTER
+    /// TRANSFORM` that added or changed fields, a resumed column) reports
+    /// [`TransformStatus::Backfilling`] until they are built (#625 F8b). So does
     /// a `live` one reading an upstream (another definition's target, as its
     /// source or through a relationship) that isn't `live` itself: paused,
     /// quarantined, rebuilding or catching up, down the whole chain (issue
@@ -1503,7 +1515,8 @@ pub struct DefinitionStatus {
     /// on it (issue #622). It clears on its own once the lock holder lets
     /// go. A definition waits on capture while it is `waiting_to_backfill`,
     /// or while an `ALTER TRANSFORM` field it gained is paused until the
-    /// capture images the column it reads (it is `catching_up` then, #687).
+    /// capture images the column it reads (it is `backfilling` then, its
+    /// field build waiting to start, #687, #625 F8b).
     /// One a schema change paused doesn't: it waits for the resume its
     /// `capture_failure` asks for (#705). The staging worker's latest pass records it in the catalog
     /// (`capture_holdups`), so every process reports it, wherever the worker

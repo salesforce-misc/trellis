@@ -12,20 +12,21 @@
 //!   `drop_single_column_removes_the_physical_column`,
 //!   `alter_single_column_recomputes_existing_rows`,
 //!   `combined_add_drop_alter_in_one_statement`)
-//! - single-pass backfill of multiple added columns under a concurrent
-//!   writer (`single_pass_backfill_stays_consistent_under_concurrent_writes`,
-//!   which runs no live pipeline and drives the initial build's chunk queue
-//!   by hand instead; see its doc comment for why)
-//! - the column-granularity pause state: the new column reports paused while
-//!   backfilling, and the rest of the target stays live and queryable
-//!   (`the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stays_live`,
-//!   which holds the backfill at a fixed point mid-way and drives live apply
-//!   by hand; see its doc comment)
-//! - that pause is only ever undone for a field the `ALTER` itself paused,
-//!   including when another pause lands mid-backfill, and `DROP <field>`
-//!   clears the dropped column's quarantine bookkeeping (issue #309:
+//! - #666 (#625 F8b): an `ALTER` only registers a field build and returns
+//!   before any target row changes, and the field is built once its chunks
+//!   run (`an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the_field`,
+//!   driven by hand)
+//! - one field build for several added columns, reading each row once under
+//!   a concurrent writer (`one_field_build_reads_each_row_once_under_concurrent_writes`)
+//! - the field applies while its build runs, and the rest of the target
+//!   stays live and queryable
+//!   (`the_field_applies_while_its_build_runs_and_the_rest_of_the_target_stays_live`,
+//!   which stops the build at a fixed point and drives live apply by hand)
+//! - an `ALTER` never undoes a pause it didn't create, a pause landing
+//!   mid-build survives it, and `DROP <field>` clears the dropped column's
+//!   quarantine bookkeeping (issue #309:
 //!   `an_alter_leaves_a_pause_it_did_not_create_in_place`,
-//!   `a_pause_landing_mid_alter_backfill_survives_the_alters_unpause`,
+//!   `a_pause_landing_mid_field_build_survives_it`,
 //!   `dropping_a_paused_field_clears_its_quarantine_state`)
 //! - idempotency in both directions for all three edit kinds
 //!   (`edits_are_idempotent_in_both_directions`), and the two genuine
@@ -241,6 +242,9 @@ async fn add_single_column_backfills_existing_rows() {
     assert_eq!(added, vec!["double_a".to_string()]);
     assert!(dropped.is_empty());
     assert!(altered.is_empty());
+    // #625 F8b: the drain workers build the field in the background, and
+    // the definition reads `live` again once they have.
+    wait_for_live(&raw, "order_calc").await;
 
     let rows = raw
         .query(
@@ -258,7 +262,7 @@ async fn add_single_column_backfills_existing_rows() {
         assert_eq!(
             double_a.parse::<f64>().unwrap(),
             a.parse::<f64>().unwrap() * 2.0,
-            "the single-pass backfill must have populated every existing row"
+            "the field build must have populated every existing row"
         );
     }
 
@@ -338,6 +342,7 @@ async fn alter_single_column_recomputes_existing_rows() {
     assert!(added.is_empty());
     assert!(dropped.is_empty());
     assert_eq!(altered, vec!["total".to_string()]);
+    wait_for_live(&raw, "order_calc").await;
 
     assert_eq!(
         column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
@@ -542,6 +547,7 @@ async fn combined_add_drop_alter_in_one_statement() {
     assert_eq!(added, vec!["sum_ab".to_string()]);
     assert_eq!(dropped, vec!["b".to_string()]);
     assert_eq!(altered, vec!["total".to_string()]);
+    wait_for_live(&raw, "order_calc").await;
 
     let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
     assert!(!columns.contains("b"));
@@ -620,39 +626,183 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
     }
 }
 
-/// **Single pass, not one job per column.** Adds two columns in one
+/// The target's rows as `(id, xmin)` text, in key order: a row any write
+/// touched has a new `xmin`.
+async fn row_versions(raw: &Client) -> Vec<String> {
+    raw.query(
+        &format!("select id::text || ':' || xmin::text from {DEFAULT_TARGET_SCHEMA}.order_calc order by id"),
+        &[],
+    )
+    .await
+    .expect("read the target's row versions")
+    .into_iter()
+    .map(|row| row.get(0))
+    .collect()
+}
+
+/// `backfill_chunks` rows of `kind` of a field build for `target`'s
+/// definition, and how many of them are done.
+async fn chunk_rows(raw: &Client, target: &str, kind: &str) -> (i64, i64) {
+    let row = raw
+        .query_one(
+            "select count(*), count(*) filter (where bc.done) from backfill_chunks bc \
+             join transform_definitions d on d.id = bc.definition_id \
+             where split_part(d.target_table, '.', 2) = $1 and bc.kind = $2 \
+               and bc.fields is not null",
+            &[&target, &kind],
+        )
+        .await
+        .expect("count chunk rows");
+    (row.get(0), row.get(1))
+}
+
+/// A drain worker's build options for the hand-driven steps below.
+fn worker_options() -> trellis::staging::build::WorkerOptions {
+    trellis::staging::build::WorkerOptions {
+        chunk_rows: trellis::staging::build::DEFAULT_CHUNK_ROWS,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    }
+}
+
+/// Claims one build row of `kind` and runs it, as a drain worker does.
+async fn run_one(pool: &trellis::Pool, kind: &str) {
+    const BY: &str = "alter_transform_test_build_worker";
+    let claimed = {
+        let client = pool.get().await.expect("acquire connection");
+        chunk_queue::claim_chunks_of(&**client, BY, 1, &[kind])
+            .await
+            .expect("claim build work")
+    };
+    let chunk = claimed
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("a {kind} row to claim"));
+    trellis::staging::build::run_claimed(pool, &chunk, BY, &worker_options()).await;
+}
+
+/// #666 (#625 F8b): `ALTER TRANSFORM` only registers its edit. On a source
+/// larger than one chunk it returns before any target row changes, with
+/// the definition `backfilling` and one field-scoped plan job enqueued, and
+/// the field is built once the drain workers' build steps, driven here by
+/// hand, run its chunks. No pipeline runs, so nothing else writes.
+#[tokio::test]
+async fn an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the_field() {
+    // Three chunks of `DEFAULT_CHUNK_ROWS`.
+    const ROWS: i64 = 2 * trellis::staging::build::DEFAULT_CHUNK_ROWS + 1;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, ROWS).await;
+
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    drain_backfill_chunks(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live")
+    );
+    let before = row_versions(&raw).await;
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+        .await
+        .expect("add a column");
+    let (added, _, _) = into_altered(applied);
+    assert_eq!(added, vec!["double_a".to_string()]);
+
+    assert_eq!(
+        row_versions(&raw).await,
+        before,
+        "the ALTER must return before any target row is written"
+    );
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("backfilling"),
+        "the definition reads as not yet built until its field build is done"
+    );
+    let status = trellis
+        .status("order_calc")
+        .await
+        .expect("status")
+        .expect("the definition");
+    assert_eq!(status.status, TransformStatus::Backfilling);
+    let fields: Vec<String> = raw
+        .query_one(
+            "select fields from backfill_chunks where kind = 'plan' and not done",
+            &[],
+        )
+        .await
+        .expect("the field build's plan job")
+        .get(0);
+    assert_eq!(fields, vec!["double_a".to_string()]);
+    assert_eq!(chunk_rows(&raw, "order_calc", "rederive").await, (0, 0));
+
+    // The plan job, then each chunk, as a drain worker runs them.
+    run_one(&db.pool, chunk_queue::KIND_PLAN).await;
+    assert_eq!(
+        chunk_rows(&raw, "order_calc", "rederive").await,
+        (3, 0),
+        "a source of three chunks gets three field chunks"
+    );
+    for done in 1..=3 {
+        run_one(&db.pool, chunk_queue::KIND_REDERIVE).await;
+        let built: i64 = raw
+            .query_one(
+                &format!(
+                    "select count(*) from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                     where double_a = a + a"
+                ),
+                &[],
+            )
+            .await
+            .expect("count built rows")
+            .get(0);
+        assert_eq!(
+            built,
+            (done * trellis::staging::build::DEFAULT_CHUNK_ROWS).min(ROWS),
+            "each chunk builds its own range"
+        );
+    }
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live"),
+        "the last chunk's commit flips the definition `live`"
+    );
+    let wrong: i64 = raw
+        .query_one(
+            &format!(
+                "select count(*) from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 where double_a is distinct from a + a"
+            ),
+            &[],
+        )
+        .await
+        .expect("check the target")
+        .get(0);
+    assert_eq!(wrong, 0, "every row's field is built");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// **One read per row, not one per column.** Adds two columns in one
 /// statement while a concurrent writer keeps rewriting `a`. `col_x = a` and
 /// `col_y = a + 1` only agree (`col_y == col_x + 1`) if both came from the
-/// same read of a row. A backfill that ran one pass per column would read
-/// `a` twice, and every row the writer changed between the two passes would
+/// same read of a row. A build that ran one pass per column would read `a`
+/// twice, and every row the writer changed between the two passes would
 /// break the invariant.
 ///
-/// The check reads the backfill's own output the moment `ALTER TRANSFORM`
-/// returns, with no live pipeline running. That's deliberate. With a
-/// pipeline, the catch-up the edit parks (issue #305) re-derives every row
-/// from a single source image once it drains, so a converged final state
-/// satisfies the invariant whether or not the backfill was single-pass. The
-/// earlier version of this test asserted on exactly that converged state
-/// and passed with a per-column backfill substituted in (issue #299). It
-/// also spent most of its time waiting for a live pipeline to drain several
-/// hundred thousand enumerated rows under a wall-clock budget. With no
-/// pipeline there is nothing to wait for.
-///
-/// What the old version's final state also touched is covered where it can
-/// be checked directly. The version-fence bump:
-/// `an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock` below,
-/// and `apply.rs`'s
-/// `a_definition_change_on_a_touched_source_trips_the_version_fence`. Rows
-/// changed while the new column was paused getting repaired:
-/// `defs_backfill_chunk_queue.rs`'s
-/// `alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_backfill`.
-/// Live apply writing every column except a paused one:
-/// `column_quarantine.rs`'s
-/// `paused_column_freezes_instead_of_going_null_or_being_overwritten`.
+/// The `ALTER` registers one field build for both columns (#625 F8b), whose
+/// chunks are driven here by hand while the writer runs. No pipeline runs,
+/// so the check reads the chunks' own output: Apply, which writes both
+/// columns from one image too, never touches it.
 #[tokio::test]
-async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
-    // Large enough that each backfill pass takes long enough for the writer
-    // to land many updates inside it.
+async fn one_field_build_reads_each_row_once_under_concurrent_writes() {
     const ROWS: i64 = 20_000;
 
     let cluster = TestCluster::start();
@@ -670,6 +820,18 @@ async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
         persisted_status(&raw, "order_calc").await.as_deref(),
         Some("live"),
         "ALTER TRANSFORM requires a live target"
+    );
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a AS col_x, ADD a + 1 AS col_y")
+        .await
+        .expect("add two columns");
+    let (added, _, _) = into_altered(applied);
+    assert_eq!(added, vec!["col_x".to_string(), "col_y".to_string()]);
+    assert_eq!(
+        chunk_rows(&raw, "order_calc", "plan").await,
+        (1, 0),
+        "one build for both fields"
     );
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -694,25 +856,21 @@ async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
             }
         })
     };
-
-    // Let the writer get going before the edit starts.
     while updates.load(Ordering::Relaxed) == 0 {
         tokio::task::yield_now().await;
     }
     let before = updates.load(Ordering::Relaxed);
-    let applied = trellis
-        .apply("ALTER TRANSFORM order_calc ADD a AS col_x, ADD a + 1 AS col_y")
-        .await
-        .expect("add two columns under write pressure");
+    trellis::staging::build::settle_builds(&db.pool).await;
     let during = updates.load(Ordering::Relaxed) - before;
     stop.store(true, Ordering::Relaxed);
     writer.await.expect("writer task");
-
-    let (added, _, _) = into_altered(applied);
-    assert_eq!(added, vec!["col_x".to_string(), "col_y".to_string()]);
     assert!(
         during > 0,
-        "the writer must have updated rows while the backfill ran, or this test proves nothing"
+        "the writer must have updated rows while the build ran, or this test proves nothing"
+    );
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live")
     );
 
     let rows = raw
@@ -721,18 +879,18 @@ async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
             &[],
         )
         .await
-        .expect("read the backfilled target");
-    assert_eq!(rows.len() as i64, ROWS, "the backfill must cover every row");
+        .expect("read the built target");
+    assert_eq!(rows.len() as i64, ROWS, "the build must cover every row");
     for row in rows {
         let id: i64 = row.get(0);
         let col_x: i64 = row
             .get::<_, Option<String>>(1)
-            .unwrap_or_else(|| panic!("row {id}: col_x must be backfilled"))
+            .unwrap_or_else(|| panic!("row {id}: col_x must be built"))
             .parse()
             .unwrap();
         let col_y: i64 = row
             .get::<_, Option<String>>(2)
-            .unwrap_or_else(|| panic!("row {id}: col_y must be backfilled"))
+            .unwrap_or_else(|| panic!("row {id}: col_y must be built"))
             .parse()
             .unwrap();
         assert_eq!(
@@ -744,8 +902,8 @@ async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
             col_y,
             col_x + 1,
             "row {id}: col_y must equal col_x + 1. This only fails if the two columns were \
-             populated from two different reads of the row, i.e. a backfill per column \
-             rather than a single pass"
+             built from two different reads of the row, i.e. a build per column rather than \
+             one"
         );
     }
 
@@ -816,263 +974,134 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
-/// The column-granularity form of the pause state, checked at a fixed point
-/// in the middle of the backfill rather than raced against it: while
-/// `double_a` is backfilling, `quarantine_status` reports it paused, live
-/// apply leaves it alone, and the rest of the target (its already-live `a`
-/// column) stays readable and keeps taking live changes. That is the ADR's
-/// "the rest of the target stays live."
-///
-/// The backfill writes one PK-range chunk per autocommit statement
-/// (`BACKFILL_CHUNK_ROWS`, 50,000 rows). The test holds it inside its second
-/// chunk with a row trigger on the target that waits on an advisory lock the
-/// test holds, so at the checkpoint the first chunk is committed and the
-/// second is not. Nothing here waits on a live pipeline: the initial build
-/// runs through the chunk queue by hand, and the live change is staged and
-/// drained through `apply::drain_once` by hand.
-///
-/// The earlier version of this test (issue #359) ran a live pipeline over
-/// 150,000 rows and polled `quarantine_status` hoping to catch the paused
-/// state inside the backfill's wall-clock window. It never checked the rest
-/// of the target at all.
+/// The field applies from the `ALTER`'s commit, while its build runs (#625
+/// F8b, B1), and the rest of the target stays live: checked at a fixed
+/// point with one of three chunks built, by hand, with no pipeline running.
+/// A live change to a row the built chunk covered and one to a row no chunk
+/// has reached both reach the new field through Apply, and the rest of the
+/// built and unbuilt rows are as the chunk left them. The build then
+/// finishes with every row right and nothing to catch up: the changed rows
+/// keep their Apply-written values, which the later chunks' snapshots also
+/// see.
 #[tokio::test]
-async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stays_live() {
-    // One row past the first 50,000-row chunk, so the backfill has a second
-    // chunk to be held inside.
-    const ROWS: i64 = 50_001;
-    const GATE_ID: i64 = ROWS;
-    const GATE_KEY: i64 = 359;
-    // Row 1 sits in the already-committed first chunk.
-    const LIVE_ID: i64 = 1;
-    const LIVE_NEW_A: i64 = 1000;
+async fn the_field_applies_while_its_build_runs_and_the_rest_of_the_target_stays_live() {
+    const ROWS: i64 = 2 * trellis::staging::build::DEFAULT_CHUNK_ROWS + 1;
+    // Row 1 is in the first chunk, which the checkpoint has built; row ROWS
+    // is in the last, which it hasn't.
+    const BUILT_ID: i64 = 1;
+    const UNBUILT_ID: i64 = ROWS;
+    const NEW_A: i64 = 1000;
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     seed_orders(&raw, ROWS).await;
 
-    let trellis = Arc::new(define_only(db.dsn()).await);
+    let trellis = define_only(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
         .expect("define");
     drain_backfill_chunks(&db.pool).await;
-    assert_eq!(
-        persisted_status(&raw, "order_calc").await.as_deref(),
-        Some("live"),
-        "ALTER TRANSFORM requires a live target"
-    );
-    // Drain anything the build left in the ring before the gate goes in, or
-    // its re-derive of GATE_ID would wait on the gate (a Re-derive build
-    // parks no go-live catch-up, #625 F8a, so this is belt and braces).
     let mut ring = connect_raw(db.dsn()).await;
     drain_to_quiescence(&db.pool, &mut ring).await;
 
-    // The gate: any write to the target's GATE_ID row waits for GATE_KEY,
-    // which `gate` holds until the checkpoint is done.
-    raw.batch_execute(&format!(
-        "create function public.alter_transform_test_gate() returns trigger \
-         language plpgsql as $$ begin \
-             if new.id = {GATE_ID} then perform pg_advisory_xact_lock_shared({GATE_KEY}); end if; \
-             return new; \
-         end $$; \
-         create trigger alter_transform_test_gate \
-             before insert or update on {DEFAULT_TARGET_SCHEMA}.order_calc \
-             for each row execute function public.alter_transform_test_gate();"
-    ))
-    .await
-    .expect("install the backfill gate");
-    let gate = connect_raw(db.dsn()).await;
-    gate.execute("select pg_advisory_lock($1)", &[&GATE_KEY])
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
         .await
-        .expect("close the gate");
+        .expect("add a column");
+    run_one(&db.pool, chunk_queue::KIND_PLAN).await;
+    run_one(&db.pool, chunk_queue::KIND_REDERIVE).await;
 
-    let alter = {
-        let trellis = Arc::clone(&trellis);
-        tokio::spawn(async move {
-            trellis
-                .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
-                .await
-        })
-    };
-
-    // Not a race: once the backfill reaches the gate it stays there until
-    // the test opens it. The timeout only turns a backfill that never gets
-    // there into a failure instead of a hang.
-    poll_until(
-        Duration::from_secs(60),
-        "the backfill must reach the gated row in its second chunk",
-        async || {
-            raw.query_one(
-                "select count(*) from pg_locks \
-                 where locktype = 'advisory' and not granted and objid = $1::bigint::oid \
-                   and database = (select oid from pg_database where datname = current_database())",
-                &[&GATE_KEY],
-            )
-            .await
-            .expect("read pg_locks")
-            .get::<_, i64>(0)
-                > 0
-        },
-    )
-    .await;
-    assert!(
-        !alter.is_finished(),
-        "the ALTER must still be running while its backfill is held"
-    );
-
-    // Checkpoint: the first chunk is committed, the second isn't.
-    //
-    // 1. The new column reports paused.
+    // Checkpoint: the first chunk is built, the other two aren't.
     let entry = trellis
         .quarantine_status("order_calc.double_a")
         .await
         .expect("status");
     assert_eq!(
         entry.state,
-        trellis::QuarantineState::Paused,
-        "the new column must report paused while its backfill is in flight"
+        trellis::QuarantineState::Live,
+        "the field applies while it builds: nothing pauses it"
     );
+    let chunk = trellis::staging::build::DEFAULT_CHUNK_ROWS;
+    assert_eq!(built(&raw).await, (chunk, ROWS - chunk, 0));
 
-    // 2. The target stays readable. A lock timeout turns a backfill that
-    //    locked readers out into a failure instead of a hang.
-    raw.batch_execute("set lock_timeout = '10s'")
+    // Live changes to a built row and an unbuilt one, through Apply.
+    for id in [BUILT_ID, UNBUILT_ID] {
+        raw.execute(
+            "update orders set a = $1::bigint where id = $2",
+            &[&NEW_A, &id],
+        )
         .await
-        .expect("set lock_timeout");
+        .expect("update the source row");
+        stage_orders_update(&raw, id, id, NEW_A).await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        drain_to_quiescence(&db.pool, &mut ring),
+    )
+    .await
+    .expect("live apply must not wait on the build");
+    for id in [BUILT_ID, UNBUILT_ID] {
+        let row = raw
+            .query_one(
+                &format!(
+                    "select a::text, double_a::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                     where id = $1"
+                ),
+                &[&id],
+            )
+            .await
+            .expect("read the live row");
+        assert_eq!(
+            (row.get::<_, String>(0), row.get::<_, Option<String>>(1)),
+            (NEW_A.to_string(), Some((2 * NEW_A).to_string())),
+            "row {id}: Apply writes the building field from its change's image"
+        );
+    }
+    // Every other row is as the build left it: the first chunk built, the
+    // rest not yet. (Row 1 counts as built and with `a` changed, row ROWS as
+    // built.)
+    assert_eq!(built(&raw).await, (chunk + 1, ROWS - chunk - 1, 2));
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live"),
+        "the build's last chunk flips the definition `live`, with no catch-up"
+    );
+    let wrong: i64 = raw
+        .query_one(
+            &format!(
+                "select count(*) from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 where double_a is distinct from a + a"
+            ),
+            &[],
+        )
+        .await
+        .expect("check the target")
+        .get(0);
+    assert_eq!(wrong, 0, "at `live` every row's field is right");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `order_calc`'s rows whose `double_a` is built (`a + a`), whose
+/// `double_a` is still null, and whose `a` differs from its seed.
+async fn built(raw: &Client) -> (i64, i64, i64) {
     let row = raw
         .query_one(
             &format!(
-                "select count(*), \
-                        count(*) filter (where double_a is not null), \
-                        count(*) filter (where double_a is distinct from a + a and double_a is not null), \
+                "select count(*) filter (where double_a = a + a), \
+                        count(*) filter (where double_a is null), \
                         count(*) filter (where a is distinct from id) \
                  from {DEFAULT_TARGET_SCHEMA}.order_calc"
             ),
             &[],
         )
         .await
-        .expect("the target must stay readable while the new column backfills");
-    let (total, populated, wrong, stale_a): (i64, i64, i64, i64) =
-        (row.get(0), row.get(1), row.get(2), row.get(3));
-    assert_eq!(total, ROWS, "every row stays in the target");
-    assert_eq!(stale_a, 0, "the already-live column keeps its values");
-    assert!(
-        populated > 0 && populated < ROWS,
-        "the checkpoint must fall mid-backfill, with the first chunk committed and the \
-         second not (populated {populated} of {ROWS}); if BACKFILL_CHUNK_ROWS changed, \
-         resize ROWS"
-    );
-    assert_eq!(wrong, 0, "the committed chunk wrote double_a = a + a");
-
-    // 3. Live apply keeps writing the already-live column and leaves the
-    //    paused one alone. Row LIVE_ID's double_a was backfilled from a = 1,
-    //    so it must stay 2: neither recomputed to 2000 nor nulled.
-    raw.execute(
-        "update orders set a = $1::bigint where id = $2",
-        &[&LIVE_NEW_A, &LIVE_ID],
-    )
-    .await
-    .expect("update the source row");
-    stage_orders_update(&raw, LIVE_ID, LIVE_ID, LIVE_NEW_A).await;
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        drain_to_quiescence(&db.pool, &mut ring),
-    )
-    .await
-    .expect("live apply must not wait on the in-flight backfill");
-    let row = raw
-        .query_one(
-            &format!(
-                "select a::text, double_a::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
-                 where id = $1"
-            ),
-            &[&LIVE_ID],
-        )
-        .await
-        .expect("read the live row");
-    assert_eq!(
-        row.get::<_, Option<String>>(0).as_deref(),
-        Some(LIVE_NEW_A.to_string().as_str()),
-        "live apply must keep writing the already-live column while the new one backfills"
-    );
-    assert_eq!(
-        row.get::<_, Option<String>>(1).as_deref(),
-        Some("2"),
-        "live apply must leave the paused column at its backfilled value"
-    );
-
-    // Open the gate. The edit finishes and the column goes live.
-    gate.execute("select pg_advisory_unlock($1)", &[&GATE_KEY])
-        .await
-        .expect("open the gate");
-    let applied = alter
-        .await
-        .expect("join the ALTER")
-        .expect("the ALTER completes once the gate opens");
-    let (added, _, _) = into_altered(applied);
-    assert_eq!(added, vec!["double_a".to_string()]);
-
-    let entry = trellis
-        .quarantine_status("order_calc.double_a")
-        .await
-        .expect("status");
-    assert_eq!(entry.state, trellis::QuarantineState::Live);
-
-    // Every row is backfilled. Row LIVE_ID is left out of the value check:
-    // its chunk read a = 1 before the live change, and repairing that is the
-    // catch-up's job (`defs_backfill_chunk_queue.rs`'s
-    // `alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_backfill`).
-    let row = raw
-        .query_one(
-            &format!(
-                "select count(*) filter (where double_a is null), \
-                        count(*) filter (where id <> $1 and double_a is distinct from a + a) \
-                 from {DEFAULT_TARGET_SCHEMA}.order_calc"
-            ),
-            &[&LIVE_ID],
-        )
-        .await
-        .expect("read the backfilled target");
-    let (missing, wrong): (i64, i64) = (row.get(0), row.get(1));
-    assert_eq!(missing, 0, "the backfill must cover every row");
-    assert_eq!(wrong, 0, "every backfilled double_a must equal a + a");
-
-    // Issue #476: row LIVE_ID still holds the stale double_a, so the target
-    // isn't in its steady state and the definition doesn't report `live`
-    // (it keeps applying meanwhile). The staging worker's next pass runs the
-    // catch-up and flips it; once that drains, the row is repaired.
-    assert_eq!(
-        persisted_status(&raw, "order_calc").await.as_deref(),
-        Some("catching_up"),
-        "an ALTER that added a column leaves its catch-up to run before `live`"
-    );
-    trellis::intake::markers::discharge_registrations(&db.pool)
-        .await
-        .expect("discharge the ALTER's catch-up");
-    assert_eq!(
-        persisted_status(&raw, "order_calc").await.as_deref(),
-        Some("live")
-    );
-    drain_to_quiescence(&db.pool, &mut ring).await;
-    let double_a: String = raw
-        .query_one(
-            &format!("select double_a::text from {DEFAULT_TARGET_SCHEMA}.order_calc where id = $1"),
-            &[&LIVE_ID],
-        )
-        .await
-        .expect("read the repaired row")
-        .get(0);
-    assert_eq!(
-        double_a,
-        (2 * LIVE_NEW_A).to_string(),
-        "at `live`, the row changed mid-backfill is repaired"
-    );
-
-    Arc::into_inner(trellis)
-        .expect("the ALTER task released its handle")
-        .shutdown()
-        .await
-        .expect("shutdown");
+        .expect("the target stays readable while the field builds");
+    (row.get(0), row.get(1), row.get(2))
 }
 
 /// `(local_fuse, cascade edges into it)` for `transform.column`'s
@@ -1245,18 +1274,18 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #309, the mid-backfill half: a pause that lands on a field *while*
-/// `ALTER TRANSFORM`'s own backfill of it is still running takes that pause
-/// over, so the `ALTER`'s closing unpause must leave it alone. An operator
-/// pause upgrades the `ALTER`'s row to `local_fuse`; an upstream pause
-/// cascading onto it leaves the row as it was but records an edge into it.
+/// Issue #309, the mid-build half: a pause that lands on a field *while*
+/// its field build runs (#625 F8b) holds the field out of the build's
+/// remaining chunks, and survives the build: an operator pause stays
+/// `local_fuse`, and an upstream pause cascading onto it keeps its edge.
+/// The field nothing paused is built.
 ///
 /// Deterministic rather than timing-based: the test holds an `ACCESS
 /// EXCLUSIVE` lock on the edited definition's source table, which blocks the
-/// backfill's first read of it (its own pause is committed before that
-/// read), so the `ALTER` cannot reach its unpause until the lock is released.
+/// build's plan job (its walk reads the source) but not the `ALTER`, which
+/// only registers the build and so returns with the source still locked.
 #[tokio::test]
-async fn a_pause_landing_mid_alter_backfill_survives_the_alters_unpause() {
+async fn a_pause_landing_mid_field_build_survives_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -1277,7 +1306,7 @@ async fn a_pause_landing_mid_alter_backfill_survives_the_alters_unpause() {
         .expect("define the chained 1-1 target");
     wait_for_live(&raw, "order_next").await;
 
-    // Freeze the backfill: `order_calc` is `order_next`'s source.
+    // Freeze the build: `order_calc` is `order_next`'s source.
     let mut locker = connect_raw(db.dsn()).await;
     let lock = locker.transaction().await.expect("begin the lock holder");
     lock.batch_execute(&format!(
@@ -1286,75 +1315,72 @@ async fn a_pause_landing_mid_alter_backfill_survives_the_alters_unpause() {
     .await
     .expect("lock the ALTER's source table");
 
-    let alter = {
-        let dsn = db.dsn().to_string();
-        tokio::spawn(async move {
-            let trellis = define_only(&dsn).await;
-            let applied = trellis
-                .apply(
-                    "ALTER TRANSFORM order_next \
-                     ADD total + total AS t3, ADD a2 + 1 AS a3, ADD a2 + 2 AS a4",
-                )
-                .await
-                .expect("add three columns");
-            trellis.shutdown().await.expect("shutdown");
-            applied
-        })
-    };
-
-    // The ALTER's own pauses are committed before its backfill touches the
-    // (locked) source, so seeing all three means it is parked mid-backfill.
-    poll_until(
-        Duration::from_secs(30),
-        "the ALTER must commit its own pauses before backfilling",
-        async || {
-            let n: i64 = raw
-                .query_one(
-                    "select count(*) from column_status \
-                     where transform_table = 'order_next' \
-                       and column_name in ('t3', 'a3', 'a4')",
-                    &[],
-                )
-                .await
-                .expect("count the ALTER's pauses")
-                .get(0);
-            n == 3
-        },
-    )
-    .await;
-    assert!(!alter.is_finished(), "the backfill must still be blocked");
-
+    // The ALTER returns with its source still locked: it reads nothing of it.
     let operator = define_only(db.dsn()).await;
-    // An operator pause on one field the ALTER is backfilling...
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        operator.apply(
+            "ALTER TRANSFORM order_next \
+             ADD total + total AS t3, ADD a2 + 1 AS a3, ADD a2 + 2 AS a4",
+        ),
+    )
+    .await
+    .expect("the ALTER must not wait on its source")
+    .expect("add three columns");
+    assert_eq!(
+        persisted_status(&raw, "order_next").await.as_deref(),
+        Some("backfilling")
+    );
+    // An operator pause on one field the build is building...
     operator
         .apply("PAUSE TRANSFORM order_next.a3")
         .await
-        .expect("pause a3 mid-backfill");
+        .expect("pause a3 mid-build");
     // ...and an upstream pause that cascades onto another (`t3` reads
     // `total`).
     operator
         .apply("PAUSE TRANSFORM order_calc.total")
         .await
-        .expect("pause the upstream column mid-backfill");
-    assert!(!alter.is_finished(), "the backfill must still be blocked");
+        .expect("pause the upstream column mid-build");
+    assert_eq!(
+        persisted_status(&raw, "order_next").await.as_deref(),
+        Some("backfilling"),
+        "the build must still be blocked"
+    );
 
     lock.rollback().await.expect("release the source lock");
-    alter.await.expect("alter task");
+    wait_for_live(&raw, "order_next").await;
 
     assert_eq!(
         column_pause_state(&raw, "order_next", "a3").await,
         Some((true, 0)),
-        "an operator pause taken mid-backfill must survive the ALTER's unpause"
+        "an operator pause taken mid-build must survive the build"
     );
     assert_eq!(
         column_pause_state(&raw, "order_next", "t3").await,
         Some((false, 1)),
-        "a cascade onto the field mid-backfill must survive the ALTER's unpause"
+        "a cascade onto the field mid-build must survive the build"
     );
     assert_eq!(
         column_pause_state(&raw, "order_next", "a4").await,
         None,
-        "a field nothing else paused is still released by the ALTER"
+        "a field nothing else paused is built and stays applying"
+    );
+    let row = raw
+        .query_one(
+            &format!(
+                "select count(*) filter (where a3 is not null or t3 is not null), \
+                        count(*) filter (where a4 is distinct from a2 + 2) \
+                 from {DEFAULT_TARGET_SCHEMA}.order_next"
+            ),
+            &[],
+        )
+        .await
+        .expect("read order_next");
+    assert_eq!(
+        (row.get::<_, i64>(0), row.get::<_, i64>(1)),
+        (0, 0),
+        "the build writes a4 and leaves the two paused fields alone"
     );
 
     operator.shutdown().await.expect("shutdown");

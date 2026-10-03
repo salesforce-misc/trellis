@@ -43,15 +43,14 @@ use tokio_postgres::{GenericClient, Transaction};
 use crate::defs::ast::KeySpace;
 use crate::defs::catalog;
 use crate::defs::ddl::{self, DdlError};
-use crate::defs::model::{Definition, TransformStatus};
-use crate::pool::{Pool, quote_ident};
+use crate::defs::model::TransformStatus;
+use crate::pool::Pool;
 
 #[cfg(any(test, feature = "internals"))]
 use super::append::{self, StagedChange};
 use super::append::{RING_SIZE, ring_table_name};
 use super::apply::{self, ApplyError};
 use super::fold::FoldedChange;
-use super::target_mutations::TargetMutations;
 use super::watermark::StagedWatermark;
 
 /// The fuse threshold ADR-0003 left open, decided here: a key evicts once
@@ -2237,24 +2236,28 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
     cascade_pause(pool, transform, column).await
 }
 
-/// Resumes a paused column: clears its counter, recomputes its value across
-/// every existing row ([`recompute_column`]), clears its `column_status` row
-/// and outgoing cascade edges, then un-cascades every dependent this pause
-/// reached — but only a dependent with *no other* remaining reason to stay
-/// paused (no `local_fuse` of its own, and no other live
+/// Resumes a paused column: clears its counter and its `column_status` row
+/// and outgoing cascade edges, starts a field build that rewrites its value
+/// across every existing row (#625 F8b), then un-cascades every dependent
+/// this pause reached — but only a dependent with *no other* remaining
+/// reason to stay paused (no `local_fuse` of its own, and no other live
 /// `column_pause_cascades` edge into it — decision: careful not to un-pause
 /// a dependent that has its own independent reason to stay paused). Returns
 /// every `(transform, column)` pair actually resumed, `transform`/`column`
 /// itself first, in the order resumed.
 ///
-/// Each pair's unpause also parks a `pending_backfill` catch-up marker for
-/// its definition's source table, in the same transaction (issue #305): the
-/// recompute reads the source once, so a row changed after that read — its
-/// delta applied while the column was still paused — would otherwise keep a
-/// stale value forever. The marker's discharge re-derives every row with the
-/// column unpaused, the same closed loop
-/// `defs::catalog::complete_direct_backfill` ends a first `define`'s chunked
-/// build with.
+/// **The field build** (`super::build::start_field_build`). Each 1-1 pair's
+/// unpause and its field build's registration commit together: the
+/// definition moves `live -> backfilling` (one already under a Re-derive
+/// build keeps building) and the drain workers rewrite the column in the
+/// background, so the call returns at once (#666) and the definition reads
+/// `backfilling` until the column is rebuilt. The column applies from that
+/// commit, as a new definition does under the Re-derive build (#625 B1):
+/// every page after it writes the column from its change's image, and each
+/// chunk rewrites it under the keys' entry lock, so a row changed while the
+/// build runs needs no catch-up. An aggregate's column is never held out of
+/// Apply (only a 1-1 plan drops paused columns, `apply::compute`), so its
+/// resume only unpauses it.
 ///
 /// Errors with [`ApplyError::ColumnNotPaused`] if `(transform, column)`
 /// isn't currently paused — resuming a live column is caller error, not a
@@ -2264,19 +2267,14 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 ///
 /// Errors with [`ApplyError::DefinitionNotLive`] — with no side effects at
 /// all, checked before any of this function's deletes run — if `transform`
-/// isn't currently applying ([`TransformStatus::is_applying`]: `live`, or
-/// `catching_up` once its build has finished; most concretely, still
-/// `Backfilling` behind an in-flight `backfill_chunks` queue). See that
-/// variant's doc comment for why: [`recompute_column`] takes one snapshot of
-/// the source table, and a row a still-running backfill chunk inserts into
-/// the target during that window would never be revisited once
-/// `column_status` is cleared, permanently stranding it. The same check
-/// applies per-pair inside the cascade queue below; a downstream pair
-/// blocked on its own definition not being live yet is simply left paused
-/// (not resumed, not an abort of the whole call) rather than risking the
-/// same bug one hop down — by the time a downstream pair is reached, any
-/// upstream pairs earlier in the queue have already been fully resumed and
-/// committed, so there is nothing left to roll back.
+/// doesn't apply (`super::build::takes_field_build`, a field build's
+/// precondition: `live`, `catching_up`, or under a Re-derive build). A
+/// definition still behind an old-path build is the concrete case: its rows
+/// are still being written by a build that skips the paused column. The same check applies per-pair inside the cascade queue below;
+/// a downstream pair blocked on its own definition is simply left paused
+/// (not resumed, not an abort of the whole call) — by the time a downstream
+/// pair is reached, any upstream pairs earlier in the queue have already
+/// been fully resumed and committed, so there is nothing left to roll back.
 #[tracing::instrument(
     name = "quarantine.resume_column",
     skip(pool),
@@ -2321,12 +2319,19 @@ pub async fn resume_column(
         // the catalog) isn't this function's problem to police — fall
         // through and let the loop below's own lookup handle it the way it
         // already does.
-        if let Some(def) = catalog::definition_by_target(pool, transform).await?
-            && !def.status.is_applying()
-        {
-            return Err(ApplyError::DefinitionNotLive {
-                transform: transform.to_string(),
-            });
+        if let Some(def) = catalog::definition_by_target(pool, transform).await? {
+            let build: Option<String> = client
+                .query_one(
+                    "select build from transform_definitions where id = $1",
+                    &[&def.id],
+                )
+                .await?
+                .get(0);
+            if !super::build::takes_field_build(def.status, build.as_deref()) {
+                return Err(ApplyError::DefinitionNotLive {
+                    transform: transform.to_string(),
+                });
+            }
         }
 
         client
@@ -2351,48 +2356,54 @@ pub async fn resume_column(
         let Some(def) = catalog::definition_by_target(pool, &t).await? else {
             continue;
         };
-        if !def.status.is_applying() {
+        let mut client = pool.get().await?;
+        let txn = client.transaction().await?;
+        let row = txn
+            .query_one(
+                "select status, build from transform_definitions where id = $1 for update",
+                &[&def.id],
+            )
+            .await?;
+        let status_text: String = row.get(0);
+        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+            panic!("transform_definitions.status held unrecognized value '{status_text}'")
+        });
+        let build: Option<String> = row.get(1);
+        if !super::build::takes_field_build(status, build.as_deref()) {
             // Reached via cascade (the initial pair was already gated above
-            // before any side effects ran): a downstream dependent this
-            // pause cascaded onto (`column_dependents`, unlike the
+            // before any side effects ran, and a definition that left the
+            // state since is caught the same way): a downstream dependent
+            // this pause cascaded onto (`column_dependents`, unlike the
             // applying-status-filtered lookups CDC apply uses, does not
-            // require the dependent to be applying) can still be mid-backfill.
+            // require the dependent to be applying) can still be mid-build.
             // Aborting the whole call here would misrepresent what already
             // happened, since earlier pairs in this queue may already be
             // fully resumed and committed — instead this pair alone is left
             // exactly as it was, still paused, to be resumed on a later
-            // call once its own build has finished.
+            // call.
+            txn.rollback().await?;
             continue;
         }
-        recompute_column(pool, &def, &c).await?;
+        if !def.def.fields.iter().any(|f| f.name == c) {
+            return Err(ApplyError::ColumnNotPaused {
+                transform: def.def.target.clone(),
+                column: c.to_string(),
+            });
+        }
 
-        // Unpause and park a catch-up marker in one transaction (issue
-        // #305). `recompute_column` read the source under one snapshot, and
-        // until `column_status` is cleared live CDC apply skips `c`: a row
-        // changed after that read had its delta applied to every *other*
-        // column, leaving `c` at the recompute's pre-change value, and
-        // nothing would ever revisit it once unpaused. The marker is the same
-        // closed loop a first `define`'s chunked build ends with
-        // (`defs::catalog::complete_direct_backfill`): once its fence
-        // settles, `run_pending_backfills` re-enumerates the source and
-        // re-derives every row with `c` unpaused. It must become visible
-        // atomically with the unpause — a marker discharged while `c` is
-        // still paused would re-open exactly this gap.
-        let mut client = pool.get().await?;
-        let txn = client.transaction().await?;
+        // The unpause and the field build's registration commit together
+        // (#625 F8b): the column applies from this commit, and the build's
+        // chunks rewrite it under the keys' entry lock, so nothing needs a
+        // catch-up. See this function's doc comment.
         txn.execute(
             "delete from column_status where transform_table = $1 and column_name = $2",
             &[&t, &c],
         )
         .await?;
-        // Issue #476: until that discharge, the definition reports
-        // `catching_up` (it keeps applying).
-        crate::intake::markers::park_catch_up(
-            &*txn,
-            &[def.id],
-            std::slice::from_ref(&def.source_table),
-        )
-        .await?;
+        if matches!(def.def.key_space, KeySpace::OneToOne) {
+            super::build::start_field_build(&*txn, def.id, status, std::slice::from_ref(&c))
+                .await?;
+        }
         let affected = txn
             .query(
                 "delete from column_pause_cascades \
@@ -2418,7 +2429,7 @@ pub async fn resume_column(
             };
             let (local_fuse, awaiting_capture): (bool, bool) = (status.get(0), status.get(1));
             // #687: a field awaiting its capture widen stays paused; with
-            // this cascade gone, its catch-up's discharge unpauses it.
+            // this cascade gone, its field build's start unpauses it.
             if local_fuse || awaiting_capture {
                 continue;
             }
@@ -2648,103 +2659,6 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     );
     Ok(())
 }
-
-/// Re-derives every current row of `def`'s source with `column` written
-/// again — [`resume_column`]'s "re-run the backfill for just this column's
-/// formula against already-built rows" (ADR-0003's amendment).
-///
-/// Each chunk of [`RECOMPUTE_COLUMN_CHUNK`] keys is one Re-derive on the
-/// target's ledger (`apply::DirectRederive`, #623 D6), in its own short
-/// transaction, as a page Re-derives a key: the chunk's entries are locked
-/// in key order, the rows are read with the snapshot that stamps each
-/// entry's `basis`, and only a row whose values change is written, through
-/// the target-mutation seam (issue #315). A concurrent page's Apply of a
-/// change the read already saw is then refused (ADR-0002 I2), so a resume
-/// can't be overwritten by an older image, nor overwrite a newer one.
-///
-/// Every other column still paused is left as it is: `column` itself is
-/// still paused in `column_status` here (`resume_column` deletes that row
-/// after this returns), so it is taken out of the exclusion. A quarantined
-/// key, and a key with a `NULL` part (only an aggregate target, keyed by a
-/// nullable unique index, has those; no 1-1 target row can represent one,
-/// issue #205), are left out, as a first build leaves them out. A row that
-/// still fails to evaluate is left as it is rather than aborting the resume,
-/// and can re-trip the fuse later through live CDC.
-async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result<(), ApplyError> {
-    /// A chunk's attempts while the tombstone GC keeps collecting an entry
-    /// the chunk locks (#712), before the error is returned.
-    const ATTEMPTS: usize = 8;
-    if !def.def.fields.iter().any(|f| f.name == column) {
-        return Err(ApplyError::ColumnNotPaused {
-            transform: def.def.target.clone(),
-            column: column.to_string(),
-        });
-    }
-    // Issue #315: an aggregate column has nothing to recompute here. The
-    // aggregate apply path never honors a column pause (only a 1-1 plan
-    // drops paused columns — see `apply::compute`), so the column was never
-    // frozen, and the catch-up marker `resume_column` parks re-derives every
-    // group through the ordinary drain path anyway.
-    if matches!(def.def.key_space, KeySpace::Aggregate { .. }) {
-        return Ok(());
-    }
-
-    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
-    let pk_key_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
-    let not_null = pk
-        .iter()
-        .map(|c| format!("t.{} is not null", quote_ident(&c.name)))
-        .collect::<Vec<_>>()
-        .join(" and ");
-    let client = pool.get().await?;
-    let keys: Vec<String> = client
-        .query(
-            &format!(
-                "select {pk_key_expr} from {} t where {not_null} and not exists \
-                 (select 1 from poison p where p.src_table = $1 and p.key = {pk_key_expr})",
-                ddl::qualified_source_table(&def.source_table),
-            ),
-            &[&def.source_table],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    drop(client);
-
-    let mut excluded = paused_columns_for(pool, &def.def.target).await?;
-    excluded.remove(column);
-    for chunk in keys.chunks(RECOMPUTE_COLUMN_CHUNK) {
-        let rederive = apply::DirectRederive::new(
-            pool,
-            &def.def,
-            &def.source_table,
-            &def.target_table,
-            &def.source_columns,
-            excluded.clone(),
-            true,
-            chunk,
-        )
-        .await?;
-        let mut client = pool.get().await?;
-        for attempt in 1.. {
-            let txn = client.transaction().await?;
-            let mut mutations = TargetMutations::new();
-            match rederive.settle(&txn, &mut mutations).await {
-                Ok(()) => {}
-                Err(ApplyError::LedgerEntryCollected { .. }) if attempt < ATTEMPTS => continue,
-                Err(err) => return Err(err),
-            }
-            mutations.flush(&txn).await?;
-            txn.commit().await?;
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// How many keys [`recompute_column`] re-derives per transaction.
-const RECOMPUTE_COLUMN_CHUNK: usize = 1000;
 
 // ---------------------------------------------------------------------
 // Release
@@ -2986,6 +2900,7 @@ pub async fn halting_stop_stats(pool: &Pool) -> Result<HaltingStopStats, ApplyEr
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::defs::model::Definition;
 
     fn probe(src: &str, key: &str) -> PoisonedProbe {
         PoisonedProbe {

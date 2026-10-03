@@ -76,7 +76,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::chunk_queue::ClaimFence;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
-use crate::staging::target_mutations::TargetMutations;
 use tokio_postgres::GenericClient;
 
 use super::ast::{
@@ -118,9 +117,8 @@ pub enum BackfillError {
     /// enumeration instead (ADR-0016's dispatch by shape).
     Unsupported(String),
     /// Staging a changed row's downstream propagation through the
-    /// target-mutation seam failed (issue #315) — only reachable from
-    /// [`backfill_altered_columns`], the one writer here whose target can
-    /// already have readers.
+    /// target-mutation seam failed (issue #315), wrapped where a backfill
+    /// error is expected.
     Propagation(Box<crate::staging::ApplyError>),
     /// The chunk-queue claim this build ran under no longer holds (issue
     /// #434): its definition was resumed since the claim was taken, or the
@@ -615,102 +613,40 @@ async fn backfill_one_to_one(
     Ok(())
 }
 
-/// Populates every one of `written_fields` across `def`'s target in one
-/// source enumeration — `ALTER TRANSFORM`'s single-pass column-add/alter
-/// backfill (`catalog::alter_transform`, ADR-0015, issue #241), over the
-/// same `(lo, hi]` PK ranges a first build walks.
-///
-/// Each range is one Re-derive of its keys on the target's ledger
-/// (`staging::apply::DirectRederive`, #623 D6), as a page Re-derives a key:
-/// the range's entries are locked in key order, the rows are read with the
-/// snapshot that stamps each entry's `basis`, and only a row whose values
-/// change is written, through the target-mutation seam (issue #315). A
-/// concurrent page's Apply of a change the read already saw is then refused
-/// (ADR-0002 I2), and one the read didn't see waits on the entry lock.
-///
-/// `def` is the *merged* (already-edited) field list. `written_fields` are
-/// paused by `alter_transform` for exactly this call, which writes them
-/// anyway — the one write path allowed to touch a paused column is the
-/// operator-driven recompute that owns the pause, as
-/// `staging::quarantine::resume_column`'s `recompute_column` does. Every
-/// other paused column is left as it is. A quarantined key and a key with a
-/// `NULL` part are left out, as a first build leaves them out.
-///
-/// Relationship-free 1-1 only ([`uses_relationships`] is `alter_transform`'s
-/// own gate before this is ever called).
-pub(crate) async fn backfill_altered_columns(
-    pool: &Pool,
-    def: &TransformDef,
+/// The encoded keys of `source_table`'s rows in `(lo, hi]` of its primary
+/// key `pk`, leaving out a quarantined key and a key with a `NULL` part, as
+/// a first build leaves them out: a field build's chunk over a target the
+/// Re-derive build's SQL can't render (a relationship-enriched 1-1, #625
+/// F8b, `staging::build`).
+pub(crate) async fn range_keys(
+    client: &impl GenericClient,
     source_table: &str,
-    target_table: &str,
-    source_columns: &HashMap<String, ValueType>,
-    written_fields: &HashSet<String>,
-) -> Result<(), BackfillError> {
-    /// A range's attempts while the tombstone GC keeps collecting an entry
-    /// the range locks (#712), before the error is returned.
-    const ATTEMPTS: usize = 8;
-    let pk = source_primary_key(pool, source_table).await?;
+    pk: &[PrimaryKeyColumn],
+    lo: &Option<Vec<String>>,
+    hi: &[String],
+) -> Result<Vec<String>, BackfillError> {
     let source = ddl::qualified_source_table(source_table);
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let mut client = pool.get().await?;
-    let excluded: HashSet<String> = paused_columns_for(&**client, &def.target)
+    let mut params = range_params(lo, hi);
+    let where_clause = format!(
+        "{} and {} and {}",
+        pk_range_where(&pk_idents, pk, lo),
+        key_not_null(&pk_idents),
+        not_quarantined(pk, params.len() + 1),
+    );
+    params.push(&source_table);
+    Ok(client
+        .query(
+            &format!(
+                "select {} from {source} as {SOURCE_ALIAS} where {where_clause}",
+                ddl::pk_key_sql_expr(pk, Some(SOURCE_ALIAS)),
+            ),
+            &params,
+        )
         .await?
         .into_iter()
-        .filter(|name| !written_fields.contains(name))
-        .collect();
-    for (lo, hi) in discover_pk_ranges(&**client, &source, &pk).await? {
-        let mut params = range_params(&lo, &hi);
-        let where_clause = format!(
-            "{} and {} and {}",
-            pk_range_where(&pk_idents, &pk, &lo),
-            key_not_null(&pk_idents),
-            not_quarantined(&pk, params.len() + 1),
-        );
-        params.push(&source_table);
-        let keys: Vec<String> = client
-            .query(
-                &format!(
-                    "select {} from {source} as {SOURCE_ALIAS} where {where_clause}",
-                    ddl::pk_key_sql_expr(&pk, Some(SOURCE_ALIAS)),
-                ),
-                &params,
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        if keys.is_empty() {
-            continue;
-        }
-        let rederive = crate::staging::apply::DirectRederive::new(
-            pool,
-            def,
-            source_table,
-            target_table,
-            source_columns,
-            excluded.clone(),
-            false,
-            &keys,
-        )
-        .await?;
-        for attempt in 1.. {
-            let txn = client.transaction().await?;
-            let mut mutations = TargetMutations::new();
-            match rederive.settle(&txn, &mut mutations).await {
-                Ok(()) => {}
-                Err(crate::staging::apply::ApplyError::LedgerEntryCollected { .. })
-                    if attempt < ATTEMPTS =>
-                {
-                    continue;
-                }
-                Err(err) => return Err(err.into()),
-            }
-            mutations.flush(&txn).await?;
-            txn.commit().await?;
-            break;
-        }
-    }
-    Ok(())
+        .map(|row| row.get(0))
+        .collect())
 }
 
 /// The bind parameters [`pk_range_where`]'s clause expects for `(lo, hi]`:

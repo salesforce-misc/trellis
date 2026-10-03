@@ -123,6 +123,13 @@ pub struct BuildUnderLoad {
     /// amt AS dbl` instead of the aggregate (#625 F8a), and the oracle
     /// compares it row by row.
     pub one_to_one: bool,
+    /// `--apply-latency` (with `--one-to-one`): once the target is `live`,
+    /// time every statement `apply` accepts with the writers running
+    /// ([`apply_latency`](super::apply_latency), #666, #625 F8b).
+    pub apply_latency: bool,
+    /// `--apply-latency-big-to-side`: the audit also declares a
+    /// relationship whose to-side is the loaded source.
+    pub apply_big_to_side: bool,
 }
 
 impl BuildUnderLoad {
@@ -221,6 +228,8 @@ impl WriterTally {
 #[derive(Debug)]
 pub struct BuildUnderLoadResult {
     pub cfg: BuildUnderLoad,
+    /// `--apply-latency`'s audit.
+    pub apply: Option<super::apply_latency::ApplyAudit>,
     pub application_threads: usize,
     /// The engine's `build_chunk_rows` (#625 F2).
     pub build_chunk_rows: i64,
@@ -390,6 +399,15 @@ fn opt_f(v: Option<f64>) -> String {
 
 impl BuildUnderLoadResult {
     pub fn to_json(&self, scenario: &str) -> String {
+        let mut json = self.to_json_without_apply(scenario);
+        if let Some(apply) = &self.apply {
+            json.pop();
+            json.push_str(&format!(",\"apply\":{}}}", apply.to_json()));
+        }
+        json
+    }
+
+    fn to_json_without_apply(&self, scenario: &str) -> String {
         let writes_issued = KINDS
             .iter()
             .zip(self.writes.issued)
@@ -479,6 +497,13 @@ impl BuildUnderLoadResult {
     }
 
     pub fn human(&self) -> String {
+        match &self.apply {
+            Some(apply) => format!("{}\n{}", self.human_without_apply(), apply.human()),
+            None => self.human_without_apply(),
+        }
+    }
+
+    fn human_without_apply(&self) -> String {
         let w = &self.writes;
         format!(
             "build-under-load: {} rows / {} groups, loaded at {:.0} rows/s; build {:.1}s over {} \
@@ -1007,6 +1032,24 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         cfg.post_live.as_secs_f64()
     );
 
+    let apply = if cfg.apply_latency {
+        assert!(cfg.one_to_one, "--apply-latency needs --one-to-one");
+        Some(
+            super::apply_latency::run(
+                db.dsn(),
+                &raw,
+                SOURCE,
+                TARGET,
+                cfg.groups,
+                cfg.apply_big_to_side,
+                cfg.build_timeout,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
     tokio::time::sleep(cfg.post_live).await;
     shared.stop.store(true, Ordering::Relaxed);
     let mut writes = WriterTally::default();
@@ -1100,6 +1143,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
 
     BuildUnderLoadResult {
         cfg,
+        apply,
         application_threads: tuning.application_threads,
         build_chunk_rows: tuning.build_chunk_rows,
         build,

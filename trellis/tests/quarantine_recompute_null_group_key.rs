@@ -241,6 +241,8 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
         vec![("sku_totals_echo".to_string(), "echo_total".to_string())],
         "only the resumed column itself"
     );
+    // #625 F8b: the resume registers the column's field build; run it.
+    trellis::staging::build::settle_builds(&db.pool).await;
 
     let echo_after = sku_totals_echo(&client).await;
     assert_eq!(

@@ -107,7 +107,12 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 /// - `--min-max`: the definition also has `MIN(amt)` and `MAX(amt)`,
 ///   recomputed fields (#625 F5);
 /// - `--one-to-one`: the definition is a 1-1 target, `SELECT grp AS grp,
-///   amt + amt AS dbl`, instead of the aggregate (#625 F8a).
+///   amt + amt AS dbl`, instead of the aggregate (#625 F8a);
+/// - `--apply-latency` (with `--one-to-one`): once it is `live`, time every
+///   statement `apply` accepts while the writers run, and each field
+///   rebuild to `live` (`apply_latency`, #666, #625 F8b);
+///   `--apply-latency-big-to-side` adds a relationship whose to-side is the
+///   loaded source.
 ///
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
@@ -144,6 +149,8 @@ fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad 
         progress: (progress > 0.0).then(|| Duration::from_secs_f64(progress)),
         min_max: args.iter().any(|a| a == "--min-max"),
         one_to_one: args.iter().any(|a| a == "--one-to-one"),
+        apply_latency: args.iter().any(|a| a == "--apply-latency"),
+        apply_big_to_side: args.iter().any(|a| a == "--apply-latency-big-to-side"),
     }
 }
 
@@ -1196,6 +1203,13 @@ mod tests {
             build_under_load_config(&argv(&["build-under-load", "--one-to-one"])).one_to_one,
             "--one-to-one builds a 1-1 target"
         );
+        assert!(!d.apply_latency && !d.apply_big_to_side);
+        let a = build_under_load_config(&argv(&[
+            "build-under-load",
+            "--apply-latency",
+            "--apply-latency-big-to-side",
+        ]));
+        assert!(a.apply_latency && a.apply_big_to_side);
         let c = build_under_load_config(&argv(&[
             "build-under-load",
             "--rows",

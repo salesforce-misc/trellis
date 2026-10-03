@@ -141,6 +141,38 @@
 //! deltas, its target has no delta table, and nothing merges for it. A
 //! relationship-enriched 1-1 target waits for milestone E.
 //!
+//! **Field builds (F8b).** `ALTER TRANSFORM ... ADD`/`ALTER` and a column
+//! resume rebuild only the fields they change, in the background
+//! ([`start_field_build`]). The call's own transaction (#666: `apply` only
+//! registers) moves the definition `live -> backfilling` with `build =
+//! 'rederive'`, or leaves it `backfilling` when a build is already running,
+//! and enqueues a plan job whose `backfill_chunks.fields` names the fields.
+//! The field applies from that commit, as a whole build's definition does
+//! (B1): no `column_status` row holds it out of Apply, so every page after
+//! the commit writes it from its change's image, and nothing needs a
+//! catch-up. The plan job enqueues chunks with the same scope, and the same
+//! strict flip moves the definition `live` once they are all done, so the
+//! definition reads `backfilling` until every field it was building is.
+//!
+//! - **The chunk** of a plain 1-1 target ([`one_to_one::run_field_chunk`])
+//!   takes the keys' entry lock and then rewrites just the fields of their
+//!   existing target rows from one snapshot, leaving the entries alone. A
+//!   relationship-enriched 1-1 target, which only a column resume reaches
+//!   (`ALTER` refuses a relationship path), takes a page's whole-row
+//!   Re-derive of the range's keys instead (`apply::DirectRederive`). An
+//!   aggregate's fields are never held out of Apply, so neither call builds
+//!   one.
+//! - **The capture gate.** A field that reads a source column the source's
+//!   capture may not image yet (#622) can't apply before capture images it:
+//!   a page would meet rows staged without the column and quarantine their
+//!   keys. `ALTER` holds such a field out of Apply with a `column_status`
+//!   row marked `awaiting_capture`, and the plan job starts by waiting
+//!   ([`field_build_ready`]): until the installed capture images every
+//!   column the definition reads and the source's capture gate is clear, it
+//!   gives its claim back for a later try. Then one transaction releases the
+//!   field, and the walk begins after it, so every chunk's snapshot is
+//!   taken after the field applies.
+//!
 //! **Recomputed fields (F5).** A chunk writes a delta row for every group an
 //! entry it changed moved into or out of, even when the increments net to 0,
 //! with whether a changed entry counted in the group before (`__out`) and
@@ -865,11 +897,83 @@ pub async fn start_ready_builds(
             taken.push(id);
             continue;
         }
+        if awaits_capture(&*client, &definition).await? {
+            tracing::debug!(
+                definition_id = id,
+                table = %definition.source_table,
+                "re-derive build held until its source's capture images an edited field's column"
+            );
+            taken.push(id);
+            continue;
+        }
         if start(client, &definition).await? {
             taken.push(id);
         }
     }
     Ok(taken)
+}
+
+/// Whether `definition` has a field `ALTER TRANSFORM` holds out of Apply
+/// until its source's capture images the field's column
+/// (`column_status.awaiting_capture`, see the module doc's "Field builds")
+/// and the installed capture doesn't image every column the definition
+/// reads yet. A resumed definition can: its resume discards the field
+/// build that would have released the field, and its rebuild's start
+/// releases it instead ([`start`]), once this is false and the capture gate
+/// is clear.
+async fn awaits_capture(
+    client: &impl GenericClient,
+    definition: &Definition,
+) -> Result<bool, ApplyError> {
+    let awaiting: bool = client
+        .query_one(
+            "select exists (select 1 from column_status \
+             where transform_table = $1 and awaiting_capture)",
+            &[&definition.def.target],
+        )
+        .await?
+        .get(0);
+    if !awaiting {
+        return Ok(false);
+    }
+    let read: std::collections::BTreeSet<String> =
+        crate::defs::oracle::referenced_source_columns(&definition.def)
+            .into_iter()
+            .collect();
+    Ok(!capture_images(client, &definition.source_table, &read).await?)
+}
+
+/// Releases `target`'s `awaiting_capture` pauses in `txn` (see the module
+/// doc's "Field builds"), as only a build's start may: those the edit that
+/// made them still owns are deleted, and one an operator pause, a fuse trip
+/// or an upstream pause's cascade took over (issue #309) only stops
+/// waiting, and stays paused for its own resume. With `fields`, only those.
+async fn release_awaiting_capture(
+    txn: &impl GenericClient,
+    target: &str,
+    fields: Option<&[String]>,
+) -> Result<(), tokio_postgres::Error> {
+    let fields: Option<Vec<String>> = fields.map(<[String]>::to_vec);
+    txn.execute(
+        "delete from column_status s \
+         where s.transform_table = $1 and s.awaiting_capture \
+           and ($2::text[] is null or s.column_name = any($2)) \
+           and not s.local_fuse \
+           and not exists ( \
+               select 1 from column_pause_cascades c \
+               where c.downstream_transform = s.transform_table \
+                 and c.downstream_column = s.column_name)",
+        &[&target, &fields],
+    )
+    .await?;
+    txn.execute(
+        "update column_status set awaiting_capture = false \
+         where transform_table = $1 and awaiting_capture \
+           and ($2::text[] is null or column_name = any($2))",
+        &[&target, &fields],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Whether `table` has a capture gate a pending change still holds
@@ -934,6 +1038,9 @@ async fn start(
         ],
     )
     .await?;
+    // The caller found any field awaiting capture ready (#625 F8b), so it
+    // applies from this commit, and the build's chunks write it.
+    release_awaiting_capture(&txn, &definition.def.target, None).await?;
     txn.execute(
         "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
          select id, $2, fuse_rearmed_at, pg_current_xact_id() \
@@ -960,6 +1067,201 @@ async fn start(
         "transform status transition: re-derive build started"
     );
     Ok(true)
+}
+
+/// Whether a definition read as `status` with `build` can take a field
+/// build ([`start_field_build`], #625 F8b): one that applies. That is a
+/// `live` one, a `catching_up` one (whose catch-up's discharge then hands it
+/// to this build rather than flipping it `live` while field chunks remain,
+/// `intake::markers`' `go_live_caught_up`), or a `backfilling` one under a
+/// Re-derive build, which the field build joins. A definition behind an
+/// old-path build, or frozen, doesn't apply.
+pub(crate) fn takes_field_build(status: TransformStatus, build: Option<&str>) -> bool {
+    matches!(status, TransformStatus::Live | TransformStatus::CatchingUp)
+        || (status == TransformStatus::Backfilling && build == Some(BUILD_REDERIVE))
+}
+
+/// Starts a field build of `fields` on definition `id` in `txn`, the
+/// caller's transaction (see the module doc's "Field builds"): moves a
+/// `live` definition to `backfilling` with `build = 'rederive'` (one already
+/// building, or `catching_up`, stays as it is) and enqueues a plan job
+/// scoped to `fields`. The caller holds the definition's row `for update`
+/// and has checked
+/// [`takes_field_build`] against what it read under that lock (`status`),
+/// and commits. From that commit the definition applies as before, the
+/// fields included unless a `column_status` row holds one out, and it reads
+/// `backfilling` until the build's last chunk is done ([`try_complete`]).
+pub(crate) async fn start_field_build(
+    txn: &impl GenericClient,
+    id: i64,
+    status: TransformStatus,
+    fields: &[String],
+) -> Result<(), tokio_postgres::Error> {
+    if status == TransformStatus::Live {
+        txn.execute(
+            "update transform_definitions set status = $2, build = $3 where id = $1",
+            &[&id, &TransformStatus::Backfilling.as_str(), &BUILD_REDERIVE],
+        )
+        .await?;
+    }
+    txn.execute(
+        "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid, fields) \
+         select id, $2, fuse_rearmed_at, pg_current_xact_id(), $3 \
+         from transform_definitions where id = $1",
+        &[&id, &chunk_queue::KIND_PLAN, &fields],
+    )
+    .await?;
+    let to = if status == TransformStatus::Live {
+        TransformStatus::Backfilling
+    } else {
+        status
+    };
+    tracing::info!(
+        definition_id = id,
+        from = %status.as_str(),
+        to = %to.as_str(),
+        ?fields,
+        "transform status transition: field build registered"
+    );
+    Ok(())
+}
+
+/// What a field build's plan job found at its start ([`field_build_ready`]).
+enum FieldStart {
+    /// Every field applies: the walk may begin.
+    Go,
+    /// A field still waits for its source's capture to image a column it
+    /// reads; the job gives its claim back for a later try.
+    Wait,
+    /// The job's claim no longer holds.
+    Superseded,
+}
+
+/// How long a field build's plan job waits before it looks at its source's
+/// capture again ([`field_build_ready`]).
+const FIELD_CAPTURE_RETRY: Duration = Duration::from_millis(500);
+
+/// A field build's start (see the module doc's "Field builds"): releases
+/// the `awaiting_capture` pauses `ALTER TRANSFORM` put on `fields` once the
+/// definition's source is ready for them, in one transaction fenced by the
+/// plan job's claim. Ready means what the backfill discharge required of a
+/// registration (`intake::markers`): the installed capture images every
+/// source column the definition reads ([`capture_images`]),
+/// and no change at or below the source's capture gate is still pending
+/// ([`capture_gate_holds`]), so no row staged without a column is left for a
+/// page to meet.
+///
+/// A pause the edit no longer owns (an operator pause or a fuse trip
+/// upgraded it to `local_fuse`, or an upstream pause cascaded onto it,
+/// issue #309) only stops waiting: the field stays out of Apply and out of
+/// the build's chunks until its own resume.
+async fn field_build_ready(
+    pool: &Pool,
+    definition: &Definition,
+    fields: &[String],
+    fence: &ClaimFence<'_>,
+) -> Result<FieldStart, ChunkQueueError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(FieldStart::Superseded);
+    }
+    let awaiting = txn
+        .query(
+            "select column_name from column_status \
+             where transform_table = $1 and column_name = any($2) and awaiting_capture \
+             for update",
+            &[&definition.def.target, &fields],
+        )
+        .await?;
+    if awaiting.is_empty() {
+        txn.commit().await?;
+        return Ok(FieldStart::Go);
+    }
+    let read: std::collections::BTreeSet<String> =
+        crate::defs::oracle::referenced_source_columns(&definition.def)
+            .into_iter()
+            .collect();
+    let images = capture_images(&*txn, &definition.source_table, &read)
+        .await
+        .map_err(build_error)?;
+    if !images
+        || capture_gate_holds(&*txn, &definition.source_table)
+            .await
+            .map_err(build_error)?
+    {
+        txn.rollback().await?;
+        return Ok(FieldStart::Wait);
+    }
+    release_awaiting_capture(&*txn, &definition.def.target, Some(fields)).await?;
+    txn.commit().await?;
+    tracing::info!(
+        definition_id = definition.id,
+        ?fields,
+        "field build's capture is ready; its fields apply from here"
+    );
+    Ok(FieldStart::Go)
+}
+
+/// Whether every row staged for `table` from now on carries `columns`
+/// ([`field_build_ready`]): `table` is another definition's target, fed by
+/// the target-mutation seam rather than captured; or nothing is installed on
+/// it, so no row lacking a column can exist and the install, from a catalog
+/// read after the edit, images them all; or its installed functions are
+/// current and image every one of `columns`.
+async fn capture_images(
+    client: &impl GenericClient,
+    table: &str,
+    columns: &std::collections::BTreeSet<String>,
+) -> Result<bool, ApplyError> {
+    use crate::capture::{CaptureError, install::Installed};
+    use crate::intake::IntakeError;
+
+    if catalog::is_definition_target(client, table).await? {
+        return Ok(true);
+    }
+    let schema: String = client
+        .query_one("select pg_catalog.current_schema()::text", &[])
+        .await?
+        .get(0);
+    let installed = crate::capture::install::installed(client, &schema, table)
+        .await
+        .map_err(|err| match err {
+            CaptureError::Db(err) => ApplyError::from(err),
+            CaptureError::Catalog(err) => ApplyError::from(err),
+            CaptureError::Marker(err) => ApplyError::from(err),
+            other => ApplyError::from(IntakeError::InvalidTableName(other.to_string())),
+        })?;
+    Ok(match installed {
+        Installed::Absent => true,
+        Installed::Partial { .. } => false,
+        Installed::Complete { spec, current } => {
+            current && columns.iter().all(|c| spec.columns().contains(c))
+        }
+    })
+}
+
+/// Gives `chunk`'s claim back without a charge, to be claimed again after
+/// `delay` (a field build's plan job waiting on capture). A claim already
+/// reclaimed from `claimed_by` is left to its new holder.
+async fn defer_claim(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+    delay: Duration,
+) -> Result<(), ChunkQueueError> {
+    let client = pool.get().await?;
+    client
+        .execute(
+            "update backfill_chunks \
+             set claimed_by = null, claimed_at = null, \
+                 next_attempt_at = now() + make_interval(secs => $3) \
+             where id = $1 and claimed_by = $2",
+            &[&chunk.id, &claimed_by, &delay.as_secs_f64()],
+        )
+        .await?;
+    Ok(())
 }
 
 /// How a drain worker runs the Re-derive build's work ([`work_once`]).
@@ -1076,17 +1378,30 @@ pub async fn work_once(
 
 /// Every definition a Re-derive build is running for that isn't frozen,
 /// with its target and whether the target has a group-delta table to merge
-/// (a 1-1 target has none, #625 F8a), in id order.
+/// (a 1-1 target has none, #625 F8a), in id order: each `backfilling` one
+/// under a Re-derive build, and each `catching_up` one with a field build's
+/// chunk left (#625 F8b), which its catch-up hands to the Re-derive build
+/// once it discharges.
 async fn building(pool: &Pool) -> Result<Vec<(i64, String, bool)>, ChunkQueueError> {
     let client = pool.get().await?;
     Ok(client
         .query(
             &format!(
-                "select id, target_table, {} from transform_definitions \
-                 where build = $1 and status = $2 order by id",
-                deltas_exist_sql("target_table")
+                "select d.id, d.target_table, {} from transform_definitions d \
+                 where (d.build = $1 and d.status = $2) \
+                    or (d.status = $3 and exists ( \
+                        select 1 from backfill_chunks bc \
+                        where bc.definition_id = d.id and not bc.done \
+                          and bc.fields is not null and not ({}))) \
+                 order by d.id",
+                deltas_exist_sql("d.target_table"),
+                chunk_queue::STALE,
             ),
-            &[&BUILD_REDERIVE, &TransformStatus::Backfilling.as_str()],
+            &[
+                &BUILD_REDERIVE,
+                &TransformStatus::Backfilling.as_str(),
+                &TransformStatus::CatchingUp.as_str(),
+            ],
         )
         .await?
         .into_iter()
@@ -1208,7 +1523,10 @@ async fn run_rederive(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
-    let plan = AnyPlan::for_definition(pool, &definition).await?;
+    let plan = match &chunk.fields {
+        None => ChunkPlan::Whole(AnyPlan::for_definition(pool, &definition).await?),
+        Some(fields) => FieldPlan::for_chunk(pool, &definition, fields, lo, hi).await?,
+    };
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
         chunk.id,
@@ -1233,16 +1551,32 @@ async fn run_rederive(
     }
     metrics::record_build_statement(BuildStatement::ChunkSetup, setup_started.elapsed());
     let (keys, delta_rows) = match &plan {
-        AnyPlan::Ledger(plan) => {
+        ChunkPlan::Whole(AnyPlan::Ledger(plan)) => {
             let outcome = run_chunk(&txn, plan, lo, hi).await.map_err(build_error)?;
             (outcome.keys, outcome.delta_rows)
         }
-        AnyPlan::OneToOne(plan) => {
+        ChunkPlan::Whole(AnyPlan::OneToOne(plan)) => {
             let outcome = one_to_one::run_chunk(&txn, plan, lo, hi)
                 .await
                 .map_err(build_error)?;
             (outcome.keys, 0)
         }
+        ChunkPlan::Field(FieldPlan::OneToOne(plan, fields)) => {
+            let outcome = one_to_one::run_field_chunk(&txn, plan, fields, lo, hi)
+                .await
+                .map_err(build_error)?;
+            (outcome.keys, 0)
+        }
+        ChunkPlan::Field(FieldPlan::Direct(rederive, keys)) => {
+            let mut mutations = TargetMutations::new();
+            rederive
+                .settle(&txn, &mut mutations)
+                .await
+                .map_err(build_error)?;
+            mutations.flush(&txn).await.map_err(build_error)?;
+            (*keys, 0)
+        }
+        ChunkPlan::Field(FieldPlan::Empty) => (0, 0),
     };
     let commit_started = Instant::now();
     txn.execute(
@@ -1260,6 +1594,98 @@ async fn run_rederive(
     );
     try_complete(pool, chunk.definition_id).await?;
     Ok(())
+}
+
+/// What one claimed `rederive` row runs.
+enum ChunkPlan {
+    /// A whole build's chunk.
+    Whole(AnyPlan),
+    /// A field build's chunk (#625 F8b).
+    Field(FieldPlan),
+}
+
+/// A field build's chunk (see the module doc's "Field builds").
+enum FieldPlan {
+    /// A plain 1-1 target's: [`one_to_one::run_field_chunk`] over the
+    /// fields.
+    OneToOne(one_to_one::OneToOnePlan, Vec<String>),
+    /// A 1-1 target the Re-derive build's SQL can't render (a
+    /// relationship-enriched one): a page's whole-row Re-derive of the
+    /// range's keys, built before the chunk's transaction (it reads the
+    /// relationships' context through the pool, as a page's Phase 2 does),
+    /// and how many keys it re-derives.
+    Direct(Box<super::apply::DirectRederive>, usize),
+    /// A range with no key to re-derive.
+    Empty,
+}
+
+impl FieldPlan {
+    /// The chunk `(lo, hi]` of `definition`'s field build over `fields`.
+    /// Only a 1-1 target holds a field out of Apply, so only a 1-1 target
+    /// has a field build; anything else is
+    /// [`BackfillError::Unsupported`](crate::defs::backfill::BackfillError::Unsupported).
+    async fn for_chunk(
+        pool: &Pool,
+        definition: &Definition,
+        fields: &[String],
+        lo: Option<&str>,
+        hi: &str,
+    ) -> Result<ChunkPlan, ChunkQueueError> {
+        if let Some(plan) = one_to_one::OneToOnePlan::for_definition(pool, definition)
+            .await
+            .map_err(build_error)?
+        {
+            return Ok(ChunkPlan::Field(FieldPlan::OneToOne(plan, fields.to_vec())));
+        }
+        if !matches!(
+            definition.def.key_space,
+            crate::defs::ast::KeySpace::OneToOne
+        ) {
+            return Err(build_error(
+                crate::defs::backfill::BackfillError::Unsupported(
+                    "only a 1-1 target has a field build".to_string(),
+                ),
+            ));
+        }
+        let pk = ddl::source_primary_key(pool, &definition.source_table)
+            .await
+            .map_err(build_error)?;
+        let decode = |text: &str| -> Result<Vec<String>, ChunkQueueError> {
+            Ok(ddl::split_pk_key(&pk, &definition.source_table, text)
+                .map_err(build_error)?
+                .into_iter()
+                .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
+                .collect())
+        };
+        let (lo, hi) = (lo.map(decode).transpose()?, decode(hi)?);
+        let keys = {
+            let client = pool.get().await?;
+            crate::defs::backfill::range_keys(&**client, &definition.source_table, &pk, &lo, &hi)
+                .await?
+        };
+        if keys.is_empty() {
+            return Ok(ChunkPlan::Field(FieldPlan::Empty));
+        }
+        let excluded = super::quarantine::paused_columns_for(pool, &definition.def.target)
+            .await
+            .map_err(build_error)?;
+        let rederive = super::apply::DirectRederive::new(
+            pool,
+            &definition.def,
+            &definition.source_table,
+            &definition.target_table,
+            &definition.source_columns,
+            excluded,
+            false,
+            &keys,
+        )
+        .await
+        .map_err(build_error)?;
+        Ok(ChunkPlan::Field(FieldPlan::Direct(
+            Box::new(rederive),
+            keys.len(),
+        )))
+    }
 }
 
 /// The plan of either kind of target a Re-derive build serves.
@@ -1324,6 +1750,21 @@ async fn run_plan(
         options.heartbeat_interval,
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
+    // A field build starts once its fields apply (#625 F8b), and its walk,
+    // so every chunk, comes after that commit.
+    if let Some(fields) = &chunk.fields
+        && cursor.is_none()
+    {
+        match field_build_ready(pool, &definition, fields, &fence).await? {
+            FieldStart::Go => {}
+            FieldStart::Wait => {
+                return defer_claim(pool, chunk, claimed_by, FIELD_CAPTURE_RETRY).await;
+            }
+            FieldStart::Superseded => {
+                return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+            }
+        }
+    }
     let mut client = pool.get().await?;
     loop {
         let started = Instant::now();
@@ -1349,8 +1790,8 @@ async fn run_plan(
             .map(|(lo, hi)| (lo.as_deref(), hi.as_str()))
             .unzip();
         txn.execute(
-            "insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at) \
-             select bc.definition_id, $4, r.lo, r.hi, bc.fuse_rearmed_at \
+            "insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at, fields) \
+             select bc.definition_id, $4, r.lo, r.hi, bc.fuse_rearmed_at, bc.fields \
              from unnest($2::text[], $3::text[]) with ordinality as r(lo, hi, n) \
              cross join backfill_chunks bc \
              where bc.id = $1 \
@@ -1692,6 +2133,11 @@ fn any_delta_sql(deltas: &str) -> String {
 /// frozen one is left as it is. Panics on any failure, or when the builds
 /// make no progress for a while (a chunk that keeps failing backs off): it
 /// is test harness.
+///
+/// A field build whose plan job waits on its source's capture (#625 F8b,
+/// [`field_build_ready`]) can't go on until the staging worker's capture
+/// pass, which this doesn't run: once that is all that is left, it returns
+/// with the build still running.
 #[cfg(any(test, feature = "internals"))]
 pub async fn settle_builds(pool: &Pool) {
     const CLAIMED_BY: &str = "settle_rederive_builds";
@@ -1703,6 +2149,21 @@ pub async fn settle_builds(pool: &Pool) {
         reclaim_ttl: Duration::from_secs(60),
     };
     let mut last_progress = Instant::now();
+    // A field build's plan job that gave its claim back to wait on capture
+    // is tried again now, once: the capture pass that may have readied it
+    // ran before this call, not on the job's backoff.
+    {
+        let client = pool.get().await.expect("acquire a connection");
+        client
+            .execute(
+                "update backfill_chunks set next_attempt_at = null \
+                 where kind = $1 and fields is not null and lo is null and not done \
+                   and claimed_by is null and last_error is null",
+                &[&chunk_queue::KIND_PLAN],
+            )
+            .await
+            .expect("retry the field builds waiting on capture");
+    }
     loop {
         let building = building(pool).await.expect("list the running builds");
         if building.is_empty() {
@@ -1734,13 +2195,15 @@ pub async fn settle_builds(pool: &Pool) {
         };
         for chunk in &claimed {
             run_claimed(pool, chunk, CLAIMED_BY, &options).await;
-            progressed = true;
+            progressed |= !deferred(pool, chunk).await;
         }
         for (id, ..) in &building {
             progressed |= try_complete(pool, *id).await.expect("complete a build");
         }
         if progressed {
             last_progress = Instant::now();
+        } else if only_capture_waits(pool).await {
+            return;
         } else {
             assert!(
                 last_progress.elapsed() < STALL,
@@ -1749,6 +2212,52 @@ pub async fn settle_builds(pool: &Pool) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// Whether `chunk`, just run, gave its claim back to wait on capture
+/// ([`defer_claim`]), which [`settle_builds`] doesn't count as progress.
+#[cfg(any(test, feature = "internals"))]
+async fn deferred(pool: &Pool, chunk: &ClaimedChunk) -> bool {
+    let client = pool.get().await.expect("acquire a connection");
+    client
+        .query_one(
+            "select exists (select 1 from backfill_chunks \
+             where id = $1 and not done and claimed_by is null and lo is null \
+               and fields is not null and next_attempt_at > now())",
+            &[&chunk.id],
+        )
+        .await
+        .expect("read a build row")
+        .get(0)
+}
+
+/// Whether every unfinished row of a running build is a field build's plan
+/// job, not yet started, whose fields still await their source's capture
+/// ([`settle_builds`]'s stop).
+#[cfg(any(test, feature = "internals"))]
+async fn only_capture_waits(pool: &Pool) -> bool {
+    let client = pool.get().await.expect("acquire a connection");
+    client
+        .query_one(
+            &format!(
+                "select not exists ( \
+                     select 1 from backfill_chunks bc \
+                     join transform_definitions d on d.id = bc.definition_id \
+                     where not bc.done and not ({}) \
+                       and not (bc.kind = $1 and bc.fields is not null and bc.lo is null \
+                                and exists (select 1 from column_status cs \
+                                            where cs.transform_table = \
+                                                  split_part(d.target_table, '.', 2) \
+                                              and cs.column_name = any(bc.fields) \
+                                              and cs.awaiting_capture))) \
+                 and exists (select 1 from backfill_chunks bc where not bc.done)",
+                chunk_queue::STALE
+            ),
+            &[&chunk_queue::KIND_PLAN],
+        )
+        .await
+        .expect("read the running builds' rows")
+        .get(0)
 }
 
 #[cfg(test)]

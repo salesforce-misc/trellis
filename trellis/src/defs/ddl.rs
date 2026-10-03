@@ -643,8 +643,8 @@ const KEY_PART_ESCAPE: char = '\u{1e}';
 /// delete path filters on it the same way; `defs::backfill`'s initial build
 /// of that same target inserts the source's PK column *raw*
 /// (`insert into target (pk, …) select pk, …`), never through any encoder;
-/// `staging::quarantine::recompute_column` re-reads the source's
-/// `pk::text` raw and updates the target by it. Escaping at arity 1 would
+/// a 1-1 build chunk (`staging::build::one_to_one`) reads the source's
+/// key and writes the target by it. Escaping at arity 1 would
 /// silently desynchronize those: for a PK value that genuinely contains
 /// U+001F, backfill would write the raw value and the incremental apply an
 /// escaped one — two rows for one source row, and a delete that matches
@@ -820,8 +820,7 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// (`$n::text::{pk_cast}`), while three other writers/readers of that very
 /// column use the source's raw value instead —
 /// `defs::backfill`'s `insert into {target} select {pk} from {source}`,
-/// `staging::quarantine::recompute_column`'s `where {pk}::text = $2`
-/// write-back, and `defs::oracle::recompute`'s `{pk}::text`. An encoding
+/// a 1-1 build chunk's key join, and `defs::oracle::recompute`'s `{pk}::text`. An encoding
 /// that changes a real value's text therefore makes those paths disagree,
 /// duplicating or orphaning the target row for exactly the values it
 /// rewrites — empirically reproduced for a `text` primary key holding a
@@ -1368,7 +1367,7 @@ pub(crate) fn qualified_source_table(qualified: &str) -> String {
 /// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
 /// whole-branch review): the live CDC-apply write path (`staging::apply`'s
 /// `apply_target`/truncate-clears loop, the aggregate target-write sites,
-/// `staging::quarantine`'s `recompute_column`) never got
+/// `staging::quarantine`'s column recompute) never got
 /// this fix on the target side, even though issue #76 already let a
 /// `TRANSFORM` clause spell an explicit non-default target schema — every
 /// one of those sites was still binding `def.def.target` (bare) straight

@@ -429,6 +429,8 @@ async fn resuming_a_column_propagates_each_changed_row_to_a_chained_reader() {
     quarantine::resume_column(&db.pool, "t", "doubled")
         .await
         .expect("resume t.doubled");
+    // #625 F8b: the resume registers the column's field build; run it.
+    trellis::staging::build::settle_builds(&db.pool).await;
 
     let staged = staged_recomputes(&raw, "public.t").await;
     assert_eq!(
@@ -617,6 +619,7 @@ async fn an_altered_column_propagates_to_a_chained_reader() {
         panic!("not an ALTER");
     };
     alter_transform(&db.pool, &alter).await.expect("alter t.w");
+    trellis::staging::build::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
@@ -826,6 +829,8 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
     quarantine::resume_column(&db.pool, "t", "doubled")
         .await
         .expect("resume t.doubled");
+    // #625 F8b: the resume registers the column's field build; run it.
+    trellis::staging::build::settle_builds(&db.pool).await;
 
     let staged = staged_recomputes(&raw, "public.t").await;
     assert_eq!(staged.len(), 1250, "exactly the rows the resume changed");
@@ -1352,11 +1357,12 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
     );
 }
 
-/// Issue #497: a `live` reader of an upstream that is catching up (here on a
-/// resumed column's catch-up) reports `catching_up` though nothing was parked
-/// for the reader itself, and `live` once the upstream's catch-up discharges.
+/// Issue #497: a `live` reader of an upstream that isn't `live` (here
+/// rebuilding a resumed column, #625 F8b) reports `catching_up` though
+/// nothing was parked for the reader itself, and `live` once the upstream's
+/// field build is done.
 #[tokio::test]
-async fn a_chained_reader_reports_catching_up_while_its_upstream_catches_up() {
+async fn a_chained_reader_reports_catching_up_while_its_upstream_builds_a_field() {
     let (_cluster, db, mut raw) = setup().await;
     chained_pair(&db, &mut raw, false).await;
     let trellis = trellis::Trellis::connect(
@@ -1375,18 +1381,11 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_catches_up() {
     quarantine::resume_column(&db.pool, "t", "doubled")
         .await
         .expect("resume t.doubled");
-    assert_eq!(stored(&raw, "t").await, "catching_up");
+    assert_eq!(stored(&raw, "t").await, "backfilling");
     assert_eq!(stored(&raw, "d").await, "live", "nothing was parked for d");
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
 
-    markers::run_pending_backfills(
-        &mut raw,
-        WAKE,
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge t's catch-up");
+    trellis::staging::build::settle_builds(&db.pool).await;
     assert_eq!(reported(&trellis, "t").await, TransformStatus::Live);
     assert_eq!(reported(&trellis, "d").await, TransformStatus::Live);
 }

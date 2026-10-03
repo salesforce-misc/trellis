@@ -466,21 +466,6 @@ impl Driver {
         panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
     }
 
-    /// Discharges every parked catch-up marker (a column resume's, an
-    /// `ALTER TRANSFORM`'s) and settles the re-derives it stages.
-    pub async fn catch_up(&mut self) {
-        self.settle().await;
-        markers::run_pending_backfills(
-            &mut self.ctl,
-            WAKE,
-            &StagedWatermark::saturated(),
-            Duration::ZERO,
-        )
-        .await
-        .expect("run_pending_backfills");
-        self.settle().await;
-    }
-
     /// Frees the ring slots of drained segments.
     pub async fn retire(&mut self) {
         retire_drained_segments(&mut self.ctl)

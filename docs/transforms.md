@@ -297,11 +297,12 @@ Every defined transform carries an observable **status**:
   transform's target), is built while its live changes are applied, and goes
   from here straight to `live`
   ([data-flow — Re-derive-built definitions](data-flow.md#re-derive-built-definitions)).
+  A `live` 1-1 transform comes back here while an `ALTER TRANSFORM` that adds
+  or changes a field, or a resumed column, is rebuilt in the background
+  ([Changing a definition](#changing-a-definition)).
 * **`catching_up`** — the build is done and live changes are applied, but the
   target may still be missing changes made while it was building. A catch-up
-  re-reads the source and takes it `live`. A `live` transform comes back here
-  for its own catch-up after an `ALTER TRANSFORM` adds columns or a
-  quarantined column is resumed.
+  re-reads the source and takes it `live`.
 * **`live`** — the steady state: once a transform reports `live`, awaiting a
   watermark token taken after a commit guarantees its target reflects that
   commit ([embedding — Reading your own writes](embedding.md#reading-your-own-writes)).
@@ -368,6 +369,23 @@ is a definition — so `DROP RELATIONSHIP` exists.
 
 `DROP TRANSFORM <target>.<column>` is likewise not a statement: removing one
 calculated field is an `ALTER TRANSFORM` operation, not a drop.
+
+**`apply` only registers.** Every statement returns once the change is
+recorded; none reads the source's rows. A new transform is built in the
+background from `waiting_to_backfill`. An `ALTER TRANSFORM` that adds or
+changes fields, and a `RESUME TRANSFORM <target>.<column>`, start a
+*field build*: the transform goes `backfilling`, the changed fields are
+computed for every new change from that moment on, and background chunks
+rewrite them across the existing rows, reading the source once however many
+fields changed. The transform reads `live` again once they are all done, so
+poll its status before relying on the new fields
+([embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)).
+Until then a row's new field can still be empty (an added field) or hold the
+old formula's value (a changed or resumed one). A field whose formula reads a
+source column the source's capture doesn't record yet waits, paused, until
+capture records it before its build starts. Declaring a to-one relationship,
+or a transform reading through one, is the exception today: it fills the
+relationship's lookup table from the to-side table inside the call.
 
 ## Scope
 

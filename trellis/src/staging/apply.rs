@@ -213,9 +213,9 @@ pub enum ApplyError {
     /// column it reads (`column_status.awaiting_capture`, #687). Unpausing it
     /// before then would let a row the narrower capture function staged,
     /// which lacks that column, reach it and fail with `MissingColumn`. The
-    /// field's catch-up marker unpauses it once the widened capture lands;
-    /// the definition's `capture_wait` or `capture_failure` status says what
-    /// holds that up.
+    /// field build's start unpauses it once the widened capture lands
+    /// (`staging::build`'s "Field builds"); the definition's `capture_wait`
+    /// or `capture_failure` status says what holds that up.
     ColumnAwaitingCapture { transform: String, column: String },
     /// A failure from [`crate::intake::markers`]'s backfill-marker
     /// machinery (issue #55: [`super::quarantine::resume_transform`]
@@ -1202,8 +1202,8 @@ pub(crate) struct RelationshipGenBump {
 /// pre-image of each of `rows`' underlying changes — used only to widen the
 /// gen-bump touched-key set (see [`RelationshipGenBump`]'s doc comment) with
 /// each change's *old* join-key value, not to resolve anything the evaluator
-/// reads. `None` is the shape `quarantine::recompute_column`'s ad hoc,
-/// non-transactional resume path passes, since it isn't part of the staging
+/// reads. `None` is the shape a direct writer's Re-derive ([`DirectRederive`])
+/// passes, since it isn't part of the staging
 /// ring's claim/fold/compute/apply pipeline this gen bump guards — that
 /// caller discards the returned gen-bump map entirely, so `None` simply
 /// costs it nothing beyond not bothering to compute the old-side half.
@@ -1213,7 +1213,7 @@ pub(crate) struct RelationshipGenBump {
 /// signal, read for its `group_key` (the real, pre-fold union of touched
 /// join keys; see that field's doc comment) and unioned into the same
 /// gen-bump touched-key set `old_rows` widens. `None` for the same
-/// `quarantine::recompute_column` caller as `old_rows`: that path has no
+/// [`DirectRederive`] caller as `old_rows`: that path has no
 /// `FoldedChange`s at all (a live full-table scan, not the staging ring's
 /// pipeline) and, as above, discards the gen-bump map regardless.
 pub(crate) async fn build_relationship_context(
@@ -6019,9 +6019,9 @@ pub(super) fn pk_keyset_col(i: usize) -> String {
 /// column match [`apply_target`] needs once a composite (arity > 1) primary
 /// key means a plain `= any($1::text[]::cast[])` no longer identifies a row
 /// on its own (issue #121) — arity 1 keeps that simpler, pre-existing form
-/// instead (see [`apply_target`]'s own arity branch). `quarantine`'s
-/// `recompute_column` uses it at every arity (issue #377), since joining on
-/// the target's own key columns is what lets its write-back use the index.
+/// instead (see [`apply_target`]'s own arity branch). A column recompute
+/// used it at every arity (issue #377), since joining on the target's own
+/// key columns is what lets its write-back use the index.
 pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
     let arrays: Vec<String> = pk
         .iter()
@@ -6155,8 +6155,8 @@ fn join_coverage<'a>(
 }
 
 /// A direct writer's Re-derive of 1-1 keys, outside a page (#623 D6):
-/// `ALTER TRANSFORM`'s backfill (`defs::backfill::backfill_altered_columns`)
-/// and a column resume (`quarantine::recompute_column`). Settled on the
+/// a field build's chunk over a relationship-enriched 1-1 target (a column
+/// resume, #625 F8b, `staging::build`). Settled on the
 /// ledger exactly as a page settles a Re-derive
 /// ([`settle_one_to_one_target`]). Built before the writer's transaction,
 /// since a relationship-enriched definition's context is read through the

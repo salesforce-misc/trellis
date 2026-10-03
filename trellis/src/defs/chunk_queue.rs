@@ -187,6 +187,10 @@ pub struct ClaimedChunk {
     pub id: i64,
     pub definition_id: i64,
     pub work: ChunkWork,
+    /// A field build's scope (#625 F8b, `backfill_chunks.fields`): the
+    /// target columns a [`ChunkWork::Plan`] or [`ChunkWork::Rederive`] row
+    /// writes. `None` for a whole build.
+    pub fields: Option<Vec<String>>,
 }
 
 /// What one `backfill_chunks` row builds.
@@ -599,7 +603,7 @@ pub async fn claim_chunks_of(
              set claimed_by = $1, claimed_at = now() \
              from candidate \
              where c.id = candidate.id \
-             returning c.id, c.definition_id, c.lo, c.hi, c.kind",
+             returning c.id, c.definition_id, c.lo, c.hi, c.kind, c.fields",
             &[&claimed_by, &limit, &dispatchable, &kinds],
         )
         .await?;
@@ -623,6 +627,7 @@ pub async fn claim_chunks_of(
                 id: row.get(0),
                 definition_id: row.get(1),
                 work,
+                fields: row.get(5),
             })
         })
         .collect()
@@ -1118,15 +1123,16 @@ async fn fail_range_chunk(
     let outcome = match narrowed {
         Some(backfill::ChunkNarrowing::Split { mid }) => {
             // This row keeps the lower half, and a new one takes the upper
-            // half, of the same kind (a 1-1 range or a Re-derive chunk). Both
-            // carry the failure so far, so `status` keeps reporting it while
-            // the build narrows, and the build's `fuse_rearmed_at`, so a
-            // resume supersedes both alike.
+            // half, of the same kind (a 1-1 range or a Re-derive chunk) and
+            // field scope (#625 F8b). Both carry the failure so far, so
+            // `status` keeps reporting it while the build narrows, and the
+            // build's `fuse_rearmed_at`, so a resume supersedes both alike.
             txn.execute(
                 "insert into backfill_chunks \
                      (definition_id, kind, lo, hi, fuse_rearmed_at, attempts, charged, \
-                      last_error, next_attempt_at) \
-                 select definition_id, kind, $2, hi, fuse_rearmed_at, $3, charged, $4, now() \
+                      last_error, next_attempt_at, fields) \
+                 select definition_id, kind, $2, hi, fuse_rearmed_at, $3, charged, $4, now(), \
+                        fields \
                  from backfill_chunks where id = $1",
                 &[&chunk.id, &mid, &attempts, &error],
             )
