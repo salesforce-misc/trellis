@@ -1636,6 +1636,29 @@ pub async fn alter_transform(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
+    // The same version-fence bump `create_definition_inner` makes for a
+    // brand-new definition — see this function's own doc comment. It is
+    // this transaction's first lock. The bump waits for every drain in
+    // flight that holds the row `for share` (a drain's Phase 3 takes it
+    // first and holds it to its commit), so it must hold nothing such a
+    // drain could be waiting on, directly or through a third transaction.
+    // Taking the target's `ACCESS EXCLUSIVE` lock first deadlocks against
+    // the drain itself, which row-locks the target; taking the definition
+    // row first deadlocks against a drain queued on a transaction that
+    // wants that row, such as the catch-up discharge (issue #744). A drain
+    // that already holds the row finishes first, and one that arrives later
+    // waits for this commit and then misses the fence. A refusal below
+    // rolls the bump back with everything else.
+    txn.query_one(
+        "insert into source_table_versions (source_table, version) \
+         values ($1, 1) \
+         on conflict (source_table) \
+         do update set version = source_table_versions.version + 1 \
+         returning version",
+        &[&current.source_table],
+    )
+    .await?;
+
     // Row-lock the definition and recheck its status: a pause, a drop, or
     // another concurrent alter must not interleave between the checks above
     // and this commit (issue #231's lesson, applied here the same way
@@ -1703,24 +1726,6 @@ pub async fn alter_transform(
     let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
     assert_collation_safe_text_functions(&txn, &merged, &current.source_table, Some(&edited))
         .await?;
-
-    // The same version-fence bump `create_definition_inner` makes for a
-    // brand-new definition — see this function's own doc comment. It runs
-    // *before* the DDL below, not after it: a drain's Phase 3 takes this
-    // row `for share` and then row-locks the target, so taking the target's
-    // `ACCESS EXCLUSIVE` lock first and this row second is the opposite
-    // order and deadlocks against any drain in flight. In this order, a
-    // drain that already holds the row finishes first, and one that arrives
-    // later waits for this commit and then misses the fence.
-    txn.query_one(
-        "insert into source_table_versions (source_table, version) \
-         values ($1, 1) \
-         on conflict (source_table) \
-         do update set version = source_table_versions.version + 1 \
-         returning version",
-        &[&current.source_table],
-    )
-    .await?;
 
     for field in &real_drops {
         txn.batch_execute(&format!(
