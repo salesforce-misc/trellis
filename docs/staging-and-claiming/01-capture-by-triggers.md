@@ -268,8 +268,8 @@ Under `SERIALIZABLE` the re-read's index probe takes a predicate (SIREAD)
 lock on the key's btree leaf page, and concurrent serializable writers on
 neighbouring keys then form the read-write conflict chains Postgres cancels
 with `40001`. Every insert of an auto-increment id lands on the rightmost
-leaf, so with an unconditional re-read about half of all single-row
-serializable inserts failed at 4 to 16 writers, where none fail without
+leaf, so with an unconditional re-read 50% of single-row serializable
+inserts failed at 4 writers and 87% at 8 and 16, where none fail without
 capture (`benchmark` scenario `ssi-tax`; `local_docs/pr/623-d8a.md`).
 
 So capture re-reads only when the live row can differ from the transition
@@ -294,10 +294,10 @@ has the argument.
 The capture runs inside the application's transaction, so the writer pays for
 it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
-WAL per row (#622 C4, `local_docs/bench/622-baseline.md`). The live re-read
-(#623 D8a) adds one primary-key index probe per captured row: about 0.65–1.0
-µs per row in batched writes (1.8–2.5× one expression index in all) and 3–10
-µs per single-row statement.
+WAL per row (#622 C4, `local_docs/bench/622-baseline.md`). The begin
+trigger and the span bookkeeping (#623 D8a) add about 4.4 µs per statement,
+and nothing per row; when a statement does re-read, the probe adds about
+0.65–1.0 µs per row in batched writes and 3–10 µs per single-row statement.
 
 ## Trellis migrations and the write path
 
