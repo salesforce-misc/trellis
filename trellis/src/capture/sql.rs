@@ -33,6 +33,10 @@
 //!   `ring_slot_mirror` with `pg_sequence_last_value`, in the same expression
 //!   that assigns the writer's xid. See `staging::append::active_ring_slot`
 //!   for why both halves matter at every isolation level.
+//! - **It images the live row** (#623 D8a): every row the statement wrote
+//!   is re-read by primary key, so a nested write to the same key leaves the
+//!   later ring row carrying the final values, and an update row whose
+//!   imaged columns didn't change is dropped (see [`ring_select`]).
 //! - **It skips a statement that changed nothing.** An `UPDATE … WHERE false`
 //!   still fires a statement trigger. Returning early keeps it from
 //!   assigning an xid it doesn't need.
@@ -621,8 +625,9 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
                 rows.join(", ")
             )
         };
-    // Only the event's own transition tables have arguments; the others are
-    // `null`, which `format()` never reads.
+    // Only the aliases the event reads (its transition tables and the live
+    // table `t`) have arguments; the others are `null`, which `format()`
+    // never reads.
     let reads = |alias: &str| match event {
         CaptureEvent::Insert => alias != "o",
         CaptureEvent::Delete => alias != "n",
