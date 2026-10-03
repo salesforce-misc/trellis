@@ -17,6 +17,13 @@
 //!   included), stages nothing. A move of a relationship join column alone
 //!   still stages, on both sides of the relationship.
 //!
+//! The re-read runs only when another write to the table ran in the
+//! statement's span (`capture_ssi.rs` checks that gate). The tests that check
+//! the re-read's own SQL (no leak, its `age` and key-text filters, its plan)
+//! disable the begin trigger with [`always_reread`], the gate's fallback, so
+//! every capture re-reads whether or not a nested write happened. The
+//! nested-write tests run with the gate on.
+//!
 //! Capture is installed by hand and the ring is read directly; nothing waits
 //! for convergence (#297).
 
@@ -27,7 +34,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, IsolationLevel, NoTls};
 use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, Progress};
-use trellis::capture::sql::CaptureSpec;
+use trellis::capture::sql::{CaptureEvent, CaptureSpec, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_relationship, install_definition};
@@ -55,6 +62,19 @@ async fn install_spec(client: &mut Client, spec: &CaptureSpec) {
         Progress::Done(_) => {}
         Progress::Waiting(wait) => panic!("an install without a deadline landed: {wait}"),
     }
+}
+
+/// Makes every capture of `table` re-read the live row: with its begin
+/// trigger disabled no statement marks a span start, and the gate falls back
+/// to the re-read (#623 D8a).
+async fn always_reread(client: &Client, table: &str) {
+    client
+        .batch_execute(&format!(
+            "alter table {table} disable trigger {}",
+            trigger_name(DEFAULT_SCHEMA, CaptureEvent::Begin)
+        ))
+        .await
+        .expect("disable the begin trigger");
 }
 
 fn spec(table: &str, columns: &[&str]) -> CaptureSpec {
@@ -228,6 +248,7 @@ async fn no_leak_at(level: IsolationLevel) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = held_table(db.dsn()).await;
+    always_reread(&raw, "public.t").await;
 
     let mut holder = connect(db.dsn()).await;
     let hold = holder.transaction().await.expect("begin holder");
@@ -299,6 +320,7 @@ async fn a_held_insert_owns_its_new_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = held_table(db.dsn()).await;
+    always_reread(&raw, "public.t").await;
 
     let mut holder = connect(db.dsn()).await;
     let hold = holder.transaction().await.expect("begin holder");
@@ -341,6 +363,7 @@ async fn an_upsert_over_another_sessions_commit_images_its_own_result() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = held_table(db.dsn()).await;
+    always_reread(&raw, "public.t").await;
 
     let mut other = connect(db.dsn()).await;
     let pending = other.transaction().await.expect("begin other");
@@ -399,6 +422,7 @@ async fn a_version_another_session_removed_after_the_snapshot_is_never_imaged() 
             let cluster = TestCluster::start();
             let db = cluster.create_isolated_database().await;
             let raw = held_table(db.dsn()).await;
+            always_reread(&raw, "public.t").await;
             raw.batch_execute(
                 "create function public.undo_insert() returns trigger language plpgsql as $$ \
                  begin \
@@ -464,6 +488,7 @@ async fn a_key_move_its_types_equality_calls_a_no_op_deletes_the_old_key() {
     .await
     .expect("create public.n");
     install_spec(&mut raw, &spec("public.n", &["a"])).await;
+    always_reread(&raw, "public.n").await;
 
     raw.batch_execute("begin; update public.n set id = 1.00")
         .await
@@ -671,6 +696,7 @@ async fn an_fk_cascade_from_another_tables_statement_images_the_child() {
     .await
     .expect("create p and c");
     install_spec(&mut raw, &spec("public.c", &["pid", "v"])).await;
+    always_reread(&raw, "public.c").await;
 
     raw.batch_execute(
         "begin; delete from public.p where id = 1; update public.p set id = 3 where id = 2",
@@ -917,6 +943,7 @@ async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {
         .await
         .expect("vacuum public.g");
     install_spec(&mut raw, &spec("public.g", &["a"])).await;
+    always_reread(&raw, "public.g").await;
 
     let writer = connect(db.dsn()).await;
     writer

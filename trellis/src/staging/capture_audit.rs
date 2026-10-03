@@ -1,7 +1,7 @@
 //! The capture audit `self_check` runs before its recompute comparison
 //! (#622 C9, acceptance A5; ADR-0013, "The capture audit").
 //!
-//! A captured table's changes reach the ring only through its four capture
+//! A captured table's changes reach the ring only through its five capture
 //! triggers ([`crate::capture`]). A trigger an operator disabled, dropped or
 //! re-pointed breaks that silently: nothing errors, the ring just stops
 //! getting the table's changes, and the target goes stale. So does the

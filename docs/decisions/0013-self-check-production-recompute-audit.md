@@ -40,7 +40,7 @@ the target is computed from (its source and the to-side of each relationship
 it reads through, less any this instance's seam feeds) is still captured as
 the staging worker installed it:
 
-- all four capture triggers exist, are `ENABLE ALWAYS` (`tgenabled = 'A'`),
+- all five capture triggers exist, are `ENABLE ALWAYS` (`tgenabled = 'A'`),
   and call their event's function;
 - each function exists, is `SECURITY DEFINER`, and is owned by the role that
   owns the ring (the one Trellis role that runs the migrations and installs

@@ -413,7 +413,11 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         .await
         .expect("check function privilege");
     let (functions, executable): (i64, i64) = (privileges.get(0), privileges.get(1));
-    assert_eq!(functions, 4 * specs.len() as i64, "one function per event");
+    assert_eq!(
+        functions,
+        5 * specs.len() as i64,
+        "one function per event, and the begin function"
+    );
     assert_eq!(executable, 0, "PUBLIC can't execute a capture function");
 
     let rows = fam_rows();

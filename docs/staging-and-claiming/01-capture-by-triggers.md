@@ -37,7 +37,9 @@ segment with one `INSERT … SELECT`:
   `extra_float_digits`), set as the function's own `SET` clauses. So an image
   doesn't depend on the writing session's settings. `old_image` comes from
   the OLD transition table, which carries the whole row, detoasted.
-- **`new_image` is the live row** (#623 D8a). Each row the statement wrote is
+- **`new_image` is the live row** (#623 D8a). When another write to the
+  table ran during the statement (see "When capture re-reads" below), each
+  row the statement wrote is
   re-read from the table by primary key, and `new_image` images that row,
   the one the transaction holds once the statement and its own `AFTER ROW`
   triggers are done, not the transition table's version (see "Nested writes
@@ -59,12 +61,9 @@ segment with one `INSERT … SELECT`:
   whole table for every captured row once it grows
   (`tests/capture_reread.rs`, at every isolation level).
 - **The re-read needs `SELECT` on the table**, which the Trellis role holds
-  as the table's owner; the capture audit reports it missing. Two costs
-  are new with it: under `SERIALIZABLE` the probe takes predicate locks on
-  the primary key's index pages, so two serializable writers to nearby keys
-  can now fail where they didn't before; and on a table with `FORCE ROW
-  LEVEL SECURITY` whose policies hide a row from the Trellis role, the
-  re-read can't find it and stages a delete.
+  as the table's owner; the capture audit reports it missing. On a table
+  with `FORCE ROW LEVEL SECURITY` whose policies hide a row from the
+  Trellis role, the re-read can't find it and stages a delete.
 - **Updates** pair the OLD and NEW transition tables by primary key. A row
   whose key changed has no partner, so it becomes a delete of the old key and
   an insert of the new one.
@@ -262,6 +261,33 @@ one (`tests/capture_join.rs`, `tests/ledger_interleavings.rs`). Its
 `old_image` is still the outer statement's OLD row: the fold keeps the
 earliest old image anyway, and only the relationship readers read it (until
 #624).
+
+## When capture re-reads (#623 D8a)
+
+Under `SERIALIZABLE` the re-read's index probe takes a predicate (SIREAD)
+lock on the key's btree leaf page, and concurrent serializable writers on
+neighbouring keys then form the read-write conflict chains Postgres cancels
+with `40001`. Every insert of an auto-increment id lands on the rightmost
+leaf, so with an unconditional re-read about half of all single-row
+serializable inserts failed at 4 to 16 writers, where none fail without
+capture (`benchmark` scenario `ssi-tax`; `local_docs/pr/623-d8a.md`).
+
+So capture re-reads only when the live row can differ from the transition
+row: when some other write to the same table changed it after the
+statement's row change and before its capture. Each such write is itself a
+statement on the table (a nested statement from an application trigger, an
+FK cascade or a function the statement calls, or a sibling event of the
+same statement: a writable CTE, `MERGE`, `INSERT … ON CONFLICT DO UPDATE`),
+so its own capture runs first. A fifth trigger, `<schema>_capture_begin`
+(`BEFORE INSERT OR UPDATE OR DELETE … FOR EACH STATEMENT`), marks where each
+statement's span starts in a transaction-local setting, and a capture
+re-reads only if another capture of the table staged rows since then.
+Otherwise it images the transition tables and reads no relation, so a
+statement nothing else touched takes no predicate lock on the table. The
+inexact cases all err towards re-reading: a disabled or missing begin
+trigger makes every capture re-read (and the capture audit reports it).
+`tests/capture_ssi.rs` pins the gate, and `capture::sql`'s `function_body`
+has the argument.
 
 ## What it costs the writer
 

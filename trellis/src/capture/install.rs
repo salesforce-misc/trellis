@@ -242,8 +242,8 @@ use crate::locks::{self, DdlRetry, USER_TABLE_DDL_LOCK_TIMEOUT};
 pub enum Installed {
     /// No trigger and no function of this instance for the table.
     Absent,
-    /// All four triggers exist, enabled `ALWAYS`, each calling its event's
-    /// function, and all four functions' comments record `spec`. `current`
+    /// All five triggers exist, enabled `ALWAYS`, each calling its event's
+    /// function, and all five functions' comments record `spec`. `current`
     /// says whether every function's source is what this build generates for
     /// `spec`.
     Complete { spec: CaptureSpec, current: bool },

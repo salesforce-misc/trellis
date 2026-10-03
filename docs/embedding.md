@@ -102,9 +102,10 @@ So:
   sequences. It has them as their owner, and the schema's `USAGE` through
   membership in the schema's owner when that is another role, unless someone
   revokes them.
-* **Leave the capture triggers alone.** Each source table carries four
+* **Leave the capture triggers alone.** Each source table carries five
   triggers named `<schema>_capture_<event>` (`trellis_capture_insert` and so
-  on for the default schema). Disabling or dropping one, or making the
+  on for the default schema; `trellis_capture_begin` is the `BEFORE`
+  statement trigger that lets capture skip its re-read of the table). Disabling or dropping one, or making the
   source a partition or part of an inheritance hierarchy, stops some of its
   changes reaching the target, with no error anywhere. Handing a capture
   function to another owner or revoking one of the privileges above is loud

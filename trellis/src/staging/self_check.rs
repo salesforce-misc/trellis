@@ -35,7 +35,7 @@
 //!
 //! Before it waits or compares anything, [`self_check`] checks from the
 //! catalog that every table the target is computed from is still captured
-//! as `capture::install` installed it: all four triggers present, `ENABLE
+//! as `capture::install` installed it: all five triggers present, `ENABLE
 //! ALWAYS` and calling their functions, the functions `SECURITY DEFINER` and
 //! owned by the Trellis role, that role still holding the privileges the
 //! functions use, and the table still outside any partition or inheritance
