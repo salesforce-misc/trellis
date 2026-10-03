@@ -224,6 +224,19 @@ pub fn pinned_output_settings() -> Vec<&'static str> {
         .collect()
 }
 
+/// Planner settings every capture function runs (and so plans) under, as
+/// `SET` clauses (#623 D8a).
+///
+/// PL/pgSQL plans each statement once per session, often on the first
+/// write to a table that is still empty or that a `VACUUM` last saw empty.
+/// Costed against an empty table, a sequential scan beats the primary-key
+/// index for the live re-read, and the cached plan would then scan the whole
+/// table for every captured row once it has grown. With sequential scans
+/// off, the probe is an index scan from the first plan on. The function's
+/// other reads are transition tables (not sequential scans) and catalog
+/// probes that use their indexes anyway.
+pub const PLANNER_SETTINGS: &[&str] = &["set enable_seqscan to 'off'"];
+
 /// The unquoted name of `table`'s capture function for `event`, in the
 /// instance schema: `cap_<event>_<table>_<hash>`, where `<table>` is the
 /// table's name cut to fit and `<hash>` is 16 hex digits of a hash of the
@@ -368,6 +381,7 @@ pub fn function_ddl(
     let tag = dollar_tag(&body);
     let settings: String = pinned_output_settings()
         .iter()
+        .chain(PLANNER_SETTINGS)
         .map(|clause| format!("\n    {clause}"))
         .collect();
     Ok(format!(
@@ -792,15 +806,22 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> Strin
     let table = quoted_table(&spec.table).expect("CaptureSpec::new checked the table name");
     let first_key = quote_ident(&spec.key[0]);
     let live = format!("t.{first_key} is not null");
-    // `t` joined by the primary key's typed equality, so the re-read is an
-    // index probe. `of` is the typed key's source per key column.
+    // `t`, read by the primary key's typed equality. The `limit 1` keeps the
+    // lateral subquery from being flattened into a join, so the plan is a
+    // probe per captured row whatever the table's size was when PL/pgSQL
+    // planned the statement (it plans once per session); see
+    // [`PLANNER_SETTINGS`] for the probe's index scan. `of` is the typed
+    // key's source per key column.
     let live_join = |of: &dyn Fn(&str) -> String| {
         let on: Vec<String> = spec
             .key
             .iter()
             .map(|c| format!("t.{} = {}", quote_ident(c), of(&quote_ident(c))))
             .collect();
-        format!("{indent}left join {table} t on {}", on.join(" and "))
+        format!(
+            "{indent}left join lateral (select * from {table} t where {} limit 1) t on true",
+            on.join(" and ")
+        )
     };
     match event {
         CaptureEvent::Insert => format!(
@@ -1169,6 +1190,16 @@ mod tests {
     }
 
     #[test]
+    fn the_live_reread_plans_as_an_index_probe_from_the_first_call() {
+        for event in CaptureEvent::ALL {
+            assert!(
+                ddl(&spec(), event).contains("\n    set enable_seqscan to 'off'\nas "),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_set_clauses_come_from_the_pools_pinned_settings() {
         let clauses = pinned_output_settings();
         // At least the five pinned before #672; the exact list grows with the pool's, and every
@@ -1409,8 +1440,11 @@ mod tests {
         ] {
             let sql = ddl(&spec(), event);
             assert!(
-                sql.contains(&format!("left join \"public\".\"orders\" t on {on}")),
-                "{sql}"
+                sql.contains(&format!(
+                    "left join lateral (select * from \"public\".\"orders\" t \
+                     where {on} limit 1) t on true"
+                )),
+                "a probe per row, never a join the planner could hash:\n{sql}"
             );
             assert!(
                 sql.contains(
@@ -1422,7 +1456,9 @@ mod tests {
         }
         let composite = ddl(&composite(), CaptureEvent::Insert);
         assert!(
-            composite.contains("t on t.\"post\" = n.\"post\" and t.\"tag\" = n.\"tag\";"),
+            composite.contains(
+                "where t.\"post\" = n.\"post\" and t.\"tag\" = n.\"tag\" limit 1) t on true;"
+            ),
             "{composite}"
         );
     }

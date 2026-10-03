@@ -745,3 +745,53 @@ async fn a_move_of_a_join_column_alone_still_stages() {
         )]
     );
 }
+
+// ------------------------------------------------------------ plan shape
+
+/// The live re-read stays a primary-key probe per captured row after the
+/// table grows, although PL/pgSQL planned it once, on the session's first
+/// write, against a table a `VACUUM` had just seen empty. Costed against
+/// that, a sequential scan beats the index, and a cached sequential scan
+/// would read the whole table for every captured row (a 1,000-row insert
+/// ran at 3% of control before the probe was forced). Inserts don't scan
+/// the table themselves, so any sequential scan of it is the re-read's.
+#[tokio::test]
+async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute("create table public.g (id bigint primary key, a int)")
+        .await
+        .expect("create public.g");
+    raw.batch_execute("vacuum public.g")
+        .await
+        .expect("vacuum public.g");
+    install_spec(&mut raw, &spec("public.g", &["a"])).await;
+
+    let writer = connect(db.dsn()).await;
+    writer
+        .batch_execute(
+            "insert into public.g values (0, 0); \
+             insert into public.g select i, i from generate_series(1, 2000) i; \
+             insert into public.g select i, i from generate_series(2001, 4000) i; \
+             select pg_stat_force_next_flush()",
+        )
+        .await
+        .expect("writes planned against an empty table");
+    writer.batch_execute("select 1").await.expect("flush stats");
+
+    raw.batch_execute("select pg_stat_clear_snapshot()")
+        .await
+        .expect("clear the stats snapshot");
+    let row = raw
+        .query_one(
+            "select seq_scan, idx_scan from pg_stat_user_tables where relid = 'public.g'::regclass",
+            &[],
+        )
+        .await
+        .expect("table stats");
+    let (seq, idx): (i64, i64) = (row.get(0), row.get::<_, Option<i64>>(1).unwrap_or(0));
+    assert_eq!(seq, 0, "the re-read scanned public.g");
+    assert!(idx >= 4001, "one probe per captured row, got {idx}");
+    assert_eq!(ring(&raw, "public.g").await.len(), 4001);
+}
