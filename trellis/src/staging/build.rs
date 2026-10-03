@@ -1188,6 +1188,13 @@ const FIELD_CAPTURE_RETRY: Duration = Duration::from_millis(500);
 /// upgraded it to `local_fuse`, or an upstream pause cascaded onto it,
 /// issue #309) only stops waiting: the field stays out of Apply and out of
 /// the build's chunks until its own resume.
+///
+/// The release bumps the version fence ([`bump_version_fence`]) as its
+/// transaction's first lock, so its wait for the pages in flight holds
+/// nothing a page could be waiting on (issue #744). A look under the claim
+/// alone comes first, so a call that has nothing to release, or whose
+/// capture isn't ready, doesn't bump the fence; the release then looks again
+/// under its locks.
 async fn field_build_ready(
     pool: &Pool,
     definition: &Definition,
@@ -1200,36 +1207,35 @@ async fn field_build_ready(
         txn.rollback().await?;
         return Ok(FieldStart::Superseded);
     }
-    let awaiting = txn
-        .query(
-            "select column_name from column_status \
-             where transform_table = $1 and column_name = any($2) and awaiting_capture \
-             for update",
-            &[&definition.def.target, &fields],
-        )
-        .await?;
-    if awaiting.is_empty() {
-        txn.commit().await?;
-        return Ok(FieldStart::Go);
+    let release = capture_release(&txn, definition, fields, false).await?;
+    txn.rollback().await?;
+    match release {
+        CaptureRelease::Nothing => return Ok(FieldStart::Go),
+        CaptureRelease::NotReady => return Ok(FieldStart::Wait),
+        CaptureRelease::Ready => {}
     }
-    let read: std::collections::BTreeSet<String> =
-        crate::defs::oracle::referenced_source_columns(&definition.def)
-            .into_iter()
-            .collect();
-    let images = capture_images(&*txn, &definition.source_table, &read)
-        .await
-        .map_err(build_error)?;
-    if !images
-        || capture_gate_holds(&*txn, &definition.source_table)
-            .await
-            .map_err(build_error)?
-    {
-        txn.rollback().await?;
-        return Ok(FieldStart::Wait);
-    }
+
+    let txn = client.transaction().await?;
     // A page that read the paused fields before this commit must not apply
-    // after it ([`bump_version_fence`]).
+    // after it. The claim's idle timeout goes first: from the bump on, a
+    // stalled worker holds up every page of the source, not just its chunk.
+    fence.arm(&*txn).await?;
     bump_version_fence(&*txn, &definition.source_table).await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(FieldStart::Superseded);
+    }
+    match capture_release(&txn, definition, fields, true).await? {
+        CaptureRelease::Nothing => {
+            txn.rollback().await?;
+            return Ok(FieldStart::Go);
+        }
+        CaptureRelease::NotReady => {
+            txn.rollback().await?;
+            return Ok(FieldStart::Wait);
+        }
+        CaptureRelease::Ready => {}
+    }
     release_awaiting_capture(&*txn, &definition.def.target, Some(fields)).await?;
     txn.commit().await?;
     tracing::info!(
@@ -1238,6 +1244,54 @@ async fn field_build_ready(
         "field build's capture is ready; its fields apply from here"
     );
     Ok(FieldStart::Go)
+}
+
+/// What [`capture_release`] found for a field build's `fields`.
+enum CaptureRelease {
+    /// None of them awaits its capture.
+    Nothing,
+    /// One does, and the source's capture isn't ready for it yet.
+    NotReady,
+    /// One does, and the capture is ready: release them.
+    Ready,
+}
+
+/// Whether [`field_build_ready`] has `fields`' `awaiting_capture` pauses to
+/// release, reading them `for update` when `lock`.
+async fn capture_release(
+    txn: &Transaction<'_>,
+    definition: &Definition,
+    fields: &[String],
+    lock: bool,
+) -> Result<CaptureRelease, ChunkQueueError> {
+    let lock = if lock { " for update" } else { "" };
+    let awaiting = txn
+        .query(
+            &format!(
+                "select column_name from column_status \
+                 where transform_table = $1 and column_name = any($2) and awaiting_capture{lock}"
+            ),
+            &[&definition.def.target, &fields],
+        )
+        .await?;
+    if awaiting.is_empty() {
+        return Ok(CaptureRelease::Nothing);
+    }
+    let read: std::collections::BTreeSet<String> =
+        crate::defs::oracle::referenced_source_columns(&definition.def)
+            .into_iter()
+            .collect();
+    let images = capture_images(txn, &definition.source_table, &read)
+        .await
+        .map_err(build_error)?;
+    if !images
+        || capture_gate_holds(txn, &definition.source_table)
+            .await
+            .map_err(build_error)?
+    {
+        return Ok(CaptureRelease::NotReady);
+    }
+    Ok(CaptureRelease::Ready)
 }
 
 /// Bumps `source_table`'s version fence (`source_table_versions`) in `txn`,
@@ -1255,6 +1309,12 @@ async fn field_build_ready(
 /// page holding the fence `for share` (Phase 3 holds it to its commit), and
 /// a page that reaches the fence after the commit misses it and computes
 /// again, with the field.
+///
+/// Callers bump it as their transaction's first lock, as `ALTER TRANSFORM`
+/// does (issue #744). A page takes the fence before any other lock, so a
+/// bump that holds nothing while it waits can't close a cycle; one that
+/// holds the definition row can, through a page queued on a third
+/// transaction that wants that row.
 pub(crate) async fn bump_version_fence(
     txn: &impl GenericClient,
     source_table: &str,

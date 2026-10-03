@@ -1042,6 +1042,135 @@ async fn a_page_computed_before_a_column_resume_does_not_apply_after_it() {
     assert_oracle(&mut d).await;
 }
 
+// ------------------ an edit waiting on a page at the fence holds nothing (#744)
+
+/// The edits that bump the version fence of a live 1-1 definition's source
+/// and lock its definition row.
+#[derive(Clone, Copy)]
+enum FenceEdit {
+    /// `RESUME TRANSFORM one.dbl`, of a column paused beforehand.
+    ResumeColumn,
+    /// `ALTER TRANSFORM one ADD v + 1 AS w`.
+    Alter,
+}
+
+/// A fence bump waits for every page holding the fence, so it must hold no
+/// lock while it waits: a page it waits on can be waiting in turn on a third
+/// transaction that wants that lock. Here a page computed key 1's change,
+/// holds the fence `for share`, and queues on key 1's entry, which a third
+/// transaction holds. The edit then waits on the page at the fence. Had it
+/// locked the definition row first, the third transaction's lock on that
+/// row would close the cycle: third on edit, edit on page, page on third,
+/// and Postgres would abort one of them with `40P01`. In issue #744 the
+/// third was the catch-up discharge: its orphan sweep held target rows a
+/// page queued on, and it then locked its `catching_up` readers'
+/// definition rows (`catalog::catching_up_readers`). The edit bumps the
+/// fence first, so the third takes the row, and all three commit in turn.
+async fn an_edit_waiting_on_a_page_at_the_fence(edit: FenceEdit) {
+    let mut d = Driver::start(
+        &format!("{CREATE} {}", seed(&[(1, 1, 1), (2, 1, 2)])),
+        &columns(),
+        &[ONE],
+        &["public.src"],
+    )
+    .await;
+    if matches!(edit, FenceEdit::ResumeColumn) {
+        trellis::staging::quarantine::pause_column(d.pool(), "one", "dbl")
+            .await
+            .expect("pause one.dbl");
+    }
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 10 where id = 1")
+        .await
+        .expect("update key 1");
+    let batch = d.seal().await;
+    // The page holds the fence `for share` and stops before its entry lock.
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    let frozen = page.reached(PausePoint::AfterPlaceholders).await;
+    // The third transaction holds key 1's entry, and the page queues on it.
+    let mut third = d.user().await;
+    let third_pid: i32 = third
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("read the third's backend pid")
+        .get(0);
+    let third = third.transaction().await.expect("begin the third");
+    third
+        .execute(
+            "select 1 from public.one__ledger where __from_key = '1' for update",
+            &[],
+        )
+        .await
+        .expect("the third locks key 1's entry");
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    d.wait_blocked_behind(third_pid).await;
+    // The edit queues on the page at the fence.
+    let edited = tokio::spawn({
+        let pool = d.pool().clone();
+        async move {
+            match edit {
+                FenceEdit::ResumeColumn => {
+                    trellis::staging::quarantine::resume_column(&pool, "one", "dbl")
+                        .await
+                        .map(drop)
+                        .map_err(|err| err.to_string())
+                }
+                FenceEdit::Alter => {
+                    let trellis::defs::Statement::AlterTransform(alter) =
+                        trellis::defs::parse_statement("ALTER TRANSFORM one ADD v + 1 AS w")
+                            .expect("parse")
+                    else {
+                        panic!("not an ALTER");
+                    };
+                    trellis::defs::alter_transform(&pool, &alter)
+                        .await
+                        .map(drop)
+                        .map_err(|err| err.to_string())
+                }
+            }
+        }
+    });
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    // The third now wants the definition row. Before #744's fix the cycle
+    // closed here, and whichever of the three ran its deadlock check first
+    // was aborted: usually the page, which retries, so only the log shows it.
+    let locked = third
+        .execute(
+            "select 1 from transform_definitions where target_table = $1 for update",
+            &[&TARGET],
+        )
+        .await;
+    let deadlocks = d.deadlocks_logged();
+    assert!(
+        locked.is_ok() && deadlocks.is_empty(),
+        "the edit held the definition row while it waited on the page: {locked:?}\n{}",
+        deadlocks.join("\n---\n"),
+    );
+    third.commit().await.expect("commit the third");
+    page.finish().await;
+    edited
+        .await
+        .expect("the edit's task")
+        .expect("the edit commits");
+    trellis::staging::build::settle_builds(d.pool()).await;
+    match edit {
+        FenceEdit::ResumeColumn => assert_oracle(&mut d).await,
+        FenceEdit::Alter => assert_field_oracle(&mut d).await,
+    }
+}
+
+#[tokio::test]
+async fn a_column_resume_waiting_on_a_page_at_the_fence_holds_nothing() {
+    an_edit_waiting_on_a_page_at_the_fence(FenceEdit::ResumeColumn).await;
+}
+
+#[tokio::test]
+async fn an_alter_waiting_on_a_page_at_the_fence_holds_nothing() {
+    an_edit_waiting_on_a_page_at_the_fence(FenceEdit::Alter).await;
+}
+
 // --------------------------- a chunk planned before an edit, run after it
 
 /// One drain worker's build step, as `work_once` takes it.

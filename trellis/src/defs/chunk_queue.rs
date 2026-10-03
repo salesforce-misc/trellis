@@ -479,13 +479,7 @@ impl<'a> ClaimFence<'a> {
         &self,
         txn: &impl GenericClient,
     ) -> Result<bool, tokio_postgres::Error> {
-        // Zero would disable the timeout, and the setting is an `int` of
-        // milliseconds.
-        let idle_ms = self.idle_timeout.as_millis().clamp(1, i32::MAX as u128);
-        txn.batch_execute(&format!(
-            "set local idle_in_transaction_session_timeout = {idle_ms}"
-        ))
-        .await?;
+        self.arm(txn).await?;
         let claimed = txn
             .query_opt(
                 "select 1 from backfill_chunks \
@@ -514,6 +508,22 @@ impl<'a> ClaimFence<'a> {
             .await?
             .get(0);
         Ok(!stale)
+    }
+
+    /// Sets `txn`'s `idle_in_transaction_session_timeout` to the reclaim
+    /// TTL, as [`hold`](Self::hold) does first. A fenced transaction that
+    /// takes a lock before the claim's calls this before that lock, so the
+    /// timeout bounds a stall that holds it too
+    /// (`staging::build::field_build_ready`'s version-fence bump, issue
+    /// #744).
+    pub(crate) async fn arm(&self, txn: &impl GenericClient) -> Result<(), tokio_postgres::Error> {
+        // Zero would disable the timeout, and the setting is an `int` of
+        // milliseconds.
+        let idle_ms = self.idle_timeout.as_millis().clamp(1, i32::MAX as u128);
+        txn.batch_execute(&format!(
+            "set local idle_in_transaction_session_timeout = {idle_ms}"
+        ))
+        .await
     }
 }
 
