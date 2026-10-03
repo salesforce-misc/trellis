@@ -437,6 +437,8 @@ async fn collect_tombstones_finds_a_mixed_case_spaced_ledger() {
                 "__basis" pg_snapshot,
                 "__tombstone" boolean not null default false
             );
+            create index on "Weird Schema"."Weird Target__ledger" ("__from_key")
+                where "__tombstone";
             insert into "Weird Schema"."Weird Target__ledger"
                 ("__from_key", "__applied_seg", "__tombstone")
             values ('k1', 1, true);
@@ -468,4 +470,56 @@ async fn collect_tombstones_finds_a_mixed_case_spaced_ledger() {
         .expect("count remaining rows")
         .get(0);
     assert_eq!(remaining, 0);
+}
+
+/// A ledger without its tombstone index is left for a later pass: an
+/// aggregate build drops the ledger's indexes for its load and adds them
+/// back in a later transaction, and between the two the GC's only plan
+/// would be a sequential scan of the whole ledger (#722, #738). Once the
+/// index is back, the GC collects as usual.
+#[tokio::test]
+async fn collect_tombstones_skips_a_ledger_without_its_tombstone_index() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            r#"
+            create table public.t__ledger (
+                "__from_key" text primary key,
+                "__applied_lsn" pg_lsn,
+                "__applied_seg" bigint,
+                "__basis" pg_snapshot,
+                "__tombstone" boolean not null default false
+            );
+            insert into public.t__ledger ("__from_key", "__applied_seg", "__tombstone")
+            values ('k1', 1, true), ('k2', 1, false);
+
+            insert into source_table_versions (source_table, version)
+            values ('public.src', 1);
+            insert into transform_definitions
+                (target_table, source_table, source_version, definition_text)
+            values ('public.t', 'public.src', 1, 'n/a');
+            "#,
+        )
+        .await
+        .expect("create a ledger with no tombstone index");
+
+    seal_and_fence(&mut client).await; // segment 1
+    mark_drained(&client, 1).await;
+
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 0, "no index, no collection");
+
+    client
+        .batch_execute(r#"create index on public.t__ledger ("__applied_seg") where "__tombstone""#)
+        .await
+        .expect("add the tombstone index");
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 1, "k1's tombstone goes once the index is back");
 }

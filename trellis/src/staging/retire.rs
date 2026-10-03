@@ -242,28 +242,31 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    let delete = |ledger: &str| {
-        let tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN);
-        let seg = quote_ident(crate::defs::ledger::APPLIED_SEG_COLUMN);
-        format!(
-            "delete from {ledger} where ctid = any(array( \
-                 select ctid from {ledger} where {tombstone} and {seg} <= $1 \
-                 limit $2 for update skip locked))"
-        )
-    };
     let mut collected = 0;
     for ledger in &ledgers {
-        let sql = delete(ledger);
+        let sql = collect_statement(ledger);
         for _ in 0..TOMBSTONE_BATCHES_PER_PASS {
             let txn = client.transaction().await?;
             if let Err(err) = txn
-                .batch_execute(&format!("lock table {ledger} in row exclusive mode nowait"))
+                .batch_execute(&format!(
+                    "lock table {ledger} in row exclusive mode nowait; {GC_PLAN_SETTINGS}"
+                ))
                 .await
             {
                 if is_lock_not_available(&err) || is_undefined_table(&err) {
                     break;
                 }
                 return Err(err.into());
+            }
+            let indexed: bool = txn
+                .query_one(
+                    TOMBSTONE_INDEX_SQL,
+                    &[&ledger.as_str(), &TOMBSTONE_INDEX_PREDICATE],
+                )
+                .await?
+                .get(0);
+            if !indexed {
+                break;
             }
             let deleted = txn.execute(&sql, &[&through, &TOMBSTONE_BATCH]).await?;
             txn.commit().await?;
@@ -274,6 +277,81 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
         }
     }
     Ok(collected)
+}
+
+/// The plan settings a GC batch's statement runs under (#738, #722): no
+/// sequential scan and no bitmap scan, so the batch walks the ledger's
+/// partial `where __tombstone` index and stops at its `limit`. Its cost is
+/// then the tombstones it walks, not the ledger's size.
+///
+/// Left to the statistics, the planner seq-scanned the ledger. Right after
+/// a burst of deletes, `analyze` sees many tombstones at or below the
+/// prefix, so a scan that stops at the batch's `limit` looks cheap. Once the
+/// GC has taken them, that scan reads the whole ledger to find the few that
+/// are left: 0.5 s a tick at 7M entries, and a 33 s transaction, holding
+/// `xmin` back for every table, on a 28.6 GB ledger at 100M. A bitmap scan
+/// would build the bitmap of every collectable tombstone before the
+/// `limit` applies.
+///
+/// The planner can only keep to that plan while the index exists, so a
+/// batch first checks it does ([`TOMBSTONE_INDEX_SQL`]). The settings are
+/// `set local`, and the batch's transaction commits (or the explain's rolls
+/// back) right after the statement, so nothing else plans under them.
+const GC_PLAN_SETTINGS: &str = "set local enable_seqscan = off; set local enable_bitmapscan = off";
+
+/// Whether the ledger `$1` has its partial tombstone index (the one whose
+/// predicate is `$2`, [`TOMBSTONE_INDEX_PREDICATE`]), valid. An aggregate
+/// build drops a ledger's indexes for its load and builds them again in a
+/// later transaction (`defs::backfill`'s `load_emptied_ledger`). Between
+/// the two, the batch's only plan would be a sequential scan of the
+/// just-loaded ledger, so it skips the ledger instead. The batch holds the
+/// ledger's `ROW EXCLUSIVE` lock when it asks, which conflicts with both
+/// `drop index` and `create index`, so the answer holds until it commits.
+const TOMBSTONE_INDEX_SQL: &str = "\
+    select exists ( \
+        select 1 from pg_catalog.pg_index \
+        where indrelid = $1::text::regclass and indisvalid \
+          and pg_catalog.pg_get_expr(indpred, indrelid) = $2)";
+
+/// The predicate of a ledger's tombstone index, as `pg_get_expr` prints it
+/// (`defs::ledger`'s DDL for both kinds of ledger).
+const TOMBSTONE_INDEX_PREDICATE: &str = crate::defs::ledger::TOMBSTONE_COLUMN;
+
+/// One GC batch's statement on `ledger`: deletes up to `$2` tombstones
+/// whose `applied_seg` is at or below `$1`. Run under [`GC_PLAN_SETTINGS`].
+fn collect_statement(ledger: &str) -> String {
+    let tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN);
+    let seg = quote_ident(crate::defs::ledger::APPLIED_SEG_COLUMN);
+    format!(
+        "delete from {ledger} where ctid = any(array( \
+             select ctid from {ledger} where {tombstone} and {seg} <= $1 \
+             limit $2 for update skip locked))"
+    )
+}
+
+/// The plan of one GC batch's statement on `ledger` (schema-qualified and
+/// quoted) through `through`, as `explain`'s text, under the settings a
+/// batch runs it with. For tests of the plan's shape. It deletes nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_collect(
+    client: &mut Client,
+    ledger: &str,
+    through: i64,
+) -> Result<String, StagingError> {
+    let txn = client.transaction().await?;
+    txn.batch_execute(GC_PLAN_SETTINGS).await?;
+    let rows = txn
+        .query(
+            &format!("explain {}", collect_statement(ledger)),
+            &[&through, &TOMBSTONE_BATCH],
+        )
+        .await?;
+    txn.rollback().await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn is_undefined_table(err: &tokio_postgres::Error) -> bool {
