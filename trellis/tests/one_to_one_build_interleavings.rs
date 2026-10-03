@@ -393,6 +393,39 @@ async fn the_chunk_statement_reads_every_table_by_its_key() {
     assert_oracle(&mut d).await;
 }
 
+/// The chunk statement's plan setting (no sequential scans) ends with the
+/// statement: whatever else the chunk's or a sweep batch's transaction runs
+/// next (marking the chunk done, the sweep's cursor) plans as usual.
+#[tokio::test]
+async fn the_chunk_plan_setting_ends_with_its_statement() {
+    let (d, plan) = start_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    let mut client = d.pool().get().await.expect("a connection");
+    let seqscan = async |txn: &tokio_postgres::Transaction<'_>| -> String {
+        txn.query_one("select current_setting('enable_seqscan')", &[])
+            .await
+            .expect("read enable_seqscan")
+            .get(0)
+    };
+
+    let txn = client.transaction().await.expect("begin");
+    let outcome = one_to_one::run_chunk(&txn, &plan, None, "3")
+        .await
+        .expect("run the chunk");
+    assert_eq!(outcome.written, 3, "the chunk ran its statement");
+    assert_eq!(seqscan(&txn).await, "on", "after a chunk");
+    txn.commit().await.expect("commit the chunk");
+
+    // Every entry's basis is older than a start past every xid, so the
+    // sweep re-derives them all.
+    let txn = client.transaction().await.expect("begin");
+    let swept = one_to_one::sweep_batch(&txn, &plan, "18446744073709551615", None, 10)
+        .await
+        .expect("run a sweep batch");
+    assert_eq!(swept.rederived, 3, "the sweep ran its statement");
+    assert_eq!(seqscan(&txn).await, "on", "after a sweep batch");
+    txn.commit().await.expect("commit the sweep batch");
+}
+
 // ------------------------------------------------------- chunk lock waits
 
 /// A chunk frozen after its entry lock holds an existing key's entry (the
@@ -475,11 +508,14 @@ async fn a_chunk_gives_up_on_a_key_a_page_holds() {
     assert_oracle(&mut d).await;
 }
 
-/// A chunk takes its entry lock before it reads (I1 for the build, the
-/// `chunk_without_entry_lock` plant). Key 2 has an entry, and a page
-/// applying a later change to it is frozen after its entry lock, before it
-/// writes. The chunk over key 2 queues behind it, and its read sees the
-/// page's commit, so the row ends at the page's change.
+/// A chunk takes its entry lock before it reads (I1 for the build). Key 2
+/// has an entry, and a page applying a later change to it is frozen after
+/// its entry lock, before it writes. The chunk over key 2 queues behind it,
+/// and its read sees the page's commit, so the row ends at the page's
+/// change. The `chunk_without_entry_lock` plant doesn't fail this one: the
+/// page's change was committed before the chunk's read, so the chunk writes
+/// the same row either way (its entry rewrite still queues behind the
+/// page). `a_page_queues_behind_a_chunk_holding_its_key` catches the plant.
 #[tokio::test]
 async fn a_chunk_reads_a_row_only_once_the_page_holding_it_commits() {
     let (mut d, plan) = start_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
