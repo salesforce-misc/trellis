@@ -725,6 +725,11 @@ pub fn evaluate_with_relationships(
 /// behavior via [`evaluate_with_relationships`]/[`evaluate`]); it's non-empty
 /// only when the caller has already looked up which of this definition's
 /// columns are currently paused (ADR-0003's amendment).
+///
+/// `excluded` must be closed over alias readers ([`AliasReaders::close`],
+/// issue #748): a field left in that reads an excluded one by alias would
+/// read the `None` seeded here and be written NULL, where ADR-0003 freezes
+/// it. Every caller's paused set is read through that closure.
 pub fn evaluate_with_relationships_excluding(
     def: &TransformDef,
     row: &Row,
@@ -736,6 +741,14 @@ pub fn evaluate_with_relationships_excluding(
     let fields_by_name: HashMap<&str, &FieldDef> =
         def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
+    debug_assert!(
+        excluded.is_empty() || {
+            let mut closed = excluded.clone();
+            AliasReaders::of(def).close(&mut closed);
+            closed == *excluded
+        },
+        "the excluded fields {excluded:?} leave out a field that reads one of them by alias"
+    );
     let mut cache: HashMap<String, Option<Value>> = HashMap::with_capacity(def.fields.len());
     let mut in_progress: HashSet<String> = HashSet::new();
     for excluded_name in excluded {
@@ -764,6 +777,68 @@ pub fn evaluate_with_relationships_excluding(
         cache.remove(excluded_name);
     }
     Ok(cache)
+}
+
+/// Which fields of one definition read which others by alias (issue #748):
+/// for each field, the fields whose expressions name it directly.
+///
+/// A field `f` reads sibling `g` when `f`'s expression names `g` and `g`
+/// isn't `f` itself. A field naming itself reads its source column
+/// (`c AS c`), the carve-out [`eval_expr`] and `validate`'s cycle detection
+/// make, and a persisted definition passed `validate`, which refuses a field
+/// naming itself that isn't a source column.
+///
+/// ADR-0003 freezes a paused field rather than nulling it, and a field that
+/// reads a paused one by alias is paused too: evaluating it would read the
+/// paused field as absent ([`evaluate_with_relationships_excluding`]) and
+/// write NULL. [`Self::close`] is how every paused-field read
+/// (`staging::quarantine::paused_columns_for` and its copies) takes that in,
+/// and how a field build adds the fields that read the ones it rebuilds.
+#[derive(Debug, Clone, Default)]
+pub struct AliasReaders {
+    readers: HashMap<String, Vec<String>>,
+}
+
+impl AliasReaders {
+    /// `def`'s alias readers.
+    pub fn of(def: &TransformDef) -> Self {
+        let names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
+        let mut readers: HashMap<String, Vec<String>> = HashMap::new();
+        for field in &def.fields {
+            let mut columns = Vec::new();
+            super::validate::collect_columns(&field.expr, &mut columns);
+            for column in columns {
+                if column != field.name && names.contains(column.as_str()) {
+                    let entry = readers.entry(column).or_default();
+                    if !entry.contains(&field.name) {
+                        entry.push(field.name.clone());
+                    }
+                }
+            }
+        }
+        Self { readers }
+    }
+
+    /// The fields that read `field` by alias directly, in definition order.
+    pub fn direct(&self, field: &str) -> &[String] {
+        self.readers.get(field).map_or(&[], Vec::as_slice)
+    }
+
+    /// Adds to `fields` every field that reads one of them by alias,
+    /// directly or through other fields.
+    pub fn close(&self, fields: &mut HashSet<String>) {
+        if self.readers.is_empty() {
+            return;
+        }
+        let mut queue: Vec<String> = fields.iter().cloned().collect();
+        while let Some(field) = queue.pop() {
+            for reader in self.direct(&field) {
+                if fields.insert(reader.clone()) {
+                    queue.push(reader.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Every `<rel>.<column>` relationship reference in `def`'s field expressions
@@ -2748,6 +2823,63 @@ mod tests {
         types: &HashMap<String, ValueType>,
     ) -> Result<HashMap<String, Option<Value>>, EvalError> {
         evaluate(d, r, types, &mut RegexCache::new())
+    }
+
+    fn field(name: &str, expr: Expr) -> FieldDef {
+        FieldDef {
+            name: name.to_string(),
+            expr,
+        }
+    }
+
+    fn closed(d: &TransformDef, seeds: &[&str]) -> Vec<String> {
+        let mut set: HashSet<String> = seeds.iter().map(|s| s.to_string()).collect();
+        AliasReaders::of(d).close(&mut set);
+        let mut out: Vec<String> = set.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// Issue #748: a field reading a paused one by alias, directly or
+    /// through a chain, is closed into the paused set; a field naming
+    /// itself reads its source column, not itself, and an unrelated field
+    /// stays out.
+    #[test]
+    fn alias_readers_close_over_direct_and_transitive_readers_only() {
+        let d = def(vec![
+            field("c3", col("c3")),
+            field("derived", add(col("c3"), col("price"))),
+            field("chained", add(col("derived"), col("derived"))),
+            field("other", col("price")),
+        ]);
+        assert_eq!(closed(&d, &["c3"]), ["c3", "chained", "derived"]);
+        assert_eq!(closed(&d, &["derived"]), ["chained", "derived"]);
+        assert_eq!(closed(&d, &["other"]), ["other"]);
+        assert_eq!(AliasReaders::of(&d).direct("c3"), ["derived"]);
+        assert!(AliasReaders::of(&d).direct("chained").is_empty());
+    }
+
+    /// The evaluation the closure exists for: with `c3` and its reader
+    /// excluded, neither is in the result, so Apply's write plan (which drops
+    /// the same set) leaves both as they were rather than writing NULL.
+    #[test]
+    fn evaluate_excluding_a_closed_set_omits_the_alias_reader() {
+        let d = def(vec![
+            field("c3", col("c3")),
+            field("derived", add(col("c3"), col("price"))),
+            field("other", col("price")),
+        ]);
+        let mut excluded: HashSet<String> = HashSet::from(["c3".to_string()]);
+        AliasReaders::of(&d).close(&mut excluded);
+        let out = evaluate_excluding(
+            &d,
+            &row(&[("c3", Some("1")), ("price", Some("2"))]),
+            &numeric_types(&["c3", "price"]),
+            &mut RegexCache::new(),
+            &excluded,
+        )
+        .expect("evaluate");
+        assert_eq!(out.keys().collect::<Vec<_>>(), ["other"]);
     }
 
     #[test]

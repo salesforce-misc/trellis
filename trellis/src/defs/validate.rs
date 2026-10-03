@@ -1512,7 +1512,7 @@ fn expr_is_group_by_key_passthrough(expr: &Expr, key: &GroupByKey) -> bool {
     }
 }
 
-fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
+pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.clone()),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}

@@ -75,6 +75,9 @@ pub struct OneToOnePlan {
     /// Each field's name and its self-contained SQL over the source's
     /// columns, in definition order.
     fields: Vec<(String, String)>,
+    /// Which fields read which others by alias, so a field reading a paused
+    /// one is left out with it (issue #748).
+    alias_readers: crate::defs::eval::AliasReaders,
 }
 
 /// Whether `definition` is a 1-1 target the Re-derive build serves (#625
@@ -131,6 +134,7 @@ impl OneToOnePlan {
             source_table: definition.source_table.clone(),
             pk,
             fields,
+            alias_readers: crate::defs::eval::AliasReaders::of(&definition.def),
         }))
     }
 }
@@ -594,7 +598,7 @@ async fn prepare_statement(
     scope: Option<&[String]>,
     pick: &Pick,
 ) -> Result<(Option<String>, Option<String>, TargetMutations), ApplyError> {
-    let paused: HashSet<String> = txn
+    let mut paused: HashSet<String> = txn
         .query(
             "select column_name from column_status where transform_table = $1",
             &[&plan.transform],
@@ -603,6 +607,7 @@ async fn prepare_statement(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
+    plan.alias_readers.close(&mut paused);
     let mut mutations = TargetMutations::new();
     let image = mutations.image_sql(txn, &plan.target, "t").await?;
     let sql = match scope {

@@ -2493,3 +2493,390 @@ async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
         "Apply writes the resumed column for a change after its resume"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #748: a field that reads a paused field by alias is paused with it.
+// ---------------------------------------------------------------------
+
+/// Creates source `items (id, price, tax, bonus)` and the 1-1 transform
+/// `sib` over it from `select` (its `SELECT` list), with its target table.
+async fn seed_items_transform(db: &TestDatabase, client: &Client, select: &str) {
+    client
+        .batch_execute(
+            "create table items (id integer primary key, price numeric, tax numeric, \
+             bonus numeric)",
+        )
+        .await
+        .expect("seed source table");
+    let source_columns = numeric_columns(&["id", "price", "tax", "bonus"]);
+    let definition = create_definition(
+        &db.pool,
+        &format!("TRANSFORM sib FROM items SELECT {select}"),
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, &definition.def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(
+        &db.pool,
+        &definition.def,
+        "public",
+        &pk,
+        &source_columns,
+        &definition.def.source,
+    )
+    .await
+    .expect("create target table");
+}
+
+/// Writes `items` row `id` as `(price, tax, bonus)` and stages its change
+/// (`before` the row's prior values, `None` for an insert), then drains
+/// everything staged.
+async fn change_item(
+    client: &mut Client,
+    pool: &trellis::Pool,
+    id: i64,
+    before: Option<(i64, i64, i64)>,
+    after: (i64, i64, i64),
+) {
+    let (price, tax, bonus) = after;
+    client
+        .execute(
+            "insert into items (id, price, tax, bonus) values ($1, $2::bigint, $3::bigint, \
+             $4::bigint) \
+             on conflict (id) do update set price = excluded.price, tax = excluded.tax, \
+             bonus = excluded.bonus",
+            &[&(id as i32), &price, &tax, &bonus],
+        )
+        .await
+        .expect("write the source row");
+    let image = |(price, tax, bonus): (i64, i64, i64)| {
+        format!(r#"{{"id":"{id}","price":"{price}","tax":"{tax}","bonus":"{bonus}"}}"#)
+    };
+    let table = active_segment_table(client).await;
+    let (op, old_image) = match before {
+        Some(before) => ("update", Some(image(before))),
+        None => ("insert", None),
+    };
+    insert_cdc_row(
+        client,
+        &table,
+        "items",
+        &id.to_string(),
+        op,
+        old_image.as_deref(),
+        Some(&image(after)),
+    )
+    .await;
+    drain_staged(client, pool).await;
+}
+
+/// Seals and drains every staged change, as the last test above does.
+async fn drain_staged(client: &mut Client, pool: &trellis::Pool) {
+    use trellis::staging::{has_pending, retire_drained_segments};
+    for _ in 0..16 {
+        let seg_seq = seal_active_segment(client).await;
+        while apply::drain_once(
+            pool,
+            seg_seq,
+            "worker",
+            1,
+            "trellis_column_quarantine_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("the staged changes never drained");
+}
+
+/// `sib`'s row `id`, as `column = value` text for each of `columns`.
+async fn sib_row(client: &Client, id: i32, columns: &[&str]) -> Vec<Option<String>> {
+    let select: Vec<String> = columns.iter().map(|c| format!("{c}::text")).collect();
+    let row = client
+        .query_one(
+            &format!("select {} from public.sib where id = $1", select.join(", ")),
+            &[&id],
+        )
+        .await
+        .expect("read the target row");
+    (0..columns.len()).map(|i| row.get(i)).collect()
+}
+
+fn some(values: &[&str]) -> Vec<Option<String>> {
+    values.iter().map(|v| Some(v.to_string())).collect()
+}
+
+/// The repro's shape (`derived = CHAR_LENGTH(c3)` over field `c3`), in
+/// numbers: while `total` is paused, a change to the key keeps `doubled`
+/// (which reads `total` by alias) at its old value instead of writing it
+/// NULL, `status` lists `doubled` as paused, and the resume releases and
+/// rebuilds both.
+#[tokio::test]
+async fn a_field_reading_a_paused_field_by_alias_freezes_and_its_resume_rebuilds_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(
+        &db,
+        &client,
+        "price + tax AS total, total + total AS doubled",
+    )
+    .await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        some(&["15", "30"])
+    );
+
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert_eq!(
+        column_status_row(&client, "sib", "doubled").await,
+        Some((
+            false,
+            Some("paused because upstream column 'sib.total' is paused".to_string())
+        )),
+        "a sibling reading the paused field is paused too, for that reason only"
+    );
+    assert!(cascade_edge_exists(&client, "sib", "doubled", "sib", "total").await);
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+    let status = trellis
+        .quarantine_status("sib.doubled")
+        .await
+        .expect("read the sibling's status");
+    assert_eq!(status.state, trellis::QuarantineState::Paused);
+
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        some(&["15", "30"]),
+        "both freeze: the sibling keeps its value rather than reading the paused field as \
+         absent and going NULL"
+    );
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib".to_string(), "doubled".to_string()),
+        ]
+    );
+    assert_eq!(column_status_row(&client, "sib", "doubled").await, None);
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        some(&["25", "50"]),
+        "the resume's field build rebuilds the sibling with the resumed field"
+    );
+    assert_eq!(status_named(&client, "sib").await, "live");
+}
+
+/// The same, through a chain: `b` reads `a` and `c` reads `b`, so pausing
+/// `a` pauses and freezes both, and resuming it rebuilds all three.
+#[tokio::test]
+async fn a_transitive_alias_chain_freezes_and_rebuilds_with_its_paused_head() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS a, a + a AS b, b + 1 AS c").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["a", "b", "c"]).await,
+        some(&["15", "30", "31"])
+    );
+
+    quarantine::pause_column(&db.pool, "sib", "a")
+        .await
+        .expect("pause a");
+    assert!(column_status_row(&client, "sib", "b").await.is_some());
+    assert!(column_status_row(&client, "sib", "c").await.is_some());
+    assert!(cascade_edge_exists(&client, "sib", "c", "sib", "b").await);
+
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["a", "b", "c"]).await,
+        some(&["15", "30", "31"]),
+        "every field down the chain freezes"
+    );
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "a")
+        .await
+        .expect("resume a");
+    assert_eq!(resumed.len(), 3, "a, b and c all resume: {resumed:?}");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        sib_row(&client, 1, &["a", "b", "c"]).await,
+        some(&["25", "50", "51"])
+    );
+}
+
+/// A sibling reading two paused fields stays paused, and frozen, until both
+/// are resumed: resuming one rebuilds only that one.
+#[tokio::test]
+async fn a_sibling_reading_two_paused_fields_stays_paused_until_both_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + 0 AS p, tax + 0 AS t, p + t AS s").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["p", "t", "s"]).await,
+        some(&["10", "5", "15"])
+    );
+
+    quarantine::pause_column(&db.pool, "sib", "p")
+        .await
+        .expect("pause p");
+    quarantine::pause_column(&db.pool, "sib", "t")
+        .await
+        .expect("pause t");
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 7, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["p", "t", "s"]).await,
+        some(&["10", "5", "15"])
+    );
+
+    // An operator pause of s too, then its resume while p and t are still
+    // paused: that drops only the operator's reason, and s stays paused for
+    // the fields it reads.
+    quarantine::pause_column(&db.pool, "sib", "s")
+        .await
+        .expect("pause s");
+    let resumed = quarantine::resume_column(&db.pool, "sib", "s")
+        .await
+        .expect("resume s");
+    assert!(resumed.is_empty(), "s reads paused fields: {resumed:?}");
+    assert_eq!(
+        column_status_row(&client, "sib", "s")
+            .await
+            .map(|(local_fuse, _)| local_fuse),
+        Some(false),
+        "s stays paused, now for the cascade's reason only"
+    );
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "p")
+        .await
+        .expect("resume p");
+    assert_eq!(resumed, vec![("sib".to_string(), "p".to_string())]);
+    assert!(
+        column_status_row(&client, "sib", "s").await.is_some(),
+        "s still reads the paused t, so it stays paused"
+    );
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        sib_row(&client, 1, &["p", "t", "s"]).await,
+        some(&["20", "5", "15"]),
+        "p is rebuilt; s stays frozen while t is paused"
+    );
+    change_item(&mut client, &db.pool, 1, Some((20, 7, 0)), (30, 7, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["p", "t", "s"]).await,
+        some(&["30", "5", "15"]),
+        "Apply writes p and still holds s"
+    );
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "t")
+        .await
+        .expect("resume t");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "t".to_string()),
+            ("sib".to_string(), "s".to_string()),
+        ]
+    );
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        sib_row(&client, 1, &["p", "t", "s"]).await,
+        some(&["30", "7", "37"])
+    );
+}
+
+/// `ALTER TRANSFORM` changing a field another reads by alias: `doubled`'s
+/// value moves with `total`'s, so the edit's field build rebuilds it too,
+/// rather than leaving every key the edit's build alone reaches at the value
+/// from the old formula.
+#[tokio::test]
+async fn an_alter_of_a_field_a_sibling_reads_by_alias_rebuilds_the_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(
+        &db,
+        &client,
+        "price + tax AS total, total + total AS doubled",
+    )
+    .await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 3)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        some(&["15", "30"])
+    );
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+    trellis
+        .apply("ALTER TRANSFORM sib ALTER total AS price + tax + 1")
+        .await
+        .expect("alter the field doubled reads");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        some(&["16", "32"]),
+        "doubled reads the altered field, so the edit rebuilds it"
+    );
+    assert_eq!(status_named(&client, "sib").await, "live");
+}
+
+/// Apply's own read of the paused fields closes over alias readers, not
+/// only `cascade_pause`'s rows: a field paused by a `column_status` row
+/// that no cascade has walked yet (the moment between a pause's own row and
+/// its cascade, or an `ALTER TRANSFORM` field awaiting its capture) still
+/// holds its readers out.
+#[tokio::test]
+async fn apply_holds_out_an_alias_reader_of_a_paused_field_without_a_row_of_its_own() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(
+        &db,
+        &client,
+        "price + tax AS total, total + total AS doubled",
+    )
+    .await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+
+    client
+        .execute(
+            "insert into column_status (transform_table, column_name, paused_at, local_fuse) \
+             values ('sib', 'total', now(), true)",
+            &[],
+        )
+        .await
+        .expect("pause total with no cascade");
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+    assert_eq!(
+        sib_row(&client, 1, &["total", "doubled"]).await,
+        some(&["15", "30"])
+    );
+}

@@ -1568,6 +1568,29 @@ pub async fn alter_transform(
         ..current.def.clone()
     };
 
+    // The fields the edit's field build rewrites: each added or altered one,
+    // and (issue #748) every field that reads one of them by alias, directly
+    // or through others, since its value moves with theirs.
+    //
+    // An added field an existing one already named, or a dropped one a
+    // remaining field still names, moves no reader's value: such a name is
+    // a source column, and a field named after a source column must pass
+    // that column through (`ValidationError::CalculatedFieldShadowsSourceColumn`).
+    let build_fields: Vec<String> = {
+        let mut edited: HashSet<String> = real_adds
+            .iter()
+            .chain(&real_alters)
+            .map(|f| f.name.clone())
+            .collect();
+        super::eval::AliasReaders::of(&merged).close(&mut edited);
+        merged
+            .fields
+            .iter()
+            .filter(|f| edited.contains(&f.name))
+            .map(|f| f.name.clone())
+            .collect()
+    };
+
     if (!real_adds.is_empty() || !real_alters.is_empty()) && backfill::uses_relationships(&merged) {
         return Err(CatalogError::UnsupportedAlter(format!(
             "'{}' would read a relationship path after this edit; ALTER TRANSFORM's ADD/ALTER \
@@ -1684,7 +1707,7 @@ pub async fn alter_transform(
     // already under a Re-derive build, which it joins. An edit that only
     // drops fields builds nothing; it takes the same definitions.
     let build: Option<String> = row.get(2);
-    let builds_fields = !real_adds.is_empty() || !real_alters.is_empty();
+    let builds_fields = !build_fields.is_empty();
     if !crate::staging::build::takes_field_build(status, build.as_deref()) {
         return Err(CatalogError::TransformNotLive {
             transform: alter.target.clone(),
@@ -1795,13 +1818,16 @@ pub async fn alter_transform(
         && reads_new_source_columns(&current.def, &merged)
         && !is_definition_target(&*txn, &current.source_table).await?
     {
-        for field in real_adds.iter().chain(real_alters.iter()) {
+        // Every field the build rewrites, so a sibling reading an edited
+        // field by alias is held out (and listed as paused) with it, rather
+        // than evaluated over its absence and written NULL (issue #748).
+        for field in &build_fields {
             txn.execute(
                 "insert into column_status \
                      (transform_table, column_name, paused_at, local_fuse, awaiting_capture) \
                  values ($1, $2, now(), false, true) \
                  on conflict (transform_table, column_name) do nothing",
-                &[&alter.target, &field.name],
+                &[&alter.target, field],
             )
             .await?;
         }
@@ -1820,12 +1846,7 @@ pub async fn alter_transform(
     // by the drain workers. See "The field build" in this function's doc
     // comment.
     if builds_fields {
-        let fields: Vec<String> = real_adds
-            .iter()
-            .chain(real_alters.iter())
-            .map(|f| f.name.clone())
-            .collect();
-        crate::staging::build::start_field_build(&*txn, current.id, status, &fields).await?;
+        crate::staging::build::start_field_build(&*txn, current.id, status, &build_fields).await?;
     }
 
     txn.commit().await?;
@@ -6201,13 +6222,33 @@ pub async fn definition_by_target(
 /// it that nothing in the aggregate write path ever consults or clears, and
 /// that `resume_column`'s cascade walk would later try (and fail) to
 /// recompute through its 1-1 field build.
+///
+/// **Sibling readers first** (issue #748). A 1-1 definition's own fields
+/// that read `upstream_column` by alias ([`super::eval::AliasReaders`])
+/// come first, under `upstream_table` itself: a field reading a paused
+/// field is paused too (ADR-0003 freezes it rather than evaluating it over
+/// the paused field's absence), so the cascade gives it a `column_status`
+/// row, which `status` lists, and an edge, which keeps it paused until every
+/// field it reads is resumed. They are one hop, like the rest; the cascade's
+/// walk reaches a sibling's own readers, and its downstream ones, from it.
 pub(crate) async fn column_dependents(
     pool: &Pool,
     upstream_table: &str,
     upstream_column: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
+    let mut deps: Vec<(String, String)> = match definition_by_target(pool, upstream_table).await? {
+        Some(definition) if matches!(definition.def.key_space, KeySpace::OneToOne) => {
+            super::eval::AliasReaders::of(&definition.def)
+                .direct(upstream_column)
+                .iter()
+                .map(|reader| (upstream_table.to_string(), reader.clone()))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     let client = pool.get().await?;
-    column_dependents_via(&**client, upstream_table, upstream_column, true).await
+    deps.extend(column_dependents_via(&**client, upstream_table, upstream_column, true).await?);
+    Ok(deps)
 }
 
 /// [`column_dependents`], generalized to *every* downstream key-space (not

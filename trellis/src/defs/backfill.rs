@@ -677,17 +677,24 @@ pub(crate) fn range_params<'a>(
 /// (`staging::apply` already depends on `defs::backfill`, so the reverse
 /// dependency would be circular). Empty (the overwhelmingly common case) for
 /// a definition with nothing currently paused.
+///
+/// Closed over `def`'s alias readers, as the `staging::quarantine` original
+/// is (issue #748).
 async fn paused_columns_for(
     client: &impl GenericClient,
-    transform_table: &str,
+    def: &TransformDef,
 ) -> Result<HashSet<String>, BackfillError> {
     let rows = client
         .query(
             "select column_name from column_status where transform_table = $1",
-            &[&transform_table],
+            &[&def.target],
         )
         .await?;
-    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    let mut paused: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();
+    if !paused.is_empty() {
+        super::eval::AliasReaders::of(def).close(&mut paused);
+    }
+    Ok(paused)
 }
 
 /// One `(lo, hi]` PK-range chunk's write — the body [`backfill_one_to_one`]'s
@@ -718,7 +725,7 @@ async fn write_one_to_one_range(
     // this definition currently has paused from both the computed column
     // list and the `ON CONFLICT` update set — see `paused_columns_for`'s doc
     // comment for why a durable, re-executable chunk write can't skip this.
-    let paused = paused_columns_for(client, &def.target).await?;
+    let paused = paused_columns_for(client, def).await?;
     let should_write = |name: &str| !paused.contains(name);
 
     let field_idents: Vec<String> = def
@@ -2286,7 +2293,7 @@ async fn backfill_relationship_one_to_one(
     // ADR-0003's amendment (column-level quarantine): exclude any column
     // this definition currently has paused, same as `write_one_to_one_range`
     // — see that function's `paused_columns_for` doc comment.
-    let paused = paused_columns_for(&**client, &def.target).await?;
+    let paused = paused_columns_for(&**client, def).await?;
 
     // Build the INSERT's column list, its per-field SELECT expression, and the
     // ON CONFLICT update set. The primary key comes first, then one column per

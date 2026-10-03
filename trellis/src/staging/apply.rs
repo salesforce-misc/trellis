@@ -5322,7 +5322,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // the overwhelmingly common case — so this is a cheap,
             // indexed no-op read then, behavior-identical to before this
             // amendment.
-            let paused = quarantine::paused_columns_for(pool, &def.def.target).await?;
+            let paused = quarantine::paused_columns_for(pool, &def.def).await?;
             let (field_names, field_types): (Vec<String>, Vec<ValueType>) = if paused.is_empty() {
                 (field_names, field_types)
             } else {

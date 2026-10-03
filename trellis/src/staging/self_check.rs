@@ -438,7 +438,7 @@ pub async fn self_check(
     let pk = ddl::source_primary_key(pool, &def.source_table).await?;
 
     let schema_divergences = check_schema(pool, &def, &pk).await?;
-    let paused = paused_columns(pool, &def.def.target).await?;
+    let paused = paused_columns(pool, &def.def).await?;
 
     let pass1 = match await_then_compare(pool, &def, &pk, &scope, &paused, timeout).await? {
         AwaitOutcome::NotCaughtUp { attempted } => {
@@ -832,18 +832,24 @@ fn diff_page(columns: &[&str], mut recomputed: Page, mut persisted: Page, limit:
 /// (that helper is `pub(super)`, scoped to `staging::quarantine`'s own
 /// callers, and `defs::backfill::paused_columns_for` already duplicates it
 /// too, for the same layering reason: see that pair's own doc comments).
+///
+/// Closed over `def`'s alias readers, as that original is (issue #748).
 async fn paused_columns(
     pool: &Pool,
-    transform_table: &str,
+    def: &crate::defs::ast::TransformDef,
 ) -> Result<HashSet<String>, SelfCheckError> {
     let client = pool.get().await?;
     let rows = client
         .query(
             "select column_name from column_status where transform_table = $1",
-            &[&transform_table],
+            &[&def.target],
         )
         .await?;
-    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    let mut paused: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();
+    if !paused.is_empty() {
+        crate::defs::eval::AliasReaders::of(def).close(&mut paused);
+    }
+    Ok(paused)
 }
 
 /// The columns `def`'s target table is expected to physically have (its

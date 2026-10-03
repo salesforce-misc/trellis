@@ -150,7 +150,11 @@
 //!
 //! **Field builds (F8b).** `ALTER TRANSFORM ... ADD`/`ALTER` and a column
 //! resume rebuild only the fields they change, in the background
-//! ([`start_field_build`]). The call's own transaction (#666: `apply` only
+//! ([`start_field_build`]). The fields they change take in every field that
+//! reads one of them by alias, directly or through others (issue #748,
+//! `defs::eval::AliasReaders`), since its value moves with theirs; a column
+//! pause holds such a reader out of Apply with the field it reads, so the
+//! resume rebuilds both. The call's own transaction (#666: `apply` only
 //! registers) moves the definition `live -> backfilling` with `build =
 //! 'rederive'`, or leaves it `backfilling` when a build is already running,
 //! and enqueues a plan job whose `backfill_chunks.fields` names the fields.
@@ -1840,7 +1844,7 @@ impl FieldPlan {
         if keys.is_empty() {
             return Ok(ChunkPlan::Field(FieldPlan::Empty));
         }
-        let excluded = super::quarantine::paused_columns_for(pool, &definition.def.target)
+        let excluded = super::quarantine::paused_columns_for(pool, &definition.def)
             .await
             .map_err(build_error)?;
         let rederive = super::apply::DirectRederive::new(

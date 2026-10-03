@@ -40,9 +40,10 @@ use std::time::SystemTime;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ast::KeySpace;
+use crate::defs::ast::{KeySpace, TransformDef};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, DdlError};
+use crate::defs::eval::AliasReaders;
 use crate::defs::model::TransformStatus;
 use crate::pool::Pool;
 
@@ -1980,6 +1981,14 @@ async fn attribute_column_failure(
 /// Empty (the overwhelmingly common case) for a transform with nothing
 /// paused.
 ///
+/// Closed over `def`'s alias readers ([`AliasReaders::close`], issue #748):
+/// a field reading a paused field by alias is held out too, so it keeps its
+/// value rather than being evaluated over the paused field's absence and
+/// written NULL. Its `column_status` row ([`cascade_pause`]) says the same
+/// for `status`; the closure here also covers a reader whose row hasn't
+/// committed yet ([`pause_column`] writes the paused field's row before its
+/// cascade runs).
+///
 /// `defs::backfill`'s durable chunk-queue write path
 /// (`write_one_to_one_range`/`backfill_relationship_one_to_one`) needs this
 /// same exclusion for the same reason (a (re-)executed backfill chunk must
@@ -1991,16 +2000,20 @@ async fn attribute_column_failure(
 /// plain `&Client` rather than a `&Pool`.
 pub(super) async fn paused_columns_for(
     pool: &Pool,
-    transform_table: &str,
+    def: &TransformDef,
 ) -> Result<HashSet<String>, ApplyError> {
     let client = pool.get().await?;
     let rows = client
         .query(
             "select column_name from column_status where transform_table = $1",
-            &[&transform_table],
+            &[&def.target],
         )
         .await?;
-    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    let mut paused: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();
+    if !paused.is_empty() {
+        AliasReaders::of(def).close(&mut paused);
+    }
+    Ok(paused)
 }
 
 /// Records one distinct poisoned row's failure for `(transform, column)` and
@@ -2108,7 +2121,8 @@ async fn trip_column_fuse(
 /// Pauses every direct and transitive dependent of `(transform, column)`
 /// (decision #5: a transform reading a paused column's output must also
 /// pause, rather than silently consume a frozen/stale value with no
-/// signal) — a breadth-first walk over
+/// signal), including a field of the same definition that reads it by
+/// alias (issue #748) — a breadth-first walk over
 /// [`crate::defs::catalog::column_dependents`], recorded into
 /// `column_pause_cascades` so [`resume_column`] can later tell a purely
 /// cascaded pause apart from one with its own independent (`local_fuse`)
@@ -2246,6 +2260,15 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// every `(transform, column)` pair actually resumed, `transform`/`column`
 /// itself first, in the order resumed.
 ///
+/// **Sibling readers** (issue #748). A field of the same definition that
+/// reads a resumed field by alias was paused with it ([`cascade_pause`]).
+/// One with no other reason to stay paused is released in the same
+/// transaction, and the field build covers every such reader, so it is
+/// rebuilt from the resumed field rather than left frozen at its value from
+/// before the pause. One that also reads a field still paused stays paused
+/// (its other cascade edge), and the build's chunks leave it out
+/// ([`paused_columns_for`]'s closure) until that field's resume.
+///
 /// **The field build** (`super::build::start_field_build`). Each 1-1 pair's
 /// unpause and its field build's registration commit together: the
 /// definition moves `live -> backfilling` (one already under a Re-derive
@@ -2264,6 +2287,10 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// silent no-op — and with [`ApplyError::ColumnAwaitingCapture`] if it is
 /// an `ALTER TRANSFORM` field still awaiting its capture widen (#687). A
 /// dependent in that state reached through the cascade stays paused too.
+/// A field that reads another field of its definition still paused, by
+/// alias, stays paused (issue #748): the resume drops only its own reason
+/// (`local_fuse`), leaves the cascade's, and resumes nothing. The resume of
+/// the field it reads releases and rebuilds it.
 ///
 /// Errors with [`ApplyError::DefinitionNotLive`] — with no side effects at
 /// all, checked before any of this function's deletes run — if `transform`
@@ -2346,6 +2373,22 @@ pub async fn resume_column(
                 &[&transform, &column],
             )
             .await?;
+
+        if reads_paused_sibling(&**client, pool, transform, column).await? {
+            client
+                .execute(
+                    "update column_status set local_fuse = false \
+                     where transform_table = $1 and column_name = $2",
+                    &[&transform, &column],
+                )
+                .await?;
+            tracing::info!(
+                transform = %transform,
+                column = %column,
+                "column reads a field still paused; it stays paused with it"
+            );
+            return Ok(Vec::new());
+        }
     }
 
     let mut resumed = Vec::new();
@@ -2410,58 +2453,119 @@ pub async fn resume_column(
             &[&t, &c],
         )
         .await?;
-        if one_to_one {
-            super::build::start_field_build(&*txn, def.id, status, std::slice::from_ref(&c))
+        // Un-cascade from `c`, and from each sibling this releases with it
+        // (issue #748): a field of this definition that reads a released
+        // one by alias, and has no other reason to stay paused, is released
+        // in this same transaction and rebuilt by the same field build. A
+        // dependent in another definition goes on the queue.
+        let mut released = vec![c.clone()];
+        let mut frontier = vec![c.clone()];
+        while let Some(upstream) = frontier.pop() {
+            let affected = txn
+                .query(
+                    "delete from column_pause_cascades \
+                     where upstream_transform = $1 and upstream_column = $2 \
+                     returning downstream_transform, downstream_column",
+                    &[&t, &upstream],
+                )
                 .await?;
+            for row in affected {
+                let downstream_transform: String = row.get(0);
+                let downstream_column: String = row.get(1);
+                let status = txn
+                    .query_opt(
+                        "select local_fuse, awaiting_capture from column_status \
+                         where transform_table = $1 and column_name = $2",
+                        &[&downstream_transform, &downstream_column],
+                    )
+                    .await?;
+                let Some(status) = status else {
+                    // Already resumed by some other path (shouldn't happen
+                    // within one resume walk, but tolerate it rather than
+                    // panic).
+                    continue;
+                };
+                let (local_fuse, awaiting_capture): (bool, bool) = (status.get(0), status.get(1));
+                // #687: a field awaiting its capture widen stays paused; with
+                // this cascade gone, its field build's start unpauses it.
+                if local_fuse || awaiting_capture {
+                    continue;
+                }
+                let remaining: i64 = txn
+                    .query_one(
+                        "select count(*) from column_pause_cascades \
+                         where downstream_transform = $1 and downstream_column = $2",
+                        &[&downstream_transform, &downstream_column],
+                    )
+                    .await?
+                    .get(0);
+                if remaining > 0 {
+                    continue;
+                }
+                if downstream_transform == t {
+                    txn.execute(
+                        "delete from column_status \
+                         where transform_table = $1 and column_name = $2",
+                        &[&t, &downstream_column],
+                    )
+                    .await?;
+                    released.push(downstream_column.clone());
+                    frontier.push(downstream_column);
+                } else {
+                    queue.push_back((downstream_transform, downstream_column));
+                }
+            }
         }
-        let affected = txn
-            .query(
-                "delete from column_pause_cascades \
-                 where upstream_transform = $1 and upstream_column = $2 \
-                 returning downstream_transform, downstream_column",
-                &[&t, &c],
-            )
-            .await?;
-        for row in affected {
-            let downstream_transform: String = row.get(0);
-            let downstream_column: String = row.get(1);
-            let status = txn
-                .query_opt(
-                    "select local_fuse, awaiting_capture from column_status \
-                     where transform_table = $1 and column_name = $2",
-                    &[&downstream_transform, &downstream_column],
-                )
-                .await?;
-            let Some(status) = status else {
-                // Already resumed by some other path (shouldn't happen
-                // within one resume walk, but tolerate it rather than panic).
-                continue;
-            };
-            let (local_fuse, awaiting_capture): (bool, bool) = (status.get(0), status.get(1));
-            // #687: a field awaiting its capture widen stays paused; with
-            // this cascade gone, its field build's start unpauses it.
-            if local_fuse || awaiting_capture {
-                continue;
-            }
-            let remaining: i64 = txn
-                .query_one(
-                    "select count(*) from column_pause_cascades \
-                     where downstream_transform = $1 and downstream_column = $2",
-                    &[&downstream_transform, &downstream_column],
-                )
-                .await?
-                .get(0);
-            if remaining == 0 {
-                queue.push_back((downstream_transform, downstream_column));
-            }
+        // The build covers every field reading a released one by alias,
+        // whether or not it had a cascade edge: one still held out by
+        // another paused field it reads is left out of the build's chunks
+        // (`paused_columns_for`), and that field's own resume builds it.
+        if one_to_one {
+            let mut fields: HashSet<String> = released.iter().cloned().collect();
+            AliasReaders::of(&def.def).close(&mut fields);
+            let fields: Vec<String> = def
+                .def
+                .fields
+                .iter()
+                .filter(|f| fields.contains(&f.name))
+                .map(|f| f.name.clone())
+                .collect();
+            super::build::start_field_build(&*txn, def.id, status, &fields).await?;
         }
         txn.commit().await?;
-        resumed.push((t.clone(), c.clone()));
+        resumed.extend(released.into_iter().map(|field| (t.clone(), field)));
     }
 
     tracing::Span::current().record("resumed", resumed.len());
     tracing::info!(resumed = ?resumed, "resumed paused column(s)");
     Ok(resumed)
+}
+
+/// Whether `column` of `transform` reads another of its fields that is
+/// still paused, by alias, directly or through others (issue #748): Apply
+/// holds it out with that field whatever its own row says
+/// ([`paused_columns_for`]).
+async fn reads_paused_sibling(
+    client: &impl GenericClient,
+    pool: &Pool,
+    transform: &str,
+    column: &str,
+) -> Result<bool, ApplyError> {
+    let Some(def) = catalog::definition_by_target(pool, transform).await? else {
+        return Ok(false);
+    };
+    let mut others: HashSet<String> = client
+        .query(
+            "select column_name from column_status \
+             where transform_table = $1 and column_name <> $2",
+            &[&transform, &column],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    AliasReaders::of(&def.def).close(&mut others);
+    Ok(others.contains(column))
 }
 
 /// Resumes a whole-transform-frozen definition — ADR-0003's coarser,
