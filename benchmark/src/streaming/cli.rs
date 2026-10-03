@@ -12,7 +12,7 @@ use crate::streaming::tuning::EngineTuning;
 use crate::streaming::write_tax::{self, CellOptions, ProbeMode, Shape, Variant};
 use crate::streaming::{
     build_under_load, capture_ceiling, disk_tier, fold_in, generator_reach, hop_latency, idle_cost,
-    load, throughput,
+    load, ssi_tax, throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -25,6 +25,7 @@ pub const SCENARIOS: &[&str] = &[
     "group-contention",
     "write-tax",
     "capture-ceiling",
+    "ssi-tax",
     "idle-cost",
     "generator-reach",
     "build-under-load",
@@ -518,6 +519,33 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             ));
             eprintln!("{}", write_tax::summary(&results));
             Some(results.iter().all(|r| r.ring_ok))
+        }
+
+        // #623 D8a: `--workloads serial1,serial-batch,random1,update1`,
+        // `--writers 1,4,8,16`, `--variants none,trigger`,
+        // `--isolation serializable[,read-committed]`, `--batch 10`,
+        // `--secs 8`, `--reps`.
+        "ssi-tax" => {
+            let workloads: Vec<ssi_tax::Workload> = match flag(args, "--workloads") {
+                Some(raw) => raw.split(',').map(ssi_tax::Workload::parse).collect(),
+                None => ssi_tax::DEFAULT_WORKLOADS.to_vec(),
+            };
+            let isolations: Vec<ssi_tax::Isolation> = match flag(args, "--isolation") {
+                Some(raw) => raw.split(',').map(ssi_tax::Isolation::parse).collect(),
+                None => vec![ssi_tax::Isolation::Serializable],
+            };
+            let writers = usize_list(args, "--writers", ssi_tax::DEFAULT_WRITERS);
+            let variants = variants(args, ssi_tax::DEFAULT_VARIANTS);
+            let opts = ssi_tax::Options {
+                batch: number(args, "--batch")
+                    .map(|v| v as usize)
+                    .unwrap_or(ssi_tax::DEFAULT_BATCH),
+                window: secs(args, "--secs").unwrap_or(ssi_tax::DEFAULT_WINDOW),
+            };
+            let cells = ssi_tax::schedule(&workloads, &writers, &variants, &isolations, reps(args));
+            let results = writer_runtime().block_on(ssi_tax::run_matrix(cells, &opts));
+            eprintln!("{}", ssi_tax::summary(&results));
+            Some(true)
         }
 
         "idle-cost" => {

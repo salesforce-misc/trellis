@@ -56,6 +56,8 @@
 //!   it, per capture variant and transaction shape (#565 E1, #622 C4).
 //! - [`capture_ceiling`]: rows/s reaching the ring as writers are added,
 //!   with nothing draining (#565 E2, #622 C4). It replaced `intake-ceiling`.
+//! - [`ssi_tax`]: the `40001` rate capture adds to concurrent
+//!   `SERIALIZABLE` writers, against the same table with no capture (#623 D8a).
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
 //!   and seals/sec (V-IDLE).
 //! - [`build_under_load`]: a large aggregate build under a paced mixed write
@@ -85,6 +87,7 @@ pub mod process_memory;
 pub mod rate;
 pub mod scrape;
 pub mod server_cost;
+pub mod ssi_tax;
 pub mod throughput;
 pub mod tuning;
 pub mod write_tax;

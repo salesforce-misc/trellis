@@ -971,26 +971,24 @@ pub fn against_control(
 }
 
 /// Sets `variant` up on a fresh database: an index or the capture triggers.
-async fn set_up_variant(variant: Variant, raw: &mut RawClient) {
+pub async fn set_up_variant(variant: Variant, table: &str, raw: &mut RawClient) {
     match variant {
         Variant::None => {}
         Variant::Btree => {
-            raw.batch_execute(&format!(
-                "create index wt_val_idx on public.{SOURCE_TABLE} (val)"
-            ))
-            .await
-            .expect("create the btree index");
+            raw.batch_execute(&format!("create index wt_val_idx on public.{table} (val)"))
+                .await
+                .expect("create the btree index");
         }
         Variant::RegexIndex => {
             raw.batch_execute(&format!(
-                "create index wt_val_regex_idx on public.{SOURCE_TABLE} \
+                "create index wt_val_regex_idx on public.{table} \
                  (regexp_count(val::text, '[13579]'))"
             ))
             .await
             .expect("create the expression index");
         }
         Variant::Trigger => {
-            let table = format!("public.{SOURCE_TABLE}");
+            let table = format!("public.{table}");
             let catalog = trellis::dev::capture::load_catalog(&*raw, DEFAULT_SCHEMA)
                 .await
                 .expect("load the capture catalog");
@@ -1028,7 +1026,7 @@ pub async fn run_cell(
     .expect("create the source table");
     // The same catalog for every variant: one transform reading `val`.
     install_chain_hops(&db.pool, SOURCE_TABLE, 1).await;
-    set_up_variant(variant, &mut raw).await;
+    set_up_variant(variant, SOURCE_TABLE, &mut raw).await;
 
     let rows_target = opts
         .rows
