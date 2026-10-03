@@ -288,8 +288,10 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
 /// a burst of deletes, `analyze` sees many tombstones at or below the
 /// prefix, so a scan that stops at the batch's `limit` looks cheap. Once the
 /// GC has taken them, that scan reads the whole ledger to find the few that
-/// are left: 0.5 s a tick at 7M entries, and a 33 s transaction, holding
-/// `xmin` back for every table, on a 28.6 GB ledger at 100M. A bitmap scan
+/// are left: up to 0.6 s a tick at 10M entries, and, by the same plan, the
+/// 33 s transaction #722 saw holding `xmin` back for every table on a
+/// 28.6 GB ledger at 100M. Under these settings it was 65 ms at most at
+/// 100M (0.4 ms mean). A bitmap scan
 /// would build the bitmap of every collectable tombstone before the
 /// `limit` applies.
 ///
