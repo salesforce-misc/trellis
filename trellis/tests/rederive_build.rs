@@ -358,7 +358,8 @@ async fn changes_drained_while_backfilling_are_applied() {
     let mut f = Fixture::new(200, &[AGG]).await;
     f.pass().await;
 
-    // A new group, before any chunk: only Apply can put it there.
+    // A new group, before any chunk: only a page can put it there (a
+    // Re-derive, its batch being the start's own segment, #733).
     f.raw
         .batch_execute("insert into public.src values (1000, 99, 5)")
         .await
@@ -2022,4 +2023,64 @@ async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted
         "agg2 equals a from-scratch GROUP BY over the source"
     );
     f.assert_agg_oracle().await;
+}
+
+/// A second plain 1-1 target over the same source, registered once the
+/// first is live.
+const ONE2: &str = "TRANSFORM one2 FROM public.src SELECT g AS g, v + v AS dbl";
+
+/// #733 on a 1-1 target (F8a): the same out-of-order drain across the
+/// start as `a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted_key`.
+/// The key's delete drained before `one2` started, so it never reached
+/// `one2`, and its insert, in an older batch, drained after the start. No
+/// chunk reads a key the source no longer has, and a fresh build has no
+/// sweep, so an Apply of that insert left a target row the source doesn't
+/// back for good.
+#[tokio::test]
+async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_a_deleted_key() {
+    let mut f = Fixture::new(20, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    let watermark = StagedWatermark::saturated();
+    let seal = async |f: &mut Fixture, sql: &str| -> i64 {
+        f.raw.batch_execute(sql).await.expect("write");
+        trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
+            .await
+            .expect("seal")
+            .expect("the write made the active segment non-empty")
+            .sealed_seg_seq
+    };
+    let older = seal(&mut f, "insert into public.src values (100, 5, 7)").await;
+    let newer = seal(&mut f, "delete from public.src where id = 100").await;
+    apply::drain_once(&f.db.pool, newer, "drainer", 1, WAKE, &watermark)
+        .await
+        .expect("drain the newer batch");
+
+    let columns = [
+        ("id".to_string(), ValueType::Numeric),
+        ("g".to_string(), ValueType::Numeric),
+        ("v".to_string(), ValueType::Numeric),
+    ]
+    .into_iter()
+    .collect();
+    trellis::defs::install_definition(&f.db.pool, ONE2, &columns, "public")
+        .await
+        .expect("register one2");
+    f.pass().await;
+    assert_eq!(f.status("one2").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("one2").await.as_deref(), Some("rederive"));
+
+    apply::drain_once(&f.db.pool, older, "drainer", 1, WAKE, &watermark)
+        .await
+        .expect("drain the older batch");
+    f.run("one2").await;
+    assert_eq!(f.status("one2").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.rows("select (id, g, dbl)::text from public.one2 order by id")
+            .await,
+        f.rows(ONE_EXPECTED).await,
+        "one2 equals its source"
+    );
+    f.assert_one_oracle().await;
 }

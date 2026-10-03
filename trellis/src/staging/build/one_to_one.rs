@@ -39,7 +39,11 @@
 //! after the chunk applies a change only if ADR-0002's I2 holds: one the
 //! snapshot saw is refused, and one it didn't is newer than the row the
 //! chunk wrote. A key a page inserted after step 1 isn't locked, and its own
-//! change applies it.
+//! change applies it. As for a ledger target, a page whose batch is at or
+//! below the start's segment re-derives its keys instead of applying them
+//! (#733, `super::start`): an older change drained after the start, whose
+//! key's later delete drained before it, would otherwise write a target row
+//! no chunk reaches.
 //!
 //! A paused column (`column_status`) is left out of the chunk's insert and
 //! update, as the page and the old range build leave it.

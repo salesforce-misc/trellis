@@ -6251,7 +6251,9 @@ impl DirectRederive {
             .query_one("select coalesce(max(seg_seq), 0) from segments", &[])
             .await?
             .get(0);
-        settle_one_to_one_target(txn, &self.target, &self.plan, seg, mutations).await?;
+        // Every record is a Re-derive already, so the first segment
+        // changes nothing.
+        settle_one_to_one_target(txn, &self.target, &self.plan, seg, seg, mutations).await?;
         Ok(())
     }
 }
@@ -6266,17 +6268,43 @@ impl DirectRederive {
 /// latest Apply. A Re-derive of a relationship-enriched definition whose row
 /// now joins through a key Phase 2's context didn't resolve is re-staged
 /// instead, so a later page builds a context for it.
+///
+/// `first_seg` and `seg_seq` are the lowest and highest segments of the
+/// page's batches. A page whose first is at or below the target's
+/// `build_seg` re-derives every record instead of applying it, as a ledger
+/// target's page does (#733, `super::ledger::page_may_predate_build`): a
+/// change committed before the target's Re-derive build started may have
+/// had a later change drained before the start, which never reached the
+/// target, and a key deleted that way has no source row for a chunk to
+/// find. The entries take `seg_seq` as their `applied_seg`.
 async fn settle_one_to_one_target(
     txn: &Transaction<'_>,
     target: &str,
     plan: &TargetPlan,
+    first_seg: i64,
     seg_seq: i64,
     mutations: &mut TargetMutations,
 ) -> Result<AppliedTarget, ApplyError> {
+    let rederived_records: Vec<OneToOneRecord>;
+    let records: &[OneToOneRecord] = if plan.records.iter().any(|r| r.apply.is_some())
+        && super::ledger::page_may_predate_build(txn, &plan.qualified_target, first_seg).await?
+    {
+        rederived_records = plan
+            .records
+            .iter()
+            .map(|r| OneToOneRecord {
+                apply: None,
+                ..r.clone()
+            })
+            .collect();
+        &rederived_records
+    } else {
+        &plan.records
+    };
     // A key that decodes to `None` (a NULL key part) has no target row to
     // write; it is never settled.
     let mut by_key: BTreeMap<&str, &OneToOneRecord> = BTreeMap::new();
-    for record in &plan.records {
+    for record in records {
         if decode_target_pk_parts(&plan.pk, target, &record.pk_text)?.is_none() {
             continue;
         }
@@ -7136,8 +7164,15 @@ pub(crate) async fn apply_page(
     let page_first_seg = steps.iter().map(|step| step.seg_seq).min().unwrap_or(0);
     let mut restaged: Vec<Restage> = Vec::new();
     for (target, target_plan) in &plan.targets {
-        let (written, deleted, restage) =
-            settle_one_to_one_target(txn, target, target_plan, page_seg, &mut mutations).await?;
+        let (written, deleted, restage) = settle_one_to_one_target(
+            txn,
+            target,
+            target_plan,
+            page_first_seg,
+            page_seg,
+            &mut mutations,
+        )
+        .await?;
         restaged.extend(restage);
         keys_written += written;
         keys_deleted += deleted;

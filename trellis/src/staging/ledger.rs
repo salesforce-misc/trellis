@@ -1848,6 +1848,27 @@ pub(super) async fn lock_entries(
     Ok(())
 }
 
+/// Whether a page whose lowest segment is `first_seg` may hold a change
+/// committed before `target`'s Re-derive build started (#733): its batch
+/// is at or below the target's `build_seg` (`super::build`'s start). Such a
+/// page re-derives every key it holds for the target rather than applying
+/// their changes, on the ledger ([`apply_ledger_target`]) and on a 1-1
+/// target alike (`super::apply`'s `settle_one_to_one_target`).
+pub(crate) async fn page_may_predate_build(
+    txn: &Transaction<'_>,
+    target: &str,
+    first_seg: i64,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(txn
+        .query_one(
+            "select coalesce($2 <= (select build_seg from transform_definitions \
+                                    where target_table = $1), false)",
+            &[&target, &first_seg],
+        )
+        .await?
+        .get(0))
+}
+
 /// Applies one page's records to one ledger target, in the page's
 /// transaction. See the module doc. Returns the groups written and deleted.
 /// `first_seg` and `seg_seq` are the lowest and highest segments of the
@@ -1884,14 +1905,8 @@ pub(crate) async fn apply_ledger_target(
     // 2. The Re-derive read: its rows and its snapshot in one statement. A
     // page with a batch at or below the segment the target's Re-derive build
     // started in re-derives every record (#733, see the module doc).
-    let rederive_all: bool = txn
-        .query_one(
-            "select coalesce($2 <= (select build_seg from transform_definitions \
-                                    where target_table = $1), false)",
-            &[&plan.target, &first_seg],
-        )
-        .await?
-        .get(0);
+    let rederive_all = records.iter().any(|r| r.apply.is_some())
+        && page_may_predate_build(txn, &plan.target, first_seg).await?;
     fn apply_of(record: &LedgerRecord, rederive: bool) -> Option<&(PgLsn, String, Option<String>)> {
         if rederive {
             None

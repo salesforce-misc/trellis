@@ -1023,7 +1023,8 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// start commits, so every change committed before the start is in a batch
 /// at or below `build_seg`, and a page that drains one re-derives its keys
 /// for the definition rather than applying their changes
-/// ([`ledger::apply_ledger_target`]). Every batch above it holds only
+/// ([`ledger::page_may_predate_build`]), on a ledger target and a 1-1
+/// target alike. Every batch above it holds only
 /// changes committed after the start, drained by pages that read the
 /// definition list after it, so none is dropped.
 ///
