@@ -49,9 +49,14 @@
 //!    transient error: it rolls back and retries, inserting that key's
 //!    placeholder afresh (#712).
 //! 2. **Re-derive read**: a record staged as a `recompute` (or folded with
-//!    one) is a Re-derive, and so is one with no change identity. One
-//!    statement reads those keys' source rows *and* `pg_current_snapshot()`,
-//!    after the lock. A key with no row is a tombstone.
+//!    one) is a Re-derive, and so is one with no change identity. So is
+//!    every record of a page with a batch at or below the target's
+//!    `build_seg`, the segment its Re-derive build started in (#733): such a
+//!    batch may hold changes committed before the start, and a later change
+//!    to the same key may have drained before the start, unapplied, leaving
+//!    the older change's image stale (`super::build`'s start). One statement
+//!    reads those keys' source rows *and* `pg_current_snapshot()`, after the
+//!    lock. A key with no row is a tombstone.
 //! 3. **One statement** updates the entries, aggregates the moves between
 //!    each updated entry's old and new state into per-group increments, and
 //!    upserts them in group order (I5), returning each written group:
@@ -1845,6 +1850,10 @@ pub(super) async fn lock_entries(
 
 /// Applies one page's records to one ledger target, in the page's
 /// transaction. See the module doc. Returns the groups written and deleted.
+/// `first_seg` and `seg_seq` are the lowest and highest segments of the
+/// page's batches: the first decides whether the page re-derives every
+/// record (step 2), and the entries take the second as their
+/// `applied_seg`.
 #[tracing::instrument(
     name = "staging.apply_ledger_target",
     skip(txn, plan, mutations),
@@ -1853,6 +1862,7 @@ pub(super) async fn lock_entries(
 pub(crate) async fn apply_ledger_target(
     txn: &Transaction<'_>,
     plan: &LedgerTargetPlan,
+    first_seg: i64,
     seg_seq: i64,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
@@ -1871,10 +1881,27 @@ pub(crate) async fn apply_ledger_target(
     let skip_lock = false;
     lock_entries(txn, plan, &keys, skip_lock).await?;
 
-    // 2. The Re-derive read: its rows and its snapshot in one statement.
+    // 2. The Re-derive read: its rows and its snapshot in one statement. A
+    // page with a batch at or below the segment the target's Re-derive build
+    // started in re-derives every record (#733, see the module doc).
+    let rederive_all: bool = txn
+        .query_one(
+            "select coalesce($2 <= (select build_seg from transform_definitions \
+                                    where target_table = $1), false)",
+            &[&plan.target, &first_seg],
+        )
+        .await?
+        .get(0);
+    fn apply_of(record: &LedgerRecord, rederive: bool) -> Option<&(PgLsn, String, Option<String>)> {
+        if rederive {
+            None
+        } else {
+            record.apply.as_ref()
+        }
+    }
     let rederive: Vec<&str> = records
         .iter()
-        .filter(|r| r.apply.is_none())
+        .filter(|r| apply_of(r, rederive_all).is_none())
         .map(|r| r.key.as_str())
         .collect();
     let mut read_images: HashMap<String, String> = HashMap::new();
@@ -1920,7 +1947,7 @@ pub(crate) async fn apply_ledger_target(
     let mut txids: Vec<Option<&str>> = Vec::with_capacity(records.len());
     let mut images: Vec<Option<&str>> = Vec::with_capacity(records.len());
     for record in &records {
-        match &record.apply {
+        match apply_of(record, rederive_all) {
             Some((lsn, txid, image)) => {
                 flags.push(false);
                 lsns.push(Some(lsn.to_string()));

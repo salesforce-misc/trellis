@@ -441,6 +441,7 @@ impl Sweep {
                 txn,
                 &plan,
                 seg_seq.unwrap_or(0),
+                seg_seq.unwrap_or(0),
                 &mut self.mutations,
             )
             .await?;

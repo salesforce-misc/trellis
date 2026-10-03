@@ -1439,6 +1439,15 @@ async fn a_rebuild_sweeps_a_deleted_key_only_apply_had_counted() {
     f.pass().await;
     f.run("agg").await;
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    // Nothing has sealed since the start, so the start's segment is still
+    // active, and a page re-derives its batch's keys (#733). A write sealed
+    // into that batch moves the inserts below to the next, which Apply
+    // applies.
+    f.raw
+        .batch_execute("update public.src set v = v where id = 1")
+        .await
+        .expect("a write in the start's segment");
+    f.drain().await;
     f.raw
         .batch_execute("insert into public.src values (100, 3, 1000), (101, 4, 2000)")
         .await
@@ -1944,4 +1953,73 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
         0
     );
     assert_eq!(f.count("select count(*) from public.one").await, 0);
+}
+
+/// A second `SUM` and `COUNT(*)` by `g` over the same source, registered
+/// once the first is live.
+const AGG2: &str =
+    "TRANSFORM agg2 FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+
+/// #733: a change committed before a build starts, in a batch drained only
+/// after the start, while a later change to its key was drained before the
+/// start. The later change never reaches the new definition (no page that
+/// ran before the start applies it), and the key is gone before any chunk
+/// reads its range, so no chunk re-derives it either. Applied as it stands,
+/// the older change counted the key back in for good: a group present
+/// that the oracle doesn't have, or a count one too high. A page re-derives
+/// every record of a batch the start may have preceded instead.
+///
+/// The batches are sealed and drained by hand, newest first, which is what
+/// a page held at its entry lock does to a loaded engine (the steady-load
+/// tier's stall).
+#[tokio::test]
+async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted_key() {
+    let mut f = Fixture::new(20, &[AGG]).await;
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    let watermark = StagedWatermark::saturated();
+    let seal = async |f: &mut Fixture, sql: &str| -> i64 {
+        f.raw.batch_execute(sql).await.expect("write");
+        trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
+            .await
+            .expect("seal")
+            .expect("the write made the active segment non-empty")
+            .sealed_seg_seq
+    };
+    // Key 100 is inserted into a new group in one batch and deleted in the
+    // next.
+    let older = seal(&mut f, "insert into public.src values (100, 50, 7)").await;
+    let newer = seal(&mut f, "delete from public.src where id = 100").await;
+    // The newer batch drains before `agg2` exists, let alone applies.
+    apply::drain_once(&f.db.pool, newer, "drainer", 1, WAKE, &watermark)
+        .await
+        .expect("drain the newer batch");
+
+    let columns = [
+        ("id".to_string(), ValueType::Numeric),
+        ("g".to_string(), ValueType::Numeric),
+        ("v".to_string(), ValueType::Numeric),
+    ]
+    .into_iter()
+    .collect();
+    trellis::defs::install_definition(&f.db.pool, AGG2, &columns, "public")
+        .await
+        .expect("register agg2");
+    f.pass().await;
+    assert_eq!(f.status("agg2").await.as_deref(), Some("backfilling"));
+
+    // The older batch drains after the start: its insert reaches `agg2`.
+    apply::drain_once(&f.db.pool, older, "drainer", 1, WAKE, &watermark)
+        .await
+        .expect("drain the older batch");
+    f.run("agg2").await;
+    assert_eq!(f.status("agg2").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.rows("select (g, total, n)::text from public.agg2 order by g")
+            .await,
+        f.rows(AGG_EXPECTED).await,
+        "agg2 equals a from-scratch GROUP BY over the source"
+    );
+    f.assert_agg_oracle().await;
 }

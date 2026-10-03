@@ -321,14 +321,16 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // added V63 (`backfill_chunks`' failure record, #616), and F2 V64 (the
     // Re-derive build's chunk kinds and `build` column); V61 and V62 are
     // left free for the other lane's #623 work. #623 D5 added V65 (drops
-    // V40's `aggregate_extinct_horizon`), and #625 F8b V67
-    // (`backfill_chunks.fields`, a field build's scope); V66 is #733's.
+    // V40's `aggregate_extinct_horizon`), #625 F8b V67
+    // (`backfill_chunks.fields`, a field build's scope), and #733 V68
+    // (`transform_definitions.build_seg`, the segment a Re-derive build
+    // started in). V66 is unused.
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
-            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67
+            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68
         ]
     );
 }

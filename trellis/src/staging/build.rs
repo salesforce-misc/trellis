@@ -14,8 +14,11 @@
 //!   `transform_definitions.build = 'rederive'` and enqueues its plan job.
 //!   From that commit it applies (`defs::model::APPLYING_SQL`, B1): Apply
 //!   folds its source's changes into its ledger and groups, so nothing needs
-//!   a catch-up. The backfill discharge never dispatches a definition that
-//!   qualifies (`intake::markers`), and a resume leaves it to this start
+//!   a catch-up. The start also records `build_seg`, the segment active at
+//!   its commit, and a page re-derives rather than applies the keys of any
+//!   batch at or below it (#733, see `start`). The backfill discharge never
+//!   dispatches a definition that qualifies (`intake::markers`), and a
+//!   resume leaves it to this start
 //!   (`super::quarantine::resume_transform`), so each definition is on
 //!   exactly one build path.
 //! - **Rebuild** (F3). A resumed definition keeps its ledger, its groups and
@@ -74,7 +77,11 @@
 //! (applied over the entry the chunk wrote, which is the snapshot's state). A
 //! key with no entry has contributed nothing anywhere, so an Apply that comes
 //! first counts it from nothing and the chunk then moves it by the
-//! difference.
+//! difference. That needs the change's image to be the key's latest state
+//! the definition hasn't seen, which only a change committed after the start
+//! is sure to be: an older one, drained after the start, may have had a
+//! later change drained before it, and a key deleted that way has no row
+//! for a chunk to find. A page re-derives those keys instead (`start`).
 //!
 //! # The merger
 //!
@@ -1004,6 +1011,22 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// which the sweep's filter reads: every chunk's snapshot is taken after
 /// the start commits, so its `xmax` is past that id.
 ///
+/// **The start's segment (#733).** Pages drain batches out of order, so a
+/// page that ran before the start can drain a key's later change while an
+/// older one waits in an earlier batch, which a page drains after the
+/// start. The later change never reaches the definition, and the older
+/// one's image is stale: applied, it would count a key that a chunk then
+/// can't find (it was deleted) back in for good. So the start also stores
+/// `build_seg`, the segment active at its commit, read under a share lock
+/// on `segment_pointer` that keeps seal phase 1 (`super::seal`) from moving
+/// it until the start commits. That segment's fence is taken after the
+/// start commits, so every change committed before the start is in a batch
+/// at or below `build_seg`, and a page that drains one re-derives its keys
+/// for the definition rather than applying their changes
+/// ([`ledger::apply_ledger_target`]). Every batch above it holds only
+/// changes committed after the start, drained by pages that read the
+/// definition list after it, so none is dropped.
+///
 /// Returns `false`, writing nothing, when the definition left
 /// `waiting_to_backfill` meanwhile.
 async fn start(
@@ -1057,6 +1080,15 @@ async fn start(
         )
         .await?;
     }
+    // The start's segment (#733), last, so the share lock that keeps the
+    // active segment from sealing until this commits is held only for the
+    // commit. See this function's doc.
+    txn.execute(
+        "update transform_definitions set build_seg = p.active_seq \
+         from (select active_seq from segment_pointer for share) p where id = $1",
+        &[&definition.id],
+    )
+    .await?;
     txn.commit().await?;
     tracing::info!(
         definition_id = definition.id,

@@ -4226,8 +4226,12 @@ mod strategy {
     /// multiples of its seal interval. A page that stalls before its entry
     /// lock for over two seal intervals can still be waiting when a later
     /// segment has sealed and drained and the maintenance tick after that
-    /// collects tombstones: the shape `early_tombstone_gc` needs.
-    pub const LOAD_STALL_SEALS: std::ops::RangeInclusive<u32> = 2..=4;
+    /// collects tombstones: the shape `early_tombstone_gc` needs. From 3
+    /// rather than 2 (#733) for the margin: at 2 to 4 the plant was caught
+    /// in as few as 1 case in 48. The wider stalls also drain more older
+    /// segments after newer ones across a build's start, the race #733
+    /// fixed.
+    pub const LOAD_STALL_SEALS: std::ops::RangeInclusive<u32> = 3..=6;
 
     fn load_draws() -> impl Strategy<Value = LoadDraws> {
         (LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS).prop_map(

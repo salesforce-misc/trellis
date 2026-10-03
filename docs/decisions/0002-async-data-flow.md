@@ -432,7 +432,13 @@ applying.
   tombstone, and the chunk's later Re-derive replaces the entry under a
   snapshot that includes that commit, so the group ends up counted once.
   There is no go-live re-read, no orphan sweep and no catch-up: nothing was
-  skipped. *Evidence:*
+  skipped. *Amended by #733:* batches drain out of order, so a change committed
+  before the start can drain after it while a later change to the same key
+  drained before it, unapplied. Its image is then stale, and a key deleted
+  that way has no row for a chunk to find. The start records the segment
+  active at its commit (seal phase 1 can't move it until the start commits),
+  every change committed before the start is in a batch at or below it, and
+  a page re-derives rather than applies the keys of such a batch. *Evidence:*
   [#617 step 2](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5852918496):
   oracle matched on four 10M runs under 2,000 writes/s, with 196–361k changes
   correctly skipped by chunk bases and 0 in-progress ids.

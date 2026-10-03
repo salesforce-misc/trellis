@@ -7133,6 +7133,7 @@ pub(crate) async fn apply_page(
     // target order, so every page and every direct writer takes their
     // entry locks in one order: see `settle_one_to_one_target`.
     let page_seg = steps.iter().map(|step| step.seg_seq).max().unwrap_or(0);
+    let page_first_seg = steps.iter().map(|step| step.seg_seq).min().unwrap_or(0);
     let mut restaged: Vec<Restage> = Vec::new();
     for (target, target_plan) in &plan.targets {
         let (written, deleted, restage) =
@@ -7147,8 +7148,14 @@ pub(crate) async fn apply_page(
     // never splits across a page's segments by more than that, and a later
     // stamp only delays tombstone GC (the D split's Q7).
     for ledger_plan in plan.ledger_targets.values() {
-        let (written, deleted) =
-            super::ledger::apply_ledger_target(txn, ledger_plan, page_seg, &mut mutations).await?;
+        let (written, deleted) = super::ledger::apply_ledger_target(
+            txn,
+            ledger_plan,
+            page_first_seg,
+            page_seg,
+            &mut mutations,
+        )
+        .await?;
         keys_written += written;
         keys_deleted += deleted;
     }
