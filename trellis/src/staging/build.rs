@@ -1550,6 +1550,8 @@ async fn run_rederive(
     options: &WorkerOptions,
 ) -> Result<(), ChunkQueueError> {
     let setup_started = Instant::now();
+    // Before anything the plan is made from ([`plan_epoch`]).
+    let epoch = plan_epoch(&**pool.get().await?, chunk.definition_id).await?;
     let definition = catalog::definition_by_id(pool, chunk.definition_id)
         .await?
         .ok_or(ChunkQueueError::DefinitionNotFound {
@@ -1610,6 +1612,15 @@ async fn run_rederive(
         }
         ChunkPlan::Field(FieldPlan::Empty) => (0, 0),
     };
+    if plan.edits_change_it() && plan_epoch(&*txn, chunk.definition_id).await? != epoch {
+        txn.rollback().await?;
+        tracing::debug!(
+            definition_id = chunk.definition_id,
+            chunk_id = chunk.id,
+            "build chunk planned before an edit to its definition; planning it again"
+        );
+        return defer_claim(pool, chunk, claimed_by, Duration::ZERO).await;
+    }
     let commit_started = Instant::now();
     txn.execute(
         "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
@@ -1634,6 +1645,44 @@ enum ChunkPlan {
     Whole(AnyPlan),
     /// A field build's chunk (#625 F8b).
     Field(FieldPlan),
+}
+
+impl ChunkPlan {
+    /// Whether an edit committed after the plan was made can make it wrong
+    /// ([`plan_epoch`]): a 1-1 target's, whose fields `ALTER TRANSFORM`
+    /// changes and whose paused columns a column resume releases.
+    fn edits_change_it(&self) -> bool {
+        !matches!(self, ChunkPlan::Whole(AnyPlan::Ledger(_)))
+    }
+}
+
+/// The version fence of definition `id`'s source (`source_table_versions`),
+/// which a chunk or a sweep batch of a 1-1 target reads before it plans and
+/// again before it commits (#625 F8b). A chunk plans before its
+/// transaction (its fields, and for a relationship-enriched target its
+/// paused columns), so an edit can commit in between: `ALTER TRANSFORM`, a
+/// column resume or a field build's capture release, each of which bumps
+/// the fence. If the chunk then went on, the edit's own field build could
+/// already have written keys the chunk had yet to lock, and the chunk would
+/// put its older plan's values over them, or stamp an entry's `basis` past
+/// a change whose page then can't write the new field. One that finds the
+/// fence moved rolls back and plans again. One that finds it unmoved holds
+/// its keys' entries already, so the edit's build reaches them only after
+/// it commits. A define on the same source bumps the fence too, which costs
+/// such a chunk a retry.
+async fn plan_epoch(
+    client: &impl GenericClient,
+    id: i64,
+) -> Result<Option<i64>, tokio_postgres::Error> {
+    Ok(client
+        .query_opt(
+            "select v.version from transform_definitions d \
+             join source_table_versions v on v.source_table = d.source_table \
+             where d.id = $1",
+            &[&id],
+        )
+        .await?
+        .map(|row| row.get(0)))
 }
 
 /// A field build's chunk (see the module doc's "Field builds").
@@ -1874,6 +1923,8 @@ async fn run_sweep(
     mut cursor: Option<String>,
     options: &WorkerOptions,
 ) -> Result<(), ChunkQueueError> {
+    // Before anything the plan is made from ([`plan_epoch`]).
+    let epoch = plan_epoch(&**pool.get().await?, chunk.definition_id).await?;
     let definition = catalog::definition_by_id(pool, chunk.definition_id)
         .await?
         .ok_or(ChunkQueueError::DefinitionNotFound {
@@ -1920,6 +1971,17 @@ async fn run_sweep(
             }
         }
         .map_err(build_error)?;
+        // The batches done so far keep their cursor; the rest plan again.
+        if matches!(plan, AnyPlan::OneToOne(_))
+            && plan_epoch(&*txn, chunk.definition_id).await? != epoch
+        {
+            txn.rollback().await?;
+            tracing::debug!(
+                definition_id = chunk.definition_id,
+                "re-derive sweep planned before an edit to its definition; planning it again"
+            );
+            return defer_claim(pool, chunk, claimed_by, Duration::ZERO).await;
+        }
         let next = outcome.next.clone().or(cursor.clone());
         txn.execute(
             "update backfill_chunks set lo = $2, done = $3, \

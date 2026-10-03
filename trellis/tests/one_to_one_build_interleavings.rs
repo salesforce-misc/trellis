@@ -1041,3 +1041,78 @@ async fn a_page_computed_before_a_column_resume_does_not_apply_after_it() {
     );
     assert_oracle(&mut d).await;
 }
+
+// --------------------------- a chunk planned before an edit, run after it
+
+/// One drain worker's build step, as `work_once` takes it.
+async fn build_step(pool: &trellis::Pool, worker: &str) -> trellis::staging::build::Step {
+    let options = trellis::staging::build::WorkerOptions {
+        chunk_rows: 10_000,
+        drain_batch_cap: 10_000,
+        heartbeat_interval: std::time::Duration::from_secs(1),
+        reclaim_ttl: std::time::Duration::from_secs(60),
+    };
+    trellis::staging::build::work_once(pool, worker, &options)
+        .await
+        .expect("a build step")
+}
+
+/// A chunk plans from the definition before its transaction, so an edit can
+/// commit between the two. Here the first field build's chunk has read `w`
+/// as `v + 1` and stops before its entry lock; `ALTER ... ALTER w AS v + 2`
+/// commits, and its own field build runs over every key and writes `v + 2`.
+/// Had the first chunk then gone on, it would have put `v + 1` back over
+/// every row, and with both builds done nothing would have rewritten it. It
+/// checks the source's version fence before it commits, finds the edit's
+/// bump, and gives its claim back to plan again.
+#[tokio::test]
+async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
+    let (mut d, _plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    // The first field build's plan job enqueues its one chunk.
+    assert_eq!(
+        build_step(d.pool(), "planner").await,
+        trellis::staging::build::Step::Planned
+    );
+    let mut stale = d
+        .run_frozen(
+            &[(PausePoint::AfterPlaceholders, TARGET)],
+            |pool| async move { Ok(build_step(&pool, "stale").await) },
+        )
+        .await;
+    stale.reached(PausePoint::AfterPlaceholders).await;
+    let trellis::defs::Statement::AlterTransform(alter) =
+        trellis::defs::parse_statement("ALTER TRANSFORM one ALTER w AS v + 2").expect("parse")
+    else {
+        panic!("not an ALTER");
+    };
+    trellis::defs::alter_transform(d.pool(), &alter)
+        .await
+        .expect("alter one.w");
+    // The edit's field build: its plan job, then its chunk.
+    assert_eq!(
+        build_step(d.pool(), "second").await,
+        trellis::staging::build::Step::Planned
+    );
+    assert_eq!(
+        build_step(d.pool(), "second").await,
+        trellis::staging::build::Step::Chunk
+    );
+    assert_eq!(
+        d.rows("select id, w from public.one order by id").await,
+        ["(1,3)", "(2,4)", "(3,5)"],
+        "the edit's build wrote v + 2"
+    );
+    d.release(&mut stale, PausePoint::AfterPlaceholders).await;
+    stale.finish().await;
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select id, w from public.one order by id").await,
+        ["(1,3)", "(2,4)", "(3,5)"],
+        "the chunk planned before the edit wrote nothing after it"
+    );
+    d.settle().await;
+    assert_eq!(
+        d.rows("select id, w from public.one order by id").await,
+        d.rows("select id, v + 2 from public.src order by id").await,
+    );
+}
