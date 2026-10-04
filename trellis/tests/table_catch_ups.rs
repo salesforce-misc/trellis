@@ -1318,3 +1318,81 @@ async fn releasing_a_parked_rename_whose_segment_is_still_draining_advances_the_
     );
     assert_eq!(order_names(&client).await, renamed());
 }
+
+/// Issue #754 review: a pending change whose own page already applied it
+/// still counts as pending while another bucket holds its segment up. Its
+/// write stamped the projection row at or above its own `lsn`, so a
+/// superseded older delete writes the key from the live row rather than
+/// leaving it to a change that will never write it again.
+#[tokio::test]
+async fn a_superseded_delete_writes_a_key_whose_pending_reinsert_already_applied() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 1",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 1, "ann"),
+    )
+    .await;
+    let delete = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, delete.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    markers::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    commit_and_stage(
+        &mut client,
+        "insert into public.customers values (1, 'ann2')",
+        |lsn| customer_cdc(lsn, CdcOp::Insert, 1, "ann2"),
+    )
+    .await;
+    let reinsert = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, reinsert.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    drain_sealed(&db.pool, reinsert.sealed_seg_seq).await;
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string())),
+        "the re-insert applied"
+    );
+    // Another bucket of the re-insert's segment is still draining.
+    client
+        .execute(
+            "update segments set state = 'draining' where seg_seq = $1",
+            &[&reinsert.sealed_seg_seq],
+        )
+        .await
+        .expect("mark the re-insert's segment draining");
+    drain_sealed(&db.pool, delete.sealed_seg_seq).await;
+    client
+        .execute(
+            "update segments set state = 'drained' where seg_seq = $1",
+            &[&reinsert.sealed_seg_seq],
+        )
+        .await
+        .expect("mark the re-insert's segment drained");
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
