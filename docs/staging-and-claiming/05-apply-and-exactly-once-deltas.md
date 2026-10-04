@@ -154,7 +154,10 @@ now holds) to the group's increments
 state, so what a page subtracts is **exactly what the entry's last write
 added**, whichever batch that came from.
 
-The moves telescope: a group is always the sum of its live members' entries.
+The moves telescope: a group row, plus any of its increments a Re-derive build
+has queued and not yet merged ([below](#aggregate-groups-the-ledger)), is always
+the sum of its live members' entries. With no build running, the group row alone
+is.
 A change the entry's I2 test refuses moves nothing, so a batch draining after a
 newer one for the same key adds nothing twice.
 
@@ -196,9 +199,11 @@ pass:
 1. **The entry lock (I5).** Insert an entry for every key with none, then
    lock every other entry `for update`, sorted by key. A new key's Apply is
    settled by its insert, since with no entry I2 is only the truncate floor;
-   a Re-derive's entry is a placeholder until step 3. Every writer of the
-   key's target row holds the entry, so every Phase 3 for a key runs one at a
-   time. It can't be the target row's `FOR UPDATE`: a stale insert racing a
+   a Re-derive's entry is a placeholder until step 3. Every Phase 3 writer of
+   the key's target row holds the entry, so every Phase 3 for a key runs one
+   at a time. (A catch-up's orphan sweep deletes 1-1 rows the source no longer
+   backs without it; that sweep is ordered by its own snapshot argument,
+   `intake::resume_orphans`.) It can't be the target row's `FOR UPDATE`: a stale insert racing a
    delete has no row to lock. A key whose tombstone the GC collects between
    the two statements fails the page transiently and it is retried (#712).
 2. **The Re-derive read (I1).** The Re-derived keys' source rows and
@@ -213,11 +218,13 @@ pass:
    it changed.
 4. **The target rows** of exactly those keys are upserted or deleted.
 
-Why that converges: an Apply the test refuses is either already reflected by
-a Re-derive whose snapshot saw its commit, or older than the change last
-applied. Anything a Re-derive's snapshot did not see commits after it and has
-a change of its own still to come, which waits on the entry lock and then
-applies. So the last Phase 3 for a key always leaves its final state.
+Why that converges: an Apply the test refuses is already reflected by a
+Re-derive whose snapshot saw its commit, or older than the change last
+applied, or from before a source truncate. A change a Re-derive's snapshot
+did not see committed after the change last applied (one key's writes are
+ordered by its row lock), so its `lsn` is above `__applied_lsn`, and its
+transaction is not in `__basis`: when it drains it waits on the entry lock
+and then applies. So the last Phase 3 for a key always leaves its final state.
 
 Nothing has to be re-read for a hot key: an Apply is judged by its own
 position, so a key whose source changes faster than a batch drains still
@@ -337,16 +344,17 @@ five steps:
    reach 0.
 4. **Recomputed fields.** Each group the upsert wrote has its recomputed
    fields rewritten from its live member entries. The upsert holds every
-   written group's row lock, so this statement sees every entry of those
-   groups.
+   written group's row lock, so this statement sees every entry change any
+   other page made to those groups (a build chunk takes no group lock, and
+   the merger recomputes every group it writes).
 5. **Empty groups go.** Groups whose every accumulator (`__trellis_members`,
    each count, each sum) reached 0 are deleted. With one writer of groups that
    is the same as the member count reaching 0. A Re-derive build adds a second
    writer (below), and then a group can reach 0 members while a sum is
    still owed to it.
 
-A page takes its locks in one order: entries, then groups, each in one sorted
-statement. A Re-derive of an unchanged key moves nothing, so a go-live re-read
+A page takes its locks in one order: entries (a placeholder insert for new
+keys, then one sorted `for update`), then groups, in one sorted upsert. A Re-derive of an unchanged key moves nothing, so a go-live re-read
 after the build writes no group rows.
 
 Each written or deleted group reaches the seam with its prior image. PG 17 has
@@ -382,15 +390,34 @@ only with the ledger: by a truncate, a drop, or the one-pass build.
 
 **Truncate.** A source `TRUNCATE` empties the ledger and the group deltas,
 deletes every group row, and raises the target's truncate floor
-(`ledger_truncate_floor`) to the truncate's `lsn` (#623 Q6). `TRUNCATE` takes `ACCESS EXCLUSIVE`, so every
-earlier writer's trigger ran below that `lsn` and every later writer's above it.
+(`ledger_truncate_floor`) to the truncate's `lsn` (#623 Q6). A 1-1 target
+does the same to its ledger, and the page clears its rows. `TRUNCATE` takes
+`ACCESS EXCLUSIVE`, so every earlier writer's trigger ran below that `lsn` and
+every later writer's above it; a write later in the truncating transaction
+itself is above it too, since the truncate's own ring row moves the WAL insert
+position on. The floor is the second line of defence: the drain barrier
+already orders the truncate's batch after every earlier one and before every
+later one (no segment above an undrained truncate's is claimable,
+`next_claimable_segments`; see [truncate-propagation-spec.md](truncate-propagation-spec.md)),
+and the fold voids its own batch's rows from before it.
 
 **Release and the orphan sweep.** Releasing a quarantined key
 (`staging::release_key`) stages one `Recompute` of it and discards the parked
 rows. A replayed row would carry the releaser's `row_txid`, not the source
 transaction's. A catch-up discharge's orphan sweep finds live entries the
-source no longer backs, and stages a `Recompute` of each instead of deleting
-their groups directly.
+source no longer backs and Re-derives them in its own transaction (each comes
+back a tombstone and leaves its group), stamping them with the newest segment.
+
+**Tombstone GC (I4).** Maintenance deletes each tombstone whose
+`__applied_seg` is at or below the **contiguous drained prefix**, the highest
+`seg_seq` at or below which every segment is drained, not the highest drained
+segment (`staging::retire::collect_tombstones`). An earlier change to the same
+key committed before the delete's trigger ran, so it is in the delete's batch
+or an earlier one, and at or below the prefix it has been applied or refused.
+A Re-derive stamps at least the newest segment its snapshot sees (#742), so a
+tombstone it wrote outlives every change its `__basis` would refuse. A later
+change to a collected key finds no entry and gets a fresh placeholder, where
+I2 reduces to the truncate floor.
 
 ## What this replaced
 
@@ -620,7 +647,6 @@ key, or a schema error into a silently parked one. The classification:
 | **Transient** | serialization/deadlock (`40001`/`40P01`), lock-not-available, statement timeout, dropped connection | retry with backoff; **charge nothing to any key** — a transient failure is not attributable. A lock timeout retries for up to three `lock_timeout`s with the claim held rather than five attempts ([I7](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)) |
 | **Version fence miss** | a definition changed mid-drain | reload the schema and retry; back off on *consecutive* misses only |
 | **Halting schema diagnosis** | a tripped hop bound (a real cross-table value cycle); a relationship endpoint that is not a source column | **propagate loudly**; never quarantine. Quarantining would convert a loud, actionable error into a key that blocks reads forever |
-| **Ordering artefact** | a delta guard tripped while a lower-numbered batch is still outstanding | self-heals; charge only once every predecessor has drained |
 | **Claim lost** | a page's claim check or completion finds a held bucket's claim gone | surface; never isolate. The page rolled back, and whoever holds the buckets now resumes from the last committed cursor |
 | **Everything else** | a genuinely poisonous change | isolate and charge — see [06](06-cleanup-and-reclaim.md) |
 

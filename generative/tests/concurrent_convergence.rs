@@ -1261,7 +1261,7 @@ fn hot_key_case_3_11() -> (
 
 /// The pinned case loads in the default suite, so a change to the model or
 /// to `pin_ops` that breaks it shows up here rather than only when someone
-/// runs the ignored pin. It touches no database.
+/// runs the pin with `GENERATIVE_PIN_ATTEMPTS` set. It touches no database.
 #[test]
 fn hot_key_case_3_11_loads() {
     let (program, plan) = hot_key_case_3_11();

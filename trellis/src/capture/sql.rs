@@ -322,7 +322,7 @@ pub fn function_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<Strin
 }
 
 /// Every statement that removes `table`'s capture in instance schema
-/// `schema`, in order: the four triggers, then the four functions, each `if
+/// `schema`, in order: the five triggers, then the five functions, each `if
 /// exists`, so a partial install is removed as well. With `table_exists`
 /// false (the application dropped the table, and its triggers with it) only
 /// the functions are dropped.

@@ -181,11 +181,13 @@ its key last applied, and a 1-1 target overwrites its row, so an Apply needs
 only the new image and `last_change`
 ([05](05-apply-and-exactly-once-deltas.md#the-ledger)). Besides the fold's
 own image-bearing test (below) and quarantine, which parks it in
-`poison_held.old_image`, the folded `old_image` is read only by relationship
-machinery, as the one place a key's old join value still exists: a to-side
-row's reverse path (the from-side rows that joined its old key, and its
-projection record), and a from-side row's re-point or delete, which bumps
-the parent it left (#130). Capture still stages OLD images for them;
+`poison_held.old_image` and hands it back as the release `Recompute`'s
+prior image, the old image is read only by relationship machinery, as the
+one place a key's old join value still exists: a to-side row's reverse path
+(the from-side rows that joined its old key, and its projection record), a
+from-side row's re-point or delete, which bumps the parent it left (#130),
+and the reverse guard's in-flight check, which scans the ring's `old_image`
+directly. Capture still stages OLD images for them;
 dropping OLD from the ring is milestone E (#624).
 
 ### The two kinds of missing image

@@ -309,8 +309,9 @@ state that orders its writes.
   instead gives a never-seen key no single row to lock. The side table is
   one lock domain per key (a placeholder insert, then a sorted `for
   update`). Its cost is one more row write per change: ~200 B of WAL per
-  row, with the `throughput-ramp` knee unchanged once the placeholder
-  insert settles a new key's Apply on its own (#724).
+  row in `throughput-ramp` (about 500 B right after a checkpoint, with its
+  full-page images; open question 4), with the knee unchanged once the
+  placeholder insert settles a new key's Apply on its own (#724).
 - **Must:** exactly two operations exist, and every producer is one of them.
   - **Re-derive(r).** Lock r's entry (inserting a placeholder if absent).
     In one statement: take the snapshot, read r's source row and, through
@@ -377,10 +378,12 @@ state that orders its writes.
   did), 4k groups is 19–32% faster end to end, a 5,000-row page cap costs
   1.4–1.5x instead of 6–8x, and the 10M build converges in 65 s against
   791 s, with no deadlocks anywhere. **The cost bar above is missed** at a
-  high fold-in ratio: 400 groups is 33–57% slower, because the old path wrote
-  one group row per group per page and the ledger writes one entry per
-  source row. WAL per folded row is 2.4–2.6x the old path's (1.67x at 10M),
-  and Postgres CPU per folded row 2–2.6x. These bars are open for #629.
+  high fold-in ratio: 400 groups is 33–57% slower in-window (39–51% end to
+  end), because the old path wrote one group row per group per page and the
+  ledger writes one entry per source row. WAL per folded row is 2.5–2.6x
+  the old path's (2.1x at a 5,000-row page cap, 1.67x at 10M), and Postgres
+  CPU per folded row 1.8–2.6x (0.8x at the 5,000-row cap). These bars are
+  open for #629.
 
 ### Apply is one set-based statement per batch per target, and the batch is bounded
 
@@ -629,9 +632,12 @@ settled target checks both: `live` from status, then its token.
   I2 then also refuses any change at or below the floor. The floor is
   exact because `TRUNCATE` takes `ACCESS EXCLUSIVE`: every writer that
   touched the table before it committed first, so its trigger's position is
-  below the truncate's, and every writer after it is above. Pending changes
-  from before the truncate are dropped by the floor as they drain, the way
-  Postgres's own lock orders them.
+  below the truncate's, and every writer after it is above. The drain
+  barrier already applies the truncate's batch after every earlier batch and
+  before every later one, and the fold voids the batch's own earlier rows, so
+  the floor is a second line of defence: any change from before the truncate
+  that still reaches a page is refused, the way Postgres's own lock orders
+  them.
 - Source `ALTER TABLE` on a read column follows the schema-changed marker
   and regeneration rule; on any other column it is invisible.
 - Dropping the last definition on a table drops its triggers on the next
@@ -861,9 +867,10 @@ For the debate on #618; each has a recommendation where one exists.
    heap tuple header 24 B, the text key 7 B here. Two larger levers are
    left for #629: an aggregate ledger's updates are never HOT, because
    every Apply changes `__applied_seg`, which the tombstone GC's partial
-   index keys on (0 of 1.2M updates were HOT; its two indexes are 285 of
-   the 682 B), and a ledger is built full (`fillfactor` 100), which keeps
-   the 1-1 ledger at 0.6% HOT too. **No separate tablespace is
+   index keys on (0 of 1.2M updates were HOT, the build's included; the two
+   indexes an update writes are 285 of the 682 B), and a ledger is built
+   full (`fillfactor` 100), which keeps even the 1-1 ledger, whose indexes
+   allow HOT, at 13–16% HOT updates. **No separate tablespace is
    documented:** at ~3x a narrow source the ledger is sized like any other
    derived table, and nothing measured so far shows its I/O needs a device
    of its own.

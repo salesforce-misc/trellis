@@ -75,11 +75,11 @@
 //!
 //! Each row also carries the key's **prior image**: the target row as it
 //! stood before this transaction first touched it (`None` if the transaction
-//! created it). A downstream aggregate grouped by a non-key column of this
-//! target needs it. When an upstream write moves a row from group A to group
-//! B, the live re-read only names B; the prior image says the row was in A.
-//! (An aggregate on the ledger also has the key's entry, which names A,
-//! #623 D5.)
+//! created it). Only relationship machinery reads it, until #624 drops it:
+//! when an upstream write changes a row's join value, the live re-read only
+//! names the new parent, and the prior image names the one the row left. A
+//! downstream aggregate doesn't need it. When an upstream write moves a row
+//! from group A to group B, the key's ledger entry still names A (#623 D5).
 //!
 //! Writers capture the prior image with the same statement that already
 //! row-locks the key before writing it (a `SELECT ... FOR UPDATE` pre-lock,

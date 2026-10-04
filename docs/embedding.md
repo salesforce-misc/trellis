@@ -358,14 +358,15 @@ behaves in four ways you might not expect:
   and that includes a migration that changed a table before its define. So
   a migration that polls for `live` inside its own transaction can wait on
   itself until its deadline.
-* **Some statements can hang on the migration's locks.** A define doesn't
-  lock the source table, so a migration that altered it doesn't block one.
-  But a define whose target name matches a table the migration created and
-  hasn't committed waits for the migration to end, and so does a `DROP
-  TRANSFORM` of a target the migration has read or written. The migration is
-  waiting for Trellis meanwhile, and Postgres sees an idle transaction and a
-  waiting one, not a deadlock, so nothing breaks the wait. Trellis sets no
-  `lock_timeout` of its own.
+* **Some statements wait on the migration's locks, then fail.** A define
+  doesn't lock the source table, so a migration that altered it doesn't
+  block one. But a define whose target name matches a table the migration
+  created and hasn't committed waits for the migration to end, and so does a
+  `DROP TRANSFORM` of a target the migration has read or written. The
+  migration is waiting for Trellis meanwhile, and Postgres sees an idle
+  transaction and a waiting one, not a deadlock. What ends the wait is the
+  `lock_timeout` every Trellis connection is capped at (30 seconds): the
+  call fails with a lock timeout and changes nothing.
 
 So keep Trellis out of the host's transaction, in this order:
 

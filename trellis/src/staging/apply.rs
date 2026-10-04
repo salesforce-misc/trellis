@@ -6484,8 +6484,8 @@ async fn settle_one_to_one_target(
 /// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
 /// proposed write physically changes nothing) to `mutations`, with the
 /// key's prior image (issue #315, which subsumes #196's image-bearing
-/// delete: a deleted row's prior image is what lets a downstream aggregate
-/// find the group it left). Returns only the counts.
+/// delete; a relationship reader downstream takes a deleted row's old join
+/// value from it until #624). Returns only the counts.
 ///
 /// The pre-lock takes every key this call touches (write or delete) `FOR
 /// UPDATE`, ordered ascending, in one round trip — the deadlock-avoidance

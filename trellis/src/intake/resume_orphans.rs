@@ -24,9 +24,16 @@
 //! target ([`Sweep`]). It is a target write like any other, so it goes
 //! through the target-mutation seam (`staging::target_mutations`, issue
 //! #315): each deleted key is recorded with its prior image and flushed as a
-//! downstream `Recompute` in the discharge's own transaction. The prior image
-//! is what lets a chained aggregate one hop down find the group the deleted
-//! row belonged to, since the live re-read finds nothing.
+//! downstream `Recompute` in the discharge's own transaction. A chained
+//! aggregate one hop down finds the group the deleted row belonged to from
+//! its own ledger entry; the prior image is for relationship readers, which
+//! take the row's old join value from it until #624.
+//!
+//! A target on the ledger is swept twice over. Each of its live entries the
+//! source no longer backs is re-derived, which leaves a tombstone, takes the
+//! entry's contribution out of its group and deletes a group it empties.
+//! A group row with no live entry and no source row behind it is deleted
+//! directly.
 //!
 //! # One snapshot for the anti-join and the read (issue #436)
 //!
@@ -50,10 +57,10 @@
 //!   its ledger entry, which builds the group again from its entries (see
 //!   "Pending deltas on a deleted group").
 //! - **Backed at *S***: kept, and the source row backing it at *S* is
-//!   enumerated, so its `Recompute` re-derives the row or group from live
-//!   state. A change after *S* that empties the group folds with that
-//!   `Recompute` and still forces the re-derive (issue #392, #493), and
-//!   apply's existence check then deletes the group.
+//!   enumerated, so its `Recompute` re-derives the 1-1 row, or the
+//!   aggregate row's ledger entry, from live state. A change after *S* that
+//!   empties the group applies to its rows' entries, and the group row is
+//!   deleted when its last member leaves.
 //!
 //! Neither case depends on when, between *S* and the drain, the source
 //! changed, which is what closes the race #436 was filed for. Before it, the
