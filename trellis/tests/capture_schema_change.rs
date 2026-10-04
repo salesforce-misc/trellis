@@ -1412,3 +1412,57 @@ async fn resuming_a_reader_refreshes_the_projection_its_skipped_to_side_rows_mis
         "the resumed reader reads the to-side as it is now"
     );
 }
+
+/// Issue #768: a definition still waiting for its build counts as a reader
+/// of the to-side. It applies nothing yet, but its go-live catch-up
+/// re-derives every from-side row from the relationship's settled
+/// projection, which the to-side's rows keep current. Skipping them while
+/// it builds would let it go live on the names from before them, so the
+/// drain halts, as for a reader that applies.
+#[tokio::test]
+async fn a_to_side_key_retyped_off_the_allowlist_halts_the_drain_while_a_reader_waits_for_its_build()
+ {
+    use trellis::staging::{StagedWatermark, apply, seal};
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM posts_named")
+        .await
+        .expect("pause the reader");
+    app.batch_execute("alter table public.users alter column handle type character(8)")
+        .await
+        .expect("retype the key");
+    trellis
+        .apply("TRANSFORM posts_renamed FROM public.posts SELECT author.name AS name")
+        .await
+        .expect("register a second reader");
+    assert_eq!(
+        status(&raw, "posts_renamed").await,
+        TransformStatus::WaitingToBackfill
+    );
+    app.batch_execute("update public.users set name = 'Annie' where handle = 'ann'")
+        .await
+        .expect("write the to-side");
+    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, outcome.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    let err = apply::drain_once(
+        &db.pool,
+        outcome.sealed_seg_seq,
+        "capture_schema_change_test",
+        1,
+        "trellis_capture_schema_change_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect_err("the drain halts while posts_renamed waits for its build");
+    assert!(
+        err.to_string().contains("character"),
+        "the halt names the unsupported key type: {err}"
+    );
+}

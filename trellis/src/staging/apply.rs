@@ -4854,7 +4854,7 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
 
 /// The primary key [`compute`] keys `qualified_source`'s changes by
 /// ([`ddl::source_primary_key`]), or `None` when the key can't be used and
-/// no definition applies the table's rows, so `compute` skips them.
+/// no definition that isn't frozen reads the table, so `compute` skips them.
 ///
 /// A dropped source is [`ApplyError::SourceTableDropped`], reported under
 /// `qualified_source`, the ring's own spelling (issue #267): its consumers
@@ -4863,20 +4863,22 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
 /// string.
 ///
 /// Issue #768: a key that no longer passes the key gate (a type off the
-/// allowlist, or no key at all) halts the drain only while some definition
-/// applies the table's rows ([`catalog::has_applying_reader`], under the
-/// canonical `source_key`): a reader of it, directly or through a
-/// relationship, would key them wrongly or not at all. A table no reader
-/// applies, its readers paused or capture-failed, is skipped instead. Its
-/// changes drain with the page, which marks its claim drained whatever the
-/// plan holds, exactly as a paused definition's share is dropped when
-/// `catalog::transforms_for_source` leaves it out, and a resume rebuilds
-/// from the source. A relationship's settled projection on it gets none of
-/// them either, so a resume refreshes the projections on every to-side the
-/// resumed definition reads (`quarantine::resume_transform`). Asked only on
-/// the error, so a drain over usable keys reads nothing more.
+/// allowlist, or no key at all) halts the drain while any definition that
+/// isn't frozen reads the table ([`catalog::has_unfrozen_reader`], under the
+/// canonical `source_key`), directly or through a relationship: one that
+/// applies would key its rows wrongly or not at all, and one still waiting
+/// for its build, or under a chunked or direct one, re-derives from the
+/// relationship's settled projection its rows keep current. A table whose
+/// readers are all frozen (paused, capture-failed or quarantined) is skipped
+/// instead. Its changes drain with the page, which marks its claim drained
+/// whatever the plan holds, exactly as a paused definition's share is
+/// dropped when `catalog::transforms_for_source` leaves it out, and a resume
+/// rebuilds from the source. A relationship's settled projection on it gets
+/// none of them either, so a resume refreshes the projections on every
+/// to-side the resumed definition reads (`quarantine::resume_transform`).
+/// Asked only on the error, so a drain over usable keys reads nothing more.
 ///
-/// The halt is the stance while a reader still applies (#703 R2 would pause
+/// The halt is the stance while a reader isn't frozen (#703 R2 would pause
 /// that reader in the drain): the capture pass that pauses every reader of a
 /// retyped key (#760) ends it, since the next attempt finds none.
 async fn source_key_for_apply(
@@ -4906,7 +4908,7 @@ async fn source_key_for_apply(
     }
     let has_reader = {
         let client = pool.get().await?;
-        catalog::has_applying_reader(&**client, source_key).await?
+        catalog::has_unfrozen_reader(&**client, source_key).await?
     };
     if has_reader {
         return Err(err.into());
@@ -4914,7 +4916,7 @@ async fn source_key_for_apply(
     tracing::warn!(
         src_table = %qualified_source,
         error = %err,
-        "no definition applies this table's rows and its key can't be used; \
+        "every definition reading this table is frozen and its key can't be used; \
          skipping its changes"
     );
     Ok(None)

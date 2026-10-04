@@ -2757,10 +2757,10 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     }
     // Issue #768: a to-side the definition reads through a relationship may
     // have had changes no reader applied while it was frozen. The drain
-    // skips a to-side whose key can't be used when no applying definition
-    // reads it (`staging::apply::source_key_for_apply`), and those changes
-    // never reach the relationship's settled projection, which the rebuild
-    // and every later apply read. So each such to-side gets a marker whose
+    // skips a to-side whose key can't be used when every definition reading
+    // it is frozen (`staging::apply::source_key_for_apply`), and those changes
+    // never reach the relationship's settled projection, which the rebuild's
+    // go-live catch-up and every later apply read. So each such to-side gets a marker whose
     // discharge refreshes its projections from the table, as a capture widen
     // of it does (`park_widen_marker`). The same discharge re-reads the
     // to-side, so a row derived from the stale projection before it runs is

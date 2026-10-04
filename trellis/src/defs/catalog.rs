@@ -1182,28 +1182,29 @@ pub(crate) async fn applying_readers(
     Ok(readers)
 }
 
-/// Whether any definition the drain applies `table`'s rows to reads it: one
-/// in an applying status by [`super::model::applying_sql`] (so a Re-derive
-/// build's `backfilling` definition counts, unlike [`applying_readers`]),
-/// reading `table` as its source or through a relationship one of its fields
-/// reads ([`tables_read_by`]).
+/// Whether any definition that isn't frozen reads `table`, as its source or
+/// through a relationship one of its fields reads ([`tables_read_by`]):
+/// every status in [`TransformStatus::dispatchable`], so one still waiting
+/// for its build, or under any build, counts as well as one that applies.
 ///
 /// The drain asks this only when `table`'s primary key can't be used
 /// (`staging::apply::compute`, issue #768), to tell a table whose rows no
-/// reader would apply, which it skips, from one a reader still needs, which
-/// halts it.
-pub(crate) async fn has_applying_reader(
+/// reader needs, which it skips, from one a reader still needs, which halts
+/// it. A definition waiting for its build, or under a chunked or direct one,
+/// doesn't apply the rows yet, but it does need them: a to-side's rows keep
+/// the relationship's settled projection current, and its go-live catch-up
+/// re-derives every from-side row from that projection. Only a frozen
+/// definition gives them up, and its resume rebuilds it
+/// (`staging::quarantine::resume_transform`).
+pub(crate) async fn has_unfrozen_reader(
     client: &impl GenericClient,
     table: &str,
 ) -> Result<bool, CatalogError> {
     let rows = client
         .query(
-            &format!(
-                "select source_table, definition_text from transform_definitions d \
-                 where {} order by id",
-                super::model::applying_sql("d")
-            ),
-            &[],
+            "select source_table, definition_text from transform_definitions \
+             where status = any($1) order by id",
+            &[&TransformStatus::dispatchable()],
         )
         .await?;
     for row in rows {
