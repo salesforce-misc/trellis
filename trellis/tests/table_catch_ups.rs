@@ -1531,3 +1531,241 @@ async fn superseded_records_older_than_an_applied_reinsert_keep_its_key() {
     );
     assert_eq!(order_names(&client).await, renamed());
 }
+
+/// Seeds `accounts` (the to-side, joined on its unique non-key `code`) and
+/// `bills`, declares the to-one `account` relationship, registers
+/// `bill_names` (which reads `account.name` through it) and brings it
+/// `live`. Two accounts' changes can then name one projection key.
+async fn live_code_relationship_consumer(
+    dsn: &str,
+    pool: &trellis::Pool,
+    client: &mut Client,
+) -> Trellis {
+    client
+        .batch_execute(
+            "create table public.accounts (id integer primary key, code text unique, name text); \
+             create table public.bills (id integer primary key, account_code text); \
+             insert into public.accounts values (1, 'A', 'ann'), (2, 'K', 'kim'); \
+             insert into public.bills values (10, 'K'), (11, 'A')",
+        )
+        .await
+        .expect("create and seed accounts and bills");
+    create_relationship(
+        pool,
+        "RELATIONSHIP account FROM bills.account_code TO accounts.code",
+    )
+    .await
+    .expect("declare the relationship");
+    let trellis = connect_trellis(dsn).await;
+    trellis
+        .apply("TRANSFORM bill_names FROM bills SELECT account.name AS account_name")
+        .await
+        .expect("register the consumer");
+    bring_live(pool, client).await;
+    trellis
+}
+
+/// An `accounts` image, as capture stages it.
+fn account_image(id: i32, code: &str, name: &str) -> String {
+    format!(r#"{{"id":"{id}","code":"{code}","name":"{name}"}}"#)
+}
+
+/// An `accounts` change for account `id`, as capture stages it.
+fn account_cdc(
+    lsn: PgLsn,
+    op: CdcOp,
+    id: i32,
+    old: Option<(&str, &str)>,
+    new: Option<(&str, &str)>,
+) -> StagedChange {
+    StagedChange::Cdc {
+        src_table: "public.accounts".to_string(),
+        key: id.to_string(),
+        op,
+        lsn: Some(lsn),
+        old_image: old.map(|(code, name)| account_image(id, code, name)),
+        new_image: new.map(|(code, name)| account_image(id, code, name)),
+        origin_lsn: None,
+        src_changed: None,
+        hop_gen: 0,
+        group_key: None,
+    }
+}
+
+/// The `account` relationship's projection table.
+async fn account_projection(client: &Client) -> String {
+    client
+        .query_one(
+            "select rp.projection_table from relationship_projections rp \
+             join relationship_definitions rd on rd.id = rp.relationship_id \
+             where rd.name = 'account'",
+            &[],
+        )
+        .await
+        .expect("find the account projection")
+        .get(0)
+}
+
+/// The `account` projection row for `code`: its `name`, or `None` when the
+/// projection has no row for the key.
+async fn projected_account(client: &Client, code: &str) -> Option<Option<String>> {
+    let projection = account_projection(client).await;
+    client
+        .query_opt(
+            &format!("select name from \"{projection}\" where code = $1"),
+            &[&code],
+        )
+        .await
+        .expect("read the account projection")
+        .map(|r| r.get(0))
+}
+
+async fn bill_names(client: &Client) -> Vec<(i32, Option<String>)> {
+    client
+        .query("select id, account_name from bill_names order by id", &[])
+        .await
+        .expect("read bill_names")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+/// Seals the active segment and returns its `seg_seq`.
+async fn seal_active(client: &mut Client) -> i64 {
+    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    seal::seal_phase2(client, outcome.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+/// Issue #762 review: the live write's held delete names the row as its
+/// snapshot read it, so a to-side write that commits while the delete waits
+/// on the row is left alone. A from-side apply's `__trellis_gen` bump also
+/// rewrites the row and holds it until it commits, but applies no to-side
+/// change, so the delete still goes ahead after it. Account 1's superseded
+/// rename into `K` drains while account 3's later update of `K` is pending,
+/// so the live write deletes `K` and leaves it to that update. Testing the
+/// row version (`xmin`) kept the stale row instead, which a pending change
+/// that folds to no image would then never remove (#754).
+#[tokio::test]
+async fn a_held_delete_goes_ahead_after_a_concurrent_gen_bump() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_code_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+    free_drained_slots(&client).await;
+
+    client
+        .batch_execute("update public.accounts set code = 'Z' where id = 2")
+        .await
+        .expect("free code K, the CDC lost");
+    commit_and_stage(
+        &mut client,
+        "update public.accounts set code = 'K' where id = 1",
+        |lsn| {
+            account_cdc(
+                lsn,
+                CdcOp::Update,
+                1,
+                Some(("A", "ann")),
+                Some(("K", "ann")),
+            )
+        },
+    )
+    .await;
+    let rename = seal_active(&mut client).await;
+    client
+        .batch_execute(
+            "update public.accounts set code = 'B' where id = 1; \
+             insert into public.accounts values (3, 'K', 'cat')",
+        )
+        .await
+        .expect("move account 1 off K and insert account 3 at K, the CDC lost");
+    trellis
+        .request_backfill("accounts")
+        .await
+        .expect("request a re-backfill of the to-side");
+    markers::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    assert_eq!(
+        projected_account(&client, "K").await,
+        Some(Some("cat".to_string())),
+        "the refresh wrote K from the live row"
+    );
+    commit_and_stage(
+        &mut client,
+        "update public.accounts set name = 'cat2' where id = 3",
+        |lsn| {
+            account_cdc(
+                lsn,
+                CdcOp::Update,
+                3,
+                Some(("K", "cat")),
+                Some(("K", "cat2")),
+            )
+        },
+    )
+    .await;
+
+    // A from-side apply bumps K's generation and has not committed yet.
+    let projection = account_projection(&client).await;
+    let mut bumper = connect_raw(db.dsn()).await;
+    let bump = bumper.transaction().await.expect("begin the bump");
+    bump.execute(
+        &format!("update \"{projection}\" set __trellis_gen = __trellis_gen + 1 where code = 'K'"),
+        &[],
+    )
+    .await
+    .expect("bump K's generation");
+
+    let pool = db.pool.clone();
+    let drain = tokio::spawn(async move { drain_sealed(&pool, rename).await });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: bool = client
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where datname = current_database() and wait_event_type = 'Lock')",
+                &[],
+            )
+            .await
+            .expect("look for a lock wait")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rename's drain never waited on K's row"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    bump.commit().await.expect("commit the bump");
+    drain.await.expect("the rename's drain");
+
+    assert_eq!(
+        projected_account(&client, "K").await,
+        None,
+        "the live write left K to account 3's pending update"
+    );
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        projected_account(&client, "K").await,
+        Some(Some("cat2".to_string()))
+    );
+    assert_eq!(
+        bill_names(&client).await,
+        vec![(10, Some("cat2".to_string())), (11, None)]
+    );
+}

@@ -2831,9 +2831,14 @@ async fn relationship_refresh_stamps(
 /// locked one key's row `for update` in an earlier statement, and the
 /// release locks every key's, so on such a row that drain has committed
 /// before this snapshot or waits for this transaction. For any other row,
-/// the withheld-upsert delete names the row version this snapshot read
-/// (`xmin`): a row that drain wrote while this statement waited on it is
-/// left alone, since that change has then applied.
+/// the withheld-upsert delete requires the row's `lsn` to be the one this
+/// snapshot read: a to-side write committed while this statement waited on
+/// the row (that drain's, or any other) stamps a new `lsn`, so the row is
+/// left alone, and the changes still pending after that write apply after
+/// it. The test is on `lsn`, not the row version (`xmin`): a from-side
+/// apply's `__trellis_gen` bump (step 3c) also writes the row, holding its
+/// lock until it commits, without applying any to-side change, and the
+/// delete must still go ahead after it.
 async fn apply_projection_from_live(
     txn: &Transaction<'_>,
     shape: &ReverseRelationshipShape,
@@ -2889,12 +2894,13 @@ async fn apply_projection_from_live(
              from ({pending}) c order by c.lsn desc, c.change_id desc limit 1), \
          held as (select 1 from latest l where l.present), \
          seen as materialized ( \
-             select q.xmin as row_xmin from {proj} q where q.{key_ident}::text = $1), \
+             select q.{lsn_ident} as row_lsn from {proj} q where q.{key_ident}::text = $1), \
          gone as ( \
              delete from {proj} p where p.{key_ident}::text = $1 \
              and (not exists (select 1 from {to_table} t where {filter}) \
                   or (exists (select 1 from held) \
-                      and p.xmin = (select v.row_xmin from seen v)))) \
+                      and exists (select 1 from seen v \
+                                  where v.row_lsn is not distinct from p.{lsn_ident})))) \
          insert into {proj} ({insert_cols}) \
          select {select_exprs} from {to_table} t \
          where {filter} and not exists (select 1 from held) \
