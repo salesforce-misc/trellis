@@ -1066,8 +1066,11 @@ fn typed_row(plan: &LedgerTargetPlan) -> String {
 /// The `b` and `v` CTEs over a page's records: `b` binds `$1` keys, `$2`
 /// Re-derive flags, `$3` `lsn`s, `$4` `row_txid`s and `$5` images (all
 /// `text[]`, in key order), and `v` adds each record's entry values, cast or
-/// computed from its image, and whether it has one (`__present`).
-fn image_ctes(plan: &LedgerTargetPlan) -> String {
+/// computed from its image, and whether it has one (`__present`). `fresh`,
+/// when given, is the parameter (`bool[]`, in the same order) that flags
+/// each record whose entry [`lock_entries`] inserted with its change
+/// applied (`__fresh`, false when not given).
+fn image_ctes(plan: &LedgerTargetPlan, fresh: Option<&str>) -> String {
     let shape = &plan.shape;
     let ledger = &plan.ledger_ident;
     let q = |c: &str| quote_ident(c);
@@ -1117,20 +1120,26 @@ fn image_ctes(plan: &LedgerTargetPlan) -> String {
     } else {
         String::new()
     };
+    let (fresh_param, fresh_col) = match fresh {
+        Some(param) => (format!(", {param}::bool[]"), "u.__fresh"),
+        None => (String::new(), "false"),
+    };
     format!(
         "b as ( \
              select u.__k, u.__rederive, u.__lsn::pg_lsn as __lsn, u.__txid::xid8 as __txid, \
-                    u.__img::jsonb as __img \
-             from unnest($1::text[], $2::bool[], $3::text[], $4::text[], $5::text[]) \
-                  as u(__k, __rederive, __lsn, __txid, __img) \
+                    u.__img::jsonb as __img, {fresh_col} as __fresh \
+             from unnest($1::text[], $2::bool[], $3::text[], $4::text[], $5::text[]{fresh_param}) \
+                  as u(__k, __rederive, __lsn, __txid, __img{fresh_alias}) \
          ), \
          v as ( \
-             select b.__k, b.__rederive, b.__lsn, b.__txid, b.__img is not null as __present, {v_cols} \
+             select b.__k, b.__rederive, b.__lsn, b.__txid, b.__fresh, \
+                    b.__img is not null as __present, {v_cols} \
              from b cross join lateral \
                   jsonb_populate_record(null::{ledger}, jsonb_build_object({doc})) r{typed_row} \
          )",
         v_cols = v_cols.join(", "),
         doc = doc.join(", "),
+        fresh_alias = if fresh.is_some() { ", __fresh" } else { "" },
     )
 }
 
@@ -1166,7 +1175,7 @@ fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
          order by v.__k \
          on conflict do nothing \
          returning {key}, {applied} is not null",
-        ctes = image_ctes(plan),
+        ctes = image_ctes(plan, None),
         ledger = plan.ledger_ident,
         values = values.join(", "),
         when_ok = values
@@ -1183,12 +1192,23 @@ fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
 
 /// The page's one ledger-and-groups statement (see the module doc, step 3).
 /// Binds [`image_ctes`]' `$1`–`$5`, `$6` the Re-derive read's snapshot, `$7`
-/// the page's segment, `$8` the target's identity and `$9` the keys whose
-/// entry [`lock_entries`] inserted with their change applied (`text[]`).
-/// Those are left as they are (by an anti-join: every key may be one, and
-/// `<> all` would compare each entry with each of them), and each counts as
-/// a move into its group from no entry at all. `image_columns` are the seam's prior-image columns
-/// (`None`: no reader). Returns [`GroupUpsert`]'s columns.
+/// the page's segment, `$8` the target's identity, `$9` the keys of the
+/// records whose entry [`lock_entries`] did not insert with their change
+/// applied (`text[]`) and `$10` each record's flag for whether it did
+/// (`bool[]`, [`image_ctes`]' `fresh`). Only the first are read and
+/// updated; each of the others counts as a move into its group from no
+/// entry at all, with the values its image gives, which are the ones the
+/// insert wrote, so the statement never reads those entries back.
+/// `image_columns` are the seam's prior-image columns (`None`: no reader).
+/// Returns [`GroupUpsert`]'s columns.
+///
+/// The fresh entries are kept out of the ledger reads, not filtered out of
+/// them (#775): a page's every key may be fresh, and a read of the ledger
+/// joined against a list of them is a plan the planner can get wrong while
+/// a fast-growing ledger's statistics lag. In the paged benchmark an
+/// anti-join against them, and a read of them back by key, were planned as
+/// scans of the whole ledger and of its `GROUP BY` index, on every page,
+/// until `autoanalyze` caught up.
 fn ledger_statement(
     plan: &LedgerTargetPlan,
     image_columns: Option<&[String]>,
@@ -1221,7 +1241,6 @@ fn ledger_statement(
         "with {ctes}, \
          {old}, \
          fl as (select floor from ledger_truncate_floor where target_table = $8), \
-         fr as (select unnest($9::text[]) as __k), \
          upd as ( \
              update {ledger} l set {set_values}, \
                  {member} = v.__present, {tombstone} = not v.__present, \
@@ -1229,19 +1248,19 @@ fn ledger_statement(
                  {applied} = case when v.__rederive then l.{applied} else v.__lsn end, \
                  {seg} = {stamp} \
              from v \
-             where l.{key} = v.__k \
-               and not exists (select 1 from fr where fr.__k = l.{key}) \
+             where l.{key} = v.__k and not v.__fresh \
                and (v.__rederive or ({predicate})) \
              returning {returning} \
          ), \
          fresh as ( \
-             select {returning} from {ledger} l where l.{key} = any($9::text[]) \
+             select v.__k, {fresh_values}, v.__present as __live from v where v.__fresh \
          ), \
          {moves_and_deltas}, \
          {up} \
          {select}",
-        ctes = image_ctes(plan),
-        old = old_cte(plan, "$1"),
+        ctes = image_ctes(plan, Some("$10")),
+        old = old_cte(plan, "$9"),
+        fresh_values = prefixed(&values, "v"),
         set_values = set_values.join(", "),
         predicate = apply_predicate(visibility),
         stamp =
@@ -2175,6 +2194,13 @@ pub(crate) async fn apply_ledger_target(
     #[cfg(not(any(test, feature = "test-util")))]
     let (visibility, drop_racing) = (true, false);
     let sql = ledger_statement(plan, image_columns.as_deref(), visibility, drop_racing);
+    let fresh: HashSet<String> = fresh.into_iter().collect();
+    let fresh_flags: Vec<bool> = keys.iter().map(|k| fresh.contains(*k)).collect();
+    let stale_keys: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|k| !fresh.contains(*k))
+        .collect();
     let rows = txn
         .query(
             &sql,
@@ -2187,7 +2213,8 @@ pub(crate) async fn apply_ledger_target(
                 &snapshot,
                 &entry_seg,
                 &plan.target,
-                &fresh,
+                &stale_keys,
+                &fresh_flags,
             ],
         )
         .await?;
