@@ -2134,6 +2134,58 @@ async fn no_ledger_index_reads_what_an_apply_moves_one_to_one() {
     no_ledger_index_reads_what_an_apply_moves(Flavour::OneToOne).await;
 }
 
+/// A page's Apply of a key with no entry writes the entry in the insert that
+/// locks it, in one version (#775), rather than a placeholder its statement
+/// then rewrites, which left a dead version, a lock and a new index entry
+/// behind for every source row an insert-only load wrote. Key 4's insert
+/// and delete fold into a delete of a key the ledger never had: a
+/// tombstone (the third version), which counts in no group.
+async fn a_new_keys_apply_writes_its_entry_once(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    write(
+        &d,
+        "insert into public.src values (2, 1, 5), (3, 2, 7), (4, 2, 1)",
+    )
+    .await;
+    write(&d, "delete from public.src where id = 4").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_oracle(&mut d, flavour).await;
+
+    let ledger = flavour.ledger();
+    d.ctl
+        .batch_execute("create extension if not exists pageinspect")
+        .await
+        .expect("pageinspect");
+    // Every heap tuple the page's transaction (the newest writer) wrote,
+    // live or dead.
+    let written: i64 = d
+        .ctl
+        .query_one(
+            &format!(
+                "select count(*) from generate_series(0, \
+                     pg_relation_size('{ledger}') / current_setting('block_size')::int - 1) b, \
+                     heap_page_items(get_raw_page('{ledger}', b::int)) i \
+                 where i.t_xmin::text::bigint = (select max(xmin::text::bigint) from {ledger})"
+            ),
+            &[],
+        )
+        .await
+        .expect("count the page's tuples")
+        .get(0);
+    assert_eq!(written, 3, "one version per new key");
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_writes_its_entry_once_aggregate() {
+    a_new_keys_apply_writes_its_entry_once(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_writes_its_entry_once_min_max() {
+    a_new_keys_apply_writes_its_entry_once(Flavour::AggregateMinMax).await;
+}
+
 // ------------------------------------- a 1-1 and an aggregate in one page
 
 /// A 1-1 and an aggregate target fed from one source take their entry locks

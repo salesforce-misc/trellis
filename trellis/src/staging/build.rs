@@ -407,7 +407,14 @@ async fn lock_chunk_entries(
             .await?
             .get(0);
         crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
-        ledger::lock_entries(txn, ledger, keys, skip_lock).await?;
+        ledger::lock_entries(
+            txn,
+            ledger,
+            keys,
+            ledger::NewEntries::Placeholders,
+            skip_lock,
+        )
+        .await?;
         txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
             .await?;
         Ok::<_, ApplyError>(())

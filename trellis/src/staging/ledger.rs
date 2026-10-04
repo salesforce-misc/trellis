@@ -41,9 +41,12 @@
 //!
 //! # One page, one target ([`apply_ledger_target`])
 //!
-//! 1. **Lock** (I1, I5, [`lock_entries`]): insert a non-member placeholder
-//!    for every key of the page that has no entry, then `select … for
-//!    update` every entry, sorted by key, in one statement. A tombstone
+//! 1. **Lock** (I1, I5, [`lock_entries`]): insert an entry for every key of
+//!    the page that has none, then `select … for update` every other entry,
+//!    sorted by key, in one statement. An Apply's new entry has its change
+//!    written in (I2 holds against no entry; #775), unless the target reads
+//!    a relationship, whose parents are read after the lock ([`route`]).
+//!    Any other new entry is a non-member placeholder. A tombstone
 //!    collected between the two (`super::retire::collect_tombstones`, #623
 //!    D7) leaves its key with no entry to lock, which fails the page with a
 //!    transient error: it rolls back and retries, inserting that key's
@@ -65,7 +68,9 @@
 //!    - an Apply writes the entry from the change's new image (a delete
 //!      makes a tombstone) and sets `applied_lsn`, but only if the change is
 //!      not visible in the entry's `basis`, is newer than its `applied_lsn`,
-//!      and is above the target's truncate floor (I2, Q6).
+//!      and is above the target's truncate floor (I2, Q6);
+//!    - an entry step 1 wrote with its change is left as it is, and moves
+//!      into its group from no entry at all.
 //! 4. The recomputed fields of every group the page kept are rewritten from
 //!    its live entries.
 //! 5. Groups whose every accumulator reached 0 are deleted.
@@ -83,7 +88,7 @@
 //! table's row type instead. A `json`/`jsonb` column is cast from its text
 //! directly: populating would store the text as a JSON string.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use tokio_postgres::Transaction;
@@ -720,6 +725,10 @@ fn upd_returning(plan: &LedgerTargetPlan) -> String {
 /// [`schema::DELTA_KEYS_COLUMN`], the changed entries that count in it now.
 /// An entry re-derived unchanged moves out and back in with the same values,
 /// and is in neither.
+///
+/// A page's (`build` false) also moves each live entry of its `fresh` CTE
+/// into its group: the entries the page inserted with their change already
+/// applied ([`lock_entries`]), which had no entry to move out of.
 fn moves_and_deltas(plan: &LedgerTargetPlan, build: bool) -> String {
     let shape = &plan.shape;
     let (groups, args) = entry_columns(shape);
@@ -774,7 +783,7 @@ fn moves_and_deltas(plan: &LedgerTargetPlan, build: bool) -> String {
              from upd u join old o on o.__k = u.__k where u.__live \
              union all \
              select {o_cols}, -1 as __sign, o.__k, {rc} as __rc \
-             from old o join upd u on u.__k = o.__k where o.__live \
+             from old o join upd u on u.__k = o.__k where o.__live{fresh} \
          ), \
          d as ( \
              select {m_groups}, {m_gk} as __gk, {deltas}, array_agg(m.__k) as __ks \
@@ -788,6 +797,15 @@ fn moves_and_deltas(plan: &LedgerTargetPlan, build: bool) -> String {
         ),
         u_cols = prefixed(&values, "u"),
         o_cols = prefixed(&values, "o"),
+        fresh = if build {
+            String::new()
+        } else {
+            format!(
+                " union all select {}, 1 as __sign, f.__k, true as __rc \
+                 from fresh f where f.__live",
+                prefixed(&values, "f")
+            )
+        },
         m_groups = prefixed(&groups, "m"),
         m_gk = ddl::pk_key_sql_expr(&plan.identity, Some("m")),
         deltas = deltas.join(", "),
@@ -1043,29 +1061,15 @@ fn typed_row(plan: &LedgerTargetPlan) -> String {
     )
 }
 
-/// The page's one ledger-and-groups statement (see the module doc, step 3).
-/// Binds `$1` keys, `$2` Re-derive flags, `$3` `lsn`s, `$4` `row_txid`s,
-/// `$5` images (all `text[]`, in key order), `$6` the Re-derive read's
-/// snapshot, `$7` the page's segment and `$8` the target's identity.
-/// `image_columns` are the seam's prior-image columns (`None`: no reader).
-/// Returns [`GroupUpsert`]'s columns.
-fn ledger_statement(
-    plan: &LedgerTargetPlan,
-    image_columns: Option<&[String]>,
-    visibility: bool,
-    drop_racing: bool,
-) -> String {
+/// The `b` and `v` CTEs over a page's records: `b` binds `$1` keys, `$2`
+/// Re-derive flags, `$3` `lsn`s, `$4` `row_txid`s and `$5` images (all
+/// `text[]`, in key order), and `v` adds each record's entry values, cast or
+/// computed from its image, and whether it has one (`__present`).
+fn image_ctes(plan: &LedgerTargetPlan) -> String {
     let shape = &plan.shape;
     let ledger = &plan.ledger_ident;
     let q = |c: &str| quote_ident(c);
-    let (groups, args) = entry_columns(shape);
-    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
-    let member = q(schema::MEMBER_COLUMN);
-    let tombstone = q(schema::TOMBSTONE_COLUMN);
-    let key = q(schema::KEY_COLUMN);
-    let basis = q(schema::BASIS_COLUMN);
-    let applied = q(schema::APPLIED_LSN_COLUMN);
-    let seg = q(schema::APPLIED_SEG_COLUMN);
+    let (groups, _) = entry_columns(shape);
 
     // An image's plain-column values keyed by ledger column, for
     // `jsonb_populate_record`, and each value `v` carries: the record's
@@ -1111,6 +1115,94 @@ fn ledger_statement(
     } else {
         String::new()
     };
+    format!(
+        "b as ( \
+             select u.__k, u.__rederive, u.__lsn::pg_lsn as __lsn, u.__txid::xid8 as __txid, \
+                    u.__img::jsonb as __img \
+             from unnest($1::text[], $2::bool[], $3::text[], $4::text[], $5::text[]) \
+                  as u(__k, __rederive, __lsn, __txid, __img) \
+         ), \
+         v as ( \
+             select b.__k, b.__rederive, b.__lsn, b.__txid, b.__img is not null as __present, {v_cols} \
+             from b cross join lateral \
+                  jsonb_populate_record(null::{ledger}, jsonb_build_object({doc})) r{typed_row} \
+         )",
+        v_cols = v_cols.join(", "),
+        doc = doc.join(", "),
+    )
+}
+
+/// The insert that makes a page's new keys their entries (step 1, see
+/// [`lock_entries`]). Binds [`image_ctes`]' `$1`–`$5`, with a Re-derive's
+/// image null, `$6` the page's segment and `$7` the target's identity. A
+/// key with no entry gets one: an Apply above the truncate floor writes
+/// its change into it, as the page's statement would ([`ledger_statement`]:
+/// I2 holds against an entry that isn't there), and stamps `$6`. A
+/// Re-derive, or an Apply at or below the floor, gets a non-member
+/// placeholder that the page's statement then writes. Returns each key it
+/// inserted and whether its change was applied, in key order.
+///
+/// The stamp is the page's latest segment, not the Re-derive read's (#742):
+/// the change is in it or an earlier one, and so is every older change to
+/// the key, which is all an Apply's tombstone must outlast (I4), as on a
+/// 1-1 ledger (`super::one_to_one_ledger::lock_entries`).
+fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
+    let q = |c: &str| quote_ident(c);
+    let (groups, args) = entry_columns(&plan.shape);
+    let values: Vec<String> = groups.into_iter().chain(args).collect();
+    let applied = q(schema::APPLIED_LSN_COLUMN);
+    let key = q(schema::KEY_COLUMN);
+    format!(
+        "with {ctes}, \
+         fl as (select floor from ledger_truncate_floor where target_table = $7) \
+         insert into {ledger} ({key}, {values}, {member}, {tombstone}, {applied}, {seg}) \
+         select v.__k, {when_ok}, o.ok and v.__present, o.ok and not v.__present, \
+                case when o.ok then v.__lsn end, case when o.ok then $6::bigint end \
+         from v cross join lateral \
+              (select not v.__rederive \
+                      and not exists (select 1 from fl where v.__lsn <= fl.floor)) as o(ok) \
+         order by v.__k \
+         on conflict do nothing \
+         returning {key}, {applied} is not null",
+        ctes = image_ctes(plan),
+        ledger = plan.ledger_ident,
+        values = values.join(", "),
+        when_ok = values
+            .iter()
+            .map(|c| format!("case when o.ok then v.{c} end"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        member = q(schema::MEMBER_COLUMN),
+        tombstone = q(schema::TOMBSTONE_COLUMN),
+        seg = q(schema::APPLIED_SEG_COLUMN),
+    )
+}
+
+/// The page's one ledger-and-groups statement (see the module doc, step 3).
+/// Binds [`image_ctes`]' `$1`–`$5`, `$6` the Re-derive read's snapshot, `$7`
+/// the page's segment, `$8` the target's identity and `$9` the keys whose
+/// entry [`lock_entries`] inserted with their change applied (`text[]`).
+/// Those are left as they are (by an anti-join: every key may be one, and
+/// `<> all` would compare each entry with each of them), and each counts as
+/// a move into its group from no entry at all. `image_columns` are the seam's prior-image columns
+/// (`None`: no reader). Returns [`GroupUpsert`]'s columns.
+fn ledger_statement(
+    plan: &LedgerTargetPlan,
+    image_columns: Option<&[String]>,
+    visibility: bool,
+    drop_racing: bool,
+) -> String {
+    let shape = &plan.shape;
+    let ledger = &plan.ledger_ident;
+    let q = |c: &str| quote_ident(c);
+    let (groups, args) = entry_columns(shape);
+    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
+    let member = q(schema::MEMBER_COLUMN);
+    let tombstone = q(schema::TOMBSTONE_COLUMN);
+    let key = q(schema::KEY_COLUMN);
+    let basis = q(schema::BASIS_COLUMN);
+    let applied = q(schema::APPLIED_LSN_COLUMN);
+    let seg = q(schema::APPLIED_SEG_COLUMN);
     let set_values: Vec<String> = values.iter().map(|c| format!("{c} = v.{c}")).collect();
 
     // Planted bug (#557): drop the increments of a group another apply
@@ -1123,19 +1215,10 @@ fn ledger_statement(
     let upsert = group_upsert_sql(plan, image_columns, racing, "false");
 
     format!(
-        "with b as ( \
-             select u.__k, u.__rederive, u.__lsn::pg_lsn as __lsn, u.__txid::xid8 as __txid, \
-                    u.__img::jsonb as __img \
-             from unnest($1::text[], $2::bool[], $3::text[], $4::text[], $5::text[]) \
-                  as u(__k, __rederive, __lsn, __txid, __img) \
-         ), \
-         v as ( \
-             select b.__k, b.__rederive, b.__lsn, b.__txid, b.__img is not null as __present, {v_cols} \
-             from b cross join lateral \
-                  jsonb_populate_record(null::{ledger}, jsonb_build_object({doc})) r{typed_row} \
-         ), \
+        "with {ctes}, \
          {old}, \
          fl as (select floor from ledger_truncate_floor where target_table = $8), \
+         fr as (select unnest($9::text[]) as __k), \
          upd as ( \
              update {ledger} l set {set_values}, \
                  {member} = v.__present, {tombstone} = not v.__present, \
@@ -1143,14 +1226,18 @@ fn ledger_statement(
                  {applied} = case when v.__rederive then l.{applied} else v.__lsn end, \
                  {seg} = greatest(l.{seg}, $7::bigint) \
              from v \
-             where l.{key} = v.__k and (v.__rederive or ({predicate})) \
+             where l.{key} = v.__k \
+               and not exists (select 1 from fr where fr.__k = l.{key}) \
+               and (v.__rederive or ({predicate})) \
              returning {returning} \
+         ), \
+         fresh as ( \
+             select {returning} from {ledger} l where l.{key} = any($9::text[]) \
          ), \
          {moves_and_deltas}, \
          {up} \
          {select}",
-        v_cols = v_cols.join(", "),
-        doc = doc.join(", "),
+        ctes = image_ctes(plan),
         old = old_cte(plan, "$1"),
         set_values = set_values.join(", "),
         predicate = apply_predicate(visibility),
@@ -1772,19 +1859,48 @@ pub(super) async fn finish_groups(
     Ok((written, deleted))
 }
 
-/// Locks the ledger entries of `keys` (I1, I5): inserts a non-member
-/// placeholder for every key with no entry, then `select … for update`
-/// every entry, sorted by key.
+/// How [`lock_entries`] makes the entries of keys that have none.
+pub(super) enum NewEntries<'a> {
+    /// A non-member placeholder each: a build chunk's, which re-derives
+    /// every key it locks, and a page's on a target that reads a
+    /// relationship.
+    Placeholders,
+    /// A page's: [`fresh_entries_statement`]'s parameters, in `keys`' order:
+    /// the Re-derive flags, `lsn`s, `row_txid`s and Apply images (null for a
+    /// Re-derive), and the page's latest segment.
+    Page {
+        rederive: &'a [bool],
+        lsns: &'a [Option<String>],
+        txids: &'a [Option<&'a str>],
+        images: &'a [Option<&'a str>],
+        seg: i64,
+    },
+}
+
+/// Locks the ledger entries of `keys` (I1, I5): inserts an entry for every
+/// key with none, as `new` says, then `select … for update` every entry the
+/// insert didn't write, sorted by key, in one statement. An entry the
+/// insert wrote is this transaction's own row, so it is locked already, and
+/// another transaction inserting the same key waits on it. Returns the keys
+/// whose entry the insert wrote with their change applied ([`NewEntries::Page`]
+/// only): the page's statement leaves those as they are.
 ///
-/// A tombstone the placeholder insert found can be collected
+/// A page's Apply of a key with no entry writes the entry in the insert
+/// rather than a placeholder its statement then rewrites (#775). That spares
+/// the entry a second version, its index entries and a lock, as on a 1-1
+/// ledger (#623 D6). Under an insert-only load every source row is such a
+/// key, and the placeholder's rewrite could never be HOT, since it sets the
+/// entry's group and membership, which the `GROUP BY` index reads.
+///
+/// A tombstone the insert found can be collected
 /// (`super::retire::collect_tombstones`, #623 D7) before the lock reaches
 /// it, leaving its key with no entry. That fails the call with
 /// [`ApplyError::LedgerEntryCollected`], which the caller's transaction
 /// rolls back on and retries as a transient error (#712); the retry inserts
-/// the key's placeholder afresh. Taking the lock again in the same
-/// transaction would insert that placeholder while holding the other keys'
+/// the key's entry afresh. Taking the lock again in the same
+/// transaction would insert that entry while holding the other keys'
 /// locks, out of I5's one order, and deadlock with a transaction that
-/// inserted the same placeholder first and then queued on one of them. A
+/// inserted the same entry first and then queued on one of them. A
 /// savepoint to give those locks back first would cost every call two round
 /// trips, a subtransaction and a multixact on the entries it then updates,
 /// for a race that needs the GC inside a window of one round trip.
@@ -1796,23 +1912,56 @@ pub(super) async fn lock_entries(
     txn: &Transaction<'_>,
     plan: &LedgerTargetPlan,
     keys: &[&str],
+    new: NewEntries<'_>,
     skip_lock: bool,
-) -> Result<(), ApplyError> {
+) -> Result<Vec<String>, ApplyError> {
     let ledger = &plan.ledger_ident;
     let key_col = quote_ident(schema::KEY_COLUMN);
+    let mut inserted: HashSet<String> = HashSet::new();
+    let mut applied: Vec<String> = Vec::new();
     let mut distinct = keys.to_vec();
-    distinct.sort_unstable();
-    distinct.dedup();
-    txn.execute(
-        &format!(
-            "insert into {ledger} ({key_col}, {}) \
-             select k, false from unnest($1::text[]) as k order by k \
-             on conflict do nothing",
-            quote_ident(schema::MEMBER_COLUMN)
-        ),
-        &[&distinct],
-    )
-    .await?;
+    match new {
+        NewEntries::Placeholders => {
+            distinct.sort_unstable();
+            distinct.dedup();
+            for row in txn
+                .query(
+                    &format!(
+                        "insert into {ledger} ({key_col}, {}) \
+                         select k, false from unnest($1::text[]) as k order by k \
+                         on conflict do nothing \
+                         returning {key_col}",
+                        quote_ident(schema::MEMBER_COLUMN)
+                    ),
+                    &[&distinct],
+                )
+                .await?
+            {
+                inserted.insert(row.get(0));
+            }
+        }
+        NewEntries::Page {
+            rederive,
+            lsns,
+            txids,
+            images,
+            seg,
+        } => {
+            for row in txn
+                .query(
+                    &fresh_entries_statement(plan),
+                    &[&keys, &rederive, &lsns, &txids, &images, &seg, &plan.target],
+                )
+                .await?
+            {
+                let key: String = row.get(0);
+                if row.get::<_, bool>(1) {
+                    applied.push(key.clone());
+                }
+                inserted.insert(key);
+            }
+        }
+    }
     // Test-only pause point (#623 D7). See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -1821,17 +1970,22 @@ pub(super) async fn lock_entries(
         &plan.target,
     )
     .await?;
-    if !skip_lock {
+    let existing: Vec<&str> = distinct
+        .iter()
+        .copied()
+        .filter(|k| !inserted.contains(*k))
+        .collect();
+    if !existing.is_empty() && !skip_lock {
         let locked = txn
             .execute(
                 &format!(
                     "select 1 from {ledger} where {key_col} = any($1::text[]) \
                      order by {key_col} for update"
                 ),
-                &[&distinct],
+                &[&existing],
             )
             .await?;
-        if (locked as usize) < distinct.len() {
+        if (locked as usize) < existing.len() {
             return Err(ApplyError::LedgerEntryCollected {
                 target: plan.target.clone(),
             });
@@ -1845,7 +1999,7 @@ pub(super) async fn lock_entries(
         &plan.target,
     )
     .await?;
-    Ok(())
+    Ok(applied)
 }
 
 /// Whether a page whose lowest segment is `first_seg` may hold a change
@@ -1896,17 +2050,8 @@ pub(crate) async fn apply_ledger_target(
     records.sort_by(|a, b| a.key.cmp(&b.key));
     let keys: Vec<&str> = records.iter().map(|r| r.key.as_str()).collect();
 
-    // 1. The entry lock (I1, I5).
-    // Planted bug (#557): read without the entry lock. See `crate::plant`.
-    #[cfg(any(test, feature = "test-util"))]
-    let skip_lock = crate::plant::fires(crate::plant::Plant::SkipLedgerLock, true);
-    #[cfg(not(any(test, feature = "test-util")))]
-    let skip_lock = false;
-    lock_entries(txn, plan, &keys, skip_lock).await?;
-
-    // 2. The Re-derive read: its rows and its snapshot in one statement. A
-    // page with a batch at or below the segment the target's Re-derive build
-    // started in re-derives every record (#733, see the module doc).
+    // A page with a batch at or below the segment the target's Re-derive
+    // build started in re-derives every record (#733, see the module doc).
     let rederive_all = records.iter().any(|r| r.apply.is_some())
         && page_may_predate_build(txn, &plan.target, first_seg).await?;
     fn apply_of(record: &LedgerRecord, rederive: bool) -> Option<&(PgLsn, String, Option<String>)> {
@@ -1916,6 +2061,44 @@ pub(crate) async fn apply_ledger_target(
             record.apply.as_ref()
         }
     }
+    // The statements' per-record parameters, in key order. A Re-derive's
+    // image is its read's, filled in at step 2.
+    let mut flags = Vec::with_capacity(records.len());
+    let mut lsns: Vec<Option<String>> = Vec::with_capacity(records.len());
+    let mut txids: Vec<Option<&str>> = Vec::with_capacity(records.len());
+    let mut images: Vec<Option<&str>> = Vec::with_capacity(records.len());
+    for record in &records {
+        let apply = apply_of(record, rederive_all);
+        flags.push(apply.is_none());
+        lsns.push(apply.map(|(lsn, _, _)| lsn.to_string()));
+        txids.push(apply.map(|(_, txid, _)| txid.as_str()));
+        images.push(apply.and_then(|(_, _, image)| image.as_deref()));
+    }
+
+    // 1. The entry lock (I1, I5), which writes a new key's Apply into the
+    // entry it inserts.
+    // Planted bug (#557): read without the entry lock. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let skip_lock = crate::plant::fires(crate::plant::Plant::SkipLedgerLock, true);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let skip_lock = false;
+    // A target that reads a relationship gets placeholders: its parents
+    // are read after the entry lock ([`route`]), which an insert that
+    // writes the entry can't do.
+    let new = if plan.shape.joins.is_empty() {
+        NewEntries::Page {
+            rederive: &flags,
+            lsns: &lsns,
+            txids: &txids,
+            images: &images,
+            seg: seg_seq,
+        }
+    } else {
+        NewEntries::Placeholders
+    };
+    let fresh = lock_entries(txn, plan, &keys, new, skip_lock).await?;
+
+    // 2. The Re-derive read: its rows and its snapshot in one statement.
     let rederive: Vec<&str> = records
         .iter()
         .filter(|r| apply_of(r, rederive_all).is_none())
@@ -1968,24 +2151,9 @@ pub(crate) async fn apply_ledger_target(
     }
 
     // 3. The entries and the groups, in one statement.
-    let mut flags = Vec::with_capacity(records.len());
-    let mut lsns: Vec<Option<String>> = Vec::with_capacity(records.len());
-    let mut txids: Vec<Option<&str>> = Vec::with_capacity(records.len());
-    let mut images: Vec<Option<&str>> = Vec::with_capacity(records.len());
-    for record in &records {
-        match apply_of(record, rederive_all) {
-            Some((lsn, txid, image)) => {
-                flags.push(false);
-                lsns.push(Some(lsn.to_string()));
-                txids.push(Some(txid.as_str()));
-                images.push(image.as_deref());
-            }
-            None => {
-                flags.push(true);
-                lsns.push(None);
-                txids.push(None);
-                images.push(read_images.get(&record.key).map(String::as_str));
-            }
+    for (i, record) in records.iter().enumerate() {
+        if flags[i] {
+            images[i] = read_images.get(&record.key).map(String::as_str);
         }
     }
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
@@ -2009,6 +2177,7 @@ pub(crate) async fn apply_ledger_target(
                 &snapshot,
                 &entry_seg,
                 &plan.target,
+                &fresh,
             ],
         )
         .await?;

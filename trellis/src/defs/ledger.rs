@@ -88,9 +88,9 @@ pub(crate) const TOMBSTONE_COLUMN: &str = "__tombstone";
 /// entries all want room in the same transaction) made 22%, 45% and 58% of
 /// an aggregate ledger's updates HOT at 90, 80 and 70, and 34%, 45% and 67%
 /// of a 1-1 ledger's. Scattered updates do better, since Postgres prunes a
-/// page's dead versions on the way. It also lets a new key's entry be
-/// rewritten on the page it was inserted on, rather than moved to another.
-/// The price is a heap a quarter larger.
+/// page's dead versions on the way. A placeholder (a Re-derive's new key)
+/// is also rewritten on the page it was inserted on, rather than moved to
+/// another. The price is a heap a quarter larger.
 pub(crate) const LEDGER_FILLFACTOR: u8 = 80;
 
 /// The storage parameters of a ledger's `create table`, with their leading
