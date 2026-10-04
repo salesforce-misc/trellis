@@ -282,6 +282,49 @@ async fn an_install_captures_writes_and_a_repeat_install_changes_nothing() {
     assert_eq!(generation_after, generation);
 }
 
+/// The capture triggers are `ENABLE ALWAYS`, so a session in
+/// `session_replication_role = replica` (a migration tool, a trigger-skipping
+/// bulk load) is captured like any other, transition tables included. Only a
+/// logical-replication apply worker skips statement triggers (#751,
+/// `trellis::defs::subscription`), and the docs rely on this to say so.
+#[tokio::test]
+async fn a_replica_role_session_is_captured() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    install_t(&mut client).await;
+
+    client
+        .batch_execute(
+            "set session_replication_role = replica; \
+             insert into public.t values ('k', 1, 2); \
+             update public.t set a = 3 where id = 'k'; \
+             delete from public.t where id = 'k'; \
+             reset session_replication_role",
+        )
+        .await
+        .expect("write as a replica-role session");
+    let ops: Vec<(String, Option<String>)> = ring_rows(&client, "k")
+        .await
+        .into_iter()
+        .map(|(op, image, _)| (op, image))
+        .collect();
+    assert_eq!(
+        ops,
+        vec![
+            (
+                "insert".to_string(),
+                Some(r#"{"a": "1", "id": "k"}"#.to_string())
+            ),
+            (
+                "update".to_string(),
+                Some(r#"{"a": "3", "id": "k"}"#.to_string())
+            ),
+            ("delete".to_string(), None),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn an_uninstall_leaves_nothing_behind() {
     let cluster = TestCluster::start();
