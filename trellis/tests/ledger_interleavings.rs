@@ -587,14 +587,14 @@ async fn a_rederive_absorbed_update_leaves_an_older_capture_skippable_only_by_vi
     assert_oracle(&mut d, flavour).await;
 }
 
-/// A source `TRUNCATE` empties a 1-1 target's ledger, so a change from before
+/// A source `TRUNCATE` empties a target's ledger, so a change from before
 /// it that still reaches a page afterward meets no entry, no basis and no
 /// `applied_lsn`: only the truncate floor (the D split's Q6) tells it is
 /// older than the truncate. Here one is staged by hand at an `lsn` below the
 /// truncate's; applied, it would bring back a row the source no longer has.
-#[tokio::test]
-async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() {
-    let flavour = Flavour::OneToOne;
+/// On either ledger the key's Apply would write its entry in the lock's
+/// insert (#623 D6, #775), so that insert must check the floor itself.
+async fn a_change_from_before_a_truncate_does_not_come_back(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
     write(&d, "truncate public.src").await;
     d.settle().await;
@@ -622,6 +622,21 @@ async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() 
     txn.commit().await.expect("commit");
     drop(client);
     assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() {
+    a_change_from_before_a_truncate_does_not_come_back(Flavour::OneToOne).await;
+}
+
+#[tokio::test]
+async fn a_change_from_before_a_truncate_does_not_bring_back_an_aggregate_entry() {
+    a_change_from_before_a_truncate_does_not_come_back(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_change_from_before_a_truncate_does_not_bring_back_a_min_max_entry() {
+    a_change_from_before_a_truncate_does_not_come_back(Flavour::AggregateMinMax).await;
 }
 
 // ----------------------------------------------------------------- exp 2, 10
@@ -1839,6 +1854,41 @@ async fn exp2_9_gc_waits_for_the_older_update_one_to_one() {
     exp2_9_gc_waits_for_the_older_update(Flavour::OneToOne).await;
 }
 
+/// [`exp2_9_gc_waits_for_the_older_update`] for a key the ledger has never
+/// had: key 3's insert lags in batch 1 while its delete drains from batch
+/// 2. The delete's Apply writes key 3's tombstone in the lock's insert
+/// (#623 D6, #775), and that insert's segment stamp must keep it past the
+/// GC until the insert drains, or the insert applies to no entry and brings
+/// key 3 back.
+async fn a_new_keys_tombstone_waits_for_its_older_insert(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(&d, "insert into public.src values (3, 2, 5)").await;
+    let b1 = d.seal().await;
+    write(&d, "delete from public.src where id = 3").await;
+    let b2 = d.seal().await;
+    d.drain(b2, "a").await;
+    assert_eq!(tombstones(&d, flavour).await, ["(3)"]);
+    assert_eq!(d.collect_tombstones().await, 0, "the insert's batch lags");
+    d.drain(b1, "b").await;
+    assert_eq!(d.collect_tombstones().await, 1, "nothing lags any more");
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_tombstone_waits_for_its_older_insert_aggregate() {
+    a_new_keys_tombstone_waits_for_its_older_insert(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_tombstone_waits_for_its_older_insert_min_max() {
+    a_new_keys_tombstone_waits_for_its_older_insert(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_tombstone_waits_for_its_older_insert_one_to_one() {
+    a_new_keys_tombstone_waits_for_its_older_insert(Flavour::OneToOne).await;
+}
+
 /// A batch drained out of order holds GC back at the batch below it: the
 /// tombstone of the first batch goes, the one above the lagging batch
 /// stays until the lagging batch has drained.
@@ -2184,6 +2234,99 @@ async fn a_new_keys_apply_writes_its_entry_once_aggregate() {
 #[tokio::test]
 async fn a_new_keys_apply_writes_its_entry_once_min_max() {
     a_new_keys_apply_writes_its_entry_once(Flavour::AggregateMinMax).await;
+}
+
+/// A page's Apply of a key with no entry writes the entry in its lock's
+/// insert (#775), and the insert is the lock (I1): a Re-derive of the same
+/// key queues on that uncommitted entry and reads only once it commits.
+/// Page A (key 2's insert) is frozen holding the entry it wrote; key 2 is
+/// then moved to group 2, and page R, the move folded with a Re-derive of
+/// key 2, queues behind A. Released, R reads the moved row and moves key 2
+/// out of the group A counted it in. Had R not waited, it would find no
+/// entry and count key 2 a second time beside A's.
+async fn a_rederive_queues_on_a_new_keys_applied_entry(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    let insert = d.seal().await;
+    let mut a = d
+        .drain_frozen(
+            insert,
+            "a",
+            &[(PausePoint::AfterEntryLock, flavour.target())],
+        )
+        .await;
+    let frozen = a.reached(PausePoint::AfterEntryLock).await;
+    write(&d, "update public.src set g = 2, v = 50 where id = 2").await;
+    d.stage_recomputes(SRC, &["2"]).await;
+    let rederive = d.seal().await;
+    let r = d.drain_frozen(rederive, "r", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut a, PausePoint::AfterEntryLock).await;
+    a.finish().await;
+    r.finish().await;
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_rederive_queues_on_a_new_keys_applied_entry_aggregate() {
+    a_rederive_queues_on_a_new_keys_applied_entry(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_rederive_queues_on_a_new_keys_applied_entry_min_max() {
+    a_rederive_queues_on_a_new_keys_applied_entry(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_rederive_queues_on_a_new_keys_applied_entry_one_to_one() {
+    a_rederive_queues_on_a_new_keys_applied_entry(Flavour::OneToOne).await;
+}
+
+/// The other order: a Re-derive's placeholder for a key with no entry holds
+/// off a page whose Apply would write that entry in its insert (#775). Page
+/// R, a Re-derive of key 2, is frozen after its placeholder insert, before
+/// its read; key 2's insert and then an update commit; page A, draining
+/// both (folded into an Apply of the update), queues on R's placeholder.
+/// Released, R reads the updated row. A's insert then finds R's entry, so
+/// A writes nothing in it and goes through the lock and I2 like any other
+/// key: the update is visible in R's basis and skipped. Had A taken key 2
+/// for one its insert wrote, it would count R's entry in again.
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    d.stage_recomputes(SRC, &["2"]).await;
+    let rederive = d.seal().await;
+    let mut r = d
+        .drain_frozen(
+            rederive,
+            "r",
+            &[(PausePoint::AfterPlaceholders, flavour.target())],
+        )
+        .await;
+    let frozen = r.reached(PausePoint::AfterPlaceholders).await;
+    write(&d, "insert into public.src values (2, 1, 5)").await;
+    write(&d, "update public.src set v = 50 where id = 2").await;
+    let writes = d.seal().await;
+    let a = d.drain_frozen(writes, "a", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut r, PausePoint::AfterPlaceholders).await;
+    r.finish().await;
+    a.finish().await;
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder_aggregate() {
+    a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder_min_max() {
+    a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn a_new_keys_apply_queues_on_a_rederives_placeholder_one_to_one() {
+    a_new_keys_apply_queues_on_a_rederives_placeholder(Flavour::OneToOne).await;
 }
 
 // ------------------------------------- a 1-1 and an aggregate in one page
