@@ -15,7 +15,9 @@
 //! [`crate::staging::schema_change::pause_readers_of_missing`]), or reads a
 //! table whose row-level security now applies to Trellis's role (#745,
 //! [`crate::staging::schema_change::pause_readers_under_row_security`]), and
-//! leaves the table for the next pass.
+//! leaves the table for the next pass. The row-level security check also
+//! runs on each table another definition targets, which the pass doesn't
+//! capture (the target-mutation seam feeds it) but its readers still read.
 //!
 //! # Never waiting on `apply`'s path
 //!
@@ -188,6 +190,36 @@ pub async fn reconcile(
     }
 
     let desired_set: HashSet<&String> = desired.iter().collect();
+    // #745: a table another definition targets isn't in `desired` (the seam
+    // feeds it, not a trigger), but its readers read it as Trellis's role
+    // all the same. A seam-fed table whose check pauses a reader, or fails,
+    // isn't current for `ready_definitions` either.
+    let mut seam_held: HashSet<String> = HashSet::new();
+    let mut seam_fed: Vec<&String> = snapshot
+        .targets
+        .iter()
+        .filter(|t| !desired_set.contains(t))
+        .collect();
+    seam_fed.sort();
+    for table in seam_fed {
+        match crate::staging::schema_change::pause_readers_under_row_security(
+            client,
+            schema,
+            &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                seam_held.insert(table.clone());
+            }
+            Err(err) => {
+                seam_held.insert(table.clone());
+                outcome.failed.push((table.clone(), err));
+            }
+        }
+    }
     for table in installed.iter().filter(|t| !desired_set.contains(t)) {
         match install::uninstall(client, schema, table, Some(deadline)).await {
             Ok(Progress::Done(removed)) => {
@@ -238,7 +270,7 @@ pub async fn reconcile(
         .await?;
 
     let gated = gated_marker_tables(&*client).await?;
-    outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated);
+    outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);
     Ok(outcome)
 }
 
@@ -315,14 +347,19 @@ fn ready_definitions(
     desired: &[String],
     captured: &BTreeSet<String>,
     gated: &HashSet<String>,
+    seam_held: &HashSet<String>,
 ) -> Vec<i64> {
     let desired: HashSet<&String> = desired.iter().collect();
     // A table another definition targets is fed by the seam: nothing to
-    // capture. Any other table not in `desired` is read by a definition
-    // registered after the pass read `desired` (which it does before the
-    // snapshot), so nothing captures it yet.
+    // capture, unless this pass held it back (`seam_held`, #745). Any other
+    // table not in `desired` is read by a definition registered after the
+    // pass read `desired` (which it does before the snapshot), so nothing
+    // captures it yet.
     let current = |table: &String| {
-        captured.contains(table) || (!desired.contains(table) && snapshot.targets.contains(table))
+        captured.contains(table)
+            || (!desired.contains(table)
+                && snapshot.targets.contains(table)
+                && !seam_held.contains(table))
     };
     snapshot
         .waiting
@@ -553,7 +590,13 @@ mod tests {
     fn a_definition_is_ready_once_its_source_is_captured() {
         let snap = snapshot(&[(1, "public.u", &[]), (2, "public.v", &[])]);
         let desired = strings(&["public.u", "public.v"]);
-        let ready = ready_definitions(&snap, &desired, &set(&["public.u"]), &HashSet::new());
+        let ready = ready_definitions(
+            &snap,
+            &desired,
+            &set(&["public.u"]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(ready, vec![1], "v's install is still waiting");
     }
 
@@ -561,8 +604,30 @@ mod tests {
     fn a_seam_fed_source_needs_no_capture() {
         let mut snap = snapshot(&[(1, "public.target", &[])]);
         snap.targets.insert("public.target".to_string());
-        let ready = ready_definitions(&snap, &[], &BTreeSet::new(), &HashSet::new());
+        let ready = ready_definitions(
+            &snap,
+            &[],
+            &BTreeSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(ready, vec![1]);
+    }
+
+    #[test]
+    fn a_seam_fed_table_the_pass_held_back_holds_its_readers() {
+        // #745: row-level security applies to the target another definition
+        // reads, as its source or a to-side.
+        let mut snap = snapshot(&[
+            (1, "public.target", &[]),
+            (2, "public.u", &["public.target"]),
+            (3, "public.u", &[]),
+        ]);
+        snap.targets.insert("public.target".to_string());
+        let desired = strings(&["public.u"]);
+        let held: HashSet<String> = ["public.target".to_string()].into();
+        let ready = ready_definitions(&snap, &desired, &set(&["public.u"]), &HashSet::new(), &held);
+        assert_eq!(ready, vec![3]);
     }
 
     #[test]
@@ -570,7 +635,13 @@ mod tests {
         // Registered between the pass's read of `desired` and its snapshot.
         let snap = snapshot(&[(1, "public.u", &[]), (2, "public.v", &["public.w"])]);
         let desired = strings(&["public.u"]);
-        let ready = ready_definitions(&snap, &desired, &set(&["public.u"]), &HashSet::new());
+        let ready = ready_definitions(
+            &snap,
+            &desired,
+            &set(&["public.u"]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(ready, vec![1], "neither v nor w is captured yet");
     }
 
@@ -578,7 +649,13 @@ mod tests {
     fn a_to_side_whose_widen_waits_holds_the_reader() {
         let snap = snapshot(&[(1, "public.u", &["public.t"])]);
         let desired = strings(&["public.u", "public.t"]);
-        let ready = ready_definitions(&snap, &desired, &set(&["public.u"]), &HashSet::new());
+        let ready = ready_definitions(
+            &snap,
+            &desired,
+            &set(&["public.u"]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert!(ready.is_empty());
     }
 
@@ -592,12 +669,12 @@ mod tests {
             (2, "public.t", &["public.t"]),
         ]);
         assert_eq!(
-            ready_definitions(&snap, &desired, &captured, &gated),
+            ready_definitions(&snap, &desired, &captured, &gated, &HashSet::new()),
             vec![2],
             "a self-relationship is held by its own marker's gate, not by rule 3"
         );
         assert_eq!(
-            ready_definitions(&snap, &desired, &captured, &HashSet::new()),
+            ready_definitions(&snap, &desired, &captured, &HashSet::new(), &HashSet::new()),
             vec![1, 2]
         );
     }

@@ -47,22 +47,27 @@ policies apply at all. To exempt the role, either:
 
 - give it `BYPASSRLS` (`ALTER ROLE trellis BYPASSRLS`, which a superuser
   runs). The attribute isn't inherited, so give it to the role that owns
-  Trellis's ring (the one that ran the migrations) and to any login role the
-  workers connect as; or
+  Trellis's ring (the one that ran the migrations), to any login role the
+  workers connect as, and to the role that defines a transform reading a
+  to-one relationship; or
 - make it the table's owner, or a member of the owning role, which capture
   needs anyway ([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)),
   and don't set `FORCE ROW LEVEL SECURITY`.
 
 Enabling row-level security for your application's roles on a table the
-Trellis role owns needs neither: the owner is exempt. A definition whose source,
-or a relationship's to-side it reads through, has policies that apply to the
-role that owns Trellis's ring is rejected when it is defined, with an error
-naming the table, the role and the fix. Row-level security can also be
-enabled or forced, a table handed to another owner, or `BYPASSRLS` taken
-away, after a transform is defined. The staging worker then pauses every
-transform that reads the table, with the reason on `status()`'s
-`capture_failure`, and `self_check` reports it as a `capture` divergence.
-Exempt the role, then resume the transform, which rebuilds it.
+Trellis role owns needs neither: the owner is exempt. A definition whose
+source, or a relationship's to-side it reads through, has policies that apply
+to the role that owns Trellis's ring is rejected when it is defined, with an
+error naming the table, the role and the fix. So is one whose policies on a
+to-one relationship's to-side apply to the role that defines it: defining
+reads that table, as that role, to fill the relationship's projection
+([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
+Row-level security can also be enabled or forced, a table handed to another
+owner, or `BYPASSRLS` taken away, after a transform is defined. The staging
+worker then pauses every transform that reads the table (another transform's
+target included), with the reason on `status()`'s `capture_failure`, and
+`self_check` reports it as a `capture` divergence. Exempt the role, then
+resume the transform, which rebuilds it.
 
 **Key columns need a deterministic collation** (#638). Trellis matches keys by
 their exact text, but a nondeterministic collation's `=` (an ICU collation

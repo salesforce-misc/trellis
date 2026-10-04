@@ -542,3 +542,138 @@ async fn the_capture_pass_pauses_a_reader_once_the_policies_apply_and_self_check
     assert_eq!(copied, 6, "the rebuild read every row");
     it.trellis.shutdown().await.expect("shutdown");
 }
+
+/// Registration reads no source rows, with one exception: it seeds and
+/// widens a to-one relationship's settled projection from the to-side as the
+/// session's role, and a build reads the projection. So defining refuses a
+/// to-one to-side whose policies apply to the session's role, even when the
+/// ring's owner is exempt. Here the ring's owner has `BYPASSRLS`, which a
+/// login role that is a member of it doesn't inherit.
+#[tokio::test]
+async fn defining_refuses_a_to_one_to_side_whose_policies_apply_to_the_session_role() {
+    let cluster = TestCluster::start();
+    let it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create role rls_definer login in role rls_trellis; \
+             alter role rls_trellis bypassrls; \
+             alter table public.p enable row level security, force row level security; \
+             create policy hide_two on public.p using (id <> 2);",
+        )
+        .await
+        .expect("a definer role the to-side's policies apply to");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_definer");
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    let definer = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect as the definer");
+    definer
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declaring a relationship isn't checked");
+    let rls = refused_for_row_security(
+        definer
+            .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+            .await,
+    );
+    assert_eq!(
+        rls,
+        RowSecurity {
+            table: "public.p".to_string(),
+            role: "rls_definer".to_string(),
+            owner_forced: true,
+        }
+    );
+    definer
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("a definition that doesn't read the to-side is accepted");
+
+    it.admin
+        .batch_execute("alter role rls_definer bypassrls")
+        .await
+        .expect("exempt the definer");
+    definer
+        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+        .await
+        .expect("accepted once the definer is exempt");
+    let projection: String = it
+        .admin
+        .query_one(
+            &format!("select projection_table from {SCHEMA}.relationship_projections"),
+            &[],
+        )
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    let seeded: Vec<(i32, Option<String>)> = it
+        .admin
+        .query(
+            &format!("select id, name from {SCHEMA}.{projection} order by id"),
+            &[],
+        )
+        .await
+        .expect("read the projection")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        seeded,
+        (1..=3)
+            .map(|i| (i, Some(format!("n{i}"))))
+            .collect::<Vec<_>>(),
+        "every to-side row seeds the projection, the relationship's hidden one included"
+    );
+    definer.shutdown().await.expect("shutdown");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A table another definition targets isn't captured (the target-mutation
+/// seam feeds it), but its readers read it as the Trellis role all the same,
+/// so the capture pass checks it too: RLS forced on an upstream target pauses
+/// the definition sourced from it, and not the upstream, which doesn't read
+/// its own target.
+#[tokio::test]
+async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("define the upstream");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    it.trellis
+        .apply("TRANSFORM c_again FROM public.c_copy SELECT amount AS amount")
+        .await
+        .expect("define one sourced from its target");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    for target in ["c_copy", "c_again"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+
+    it.admin
+        .batch_execute(
+            "alter table public.c_copy enable row level security, force row level security",
+        )
+        .await
+        .expect("force RLS on the upstream's target");
+    capture_pass(&mut it.raw, &it.pool).await;
+    let reported = status(&it.trellis, "c_again").await;
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let failure = reported.capture_failure.expect("the reason is reported");
+    assert_eq!(failure.source_table, "public.c_copy");
+    assert!(
+        failure.error.contains("FORCE ROW LEVEL SECURITY"),
+        "{failure:?}"
+    );
+    let upstream = status(&it.trellis, "c_copy").await;
+    assert_eq!(upstream.status, TransformStatus::Live);
+    assert_eq!(upstream.capture_failure, None);
+    it.trellis.shutdown().await.expect("shutdown");
+}

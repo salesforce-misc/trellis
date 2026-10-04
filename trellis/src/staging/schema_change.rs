@@ -286,19 +286,25 @@ pub(crate) async fn pause_readers_of_missing(
 /// policies now apply to the ring's owner or to this worker's own role,
 /// which read it, recording why in
 /// `capture_failures`. RLS can be enabled or forced, or the table handed to
-/// another owner, after the definitions were accepted. Returns whether any
-/// definition reads the table, in which case the caller leaves the table for
-/// the next pass, whose catalog no longer counts them.
+/// another owner, after the definitions were accepted. Returns whether it
+/// paused any, in which case the caller leaves the table for the next pass,
+/// whose catalog no longer counts them.
 ///
 /// A definition only frozen (paused or quarantined) keeps its status but
 /// gets the record, as for a schema change: its resume is the rebuild either
 /// way, and the next pass pauses it again while the policies still apply.
+///
+/// Costs no query for a table no unpaused definition reads.
 pub(crate) async fn pause_readers_under_row_security(
     client: &mut Client,
     schema: &str,
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<bool, CaptureError> {
+    let readers = unpaused_readers(catalog, table);
+    if readers.is_empty() {
+        return Ok(false);
+    }
     let Some(rls) = crate::defs::row_security::applying(
         &*client,
         schema,
@@ -309,18 +315,6 @@ pub(crate) async fn pause_readers_under_row_security(
     else {
         return Ok(false);
     };
-    let readers: Vec<i64> = readers_of(catalog, table, &BTreeSet::new(), true)
-        .into_iter()
-        .filter(|id| {
-            catalog
-                .definitions
-                .iter()
-                .any(|r| r.id == *id && !r.capture_failed)
-        })
-        .collect();
-    if readers.is_empty() {
-        return Ok(false);
-    }
     let error = row_security_error(&rls);
     let txn = client.transaction().await?;
     for id in readers {
@@ -336,4 +330,18 @@ pub(crate) async fn pause_readers_under_row_security(
 /// applies to a table it reads.
 fn row_security_error(rls: &crate::defs::row_security::RowSecurity) -> String {
     format!("{rls}; then resume the definition to rebuild it, or drop the definition")
+}
+
+/// Every definition that reads `table` at all, as its source or a
+/// relationship's to-side, and isn't paused for a capture failure yet.
+fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
+    readers_of(catalog, table, &BTreeSet::new(), true)
+        .into_iter()
+        .filter(|id| {
+            catalog
+                .definitions
+                .iter()
+                .any(|r| r.id == *id && !r.capture_failed)
+        })
+        .collect()
 }

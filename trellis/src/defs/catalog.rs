@@ -2462,9 +2462,28 @@ async fn create_definition_inner(
     // Issue #745: Trellis reads the source, and the to-side of every
     // relationship the definition reads through, as its own role, so
     // row-level security that applies to that role would filter the reads.
-    let read_tables: Vec<String> = std::iter::once(qualified_source.clone())
-        .chain(relationships.values().map(|r| r.qualified_to_table.clone()))
+    // Registration reads no source rows itself, with one exception: it seeds
+    // and widens each to-one relationship's settled projection from the
+    // to-side as the session's role
+    // ([`widen_relationship_projections_for_definition_in_txn`], above), and
+    // a build reads the projection, so a to-one to-side is checked for the
+    // session's role too.
+    let mut to_sides: Vec<(String, super::row_security::Readers)> = relationships
+        .values()
+        .map(|r| {
+            let readers = if r.cardinality == RelationshipCardinality::ToOne {
+                super::row_security::Readers::RingAndSession
+            } else {
+                super::row_security::Readers::Ring
+            };
+            (r.qualified_to_table.clone(), readers)
+        })
         .collect();
+    to_sides.sort_by(|a, b| a.0.cmp(&b.0));
+    let read_tables: Vec<(String, super::row_security::Readers)> =
+        std::iter::once((qualified_source.clone(), super::row_security::Readers::Ring))
+            .chain(to_sides)
+            .collect();
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
 
     // Issue #440: registration creates the target here, in the transaction
@@ -4761,21 +4780,19 @@ async fn reject_unkeyed_source(
 }
 
 /// Issue #745: rejects the first of `tables` (unquoted `schema.table`
-/// identities) whose row-level security applies to the Trellis role, the
-/// ring's owner ([`super::row_security::applying`]; not the session's role,
-/// which may belong to a process that never reads the table) —
-/// [`CatalogError::RowSecurityApplies`]. A table that doesn't exist passes:
-/// the checks that need it report that.
+/// identities) whose row-level security applies to a role that reads it
+/// ([`super::row_security::applying`]): the ring's owner, and the session's
+/// role for a table registration itself reads ([`super::row_security::Readers`];
+/// not otherwise, since the session may belong to a process that never reads
+/// the table) — [`CatalogError::RowSecurityApplies`]. A table that doesn't
+/// exist passes: the checks that need it report that.
 async fn reject_row_security(
     client: &impl GenericClient,
     schema: &str,
-    tables: &[String],
+    tables: &[(String, super::row_security::Readers)],
 ) -> Result<(), CatalogError> {
-    for table in tables {
-        if let Some(rls) =
-            super::row_security::applying(client, schema, table, super::row_security::Readers::Ring)
-                .await?
-        {
+    for (table, readers) in tables {
+        if let Some(rls) = super::row_security::applying(client, schema, table, *readers).await? {
             return Err(CatalogError::RowSecurityApplies(rls));
         }
     }

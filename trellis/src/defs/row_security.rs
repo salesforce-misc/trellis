@@ -38,16 +38,25 @@
 //!
 //! - **Defining** a transform refuses its source, and the to-side of every
 //!   relationship it reads through, when the policies apply to the ring's
-//!   owner ([`super::catalog::CatalogError::RowSecurityApplies`]). Not the
-//!   session's role: a process that only defines transforms reads no source
-//!   rows, and needn't run as a role that could
-//!   (`docs/embedding.md`, "Who runs what").
+//!   owner ([`super::catalog::CatalogError::RowSecurityApplies`]). A to-one
+//!   relationship's to-side is checked for the session's role too:
+//!   registration seeds and widens the relationship's settled projection
+//!   from it as that role, and a build reads the projection. Otherwise not
+//!   the session's role: registration reads no source rows, and a process
+//!   that only defines transforms needn't run as a role that could.
+//!   Declaring a relationship isn't checked: it registers no reader, and
+//!   the projection keys it seeds are seeded again (the missing ones
+//!   inserted) by each definition that reads through it, which is.
+//!   `ALTER TRANSFORM` adds no table to read: its `ADD`/`ALTER` refuse a
+//!   relationship path.
 //! - **The staging worker's capture pass** pauses every definition that
-//!   reads a captured table whose policies now apply to the ring's owner or
-//!   to the worker's own role, recording why in `capture_failures`
-//!   (`staging::schema_change::pause_readers_under_row_security`). RLS can
-//!   be enabled or forced, a table handed to another owner, or a role's
-//!   `BYPASSRLS` or membership taken away, after define.
+//!   reads a table whose policies now apply to the ring's owner or to the
+//!   worker's own role, recording why in `capture_failures`
+//!   (`staging::schema_change::pause_readers_under_row_security`): each
+//!   captured table, and each table another definition's target is, which
+//!   the target-mutation seam feeds. RLS can be enabled or forced, a table
+//!   handed to another owner, or a role's `BYPASSRLS` or membership taken
+//!   away, after define.
 //! - **`self_check`'s capture audit** reports it for the ring's owner or the
 //!   caller's role, whose recompute it would filter
 //!   (`staging::capture_audit::CaptureFault::RowSecurity`).

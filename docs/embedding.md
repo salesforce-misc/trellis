@@ -158,6 +158,10 @@ instance schema, where Trellis keeps its own state. A transform that reads a
 parent column the projection doesn't carry yet adds it there, so the process
 that applies it must own the projection too
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
+It also reads the parent table to fill the projection, so row-level security
+on that table must not apply to the process's role either; `apply` refuses
+the transform if it does (#745,
+[transforms — Source tables](transforms.md#source-tables)).
 Code that needs the target populated polls `status()` until the transform is
 `live` ([Poll to `live`, don't wait](#poll-to-live-dont-wait)).
 
