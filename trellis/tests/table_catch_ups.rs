@@ -542,6 +542,8 @@ async fn pending_older_to_side_cdc_does_not_undo_a_requested_projection_refresh(
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+    // Three sealed segments and the active one fill the ring.
+    free_drained_slots(&client).await;
 
     commit_and_stage(
         &mut client,
@@ -575,6 +577,8 @@ async fn pending_older_to_side_cdc_does_not_resurrect_a_refreshed_out_projection
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+    // Three sealed segments and the active one fill the ring.
+    free_drained_slots(&client).await;
 
     commit_and_stage(
         &mut client,
@@ -1319,11 +1323,11 @@ async fn releasing_a_parked_rename_whose_segment_is_still_draining_advances_the_
     assert_eq!(order_names(&client).await, renamed());
 }
 
-/// Issue #754 review: a pending change whose own page already applied it
-/// still counts as pending while another bucket holds its segment up. Its
-/// write stamped the projection row at or above its own `lsn`, so a
-/// superseded older delete writes the key from the live row rather than
-/// leaving it to a change that will never write it again.
+/// Issue #754 review: a change whose bucket already applied it, while
+/// another bucket holds its segment up, is not pending (issue #762: its
+/// bucket's `drained_mask` bit says so), so a superseded older delete writes
+/// the key from the live row rather than leaving it to a change that will
+/// never write it again.
 #[tokio::test]
 async fn a_superseded_delete_writes_a_key_whose_pending_reinsert_already_applied() {
     let cluster = TestCluster::start();
@@ -1370,21 +1374,152 @@ async fn a_superseded_delete_writes_a_key_whose_pending_reinsert_already_applied
         "the re-insert applied"
     );
     // Another bucket of the re-insert's segment is still draining.
-    client
-        .execute(
-            "update segments set state = 'draining' where seg_seq = $1",
-            &[&reinsert.sealed_seg_seq],
-        )
-        .await
-        .expect("mark the re-insert's segment draining");
+    hold_open_beside(&client, reinsert.sealed_seg_seq, 1).await;
     drain_sealed(&db.pool, delete.sealed_seg_seq).await;
-    client
-        .execute(
-            "update segments set state = 'drained' where seg_seq = $1",
-            &[&reinsert.sealed_seg_seq],
+    finish_holding(&client, reinsert.sealed_seg_seq).await;
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
+
+/// Puts drained segment `seg_seq` back to what a segment looks like while
+/// another bucket is still draining (issue #762): two buckets, and only the
+/// one customer `id`'s ring rows route to has drained.
+async fn hold_open_beside(client: &Client, seg_seq: i64, id: i32) {
+    let slot: i16 = client
+        .query_one(
+            "select ring_slot from segments where seg_seq = $1",
+            &[&seg_seq],
         )
         .await
-        .expect("mark the re-insert's segment drained");
+        .expect("read the segment's ring slot")
+        .get(0);
+    let held = client
+        .execute(
+            &format!(
+                "update segments set state = 'draining', bucket_count = 2, \
+                     drained_mask = 1::bigint << (select (r.route % 2)::int from seg_{slot} r \
+                         where r.src_table = 'public.customers' and r.key = $2 limit 1) \
+                 where seg_seq = $1"
+            ),
+            &[&seg_seq, &id.to_string()],
+        )
+        .await
+        .expect("hold the segment open in its other bucket");
+    assert_eq!(held, 1);
+}
+
+/// Retires every drained segment, whatever its successor's state, so a test
+/// has the whole ring but the active slot to seal into. Setup leaves its last
+/// drained segment in place (`retire_drained_segments` waits for the
+/// successor), and its slot holds no rows a test reads.
+async fn free_drained_slots(client: &Client) {
+    let slots: Vec<i16> = client
+        .query(
+            "delete from segments where state = 'drained' returning ring_slot",
+            &[],
+        )
+        .await
+        .expect("retire the drained segments")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    for slot in slots {
+        client
+            .batch_execute(&format!("truncate seg_{slot}"))
+            .await
+            .expect("truncate the retired slot");
+    }
+}
+
+/// The other bucket of a segment [`hold_open_beside`] held open drains.
+async fn finish_holding(client: &Client, seg_seq: i64) {
+    client
+        .execute(
+            "update segments set state = 'drained', drained_mask = 3 where seg_seq = $1",
+            &[&seg_seq],
+        )
+        .await
+        .expect("drain the segment's other bucket");
+}
+
+/// Issue #762: an applied change still counted as pending while another
+/// bucket held its segment open, and the projection row's `lsn` decided
+/// whether it had applied. That test is not monotonic. A re-insert applies
+/// and its segment stays open; an older superseded rename writes the key
+/// from the live row, stamping its own, lower `lsn`; an older superseded
+/// delete then took the re-insert for unapplied and deleted the key, which
+/// nothing wrote again. A change is pending only while its bucket has not
+/// drained it.
+#[tokio::test]
+async fn superseded_records_older_than_an_applied_reinsert_keep_its_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+    // Three sealed segments and the active one fill the ring.
+    free_drained_slots(&client).await;
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann1' where id = 1",
+        |lsn| customer_update(lsn, 1, "ann", "ann1"),
+    )
+    .await;
+    let rename = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, rename.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 1",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 1, "ann1"),
+    )
+    .await;
+    let delete = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, delete.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    markers::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    commit_and_stage(
+        &mut client,
+        "insert into public.customers values (1, 'ann2')",
+        |lsn| customer_cdc(lsn, CdcOp::Insert, 1, "ann2"),
+    )
+    .await;
+    let reinsert = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, reinsert.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+
+    drain_sealed(&db.pool, reinsert.sealed_seg_seq).await;
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string())),
+        "the re-insert applied"
+    );
+    hold_open_beside(&client, reinsert.sealed_seg_seq, 1).await;
+    drain_sealed(&db.pool, rename.sealed_seg_seq).await;
+    drain_sealed(&db.pool, delete.sealed_seg_seq).await;
+    finish_holding(&client, reinsert.sealed_seg_seq).await;
     retire_drained_segments(&mut client)
         .await
         .expect("retire drained segments");

@@ -5145,9 +5145,8 @@ const PENDING_KEYS: &str = "trellis_pending_keys";
 /// the key present: of the pending changes that name the key in either image,
 /// the one latest in `(lsn, change_id)` order, the fold's order, names it in
 /// its new image. A change is a captured or seam-fed change, or relationship
-/// `relationship_id`'s deferred reverse (#134). Pending is guard (c)'s test
-/// (`staging::apply`'s `from_side_change_in_flight`): the row's segment
-/// hasn't drained, or drained without it.
+/// `relationship_id`'s deferred reverse (#134). Pending is per change
+/// ([`pending_to_side_changes`]): no committed drain has applied it.
 ///
 /// Issue #726: a catch-up insert from the live to-side
 /// ([`ensure_relationship_projection_in_txn`],
@@ -5176,7 +5175,7 @@ const PENDING_KEYS: &str = "trellis_pending_keys";
 /// refresh's update and delete halves are unchanged: #531's stamp orders a
 /// pending record against them.
 fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id: i64) -> String {
-    let arms = pending_to_side_changes(qualified_to_table, to_col, relationship_id, "");
+    let arms = pending_to_side_changes(qualified_to_table, to_col, relationship_id, "", None);
     // A change that keeps the key names it in both images. Its new image's
     // mention is the later one.
     format!(
@@ -5197,6 +5196,10 @@ fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id:
 /// old and new images. `filter` is appended to every arm's `where`, over
 /// the ring row `r`, and may be empty.
 ///
+/// Pending is per change (issue #762, `staging::page::ring_row_pending_sql`):
+/// no committed drain has applied it, and `claim`, the Phase 3 transaction
+/// reading it, if any, is not applying it.
+///
 /// Issue #754: `staging::apply::apply_projection_from_live` reads the same
 /// set for one key, narrowed by `filter`.
 pub(crate) fn pending_to_side_changes(
@@ -5204,6 +5207,7 @@ pub(crate) fn pending_to_side_changes(
     to_col: &str,
     relationship_id: i64,
     filter: &str,
+    claim: Option<&crate::staging::page::ClaimScope<'_>>,
 ) -> String {
     let col = quote_literal(to_col);
     let tables = format!(
@@ -5220,12 +5224,8 @@ pub(crate) fn pending_to_side_changes(
              from {table} r \
              where r.src_table = any({tables}) \
                and r.op in ('insert', 'update', 'delete', 'rel_reverse_deferred') {filter} \
-               and exists ( \
-                   select 1 from segments s \
-                   where s.ring_slot = {slot} \
-                     and (s.state <> 'drained' \
-                          or (s.fence_snapshot is not null \
-                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))))"
+               and {pending}",
+            pending = crate::staging::page::ring_row_pending_sql(slot, claim),
         )
     })
 }

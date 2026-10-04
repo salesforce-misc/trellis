@@ -2812,18 +2812,28 @@ async fn relationship_refresh_stamps(
 /// insert; when the change keeps the key (an update), its record writes the
 /// row whole either way, and re-derives the from-side rows it reaches.
 ///
-/// "Pending" is guard (c)'s test, which still counts a change whose segment
-/// has not finished draining after its own page applied it. Such a change
-/// already wrote the projection row at its window's `lsn`, at or above its
-/// own, so a row whose `lsn` is at or above the change's is written from the
-/// live row as before. The comparison is on the row being deleted, so a
-/// drain applying that change concurrently, which holds the row, makes this
-/// delete re-check against the row it wrote and keep it.
+/// "Pending" is per change (issue #762,
+/// `staging::page::ring_row_pending_sql`): no committed drain has applied
+/// it, by its segment's `drained_mask` and its bucket's `drain_cursor`, and
+/// `claim`, the Phase 3 transaction this runs in, is not applying it. Both
+/// are monotonic, so once a change has applied, no later write to the
+/// projection row can make it look pending again. A change this transaction
+/// applies is its own: one it already applied wrote the row, and one it
+/// hasn't yet will (#761 read "already applied" off the row's `lsn`, which a
+/// superseded older record's live write lowers, so a second older record
+/// then took an applied re-insert for pending and deleted its key).
 ///
 /// One statement per key, so the pending read, the projection read and the
 /// live read share one snapshot (ADR-0002 I1), and the delete and the upsert
 /// never both act on the row: the delete acts only where the to-side has no
-/// row, or where the upsert is withheld.
+/// row, or where the upsert is withheld. A drain applying a pending change
+/// concurrently commits its row write with its drain state. Guard (b)/(d)
+/// locked one key's row `for update` in an earlier statement, and the
+/// release locks every key's, so on such a row that drain has committed
+/// before this snapshot or waits for this transaction. For any other row,
+/// the withheld-upsert delete names the row version this snapshot read
+/// (`xmin`): a row that drain wrote while this statement waited on it is
+/// left alone, since that change has then applied.
 async fn apply_projection_from_live(
     txn: &Transaction<'_>,
     shape: &ReverseRelationshipShape,
@@ -2831,6 +2841,7 @@ async fn apply_projection_from_live(
     new_key: &Option<String>,
     lsn: Option<PgLsn>,
     pending_after: Option<PgLsn>,
+    claim: Option<&super::page::ClaimScope<'_>>,
 ) -> Result<(), ApplyError> {
     if shape.qualified_projection.is_empty() {
         return Ok(());
@@ -2870,20 +2881,20 @@ async fn apply_projection_from_live(
             "and r.lsn > $3::pg_lsn \
              and (r.old_image ->> {col} = $1::text or r.new_image ->> {col} = $1::text)"
         ),
+        claim,
     );
     let sql = format!(
         "with latest as materialized ( \
-             select c.lsn, c.new_key is not distinct from $1::text as present \
+             select c.new_key is not distinct from $1::text as present \
              from ({pending}) c order by c.lsn desc, c.change_id desc limit 1), \
-         held as ( \
-             select 1 from latest l where l.present and not exists ( \
-                 select 1 from {proj} q \
-                 where q.{key_ident}::text = $1 and q.{lsn_ident} >= l.lsn)), \
+         held as (select 1 from latest l where l.present), \
+         seen as materialized ( \
+             select q.xmin as row_xmin from {proj} q where q.{key_ident}::text = $1), \
          gone as ( \
              delete from {proj} p where p.{key_ident}::text = $1 \
              and (not exists (select 1 from {to_table} t where {filter}) \
-                  or exists (select 1 from latest l where l.present \
-                             and coalesce(p.{lsn_ident}, '0/0'::pg_lsn) < l.lsn))) \
+                  or (exists (select 1 from held) \
+                      and p.xmin = (select v.row_xmin from seen v)))) \
          insert into {proj} ({insert_cols}) \
          select {select_exprs} from {to_table} t \
          where {filter} and not exists (select 1 from held) \
@@ -2915,10 +2926,11 @@ async fn apply_projection_from_live(
 /// nothing would carry what the parked changes did to the to-side into the
 /// projection. The write is [`apply_projection_from_live`]'s, counting the
 /// pending changes after `parked_through`, the greatest parked `lsn`: a key
-/// a later pending change will write is left to it. The parked changes' own
-/// ring rows stay pending until their segment drains, which another bucket
-/// can hold up, but the release discards those changes, so the key must not
-/// be left to them. Each relationship's
+/// a later pending change will write is left to it. A parked change's ring
+/// row is applied once the page that parked it commits (issue #762), but an
+/// eviction parks a key in its own transaction, before the page retries
+/// without it, and the release discards the parked changes, so the key must
+/// never be left to them. Each relationship's
 /// refresh stamp is locked `for share` first and the projection rows `for
 /// update` in key order, the order a drain takes them (ADR-0002 I5), and the
 /// rows are stamped with the release's WAL position.
@@ -2980,8 +2992,16 @@ pub(crate) async fn release_to_one_projections(
         )
         .await?;
         for k in keys {
-            apply_projection_from_live(txn, &shape, &Some(k), &None, Some(lsn), parked_through)
-                .await?;
+            apply_projection_from_live(
+                txn,
+                &shape,
+                &Some(k),
+                &None,
+                Some(lsn),
+                parked_through,
+                None,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -7451,6 +7471,9 @@ pub(crate) async fn apply_page(
     // per record, on a path that already fans out with wide
     // reverse-relationship batches.
     let mut row_columns_cache: HashMap<String, Vec<String>> = HashMap::new();
+    // Issue #762: the ring rows this transaction applies, which a live
+    // write's pending read counts as applied.
+    let claim = super::page::ClaimScope { steps, claimed_by };
     for record in &plan.relationship_reverses {
         let shape = &record.shape;
         let old_key = relationship_key_text(&record.old_row, &shape.to_col, &shape.name)?;
@@ -7514,7 +7537,13 @@ pub(crate) async fn apply_page(
                 .await?;
                 if superseded {
                     apply_projection_from_live(
-                        txn, shape, &old_key, &new_key, record.lsn, record.lsn,
+                        txn,
+                        shape,
+                        &old_key,
+                        &new_key,
+                        record.lsn,
+                        record.lsn,
+                        Some(&claim),
                     )
                     .await?
                 } else {
@@ -7613,8 +7642,16 @@ pub(crate) async fn apply_page(
         // here; see `apply_projection_advance`'s doc comment for the
         // distinction).
         if superseded {
-            apply_projection_from_live(txn, shape, &old_key, &new_key, record.lsn, record.lsn)
-                .await?
+            apply_projection_from_live(
+                txn,
+                shape,
+                &old_key,
+                &new_key,
+                record.lsn,
+                record.lsn,
+                Some(&claim),
+            )
+            .await?
         } else {
             apply_projection_advance(
                 txn,

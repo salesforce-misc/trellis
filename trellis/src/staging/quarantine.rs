@@ -2880,11 +2880,11 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     .await?;
     // Issue #754: the `Recompute` builds no reverse record, so a to-one
     // projection of this table hears about the parked changes only here.
-    // A parked change's ring rows stay in its segment, pending until the
-    // segment drains, at or below the held row's `lsn` (its window's
-    // greatest), so the release counts only pending changes above the
-    // latest parked one: the parked ones are discarded here and will never
-    // write the key.
+    // A parked change's ring rows stay in its segment, at or below the held
+    // row's `lsn` (its window's greatest), and an eviction parks them before
+    // the page that skips them commits, so they can still be pending. The
+    // release counts only pending changes above the latest parked one: the
+    // parked ones are discarded here and will never write the key.
     if !held.is_empty() {
         let images: Vec<String> = held
             .iter()
