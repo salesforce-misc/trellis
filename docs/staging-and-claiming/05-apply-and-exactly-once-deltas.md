@@ -423,11 +423,20 @@ or an earlier one, and at or below the prefix it has been applied or refused.
 A Re-derive stamps at least the newest segment its snapshot sees (#742), so a
 tombstone it wrote outlives every change its `__basis` would refuse. A later
 change to a collected key finds no entry and gets a fresh one, where I2
-reduces to the truncate floor. Both ledgers index their tombstones by key
-(`where __tombstone`), not by `__applied_seg`, so that the Applies and
-Re-derives that move `__applied_seg` change no indexed column and can be HOT
-(#775); a GC batch filters `__applied_seg` over the tombstones it walks, under
-a pinned index-scan plan (#738).
+reduces to the truncate floor.
+
+Only a tombstone carries `__applied_seg` (#775). A write that leaves an entry
+a tombstone raises it to `greatest(old, its segment)`; one that leaves the
+entry live leaves it alone. Both ledgers index their tombstones by it
+(`(__applied_seg) where __tombstone`), so a GC batch seeks the collectable
+ones under a pinned index-scan plan (#738), however many tombstones wait
+above the drained prefix, and an Apply or Re-derive that leaves an entry live
+in its group changes no indexed column and can be HOT. A live entry's stale
+stamp never has to protect anything: a delete's Apply applies only a change
+its entry's `basis` doesn't see, so every change the `basis` does see
+completed before the delete and is in the delete's batch or an earlier one,
+which the Apply's stamp covers, and a Re-derive that deletes the key stamps
+its own read's segment (`defs::ledger::tombstone_seg_sql`).
 
 ## What this replaced
 

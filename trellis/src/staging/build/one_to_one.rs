@@ -22,7 +22,7 @@
 //!    the build's short [`super::CHUNK_LOCK_TIMEOUT`];
 //! 3. one statement ([`rederive_statement`]) reads `pg_current_snapshot()`,
 //!    the active segment and the locked keys' source rows, rewrites their
-//!    entries (`basis` := the snapshot, `applied_seg` raised to the segment,
+//!    entries (`basis` := the snapshot, a tombstone's `applied_seg` raised to the segment,
 //!    `applied_lsn` left alone, a key with no row a tombstone), upserts the
 //!    target row of every key that has a source row (only when its values
 //!    change) and deletes the target row of every key that hasn't. Every
@@ -749,7 +749,7 @@ fn rederive_statement(
          {prior}\
          upd as ( \
              update {ledger} l set {basis} = snap.__snap, \
-                 {seg} = greatest(l.{seg}, snap.__seg), {tombstone} = not v.__present \
+                 {seg} = {stamp}, {tombstone} = not v.__present \
              from v, snap \
              where l.{key} = v.__k and l.{key} = any({keys}::text[]) \
              returning l.{key} \
@@ -775,6 +775,11 @@ fn rederive_statement(
         target_where = pick.target_where,
         basis = q(crate::defs::ledger::BASIS_COLUMN),
         seg = q(crate::defs::ledger::APPLIED_SEG_COLUMN),
+        stamp = crate::defs::ledger::tombstone_seg_sql(
+            Some(&format!("l.{}", q(crate::defs::ledger::APPLIED_SEG_COLUMN))),
+            "not v.__present",
+            "snap.__seg"
+        ),
         tombstone = q(crate::defs::ledger::TOMBSTONE_COLUMN),
         key = q(crate::defs::ledger::KEY_COLUMN),
         insert_cols = insert_cols.join(", "),

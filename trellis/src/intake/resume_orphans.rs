@@ -438,7 +438,7 @@ impl Sweep {
             for key in keys.iter().filter_map(|key| key.first().cloned().flatten()) {
                 plan.push_rederive(key);
             }
-            // The entries' `applied_seg`: the ring's latest segment, at or
+            // A tombstone's `applied_seg`: the ring's latest segment, at or
             // above any a change for these keys can still be pending in.
             let seg_seq: Option<i64> = txn
                 .query_one("select max(seg_seq) from segments", &[])

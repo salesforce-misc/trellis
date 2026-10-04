@@ -595,7 +595,17 @@ applying.
   batch can see a later batch's delete. A Re-derive therefore stamps at
   least the newest segment its snapshot sees. Every change the snapshot saw
   is in that segment or an earlier one, so the tombstone outlives every
-  change its `basis` would refuse.
+  change its `basis` would refuse. *Amended by #775:* only a tombstone
+  carries the stamp. A write that leaves an entry a tombstone raises
+  `applied_seg` as above, and one that leaves it live leaves it alone, so
+  that the GC's partial index can key on it and an Apply to a live entry
+  still changes no indexed column (HOT). A live entry's stale stamp, or
+  none, is never what protects a tombstone: an Apply that deletes the key
+  applies only a change D its `basis` doesn't see, so every change the
+  `basis` does see completed before D and is in D's batch or an earlier
+  one, which D's page's stamp covers; a Re-derive that deletes it stamps
+  its own read's segment. A revival keeps the old stamp, which can only
+  delay the GC (`defs::ledger::tombstone_seg_sql`).
 - Every repair that used to be a re-read (an explicit `request_backfill`, a
   resume, a quarantine release) is a rebuild: Re-derive over the key space,
   which I2 makes safe against any pending change.

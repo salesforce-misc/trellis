@@ -60,7 +60,7 @@
 //! 3. one statement ([`super::ledger::chunk_statement`]) reads
 //!    `pg_current_snapshot()`, the active segment and the locked keys' source
 //!    rows, rewrites their entries from them (`basis` := the snapshot,
-//!    `applied_seg` raised to the segment, `applied_lsn` left alone, a key
+//!    a tombstone's `applied_seg` raised to the segment, `applied_lsn` left alone, a key
 //!    with no row a tombstone), and appends the moves' per-group increments
 //!    to `<target>__deltas`.
 //!

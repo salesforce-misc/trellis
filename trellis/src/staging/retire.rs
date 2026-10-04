@@ -196,7 +196,9 @@ const TOMBSTONE_BATCHES_PER_PASS: usize = 4;
 /// its predecessor's fence doesn't (`seal::fenced_window`), so the
 /// predecessor is in the delete's batch or an earlier one, and `applied_seg`
 /// is at least the delete's batch (a page writes the highest `seg_seq` it
-/// drains, never lowering it). At or below `P` every batch is drained: the
+/// drains, never lowering it). Only a write that leaves an entry a tombstone
+/// stamps it, which is enough whatever the entry carried while it was live
+/// (`defs::ledger::tombstone_seg_sql`, #775). At or below `P` every batch is drained: the
 /// predecessor has already been applied, or skipped. The highest drained
 /// segment is not enough, since an older one may still lag (the
 /// `early_tombstone_gc` plant).

@@ -22,9 +22,11 @@
 //!    an Apply sets `applied_lsn`, but only if its transaction is not visible
 //!    in `basis`, its `lsn` is above `applied_lsn` and it is above the
 //!    target's truncate floor. Either makes a tombstone when the key has no
-//!    row. `applied_seg` is raised to the page's latest segment, or to the
-//!    read's segment when that is newer (#742, see [`read_rows`]). Returns
-//!    the keys it changed. Step 1's settled Applies skip it.
+//!    row, and only a tombstone has its `applied_seg` raised: to the page's
+//!    latest segment, or to the read's segment when that is newer (#742, see
+//!    [`read_rows`]), so an Apply to a live entry can be HOT
+//!    ([`schema::tombstone_seg_sql`], #775). Returns the keys it changed.
+//!    Step 1's settled Applies skip it.
 //! 4. The target rows of exactly those keys are upserted or deleted, as
 //!    before (`super::apply::apply_target`).
 //!
@@ -118,12 +120,13 @@ pub(crate) async fn lock_entries(
                  fl as (select floor from ledger_truncate_floor where target_table = $4) \
                  insert into {ledger} ({key_col}, {applied}, {seg}, {tombstone}) \
                  select v.__k, case when o.ok then v.__lsn end, \
-                        case when o.ok then $5::bigint end, o.ok and not v.__present \
+                        {stamp}, o.ok and not v.__present \
                  from v cross join lateral \
                       (select v.__lsn is not null and {above_floor}) as o(ok) \
                  order by v.__k collate \"C\" \
                  on conflict do nothing \
-                 returning {key_col}, {applied} is not null"
+                 returning {key_col}, {applied} is not null",
+                stamp = schema::tombstone_seg_sql(None, "o.ok and not v.__present", "$5::bigint"),
             ),
             &[&keys, &lsns, &present, &target, &seg_seq],
         )
@@ -256,8 +259,8 @@ pub(crate) struct EntryChange<'a> {
 
 /// Updates the locked entries of `changes` on `target`'s ledger, an Apply
 /// only if ADR-0002's I2 holds for it; see the module doc. `snapshot` is the
-/// Re-derive read's, and `seg_seq` the page's latest segment, which
-/// `applied_seg` is raised to. Returns the keys it changed. `predicate`
+/// Re-derive read's, and `seg_seq` the page's latest segment, which a
+/// tombstone's `applied_seg` is raised to. Returns the keys it changed. `predicate`
 /// false is the `stale_one_to_one_write` plant's: every Apply changes its
 /// entry.
 pub(crate) async fn update_entries(
@@ -305,12 +308,17 @@ pub(crate) async fn update_entries(
                  update {ledger} l set \
                      {basis} = case when v.__rederive then $7::text::pg_snapshot else l.{basis} end, \
                      {applied} = case when v.__rederive then l.{applied} else v.__lsn end, \
-                     {seg} = greatest(l.{seg}, $8::bigint), \
+                     {seg} = {stamp}, \
                      {tombstone} = not v.__present \
                  from v \
                  where l.{key} = v.__k and (v.__rederive or ({predicate})) \
                  returning l.{key}",
                 ledger = ledger_ident(target),
+                stamp = schema::tombstone_seg_sql(
+                    Some(&format!("l.{seg}")),
+                    "not v.__present",
+                    "$8::bigint"
+                ),
             ),
             &[
                 &keys, &rederive, &lsns, &txids, &present, &target, &snapshot, &seg_seq,

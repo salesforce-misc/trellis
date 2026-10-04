@@ -6391,9 +6391,9 @@ impl DirectRederive {
     }
 
     /// Settles the Re-derive in `txn`, reporting every changed key to
-    /// `mutations`. `applied_seg` is the latest segment there is, so a
-    /// tombstone this writes is collected once everything staged so far has
-    /// drained. A key whose row now joins through a key the context didn't
+    /// `mutations`. A tombstone this writes is stamped with the latest
+    /// segment there is, so it is collected once everything staged so far
+    /// has drained. A key whose row now joins through a key the context didn't
     /// resolve is left as it is: each writer parks a catch-up that
     /// re-derives every row once it finishes.
     pub(crate) async fn settle(
@@ -6430,7 +6430,7 @@ impl DirectRederive {
 /// change committed before the target's Re-derive build started may have
 /// had a later change drained before the start, which never reached the
 /// target, and a key deleted that way has no source row for a chunk to
-/// find. The entries take `seg_seq` as their `applied_seg`, or the
+/// find. A tombstone takes `seg_seq` as its `applied_seg`, or the
 /// Re-derive read's newest segment when that is newer (#742): the read is
 /// live, so it can see a later batch's delete, and a tombstone stamped below
 /// that batch could be collected while an older change in it is pending.
@@ -7338,7 +7338,7 @@ pub(crate) async fn apply_page(
     }
 
     // 3b. Aggregate targets, all on the ledger (#623 D3 to D5), in target
-    // order. A record's `applied_seg` is the page's latest segment: a key
+    // order. A tombstone's `applied_seg` is the page's latest segment: a key
     // never splits across a page's segments by more than that, and a later
     // stamp only delays tombstone GC (the D split's Q7).
     for ledger_plan in plan.ledger_targets.values() {

@@ -65,8 +65,11 @@ pub(crate) const MEMBER_COLUMN: &str = "__member";
 /// The `lsn` of the last change applied to the entry. A Re-derive leaves it
 /// unchanged (#623 Q1), so the build writes null.
 pub(crate) const APPLIED_LSN_COLUMN: &str = "__applied_lsn";
-/// The ring segment (`seg_seq`) of the last change applied to the entry: the
-/// tombstone GC watermark (#623 Q7).
+/// The tombstone GC's watermark (#623 Q7): while the entry is a tombstone, a
+/// ring segment (`seg_seq`) at or above every batch that can hold a change
+/// the entry would refuse. Only a write that leaves the entry a tombstone
+/// sets it ([`tombstone_seg_sql`], #775); a live entry's is whatever its last
+/// tombstone left, or null, and nothing reads it.
 pub(crate) const APPLIED_SEG_COLUMN: &str = "__applied_seg";
 /// The `pg_current_snapshot()` of the read that last wrote the entry, taken
 /// in the same statement as that read (ADR-0002 I1). A change whose
@@ -75,28 +78,56 @@ pub(crate) const BASIS_COLUMN: &str = "__basis";
 /// Whether the key's last applied change deleted it.
 pub(crate) const TOMBSTONE_COLUMN: &str = "__tombstone";
 
-/// The `fillfactor` every ledger is created with (#775): the share of each
-/// heap page an insert, or a build's load, fills. The rest is left for the
-/// new versions of the page's entries.
+/// The value a write gives an entry's [`APPLIED_SEG_COLUMN`], as SQL:
+/// `greatest(old, seg)` when the write leaves the entry a tombstone
+/// (`tombstone`, the SQL of the entry's new `__tombstone`), the old value
+/// otherwise. `old` is the entry's current value (`None` for an insert,
+/// which has none) and `seg` the segment the write stamps: a page's latest
+/// segment, or for a Re-derive the newest one its read sees, if that is
+/// newer (#742).
 ///
-/// Every page and every Apply rewrites an entry, and an update can only be
-/// HOT, writing no index entry, when its new version fits on the old one's
-/// page. At Postgres's default of 100 a page has no room left once filled,
-/// so even the 1-1 ledger, whose updates change no indexed column, made only
-/// 13–16% of them HOT (#623 D9's review). On #775's 1M-entry ledgers, a run
-/// of 1,000-row updates over contiguous keys (the worst case: a page's
-/// entries all want room in the same transaction) made 22%, 45% and 58% of
-/// an aggregate ledger's updates HOT at 90, 80 and 70, and 34%, 45% and 67%
-/// of a 1-1 ledger's. Scattered updates do better, since Postgres prunes a
-/// page's dead versions on the way. A placeholder (a Re-derive's new key)
-/// is also rewritten on the page it was inserted on, rather than moved to
-/// another. The price is a heap a quarter larger.
-pub(crate) const LEDGER_FILLFACTOR: u8 = 80;
-
-/// The storage parameters of a ledger's `create table`, with their leading
-/// space.
-fn ledger_storage() -> String {
-    format!(" with (fillfactor = {LEDGER_FILLFACTOR})")
+/// **Only a tombstone carries the stamp (#775).** The GC
+/// (`staging::retire::collect_tombstones`) reads `applied_seg` only on
+/// tombstones, through a partial index keyed on it. An update that changes
+/// an indexed column can't be HOT, so if every write moved it, no Apply to a
+/// live entry could be. Left alone on a live entry, it changes only when an
+/// entry is, or becomes, a tombstone, which changes `__tombstone` (an
+/// indexed column too) or is already the rare case.
+///
+/// **Why a live entry's stale or null stamp is enough** (ADR-0002 I4: a
+/// tombstone outlives every batch that could hold a change it refuses). The
+/// stamp only has to cover the entry's state once the write that makes or
+/// keeps it a tombstone is done, and each such write stamps what that state
+/// needs, whatever the entry carried while it was live:
+///
+/// - **An Apply of a change D** (a delete) stamps at least D's batch, since a
+///   page's latest segment holds every batch it drains. The entry then
+///   refuses (I2) the changes at or below D's `lsn` and those visible in its
+///   `basis`. The first are D's same-key predecessors, which committed before
+///   D's trigger ran, so they are in D's batch or an earlier one. For the
+///   second, D was applied only because it is not visible in `basis` (or
+///   there is none): a change C that is visible completed before that
+///   snapshot was taken and D had not, so C completed before D. D's batch's
+///   fence sees D, so it sees C too: C is in D's batch or an earlier one. So
+///   D's batch covers everything, including a `basis` an earlier Re-derive
+///   wrote while the entry was live, unstamped.
+/// - **A Re-derive** stamps at least the newest segment its read's snapshot
+///   sees (#742), which holds every change that snapshot saw: everything its
+///   `basis` refuses, and the change behind the entry's `applied_lsn`, which
+///   an earlier page applied and committed before this one took the entry
+///   lock and read.
+/// - **`greatest`** keeps any higher stamp the entry already had: a stale one
+///   (an earlier tombstone's, kept through a revival) only delays the GC.
+///
+/// A revival (a tombstone becoming live again) keeps the old stamp, and the
+/// next write that makes the entry a tombstone stamps it afresh, as above.
+/// A GC batch re-checks `__tombstone` and the stamp on the row it locks, so a
+/// page that revives a tombstone under it keeps the entry.
+pub(crate) fn tombstone_seg_sql(old: Option<&str>, tombstone: &str, seg: &str) -> String {
+    match old {
+        Some(old) => format!("case when {tombstone} then greatest({old}, {seg}) else {old} end"),
+        None => format!("case when {tombstone} then {seg} end"),
+    }
 }
 
 /// A target's ledger table name.
@@ -408,29 +439,22 @@ pub(crate) fn aggregate_ledger_ddl(
     columns.push(ordering_state_columns());
     let group_idents: Vec<String> = group_columns.iter().map(|c| quote_ident(&c.name)).collect();
     format!(
-        "; create table {qualified_ledger} ({}){}{}",
+        "; create table {qualified_ledger} ({}){}",
         columns.join(", "),
-        ledger_storage(),
         aggregate_ledger_index_ddl(qualified_ledger, &group_idents),
     )
 }
 
 /// An aggregate ledger's secondary indexes, as statements each prefixed with
 /// `; `: the `GROUP BY` index, partial on live members (the only entries a
-/// group is a sum of), and the tombstones by key (what
-/// `staging::retire::collect_tombstones` reads, #623 D7). `group_idents` are
-/// the quoted `GROUP BY` columns.
+/// group is a sum of), and the tombstones by `applied_seg` (what
+/// `staging::retire::collect_tombstones` reads, #623 D7), so that a GC batch
+/// seeks the collectable ones however many are not yet collectable.
+/// `group_idents` are the quoted `GROUP BY` columns.
 ///
-/// The tombstone index keys on the key, as the 1-1 ledger's does
-/// ([`one_to_one_ledger_ddl`]), not on `applied_seg` (#775). Every Apply and
-/// every Re-derive moves `applied_seg`, and an update that changes any
-/// indexed column can't be HOT: while the index keyed on it, none of an
-/// aggregate ledger's updates was, so each one wrote a new entry into the
-/// key and `GROUP BY` indexes too. Keyed on the key, an update that keeps
-/// the entry's group and membership changes no indexed column. The GC then
-/// filters `applied_seg` over the tombstones it walks rather than seeking
-/// it, which costs at most the tombstones not yet collectable: the deletes
-/// in segments not yet drained.
+/// Neither reads a column an Apply to a live entry that keeps its group
+/// changes: such an Apply leaves `applied_seg` alone ([`tombstone_seg_sql`]),
+/// so it can be HOT (#775).
 ///
 /// Shared by the ledger's DDL and the aggregate build, which drops them for
 /// its load and builds them again after it. They are left for Postgres to
@@ -448,7 +472,7 @@ pub(crate) fn aggregate_ledger_index_ddl(
     );
     sql.push_str(&format!(
         "; create index on {qualified_ledger} ({}) where {}",
-        quote_ident(KEY_COLUMN),
+        quote_ident(APPLIED_SEG_COLUMN),
         quote_ident(TOMBSTONE_COLUMN),
     ));
     sql
@@ -520,21 +544,20 @@ pub(crate) fn aggregate_deltas_ddl(
 /// with no values (the target row holds them), as a statement to append to
 /// the target's own. Created empty: the 1-1 build's writes are absolute, and
 /// the Re-derives that follow it stamp the entries (#623 D6). The partial
-/// index is the tombstone GC's (`staging::retire::collect_tombstones`). It
-/// indexes the key, not `applied_seg`, so that an Apply to a live entry,
-/// which only moves `applied_seg` and `applied_lsn`, changes no indexed
-/// column and can be a HOT update. The GC then filters `applied_seg` over
-/// every tombstone rather than seeking it, which a 1-1 ledger's few
-/// tombstones keep cheap. The key sorts in `"C"`: every lock is
-/// taken in key order, and a byte comparison is far cheaper than a locale's.
+/// index is the tombstone GC's (`staging::retire::collect_tombstones`), keyed
+/// on `applied_seg` as an aggregate ledger's is, so that a GC batch seeks the
+/// collectable tombstones rather than walking every one above the drained
+/// prefix. An Apply to a live entry leaves `applied_seg` alone
+/// ([`tombstone_seg_sql`]), so it changes no indexed column and can be a HOT
+/// update (#775). The key sorts in `"C"`: every lock is taken in key order,
+/// and a byte comparison is far cheaper than a locale's.
 pub(crate) fn one_to_one_ledger_ddl(qualified_ledger: &str) -> String {
     format!(
-        "; create table {qualified_ledger} ({} text collate \"C\" primary key, {}){}; \
+        "; create table {qualified_ledger} ({} text collate \"C\" primary key, {}); \
          create index on {qualified_ledger} ({}) where {}",
         quote_ident(KEY_COLUMN),
         ordering_state_columns(),
-        ledger_storage(),
-        quote_ident(KEY_COLUMN),
+        quote_ident(APPLIED_SEG_COLUMN),
         quote_ident(TOMBSTONE_COLUMN),
     )
 }
@@ -683,7 +706,7 @@ mod tests {
         );
         assert_eq!(
             ddl,
-            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false) with (fillfactor = 80); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__from_key") where "__tombstone""#
+            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
         );
     }
 
@@ -691,7 +714,7 @@ mod tests {
     fn the_one_to_one_ledger_holds_only_the_key_and_the_ordering_state() {
         assert_eq!(
             one_to_one_ledger_ddl(r#""public"."t__ledger""#),
-            r#"; create table "public"."t__ledger" ("__from_key" text collate "C" primary key, "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false) with (fillfactor = 80); create index on "public"."t__ledger" ("__from_key") where "__tombstone""#
+            r#"; create table "public"."t__ledger" ("__from_key" text collate "C" primary key, "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
         );
     }
 

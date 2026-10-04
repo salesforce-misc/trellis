@@ -69,6 +69,8 @@
 //!      makes a tombstone) and sets `applied_lsn`, but only if the change is
 //!      not visible in the entry's `basis`, is newer than its `applied_lsn`,
 //!      and is above the target's truncate floor (I2, Q6);
+//!    - either raises `applied_seg` only on an entry it leaves a tombstone
+//!      (`schema::tombstone_seg_sql`, #775);
 //!    - an entry step 1 wrote with its change is left as it is, and moves
 //!      into its group from no entry at all.
 //! 4. The recomputed fields of every group the page kept are rewritten from
@@ -1137,7 +1139,7 @@ fn image_ctes(plan: &LedgerTargetPlan) -> String {
 /// image null, `$6` the page's segment and `$7` the target's identity. A
 /// key with no entry gets one: an Apply above the truncate floor writes
 /// its change into it, as the page's statement would ([`ledger_statement`]:
-/// I2 holds against an entry that isn't there), and stamps `$6`. A
+/// I2 holds against an entry that isn't there), and stamps `$6` if it is a tombstone. A
 /// Re-derive, or an Apply at or below the floor, gets a non-member
 /// placeholder that the page's statement then writes. Returns each key it
 /// inserted and whether its change was applied, in key order.
@@ -1157,7 +1159,7 @@ fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
          fl as (select floor from ledger_truncate_floor where target_table = $7) \
          insert into {ledger} ({key}, {values}, {member}, {tombstone}, {applied}, {seg}) \
          select v.__k, {when_ok}, o.ok and v.__present, o.ok and not v.__present, \
-                case when o.ok then v.__lsn end, case when o.ok then $6::bigint end \
+                case when o.ok then v.__lsn end, {stamp} \
          from v cross join lateral \
               (select not v.__rederive \
                       and not exists (select 1 from fl where v.__lsn <= fl.floor)) as o(ok) \
@@ -1175,6 +1177,7 @@ fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
         member = q(schema::MEMBER_COLUMN),
         tombstone = q(schema::TOMBSTONE_COLUMN),
         seg = q(schema::APPLIED_SEG_COLUMN),
+        stamp = schema::tombstone_seg_sql(None, "o.ok and not v.__present", "$6::bigint"),
     )
 }
 
@@ -1224,7 +1227,7 @@ fn ledger_statement(
                  {member} = v.__present, {tombstone} = not v.__present, \
                  {basis} = case when v.__rederive then $6::text::pg_snapshot else l.{basis} end, \
                  {applied} = case when v.__rederive then l.{applied} else v.__lsn end, \
-                 {seg} = greatest(l.{seg}, $7::bigint) \
+                 {seg} = {stamp} \
              from v \
              where l.{key} = v.__k \
                and not exists (select 1 from fr where fr.__k = l.{key}) \
@@ -1241,6 +1244,8 @@ fn ledger_statement(
         old = old_cte(plan, "$1"),
         set_values = set_values.join(", "),
         predicate = apply_predicate(visibility),
+        stamp =
+            schema::tombstone_seg_sql(Some(&format!("l.{seg}")), "not v.__present", "$7::bigint"),
         returning = upd_returning(plan),
         moves_and_deltas = moves_and_deltas(plan, false),
         up = upsert.cte,
@@ -1252,7 +1257,7 @@ fn ledger_statement(
 /// Re-derive; called from [`super::build`]): `pg_current_snapshot()`, the
 /// active segment's `seg_seq` and the locked keys' source rows, read
 /// together; the keys' entries rewritten from them (`basis` := the
-/// snapshot, `applied_seg` raised to that segment, `applied_lsn` left alone,
+/// snapshot, a tombstone's `applied_seg` raised to that segment, `applied_lsn` left alone,
 /// a key with no row a tombstone); and the moves' per-group increments
 /// appended to the target's group deltas. No group row is touched, and no
 /// row data leaves the statement. Returns the entries written and the
@@ -1395,7 +1400,7 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
          upd as ( \
              update {ledger} l set {set_values}, \
                  {member} = v.__present, {tombstone} = not v.__present, \
-                 {basis} = snap.__snap, {seg} = greatest(l.{seg}, snap.__seg) \
+                 {basis} = snap.__snap, {seg} = {stamp} \
              from v, snap \
              where l.{key} = v.__k \
              returning {returning} \
@@ -1416,6 +1421,11 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
         tombstone = q(schema::TOMBSTONE_COLUMN),
         basis = q(schema::BASIS_COLUMN),
         seg = q(schema::APPLIED_SEG_COLUMN),
+        stamp = schema::tombstone_seg_sql(
+            Some(&format!("l.{}", q(schema::APPLIED_SEG_COLUMN))),
+            "not v.__present",
+            "snap.__seg"
+        ),
         key = q(schema::KEY_COLUMN),
         returning = upd_returning(plan),
         moves_and_deltas = moves_and_deltas(plan, true),
@@ -2027,7 +2037,7 @@ pub(crate) async fn page_may_predate_build(
 /// transaction. See the module doc. Returns the groups written and deleted.
 /// `first_seg` and `seg_seq` are the lowest and highest segments of the
 /// page's batches: the first decides whether the page re-derives every
-/// record (step 2), and the entries take the second as their
+/// record (step 2), and a tombstone takes the second as its
 /// `applied_seg`, or the Re-derive read's newest segment when that is newer
 /// (#742, as `super::one_to_one_ledger::read_rows` explains for a 1-1
 /// target).
