@@ -2651,6 +2651,27 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // the same `split_part(target_table, '.', 2)` pattern
     // `TargetTableSuffixCollision`'s own check already uses, rather than
     // requiring every caller to know and pass the qualified identity.
+    let not_found = || ApplyError::TransformNotFound {
+        transform: target.to_string(),
+    };
+    let fenced_source: String = txn
+        .query_opt(
+            "select source_table from transform_definitions \
+             where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await?
+        .ok_or_else(not_found)?
+        .get(0);
+    // Issue #768: the drain skips a table whose key can't be used while
+    // every definition reading it is frozen, judged under the fence of each
+    // reader's source (`staging::apply::source_key_for_apply`). The bump
+    // makes a page that judged this definition frozen miss its fence if it
+    // reaches it after this commit, so it can't skip rows the rebuild needs.
+    // It is this transaction's first lock (issue #744): it waits for the
+    // pages holding the fence, and holding the definition row meanwhile
+    // could close a cycle through one queued on a transaction that wants it.
+    super::build::bump_version_fence(&*txn, &fenced_source).await?;
     let row = txn
         .query_opt(
             "select id, source_table, status from transform_definitions \
@@ -2659,12 +2680,15 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         )
         .await?;
     let Some(row) = row else {
-        return Err(ApplyError::TransformNotFound {
-            transform: target.to_string(),
-        });
+        return Err(not_found());
     };
     let id: i64 = row.get(0);
     let source_table: String = row.get(1);
+    if source_table != fenced_source {
+        // Dropped and defined again on another source between the two
+        // reads: not the definition the caller resumed.
+        return Err(not_found());
+    }
     let status_text: String = row.get(2);
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")

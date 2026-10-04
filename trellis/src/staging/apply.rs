@@ -4877,6 +4877,10 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
 /// none of them either, so a resume refreshes the projections on every
 /// to-side the resumed definition reads (`quarantine::resume_transform`).
 /// Asked only on the error, so a drain over usable keys reads nothing more.
+/// The answer is fenced: the version of each relationship from-side reading
+/// the table is read into `versions` first, and a definition, its resume and
+/// its edit each bump their source's, so a page can't commit a skip after a
+/// reader it didn't see.
 ///
 /// The halt is the stance while a reader isn't frozen (#703 R2 would pause
 /// that reader in the drain): the capture pass that pauses every reader of a
@@ -4885,6 +4889,7 @@ async fn source_key_for_apply(
     pool: &Pool,
     qualified_source: &str,
     source_key: &str,
+    versions: &mut HashMap<String, Option<i64>>,
 ) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
     let err = match ddl::source_primary_key(pool, qualified_source).await {
         Ok(pk) => return Ok(Some(pk)),
@@ -4905,6 +4910,20 @@ async fn source_key_for_apply(
         DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. }
     ) {
         return Err(err.into());
+    }
+    // The fence the skip is judged under, read before the readers are: a
+    // reader of `source_key` through a relationship is a definition on the
+    // relationship's from-side, and a definition, its resume or its edit
+    // commits with a bump of its source's fence. `compute`'s caller already
+    // holds `source_key`'s own entry, for a direct reader. So a page that
+    // skips the table can't commit after a reader it didn't see.
+    for rel in catalog::relationships_to_table(pool, source_key).await? {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            versions.entry(rel.qualified_from_table())
+        {
+            let version = catalog::source_table_version(pool, entry.key()).await?;
+            entry.insert(version);
+        }
     }
     let has_reader = {
         let client = pool.get().await?;
@@ -5122,7 +5141,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             "evaluating a source table's folded changes"
         );
         let version = catalog::source_table_version(pool, &source_key).await?;
-        versions.insert(source_key.clone(), version);
+        // The first read of a table's fence is kept: a skipped table's may
+        // have read this source's already, to fence the readers it judged
+        // under (`source_key_for_apply`), and a bump since then must miss.
+        versions.entry(source_key.clone()).or_insert(version);
 
         // The source identity this batch's own CDC producer staged (issue
         // #76, ADR-0007) — the ring's own spelling of `change.src_table`,
@@ -5141,7 +5163,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // spelling); `None` is a key that can't be used on a table no
         // definition applies (issue #768), whose changes are dropped with
         // the page. See [`source_key_for_apply`].
-        let Some(pk) = source_key_for_apply(pool, qualified_source, &source_key).await? else {
+        let Some(pk) =
+            source_key_for_apply(pool, qualified_source, &source_key, &mut versions).await?
+        else {
             continue;
         };
 
@@ -5771,7 +5795,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         versions.entry(source_key.clone()).or_insert(version);
 
         // The same key read, and skip, as the by-source loop's above.
-        let Some(pk) = source_key_for_apply(pool, &change.src_table, &source_key).await? else {
+        let Some(pk) =
+            source_key_for_apply(pool, &change.src_table, &source_key, &mut versions).await?
+        else {
             continue;
         };
         // `&change.src_table` (qualified), not `source_key` — see

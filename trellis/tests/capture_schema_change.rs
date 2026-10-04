@@ -1466,3 +1466,79 @@ async fn a_to_side_key_retyped_off_the_allowlist_halts_the_drain_while_a_reader_
         "the halt names the unsupported key type: {err}"
     );
 }
+
+/// Issue #768: the skip is judged under the fence of every reader's source.
+/// A page that skipped the to-side while `posts_named` was paused, and
+/// reaches its commit only after the resume, misses the fence (the resume
+/// bumps `posts`') and computes again, so it can't drop rows the resumed
+/// reader's rebuild needs: the projection refresh the resume asks for
+/// leaves a key to a change still pending, which this page would then have
+/// dropped.
+#[tokio::test]
+async fn a_page_that_skipped_a_to_side_misses_its_fence_after_a_reader_resumes() {
+    use trellis::staging::apply::{self, ApplyError};
+    use trellis::staging::{StagedWatermark, claim, fold, seal};
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM posts_named")
+        .await
+        .expect("pause the reader");
+    app.batch_execute(
+        "alter table public.users alter column handle type character(8); \
+         update public.users set name = 'Annie' where handle = 'ann';",
+    )
+    .await
+    .expect("retype the key, and write the to-side");
+    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, outcome.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    let seg_seq = outcome.sealed_seg_seq;
+
+    let mut phase1 = db.pool.get().await.expect("connection");
+    let txn = phase1.transaction().await.expect("begin phase 1");
+    claim::claim(&txn, seg_seq, "worker", 1)
+        .await
+        .expect("claim");
+    let share = claim::held_share(&*txn, seg_seq, "worker")
+        .await
+        .expect("held_share");
+    let folded = fold::fold(&txn, seg_seq, share.filter(share.buckets()))
+        .await
+        .expect("fold");
+    txn.commit().await.expect("commit phase 1");
+    assert!(
+        folded.iter().any(|c| c.src_table == "public.users"),
+        "the page holds the to-side's write"
+    );
+    let plan = apply::compute(&db.pool, &folded)
+        .await
+        .expect("compute skips the to-side, every reader being paused");
+
+    trellis
+        .apply("RESUME TRANSFORM posts_named")
+        .await
+        .expect("resume");
+
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    let err = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "worker",
+        &plan,
+        "capture_schema_change_wake",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect_err("the resume moved the fence the skip was judged under");
+    match &err {
+        ApplyError::VersionFenceMiss { src_table } => assert_eq!(src_table, "public.posts"),
+        other => panic!("expected VersionFenceMiss, got {other:?}"),
+    }
+}
