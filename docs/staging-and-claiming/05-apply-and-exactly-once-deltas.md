@@ -312,10 +312,16 @@ parent has a change of its own pending, whose write reads its new parent.
 Each page applies its records for an aggregate target in one transaction, in
 five steps:
 
-1. **Lock (I1, I5).** Insert a non-member placeholder entry for every key the
-   page has no entry for, then lock every entry `for update`, sorted by key, in
-   one statement. A key whose tombstone the GC collects between the two fails
-   the page transiently and it is retried (#712).
+1. **Lock (I1, I5).** Insert an entry for every key the page has no entry
+   for, then lock every other entry `for update`, sorted by key, in one
+   statement. As on a 1-1 target, a new key's Apply is written into the entry
+   its insert creates, since with no entry I2 is only the truncate floor
+   (#775); step 3 leaves that entry alone and counts it as a move into its
+   group from no entry. A Re-derive's new key, an Apply at or below the
+   floor, and every new key of a target that reads a relationship (whose
+   parents must be read after the lock) get a non-member placeholder that
+   step 3 writes. A key whose tombstone the GC collects between the two
+   statements fails the page transiently and it is retried (#712).
 2. **Re-derive read.** A record staged as a `recompute`, or folded with one, is a
    Re-derive. So is a record with no change to apply, and every record of a
    page whose oldest batch is at or below the target's `build_seg`, as on a
@@ -353,8 +359,8 @@ five steps:
    writer (below), and then a group can reach 0 members while a sum is
    still owed to it.
 
-A page takes its locks in one order: entries (a placeholder insert for new
-keys, then one sorted `for update`), then groups, in one sorted upsert. A Re-derive of an unchanged key moves nothing, so a go-live re-read
+A page takes its locks in one order: entries (an insert for new keys, then
+one sorted `for update` of the rest), then groups, in one sorted upsert. A Re-derive of an unchanged key moves nothing, so a go-live re-read
 after the build writes no group rows.
 
 Each written or deleted group reaches the seam with its prior image. PG 17 has
@@ -416,8 +422,12 @@ key committed before the delete's trigger ran, so it is in the delete's batch
 or an earlier one, and at or below the prefix it has been applied or refused.
 A Re-derive stamps at least the newest segment its snapshot sees (#742), so a
 tombstone it wrote outlives every change its `__basis` would refuse. A later
-change to a collected key finds no entry and gets a fresh placeholder, where
-I2 reduces to the truncate floor.
+change to a collected key finds no entry and gets a fresh one, where I2
+reduces to the truncate floor. Both ledgers index their tombstones by key
+(`where __tombstone`), not by `__applied_seg`, so that the Applies and
+Re-derives that move `__applied_seg` change no indexed column and can be HOT
+(#775); a GC batch filters `__applied_seg` over the tombstones it walks, under
+a pinned index-scan plan (#738).
 
 ## What this replaced
 

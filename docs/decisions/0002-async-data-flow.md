@@ -337,7 +337,9 @@ state that orders its writes.
     Otherwise `delta = f(NEW) − entry.contrib`, group += delta, entry :=
     (new group, new contribution, C's position, basis unchanged). A delete
     is `f(NEW) = 0` and the entry becomes a tombstone. A row with no entry
-    is an insert of NEW.
+    is an insert of NEW, which the lock's own insert writes as the entry
+    (1-1 since #724, an aggregate ledger since #775, except one that reads a
+    relationship, whose parents are read after the lock).
 
   | Producer | Operation |
   |---|---|
@@ -870,7 +872,22 @@ For the debate on #618; each has a recommendation where one exists.
    index keys on (0 of 1.2M updates were HOT, the build's included; the two
    indexes an update writes are 285 of the 682 B), and a ledger is built
    full (`fillfactor` 100), which keeps even the 1-1 ledger, whose indexes
-   allow HOT, at 13–16% HOT updates. **No separate tablespace is
+   allow HOT, at 13–16% HOT updates. *#775 took both, and a third:*
+   ledgers are built at `fillfactor` 80 and both kinds index their
+   tombstones by key, so a run of contiguous 1,000-row updates goes from
+   0% to 45% HOT on an aggregate ledger (8% to 45% on a 1-1 one); and a
+   page's Apply of a key with no entry writes the entry in the insert that
+   locks it, as the 1-1 ledger already did, rather than a placeholder its
+   statement rewrites. That rewrite set the entry's group and membership,
+   which the `GROUP BY` index reads, so no fillfactor could make it HOT,
+   and it was most of the ledger's WAL under an insert-only load: at 400
+   and 4,000 groups and 8 workers WAL per folded row fell from 1.10–1.20
+   KB to 755–810 B (1.7x the pre-D control's, under the 2x bar). The
+   400-group in-window rate did not move (CPU per row stayed ~50 µs, 2.5x
+   the old path's); end to end it gained 5–12%. The `fillfactor` alone made
+   that load worse (WAL +5–13%), and with the direct insert it changes
+   nothing there but the ledger's size (+16%); it is kept for update
+   loads. **No separate tablespace is
    documented:** at ~3x a narrow source the ledger is sized like any other
    derived table, and nothing measured so far shows its I/O needs a device
    of its own.
