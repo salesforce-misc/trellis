@@ -21,8 +21,15 @@
 //! included, so a comparison would agree with a wrong answer. The staging
 //! worker's capture pass pauses the table's readers for it.
 //!
+//! And it reports a table a logical-replication subscription replicates
+//! into (issue #751, [`crate::defs::subscription`]). The triggers are all
+//! in place, but the subscription's apply worker fires only row-level
+//! triggers, so none of its changes reach the ring. The capture pass pauses
+//! the table's readers for that too.
+//!
 //! [`audit`] reads all of that from the catalog (`pg_trigger`, `pg_proc`,
-//! `pg_inherits` and the `has_*_privilege` functions) for every table a
+//! `pg_inherits`, `pg_subscription_rel` and the `has_*_privilege`
+//! functions) for every table a
 //! definition's target depends on, and reports each problem as a
 //! [`CaptureFault`].
 //!
@@ -86,6 +93,7 @@ use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::regclass_arg;
 use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::row_security::{self, RowSecurity};
+use crate::defs::subscription::{self, Subscribed};
 use crate::staging::append::RING_SIZE;
 
 /// One way a table's capture is broken, found by [`audit`]. Each names the
@@ -156,6 +164,13 @@ pub enum CaptureFault {
     /// table the definition reads, including one the target-mutation seam
     /// feeds.
     RowSecurity(RowSecurity),
+    /// A logical-replication subscription replicates into the table (issue
+    /// #751, [`crate::defs::subscription`]). Its apply worker fires only
+    /// row-level triggers, so the capture triggers, installed and enabled as
+    /// they are, never see the changes it applies. Checked on every table the
+    /// definition reads, including one the target-mutation seam feeds, which
+    /// doesn't see them either.
+    Subscribed(Subscribed),
 }
 
 impl CaptureFault {
@@ -174,6 +189,7 @@ impl CaptureFault {
             | CaptureFault::InheritanceChild { table, .. }
             | CaptureFault::InheritanceParent { table, .. } => Some(table),
             CaptureFault::RowSecurity(rls) => Some(&rls.table),
+            CaptureFault::Subscribed(sub) => Some(&sub.table),
             CaptureFault::MissingPrivilege { .. } => None,
         }
     }
@@ -253,14 +269,16 @@ impl fmt::Display for CaptureFault {
                  rows as {table}'s"
             ),
             CaptureFault::RowSecurity(rls) => write!(f, "{rls}"),
+            CaptureFault::Subscribed(sub) => write!(f, "{sub}"),
         }
     }
 }
 
 /// Every [`CaptureFault`] on the tables `def` reads, in a deterministic
 /// order: per table (sorted), its trigger and function faults in event
-/// order, then its hierarchy faults, then its row-level security; then the
-/// privilege faults, per role.
+/// order, then its hierarchy faults, then its row-level security, then the
+/// subscription that replicates into it; then the privilege faults, per
+/// role.
 /// Empty for a definition whose capture needn't be installed yet (see the
 /// module doc).
 pub async fn audit(
@@ -298,6 +316,9 @@ pub async fn audit(
         .await?
         {
             faults.push(CaptureFault::RowSecurity(rls));
+        }
+        if let Some(sub) = subscription::subscribed(client, &table).await? {
+            faults.push(CaptureFault::Subscribed(sub));
         }
     }
     for (role, tables) in runs_as {

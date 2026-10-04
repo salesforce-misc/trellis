@@ -13,11 +13,12 @@
 //! Before it regenerates a table's functions, the pass pauses every
 //! definition that reads a column the table no longer has (#622 C6,
 //! [`crate::staging::schema_change::pause_readers_of_missing`]), or reads a
-//! table whose row-level security now applies to Trellis's role (#745,
-//! [`crate::staging::schema_change::pause_readers_under_row_security`]), and
-//! leaves the table for the next pass. The row-level security check also
-//! runs on each table another definition targets, which the pass doesn't
-//! capture (the target-mutation seam feeds it) but its readers still read.
+//! table whose row-level security now applies to Trellis's role (#745), or
+//! that a logical-replication subscription now replicates into (#751)
+//! ([`crate::staging::schema_change::pause_readers_of_unsupported`]), and
+//! leaves the table for the next pass. Those last two checks also run on
+//! each table another definition targets, which the pass doesn't capture
+//! (the target-mutation seam feeds it) but its readers still read.
 //!
 //! # Never waiting on `apply`'s path
 //!
@@ -122,9 +123,9 @@ pub async fn reconcile(
 
     for table in desired {
         // #745: row-level security that applies to Trellis's role filters
-        // every read of the table, so its readers pause, whatever capture
-        // does.
-        match crate::staging::schema_change::pause_readers_under_row_security(
+        // every read of the table, and #751: a subscription's changes to it
+        // are never captured, so its readers pause, whatever capture does.
+        match crate::staging::schema_change::pause_readers_of_unsupported(
             client,
             schema,
             &snapshot.catalog,
@@ -190,9 +191,10 @@ pub async fn reconcile(
     }
 
     let desired_set: HashSet<&String> = desired.iter().collect();
-    // #745: a table another definition targets isn't in `desired` (the seam
-    // feeds it, not a trigger), but its readers read it as Trellis's role
-    // all the same. A seam-fed table whose check pauses a reader, or fails,
+    // #745, #751: a table another definition targets isn't in `desired` (the
+    // seam feeds it, not a trigger), but its readers read it as Trellis's
+    // role all the same, and the seam doesn't see a subscription's writes to
+    // it either. A seam-fed table whose check pauses a reader, or fails,
     // isn't current for `ready_definitions` either.
     let mut seam_held: HashSet<String> = HashSet::new();
     let mut seam_fed: Vec<&String> = snapshot
@@ -202,7 +204,7 @@ pub async fn reconcile(
         .collect();
     seam_fed.sort();
     for table in seam_fed {
-        match crate::staging::schema_change::pause_readers_under_row_security(
+        match crate::staging::schema_change::pause_readers_of_unsupported(
             client,
             schema,
             &snapshot.catalog,

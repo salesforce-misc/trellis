@@ -110,6 +110,13 @@ So:
   worker pauses a transform whose table comes under such policies later,
   with the reason on `capture_failure`
   ([transforms — Source tables](transforms.md#source-tables)).
+* **No logical-replication subscription into a table Trellis reads** (#751).
+  A subscription's apply worker fires only row-level triggers, so capture
+  never sees the changes it applies. Running Trellis on a logical replica's
+  replicated tables isn't supported. Defining a transform over such a table
+  is refused, and the worker pauses a transform whose table a subscription
+  starts replicating into later, with the reason on `capture_failure`
+  ([transforms — Source tables](transforms.md#source-tables)).
 * **Leave the capture triggers alone.** Each source table carries five
   triggers named `<schema>_capture_<event>` (`trellis_capture_insert` and so
   on for the default schema; `trellis_capture_begin` is the `BEFORE`

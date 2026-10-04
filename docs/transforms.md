@@ -69,6 +69,34 @@ target included), with the reason on `status()`'s `capture_failure`, and
 `self_check` reports it as a `capture` divergence. Exempt the role, then
 resume the transform, which rebuilds it.
 
+**A logical-replication subscription must not replicate into a table Trellis
+reads** (#751). Capture uses statement-level triggers, and a subscription's
+apply worker fires only row-level triggers for the inserts, updates and
+deletes it applies, so none of them reach Trellis and the target silently
+goes stale. (The subscription's initial copy of the table, and a replicated
+`TRUNCATE`, fire statement triggers and are captured; nothing after them
+is.) So a table that a subscription in the same database replicates into
+isn't supported as a source, or as the to-side of a relationship a
+transform reads through. That holds whatever state its initial sync is in,
+and while the subscription is disabled: enabling it applies every change it
+missed. Trellis running on a logical replica is the case this rules out;
+publishing a source table to another database is fine.
+
+A definition that reads such a table is rejected when it is defined, with an
+error naming the table, the subscription and the fix. A subscription can
+also be created, or refreshed to include the table, after a transform is
+defined. The staging worker then pauses every transform that reads the table
+(another transform's target included), with the reason on `status()`'s
+`capture_failure`, and `self_check` reports it as a `capture` divergence. To
+stop replicating into the table, remove it from the publication on the
+publisher and run `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the
+subscription. Then resume the transform, which rebuilds it.
+
+Other writers aren't affected: a session with `session_replication_role =
+replica` fires the capture triggers, which are `ENABLE ALWAYS`
+([stage 1](staging-and-claiming/01-capture-by-triggers.md)). Only the
+subscription apply worker skips statement triggers.
+
 **Key columns need a deterministic collation** (#638). Trellis matches keys by
 their exact text, but a nondeterministic collation's `=` (an ICU collation
 created with `deterministic = false`, such as a case-insensitive one) treats

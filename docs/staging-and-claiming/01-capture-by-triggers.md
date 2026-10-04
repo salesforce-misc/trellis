@@ -101,7 +101,12 @@ role that ran the migrations), with `search_path` pinned. That need not be the
 schema's owner: a DBA can pre-create the schema as another role (issue #701).
 The application needs no privilege on Trellis's schema. The triggers are
 `ENABLE ALWAYS`, so a session in `session_replication_role = replica` is
-captured too. Nothing in the capture path issues `NOTIFY`, because `NOTIFY`
+captured too. A logical-replication subscription's apply worker is not: it
+runs in that role but fires only row-level triggers, so its inserts, updates
+and deletes never reach the ring. That isn't supported (#751): defining
+refuses a table a subscription replicates into, the staging worker pauses its
+readers if a subscription starts to later, and `self_check` reports it
+(`defs::subscription`). Nothing in the capture path issues `NOTIFY`, because `NOTIFY`
 takes a database-wide lock at commit.
 
 What is installed lives only in Postgres's catalog: the triggers in

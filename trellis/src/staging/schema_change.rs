@@ -280,22 +280,29 @@ pub(crate) async fn pause_readers_of_missing(
     Ok(true)
 }
 
-/// The staging worker's capture pass's check for row-level security (issue
-/// #745, [`crate::defs::row_security`]): pauses every definition that reads
-/// `table` and isn't paused for a capture failure yet, when the table's
-/// policies now apply to the ring's owner or to this worker's own role,
-/// which read it, recording why in
-/// `capture_failures`. RLS can be enabled or forced, or the table handed to
-/// another owner, after the definitions were accepted. Returns whether it
-/// paused any, in which case the caller leaves the table for the next pass,
-/// whose catalog no longer counts them.
+/// The staging worker's capture pass's check for a table Trellis can't read
+/// correctly: pauses every definition that reads `table` and isn't paused
+/// for a capture failure yet, recording why in `capture_failures`, when
+///
+/// - the table's row-level security policies now apply to the ring's owner
+///   or to this worker's own role, which read it (issue #745,
+///   [`crate::defs::row_security`]). RLS can be enabled or forced, or the
+///   table handed to another owner, after the definitions were accepted; or
+/// - a logical-replication subscription now replicates into it, whose
+///   changes capture never sees (issue #751, [`crate::defs::subscription`]).
+///   A subscription can be created, or refreshed to include the table,
+///   after define.
+///
+/// Returns whether it paused any, in which case the caller leaves the table
+/// for the next pass, whose catalog no longer counts them.
 ///
 /// A definition only frozen (paused or quarantined) keeps its status but
 /// gets the record, as for a schema change: its resume is the rebuild either
-/// way, and the next pass pauses it again while the policies still apply.
+/// way, and the next pass pauses it again while the table is still
+/// unsupported.
 ///
 /// Costs no query for a table no unpaused definition reads.
-pub(crate) async fn pause_readers_under_row_security(
+pub(crate) async fn pause_readers_of_unsupported(
     client: &mut Client,
     schema: &str,
     catalog: &CaptureCatalog,
@@ -305,17 +312,20 @@ pub(crate) async fn pause_readers_under_row_security(
     if readers.is_empty() {
         return Ok(false);
     }
-    let Some(rls) = crate::defs::row_security::applying(
+    let error = if let Some(rls) = crate::defs::row_security::applying(
         &*client,
         schema,
         table,
         crate::defs::row_security::Readers::RingAndSession,
     )
     .await?
-    else {
+    {
+        row_security_error(&rls)
+    } else if let Some(sub) = crate::defs::subscription::subscribed(&*client, table).await? {
+        subscribed_error(&sub)
+    } else {
         return Ok(false);
     };
-    let error = row_security_error(&rls);
     let txn = client.transaction().await?;
     for id in readers {
         if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error).await? {
@@ -324,6 +334,12 @@ pub(crate) async fn pause_readers_under_row_security(
     }
     txn.commit().await?;
     Ok(true)
+}
+
+/// The `capture_failure` sentence for a definition paused because `sub`
+/// replicates into a table it reads.
+fn subscribed_error(sub: &crate::defs::subscription::Subscribed) -> String {
+    format!("{sub}; then resume the definition to rebuild it, or drop the definition")
 }
 
 /// The `capture_failure` sentence for a definition paused because `rls`

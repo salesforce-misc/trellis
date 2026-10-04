@@ -52,7 +52,7 @@
 //! - **The staging worker's capture pass** pauses every definition that
 //!   reads a table whose policies now apply to the ring's owner or to the
 //!   worker's own role, recording why in `capture_failures`
-//!   (`staging::schema_change::pause_readers_under_row_security`): each
+//!   (`staging::schema_change::pause_readers_of_unsupported`): each
 //!   captured table, and each table another definition's target is, which
 //!   the target-mutation seam feeds. RLS can be enabled or forced, a table
 //!   handed to another owner, or a role's `BYPASSRLS` or membership taken

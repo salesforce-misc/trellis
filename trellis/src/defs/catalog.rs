@@ -250,6 +250,12 @@ pub enum CatalogError {
     /// reads the table as, so its policies would filter Trellis's reads
     /// (see [`super::row_security`]). Not supported.
     RowSecurityApplies(super::row_security::RowSecurity),
+    /// Issue #751: a logical-replication subscription replicates into the
+    /// definition's source, or into the to-side of a relationship it reads
+    /// through. The subscription's apply worker fires only row-level
+    /// triggers, so Trellis's capture never sees its changes (see
+    /// [`super::subscription`]). Not supported.
+    Subscribed(super::subscription::Subscribed),
     /// Issue #429: a relationship endpoint's row-identity key (its primary
     /// key, or the unique index [`ddl::source_primary_key`] falls back to)
     /// has a column whose type isn't on the key allowlist. Every change the
@@ -404,6 +410,7 @@ impl CatalogError {
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RowSecurityApplies(_) => ErrorCode::Validation,
+            CatalogError::Subscribed(_) => ErrorCode::Validation,
             CatalogError::RelationshipEndpointUnsupportedKey { .. } => ErrorCode::Validation,
             CatalogError::Ddl(err) => err.code(),
             CatalogError::DirectBackfill(err) => err.code(),
@@ -493,6 +500,7 @@ impl fmt::Display for CatalogError {
                  aggregate target, it can't be a relationship endpoint here"
             ),
             CatalogError::RowSecurityApplies(rls) => write!(f, "{rls}"),
+            CatalogError::Subscribed(sub) => write!(f, "{sub}"),
             CatalogError::RelationshipEndpointUnsupportedKey {
                 name,
                 side,
@@ -594,6 +602,7 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => None,
             CatalogError::RowSecurityApplies(_) => None,
+            CatalogError::Subscribed(_) => None,
             CatalogError::RelationshipEndpointUnsupportedKey { .. } => None,
             CatalogError::Ddl(err) => Some(err),
             CatalogError::DirectBackfill(err) => Some(err),
@@ -2485,6 +2494,13 @@ async fn create_definition_inner(
             .chain(to_sides)
             .collect();
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
+    // Issue #751: and a table a logical-replication subscription writes is
+    // one whose changes capture never sees, for the same tables.
+    let read_tables: Vec<&str> = read_tables
+        .iter()
+        .map(|(table, _)| table.as_str())
+        .collect();
+    reject_subscribed(&*txn, &read_tables).await?;
 
     // Issue #440: registration creates the target here, in the transaction
     // that records the definition, so a failure anywhere after this rolls the
@@ -4794,6 +4810,22 @@ async fn reject_row_security(
     for (table, readers) in tables {
         if let Some(rls) = super::row_security::applying(client, schema, table, *readers).await? {
             return Err(CatalogError::RowSecurityApplies(rls));
+        }
+    }
+    Ok(())
+}
+
+/// Issue #751: rejects the first of `tables` (unquoted `schema.table`
+/// identities) that a logical-replication subscription replicates into
+/// ([`super::subscription::subscribed`]) — [`CatalogError::Subscribed`]. A
+/// table that doesn't exist passes: the checks that need it report that.
+async fn reject_subscribed(
+    client: &impl GenericClient,
+    tables: &[&str],
+) -> Result<(), CatalogError> {
+    for table in tables {
+        if let Some(sub) = super::subscription::subscribed(client, table).await? {
+            return Err(CatalogError::Subscribed(sub));
         }
     }
     Ok(())
