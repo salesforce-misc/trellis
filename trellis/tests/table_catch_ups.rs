@@ -600,6 +600,128 @@ async fn pending_older_to_side_cdc_does_not_resurrect_a_refreshed_out_projection
     );
 }
 
+/// A customer's insert or delete CDC, as capture stages it.
+fn customer_cdc(lsn: PgLsn, op: CdcOp, id: i32, name: &str) -> StagedChange {
+    let image = Some(format!(r#"{{"id":"{id}","name":"{name}"}}"#));
+    let (old_image, new_image) = match op {
+        CdcOp::Delete => (image, None),
+        _ => (None, image),
+    };
+    StagedChange::Cdc {
+        src_table: "public.customers".to_string(),
+        key: id.to_string(),
+        op,
+        lsn: Some(lsn),
+        old_image,
+        new_image,
+        origin_lsn: None,
+        src_changed: None,
+        hop_gen: 0,
+        group_key: None,
+    }
+}
+
+/// Issue #726: a customer inserted before a projection refresh and deleted
+/// after it, with both changes still in the ring, folds to a record with no
+/// image at all, so no reverse record ever names the customer. A refresh
+/// that wrote the customer's projection row from the live table left that
+/// row behind, and every order pointing at the customer kept its name. The
+/// refresh leaves a key a pending change names to that change.
+#[tokio::test]
+async fn a_refresh_leaves_a_to_side_key_with_pending_cdc_to_that_cdc() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "insert into public.customers values (3, 'cat')",
+        |lsn| customer_cdc(lsn, CdcOp::Insert, 3, "cat"),
+    )
+    .await;
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    markers::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 3",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 3, "cat"),
+    )
+    .await;
+    commit_and_stage(
+        &mut client,
+        "insert into public.orders values (13, 3)",
+        |lsn| StagedChange::Cdc {
+            src_table: "public.orders".to_string(),
+            key: "13".to_string(),
+            op: CdcOp::Insert,
+            lsn: Some(lsn),
+            old_image: None,
+            new_image: Some(r#"{"id":"13","customer_id":"3"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: Some(vec!["3".to_string()]),
+        },
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(projected_name(&client, 3).await, None);
+    assert_eq!(
+        order_names(&client).await,
+        vec![
+            (10, Some("ann".to_string())),
+            (11, Some("bob".to_string())),
+            (12, Some("ann".to_string())),
+            (13, None),
+        ]
+    );
+}
+
+/// Issue #726 through the other catch-up insert: registering a second
+/// consumer of the relationship catches the projection up from the live
+/// to-side (`ensure_relationship_projection_in_txn`), and must leave a
+/// customer whose insert is still in the ring to that insert, or the
+/// customer's delete, folded with it, leaves the row behind.
+#[tokio::test]
+async fn a_new_consumers_projection_catch_up_leaves_a_key_with_pending_cdc_to_that_cdc() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "insert into public.customers values (3, 'cat')",
+        |lsn| customer_cdc(lsn, CdcOp::Insert, 3, "cat"),
+    )
+    .await;
+    trellis
+        .apply("TRANSFORM order_names2 FROM orders SELECT customer.name AS customer_name")
+        .await
+        .expect("register a second consumer");
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 3",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 3, "cat"),
+    )
+    .await;
+    bring_live(&db.pool, &mut client).await;
+
+    assert_eq!(projected_name(&client, 3).await, None);
+}
+
 /// Issue #531 for a deferred reverse (issue #134): a rename a guard deferred
 /// before the refresh keeps its original LSN, so its retry is at or below the
 /// stamp as well and must not put its image back either.

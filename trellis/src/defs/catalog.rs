@@ -98,7 +98,7 @@ use std::fmt;
 use crate::error_code::{self, ErrorCode};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
-use crate::pool::{Pool, quote_ident};
+use crate::pool::{Pool, quote_ident, quote_literal};
 use tokio_postgres::GenericClient;
 
 use super::ast::{
@@ -4983,14 +4983,20 @@ async fn ensure_relationship_projection_in_txn(
     // otherwise reach for.
     let insert_cols = insert_col_idents.join(", ");
     let select_cols = select_col_exprs.join(", ");
+    // Issue #726: a key a pending to-side change names is left to that
+    // change, as in `refresh_relationship_projections_in_txn`.
+    let pending = pending_to_side_keys(qualified_to_table, to_col, relationship_id);
     let catch_up_sql = format!(
-        "with seed as (select pg_current_wal_lsn() as lsn) \
+        "with seed as (select pg_current_wal_lsn() as lsn), {pending} \
          insert into {qualified_projection} ({insert_cols}) \
          select {select_cols} \
          from {quoted_to_table} t, seed \
          where t.{to_col_ident} is not null \
            and not exists (\
              select 1 from {qualified_projection} p where p.{to_col_ident} = t.{to_col_ident}\
+           ) \
+           and not exists (\
+             select 1 from {PENDING_KEYS} k where k.key = t.{to_col_ident}::text\
            )"
     );
     txn.batch_execute(&catch_up_sql).await?;
@@ -4998,12 +5004,73 @@ async fn ensure_relationship_projection_in_txn(
     Ok(())
 }
 
+/// The name of the CTE [`pending_to_side_keys`] renders.
+const PENDING_KEYS: &str = "trellis_pending_keys";
+
+/// A CTE, named [`PENDING_KEYS`], of every `to_col` value (as text, in a
+/// column `key`) that a pending change to `qualified_to_table` names in
+/// either image: a captured or seam-fed change, or relationship
+/// `relationship_id`'s deferred reverse (#134). Pending is guard (c)'s test
+/// (`staging::apply`'s `from_side_change_in_flight`): the row's segment
+/// hasn't drained, or drained without it.
+///
+/// Issue #726: a catch-up insert from the live to-side
+/// ([`ensure_relationship_projection_in_txn`],
+/// [`refresh_relationship_projections_in_txn`]) leaves out such a key. Its
+/// projection row is written by the change, whose record carries the key's
+/// state. Written from the live row instead, it could outlive the to-side
+/// row: a row inserted before the read and deleted after it folds, with
+/// both changes pending, to a record with no image, which names no key, so
+/// no reverse record ever removes the row the read wrote. Leaving the key
+/// out is right whichever way the change drains: a record that ends with
+/// the key present upserts it from its new image, and one that doesn't
+/// leaves the projection without it, as the to-side is. The read and this
+/// CTE are one statement, so one snapshot: a change the read saw is either
+/// applied or pending here.
+///
+/// Only the insert half needs it. A projection row the read finds already
+/// there was written before the pending change, so the change's record
+/// starts from a state that has the key, and its old image names it. The
+/// refresh's update and delete halves are unchanged: #531's stamp orders a
+/// pending record against them.
+fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id: i64) -> String {
+    let col = quote_literal(to_col);
+    let tables = format!(
+        "array[{}, {}]",
+        quote_literal(qualified_to_table),
+        quote_literal(
+            &crate::staging::apply::relationship_reverse_deferred_src_table(relationship_id)
+        )
+    );
+    let arms = crate::staging::converge::per_ring_table(" union all ", |slot, table| {
+        format!(
+            "select r.old_image ->> {col} as old_key, r.new_image ->> {col} as new_key \
+             from {table} r \
+             where r.src_table = any({tables}) \
+               and r.op in ('insert', 'update', 'delete', 'rel_reverse_deferred') \
+               and exists ( \
+                   select 1 from segments s \
+                   where s.ring_slot = {slot} \
+                     and (s.state <> 'drained' \
+                          or (s.fence_snapshot is not null \
+                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))))"
+        )
+    });
+    format!(
+        "{PENDING_KEYS} as materialized ( \
+             select distinct v.key from ({arms}) c \
+             cross join lateral (values (c.old_key), (c.new_key)) v(key) \
+             where v.key is not null)"
+    )
+}
+
 /// Re-syncs every settled parent projection whose to-side is
 /// `qualified_to_table` with that table's current rows (issue #507): deletes
 /// each projection row whose to-side row is gone, rewrites the data columns of
 /// each row whose to-side row now differs, and inserts a row for each to-side
-/// key it lacks, seeded as [`ensure_relationship_projection_in_txn`] seeds
-/// one. Returns how many projection rows it changed.
+/// key it lacks and no pending change names ([`pending_to_side_keys`], issue
+/// #726), seeded as [`ensure_relationship_projection_in_txn`] seeds one.
+/// Returns how many projection rows it changed.
 ///
 /// The catch-up discharge runs this for a marker parked because a rebuild
 /// rewrote a definition's target (`pending_backfill.refresh_projections`,
@@ -5144,14 +5211,20 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
             insert_cols.push(c.clone());
             select_cols.push(format!("t.{c}"));
         }
+        // Issue #726: a key a pending change names is left to that change
+        // (see `pending_to_side_keys`).
+        let relationship_id: i64 = row.get(3);
+        let pending = pending_to_side_keys(qualified_to_table, &to_col, relationship_id);
         changed += client
             .execute(
                 &format!(
-                    "with seed as (select pg_current_wal_lsn() as lsn) \
+                    "with seed as (select pg_current_wal_lsn() as lsn), {pending} \
                      insert into {qualified_projection} ({insert_cols}) \
                      select {select_cols} from {quoted_to_table} t, seed \
                      where t.{key} is not null and not exists ( \
-                         select 1 from {qualified_projection} p where p.{key} = t.{key})",
+                         select 1 from {qualified_projection} p where p.{key} = t.{key}) \
+                       and not exists ( \
+                         select 1 from {PENDING_KEYS} k where k.key = t.{key}::text)",
                     insert_cols = insert_cols.join(", "),
                     select_cols = select_cols.join(", "),
                 ),

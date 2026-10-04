@@ -103,9 +103,9 @@
 //! needs can be collected (`early_tombstone_gc`). Cases with a relationship
 //! are left out: under the load, the relationship-fed shapes diverged in
 //! about one case in ten, more than a sweep's baseline bar. #623 D5 put the
-//! relationship-fed aggregates (#719) on the ledger, but they haven't been
-//! measured enough since to take back in, and the 1-1 enrichment's stale
-//! value (#726) still fails unplanted after D5.
+//! relationship-fed aggregates (#719) on the ledger, and #726 fixed the 1-1
+//! enrichment's stale value, but neither has been measured under the load
+//! since, so they stay out.
 //!
 //! The stall is process-wide, so the tier has no property test: it runs
 //! only in [`planted_bugs_are_caught`]'s sweep processes, one case at a time

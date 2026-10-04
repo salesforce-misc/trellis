@@ -4035,10 +4035,11 @@ mod strategy {
     /// A case with a relationship is drawn again: under the load, the
     /// relationship-fed shapes diverged in about one case in ten, more than a
     /// sweep's baseline bar. #623 D5 put the relationship-fed aggregates
-    /// (#719) on the ledger, but they haven't been measured enough since to
-    /// take back in, and the 1-1 enrichment's stale value (#726) still fails
-    /// unplanted after D5. Drawn apart from [`mid_burst_case`] so that tier's
-    /// cases, seed for seed, stay what they were.
+    /// (#719) on the ledger, and #726 fixed the 1-1 enrichment's stale value
+    /// (a projection refresh racing pending to-side CDC), but neither has
+    /// been measured under the load since. Drawn apart from
+    /// [`mid_burst_case`] so that tier's cases, seed for seed, stay what they
+    /// were.
     pub fn steady_load_case() -> impl Strategy<Value = ConcurrentCase> {
         let extras = (mid_burst_draws(), load_draws()).prop_map(|(mut draws, load)| {
             draws.load = Some(load);
