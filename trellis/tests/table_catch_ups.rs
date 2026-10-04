@@ -722,6 +722,91 @@ async fn a_new_consumers_projection_catch_up_leaves_a_key_with_pending_cdc_to_th
     assert_eq!(projected_name(&client, 3).await, None);
 }
 
+/// Issue #726 when the key's latest pending change is an update that keeps
+/// it, so names it in both images: that change still writes the key, and the
+/// refresh leaves it alone.
+#[tokio::test]
+async fn a_refresh_leaves_a_key_whose_latest_pending_cdc_keeps_it_to_that_cdc() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "insert into public.customers values (3, 'cat')",
+        |lsn| customer_cdc(lsn, CdcOp::Insert, 3, "cat"),
+    )
+    .await;
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'cat2' where id = 3",
+        |lsn| customer_update(lsn, 3, "cat", "cat2"),
+    )
+    .await;
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    markers::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 3",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 3, "cat2"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(projected_name(&client, 3).await, None);
+}
+
+/// Issue #726's skip must not swallow a key whose pending changes end with it
+/// gone while the to-side has it back through a write no pending change
+/// carries (a lost change, as a requested re-backfill repairs). The pending
+/// insert and delete fold to a record with no image, so only the refresh can
+/// write the customer's projection row.
+#[tokio::test]
+async fn a_refresh_writes_a_key_back_whose_pending_cdc_ends_with_it_gone() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "insert into public.customers values (3, 'cat')",
+        |lsn| customer_cdc(lsn, CdcOp::Insert, 3, "cat"),
+    )
+    .await;
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 3",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 3, "cat"),
+    )
+    .await;
+    client
+        .batch_execute("insert into public.customers values (3, 'cat2')")
+        .await
+        .expect("re-insert a customer, the CDC lost");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_name(&client, 3).await,
+        Some(Some("cat2".to_string()))
+    );
+}
+
 /// Issue #531 for a deferred reverse (issue #134): a rename a guard deferred
 /// before the refresh keeps its original LSN, so its retry is at or below the
 /// stamp as well and must not put its image back either.

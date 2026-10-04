@@ -4983,7 +4983,7 @@ async fn ensure_relationship_projection_in_txn(
     // otherwise reach for.
     let insert_cols = insert_col_idents.join(", ");
     let select_cols = select_col_exprs.join(", ");
-    // Issue #726: a key a pending to-side change names is left to that
+    // Issue #726: a key a pending to-side change will write is left to that
     // change, as in `refresh_relationship_projections_in_txn`.
     let pending = pending_to_side_keys(qualified_to_table, to_col, relationship_id);
     let catch_up_sql = format!(
@@ -5008,8 +5008,10 @@ async fn ensure_relationship_projection_in_txn(
 const PENDING_KEYS: &str = "trellis_pending_keys";
 
 /// A CTE, named [`PENDING_KEYS`], of every `to_col` value (as text, in a
-/// column `key`) that a pending change to `qualified_to_table` names in
-/// either image: a captured or seam-fed change, or relationship
+/// column `key`) whose latest pending change to `qualified_to_table` leaves
+/// the key present: of the pending changes that name the key in either image,
+/// the one latest in `(lsn, change_id)` order, the fold's order, names it in
+/// its new image. A change is a captured or seam-fed change, or relationship
 /// `relationship_id`'s deferred reverse (#134). Pending is guard (c)'s test
 /// (`staging::apply`'s `from_side_change_in_flight`): the row's segment
 /// hasn't drained, or drained without it.
@@ -5017,16 +5019,23 @@ const PENDING_KEYS: &str = "trellis_pending_keys";
 /// Issue #726: a catch-up insert from the live to-side
 /// ([`ensure_relationship_projection_in_txn`],
 /// [`refresh_relationship_projections_in_txn`]) leaves out such a key. Its
-/// projection row is written by the change, whose record carries the key's
-/// state. Written from the live row instead, it could outlive the to-side
-/// row: a row inserted before the read and deleted after it folds, with
-/// both changes pending, to a record with no image, which names no key, so
-/// no reverse record ever removes the row the read wrote. Leaving the key
-/// out is right whichever way the change drains: a record that ends with
-/// the key present upserts it from its new image, and one that doesn't
-/// leaves the projection without it, as the to-side is. The read and this
-/// CTE are one statement, so one snapshot: a change the read saw is either
-/// applied or pending here.
+/// projection row is written by that change's record, whose new image
+/// carries the key. Written from the live row instead, it could outlive the
+/// to-side row: a row inserted before the read and deleted after it folds,
+/// with both changes pending, to a record with no image, which names no key,
+/// so no reverse record ever removes the row the read wrote. Leaving the key
+/// out is right whichever way the record drains: one that still ends with
+/// the key present upserts it (from the live row, if a refresh overtook its
+/// image), and one that a later delete folded into leaves the projection
+/// without it, as the to-side is. The read and this CTE are one statement,
+/// so one snapshot: a change the read saw is either applied or pending here.
+///
+/// A key whose latest pending change names it only in its old image (a
+/// delete, or a move off the key) is written from the live row as before.
+/// The to-side has the key back through a write no pending change carries
+/// (a rebuild's, or a lost change a catch-up repairs), and the pending
+/// changes may fold to a record with no image (an insert then a delete),
+/// which would never write it.
 ///
 /// Only the insert half needs it. A projection row the read finds already
 /// there was written before the pending change, so the change's record
@@ -5044,7 +5053,8 @@ fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id:
     );
     let arms = crate::staging::converge::per_ring_table(" union all ", |slot, table| {
         format!(
-            "select r.old_image ->> {col} as old_key, r.new_image ->> {col} as new_key \
+            "select r.lsn, r.change_id, \
+                    r.old_image ->> {col} as old_key, r.new_image ->> {col} as new_key \
              from {table} r \
              where r.src_table = any({tables}) \
                and r.op in ('insert', 'update', 'delete', 'rel_reverse_deferred') \
@@ -5056,11 +5066,17 @@ fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id:
                               and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))))"
         )
     });
+    // A change that keeps the key names it in both images. Its new image's
+    // mention is the later one.
     format!(
         "{PENDING_KEYS} as materialized ( \
-             select distinct v.key from ({arms}) c \
-             cross join lateral (values (c.old_key), (c.new_key)) v(key) \
-             where v.key is not null)"
+             select l.key from ( \
+                 select distinct on (v.key) v.key, v.present \
+                 from ({arms}) c \
+                 cross join lateral (values (c.old_key, false), (c.new_key, true)) v(key, present) \
+                 where v.key is not null \
+                 order by v.key, c.lsn desc nulls last, c.change_id desc, v.present desc \
+             ) l where l.present)"
     )
 }
 
@@ -5068,8 +5084,8 @@ fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id:
 /// `qualified_to_table` with that table's current rows (issue #507): deletes
 /// each projection row whose to-side row is gone, rewrites the data columns of
 /// each row whose to-side row now differs, and inserts a row for each to-side
-/// key it lacks and no pending change names ([`pending_to_side_keys`], issue
-/// #726), seeded as [`ensure_relationship_projection_in_txn`] seeds one.
+/// key it lacks and no pending change will write ([`pending_to_side_keys`],
+/// issue #726), seeded as [`ensure_relationship_projection_in_txn`] seeds one.
 /// Returns how many projection rows it changed.
 ///
 /// The catch-up discharge runs this for a marker parked because a rebuild
@@ -5211,8 +5227,8 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
             insert_cols.push(c.clone());
             select_cols.push(format!("t.{c}"));
         }
-        // Issue #726: a key a pending change names is left to that change
-        // (see `pending_to_side_keys`).
+        // Issue #726: a key a pending change will write is left to that
+        // change (see `pending_to_side_keys`).
         let relationship_id: i64 = row.get(3);
         let pending = pending_to_side_keys(qualified_to_table, &to_col, relationship_id);
         changed += client
