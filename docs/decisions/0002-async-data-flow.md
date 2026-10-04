@@ -370,6 +370,17 @@ state that orders its writes.
   The upside of deleting the probe and pre-lock (#326's 40k-group cliff,
   where nothing drains in any mode) is unmeasured because the prototype kept
   them ([open question 4](#open-questions)).
+  *Measured on the implementation (#623 D9,
+  [round](https://github.com/salesforce-misc/trellis/issues/623#issuecomment-5982698251)),
+  against the old aggregate path on trigger capture, same session, 8
+  workers:* the 40k- and 400k-group shapes now drain (the old path never
+  did), 4k groups is 19–32% faster end to end, a 5,000-row page cap costs
+  1.4–1.5x instead of 6–8x, and the 10M build converges in 65 s against
+  791 s, with no deadlocks anywhere. **The cost bar above is missed** at a
+  high fold-in ratio: 400 groups is 33–57% slower, because the old path wrote
+  one group row per group per page and the ledger writes one entry per
+  source row. WAL per folded row is 2.4–2.6x the old path's (1.67x at 10M),
+  and Postgres CPU per folded row 2–2.6x. These bars are open for #629.
 
 ### Apply is one set-based statement per batch per target, and the batch is bounded
 
@@ -787,6 +798,10 @@ Deliverable 4 of #556. Nothing below polls for convergence (#297).
    parent, 100 and 1,000 parent updates/s, child-only churn),
    `build-under-load`, #565's E1 and E2, each with a same-session control on
    the pre-change code. The bars in this ADR are restated from that round.
+   *#623 D9 ran the aggregate half* (`fold-in-ratio`, `group-contention`,
+   `build-under-load` at 10M, on tmpfs and disk, against D3's base):
+   [round](https://github.com/salesforce-misc/trellis/issues/623#issuecomment-5982698251).
+   It is #575's control. `rel-churn` and E1/E2 remain for #629.
 5. **Writer-coupling tests:** schema change of a read column under load
    (writes succeed, definition pauses, regeneration restores capture); join
    and drop under a 30 s open transaction (worst writer wait under 100 ms);
@@ -819,6 +834,39 @@ For the debate on #618; each has a recommendation where one exists.
    the source and 1.6–1.7x WAL at 10M. Can `contrib` be narrowed for plain
    invertible aggregates (a `SUM` needs the value, a `COUNT` needs nothing),
    and does the ledger belong on a separate tablespace?
+   *Measured in #623 D9* (1M source rows of `(id bigint, grp int, amt int)`,
+   10k groups, disk, `pg_walinspect` attributing each WAL record to its
+   relation; 100k single-column updates and 100k group moves, 1,000 rows
+   per statement, each window opened with a checkpoint):
+
+   | Shape | Ledger B/source row (heap + indexes) | Entry B | WAL B/changed row, total (ledger) |
+   |---|---|---|---|
+   | `COUNT(*)` | 196 (144 + 53) | 93 | 1,539 (663), group moves |
+   | `SUM` | 204 (152 + 52) | 102 | 1,537 (682) |
+   | `AVG` | 204 | 102 | 1,551 (687) |
+   | `MIN`, `MAX` | 204 | 102 | 1,649 (685) |
+   | `SUM`, `COUNT(*)`, `MIN`, `MAX` | 204 | 102 | 1,730 (694) |
+   | 1-1 | 176 (128 + 48) | 85 | 1,499 (496) |
+
+   The same update with no reader writes 310–320 B per row; capture adds
+   ~336 B, the target 170–480 B. The ledger is 2.6–3.1x this narrow
+   source, and 1.5–1.8x a ledger-less apply's WAL (40–45% of the ledger's
+   share is full-page images after the checkpoint), in line with the
+   prototype's ~3x and 1.6–1.7x.
+
+   **`contrib` is not narrowed further.** Q5's typed columns already store
+   one value per distinct argument, shared by every field over it, and
+   none for `COUNT(*)`: `COUNT(*)` alone saves 8 B of a ~100 B entry. The
+   entry is dominated by the ordering state: `__basis` averages 44 B, the
+   heap tuple header 24 B, the text key 7 B here. Two larger levers are
+   left for #629: an aggregate ledger's updates are never HOT, because
+   every Apply changes `__applied_seg`, which the tombstone GC's partial
+   index keys on (0 of 1.2M updates were HOT; its two indexes are 285 of
+   the 682 B), and a ledger is built full (`fillfactor` 100), which keeps
+   the 1-1 ledger at 0.6% HOT too. **No separate tablespace is
+   documented:** at ~3x a narrow source the ledger is sized like any other
+   derived table, and nothing measured so far shows its I/O needs a device
+   of its own.
 5. **The status model.** Three stored states is the recommendation; the
    derived "upstream not live" rule stays. Is there any remaining repair that
    is not a rebuild?

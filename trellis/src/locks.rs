@@ -47,7 +47,8 @@ use std::time::{Duration, Instant};
 /// on the pre-lock, `bench --disk fold-in-ratio --ratios 10` (40k groups at
 /// 400k rows/s, eight workers, every page touching most groups), now has
 /// its longest page transaction, wait included, at 6.6 s (it was 89 s), and
-/// no page waits out the cap at either 30 s or 10 s. The rule was the
+/// no page waits out the cap at either 30 s or 10 s. D9's benchmark round,
+/// with a checkpoint every 30 s, saw 7.6 s at most. The rule was the
 /// smallest of 30 s and 10 s with no timeouts and the longest page under a
 /// third of the cap, which 10 s misses (6.6 s against 3.3 s): a cap that
 /// close to a normal page would turn a slow checkpoint into retries, and
