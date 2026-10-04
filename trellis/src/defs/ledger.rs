@@ -75,6 +75,30 @@ pub(crate) const BASIS_COLUMN: &str = "__basis";
 /// Whether the key's last applied change deleted it.
 pub(crate) const TOMBSTONE_COLUMN: &str = "__tombstone";
 
+/// The `fillfactor` every ledger is created with (#775): the share of each
+/// heap page an insert, or a build's load, fills. The rest is left for the
+/// new versions of the page's entries.
+///
+/// Every page and every Apply rewrites an entry, and an update can only be
+/// HOT, writing no index entry, when its new version fits on the old one's
+/// page. At Postgres's default of 100 a page has no room left once filled,
+/// so even the 1-1 ledger, whose updates change no indexed column, made only
+/// 13–16% of them HOT (#623 D9's review). On #775's 1M-entry ledgers, a run
+/// of 1,000-row updates over contiguous keys (the worst case: a page's
+/// entries all want room in the same transaction) made 22%, 45% and 58% of
+/// an aggregate ledger's updates HOT at 90, 80 and 70, and 34%, 45% and 67%
+/// of a 1-1 ledger's. Scattered updates do better, since Postgres prunes a
+/// page's dead versions on the way. It also lets a new key's entry be
+/// rewritten on the page it was inserted on, rather than moved to another.
+/// The price is a heap a quarter larger.
+pub(crate) const LEDGER_FILLFACTOR: u8 = 80;
+
+/// The storage parameters of a ledger's `create table`, with their leading
+/// space.
+fn ledger_storage() -> String {
+    format!(" with (fillfactor = {LEDGER_FILLFACTOR})")
+}
+
 /// A target's ledger table name.
 pub(crate) fn ledger_table_name(target: &str) -> String {
     format!("{target}{LEDGER_SUFFIX}")
@@ -384,8 +408,9 @@ pub(crate) fn aggregate_ledger_ddl(
     columns.push(ordering_state_columns());
     let group_idents: Vec<String> = group_columns.iter().map(|c| quote_ident(&c.name)).collect();
     format!(
-        "; create table {qualified_ledger} ({}){}",
+        "; create table {qualified_ledger} ({}){}{}",
         columns.join(", "),
+        ledger_storage(),
         aggregate_ledger_index_ddl(qualified_ledger, &group_idents),
     )
 }
@@ -493,10 +518,11 @@ pub(crate) fn aggregate_deltas_ddl(
 /// taken in key order, and a byte comparison is far cheaper than a locale's.
 pub(crate) fn one_to_one_ledger_ddl(qualified_ledger: &str) -> String {
     format!(
-        "; create table {qualified_ledger} ({} text collate \"C\" primary key, {}); \
+        "; create table {qualified_ledger} ({} text collate \"C\" primary key, {}){}; \
          create index on {qualified_ledger} ({}) where {}",
         quote_ident(KEY_COLUMN),
         ordering_state_columns(),
+        ledger_storage(),
         quote_ident(KEY_COLUMN),
         quote_ident(TOMBSTONE_COLUMN),
     )
@@ -646,7 +672,7 @@ mod tests {
         );
         assert_eq!(
             ddl,
-            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
+            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false) with (fillfactor = 80); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
         );
     }
 
@@ -654,7 +680,7 @@ mod tests {
     fn the_one_to_one_ledger_holds_only_the_key_and_the_ordering_state() {
         assert_eq!(
             one_to_one_ledger_ddl(r#""public"."t__ledger""#),
-            r#"; create table "public"."t__ledger" ("__from_key" text collate "C" primary key, "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("__from_key") where "__tombstone""#
+            r#"; create table "public"."t__ledger" ("__from_key" text collate "C" primary key, "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false) with (fillfactor = 80); create index on "public"."t__ledger" ("__from_key") where "__tombstone""#
         );
     }
 
