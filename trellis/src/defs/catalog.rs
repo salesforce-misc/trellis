@@ -5122,29 +5122,7 @@ const PENDING_KEYS: &str = "trellis_pending_keys";
 /// refresh's update and delete halves are unchanged: #531's stamp orders a
 /// pending record against them.
 fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id: i64) -> String {
-    let col = quote_literal(to_col);
-    let tables = format!(
-        "array[{}, {}]",
-        quote_literal(qualified_to_table),
-        quote_literal(
-            &crate::staging::apply::relationship_reverse_deferred_src_table(relationship_id)
-        )
-    );
-    let arms = crate::staging::converge::per_ring_table(" union all ", |slot, table| {
-        format!(
-            "select r.lsn, r.change_id, \
-                    r.old_image ->> {col} as old_key, r.new_image ->> {col} as new_key \
-             from {table} r \
-             where r.src_table = any({tables}) \
-               and r.op in ('insert', 'update', 'delete', 'rel_reverse_deferred') \
-               and exists ( \
-                   select 1 from segments s \
-                   where s.ring_slot = {slot} \
-                     and (s.state <> 'drained' \
-                          or (s.fence_snapshot is not null \
-                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))))"
-        )
-    });
+    let arms = pending_to_side_changes(qualified_to_table, to_col, relationship_id, "");
     // A change that keeps the key names it in both images. Its new image's
     // mention is the later one.
     format!(
@@ -5157,6 +5135,45 @@ fn pending_to_side_keys(qualified_to_table: &str, to_col: &str, relationship_id:
                  order by v.key, c.lsn desc nulls last, c.change_id desc, v.present desc \
              ) l where l.present)"
     )
+}
+
+/// The pending changes [`pending_to_side_keys`] reads, as a `union all` of
+/// one `select` per ring table, each row `(lsn, change_id, old_key,
+/// new_key)`: the change's position and the `to_col` value (as text) in its
+/// old and new images. `filter` is appended to every arm's `where`, over
+/// the ring row `r`, and may be empty.
+///
+/// Issue #754: `staging::apply::apply_projection_from_live` reads the same
+/// set for one key, narrowed by `filter`.
+pub(crate) fn pending_to_side_changes(
+    qualified_to_table: &str,
+    to_col: &str,
+    relationship_id: i64,
+    filter: &str,
+) -> String {
+    let col = quote_literal(to_col);
+    let tables = format!(
+        "array[{}, {}]",
+        quote_literal(qualified_to_table),
+        quote_literal(
+            &crate::staging::apply::relationship_reverse_deferred_src_table(relationship_id)
+        )
+    );
+    crate::staging::converge::per_ring_table(" union all ", |slot, table| {
+        format!(
+            "select r.lsn, r.change_id, \
+                    r.old_image ->> {col} as old_key, r.new_image ->> {col} as new_key \
+             from {table} r \
+             where r.src_table = any({tables}) \
+               and r.op in ('insert', 'update', 'delete', 'rel_reverse_deferred') {filter} \
+               and exists ( \
+                   select 1 from segments s \
+                   where s.ring_slot = {slot} \
+                     and (s.state <> 'drained' \
+                          or (s.fence_snapshot is not null \
+                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))))"
+        )
+    })
 }
 
 /// Re-syncs every settled parent projection whose to-side is

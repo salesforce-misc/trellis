@@ -2799,6 +2799,13 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 ///   06), as the replayed rows' own positions used to keep it;
 /// - the union of their `group_key`s.
 ///
+/// A `Recompute` builds no reverse record, so it never moves a to-one
+/// relationship's projection of the key's table. The release writes each
+/// projection row the parked changes named, and the live row names, from the
+/// live row itself in the same transaction
+/// (`apply::release_to_one_projections`, issue #754), before the
+/// `Recompute` re-derives the key's from-side rows from it.
+///
 /// Returns how many held rows were released.
 #[cfg(any(test, feature = "internals"))]
 pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usize, ApplyError> {
@@ -2817,7 +2824,8 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
 
     let held = txn
         .query(
-            "select old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table \
+            "select old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table, \
+                    new_image::text \
              from poison_held \
              where src_table = any($1::text[]) and key = $2 \
              order by seg_seq asc, held_seq asc",
@@ -2870,6 +2878,16 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
         &[&names, &key],
     )
     .await?;
+    // Issue #754: the `Recompute` builds no reverse record, so a to-one
+    // projection of this table hears about the parked changes only here.
+    if !held.is_empty() {
+        let images: Vec<String> = held
+            .iter()
+            .flat_map(|row| [row.get::<_, Option<String>>(0), row.get(6)])
+            .flatten()
+            .collect();
+        apply::release_to_one_projections(pool, &txn, &names[0], key, &images).await?;
+    }
 
     txn.commit().await?;
     Ok(held.len())

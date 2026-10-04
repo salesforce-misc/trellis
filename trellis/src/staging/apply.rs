@@ -2797,12 +2797,40 @@ async fn relationship_refresh_stamps(
 /// to-side has no row. Moves [`ddl::PROJECTION_LSN_COLUMN`] to `lsn` exactly
 /// as the image advance would, and never touches
 /// [`ddl::PROJECTION_GEN_COLUMN`].
+///
+/// Issue #754: a key whose latest pending change after `pending_after` (the
+/// record's own `lsn`, so none of the record's own ring rows count) names it
+/// in its new image is left to that change, the rule
+/// `catalog::pending_to_side_keys` applies to the catch-up inserts (#726):
+/// the projection row is deleted rather than written from the live row, and
+/// that change's record writes it. Written from the live row, it could
+/// outlive the to-side row. A re-insert pending when a delete drains,
+/// superseded by it, folds with a later delete into a record with no image,
+/// which names no key, so no record would ever remove the row the live
+/// write put there. Deleting the row is what the pending change's record
+/// expects, since the key was absent before it whenever that change is an
+/// insert; when the change keeps the key (an update), its record writes the
+/// row whole either way, and re-derives the from-side rows it reaches.
+///
+/// "Pending" is guard (c)'s test, which still counts a change whose segment
+/// has not finished draining after its own page applied it. Such a change
+/// already wrote the projection row at its window's `lsn`, at or above its
+/// own, so a row whose `lsn` is at or above the change's is written from the
+/// live row as before. The comparison is on the row being deleted, so a
+/// drain applying that change concurrently, which holds the row, makes this
+/// delete re-check against the row it wrote and keep it.
+///
+/// One statement per key, so the pending read, the projection read and the
+/// live read share one snapshot (ADR-0002 I1), and the delete and the upsert
+/// never both act on the row: the delete acts only where the to-side has no
+/// row, or where the upsert is withheld.
 async fn apply_projection_from_live(
     txn: &Transaction<'_>,
     shape: &ReverseRelationshipShape,
     old_key: &Option<String>,
     new_key: &Option<String>,
     lsn: Option<PgLsn>,
+    pending_after: Option<PgLsn>,
 ) -> Result<(), ApplyError> {
     if shape.qualified_projection.is_empty() {
         return Ok(());
@@ -2833,15 +2861,32 @@ async fn apply_projection_from_live(
     insert_cols.push(lsn_ident.clone());
     select_exprs.push("$2::pg_lsn".to_string());
     update_sets.push(format!("{lsn_ident} = excluded.{lsn_ident}"));
-    let delete = format!(
-        "delete from {proj} p where p.{key_ident}::text = $1 \
-         and not exists (select 1 from {to_table} t where {filter})",
-        proj = shape.qualified_projection,
-        to_table = to_side.table,
+    let col = quote_literal(&shape.to_col);
+    let pending = catalog::pending_to_side_changes(
+        &to_side.identity,
+        &shape.to_col,
+        shape.id,
+        &format!(
+            "and r.lsn > $3::pg_lsn \
+             and (r.old_image ->> {col} = $1::text or r.new_image ->> {col} = $1::text)"
+        ),
     );
-    let upsert = format!(
-        "insert into {proj} ({insert_cols}) \
-         select {select_exprs} from {to_table} t where {filter} \
+    let sql = format!(
+        "with latest as materialized ( \
+             select c.lsn, c.new_key is not distinct from $1::text as present \
+             from ({pending}) c order by c.lsn desc, c.change_id desc limit 1), \
+         held as ( \
+             select 1 from latest l where l.present and not exists ( \
+                 select 1 from {proj} q \
+                 where q.{key_ident}::text = $1 and q.{lsn_ident} >= l.lsn)), \
+         gone as ( \
+             delete from {proj} p where p.{key_ident}::text = $1 \
+             and (not exists (select 1 from {to_table} t where {filter}) \
+                  or exists (select 1 from latest l where l.present \
+                             and coalesce(p.{lsn_ident}, '0/0'::pg_lsn) < l.lsn))) \
+         insert into {proj} ({insert_cols}) \
+         select {select_exprs} from {to_table} t \
+         where {filter} and not exists (select 1 from held) \
          on conflict ({key_ident}) do update set {update_sets}",
         proj = shape.qualified_projection,
         to_table = to_side.table,
@@ -2849,12 +2894,90 @@ async fn apply_projection_from_live(
         select_exprs = select_exprs.join(", "),
         update_sets = update_sets.join(", "),
     );
+    let pending_after = pending_after.unwrap_or(PgLsn::from(0));
     let mut keys: Vec<&str> = old_key.iter().chain(new_key).map(String::as_str).collect();
     keys.sort_unstable();
     keys.dedup();
     for key in keys {
-        txn.execute(&delete, &[&key]).await?;
-        txn.execute(&upsert, &[&key, &lsn]).await?;
+        txn.execute(&sql, &[&key, &lsn, &pending_after]).await?;
+    }
+    Ok(())
+}
+
+/// Issue #754: writes, from the live to-side row, the projection row of
+/// every key a released to-side key's parked changes named, for each to-one
+/// relationship whose to-side is `src_table` (the canonical name). `images`
+/// are the parked changes' images, as JSON text; the live row of `key` names
+/// one more.
+///
+/// `quarantine::release_key` discards the parked rows and stages an
+/// image-less `Recompute`, which builds no reverse record, so without this
+/// nothing would carry what the parked changes did to the to-side into the
+/// projection. The write is [`apply_projection_from_live`]'s, with every
+/// pending change counted, since the parked ones are no longer in the ring:
+/// a key a pending change will write is left to it. Each relationship's
+/// refresh stamp is locked `for share` first and the projection rows `for
+/// update` in key order, the order a drain takes them (ADR-0002 I5), and the
+/// rows are stamped with the release's WAL position.
+#[cfg(any(test, feature = "internals"))]
+pub(crate) async fn release_to_one_projections(
+    pool: &Pool,
+    txn: &Transaction<'_>,
+    src_table: &str,
+    key: &str,
+    images: &[String],
+) -> Result<(), ApplyError> {
+    let mut relationships: Vec<RelationshipDefinition> =
+        catalog::relationships_to_table(pool, src_table)
+            .await?
+            .into_iter()
+            .filter(|rel| rel.cardinality == RelationshipCardinality::ToOne)
+            .collect();
+    if relationships.is_empty() {
+        return Ok(());
+    }
+    relationships.sort_by_key(|rel| rel.id);
+    relationship_refresh_stamps(txn, relationships.iter().map(|rel| rel.id)).await?;
+    let lsn: PgLsn = txn
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await?
+        .get(0);
+    let pk = ddl::source_primary_key(pool, src_table).await?;
+    let pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
+    for rel in &relationships {
+        let shape = build_reverse_relationship_shape(pool, rel).await?;
+        if shape.qualified_projection.is_empty() {
+            continue;
+        }
+        let key_ident = quote_ident(&shape.to_col);
+        let keys: Vec<String> = txn
+            .query(
+                &format!(
+                    "select k from ( \
+                         select i::jsonb ->> $3 as k from unnest($1::text[]) i \
+                         union select t.{key_ident}::text from {to_table} t \
+                         where {pk_expr} = $2) keys \
+                     where k is not null order by k collate \"C\"",
+                    to_table = shape.to_side.table,
+                ),
+                &[&images, &key, &shape.to_col],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        txn.execute(
+            &format!(
+                "select 1 from {proj} where {key_ident}::text = any($1) \
+                 order by {key_ident} for update",
+                proj = shape.qualified_projection,
+            ),
+            &[&keys],
+        )
+        .await?;
+        for k in keys {
+            apply_projection_from_live(txn, &shape, &Some(k), &None, Some(lsn), None).await?;
+        }
     }
     Ok(())
 }
@@ -5165,18 +5288,18 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     if !image_less && !change.has_recompute {
                         continue;
                     }
-                    // For an image-less change only the live re-read can
-                    // carry the join key, by construction — there is no
-                    // image to read one from. A re-read that came back empty
-                    // (the key no longer exists) leaves nothing to resolve a
-                    // from-side row through, exactly as the both-images-absent
-                    // skip below always intended.
-                    let old_row = if image_less {
-                        None
-                    } else {
-                        old_rows[i].as_ref()
-                    };
-                    for row in [rows[i].as_ref(), old_row].into_iter().flatten() {
+                    // An image-less change carries no image of its own:
+                    // its new side is the live re-read, and its old side
+                    // (`old_side_image`) is its prior-image hint, the row as
+                    // readers last saw it, as the to-many branch above reads
+                    // it. A re-read that came back empty (the key no longer
+                    // exists) names no key, so only the hint reaches the
+                    // from-side rows of a parent that went away; issue #754:
+                    // a released parked delete is such a recompute.
+                    for row in [rows[i].as_ref(), old_rows[i].as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
                         // Issue #677: absent `to_col` is `MissingColumn`,
                         // only a `NULL` one is "no key".
                         let Some(join_text) = required_column(row, &rel.def.to_col, &rel.def.name)?
@@ -7385,7 +7508,10 @@ pub(crate) async fn apply_page(
                 )
                 .await?;
                 if superseded {
-                    apply_projection_from_live(txn, shape, &old_key, &new_key, record.lsn).await?
+                    apply_projection_from_live(
+                        txn, shape, &old_key, &new_key, record.lsn, record.lsn,
+                    )
+                    .await?
                 } else {
                     apply_projection_advance(
                         txn,
@@ -7482,7 +7608,8 @@ pub(crate) async fn apply_page(
         // here; see `apply_projection_advance`'s doc comment for the
         // distinction).
         if superseded {
-            apply_projection_from_live(txn, shape, &old_key, &new_key, record.lsn).await?
+            apply_projection_from_live(txn, shape, &old_key, &new_key, record.lsn, record.lsn)
+                .await?
         } else {
             apply_projection_advance(
                 txn,

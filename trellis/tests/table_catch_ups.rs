@@ -1042,3 +1042,221 @@ async fn an_escalated_older_reverse_does_not_undo_a_projection_refresh() {
     );
     assert_eq!(order_names(&client).await, renamed());
 }
+
+/// Drains sealed segment `seg_seq` alone.
+async fn drain_sealed(pool: &trellis::Pool, seg_seq: i64) {
+    while apply::drain_once(
+        pool,
+        seg_seq,
+        TEST_NAME,
+        1,
+        WAKE,
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+}
+
+/// `order_names` once customer 1 is gone.
+fn without_ann() -> Vec<(i32, Option<String>)> {
+    vec![(10, None), (11, Some("bob".to_string())), (12, None)]
+}
+
+/// Issue #754: a customer's delete at or below the refresh stamp drains
+/// while the customer's re-insert is committed but still in the ring, so the
+/// delete is superseded and written from the live row. Written from the live
+/// row, the re-insert's projection row outlived the customer: the re-insert
+/// and a later delete fold to a record with no image, which names no key, so
+/// nothing removed it. The live write leaves a key whose latest later
+/// pending change names it in its new image to that change.
+#[tokio::test]
+async fn a_superseded_delete_leaves_a_key_with_a_pending_reinsert_to_that_reinsert() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 1",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 1, "ann"),
+    )
+    .await;
+    let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, outcome.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    markers::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    commit_and_stage(
+        &mut client,
+        "insert into public.customers values (1, 'ann2')",
+        |lsn| customer_cdc(lsn, CdcOp::Insert, 1, "ann2"),
+    )
+    .await;
+    drain_sealed(&db.pool, outcome.sealed_seg_seq).await;
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 1",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 1, "ann2"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(projected_name(&client, 1).await, None);
+    assert_eq!(order_names(&client).await, without_ann());
+}
+
+/// Issue #754's other side: with no later pending change, a superseded
+/// delete still writes the key back from the live row, which a re-insert
+/// whose CDC was lost put there.
+#[tokio::test]
+async fn a_superseded_delete_writes_back_a_key_a_lost_reinsert_restored() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "delete from public.customers where id = 1",
+        |lsn| customer_cdc(lsn, CdcOp::Delete, 1, "ann"),
+    )
+    .await;
+    let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, outcome.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    markers::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    client
+        .batch_execute("insert into public.customers values (1, 'ann2')")
+        .await
+        .expect("re-insert customer 1, the CDC lost");
+    drain_sealed(&db.pool, outcome.sealed_seg_seq).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+}
+
+/// Parks customer `id`'s change as a poisoned key's batch would: the change
+/// is in `poison_held`, not the ring, and the key is marked poisoned.
+async fn park_customer_change(
+    client: &Client,
+    id: i32,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+) {
+    let key = id.to_string();
+    client
+        .execute(
+            "insert into poison (src_table, key, last_error) \
+             values ('public.customers', $1, 'test')",
+            &[&key],
+        )
+        .await
+        .expect("mark the customer poisoned");
+    client
+        .execute(
+            "insert into poison_held \
+                 (src_table, key, seg_seq, op, lsn, old_image, new_image, hop_gen) \
+             values ('public.customers', $1, 1, $2, pg_current_wal_insert_lsn(), \
+                     $3::text::jsonb, $4::text::jsonb, 0)",
+            &[&key, &op, &old_image, &new_image],
+        )
+        .await
+        .expect("park the customer's change");
+}
+
+/// Issue #754: releasing a parked to-side key stages an image-less
+/// `Recompute`, which re-derives the key's from-side rows but never moved
+/// the relationship's projection, so they re-derived from the name the
+/// projection held before the parked rename. The release writes the key's
+/// projection row from the live to-side row.
+#[tokio::test]
+async fn releasing_a_parked_to_side_rename_advances_the_projection() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    client
+        .batch_execute("update public.customers set name = 'ann2' where id = 1")
+        .await
+        .expect("rename customer 1");
+    park_customer_change(
+        &client,
+        1,
+        "update",
+        Some(r#"{"id":"1","name":"ann"}"#),
+        Some(r#"{"id":"1","name":"ann2"}"#),
+    )
+    .await;
+    trellis::staging::release_key(&db.pool, "public.customers", "1")
+        .await
+        .expect("release the parked customer");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
+
+/// Issue #754 for a parked delete: the release removes the key's projection
+/// row, and re-derives the from-side rows that pointed at it. The live row
+/// is gone, so only the parked change's pre-image names those rows.
+#[tokio::test]
+async fn releasing_a_parked_to_side_delete_removes_the_projection_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    client
+        .batch_execute("delete from public.customers where id = 1")
+        .await
+        .expect("delete customer 1");
+    park_customer_change(
+        &client,
+        1,
+        "delete",
+        Some(r#"{"id":"1","name":"ann"}"#),
+        None,
+    )
+    .await;
+    trellis::staging::release_key(&db.pool, "public.customers", "1")
+        .await
+        .expect("release the parked customer");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(projected_name(&client, 1).await, None);
+    assert_eq!(order_names(&client).await, without_ann());
+}

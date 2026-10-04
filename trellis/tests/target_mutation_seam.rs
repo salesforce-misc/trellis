@@ -1779,3 +1779,185 @@ async fn only_a_rewrites_catch_up_refreshes_the_projection() {
         );
     }
 }
+
+/// Seals the active segment and returns its `seg_seq`, leaving it undrained.
+async fn seal_only(raw: &mut Client) -> i64 {
+    let outcome = trellis::staging::seal::seal_phase1(raw)
+        .await
+        .expect("seal phase 1");
+    trellis::staging::seal::seal_phase2(raw, outcome.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+/// Drains sealed segment `seg_seq` alone, then retires what has drained.
+async fn drain_sealed(pool: &trellis::Pool, raw: &mut Client, seg_seq: i64) {
+    while apply::drain_once(
+        pool,
+        seg_seq,
+        "seam_test",
+        1,
+        WAKE,
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+    retire_drained_segments(raw)
+        .await
+        .expect("retire drained segments");
+}
+
+/// Issue #754 on a seam-fed to-side, where every record takes the live-row
+/// check: a target row's delete drains after the row's re-insert reached the
+/// target, while the re-insert's seam row is still in the ring. The delete
+/// is superseded, and written from the live row it put the re-insert's
+/// values in the projection. The re-insert's seam row then folded with a
+/// later delete's into a record with no image, so that projection row
+/// outlived the target row. The live write leaves the key to the pending
+/// re-insert instead, and removes the projection row the delete would have.
+#[tokio::test]
+async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_reinsert() {
+    use trellis::staging::CdcOp;
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, a numeric); \
+         insert into public.orders values (1, 1), (2, 2); \
+         create table public.order_doubles (id integer primary key, x numeric); \
+         create table public.reports (id integer primary key, oid integer); \
+         insert into public.reports values (1, 1), (2, 2); \
+         create table public.report_view (id integer primary key, x numeric)",
+    )
+    .await
+    .expect("create tables");
+    one_to_one_ledgers(&raw, &["order_doubles", "report_view"]).await;
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
+        &numeric_columns(&["id", "a"]),
+    )
+    .await
+    .expect("define order_doubles");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    markers::settle_registrations(&db.pool).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
+    .expect("a to-one relationship on the live target");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.report_view FROM public.reports SELECT rollup.x AS x",
+        &numeric_columns(&["id", "oid"]),
+    )
+    .await
+    .expect("define a consumer through the relationship");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    let projection_rows =
+        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
+    let report_view = "select id::text, coalesce(x::text, 'null') from public.report_view";
+    assert_eq!(
+        rows(&raw, report_view).await,
+        BTreeMap::from([
+            ("1".to_string(), "2".to_string()),
+            ("2".to_string(), "4".to_string()),
+        ]),
+        "precondition: the consumer reads the target through the projection"
+    );
+
+    // Order 1's delete reaches the target, and its seam row is sealed.
+    raw.batch_execute("delete from public.orders where id = 1")
+        .await
+        .expect("delete order 1");
+    stage_cdc(
+        &mut raw,
+        "public.orders",
+        "1",
+        CdcOp::Delete,
+        Some(r#"{"id":"1","a":"1"}"#),
+        None,
+        None,
+    )
+    .await;
+    let source_delete = seal_only(&mut raw).await;
+    drain_sealed(&db.pool, &mut raw, source_delete).await;
+    let seam_delete = seal_only(&mut raw).await;
+
+    // Its re-insert reaches the target, and its seam row stays in the ring.
+    raw.batch_execute("insert into public.orders values (1, 5)")
+        .await
+        .expect("re-insert order 1");
+    stage_cdc(
+        &mut raw,
+        "public.orders",
+        "1",
+        CdcOp::Insert,
+        None,
+        Some(r#"{"id":"1","a":"5"}"#),
+        None,
+    )
+    .await;
+    let source_insert = seal_only(&mut raw).await;
+    drain_sealed(&db.pool, &mut raw, source_insert).await;
+
+    // The delete's seam row drains, superseded by the re-inserted target row.
+    drain_sealed(&db.pool, &mut raw, seam_delete).await;
+
+    // The target row goes again, in the same segment as the re-insert's seam
+    // row, so the two fold to a record with no image.
+    let txn = raw.transaction().await.expect("begin");
+    txn.batch_execute(
+        "delete from public.orders where id = 1; \
+         delete from public.order_doubles where id = 1",
+    )
+    .await
+    .expect("delete order 1 and its target row");
+    let lsn: tokio_postgres::types::PgLsn = txn
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the WAL insert position")
+        .get(0);
+    append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: "public.order_doubles".to_string(),
+            key: "1".to_string(),
+            op: CdcOp::Delete,
+            lsn: Some(lsn),
+            old_image: Some(r#"{"id":"1","x":"10"}"#.to_string()),
+            new_image: None,
+            origin_lsn: Some(lsn),
+            src_changed: None,
+            hop_gen: 1,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the target delete's seam row");
+    txn.commit().await.expect("commit");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    assert_eq!(
+        rows(&raw, &projection_rows).await,
+        BTreeMap::from([("2".to_string(), "4".to_string())]),
+        "the projection follows the target"
+    );
+    assert_eq!(
+        rows(&raw, report_view).await,
+        BTreeMap::from([
+            ("1".to_string(), "null".to_string()),
+            ("2".to_string(), "4".to_string()),
+        ]),
+        "the consumer no longer reads the deleted target row"
+    );
+}
