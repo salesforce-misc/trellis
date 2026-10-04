@@ -1078,7 +1078,7 @@ pub(crate) async fn complete_direct_backfill(
 }
 
 /// [`tables_read_by`] for the persisted definition `definition_id`.
-async fn definition_tables_read(
+pub(crate) async fn definition_tables_read(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
 ) -> Result<Vec<String>, CatalogError> {
@@ -1180,6 +1180,47 @@ pub(crate) async fn applying_readers(
         }
     }
     Ok(readers)
+}
+
+/// Whether any definition the drain applies `table`'s rows to reads it: one
+/// in an applying status by [`super::model::applying_sql`] (so a Re-derive
+/// build's `backfilling` definition counts, unlike [`applying_readers`]),
+/// reading `table` as its source or through a relationship one of its fields
+/// reads ([`tables_read_by`]).
+///
+/// The drain asks this only when `table`'s primary key can't be used
+/// (`staging::apply::compute`, issue #768), to tell a table whose rows no
+/// reader would apply, which it skips, from one a reader still needs, which
+/// halts it.
+pub(crate) async fn has_applying_reader(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<bool, CatalogError> {
+    let rows = client
+        .query(
+            &format!(
+                "select source_table, definition_text from transform_definitions d \
+                 where {} order by id",
+                super::model::applying_sql("d")
+            ),
+            &[],
+        )
+        .await?;
+    for row in rows {
+        let qualified: String = row.get(0);
+        if qualified == table {
+            return Ok(true);
+        }
+        let def = parse(row.get::<_, &str>(1))?;
+        if tables_read_by(client, &def, &qualified)
+            .await?
+            .iter()
+            .any(|t| t == table)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Every table `def`'s direct build reads, fully qualified, sorted and

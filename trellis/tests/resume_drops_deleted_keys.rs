@@ -898,8 +898,13 @@ async fn a_discharge_that_fails_after_its_sweep_leaves_the_target_as_it_was() {
         "the rolled-back discharge staged nothing for rollup_echo or the sibling"
     );
     assert_eq!(status(&client, "order_rollup").await, "waiting_to_backfill");
+    // The source's marker; the resume parks one on the to-side `grps` too,
+    // for its projection refresh (#768).
     let markers: i64 = client
-        .query_one("select count(*) from pending_backfill", &[])
+        .query_one(
+            "select count(*) from pending_backfill where split_part(table_name, '.', 2) = 'orders'",
+            &[],
+        )
         .await
         .expect("count markers")
         .get(0);

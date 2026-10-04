@@ -4852,6 +4852,74 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
     }
 }
 
+/// The primary key [`compute`] keys `qualified_source`'s changes by
+/// ([`ddl::source_primary_key`]), or `None` when the key can't be used and
+/// no definition applies the table's rows, so `compute` skips them.
+///
+/// A dropped source is [`ApplyError::SourceTableDropped`], reported under
+/// `qualified_source`, the ring's own spelling (issue #267): its consumers
+/// (`quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
+/// `folded.retain`) match it against a ring row's `src_table` as an exact
+/// string.
+///
+/// Issue #768: a key that no longer passes the key gate (a type off the
+/// allowlist, or no key at all) halts the drain only while some definition
+/// applies the table's rows ([`catalog::has_applying_reader`], under the
+/// canonical `source_key`): a reader of it, directly or through a
+/// relationship, would key them wrongly or not at all. A table no reader
+/// applies, its readers paused or capture-failed, is skipped instead. Its
+/// changes drain with the page, which marks its claim drained whatever the
+/// plan holds, exactly as a paused definition's share is dropped when
+/// `catalog::transforms_for_source` leaves it out, and a resume rebuilds
+/// from the source. A relationship's settled projection on it gets none of
+/// them either, so a resume refreshes the projections on every to-side the
+/// resumed definition reads (`quarantine::resume_transform`). Asked only on
+/// the error, so a drain over usable keys reads nothing more.
+///
+/// The halt is the stance while a reader still applies (#703 R2 would pause
+/// that reader in the drain): the capture pass that pauses every reader of a
+/// retyped key (#760) ends it, since the next attempt finds none.
+async fn source_key_for_apply(
+    pool: &Pool,
+    qualified_source: &str,
+    source_key: &str,
+) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
+    let err = match ddl::source_primary_key(pool, qualified_source).await {
+        Ok(pk) => return Ok(Some(pk)),
+        Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
+            return Err(ApplyError::SourceTableDropped {
+                source_table: qualified_source.to_string(),
+            });
+        }
+        Err(DdlError::NoPrimaryKey { source_table })
+            if quarantine::source_table_missing(pool, &source_table).await? =>
+        {
+            return Err(ApplyError::SourceTableDropped { source_table });
+        }
+        Err(err) => err,
+    };
+    if !matches!(
+        err,
+        DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. }
+    ) {
+        return Err(err.into());
+    }
+    let has_reader = {
+        let client = pool.get().await?;
+        catalog::has_applying_reader(&**client, source_key).await?
+    };
+    if has_reader {
+        return Err(err.into());
+    }
+    tracing::warn!(
+        src_table = %qualified_source,
+        error = %err,
+        "no definition applies this table's rows and its key can't be used; \
+         skipping its changes"
+    );
+    Ok(None)
+}
+
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
 /// folded change's `f()` against the transform currently reading its
 /// source table, grouped by (unqualified) `src_table` so each source's
@@ -5066,35 +5134,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // the individual definition (issue #69) — introspected once per
         // source here and reused both below (every definition subscribed to
         // this source) and by the row decode below (every change, whichever
-        // definition it's evaluated against). A live `42P01` here means
-        // `source_key` no longer exists (issue #16's dropped-table purge,
-        // not an ordinary DDL error) — see [`ApplyError::SourceTableDropped`].
-        //
-        // Issue #267: reported as `qualified_source` (the ring's own spelling)
-        // rather than the canonical `source_key`. This error's two consumers —
-        // `quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
-        // `folded.retain(|c| c.src_table != source_table)` — both compare it
-        // to a ring row's `src_table` as an exact string, so a bare name
-        // purges and filters *nothing* and the retry loop re-fails forever on
-        // the same input. The `NoPrimaryKey` arm just below always did report
-        // the qualified form (`source_primary_key` echoes back the name it was
-        // given, which is `qualified_source` here); this arm's bare spelling
-        // happened to match only for a propagated downstream trigger, the one
-        // producer of bare `src_table` rows — which is exactly what #267
-        // stopped producing, so the two arms are made consistent instead.
-        let pk = match ddl::source_primary_key(pool, qualified_source).await {
-            Ok(pk) => pk,
-            Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
-                return Err(ApplyError::SourceTableDropped {
-                    source_table: qualified_source.to_string(),
-                });
-            }
-            Err(DdlError::NoPrimaryKey { source_table })
-                if quarantine::source_table_missing(pool, &source_table).await? =>
-            {
-                return Err(ApplyError::SourceTableDropped { source_table });
-            }
-            Err(err) => return Err(err.into()),
+        // definition it's evaluated against). A dropped source is
+        // [`ApplyError::SourceTableDropped`] (issue #16's purge, #267's
+        // spelling); `None` is a key that can't be used on a table no
+        // definition applies (issue #768), whose changes are dropped with
+        // the page. See [`source_key_for_apply`].
+        let Some(pk) = source_key_for_apply(pool, qualified_source, &source_key).await? else {
+            continue;
         };
 
         // Issue #344: the source column list a 1-1 target's Phase 3 check
@@ -5722,22 +5768,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let version = catalog::source_table_version(pool, &source_key).await?;
         versions.entry(source_key.clone()).or_insert(version);
 
-        let pk = match ddl::source_primary_key(pool, &change.src_table).await {
-            Ok(pk) => pk,
-            Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
-                // Issue #267: the ring's own spelling, not the canonical
-                // `source_key` — see the by-source loop above's identical
-                // comment on this same arm.
-                return Err(ApplyError::SourceTableDropped {
-                    source_table: change.src_table.clone(),
-                });
-            }
-            Err(DdlError::NoPrimaryKey { source_table })
-                if quarantine::source_table_missing(pool, &source_table).await? =>
-            {
-                return Err(ApplyError::SourceTableDropped { source_table });
-            }
-            Err(err) => return Err(err.into()),
+        // The same key read, and skip, as the by-source loop's above.
+        let Some(pk) = source_key_for_apply(pool, &change.src_table, &source_key).await? else {
+            continue;
         };
         // `&change.src_table` (qualified), not `source_key` — see
         // the by-source loop above's identical comment on its own

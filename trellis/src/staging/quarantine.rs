@@ -2595,7 +2595,10 @@ async fn reads_paused_sibling(
 /// sweep drops the keys deleted while it was frozen. Any other definition
 /// gets a fresh `pending_backfill` marker for its source table
 /// ([`crate::intake::markers::park_marker`], which every marker goes
-/// through). The target is left exactly as
+/// through). Every relationship to-side the definition reads gets a marker
+/// too, whose discharge refreshes the settled projections on it (issue
+/// #768: the drain may have skipped changes to it while it was frozen). The
+/// target is left exactly as
 /// the freeze left it until that marker's discharge
 /// ([`crate::intake::markers::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
@@ -2751,6 +2754,21 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     };
     if !rederive_built {
         crate::intake::markers::park_marker(&*txn, &source_table).await?;
+    }
+    // Issue #768: a to-side the definition reads through a relationship may
+    // have had changes no reader applied while it was frozen. The drain
+    // skips a to-side whose key can't be used when no applying definition
+    // reads it (`staging::apply::source_key_for_apply`), and those changes
+    // never reach the relationship's settled projection, which the rebuild
+    // and every later apply read. So each such to-side gets a marker whose
+    // discharge refreshes its projections from the table, as a capture widen
+    // of it does (`park_widen_marker`). The same discharge re-reads the
+    // to-side, so a row derived from the stale projection before it runs is
+    // re-derived from the refreshed one by reverse propagation.
+    for table in catalog::definition_tables_read(&txn, id).await? {
+        if table != source_table {
+            crate::intake::markers::park_widen_marker(&*txn, &table).await?;
+        }
     }
     // #622 C6: a transform paused by a schema change stops being reported as
     // such the moment it is resumed. Its columns count for capture again from

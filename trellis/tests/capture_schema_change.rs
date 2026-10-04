@@ -1223,3 +1223,192 @@ async fn the_release_of_a_field_awaiting_capture_builds_a_reader_added_after_it(
         "the release's build writes the reader added after it was registered"
     );
 }
+
+/// `public.users`, keyed by `handle`, is the to-side of `posts.author`;
+/// `posts_named` reads a user's name through it, `posts_plain` reads only
+/// `posts`, and `public.o` is an unrelated table whose `o_copy` shares the
+/// drain's pages with them (#768). All live.
+async fn retyped_to_side_setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+    raw.batch_execute(
+        "create table public.users (handle varchar(16) primary key, name text); \
+         create table public.posts (id int primary key, author varchar(16)); \
+         create table public.o (id int primary key, v int); \
+         insert into public.users values ('ann', 'Ann'), ('bob', 'Bob'); \
+         insert into public.posts values (1, 'ann'), (2, 'bob'); \
+         insert into public.o values (1, 10);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(dsn).await;
+    for text in [
+        "RELATIONSHIP author FROM posts.author TO users.handle",
+        "TRANSFORM posts_named FROM public.posts SELECT author.name AS name",
+        "TRANSFORM posts_plain FROM public.posts SELECT author AS author",
+        "TRANSFORM o_copy FROM public.o SELECT v AS v",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(raw, pool, &["posts_named", "posts_plain", "o_copy"]).await;
+    trellis
+}
+
+/// Issue #768: a to-side's primary key retyped off the key allowlist
+/// (`character(8)`, whose `::text` drops the padding an image keeps) once
+/// every definition reading the table is paused. The drain reads the key of
+/// every staged table, and used to fail every page holding a write to this
+/// one with `UnsupportedPrimaryKeyType`, though no reader would apply the
+/// row: the to-side stays captured while its from-side has any definition
+/// (`posts_plain` here, which doesn't read it). Now such a table's rows are
+/// dropped like any paused reader's share, and the unrelated table on the
+/// same pages keeps converging, through a row write and a `TRUNCATE` alike.
+#[tokio::test]
+async fn a_to_side_key_retyped_off_the_allowlist_does_not_halt_the_drain_once_its_readers_are_paused()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM posts_named")
+        .await
+        .expect("pause the reader");
+    app.batch_execute("alter table public.users alter column handle type character(8)")
+        .await
+        .expect("retype the key");
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+    app.batch_execute(
+        "update public.users set name = 'Annie' where handle = 'ann'; \
+         insert into public.users values ('cy', 'Cy'); \
+         update public.o set v = 11 where id = 1;",
+    )
+    .await
+    .expect("write the to-side and the unrelated table");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, "select id::text, v::text from public.o_copy").await,
+        vec![vec![Some("1".to_string()), Some("11".to_string())]],
+        "the unrelated table's write drained past the retyped to-side's"
+    );
+
+    app.batch_execute("truncate public.users; insert into public.o values (2, 20)")
+        .await
+        .expect("truncate the to-side");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, v::text from public.o_copy order by id"
+        )
+        .await,
+        vec![
+            vec![Some("1".to_string()), Some("11".to_string())],
+            vec![Some("2".to_string()), Some("20".to_string())],
+        ],
+        "a truncate of the retyped to-side drains too"
+    );
+    assert_eq!(status(&raw, "posts_named").await, TransformStatus::Paused);
+    assert_eq!(status(&raw, "posts_plain").await, TransformStatus::Live);
+}
+
+/// Issue #768's other half: while a definition still applies a to-side's
+/// rows, a primary key retyped off the allowlist halts the drain as before
+/// (#703 R2 would pause it in the drain instead). Nothing is dropped for a
+/// reader that would apply it.
+#[tokio::test]
+async fn a_to_side_key_retyped_off_the_allowlist_still_halts_the_drain_while_a_reader_applies() {
+    use trellis::staging::{StagedWatermark, apply, seal};
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let _trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute(
+        "alter table public.users alter column handle type character(8); \
+         update public.users set name = 'Annie' where handle = 'ann';",
+    )
+    .await
+    .expect("retype the key, and write");
+    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, outcome.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    let err = apply::drain_once(
+        &db.pool,
+        outcome.sealed_seg_seq,
+        "capture_schema_change_test",
+        1,
+        "trellis_capture_schema_change_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect_err("the drain halts while posts_named applies the to-side");
+    assert!(
+        err.to_string().contains("character"),
+        "the halt names the unsupported key type: {err}"
+    );
+}
+
+/// Issue #768: the to-side rows skipped while every reader was paused never
+/// reached the relationship's settled projection either. Resuming a reader
+/// once the key is back on the allowlist refreshes the projection, so rows
+/// the resumed reader derives later read the names written meanwhile, not
+/// the ones the projection held at the pause.
+#[tokio::test]
+async fn resuming_a_reader_refreshes_the_projection_its_skipped_to_side_rows_missed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM posts_named")
+        .await
+        .expect("pause the reader");
+    app.batch_execute(
+        "alter table public.users alter column handle type character(8); \
+         update public.users set name = 'Annie' where handle = 'ann'; \
+         insert into public.users values ('cy', 'Cy'); \
+         delete from public.users where handle = 'bob';",
+    )
+    .await
+    .expect("retype the key, and write the to-side");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    app.batch_execute("alter table public.users alter column handle type varchar(16)")
+        .await
+        .expect("retype the key back");
+    trellis
+        .apply("RESUME TRANSFORM posts_named")
+        .await
+        .expect("resume");
+    bring_live(
+        &mut raw,
+        &db.pool,
+        &["posts_named", "posts_plain", "o_copy"],
+    )
+    .await;
+    app.batch_execute("insert into public.posts values (3, 'ann'), (4, 'cy'), (5, 'bob')")
+        .await
+        .expect("posts after the resume");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.posts_named order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select p.id::text, u.name from public.posts p \
+             left join public.users u on u.handle = p.author order by p.id"
+        )
+        .await,
+        "the resumed reader reads the to-side as it is now"
+    );
+}
