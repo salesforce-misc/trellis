@@ -46,6 +46,8 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
+use crate::defs::key_types;
+use crate::defs::model::RelationshipCardinality;
 use crate::pool::Pool;
 
 /// What one table's markers in a drain's segments say is missing, or what
@@ -362,6 +364,167 @@ pub(crate) async fn pause_readers_of_unsupported(
     let txn = client.transaction().await?;
     for (id, error) in pauses {
         if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error).await? {
+            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// The staging worker's capture pass's check of `table`'s key columns'
+/// types and collations (issue #760, [`crate::defs::key_types`]). It pauses
+/// every definition that reads `table` and isn't paused for a capture
+/// failure yet when one of its key columns there
+///
+/// - has a type or collation define would refuse for that use now
+///   ([`key_types::refusal`]): an `ALTER COLUMN ... TYPE character(n)` on a
+///   join column, a nondeterministic `COLLATE` on a `GROUP BY` column; or
+/// - changed type, since the definition was accepted, in a way that renders
+///   the values Trellis already stored differently
+///   ([`key_types::renders_differently`]): `timestamp` to `timestamptz`,
+///   `text` to `uuid`.
+///
+/// A routine widening (`integer` to `bigint`, `varchar(n)` to `text`) does
+/// neither. The types it compares against are those recorded when the
+/// definition was accepted; a key column with none recorded (one a later
+/// `ALTER TRANSFORM` added) gets the live one recorded here instead.
+///
+/// Both checks hold across a resume: the first reads the live column, and
+/// the recorded type isn't touched, because a resume rebuilds into the
+/// tables Trellis created from it. So resuming with the type still changed
+/// pauses the definition again on the next pass, before a discharge can
+/// dispatch its rebuild.
+///
+/// A key column the table no longer has is
+/// [`pause_readers_of_missing`]'s, which the pass runs first. Returns whether
+/// it paused any. Costs no query for a table no unpaused definition reads.
+pub(crate) async fn pause_readers_of_retyped(
+    client: &mut Client,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    let readers = unpaused_readers(catalog, table);
+    if readers.is_empty() {
+        return Ok(false);
+    }
+    let (live, key) = key_types::live_columns(&*client, table).await?;
+    if live.is_empty() {
+        // No such table: `capture_spec` reports it.
+        return Ok(false);
+    }
+    // Each recorded type, with its `format_type` rendering for the reason.
+    let mut recorded: BTreeMap<(i64, String), (key_types::ColumnType, String)> = BTreeMap::new();
+    for row in client
+        .query(
+            "select transform_id, column_name, type_name, typmod, \
+                    coalesce(pg_catalog.format_type(pg_catalog.to_regtype(type_name), typmod), \
+                             type_name) \
+             from definition_key_types \
+             where transform_id = any($1) and table_name = $2",
+            &[&readers, &table],
+        )
+        .await?
+    {
+        recorded.insert(
+            (row.get(0), row.get(1)),
+            (
+                key_types::ColumnType {
+                    type_name: row.get(2),
+                    typmod: row.get(3),
+                },
+                row.get(4),
+            ),
+        );
+    }
+    let to_tables: Vec<String> = catalog
+        .relationships
+        .iter()
+        .map(|r| r.qualified_to_table())
+        .collect();
+
+    let mut pauses: Vec<(i64, Vec<String>, String)> = Vec::new();
+    let mut unrecorded: Vec<(i64, String)> = Vec::new();
+    for reader in catalog
+        .definitions
+        .iter()
+        .filter(|r| readers.contains(&r.id))
+    {
+        let rels: Vec<key_types::RelRef<'_>> = catalog
+            .relationships
+            .iter()
+            .zip(&to_tables)
+            .filter(|(r, _)| r.qualified_from_table() == reader.source)
+            .map(|(r, to_table)| key_types::RelRef {
+                name: &r.def.name,
+                from_col: &r.def.from_col,
+                to_col: &r.def.to_col,
+                to_table,
+                to_one: r.cardinality == RelationshipCardinality::ToOne,
+            })
+            .collect();
+        let mut columns: Vec<String> = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        for (column, key_use) in
+            key_types::key_uses(&reader.def, &reader.source, &rels, table, &key)
+        {
+            if columns.contains(&column) {
+                continue;
+            }
+            let Some(now) = live.get(&column) else {
+                continue;
+            };
+            let reason = match key_types::refusal(&*client, table, &column, &key_use, now).await? {
+                Some(reason) => Some(reason),
+                None => match recorded.get(&(reader.id, column.clone())) {
+                    Some((old, was))
+                        if key_types::renders_differently(old, &now.ty, key_use.mirrored()) =>
+                    {
+                        Some(key_types::retyped_error(table, &column, &key_use, was, now))
+                    }
+                    Some(_) => None,
+                    None => {
+                        if !unrecorded.contains(&(reader.id, column.clone())) {
+                            unrecorded.push((reader.id, column.clone()));
+                        }
+                        None
+                    }
+                },
+            };
+            if let Some(reason) = reason {
+                columns.push(column);
+                reasons.push(reason);
+            }
+        }
+        if !reasons.is_empty() {
+            let error = format!(
+                "{}. Change the column back and resume the definition to rebuild it, or drop \
+                 the definition and define it again",
+                reasons.join("; ")
+            );
+            pauses.push((reader.id, columns, error));
+        }
+    }
+
+    // Recorded on its own: the next pass compares against it whether or not
+    // this one pauses anything.
+    let mut by_reader: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
+    for (id, column) in unrecorded {
+        by_reader
+            .entry(id)
+            .or_default()
+            .push((table.to_string(), column));
+    }
+    for (id, columns) in &by_reader {
+        key_types::record(&*client, *id, columns).await?;
+    }
+    if pauses.is_empty() {
+        return Ok(false);
+    }
+    let txn = client.transaction().await?;
+    for (id, columns, error) in pauses {
+        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &columns, &error)
+            .await?
+        {
             tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }

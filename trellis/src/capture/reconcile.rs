@@ -23,6 +23,12 @@
 //! row-level security now applies to the worker's role, which would filter
 //! the writes (#765).
 //!
+//! It also pauses every definition one of whose key columns on the table
+//! (its source key, a `GROUP BY` key, a join column or to-side key of a
+//! relationship it reads through) now has a type or collation define would
+//! refuse, or changed type in a way that renders the keys already stored
+//! differently (#760, [`crate::staging::schema_change::pause_readers_of_retyped`]).
+//!
 //! # Never waiting on `apply`'s path
 //!
 //! Defining a transform only registers it. Installing and widening take a
@@ -160,6 +166,24 @@ pub async fn reconcile(
                 // Neither waiting nor failing: the next pass decides afresh.
                 continue;
             }
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
+        // #760: a key column whose type or collation define would refuse
+        // now, or whose type change renders the stored keys differently,
+        // pauses its readers. After the missing-column check, which owns a
+        // key column that's gone.
+        match crate::staging::schema_change::pause_readers_of_retyped(
+            client,
+            &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => continue,
             Err(err) => {
                 outcome.failed.push((table.clone(), err));
                 continue;

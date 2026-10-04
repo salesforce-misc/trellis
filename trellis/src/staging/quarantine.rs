@@ -2960,7 +2960,11 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // here, so the next reconcile widens the source's capture to them before
     // the discharge may dispatch the rebuild, or, if a column is still
     // missing, pauses it again with the reason
-    // (`staging::schema_change::pause_readers_of_missing`).
+    // (`staging::schema_change::pause_readers_of_missing`). Likewise a key
+    // column whose type or collation is still one the pass refuses (#760,
+    // `pause_readers_of_retyped`): its recorded type in
+    // `definition_key_types` stays, since the rebuild writes into the tables
+    // created from it.
     txn.execute(
         "delete from capture_failures where transform_id = $1",
         &[&id],

@@ -225,6 +225,34 @@ would otherwise wait to backfill forever, with the table's capture failing
 every pass and nothing on its status; instead it pauses again with its
 `capture_failure`. A pass that pauses leaves the table for the next pass.
 
+## A re-typed key column
+
+`ALTER COLUMN ... TYPE` rewrites the table but keeps its triggers, and the
+capture functions name columns in dynamic SQL, so capture goes on working
+over the new type: nothing marks the change. The rows the rewrite changes
+fire no trigger at all.
+
+So the same pass also checks every key column of the table: each
+definition's source key, its `GROUP BY` keys, and each relationship it reads
+through's join columns and to-side key (`defs::key_types`). Before it
+regenerates anything, it pauses a definition, with its `capture_failure`,
+when one of those columns now has a type or collation define would refuse
+for that use (a join column made `character(n)`, a nondeterministic
+`COLLATE` on a `GROUP BY` column), or when its type changed in a way that
+renders the values already stored differently (`timestamp` to `timestamptz`,
+`date` to `timestamp`, `text` to `uuid`). The second check compares against
+the type recorded in `definition_key_types` when the definition was
+accepted. A resume leaves that record alone, because the rebuild writes into
+the tables Trellis created from the old type, so the next pass pauses the
+definition again until the column is changed back. Routine changes don't
+fire: `integer` to `bigint`, any `varchar(n)` and `text` change, a `numeric`
+precision change, a change between deterministic collations.
+
+The pause doesn't stop a drain that reads a source key whose type is off the
+key allowlist: `staging::apply::compute` introspects every staged table's key
+before it asks which definitions apply, and halts on that type, as it did
+before #760. Changing the column back lets it continue.
+
 ## Nested writes to the same key
 
 When an application `AFTER ROW` trigger, or a self-referencing cascade,

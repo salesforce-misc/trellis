@@ -1547,7 +1547,7 @@ pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
 /// column is typed [`ValueType::Other`] — see
 /// [`ValidationError::UnsupportedGroupByKeyType`] for why a key role needs
 /// more than #108's passthrough classification.
-fn reject_unsupported_group_by_key_type(
+pub(crate) fn reject_unsupported_group_by_key_type(
     column: &str,
     value_type: ValueType,
 ) -> Result<(), ValidationError> {

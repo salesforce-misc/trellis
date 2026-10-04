@@ -35,6 +35,7 @@ pub mod ddl;
 pub mod error;
 pub mod eval;
 pub mod invertibility;
+pub(crate) mod key_types;
 pub mod ledger;
 mod lexer;
 pub mod lifecycle;

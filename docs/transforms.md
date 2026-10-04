@@ -161,6 +161,21 @@ never casts a join key. The error names both columns and both types. Both
 sides also need deterministic collations
 ([Supported sources and targets](#supported-sources-and-targets)).
 
+These rules hold after define too (#760). If an `ALTER COLUMN ... TYPE` or
+`COLLATE` later gives a key column (a source's primary key, a `GROUP BY`
+column, or a relationship's join column or to-side key) a type or collation
+define would refuse, or changes its type so that its existing values render
+differently (`timestamp` to `timestamptz`, `date` to `timestamp`, `text` to
+`uuid`), the staging worker pauses each definition that keys by it, with the
+reason on `status()`'s `capture_failure`. Change the column back and resume
+the definition, or drop it and define it again; resuming with the column
+still changed pauses it again. Widening a key (`integer` to `bigint`,
+`varchar(50)` to `varchar(255)` or `text`) pauses nothing, even while the two
+join columns differ between two `ALTER`s. Trellis doesn't widen the columns
+it created from the old type, though: a 1-1 target's key, a `GROUP BY`
+target's key and a relationship projection's key keep it, so a key that
+doesn't fit the old type fails to apply.
+
 See [0006-relationships](decisions/0006-relationships.md) for the full design and
 [0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)
 for how the cardinality/uniqueness prerequisites are validated (never imposed) on

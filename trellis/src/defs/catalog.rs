@@ -2679,6 +2679,15 @@ async fn create_definition_inner(
         }
         Err(err) => return Err(err.into()),
     };
+    record_key_types_in_txn(
+        &txn,
+        id,
+        &def,
+        &qualified_source,
+        &source_key,
+        &relationships,
+    )
+    .await?;
 
     txn.commit().await?;
 
@@ -2997,8 +3006,12 @@ struct ValidatedRelationship {
 /// A from-side join column with no usable index is a performance warning
 /// ([`RelationshipWarning::MissingFkIndex`]), not a requirement.
 ///
-/// The source schema changing after this runs is out of scope: it belongs to
-/// the user (ADR-0005).
+/// The source schema is the user's to change after this runs (ADR-0005). A
+/// join column or endpoint key re-typed or re-collated into what this would
+/// refuse pauses the definitions that read through the relationship
+/// (#760, `staging::schema_change::pause_readers_of_retyped`). Rule 1's
+/// same-type-and-collation pairing isn't re-checked, since widening both
+/// join columns takes two `ALTER`s.
 async fn validate_relationship(
     txn: &tokio_postgres::Transaction<'_>,
     def: &RelationshipDef,
@@ -4168,6 +4181,58 @@ fn assert_deterministic_key_collation(
             collation: resolved.collation.clone().unwrap_or_default(),
         },
     )))
+}
+
+/// Issue #760: records the type each of definition `id`'s key columns has
+/// now, the one its target, ledger and projections are built from, so the
+/// staging worker's capture pass can tell when an `ALTER COLUMN ... TYPE`
+/// renders those keys differently (see [`super::key_types`]). The key
+/// columns are [`super::key_types::key_uses`]'s, on the source (keyed by
+/// `source_key`) and on each relationship's to-side.
+async fn record_key_types_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    id: i64,
+    def: &TransformDef,
+    qualified_source: &str,
+    source_key: &[ddl::PrimaryKeyColumn],
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Result<(), CatalogError> {
+    let rels: Vec<super::key_types::RelRef<'_>> = relationships
+        .iter()
+        .map(|(name, r)| super::key_types::RelRef {
+            name,
+            from_col: &r.from_col,
+            to_col: &r.to_col,
+            to_table: &r.qualified_to_table,
+            to_one: r.cardinality == RelationshipCardinality::ToOne,
+        })
+        .collect();
+    let mut tables: Vec<(String, Vec<String>)> = vec![(
+        qualified_source.to_string(),
+        source_key.iter().map(|c| c.name.clone()).collect(),
+    )];
+    for r in relationships.values() {
+        if tables.iter().any(|(t, _)| *t == r.qualified_to_table) {
+            continue;
+        }
+        let key = ddl::identity_key_columns(txn, &r.qualified_to_table)
+            .await?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        tables.push((r.qualified_to_table.clone(), key));
+    }
+    let mut columns: Vec<(String, String)> = Vec::new();
+    for (table, key) in &tables {
+        for (column, _) in super::key_types::key_uses(def, qualified_source, &rels, table, key) {
+            let entry = (table.clone(), column);
+            if !columns.contains(&entry) {
+                columns.push(entry);
+            }
+        }
+    }
+    super::key_types::record(txn, id, &columns).await?;
+    Ok(())
 }
 
 /// Issue #638: refuses a definition if any column the engine matches as one
