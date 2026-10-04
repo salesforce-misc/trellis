@@ -23,6 +23,12 @@
 //! - **Ledger bytes** ([`ledger_bytes`]): `pg_total_relation_size` summed over
 //!   every table named `%__ledger`, read at the window's end. `0` until the
 //!   engine creates ledger tables (#623 D2).
+//! - **Ledger updates** ([`ledger_updates`]): `pg_stat_user_tables`'
+//!   `n_tup_upd` and `n_tup_hot_upd` summed over the same tables, read at the
+//!   window's end (#775). They count from the ledger's creation, not from the
+//!   window's start, and miss what a backend has not yet flushed to the
+//!   cumulative statistics (up to a second or so), so only their ratio is
+//!   meaningful: the share of ledger updates that were HOT.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -123,6 +129,20 @@ pub async fn ledger_bytes(raw: &RawClient) -> i64 {
     .get(0)
 }
 
+/// `n_tup_upd` and `n_tup_hot_upd` summed over the tables [`ledger_bytes`]
+/// sizes.
+pub async fn ledger_updates(raw: &RawClient) -> (i64, i64) {
+    let row = raw
+        .query_one(
+            "select coalesce(sum(n_tup_upd), 0)::bigint, coalesce(sum(n_tup_hot_upd), 0)::bigint \
+             from pg_stat_user_tables where relname like '%\\_\\_ledger'",
+            &[],
+        )
+        .await
+        .expect("sum ledger update counts");
+    (row.get(0), row.get(1))
+}
+
 /// The start of a [`ServerCost`] window.
 pub struct ServerCostStart {
     at: Instant,
@@ -152,12 +172,15 @@ pub struct ServerCost {
     pub deadlock_detected_lines: u64,
     pub lock_timeout_warnings: u64,
     pub ledger_bytes: i64,
+    pub ledger_tup_upd: i64,
+    pub ledger_tup_hot_upd: i64,
 }
 
 impl ServerCostStart {
     /// Closes the window now. `raw` reads the ledger sizes.
     pub async fn finish(self, raw: &RawClient) -> ServerCost {
         let ticks = cluster_cpu_ticks(self.postmaster).saturating_sub(self.cpu_ticks);
+        let (ledger_tup_upd, ledger_tup_hot_upd) = ledger_updates(raw).await;
         ServerCost {
             window_secs: self.at.elapsed().as_secs_f64(),
             pg_cpu_secs: ticks as f64 / USER_HZ,
@@ -165,6 +188,8 @@ impl ServerCostStart {
             lock_timeout_warnings: scrape::lock_timeout_warnings()
                 .saturating_sub(self.lock_timeouts),
             ledger_bytes: ledger_bytes(raw).await,
+            ledger_tup_upd,
+            ledger_tup_hot_upd,
         }
     }
 }
@@ -179,13 +204,16 @@ impl ServerCost {
     /// - `pg_cpu_cores`: the same over the window's wall time;
     /// - `pg_cpu_us_per_folded_row`: CPU microseconds per folded row;
     /// - `deadlock_detected_log_lines`, `lock_timeout_warnings`: counts;
-    /// - `ledger_bytes`, `ledger_bytes_per_source_row`.
+    /// - `ledger_bytes`, `ledger_bytes_per_source_row`;
+    /// - `ledger_tup_upd`, `ledger_tup_hot_upd` and `ledger_hot_update_ratio`,
+    ///   their quotient (0 with no updates).
     pub fn json_fields(&self, folded_rows: u64, source_rows: u64) -> String {
         let per = |n: f64, d: u64| if d == 0 { 0.0 } else { n / d as f64 };
         format!(
             "\"pg_cpu_secs\":{:.3},\"pg_cpu_cores\":{:.3},\"pg_cpu_us_per_folded_row\":{:.3},\
              \"deadlock_detected_log_lines\":{},\"lock_timeout_warnings\":{},\
-             \"ledger_bytes\":{},\"ledger_bytes_per_source_row\":{:.3}",
+             \"ledger_bytes\":{},\"ledger_bytes_per_source_row\":{:.3},\
+             \"ledger_tup_upd\":{},\"ledger_tup_hot_upd\":{},\"ledger_hot_update_ratio\":{:.3}",
             self.pg_cpu_secs,
             if self.window_secs > 0.0 {
                 self.pg_cpu_secs / self.window_secs
@@ -197,6 +225,12 @@ impl ServerCost {
             self.lock_timeout_warnings,
             self.ledger_bytes,
             per(self.ledger_bytes as f64, source_rows),
+            self.ledger_tup_upd,
+            self.ledger_tup_hot_upd,
+            per(
+                self.ledger_tup_hot_upd as f64,
+                self.ledger_tup_upd.max(0) as u64
+            ),
         )
     }
 
@@ -265,6 +299,8 @@ mod tests {
             deadlock_detected_lines: 1,
             lock_timeout_warnings: 2,
             ledger_bytes: 8192,
+            ledger_tup_upd: 400,
+            ledger_tup_hot_upd: 100,
         };
         let json = cost.json_fields(1_000_000, 4096);
         assert!(json.contains("\"pg_cpu_cores\":1.500"), "{json}");
@@ -276,6 +312,7 @@ mod tests {
             json.contains("\"ledger_bytes_per_source_row\":2.000"),
             "{json}"
         );
+        assert!(json.contains("\"ledger_hot_update_ratio\":0.250"), "{json}");
         assert!(
             ServerCost::default()
                 .json_fields(0, 0)
