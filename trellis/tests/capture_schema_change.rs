@@ -1698,3 +1698,61 @@ async fn a_reader_registered_after_skipped_to_side_rows_reads_the_to_side_as_it_
         "the new reader reads the to-side as it is now"
     );
 }
+
+/// Issue #768: a define or a resume refreshes a relationship's projection,
+/// which diffs the whole to-side, only when no other reader of the
+/// relationship that isn't frozen reads it. The drain skips a to-side only
+/// while every reader is frozen, and the first of them to go unfrozen since
+/// refreshed it; the projection's refresh stamp shows each refresh.
+#[tokio::test]
+async fn a_reader_beside_an_unfrozen_reader_of_the_relationship_refreshes_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let stamp = || async {
+        rows(
+            &raw,
+            "select rp.refreshed_lsn::text from relationship_projections rp \
+             join relationship_definitions rd on rd.id = rp.relationship_id \
+             where rd.name = 'author'",
+        )
+        .await
+    };
+
+    let before = stamp().await;
+    trellis
+        .apply("TRANSFORM posts_renamed FROM public.posts SELECT author.name AS name")
+        .await
+        .expect("register a second reader beside posts_named");
+    assert_eq!(
+        stamp().await,
+        before,
+        "posts_named reads author: no refresh"
+    );
+
+    for target in ["posts_named", "posts_renamed"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause a reader");
+    }
+    trellis
+        .apply("RESUME TRANSFORM posts_named")
+        .await
+        .expect("resume the first reader");
+    let refreshed = stamp().await;
+    assert_ne!(
+        refreshed, before,
+        "every other reader of author is paused: the resume refreshes it"
+    );
+    trellis
+        .apply("RESUME TRANSFORM posts_renamed")
+        .await
+        .expect("resume the second reader");
+    assert_eq!(
+        stamp().await,
+        refreshed,
+        "posts_named reads author again: no refresh"
+    );
+}

@@ -556,6 +556,13 @@ impl<T> Running<T> {
         }
     }
 
+    /// Whether the task has finished, without waiting for it.
+    pub fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
+    }
+
     /// Waits for the task to finish, after every armed point was released.
     pub async fn finish(self) -> T {
         self.finish_result().await.expect("the task failed")

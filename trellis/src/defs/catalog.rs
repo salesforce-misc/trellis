@@ -2280,6 +2280,25 @@ async fn create_definition_inner(
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source).await?;
 
+    // The source's version fence, bumped as this transaction's first lock
+    // (issues #744 and #770). The bump waits for every page holding the
+    // fence `for share`, and such a page goes on to lock projection rows
+    // (a reverse record, or a forward resolution's `__trellis_gen` bump), so
+    // a bump made while holding a projection the widen below locked (a new
+    // column is an `alter table`) would close a cycle with it. Everything
+    // above only reads. A failure below rolls the bump back.
+    let version: i64 = txn
+        .query_one(
+            "insert into source_table_versions (source_table, version)
+             values ($1, 1)
+             on conflict (source_table)
+             do update set version = source_table_versions.version + 1
+             returning version",
+            &[&qualified_source],
+        )
+        .await?
+        .get(0);
+
     // Issue #73 / #76, ADR-0007: resolve `def.target` — likewise always bare
     // — to its fully-qualified identity exactly once, here, mirroring
     // `qualified_source` immediately above. Unlike the source side,
@@ -2340,7 +2359,7 @@ async fn create_definition_inner(
     // reads. A relationship-free definition (by far the common case) costs
     // nothing extra here — [`super::eval::relationship_references`] returns
     // empty and the loop inside never runs a query.
-    let to_one_to_sides = widen_relationship_projections_for_definition_in_txn(
+    let refresh = widen_relationship_projections_for_definition_in_txn(
         &txn,
         &def,
         &qualified_source,
@@ -2562,29 +2581,16 @@ async fn create_definition_inner(
         .await?;
     }
 
-    let version: i64 = txn
-        .query_one(
-            "insert into source_table_versions (source_table, version)
-             values ($1, 1)
-             on conflict (source_table)
-             do update set version = source_table_versions.version + 1
-             returning version",
-            &[&qualified_source],
-        )
-        .await?
-        .get(0);
-
     // Issue #768: the drain skips a to-side whose key can't be used while
     // every definition reading it is frozen, so changes to it may never have
     // reached its projections, whose rows this definition's go-live catch-up
-    // and every later apply read. Refreshed from the table once the bump
-    // above holds the fence the skip is judged under
+    // and every later apply read. Refreshed from the table under the bump
+    // above, which holds the fence the skip is judged under
     // (`staging::apply::source_key_for_apply`): a page that skipped without
     // this definition has committed by now, its changes no longer pending to
-    // be left to it, and a later one misses the fence and halts.
-    for to_side in &to_one_to_sides {
-        refresh_relationship_projections_in_txn(&*txn, to_side).await?;
-    }
+    // be left to it, and a later one misses the fence and halts. The widen
+    // has locked their rows already.
+    refresh_relationship_projections_by_id_in_txn(&*txn, &refresh).await?;
 
     let (type_keys, type_vals) = encode_type_map(source_columns);
 
@@ -5378,32 +5384,97 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
     let Some((to_schema, to_table)) = qualified_to_table.split_once('.') else {
         return Ok(0);
     };
-    // A projection lives in the catalog schema, the same schema as
-    // `relationship_projections` itself (issue #435), which this connection's
-    // search path already resolves. Issue #531: each relationship's row is
-    // locked before its projection is touched, in `relationship_id` order
-    // (the sort runs below the lock), the order Phase 3 takes the same rows
-    // `for share` in.
     let projections = client
         .query(
-            "select rp.projection_table, n.nspname::text, rd.to_col, rp.relationship_id \
-             from relationship_projections rp \
-             join relationship_definitions rd on rd.id = rp.relationship_id \
-             join pg_class c on c.oid = 'relationship_projections'::regclass \
-             join pg_namespace n on n.oid = c.relnamespace \
-             where rd.to_schema = $1 and rd.to_table = $2 \
-             order by rp.relationship_id \
-             for update of rp",
+            &format!(
+                "{LOCK_PROJECTIONS_SELECT} where rd.to_schema = $1 and rd.to_table = $2 \
+                 {LOCK_PROJECTIONS_ORDER}"
+            ),
             &[&to_schema, &to_table],
         )
         .await?;
-    let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
+    refresh_locked_projections(client, projections).await
+}
+
+/// [`refresh_relationship_projections_in_txn`] for the relationships
+/// `relationship_ids` instead of every one on a to-side: each one's
+/// `relationship_projections` row is locked `for update`, all of them in
+/// `relationship_id` order before any projection is touched, the order
+/// Phase 3 takes the same rows `for share` in. A relationship with no
+/// projection refreshes nothing.
+///
+/// A define and a resume refresh the to-one relationships their definition
+/// reads this way (issue #768, [`relationships_to_refresh`]). One lock
+/// statement over all of them matters: locked to-side by to-side, a
+/// definition reading two relationships could hold the later one's row
+/// while a page carrying a reverse record for both held the earlier one's
+/// `for share` and waited for the later.
+pub(crate) async fn refresh_relationship_projections_by_id_in_txn(
+    client: &impl GenericClient,
+    relationship_ids: &[i64],
+) -> Result<u64, CatalogError> {
+    if relationship_ids.is_empty() {
+        return Ok(0);
+    }
+    let projections = lock_relationship_projections_in_txn(client, relationship_ids).await?;
+    refresh_locked_projections(client, projections).await
+}
+
+/// Locks the `relationship_projections` rows of `relationship_ids` `for
+/// update`, in `relationship_id` order, and returns them as
+/// [`refresh_locked_projections`] reads them: one per relationship that has
+/// a projection.
+async fn lock_relationship_projections_in_txn(
+    client: &impl GenericClient,
+    relationship_ids: &[i64],
+) -> Result<Vec<tokio_postgres::Row>, CatalogError> {
+    Ok(client
+        .query(
+            &format!(
+                "{LOCK_PROJECTIONS_SELECT} where rp.relationship_id = any($1) \
+                 {LOCK_PROJECTIONS_ORDER}"
+            ),
+            &[&relationship_ids],
+        )
+        .await?)
+}
+
+/// The projections [`refresh_locked_projections`] refreshes, each row
+/// `(projection_table, catalog schema, to_col, relationship_id, to_schema,
+/// to_table)`, followed by a filter on `rp`/`rd` and then
+/// [`LOCK_PROJECTIONS_ORDER`].
+///
+/// A projection lives in the catalog schema, the same schema as
+/// `relationship_projections` itself (issue #435), which this connection's
+/// search path already resolves.
+const LOCK_PROJECTIONS_SELECT: &str = "select rp.projection_table, n.nspname::text, rd.to_col, \
+     rp.relationship_id, rd.to_schema, rd.to_table \
+     from relationship_projections rp \
+     join relationship_definitions rd on rd.id = rp.relationship_id \
+     join pg_class c on c.oid = 'relationship_projections'::regclass \
+     join pg_namespace n on n.oid = c.relnamespace";
+
+/// Issue #531: each relationship's row is locked before its projection is
+/// touched, in `relationship_id` order (the sort runs below the lock), the
+/// order Phase 3 takes the same rows `for share` in.
+const LOCK_PROJECTIONS_ORDER: &str = "order by rp.relationship_id for update of rp";
+
+/// The body of [`refresh_relationship_projections_in_txn`], over
+/// `projections`, rows of [`LOCK_PROJECTIONS_SELECT`] its caller has locked.
+async fn refresh_locked_projections(
+    client: &impl GenericClient,
+    projections: Vec<tokio_postgres::Row>,
+) -> Result<u64, CatalogError> {
     let relationship_ids: Vec<i64> = projections.iter().map(|row| row.get(3)).collect();
     let mut changed = 0;
     for row in projections {
         let projection_table: String = row.get(0);
         let catalog_schema: String = row.get(1);
         let to_col: String = row.get(2);
+        let to_schema: String = row.get(4);
+        let to_table: String = row.get(5);
+        let qualified_to_table = format!("{to_schema}.{to_table}");
+        let quoted_to_table = ddl::qualified_source_table(&qualified_to_table);
         let qualified_projection =
             ddl::qualified_relationship_projection_table(&catalog_schema, &projection_table);
         let key = quote_ident(&to_col);
@@ -5466,7 +5537,7 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
         // Issue #726: a key a pending change will write is left to that
         // change (see `pending_to_side_keys`).
         let relationship_id: i64 = row.get(3);
-        let pending = pending_to_side_keys(qualified_to_table, &to_col, relationship_id);
+        let pending = pending_to_side_keys(&qualified_to_table, &to_col, relationship_id);
         changed += client
             .execute(
                 &format!(
@@ -5502,9 +5573,18 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
 /// ensures its settled parent projection carries every referenced column —
 /// via [`ensure_relationship_projection_in_txn`] — before `def` itself is
 /// persisted, so a definition can never be live while reading a projection
-/// that hasn't caught up to it yet. Returns the to-sides of those
-/// relationships, whose projections [`create_definition_inner`] refreshes
-/// once it holds the version fence (issue #768).
+/// that hasn't caught up to it yet.
+///
+/// Returns the relationships whose projections [`create_definition_inner`]
+/// then refreshes (issue #768): those [`relationships_to_refresh`] names
+/// that had a projection already, whose `relationship_projections` rows
+/// this locks `for update`, in `relationship_id` order, before it touches
+/// any projection. A page carrying a reverse record for one of them takes
+/// its row `for share` before it writes the projection, so a widen that
+/// locked the projection first (a new column is an `alter table`) and the
+/// row only at the refresh would deadlock with a page between the two. A
+/// projection this creates is read from the table in full and needs no
+/// refresh.
 ///
 /// A to-many relationship reference is silently skipped (no projection in
 /// Phase 1); an unknown relationship name is silently skipped too — not this
@@ -5518,16 +5598,27 @@ async fn widen_relationship_projections_for_definition_in_txn(
     def: &TransformDef,
     qualified_source: &str,
     catalog_schema: &str,
-) -> Result<std::collections::BTreeSet<String>, CatalogError> {
-    let mut to_sides = std::collections::BTreeSet::new();
+) -> Result<Vec<i64>, CatalogError> {
     // Issue #288: `def`'s relationships are the ones declared on its own
     // qualified source, not on any same-named table in another schema.
     let Some((source_schema, source_table)) = qualified_source.split_once('.') else {
-        return Ok(to_sides);
+        return Ok(Vec::new());
     };
     let mut columns_by_rel: HashMap<String, Vec<String>> = HashMap::new();
     for (rel, column) in super::eval::relationship_references(def) {
         columns_by_rel.entry(rel).or_default().push(column);
+    }
+    if columns_by_rel.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut refresh = relationships_to_refresh(txn, def, qualified_source, None).await?;
+    if !refresh.is_empty() {
+        refresh = lock_relationship_projections_in_txn(txn, &refresh)
+            .await?
+            .iter()
+            .map(|row| row.get(3))
+            .collect();
     }
 
     for (rel, columns) in columns_by_rel {
@@ -5567,10 +5658,67 @@ async fn widen_relationship_projections_for_definition_in_txn(
             &columns,
         )
         .await?;
-        to_sides.insert(qualified_to);
     }
 
-    Ok(to_sides)
+    Ok(refresh)
+}
+
+/// The to-one relationships `def`, a definition on `qualified_source`,
+/// reads through that no other definition on `qualified_source` that isn't
+/// frozen reads, sorted by id: the ones whose projections a define or a
+/// resume of `def` refreshes (issue #768). `exclude` is `def`'s own id, for
+/// a resume.
+///
+/// The drain skips a to-side whose key can't be used while every
+/// definition reading it is frozen (`staging::apply::source_key_for_apply`),
+/// so its changes never reach the projections on it. A define or a resume
+/// of a reader bumps its source's fence before it asks, so no page that
+/// skipped without it is still in flight, and it refreshes what the skip
+/// left stale. The projection of a relationship another reader that isn't
+/// frozen reads needs no refresh: the to-side hasn't been skipped since
+/// that reader was defined or resumed, and that define or resume left the
+/// projection current, by its own refresh or, by the same rule, an earlier
+/// reader's. So the refresh, which diffs the whole to-side, runs only for a
+/// definition that is the first reader of a relationship to go unfrozen.
+pub(crate) async fn relationships_to_refresh(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    qualified_source: &str,
+    exclude: Option<i64>,
+) -> Result<Vec<i64>, CatalogError> {
+    let Some((schema, table)) = qualified_source.split_once('.') else {
+        return Ok(Vec::new());
+    };
+    let mut unread: std::collections::BTreeSet<String> =
+        referenced_relationships(def).into_iter().collect();
+    if unread.is_empty() {
+        return Ok(Vec::new());
+    }
+    let readers = client
+        .query(
+            "select id, definition_text from transform_definitions \
+             where source_table = $1 and status = any($2)",
+            &[&qualified_source, &TransformStatus::dispatchable()],
+        )
+        .await?;
+    for row in readers {
+        if Some(row.get::<_, i64>(0)) == exclude {
+            continue;
+        }
+        for rel in referenced_relationships(&parse(row.get::<_, &str>(1))?) {
+            unread.remove(&rel);
+        }
+    }
+    let mut ids = Vec::new();
+    for rel in unread {
+        if let Some(reldef) = relationship_by_name_in(client, schema, table, &rel).await?
+            && reldef.cardinality == RelationshipCardinality::ToOne
+        {
+            ids.push(reldef.id);
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 /// Whether `from_table` has a usable index for looking up rows by
