@@ -2825,7 +2825,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     let held = txn
         .query(
             "select old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table, \
-                    new_image::text \
+                    new_image::text, lsn \
              from poison_held \
              where src_table = any($1::text[]) and key = $2 \
              order by seg_seq asc, held_seq asc",
@@ -2880,13 +2880,23 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     .await?;
     // Issue #754: the `Recompute` builds no reverse record, so a to-one
     // projection of this table hears about the parked changes only here.
+    // A parked change's ring rows stay in its segment, pending until the
+    // segment drains, at or below the held row's `lsn` (its window's
+    // greatest), so the release counts only pending changes above the
+    // latest parked one: the parked ones are discarded here and will never
+    // write the key.
     if !held.is_empty() {
         let images: Vec<String> = held
             .iter()
             .flat_map(|row| [row.get::<_, Option<String>>(0), row.get(6)])
             .flatten()
             .collect();
-        apply::release_to_one_projections(pool, &txn, &names[0], key, &images).await?;
+        let parked_through: Option<PgLsn> = held
+            .iter()
+            .filter_map(|row| row.get::<_, Option<PgLsn>>(7))
+            .max();
+        apply::release_to_one_projections(pool, &txn, &names[0], key, &images, parked_through)
+            .await?;
     }
 
     txn.commit().await?;

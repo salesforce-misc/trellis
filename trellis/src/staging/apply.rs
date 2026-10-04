@@ -2913,9 +2913,12 @@ async fn apply_projection_from_live(
 /// `quarantine::release_key` discards the parked rows and stages an
 /// image-less `Recompute`, which builds no reverse record, so without this
 /// nothing would carry what the parked changes did to the to-side into the
-/// projection. The write is [`apply_projection_from_live`]'s, with every
-/// pending change counted, since the parked ones are no longer in the ring:
-/// a key a pending change will write is left to it. Each relationship's
+/// projection. The write is [`apply_projection_from_live`]'s, counting the
+/// pending changes after `parked_through`, the greatest parked `lsn`: a key
+/// a later pending change will write is left to it. The parked changes' own
+/// ring rows stay pending until their segment drains, which another bucket
+/// can hold up, but the release discards those changes, so the key must not
+/// be left to them. Each relationship's
 /// refresh stamp is locked `for share` first and the projection rows `for
 /// update` in key order, the order a drain takes them (ADR-0002 I5), and the
 /// rows are stamped with the release's WAL position.
@@ -2926,6 +2929,7 @@ pub(crate) async fn release_to_one_projections(
     src_table: &str,
     key: &str,
     images: &[String],
+    parked_through: Option<PgLsn>,
 ) -> Result<(), ApplyError> {
     let mut relationships: Vec<RelationshipDefinition> =
         catalog::relationships_to_table(pool, src_table)
@@ -2976,7 +2980,8 @@ pub(crate) async fn release_to_one_projections(
         )
         .await?;
         for k in keys {
-            apply_projection_from_live(txn, &shape, &Some(k), &None, Some(lsn), None).await?;
+            apply_projection_from_live(txn, &shape, &Some(k), &None, Some(lsn), parked_through)
+                .await?;
         }
     }
     Ok(())

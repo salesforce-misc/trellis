@@ -1260,3 +1260,61 @@ async fn releasing_a_parked_to_side_delete_removes_the_projection_row() {
     assert_eq!(projected_name(&client, 1).await, None);
     assert_eq!(order_names(&client).await, without_ann());
 }
+
+/// Issue #754 review: a parked change's ring row stays in its segment, and
+/// counts as pending until the segment drains, which another bucket can hold
+/// up after the parked key's own bucket finished. The release discards the
+/// parked change, so it must not leave the key to that ring row: nothing
+/// would ever write it.
+#[tokio::test]
+async fn releasing_a_parked_rename_whose_segment_is_still_draining_advances_the_projection() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann2' where id = 1",
+        |lsn| customer_update(lsn, 1, "ann", "ann2"),
+    )
+    .await;
+    let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, outcome.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    // The rename's bucket parked it; another bucket is still draining.
+    client
+        .execute(
+            "update segments set state = 'draining' where seg_seq = $1",
+            &[&outcome.sealed_seg_seq],
+        )
+        .await
+        .expect("mark the segment draining");
+    park_customer_change(
+        &client,
+        1,
+        "update",
+        Some(r#"{"id":"1","name":"ann"}"#),
+        Some(r#"{"id":"1","name":"ann2"}"#),
+    )
+    .await;
+    trellis::staging::release_key(&db.pool, "public.customers", "1")
+        .await
+        .expect("release the parked customer");
+    // The other bucket finishes; the parked rename is never applied.
+    client
+        .execute(
+            "update segments set state = 'drained' where seg_seq = $1",
+            &[&outcome.sealed_seg_seq],
+        )
+        .await
+        .expect("mark the segment drained");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
