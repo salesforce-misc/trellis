@@ -2595,11 +2595,10 @@ async fn reads_paused_sibling(
 /// sweep drops the keys deleted while it was frozen. Any other definition
 /// gets a fresh `pending_backfill` marker for its source table
 /// ([`crate::intake::markers::park_marker`], which every marker goes
-/// through). Every relationship to-side the definition reads gets a marker
-/// too, whose discharge refreshes the settled projections on it (issue
-/// #768: the drain may have skipped changes to it while it was frozen). The
-/// target is left exactly as
-/// the freeze left it until that marker's discharge
+/// through). The settled projections on every relationship to-side the
+/// definition reads are refreshed from the table in the same transaction
+/// (issue #768: the drain may have skipped changes to it while it was
+/// frozen). The target is left exactly as the freeze left it until that marker's discharge
 /// ([`crate::intake::markers::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
 /// #330, `intake::resume_orphans`) and dispatches the rebuild by shape
@@ -2779,19 +2778,20 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     if !rederive_built {
         crate::intake::markers::park_marker(&*txn, &source_table).await?;
     }
-    // Issue #768: a to-side the definition reads through a relationship may
-    // have had changes no reader applied while it was frozen. The drain
-    // skips a to-side whose key can't be used when every definition reading
-    // it is frozen (`staging::apply::source_key_for_apply`), and those changes
-    // never reach the relationship's settled projection, which the rebuild's
-    // go-live catch-up and every later apply read. So each such to-side gets a marker whose
-    // discharge refreshes its projections from the table, as a capture widen
-    // of it does (`park_widen_marker`). The same discharge re-reads the
-    // to-side, so a row derived from the stale projection before it runs is
-    // re-derived from the refreshed one by reverse propagation.
+    // Issue #768: the drain skips a to-side whose key can't be used while
+    // every definition reading it is frozen
+    // (`staging::apply::source_key_for_apply`), so changes to a to-side this
+    // definition reads may never have reached the relationship's settled
+    // projection, which its rebuild's go-live catch-up and every later apply
+    // read. Refreshed from the table here, in the resume, so the rebuild
+    // never reads it stale. The bump above holds the fence the skip is
+    // judged under: a page that skipped while this definition was frozen has
+    // committed, its changes no longer pending to be left to it, and a later
+    // one misses the fence and halts. A to-many relationship has no
+    // projection, so its to-side refreshes nothing.
     for table in catalog::definition_tables_read(&txn, id).await? {
         if table != source_table {
-            crate::intake::markers::park_widen_marker(&*txn, &table).await?;
+            catalog::refresh_relationship_projections_in_txn(&*txn, &table).await?;
         }
     }
     // #622 C6: a transform paused by a schema change stops being reported as

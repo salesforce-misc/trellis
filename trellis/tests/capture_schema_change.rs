@@ -1640,3 +1640,61 @@ async fn a_from_side_key_retyped_off_the_allowlist_does_not_halt_the_drain_once_
         "a truncate of the to-sides drains too"
     );
 }
+
+/// Issue #768: a definition registered after the drain skipped to-side rows
+/// reads the to-side as it is. The skipped rows never reached the
+/// relationship's settled projection, which the new reader's go-live
+/// catch-up and its later applies read, so the define refreshes it from the
+/// table.
+#[tokio::test]
+async fn a_reader_registered_after_skipped_to_side_rows_reads_the_to_side_as_it_is() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    trellis
+        .apply("PAUSE TRANSFORM posts_named")
+        .await
+        .expect("pause the reader");
+    app.batch_execute(
+        "alter table public.users alter column handle type character(8); \
+         update public.users set name = 'Annie' where handle = 'ann'; \
+         insert into public.users values ('cy', 'Cy'); \
+         delete from public.users where handle = 'bob';",
+    )
+    .await
+    .expect("retype the key, and write the to-side");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    app.batch_execute("alter table public.users alter column handle type varchar(16)")
+        .await
+        .expect("retype the key back");
+    trellis
+        .apply("TRANSFORM posts_renamed FROM public.posts SELECT author.name AS name")
+        .await
+        .expect("register a second reader");
+    bring_live(
+        &mut raw,
+        &db.pool,
+        &["posts_renamed", "posts_plain", "o_copy"],
+    )
+    .await;
+    app.batch_execute("insert into public.posts values (3, 'ann'), (4, 'cy'), (5, 'bob')")
+        .await
+        .expect("posts after the define");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.posts_renamed order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select p.id::text, u.name from public.posts p \
+             left join public.users u on u.handle = p.author order by p.id"
+        )
+        .await,
+        "the new reader reads the to-side as it is now"
+    );
+}

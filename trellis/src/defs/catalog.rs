@@ -2340,7 +2340,7 @@ async fn create_definition_inner(
     // reads. A relationship-free definition (by far the common case) costs
     // nothing extra here — [`super::eval::relationship_references`] returns
     // empty and the loop inside never runs a query.
-    widen_relationship_projections_for_definition_in_txn(
+    let to_one_to_sides = widen_relationship_projections_for_definition_in_txn(
         &txn,
         &def,
         &qualified_source,
@@ -2573,6 +2573,18 @@ async fn create_definition_inner(
         )
         .await?
         .get(0);
+
+    // Issue #768: the drain skips a to-side whose key can't be used while
+    // every definition reading it is frozen, so changes to it may never have
+    // reached its projections, whose rows this definition's go-live catch-up
+    // and every later apply read. Refreshed from the table once the bump
+    // above holds the fence the skip is judged under
+    // (`staging::apply::source_key_for_apply`): a page that skipped without
+    // this definition has committed by now, its changes no longer pending to
+    // be left to it, and a later one misses the fence and halts.
+    for to_side in &to_one_to_sides {
+        refresh_relationship_projections_in_txn(&*txn, to_side).await?;
+    }
 
     let (type_keys, type_vals) = encode_type_map(source_columns);
 
@@ -5490,7 +5502,9 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
 /// ensures its settled parent projection carries every referenced column —
 /// via [`ensure_relationship_projection_in_txn`] — before `def` itself is
 /// persisted, so a definition can never be live while reading a projection
-/// that hasn't caught up to it yet.
+/// that hasn't caught up to it yet. Returns the to-sides of those
+/// relationships, whose projections [`create_definition_inner`] refreshes
+/// once it holds the version fence (issue #768).
 ///
 /// A to-many relationship reference is silently skipped (no projection in
 /// Phase 1); an unknown relationship name is silently skipped too — not this
@@ -5504,11 +5518,12 @@ async fn widen_relationship_projections_for_definition_in_txn(
     def: &TransformDef,
     qualified_source: &str,
     catalog_schema: &str,
-) -> Result<(), CatalogError> {
+) -> Result<std::collections::BTreeSet<String>, CatalogError> {
+    let mut to_sides = std::collections::BTreeSet::new();
     // Issue #288: `def`'s relationships are the ones declared on its own
     // qualified source, not on any same-named table in another schema.
     let Some((source_schema, source_table)) = qualified_source.split_once('.') else {
-        return Ok(());
+        return Ok(to_sides);
     };
     let mut columns_by_rel: HashMap<String, Vec<String>> = HashMap::new();
     for (rel, column) in super::eval::relationship_references(def) {
@@ -5552,9 +5567,10 @@ async fn widen_relationship_projections_for_definition_in_txn(
             &columns,
         )
         .await?;
+        to_sides.insert(qualified_to);
     }
 
-    Ok(())
+    Ok(to_sides)
 }
 
 /// Whether `from_table` has a usable index for looking up rows by
