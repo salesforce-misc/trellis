@@ -172,6 +172,11 @@ instance schema, where Trellis keeps its own state. A transform that reads a
 parent column the projection doesn't carry yet adds it there, so the process
 that applies it must own the projection too
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
+The role that applies a transform owns the target table it creates, along
+with the tables Trellis keeps beside it, and Trellis grants nothing on them.
+The worker writes them, so it must log in as that role or as a member that
+inherits it. A worker logging in as an unrelated role fails every write to the
+target with a permission error.
 It also reads the parent table to fill the projection, so row-level security
 on that table must not apply to the process's role either; `apply` refuses
 the transform if it does (#745,

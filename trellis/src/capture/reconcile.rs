@@ -195,9 +195,10 @@ pub async fn reconcile(
 
     let desired_set: HashSet<&String> = desired.iter().collect();
     // #745, #751: a table another definition targets isn't in `desired` (the
-    // seam feeds it, not a trigger), but its readers read it as Trellis's
-    // role all the same, and the seam doesn't see a subscription's writes to
-    // it either. #765: and the definition that targets it writes it as the
+    // seam feeds it, not a trigger), but its readers read it as the
+    // worker's role all the same (not the ring's owner: no capture function
+    // reads it), and the seam doesn't see a subscription's writes to it
+    // either. #765: and the definition that targets it writes it as the
     // worker's role, so row-level security that applies to that role pauses
     // the writer. This loop runs over every target, read or not. A seam-fed
     // table whose check pauses a definition, or fails, isn't current for

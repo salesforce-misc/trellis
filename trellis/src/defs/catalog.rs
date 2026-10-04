@@ -2479,7 +2479,10 @@ async fn create_definition_inner(
     // to-side as the session's role
     // ([`widen_relationship_projections_for_definition_in_txn`], above), and
     // a build reads the projection, so a to-one to-side is checked for the
-    // session's role too.
+    // session's role too. A table another definition targets is checked for
+    // the session's role alone: the target-mutation seam feeds it, no
+    // capture function reads it, so the ring's owner never does (see
+    // [`super::row_security::Readers::Session`]).
     let mut to_sides: Vec<(String, super::row_security::Readers)> = relationships
         .values()
         .map(|r| {
@@ -2492,10 +2495,15 @@ async fn create_definition_inner(
         })
         .collect();
     to_sides.sort_by(|a, b| a.0.cmp(&b.0));
-    let read_tables: Vec<(String, super::row_security::Readers)> =
+    let mut read_tables: Vec<(String, super::row_security::Readers)> =
         std::iter::once((qualified_source.clone(), super::row_security::Readers::Ring))
             .chain(to_sides)
             .collect();
+    for (table, readers) in &mut read_tables {
+        if is_definition_target(&*txn, table).await? {
+            *readers = super::row_security::Readers::Session;
+        }
+    }
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
     // Issue #751: and a table a logical-replication subscription writes is
     // one whose changes capture never sees, for the same tables.
@@ -4827,8 +4835,9 @@ async fn reject_unkeyed_source(
 /// ([`super::row_security::applying`]): the ring's owner, and the session's
 /// role for a table registration itself reads ([`super::row_security::Readers`];
 /// not otherwise, since the session may belong to a process that never reads
-/// the table), or only the session's role for the target it creates (#765)
-/// — [`CatalogError::RowSecurityApplies`]. A table that doesn't
+/// the table), or only the session's role for a table another definition
+/// targets, which no capture function reads, and for the target it creates
+/// (#765) — [`CatalogError::RowSecurityApplies`]. A table that doesn't
 /// exist passes: the checks that need it report that.
 async fn reject_row_security(
     client: &impl GenericClient,

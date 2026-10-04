@@ -62,6 +62,9 @@ error naming the table, the role and the fix. So is one whose policies on a
 to-one relationship's to-side apply to the role that defines it: defining
 reads that table, as that role, to fill the relationship's projection
 ([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
+For a table that is another transform's target, only the defining role is
+checked, standing in for the workers: no capture function reads that table,
+so the role that owns the ring never does.
 Row-level security can also be enabled or forced, a table handed to another
 owner, or `BYPASSRLS` taken away, after a transform is defined. The staging
 worker then pauses every transform that reads the table (another transform's

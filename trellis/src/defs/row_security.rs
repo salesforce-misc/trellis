@@ -48,17 +48,21 @@
 //!   the projection keys it seeds are seeded again (the missing ones
 //!   inserted) by each definition that reads through it, which is.
 //!   `ALTER TRANSFORM` adds no table to read: its `ADD`/`ALTER` refuse a
-//!   relationship path.
+//!   relationship path. A source or to-side that is another definition's
+//!   target is checked for the session's role alone ([`Readers::Session`]).
+//!   No capture function reads it, so the ring's owner never does.
 //! - **The staging worker's capture pass** pauses every definition that
 //!   reads a table whose policies now apply to the ring's owner or to the
 //!   worker's own role, recording why in `capture_failures`
 //!   (`staging::schema_change::pause_readers_of_unsupported`): each
 //!   captured table, and each table another definition's target is, which
-//!   the target-mutation seam feeds. RLS can be enabled or forced, a table
+//!   the target-mutation seam feeds, for the worker's own role alone
+//!   ([`Readers::Session`]). RLS can be enabled or forced, a table
 //!   handed to another owner, or a role's `BYPASSRLS` or membership taken
 //!   away, after define.
 //! - **`self_check`'s capture audit** reports it for the ring's owner or the
-//!   caller's role, whose recompute it would filter
+//!   caller's role, whose recompute it would filter, or the caller's role
+//!   alone for a seam-fed table
 //!   (`staging::capture_audit::CaptureFault::RowSecurity`).
 //!
 //! Drain threads in another process, running as another login role, aren't
@@ -185,6 +189,17 @@ pub enum Readers {
     /// session that reads the table itself: the staging worker's capture
     /// pass, or `self_check`'s recompute.
     RingAndSession,
+    /// The session's role alone, for a table the target-mutation seam feeds
+    /// (another definition's target) that a definition reads, as its source
+    /// or a relationship's to-side. Only plain SQL on a worker connection
+    /// reads one (a build, a Re-derive, a relationship read, the seam's own
+    /// image reads), as its login role. No capture function is installed on
+    /// it, so the ring's owner never reads it unless it is that role, and
+    /// checking it would pause a reader in a deployment whose workers log in
+    /// as a member of the ring's owner and define as that member: the member
+    /// owns the upstream's target, and the ring's owner owns nothing of it.
+    /// The session stands in for the workers, as for [`Readers::Target`].
+    Session,
     /// The session's role alone, for a definition's target table (issue
     /// #765). Only the workers write a target (applies, builds, a rebuild's
     /// orphan delete), each as its connection's login role, and no capture
@@ -228,7 +243,7 @@ pub async fn applying(
                 &schema,
                 &regclass_arg(table),
                 &(readers != Readers::Ring),
-                &(readers != Readers::Target),
+                &matches!(readers, Readers::Ring | Readers::RingAndSession),
             ],
         )
         .await?;

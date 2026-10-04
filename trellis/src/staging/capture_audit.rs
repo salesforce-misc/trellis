@@ -315,14 +315,15 @@ pub async fn audit(
             faults.extend(installed_faults(&table, &installed));
             faults.extend(hierarchy_faults(client, &table).await?);
         }
-        if let Some(rls) = row_security::applying(
-            client,
-            schema,
-            &table,
-            row_security::Readers::RingAndSession,
-        )
-        .await?
-        {
+        // A table the seam feeds has no capture function, so only the
+        // workers read it, as their own role, which the caller's stands in
+        // for (#765, [`row_security::Readers::Session`]).
+        let readers = if captured {
+            row_security::Readers::RingAndSession
+        } else {
+            row_security::Readers::Session
+        };
+        if let Some(rls) = row_security::applying(client, schema, &table, readers).await? {
             faults.push(CaptureFault::RowSecurity(rls));
         }
         if let Some(sub) = subscription::subscribed(client, &table).await? {
