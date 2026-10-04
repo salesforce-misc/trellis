@@ -161,12 +161,14 @@ never casts a join key. The error names both columns and both types. Both
 sides also need deterministic collations
 ([Supported sources and targets](#supported-sources-and-targets)).
 
-These rules hold after define too (#760). If an `ALTER COLUMN ... TYPE` or
-`COLLATE` later gives a key column (a source's primary key, a `GROUP BY`
-column, or a relationship's join column or to-side key) a type or collation
-define would refuse, or changes its type so that its existing values render
-differently (`timestamp` to `timestamptz`, `date` to `timestamp`, `text` to
-`uuid`), the staging worker pauses each definition that keys by it, with the
+The type allowlist and the deterministic-collation rule hold after define
+too (#760). The same-type-modifier-and-collation rule doesn't, because
+widening both join columns takes two `ALTER`s. If an `ALTER COLUMN ... TYPE` or `COLLATE` later gives a key column
+(a source's primary key, a `GROUP BY` column, or a relationship's join column
+or to-side key) a type or collation define would refuse, or changes its type
+so that its existing values render differently (`timestamp` to `timestamptz`,
+`date` to `timestamp`, `text` to `uuid`) or are rounded (a narrower `numeric`
+scale), the staging worker pauses each definition that keys by it, with the
 reason on `status()`'s `capture_failure`. Change the column back and resume
 the definition, or drop it and define it again; resuming with the column
 still changed pauses it again. Widening a key (`integer` to `bigint`,

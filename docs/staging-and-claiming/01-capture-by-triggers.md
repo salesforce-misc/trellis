@@ -246,7 +246,8 @@ accepted. A resume leaves that record alone, because the rebuild writes into
 the tables Trellis created from the old type, so the next pass pauses the
 definition again until the column is changed back. Routine changes don't
 fire: `integer` to `bigint`, any `varchar(n)` and `text` change, a `numeric`
-precision change, a change between deterministic collations.
+precision change or wider scale, a change between deterministic collations. A
+narrower `numeric` scale fires, since it rounds the stored values.
 
 The pause doesn't stop a drain that reads a source key whose type is off the
 key allowlist: `staging::apply::compute` introspects every staged table's key

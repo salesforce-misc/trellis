@@ -29,9 +29,10 @@
 //!    back as `7`), `varchar` becomes `character(n)` (padded).
 //!
 //! Routine changes don't fire: widening an integer key (`integer` to
-//! `bigint`), any `varchar(n)`/`text` change, a `numeric` precision or scale
-//! change on a `GROUP BY` key, a change between deterministic collations.
-//! None of them changes how an existing value renders. The issue's PR body
+//! `bigint`), any `varchar(n)`/`text` change, a `numeric` precision change
+//! or wider scale on a `GROUP BY` key, a change between deterministic
+//! collations. None of them changes an existing value's identity. A
+//! narrower `numeric` scale does fire: it rounds the stored values. The issue's PR body
 //! has the whole matrix and the evidence for each row.
 //!
 //! What isn't checked, and why:
@@ -203,11 +204,15 @@ impl ColumnType {
 ///   (`text`, `varchar(n)`) render every value the same within their family.
 ///   A narrowing `ALTER` fails on a value that doesn't fit, rather than
 ///   changing it (except that `varchar(n)` drops trailing spaces past `n`).
-/// - **The same type with another modifier** renders the same for `numeric`
-///   (only a `GROUP BY` key can be `numeric`; its groups are matched as
-///   numbers, and a scale change re-renders `1.50` as `1.500`, the
-///   same as two rows already can) and `bit varying`, whose stored bits
-///   don't change.
+/// - **The same type with another modifier** renders the same for `bit
+///   varying`, whose stored bits don't change, and for a `numeric` change
+///   that keeps or widens the scale (only a `GROUP BY` key can be `numeric`;
+///   its groups are matched as numbers, and a wider scale re-renders `1.50`
+///   as `1.500`, the same as two rows already can). A precision too narrow
+///   for a value fails the `ALTER`. A narrower scale, or any scale on a
+///   column that had none, rounds the stored values instead: `1.555` and
+///   `1.556` both become `1.56`, merging two groups without a capture
+///   trigger firing ([`numeric_rounds`]).
 /// - **A temporal precision change** rounds the stored values when it
 ///   narrows. When it widens, the values stay, but a mirrored copy keeps the
 ///   old precision and would round a new key into another's.
@@ -232,7 +237,8 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType, mirrored: 
         return true;
     }
     match old.base() {
-        "numeric" | "varbit" => false,
+        "numeric" => numeric_rounds(old.typmod, new.typmod),
+        "varbit" => false,
         "time" | "timetz" | "timestamp" | "timestamptz" => {
             // `-1` is the default precision, 6.
             let precision = |typmod: i32| if typmod < 0 { 6 } else { typmod };
@@ -240,6 +246,26 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType, mirrored: 
             is < was || (is != was && mirrored)
         }
         _ => true,
+    }
+}
+
+/// Whether re-typing a `numeric` column from modifier `old` to `new` rounds
+/// a value it holds: when `new` has a scale and `old` had none, or a larger
+/// one. An unconstrained `numeric` (`-1`) keeps every value.
+///
+/// A `numeric(p,s)` modifier is `((p << 16) | (s & 0x7ff)) + 4`, with `s` an
+/// 11-bit two's complement, since Postgres 15 allows a negative scale.
+fn numeric_rounds(old: i32, new: i32) -> bool {
+    let scale = |typmod: i32| {
+        (typmod >= 4).then(|| {
+            let s = (typmod - 4) & 0x7ff;
+            if s & 0x400 != 0 { s - 0x800 } else { s }
+        })
+    };
+    match (scale(old), scale(new)) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(was), Some(is)) => is < was,
     }
 }
 
@@ -427,6 +453,9 @@ mod tests {
             (ty("numeric", 655366), ty("numeric", 786438)),
             (ty("numeric", 655366), ty("numeric", 655367)),
             (ty("numeric", 655366), ty("numeric", -1)),
+            (ty("numeric", -1), ty("numeric", -1)),
+            // numeric(10,-2) -> numeric(10,0).
+            (ty("numeric", 657410), ty("numeric", 655364)),
             (ty("varbit", 8), ty("varbit", 16)),
         ] {
             for mirrored in [false, true] {
@@ -450,6 +479,12 @@ mod tests {
             (ty("text", -1), ty("int4", -1)),
             (ty("int4", -1), ty("text", -1)),
             (ty("int4", -1), ty("numeric", -1)),
+            // A narrower or new scale rounds the stored values: numeric(10,3)
+            // -> numeric(10,2), numeric -> numeric(12,2), numeric(10,0) ->
+            // numeric(10,-2).
+            (ty("numeric", 655367), ty("numeric", 655366)),
+            (ty("numeric", -1), ty("numeric", 786438)),
+            (ty("numeric", 655364), ty("numeric", 657410)),
             (ty("int4", -1), ty("oid", -1)),
             (ty("macaddr", -1), ty("macaddr8", -1)),
             (varchar(5), ty("bpchar", 9)),

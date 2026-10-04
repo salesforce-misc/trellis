@@ -1566,8 +1566,10 @@ pub struct CaptureFailure {
     /// The columns the failure is about: the renamed or dropped ones the
     /// definition reads (every missing column of the table when a
     /// primary-key column went), the old key columns when the key was
-    /// redefined, or the missing column an install names. Empty for a
-    /// failure that isn't about a column, and for a halt.
+    /// redefined, the key columns whose type or collation changed (a type
+    /// define would refuse, a re-rendering, a widening of a typed copy, a
+    /// broken join pairing), or the missing column an install names. Empty
+    /// for a failure that isn't about a column, and for a halt.
     pub columns: Vec<String>,
     /// A sentence naming the cause and, for a pause, what to do.
     pub error: String,

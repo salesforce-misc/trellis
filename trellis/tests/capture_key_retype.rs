@@ -454,3 +454,142 @@ async fn a_nondeterministic_collation_on_a_group_by_column_pauses_its_reader() {
         );
     }
 }
+
+/// A wider `numeric` scale on a `GROUP BY` key re-renders every stored
+/// value (`1.50` reads back as `1.500`) and fires no capture trigger, yet
+/// pauses nothing: numeric groups are matched as numbers, so a delete or
+/// update of a row the rewrite re-rendered still retracts from the group it
+/// was counted in, and a new row joins it. A scale narrower than the one
+/// recorded at define does pause: it rounds the stored values, so two
+/// groups (`1.555`, `1.556`) can become one (`1.56`) with no trigger firing.
+#[tokio::test]
+async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower_one_pauses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply(
+            "TRANSFORM per_price FROM public.posts GROUP BY price \
+             SELECT price AS price, COUNT(*) AS n, SUM(kind) AS kinds",
+        )
+        .await
+        .expect("define per_price");
+    bring_live(&mut raw, &db.pool, &["per_price"]).await;
+
+    raw.batch_execute("alter table public.posts alter column price type numeric(10,3)")
+        .await
+        .expect("change the GROUP BY key's scale");
+    capture_pass(&mut raw, &db.pool).await;
+    for target in ["post_authors", "post_titles", "per_kind", "per_price"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+
+    raw.batch_execute(
+        "delete from public.posts where id = 1; \
+         update public.posts set price = 1.5 where id = 2; \
+         insert into public.posts values (4, 'ann', 'd', 5, 2.5), (5, 'bob', 'e', 7, 1.5);",
+    )
+    .await
+    .expect("writes to rows the rewrite re-rendered");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "per_price").await, TransformStatus::Live);
+    // Compared as numbers: the target's rendering of a group is the one it
+    // was first written with.
+    assert_eq!(
+        rows(
+            &raw,
+            "select (price * 1000)::bigint::text, n::text, kinds::text from public.per_price \
+             where n <> 0 order by price"
+        )
+        .await,
+        rows(
+            &raw,
+            "select (price * 1000)::bigint::text, count(*)::text, sum(kind)::text \
+             from public.posts group by price order by price"
+        )
+        .await,
+    );
+
+    // Back to the recorded scale: nothing the target holds changes.
+    raw.batch_execute("alter table public.posts alter column price type numeric(10,2)")
+        .await
+        .expect("narrow back to the recorded scale");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_price").await, TransformStatus::Live);
+
+    raw.batch_execute("alter table public.posts alter column price type numeric(10,1)")
+        .await
+        .expect("narrow below the recorded scale");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_price", "public.posts", &["price"]).await;
+    assert!(
+        error.contains("from numeric(10,2) to numeric(10,1)") && error.contains("GROUP BY"),
+        "{error}"
+    );
+    for target in ["post_authors", "post_titles", "per_kind"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+}
+
+/// After only the from-side join column is widened (`varchar(8)` to
+/// `varchar(32)`), which the pass deliberately doesn't refuse, a lookup casts
+/// a from-side key to the to-side's `varchar(8)`, which truncates: the
+/// dangling key `'annabelle9'` finds the to-row `'annabell'`. The match is
+/// still dropped, because every lookup returns rows keyed by their own text
+/// and the evaluator looks up the from-side key's. So it joins nothing, as
+/// Postgres's own `=` would.
+#[tokio::test]
+async fn a_one_sided_join_widening_joins_no_key_by_its_prefix() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let _trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute(
+        "alter table public.posts alter column author type varchar(32); \
+         insert into public.users values ('annabell', 'Annabell');",
+    )
+    .await
+    .expect("widen the from-side join column only");
+    capture_pass(&mut raw, &db.pool).await;
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    raw.batch_execute(
+        "insert into public.posts values (4, 'annabelle9', 'd', 1, 1.00), \
+                                         (5, 'annabell', 'e', 1, 1.00);",
+    )
+    .await
+    .expect("a dangling key whose prefix is a to-side key, and a real one");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    raw.batch_execute("update public.users set name = 'Belle' where handle = 'annabell'")
+        .await
+        .expect("a to-side write");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    assert_eq!(status(&raw, "post_authors").await, TransformStatus::Live);
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, author_name from public.post_authors order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select p.id::text, u.name from public.posts p \
+             left join public.users u on u.handle = p.author order by p.id"
+        )
+        .await,
+    );
+}

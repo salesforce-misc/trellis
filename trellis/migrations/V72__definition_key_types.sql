@@ -12,7 +12,10 @@
 -- definition when it does (`staging::schema_change::pause_readers_of_retyped`).
 --
 -- Written when the definition is accepted, and by the capture pass for a key
--- column it finds unrecorded (one a later `ALTER TRANSFORM` added). A resume
+-- column it finds unrecorded: one that joined a table's row-identity key
+-- after define (a redefined primary key, which pauses the readers first,
+-- #687). `ALTER TRANSFORM` adds no key column: it edits only 1-1,
+-- relationship-free definitions' fields. A resume
 -- keeps the row: the tables Trellis created from the old type are still
 -- there, so a resume rebuilds into them.
 --

@@ -386,8 +386,9 @@ pub(crate) async fn pause_readers_of_unsupported(
 ///
 /// A routine widening (`integer` to `bigint`, `varchar(n)` to `text`) does
 /// neither. The types it compares against are those recorded when the
-/// definition was accepted; a key column with none recorded (one a later
-/// `ALTER TRANSFORM` added) gets the live one recorded here instead.
+/// definition was accepted; a key column with none recorded (one that
+/// joined the table's row-identity key after define, #687) gets the live one
+/// recorded here instead.
 ///
 /// Both checks hold across a resume: the first reads the live column, and
 /// the recorded type isn't touched, because a resume rebuilds into the
