@@ -1105,7 +1105,9 @@ async fn accumulate_from_side_recomputes(
     // land on a same-named table in another schema — and the from-side
     // reads below use it for the same reason.
     let qualified_from_table = rel.qualified_from_table();
-    let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
+    let Some(from_pk) = from_side_key(pool, &qualified_from_table).await? else {
+        return Ok(());
+    };
     let matches = from_side_keys(
         pool,
         &qualified_from_table,
@@ -1462,8 +1464,10 @@ pub(crate) struct ReverseRelationshipShape {
     from_col: String,
     /// The from-table's primary key, possibly composite (issue #126) — see
     /// [`from_side_rows_for_trigger_txn`]'s doc comment for how a
-    /// multi-column key's row identity is encoded/decoded.
-    from_pk: Vec<PrimaryKeyColumn>,
+    /// multi-column key's row identity is encoded/decoded. `None` when it
+    /// can't be used and every definition reading the from-table is frozen
+    /// ([`from_side_key`], issue #768): no recompute of its rows is staged.
+    from_pk: Option<Vec<PrimaryKeyColumn>>,
     /// Whether some definition on `from_table` reads this relationship. Each
     /// then re-derives every from-side row a parent change reaches: a 1-1
     /// target re-reads the row, and an aggregate on the ledger reads the
@@ -1683,7 +1687,7 @@ async fn build_reverse_relationship_shape(
     // relationship's own recorded one (issue #288), never `rel.def.from_table`
     // re-resolved through this session's `search_path`.
     let qualified_from_table = rel.qualified_from_table();
-    let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
+    let from_pk = from_side_key(pool, &qualified_from_table).await?;
     let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
 
     let needs_recompute_fallback = defs.iter().any(|def| {
@@ -2472,13 +2476,16 @@ async fn stage_reverse_recompute_fallback(
     row_columns: &[String],
 ) -> Result<(), ApplyError> {
     let shape = &record.shape;
+    let Some(from_pk) = &shape.from_pk else {
+        return Ok(());
+    };
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
         let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
         let from_rows = from_side_rows_for_trigger_txn(
             txn,
             &shape.from_table,
             &shape.from_col,
-            &shape.from_pk,
+            from_pk,
             &trigger,
             row_columns,
         )
@@ -4905,10 +4912,7 @@ async fn source_key_for_apply(
         }
         Err(err) => err,
     };
-    if !matches!(
-        err,
-        DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. }
-    ) {
+    if !is_key_gate(&err) {
         return Err(err.into());
     }
     // The fence the skip is judged under, read before the readers are: a
@@ -4925,11 +4929,7 @@ async fn source_key_for_apply(
             entry.insert(version);
         }
     }
-    let has_reader = {
-        let client = pool.get().await?;
-        catalog::has_unfrozen_reader(&**client, source_key).await?
-    };
-    if has_reader {
+    if has_unfrozen_reader(pool, source_key).await? {
         return Err(err.into());
     }
     tracing::warn!(
@@ -4937,6 +4937,57 @@ async fn source_key_for_apply(
         error = %err,
         "every definition reading this table is frozen and its key can't be used; \
          skipping its changes"
+    );
+    Ok(None)
+}
+
+/// Whether `err`, from [`ddl::source_primary_key`], is its key gate: the
+/// table has no usable key (none, or one of a type off the allowlist).
+fn is_key_gate(err: &DdlError) -> bool {
+    matches!(
+        err,
+        DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. }
+    )
+}
+
+/// [`catalog::has_unfrozen_reader`] on a pooled connection.
+async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyError> {
+    let client = pool.get().await?;
+    Ok(catalog::has_unfrozen_reader(&**client, table).await?)
+}
+
+/// A relationship from-side's primary key, which a reverse recompute keys
+/// the from-side rows a to-side change reaches by, or `None` when the key
+/// can't be used and every definition reading the from-side is frozen.
+///
+/// Issue #768, the from-side's half of [`source_key_for_apply`]: the
+/// recomputes re-derive the from-side's rows for the definitions reading
+/// it, and a frozen one's resume rebuilds it from the source, so with no
+/// other reader the caller stages none, as `compute` skips the from-side's
+/// own changes. Without this a write to the to-side halted the drain on the
+/// from-side's key though no reader would apply what it staged. A reader
+/// that isn't frozen halts it as before, and so does a from-side that is
+/// gone. A new reader rebuilds from the source too, so the skip needs no
+/// fence.
+async fn from_side_key(
+    pool: &Pool,
+    qualified_from_table: &str,
+) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
+    let err = match ddl::source_primary_key(pool, qualified_from_table).await {
+        Ok(pk) => return Ok(Some(pk)),
+        Err(err) => err,
+    };
+    if !is_key_gate(&err)
+        || quarantine::source_table_missing(pool, qualified_from_table).await?
+        || has_unfrozen_reader(pool, qualified_from_table).await?
+    {
+        return Err(err.into());
+    }
+    tracing::warn!(
+        from_table = %qualified_from_table,
+        error = %err,
+        "every definition reading this relationship from-side is frozen and its key \
+         can't be used; staging no recompute of its rows"
     );
     Ok(None)
 }
@@ -5953,7 +6004,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // that function's accumulator, and its entries are staged as
             // `src_table` verbatim.
             let qualified_from_table = rel.qualified_from_table();
-            let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
+            let Some(from_pk) = from_side_key(pool, &qualified_from_table).await? else {
+                continue;
+            };
             // #623 D5: an aggregate on the from-table keeps each row's group
             // on its ledger entry, so the recompute needs no prior image.
             let from_keys = from_side_keys(

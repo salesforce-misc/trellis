@@ -1542,3 +1542,101 @@ async fn a_page_that_skipped_a_to_side_misses_its_fence_after_a_reader_resumes()
         other => panic!("expected VersionFenceMiss, got {other:?}"),
     }
 }
+
+/// Issue #768, the from-side's half: `posts`' key retyped off the allowlist
+/// once every definition on it is paused. A write to a to-side reached the
+/// from-side's key through the reverse recompute that re-derives the
+/// `posts` rows the change joins (`author` to-one, `notes` to-many), and
+/// halted the drain on it though no reader would apply those recomputes.
+/// Now they aren't staged, and the unrelated table on the same pages keeps
+/// converging, through to-side writes and a to-side `TRUNCATE` alike. The
+/// relationship's projection still follows the to-side.
+#[tokio::test]
+async fn a_from_side_key_retyped_off_the_allowlist_does_not_halt_the_drain_once_its_readers_are_paused()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.notes (id int primary key, post_id int, body text); \
+         insert into public.notes values (1, 1, 'n1');",
+    )
+    .await
+    .expect("seed the to-many to-side");
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    for text in [
+        "RELATIONSHIP notes FROM posts.id TO notes.post_id",
+        "TRANSFORM posts_noted FROM public.posts SELECT count(notes.id) AS notes",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(
+        &mut raw,
+        &db.pool,
+        &["posts_named", "posts_plain", "posts_noted", "o_copy"],
+    )
+    .await;
+    let app = connect(db.dsn()).await;
+
+    for target in ["posts_named", "posts_plain", "posts_noted"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause a reader of posts");
+    }
+    app.batch_execute("alter table public.posts alter column id type numeric")
+        .await
+        .expect("retype the from-side key");
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+    app.batch_execute(
+        "update public.users set name = 'Annie' where handle = 'ann'; \
+         insert into public.notes values (2, 1, 'n2'); \
+         update public.o set v = 11 where id = 1;",
+    )
+    .await
+    .expect("write the to-sides and the unrelated table");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, "select id::text, v::text from public.o_copy").await,
+        vec![vec![Some("1".to_string()), Some("11".to_string())]],
+        "the unrelated table's write drained past the to-sides'"
+    );
+    let projection: String = raw
+        .query_one(
+            "select projection_table from relationship_projections rp \
+             join relationship_definitions rd on rd.id = rp.relationship_id \
+             where rd.name = 'author'",
+            &[],
+        )
+        .await
+        .expect("author's projection")
+        .get(0);
+    assert_eq!(
+        rows(
+            &raw,
+            &format!("select name from {SCHEMA}.{projection} where handle = 'ann'")
+        )
+        .await,
+        vec![vec![Some("Annie".to_string())]],
+        "the to-side's write still reaches the relationship's projection"
+    );
+
+    app.batch_execute("truncate public.users, public.notes; insert into public.o values (2, 20)")
+        .await
+        .expect("truncate the to-sides");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, v::text from public.o_copy order by id"
+        )
+        .await,
+        vec![
+            vec![Some("1".to_string()), Some("11".to_string())],
+            vec![Some("2".to_string()), Some("20".to_string())],
+        ],
+        "a truncate of the to-sides drains too"
+    );
+}
