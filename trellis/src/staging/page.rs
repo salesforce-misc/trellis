@@ -209,8 +209,15 @@ impl ClaimScope<'_> {
 /// segment in `slot` (a ring slot holds one live segment) when the row is in
 /// its fence, or the next segment when it isn't (a late writer's row,
 /// which that segment's window takes). A row whose owner has no fence yet
-/// (the active segment, or a seal's crash window) is pending, as is one
-/// whose owner can't be found.
+/// (the active segment, or a seal's crash window) is pending. A late row
+/// whose next segment is gone is applied. `seal::seal_phase1` inserts the
+/// next segment in the transaction that seals this one, so a fenced
+/// segment's successor is missing only once `retire::retire_drained_segments`
+/// has retired it, which needs it drained. That can happen while this slot's
+/// own retirement keeps being skipped (any reader of the slot fails its
+/// `nowait` lock), and counting such a row pending would keep its key out of
+/// a catch-up insert, or make a live write delete it, for a change that has
+/// already applied.
 pub(crate) fn ring_row_pending_sql(slot: i16, claim: Option<&ClaimScope<'_>>) -> String {
     let applied = |owner: &str| {
         let bucket = format!("(r.route % {owner}.bucket_count)::int");
@@ -231,11 +238,11 @@ pub(crate) fn ring_row_pending_sql(slot: i16, claim: Option<&ClaimScope<'_>>) ->
         "exists (select 1 from segments s where s.ring_slot = {slot} and \
              case when s.fence_snapshot is null then true \
                   when pg_visible_in_snapshot(r.row_txid, s.fence_snapshot) then not {own} \
-                  else not exists (select 1 from segments n \
-                                   where n.seg_seq = s.seg_seq + 1 \
-                                     and n.fence_snapshot is not null \
-                                     and pg_visible_in_snapshot(r.row_txid, n.fence_snapshot) \
-                                     and {successor}) end)",
+                  else exists (select 1 from segments n \
+                               where n.seg_seq = s.seg_seq + 1 \
+                                 and not (n.fence_snapshot is not null \
+                                          and pg_visible_in_snapshot(r.row_txid, n.fence_snapshot) \
+                                          and {successor})) end)",
         own = applied("s"),
         successor = applied("n"),
     )
@@ -465,6 +472,17 @@ mod tests {
             )
             .await
             .expect("drain the next segment");
+        assert_eq!(pending(&client, &["late"], None).await, [false]);
+
+        // The next segment is retired before this slot is (its `nowait`
+        // lock was busy): the late row stays applied.
+        client
+            .execute(
+                "delete from segments where seg_seq = $1",
+                &[&next.sealed_seg_seq],
+            )
+            .await
+            .expect("retire the next segment");
         assert_eq!(pending(&client, &["late"], None).await, [false]);
     }
 }
