@@ -121,9 +121,9 @@ experiments forced. I6 to I8 were learned from #565 and #617.
 |---|---|---|
 | **I0** | **One database.** Sources, the ring, every ledger and every target live in one Postgres database, so one snapshot orders every commit Trellis will see. | Design premise; made exact by trigger capture, which makes a ring row's transaction the source commit's. Nothing here works across databases. |
 | **I1** | **Read after lock.** Every live read that feeds an absolute write happens after the writer holds the lock on the ledger state it will write, and the snapshot it stores is taken **in the same statement** as the read. | [Exp 2](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484) scenarios 2/2b hold (Apply demonstrably blocks on the entry lock). [Exp 1b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484): a snapshot taken in a separate statement differed from the read's in 99.7% of samples under load; the stored basis is the full `pg_snapshot`, not `xmin`/`xmax`. |
-| **I2** | **Visibility-checked application.** A change C for row r is applied iff C's transaction is **not** visible in r's basis snapshot **and** C's ring position is above r's `applied_lsn`. Skipping is exact, never "maybe counted, re-derive". | Exp 2: skip-iff-visible alone fails scenarios 5b/9/9c (same-key order across batches is not decidable from visibility); stamping Apply's own snapshot fails 9b/9d; visible-or-`applied_lsn` passes all seventeen. An in-flight id is decidable from the stored list ([exp 1b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484): 0 disagreements over ~1.1M pairs); #617 saw 0 in-progress cases at 10M. |
+| **I2** | **Visibility-checked application.** A change C for row r is applied iff C's transaction is **not** visible in r's basis snapshot **and** C's ring position is above r's `applied_lsn` (and above the target's truncate floor, [Truncate](#truncate-ddl-drop)). Skipping is exact, never "maybe counted, re-derive". | Exp 2: skip-iff-visible alone fails scenarios 5b/9/9c (same-key order across batches is not decidable from visibility); stamping Apply's own snapshot fails 9b/9d; visible-or-`applied_lsn` passes all seventeen. An in-flight id is decidable from the stored list ([exp 1b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484): 0 disagreements over ~1.1M pairs); #617 saw 0 in-progress cases at 10M. |
 | **I3** | **Per-row ordering state; groups are pure sums.** The ledger entry is the only place a row's applied contribution and group live. A group value is the sum of its entries' contributions, so group updates commute and a group row is only ever incremented. For relationships the to-side value is factored out ([Relationships](#relationships-are-factored)). | Exp 2 scenarios 4 and 5; [exp 4b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5851003675) for the factoring. |
-| **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry stays, with its `applied_lsn`, until every batch at or below its own is fully applied on that target. | Exp 2 scenario 9 (an older update resurrects a deleted row without it). The batch-watermark form is exact under triggers because a same-key predecessor of a delete committed before the delete's trigger ran ([trigger amendment](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847674780)). |
+| **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry stays, with its `applied_lsn` and `applied_seg`, until every batch at or below its `applied_seg` is fully drained (amended by #623 Q7, [Convergence and status](#convergence-and-status)). | Exp 2 scenario 9 (an older update resurrects a deleted row without it). The batch-watermark form is exact under triggers because a same-key predecessor of a delete committed before the delete's trigger ran ([trigger amendment](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847674780)). |
 | **I5** | **One lock order, taken as one sorted batch.** Ledger entries, then parent rows, then partials, then groups, each locked in key order in one statement per class. Never a per-row loop. | Exp 2 finding 3: a per-row loop deadlocked 19–22 times in 20 s; the sorted batch never did. **Not yet total:** the factored variant deadlocked 9–16 times per 100k-fan-out run on disk and 0 on tmpfs ([exp 4b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5851003675)). The cycle must be found before I5 is stated as proven ([open question 3](#open-questions)). |
 | **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. No Trellis-side condition (a missing column, a broken ring) fails the application's statement. | [E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119): a bare `CREATE TRIGGER` stalled every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. [E4](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977): a renamed read column failed every insert until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
 | **I7** | **No Trellis transaction waits for a lock while it holds a snapshot open.** Every lock statement runs under a `lock_timeout`; on timeout the transaction rolls back and the work is retried from outside any transaction. | [#617 final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160): a drain batch's ledger insert waited 1 h 50 min behind chunk transactions; the open transaction pinned the slot's `restart_lsn`, `pg_wal` reached 190 GB and the sealer was refused for the whole wait. Without a slot the WAL pin goes, but an open snapshot still holds back vacuum and the sealer, so the invariant stays. |
@@ -168,6 +168,25 @@ What it does there is one append.
   323 KB per row on a 100 KB column, 40x the control, where naming only the
   read columns costs +30 µs. NEW-only is exact because the ledger holds the
   old side ([trigger amendment](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847674780)).
+  *Status after #623 D8a (#750):* the `WHEN` clause is a filter inside the
+  function (a statement trigger with transition tables can't take a
+  `WHEN`): an update row whose imaged columns are all unchanged
+  (`record_image_ne` over the typed values) stages nothing. The NEW image
+  is the **live row** whenever it can differ from the transition row: a
+  fifth trigger, `<schema>_capture_begin` (`BEFORE … FOR EACH STATEMENT`),
+  marks each statement's span, and capture re-reads its rows by primary key
+  only when another write to the same table ran inside that span (a nested
+  same-key write, #680), or when an update's old rows hold a key twice (an
+  FK action's update merged into the same capture call). Otherwise it
+  images the transition tables and reads no relation. An unconditional
+  re-read took btree predicate locks, and failed 50–87% of concurrent
+  `SERIALIZABLE` auto-increment inserts with `40001`; gated, the rate is 0,
+  as with no capture. **The ring still carries the old image:** every
+  remaining reader of it is relationship machinery (the to-one projection
+  and guards, the to-many reverse path, the #130 generation bump, prior-image
+  hints), so dropping it, with the fold's OLD-only fields, moves to
+  milestone E (#624). An aggregate Apply already takes a key's old group
+  and contribution from its ledger entry, not from the image.
   [E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)
   for the privilege model: the application needs nothing on Trellis's
   schema. The Trellis role must own each source table or be a member of its
@@ -272,20 +291,46 @@ state that orders its writes.
   group_key, join_key, contrib, applied_lsn pg_lsn, basis pg_snapshot)`,
   indexed on `group_key` and on `join_key`; written in the same transaction
   as the target, entries locked in key order before any group row is
-  touched. For a 1-1 target the ledger is the target row itself plus
-  `applied_lsn`, `basis` and a tombstone marker. *Evidence:*
+  touched. *Evidence:*
   [#558 design note](https://github.com/salesforce-misc/trellis/issues/558),
   [exp 3](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5842993962)
-  for the schema as prototyped.
+  for the schema as prototyped. *As built (#623 Q5):* the group key is the
+  target's own typed `GROUP BY` columns, `contrib` is one typed column per
+  distinct aggregate argument (`__arg<n>`, shared by every field over the
+  same argument, none at all for `COUNT(*)`) plus a `__member` flag, and
+  the ordering state is `__applied_lsn`, `__applied_seg` (the tombstone GC
+  watermark, I4), `__basis` and `__tombstone` (`defs::ledger`).
+- **Must (amended by #623 Q2):** a 1-1 target's ledger is a slim side table,
+  `<target>__ledger(from_key primary key, applied_lsn, applied_seg, basis,
+  tombstone)`, beside an unchanged target table; the target row holds the
+  values. The original text made the target row itself the ledger, with a
+  tombstone row in the target. That leaves a deleted row readable after
+  `await_converged` until GC runs, and a tombstone kept in a side table
+  instead gives a never-seen key no single row to lock. The side table is
+  one lock domain per key (a placeholder insert, then a sorted `for
+  update`). Its cost is one more row write per change: ~200 B of WAL per
+  row, with the `throughput-ramp` knee unchanged once the placeholder
+  insert settles a new key's Apply on its own (#724).
 - **Must:** exactly two operations exist, and every producer is one of them.
   - **Re-derive(r).** Lock r's entry (inserting a placeholder if absent).
     In one statement: take the snapshot, read r's source row and, through
     each relationship, the parent's applied values, compute the group key
     and contribution. Diff against the entry: subtract the old contribution
     from the old group, add the new to the new group, replace the entry with
-    the new values, the new basis and the read's position. If r no longer
-    exists in its source, the entry becomes a tombstone and its contribution
-    leaves its group.
+    the new values and the new basis, and leave `applied_lsn` as it was. If
+    r no longer exists in its source, the entry becomes a tombstone and its
+    contribution leaves its group. *Amended by #623 Q1:* the original text
+    also stored the read's position as `applied_lsn`. Under trigger capture
+    a ring row's position is the writer's pre-commit insert position, so a
+    change whose trigger ran before the read but which committed after it
+    would sit below that position, invisible to the basis, and be skipped
+    for good. The basis alone records what the read saw: every change it
+    saw is refused by visibility, and every change it missed is still
+    pending under its own ring row. The exact point a read stores is
+    therefore the full `pg_snapshot` taken in the same statement as the
+    read (I1), on every entry that read wrote; a read in keyspace chunks
+    stores each chunk's own (`chunked_read_exact_point_*` in
+    `trellis/tests/ledger_interleavings.rs`).
   - **Apply(r, C, image).** Lock r's entry. If C is visible in the entry's
     basis, or C's position is at or below `applied_lsn`, stop (I2).
     Otherwise `delta = f(NEW) − entry.contrib`, group += delta, entry :=
@@ -299,7 +344,7 @@ state that orders its writes.
   | Build (any shape), resume rebuild, `request_backfill`, quarantine release, column resume, `ALTER TRANSFORM` added column | Re-derive over the definition's key space, chunked |
   | Relationship parent change | The parent operation below; per-child Re-derive only for non-linear fields |
   | To-side `TRUNCATE` | Parent operation with `f = 0` for every parent of the table; the join-key index names the children |
-  | Source `TRUNCATE` | Every entry from that source becomes a tombstone with the truncate's position; groups decrement |
+  | Source `TRUNCATE` | The ledger is emptied, the target's truncate floor is raised to the truncate's ring position, and the target is cleared (amended by #623 Q6, [Truncate](#truncate-ddl-drop)) |
   | Chained hop | Apply, where C is the upstream apply transaction ([Multi-hop](#multi-hop-a-target-is-captured-like-a-source)) |
 
 - **Must keep contributions.** A membership-only ledger (group key and basis,
@@ -519,14 +564,22 @@ applying.
   reads directly or through a relationship) that is not `live` reports the
   upstream's state, transitively, computed when status is read and never
   stored (#497's rule).
-- **Must (I4):** tombstone GC by a per-target batch watermark: once a segment
-  is fully drained, the retire path deletes every tombstone on each target
-  whose `applied_lsn` is at or below that segment's fence. *Amended by
-  #742:* the watermark is the entry's `applied_seg`, and a Re-derive's read
-  is live, so a page draining an old batch can see a later batch's delete.
-  A Re-derive therefore stamps at least the newest segment its snapshot
-  sees. Every change the snapshot saw is in that segment or an earlier one,
-  so the tombstone outlives every change its `basis` would refuse.
+- **Must (I4):** tombstone GC by a batch watermark. Every entry records
+  `applied_seg`, the newest segment (`seg_seq`) whose changes it reflects,
+  and maintenance deletes each tombstone whose `applied_seg` is at or below
+  the **contiguous drained prefix**: the highest `seg_seq` at or below which
+  every segment is drained (`staging::retire::collect_tombstones`). *Amended
+  by #623 Q7:* the original text compared `applied_lsn` with a drained
+  segment's fence, but a fence is a snapshot, not a position, and segments
+  drain out of order, so "the segment just drained" says nothing about an
+  older one still pending. A same-key predecessor of a delete committed
+  before the delete's trigger ran, so it is in the delete's batch or an
+  earlier one, and at or below the prefix it has been applied or skipped.
+  *Amended by #742:* a Re-derive's read is live, so a page draining an old
+  batch can see a later batch's delete. A Re-derive therefore stamps at
+  least the newest segment its snapshot sees. Every change the snapshot saw
+  is in that segment or an earlier one, so the tombstone outlives every
+  change its `basis` would refuse.
 - Every repair that used to be a re-read (an explicit `request_backfill`, a
   resume, a quarantine release) is a rebuild: Re-derive over the key space,
   which I2 makes safe against any pending change.
@@ -554,9 +607,20 @@ settled target checks both: `live` from status, then its token.
 ## Truncate, DDL, drop
 
 - `AFTER TRUNCATE` statement triggers per captured table stage one truncate
-  row; the drain barrier is restated under xid order (#598). A source
-  truncate tombstones every entry from that source; a to-side truncate is
-  the parent operation with zero values for every parent of the table.
+  row; the drain barrier is restated under xid order (#598). A to-side
+  truncate is the parent operation with zero values for every parent of the
+  table.
+- **A source truncate resets the target and raises a floor** (*amended by
+  #623 Q6*; the original text tombstoned every entry from the source, an
+  O(source) write). The page that applies it empties the target's ledger
+  (and its build deltas), clears the target, and raises the target's
+  truncate floor (`ledger_truncate_floor`) to the truncate's ring `lsn`.
+  I2 then also refuses any change at or below the floor. The floor is
+  exact because `TRUNCATE` takes `ACCESS EXCLUSIVE`: every writer that
+  touched the table before it committed first, so its trigger's position is
+  below the truncate's, and every writer after it is above. Pending changes
+  from before the truncate are dropped by the floor as they drain, the way
+  Postgres's own lock orders them.
 - Source `ALTER TABLE` on a read column follows the schema-changed marker
   and regeneration rule; on any other column it is invisible.
 - Dropping the last definition on a table drops its triggers on the next
@@ -624,8 +688,9 @@ names it.
   of one row per source row (~3x the source's on-disk size at 10M in the
   prototype), and a relationship target carries P and T. WAL on the hot path
   is 1.6–1.7x a ledger-less apply for plain aggregates and 0.6–1.6x for
-  relationships. In exchange, no full old image is ever staged and
-  `REPLICA IDENTITY FULL` is not required anywhere.
+  relationships. In exchange, no full old image is ever staged (once
+  milestone E drops the ring's `old_image`; until then the imaged columns'
+  old values are) and `REPLICA IDENTITY FULL` is not required anywhere.
 - **The failure mode of a broken capture is loud, not silent.** A missing
   ring table or revoked privilege fails the application's statement with a
   `CONTEXT` line naming the capture function

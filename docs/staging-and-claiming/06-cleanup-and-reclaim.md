@@ -117,13 +117,15 @@ It is deliberately **not** bucket-scoped: it parks the whole batch's contributio
 complete and idempotent on the extended key, so a co-worker on another bucket
 parking the same rows is a no-op, not a conflict.
 
-**Release is operator-driven, one transaction:** replay every held row for the key
-— in batch then position order — into the active batch, then delete the held rows,
-the marker, and the death counter. The ordered replay telescopes the per-key delta
-chain back together ([05](05-apply-and-exactly-once-deltas.md), property 3). Each
-replayed row keeps its **original** origin position, so its band stays blocked
-until the release actually drains — the key is never in neither place, which would
-make the read-your-writes predicate lie ([07](07-convergence-and-await.md)).
+**Release is operator-driven, one transaction:** stage one `Recompute` of the key
+into the active batch, then delete the held rows, the marker, and the death
+counter (`release_key`, #623 D3). The held rows are not replayed: a replayed row would
+carry the releaser's `row_txid`, not its source commit's, so a replay could regress a ledger entry a later Re-derive already moved past. The `Recompute`
+is a Re-derive of the key from its current row on every target that reads it
+([05](05-apply-and-exactly-once-deltas.md#the-ledger)). It keeps the held rows'
+earliest origin position, so the key's band stays blocked until the release
+actually drains — the key is never in neither place, which would make the
+read-your-writes predicate lie ([07](07-convergence-and-await.md)).
 
 **What must never be quarantined.** Two error classes are deterministic and
 key-attributable yet caused by the *declared schema*, not the data — a tripped hop

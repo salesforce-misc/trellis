@@ -636,9 +636,9 @@ pub const MAX_ISOLATION_PROBES: usize = 256;
 /// [`IsolationOutcome::TransientStorm`] unless it already pinned a key.
 ///
 /// A probe that hits a lock timeout has waited a whole
-/// [`crate::locks::LOCK_TIMEOUT`] (120 s) first. Before this limit, a lock
-/// storm could run all [`MAX_ISOLATION_PROBES`] probes into it, about 8.5
-/// hours on one page. Three bounds it at 6 minutes, the same three lock
+/// [`crate::locks::LOCK_TIMEOUT`] (30 s) first. Before this limit, a lock
+/// storm could run all [`MAX_ISOLATION_PROBES`] probes into it, about 2 hours
+/// on one page. Three bounds it at 90 seconds, the same three lock
 /// timeouts a page's own lock-timeout retries get (`apply`'s
 /// `LOCK_RETRY_BUDGET`), after which the drain surfaces the failure and the
 /// page is retried later. A deadlock or serialization failure fails fast, so
@@ -2792,7 +2792,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 ///
 /// - the first parked row's pre-image (a recompute's own hint, or a CDC
 ///   row's old image) as its prior image, the state readers last saw, which
-///   names the group an aggregate not on the ledger must also re-derive;
+///   the relationship paths still read for the old join value (#624 drops it);
 /// - the parked rows' earliest `origin_lsn` (unknown if any is) and
 ///   `src_changed`, and their deepest `hop_gen` (0 if any is a source
 ///   change), so the key's band stays blocked until the release drains (doc

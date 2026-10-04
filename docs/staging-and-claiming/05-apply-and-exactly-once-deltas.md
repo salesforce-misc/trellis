@@ -7,8 +7,9 @@ it in a way that survives crashes, duplicate execution, concurrent workers, and
 concurrent definition changes.
 
 **The guarantee:** *a non-idempotent effect — an aggregate delta — is applied
-exactly once. Never twice, never zero times.* And it is guaranteed
-**structurally**, with no per-key applied-marker to keep in sync.
+exactly once. Never twice, never zero times.* It rests on one transaction and
+one per-key record: a batch's writes commit with its drained mark, and a group
+moves by exactly what its keys' ledger entries move, in the same statement.
 
 ## The three phases
 
@@ -39,7 +40,7 @@ sequenceDiagram
     W->>DB: BEGIN
     W->>DB: 1. version fence (FOR SHARE on each computed source)
     W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: sorted entry lock + I2 test)
-    W->>DB: 3. aggregate + join maintenance (delta arithmetic)
+    W->>DB: 3. aggregate ledgers (sorted entry lock, I2 test, group increments),<br/>relationship projections
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
     W->>DB: 6. pg_notify
@@ -62,8 +63,8 @@ move under you, which the version fence and the immutable batch exist to handle.
 
 ## The exactly-once argument
 
-Three properties give it, and **all three are structural** — there is no
-bookkeeping to keep in sync, no "applied" flag, no per-key watermark.
+Three properties give it. The first two are structural; the third is the
+ledger entry, which every write to a group moves in the same statement.
 
 ### 1. The claimed batch is immutable
 
@@ -143,15 +144,19 @@ ON CONFLICT (seg_seq, bucket) DO UPDATE SET ...;
 - A key never splits inside a segment (pages are key ranges), so the fold's rules
   below hold per page unchanged.
 
-### 3. The per-key fold telescopes
+### 3. A group moves by its entries' moves
 
-Within one batch, N changes to a key fold to one record whose old side is the
-*earliest* pre-image and whose new side is the *latest* post-image. Across
-batches, each batch's net delta chains onto the last: **batch *k*'s old side is
-exactly the state batch *k−1*'s new side left.**
+Within one batch, N changes to a key fold to one record carrying the *latest*
+post-image. A page writes that record into the key's ledger entry and, in the
+same statement, adds the entry's move (from the state it held to the state it
+now holds) to the group's increments
+([below](#aggregate-groups-the-ledger)). The entry is the key's last-applied
+state, so what a page subtracts is **exactly what the entry's last write
+added**, whichever batch that came from.
 
-Because the deltas are invertible they also **commute**, so an out-of-order drain
-converges to the same total.
+The moves telescope: a group is always the sum of its live members' entries.
+A change the entry's I2 test refuses moves nothing, so a batch draining after a
+newer one for the same key adds nothing twice.
 
 ## Absolute writes do not commute: the 1-1 ledger
 
@@ -180,7 +185,11 @@ So a 1-1 target is on its ledger (`staging::one_to_one_ledger`, #623 D6),
 whose entry for a key holds only the ordering state ([below](#the-ledger)); the
 target row holds the values. A change is an **Apply** when it carries the
 image of the commit it came from (its `lsn` and source `txid`), and a
-**Re-derive** when it was staged as a `recompute` or folded with one. Phase 2
+**Re-derive** when it was staged as a `recompute` or folded with one. Every
+record of a page whose oldest batch is at or below the target's `build_seg`,
+the segment its Re-derive build started in, is a Re-derive too (#733): such a
+batch may hold a change committed before the start whose later change drained
+before it, unapplied, so its image is stale. Phase 2
 evaluates an Apply's image; Phase 3 settles each 1-1 target's records in one
 pass:
 
@@ -229,8 +238,8 @@ settled the same way as a page's Re-derive.
 ### The ledger
 
 ADR-0002 gives every target a per-key ledger. Apply maintains it for every
-aggregate target since #623 D5 (plain ones since D3, next section) and for 1-1
-targets since D6 ([above](#absolute-writes-do-not-commute-the-1-1-ledger)).
+aggregate target (`staging::ledger`, next section) and every 1-1 target
+(`staging::one_to_one_ledger`, [above](#absolute-writes-do-not-commute-the-1-1-ledger)).
 
 Every target has one, `<target>__ledger` in the target's schema, created in the
 registration transaction and dropped with the target (`defs::ledger`). It holds
@@ -261,34 +270,52 @@ entry count, and so on. The group row carries that count as `__trellis_members`.
 A 1-1 target's ledger holds only the key and the ordering state, because the
 target row holds the values.
 
-The one-pass aggregate build writes the ledger. It empties it, reads the source
-into it in one statement whose snapshot becomes every entry's basis, and then
-writes the group rows as a `GROUP BY` over it. The 1-1 build writes no entries:
-a key's first change after it inserts the key's entry, and the go-live
+A target is built one of two ways. The Re-derive build (`staging::build`,
+#625) serves an aggregate target with no relationship path and a 1-1 target
+with none, on a captured source (not another definition's target): it
+applies from its start and re-derives the source in chunks, each locking its
+keys' entries as a page does and stamping them as a Re-derive does (below).
+Every other target keeps the one-pass build. For an aggregate it empties the
+ledger, reads the source into it in one statement whose snapshot becomes
+every entry's basis, and then writes the group rows as a `GROUP BY` over it.
+A relationship-enriched 1-1 target's one-pass build writes no entries: a
+key's first change after it inserts the key's entry, and the go-live
 catch-up's Re-derives stamp every key's basis.
 
 ### Aggregate groups: the ledger
 
-An aggregate target whose every field is `SUM(x)` or `AVG(x)` over an exact
-numeric source column, `COUNT(*)`, or `COUNT(x)` over a source column of any
-type but `json`/`jsonb`, grouped by plain source columns, is on the ledger
-(`staging::ledger`, #623 D3). So is one that reads such a value, or groups by
-one, through a to-one relationship (#623 D5). Its statements left-join each
-relationship's to-side and read the parent live, after the entry lock and in
-the same statement as the child's read. A parent change re-derives every
-child it reaches; a child that has since moved off the parent has a change
-of its own pending, whose write reads its new parent. `AVG(x)` keeps its hidden running sum and count
-as today and writes `sum / count::numeric`, which is Postgres's own `avg()`
-over an exact numeric argument. Each page applies its records for such a
-target in one transaction, in four steps:
+Every aggregate target is on the ledger (`staging::ledger`). Its fields are
+of two kinds (#623 D3, D4):
+
+- **Maintained** by increments: `SUM(x)` and `AVG(x)` over an exact numeric
+  argument, `COUNT(*)` and `COUNT(x)`. `AVG(x)` keeps a hidden running sum and
+  count and writes `sum / count::numeric`, which is Postgres's own `avg()`
+  over an exact numeric argument.
+- **Recomputed** from the group's live entries after the upsert: every other
+  field (`MIN`/`MAX`, `BOOL_AND`/`BOOL_OR`, a float `SUM`/`AVG`, a composed
+  field such as `SUM(a) + COUNT(b)`).
+
+An argument may be an expression (`SUM(v + 1)`), evaluated per change over
+the image as the source's row type. A target that reads a value, or groups by
+one, through a to-one relationship is no different (#623 D5): its statements
+left-join each relationship's to-side and read the parent live, after the
+entry lock and in the same statement as the child's read. A parent change
+re-derives every child it reaches; a child that has since moved off the
+parent has a change of its own pending, whose write reads its new parent.
+Each page applies its records for an aggregate target in one transaction, in
+five steps:
 
 1. **Lock (I1, I5).** Insert a non-member placeholder entry for every key the
    page has no entry for, then lock every entry `for update`, sorted by key, in
-   one statement.
+   one statement. A key whose tombstone the GC collects between the two fails
+   the page transiently and it is retried (#712).
 2. **Re-derive read.** A record staged as a `recompute`, or folded with one, is a
-   Re-derive. So is a record with no change to apply. One statement reads those
-   keys' current source rows *and* `pg_current_snapshot()`, after the lock. A key
-   with no row becomes a tombstone.
+   Re-derive. So is a record with no change to apply, and every record of a
+   page whose oldest batch is at or below the target's `build_seg`, as on a
+   1-1 target (#733). One
+   statement reads those keys' current source rows *and*
+   `pg_current_snapshot()`, after the lock. A key with no row becomes a
+   tombstone.
 3. **Entries, then groups, in one statement.** It first updates each entry:
    - A Re-derive writes the entry from its read. It sets `__basis` to the
      read's snapshot and leaves `__applied_lsn` alone (#623 Q1). Every change
@@ -308,16 +335,19 @@ target in one transaction, in four steps:
    sum and its non-null count. It upserts them in group order, incrementing every
    column (I3). A `SUM` goes `NULL` when its non-null count and its sum both
    reach 0.
-4. **Empty groups go.** Groups whose every accumulator (`__trellis_members`,
+4. **Recomputed fields.** Each group the upsert wrote has its recomputed
+   fields rewritten from its live member entries. The upsert holds every
+   written group's row lock, so this statement sees every entry of those
+   groups.
+5. **Empty groups go.** Groups whose every accumulator (`__trellis_members`,
    each count, each sum) reached 0 are deleted. With one writer of groups that
    is the same as the member count reaching 0. A Re-derive build adds a second
-   writer (next section), and then a group can reach 0 members while a sum is
+   writer (below), and then a group can reach 0 members while a sum is
    still owed to it.
 
-There is no live `GROUP BY`, probe or horizon, and a page takes its locks in one
-order: entries, then groups, each in one sorted statement. A Re-derive of an
-unchanged key moves nothing, so a go-live re-read after the build writes no
-group rows.
+A page takes its locks in one order: entries, then groups, each in one sorted
+statement. A Re-derive of an unchanged key moves nothing, so a go-live re-read
+after the build writes no group rows.
 
 Each written or deleted group reaches the seam with its prior image. PG 17 has
 no `OLD` in `RETURNING`, so the image is rebuilt from the upsert's result minus
@@ -327,8 +357,8 @@ A fold record carries the identity of the change that won its post-image
 (`last_change`: its `lsn` and `row_txid`, see
 [04](04-claiming-and-the-fold.md)). That change is the one an Apply judges.
 
-**Build chunks and the merger (#625 F1, not yet scheduled).** A Re-derive
-build re-derives the source a primary-key range at a time. A chunk takes the
+**Build chunks and the merger (#625).** A Re-derive build re-derives the
+source a primary-key range at a time. An aggregate target's chunk takes the
 same entry lock as a page (with a 1 s `lock_timeout`, so it gives way to a
 page), and then one statement reads the range's locked rows with
 `pg_current_snapshot()` and the active segment, rewrites their entries
@@ -339,7 +369,8 @@ partition: `hash_record_extended` of the group, so equal groups (`1.5` and
 `1.50`, or every `NULL` group) share one. It never writes a group row. A
 merger claims one partition's delta rows oldest first through an index on
 `(__part, __seq)` (`for update skip locked`), deletes them, and upserts their
-sums per group with the page's upsert, in group order. Only one merger works
+sums per group with the page's upsert, in group order, then rewrites the
+recomputed fields of the groups it wrote (#625 F5). Only one merger works
 on a partition at a time: it takes a transaction-scoped advisory lock on the
 partition without waiting, trying the partitions with rows in turn, and
 skips the target only when another merger holds each of them (#625 F2b,
@@ -372,42 +403,43 @@ The old, mutable-worklist design needed two extra mechanisms, both now gone:
   double-subtracts.
 
 Both existed *only* because the worklist was mutable; Property 1 removes the race.
-**A patch that reintroduces a mutable claimed batch must reintroduce them both** —
-that is the tell for whether a proposed change is actually equivalent.
+A patch that makes a claimed batch mutable again brings the race back.
 
 ## The delta model
 
-For a row with key `pk`, maintaining a measure `f` over group `g` in one Phase-3
-transaction:
+For a source key, maintaining a measure `f` over group `g` in one Phase-3
+transaction, where the key's ledger entry holds the group `g(entry)` and the
+contribution `f(entry)` it last applied:
 
 | Op | Effect |
 |---|---|
 | INSERT | `g(new) += f(new)` |
-| DELETE | `g(old) -= f(old_image)` |
-| UPDATE, grain unchanged | `g -= f(old_image)` and `g += f(new)` — one group, net delta |
-| UPDATE, grain changed | **grain migration**: `g(old) -= f(old_image)` *and* `g(new) += f(new)` — two groups |
+| DELETE | `g(entry) -= f(entry)`; the entry becomes a tombstone |
+| UPDATE, grain unchanged | `g += f(new) − f(entry)` — one group, net delta |
+| UPDATE, grain changed | **grain migration**: `g(entry) -= f(entry)` *and* `g(new) += f(new)` — two groups |
 
-The drain needs exactly two facts per folded record: the **old-side image** (to
-subtract; present iff `old_image IS NOT NULL`) and the **new-side image** (to
-add; present iff the key is still live).
+The entry is then rewritten to the new side. So the drain needs one image per
+folded record, its **new side** (none for a delete), and no old image: the old
+side is the entry.
 
-Folding the new side from the **staged post-image at the claimed position** — not
-from a live source read — is what keeps the delta scan-free *and* closes a
-read-ahead window: a live read at apply time can see a *later* state than the
-batch is accounting for, and then the next batch subtracts an old image that was
-never added.
+An Apply takes the new side from the **staged post-image at the claimed
+position**, which keeps it scan-free. A Re-derive reads the source live
+instead, which may see a *later* state than the batch accounts for. That is
+safe because the entry records what it added: the read's snapshot becomes the
+entry's `__basis`, so a later change the read already saw is refused by I2,
+and the next write subtracts what the read wrote.
 
 Composite measures fold their hidden partials, never themselves: `avg` maintains
-`{m}__sum` and `{m}__count` and recomputes the visible ratio from them.
+`__{m}_sum` and `__{m}_count` and recomputes the visible ratio from them.
 
-**Not every measure is delta-able**; the gate is explicit: only exact, invertible
-folds qualify. `count(*)`, `count(col)`, and `sum`/`avg` over
-int/numeric are in. `min`/`max` are not invertible (removing the current maximum
-tells you nothing about the next one) and take a probe-assisted recompute path
-instead. Floats need care: naïve deltas drift unboundedly because IEEE-754
-addition is non-associative, so the accumulator is kept in exact decimal and only
-rendered to float — and `Inf`/`NaN` are tracked as counts, not delta-invertible at
-all (`Inf − Inf = NaN`).
+**Not every measure is delta-able**; the gate is explicit: only exact,
+invertible folds are maintained by increments. `count(*)`, `count(col)`, and
+`sum`/`avg` over an exact numeric argument are in. Every other field is
+recomputed from the group's live entries (#623 D4): `min`/`max`, which are not
+invertible (removing the current maximum tells you nothing about the next
+one), `bool_and`/`bool_or`, a float `sum`/`avg`, whose increments would drift
+because IEEE-754 addition is non-associative (and `Inf − Inf = NaN`), and a
+composed field.
 
 **The north star for the exact types is byte-identical convergence to a
 from-scratch `GROUP BY` oracle after every op and every drain interleaving** — far
@@ -449,9 +481,13 @@ parent — or a grain change mid-batch slips through.
 
 Two workers whose batches touch overlapping keys or groups will contend on the
 same rows. That is fine; deadlocking on them is not. A page takes its locks in
-one consistent order: **entries, then groups, each in one sorted statement**
-([the ledger](#aggregate-groups-the-ledger)). The entry lock is ordered by key,
-and the group upsert writes its groups in group order.
+one consistent order: its 1-1 targets, then its aggregate targets, each in
+target order, and per target **its entries, then its rows, each in one sorted
+statement**. The entry lock is ordered by key
+([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
+[the aggregate ledger](#aggregate-groups-the-ledger)); a 1-1 target's rows are
+then pre-locked in key order, and an aggregate's group upsert writes its
+groups in group order.
 
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
@@ -480,15 +516,17 @@ retried with backoff from outside any transaction.
   `INSERT ... ON CONFLICT` waiting on another transaction's uncommitted key
   (#617's wait), an `UPDATE` of a row another transaction holds. A setting
   per transaction would cover only the transactions someone remembered.
-- **The cap is two minutes, for now.** The invariant is that the wait is
-  bounded, not that it is short: two minutes is 55 times shorter than #617's
-  wait. It was sized for the aggregate group pre-lock #623 D5 removed, which
-  queued drain pages that touch the same groups one behind another. In `bench
-  fold-in-ratio` at ratio 10 (40k groups, every page touching most of them)
-  the longest page transaction, its wait included, was 89 s, when eight
-  ~28k-record pages queued together, and 100k-record pages ran 47 s. A 5 s
-  cap fired 75 times there, and each retry lost its place in the queue. The
-  value is interim: with the pre-lock gone, it can be re-measured.
+- **The cap is 30 seconds.** The invariant is that the wait is bounded, not
+  that it is short. The cap was two minutes while the aggregate group
+  pre-lock queued drain pages that touch the same groups one behind
+  another: in `bench fold-in-ratio` at ratio 10 (40k groups, every page
+  touching most of them) the longest page transaction, its wait included,
+  was 89 s, and a 5 s cap fired 75 times. #623 D5 removed the pre-lock, and
+  D9 re-measured the same run on disk: the longest page is now 6.6 s, and no
+  page waits out a 30 s or a 10 s cap. The cap is the smallest of the two
+  whose longest page stays under a third of it, so a slow checkpoint can't
+  turn ordinary pages into retries. Going lower waits for #629's
+  measurements.
 - **A drain keeps its claim across the retry.** A page whose transaction
   times out is classified transient; the drain backs off (50 ms, doubling to
   1 s) and retries the page, recomputing it, while the heartbeat keeps its
@@ -527,13 +565,16 @@ autovacuum waits the vacuum out (#622 plan Q1).
 
 ## Downstream propagation, and why it terminates
 
-Step 4 stages the keys whose derived values depend on what just changed —
-including, for a one-to-many aggregate, the parent groups of a changed child.
-This is where the old image a capture trigger stages
-([01](01-capture-by-triggers.md)) is cashed in: a child **delete** or a
-**re-parent** must refresh both the group the child joined (from the live row) and
-the group it left (from the staged old image, which is the only place that
-information still exists).
+Step 4 stages the keys whose derived values depend on what just changed: every
+key a step above physically wrote in a target another definition reads, and,
+for a relationship whose to-side changed, the from-side rows that join it. An
+aggregate needs no old image for this: its ledger entry names the group a key
+was in. The relationship paths still read the old image a capture trigger
+stages ([01](01-capture-by-triggers.md)), the only place a key's old join
+value still exists: a to-side **delete** or **join-key change** must refresh
+the from-side rows that joined the old key, not only those that join the new
+one ([04](04-claiming-and-the-fold.md#who-reads-the-old-image)). Dropping OLD
+images is milestone E (#624).
 
 Two termination mechanisms:
 

@@ -65,9 +65,10 @@ rows. No bucket is ever held twice.
 > at 16 workers it was ~60%. A prototype that committed each claim before
 > folding removed the wait entirely. Throughput didn't move beyond run-to-run
 > noise, at 400 groups on its own or at 4,000 combined with a batched
-> existence probe, because per-row drain work binds there first. With 400 groups, the workers freed from the claim queue went on to
-> queue for the aggregate's target-row pre-lock. Fixing this won't raise
-> throughput until that per-row cost comes down.
+> existence probe, because per-row drain work bound there first: with 400
+> groups, the workers freed from the claim queue went on to queue for the
+> aggregate's group pre-lock. The ledger (#623 D5) has since removed both the
+> probe and the pre-lock.
 
 **The claim is one statement.** The claim rows and the batch's `sealed → draining`
 flip are the same `WITH … INSERT … UPDATE …` statement, so they commit together.
@@ -149,8 +150,8 @@ Four rules are load-bearing — the same four the write-time merge established:
 
 | Field | Rule | Why |
 |---|---|---|
-| `new_image` | **last** — post-image of the highest-`lsn` change (`change_id` breaks ties); a latest `delete` wins with a NULL post-image even when it carries no image | the delta's add side `+f(new)` must track the latest image, and a deleted key has none |
-| `old_image` | **first** — pre-image of the lowest-`lsn` change | the state the key was last materialized from; the delta's removal side `−f(old)` |
+| `new_image` | **last** — post-image of the highest-`lsn` change (`change_id` breaks ties); a latest `delete` wins with a NULL post-image even when it carries no image | an Apply writes the key's latest image, and a deleted key has none |
+| `old_image` | **first** — pre-image of the lowest-`lsn` change | the key's state before the window; no ledger target reads it, the relationship paths do ([below](#who-reads-the-old-image)) |
 | `src_changed` | **OR** | any source contribution makes the record a source change, so downstream propagation fires; dropping the OR reintroduces a mutual-derivation livelock |
 | `origin_lsn` | **LEAST**, unknown (`NULL`) wins | the oldest-origin marker read-your-writes soundness depends on ([07](07-convergence-and-await.md)); an unknown origin gates every token, so it must survive the merge |
 
@@ -173,6 +174,20 @@ of a transaction shares its commit `lsn`, so ordering an INSERT before a later
 UPDATE of the same key needs an intra-commit order. `lsn` stays primary;
 `change_id` only breaks ties within a single commit.
 
+### Who reads the old image
+
+No ledger target does. An aggregate's entry holds the group and contribution
+its key last applied, and a 1-1 target overwrites its row, so an Apply needs
+only the new image and `last_change`
+([05](05-apply-and-exactly-once-deltas.md#the-ledger)). Besides the fold's
+own image-bearing test (below) and quarantine, which parks it in
+`poison_held.old_image`, the folded `old_image` is read only by relationship
+machinery, as the one place a key's old join value still exists: a to-side
+row's reverse path (the from-side rows that joined its old key, and its
+projection record), and a from-side row's re-point or delete, which bumps
+the parent it left (#130). Capture still stages OLD images for them;
+dropping OLD from the ring is milestone E (#624).
+
 ### The two kinds of missing image
 
 The fold's sharpest subtlety: some producers emit changes, others bare triggers,
@@ -181,14 +196,14 @@ so both arg-extremes must distinguish **"there is genuinely no image here"** fro
 
 - A key **born inside the batch** (insert-then-update) folds to `old_image =
   NULL`, because its lowest-`lsn` change is the insert, which has no pre-image (a
-  delete symmetrically has no post-image). That NULL is a *fact about the change*
-  and it suppresses a spurious `−f(old)`. It is more correct than the old
-  write-time `COALESCE(old_image, EXCLUDED.old_image)` merge, and it must survive
-  the fold. **Do not reintroduce a blanket `COALESCE` here.**
+  delete symmetrically has no post-image). That NULL is a *fact about the change*:
+  the key had no state before the window, so a relationship reader has no old
+  join value to refresh. It must survive the fold. **Do not reintroduce a
+  blanket `COALESCE` here.**
 - An **image-less row** — both images NULL — is not a change at all. Aggregates
   like `array_agg` don't skip NULLs, so before the discriminator such a row won
   whichever ordering its `lsn` topped and handed the drain a NULL image, which the
-  delta path reads as "no side to apply". The failure ran both ways: a re-derive
+  old delta path read as "no side to apply". The failure ran both ways: a re-derive
   restaged at `pg_current_wal_lsn()` killed the `+f(new)` and **under**-counted, up
   to deleting a live group; reverse propagation and backfill restaged below and
   killed the `−f(old)`, **over**-counting with a phantom member.
@@ -204,8 +219,8 @@ WHERE old_image IS NOT NULL OR new_image IS NOT NULL
 An insert qualifies via its `new_image`, a delete via its `old_image`, a
 primary-key move-out via its `old_image` — so each still contributes its honest
 NULL on the other side, while a bare trigger is excluded from both. A key whose
-rows are all image-less folds to both images NULL, which is correct: recompute
-from live source and take a zero delta.
+rows are all image-less folds to both images NULL and no `last_change`, which
+is correct: a ledger target re-derives it from live source.
 
 One image-less row does speak to the post-image: an `op = 'delete'` is the
 key's final state within the window, whatever precedes it (ADR-0002, issue
@@ -220,13 +235,10 @@ trigger and defer to the earlier segment's post-image.
 The corollary binds *producers*, not just the fold: within one window, for one
 `(src_table, key)`, an image-bearing row always beats an image-less
 non-`delete` one — **even when the image-less one is newer**. A producer that can stage both shapes for the
-same key must therefore pick one. See issue #180's downstream propagation of an
-extinct aggregate group: it stages a real image-bearing delete carrying the
-group's captured pre-delete image, but drops back to an image-less `Recompute`
-for any key the same batch also *wrote*, precisely so the delete cannot
-annihilate the write and leave a live group subtracted downstream. Issue #196
-threads the same capture through a deleted 1-1 target row's own downstream
-propagation, reusing this same guard rather than a second copy of it.
+same key must therefore pick one. The target-mutation seam does: it stages a
+relationship-endpoint target's changed keys as image-bearing CDC-shaped rows
+and every other target's as image-less `Recompute`s, never both for one
+target (`staging::target_mutations`, #402/#403).
 
 One fact the arg-extremes erase is kept on the side: **a recompute folded with
 a change.** A `recompute` never wins an image, so when it folds with the same
@@ -405,6 +417,6 @@ lease has no consumer and the scaffolding is being removed (see #191).
   only serves the sweep.
 - **The fold rules are the core of this stage.** The four-rule table and the
   image-bearing discriminator are where the silent bugs live.
-- **No write-time merge.** It makes staged rows mutable, which forces the
-  survivor-rewrite machinery back into existence ([05](05-apply-and-exactly-once-deltas.md)).
+- **No write-time merge.** It makes staged rows mutable, and a claimed batch
+  must be immutable ([05](05-apply-and-exactly-once-deltas.md#1-the-claimed-batch-is-immutable)).
 - **The routing key does not co-locate the contended thing, and says so.**

@@ -148,8 +148,8 @@
 //! within a few cases, where the tmpfs cluster converges. It needs neither
 //! the mid-burst actions nor concurrency. It is #494's shape (a key passing
 //! through a group inside one folded batch), which disk commit timing makes
-//! common: [`group_moves_converge_on_disk`] pins it, `#[ignore]`d since
-//! before #623 D5 removed the recompute horizons.
+//! common. The old aggregate path diverged on it; [`group_moves_converge_on_disk`]
+//! is its regression pin, which #623 D5's ledger passes.
 //!
 //! # Pinned cases
 //!
@@ -157,8 +157,8 @@
 //! proptest seed: a seed replays into a different program as soon as the
 //! strategy changes shape. [`hot_key_case_3_11_converges`] is the first, the
 //! hot-key case that fails on tmpfs with no plant armed. Its ops and plan
-//! live in `tests/pins/hot_key_3_11.ops`, and it is an exit check for #623
-//! and #624.
+//! live in `tests/pins/hot_key_3_11.ops`. It was #623's exit check, and it
+//! stays a regression pin; #624 re-runs it for the factored relationships.
 //!
 //! # The burst-batching knob
 //!
@@ -942,30 +942,31 @@ fn group_moves() -> generative::model::Program {
 /// `live` before the first op), but it does need group moves: inserts and
 /// deletes alone converge. On the tmpfs test cluster the same run converges.
 ///
-/// It is #494's shape. On the old aggregate path a batch's forced re-derive
+/// It is #494's shape, and this is its regression pin. On the old aggregate
+/// path (before #623 D5) a batch's forced re-derive
 /// read the source live, so it counted a key that a later, still-undrained
 /// commit moved into group `z`, and stamped the group's recompute horizon
 /// above that commit. The key then left `z` above the horizon, and both
 /// moves folded into one later batch as `a -> b`, so nothing named `z` and
 /// its count was never taken back. On disk, the drain runs far enough behind
-/// the source that most group writes were such re-derives. #623 D5 removed
-/// the horizons; the ledger entry names `z`, which is #494's acceptance.
+/// the source that most group writes were such re-derives. The ledger has
+/// no horizons: the key's entry names `z`, so leaving it takes `z`'s count
+/// back. #623 D9 took the exit check on disk: the pre-ledger engine (#623
+/// D3's base) diverged in 17 of 20 attempts, the ledger in none of 60.
 ///
 /// Runs [`group_moves`] `ATTEMPTS` times, each on a fresh database, in
 /// bursts of 500 ops sealed every 85ms, and fails if any attempt diverged,
 /// reporting how many did and whether each divergence was still there after
 /// another 5 seconds and quiesce. It says nothing on a tmpfs, so without
-/// `GENERATIVE_CLUSTER_DIR` it returns at once (the nightly runs every
-/// ignored test in this binary). Run it on disk:
+/// `GENERATIVE_CLUSTER_DIR` it returns at once, so the default suite pays
+/// nothing for it. Run it on disk:
 ///
 /// ```text
 /// GENERATIVE_CLUSTER_DIR=$PWD/target/generative-disk \
 /// cargo test -p generative --test concurrent_convergence \
-///     group_moves_converge_on_disk -- --ignored --nocapture
+///     group_moves_converge_on_disk -- --nocapture
 /// ```
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "#494's shape needs a disk-backed cluster (it diverged on one until #623 D5); \
-            run with GENERATIVE_CLUSTER_DIR set"]
 async fn group_moves_converge_on_disk() {
     const ATTEMPTS: usize = 20;
     if std::env::var_os(CLUSTER_DIR_ENV).is_none() {
@@ -1030,12 +1031,11 @@ async fn group_moves_converge_on_disk() {
 }
 
 // ---------------------------------------------------------------------
-// Pinned hot-key case 3:11: an exit check for #623 and #624.
+// Pinned hot-key case 3:11: a regression pin, and a re-check for #624.
 // ---------------------------------------------------------------------
 
 /// How many attempts [`hot_key_case_3_11_converges`] makes. Unset, it
-/// returns at once, so the nightly's `--include-ignored` pays nothing for
-/// it.
+/// returns at once, so the default suite pays nothing for it.
 const PIN_ATTEMPTS_ENV: &str = "GENERATIVE_PIN_ATTEMPTS";
 
 /// A table whose primary key is its first column.
@@ -1279,9 +1279,11 @@ fn hot_key_case_3_11_loads() {
 /// (`t2[1:0].sum_c2: expected=68`, with `got` anywhere from 4 to 148, or
 /// `t4[1:2].rel_agg: expected=69 got=4`), or the run never converges
 /// (`ConvergenceTimeout`). The input is identical every time; only the drain
-/// workers' timing differs. It is the exit check #556's milestones D (#623)
-/// and E (#624) can use, as long as the same box shows it failing before the
-/// fix: a pass means little unless the unfixed engine fails the same run.
+/// workers' timing differs. It was the exit check of #556's milestone D
+/// (#623) and is a regression pin since; milestone E (#624) re-runs it as
+/// its own check. Either check needs the same box to show it failing on the
+/// unfixed engine first: a pass means little unless the unfixed engine
+/// fails the same run.
 ///
 /// What the failure needs, from cutting the drawn case down on tmpfs with
 /// four processes at once, 160 to 200 runs per row:
@@ -1309,6 +1311,12 @@ fn hot_key_case_3_11_loads() {
 /// the pre-lock. The pin keeps the relationship fields, and `t4`'s `rel_agg` has
 /// diverged too, so it re-checks #624's factored relationships as well.
 ///
+/// #623 D9's exit check, four processes at once: the pre-ledger engine (D3's
+/// base) failed 1 of 360 attempts on tmpfs (a `ConvergenceTimeout`; 0 of the
+/// first 120), with 2,868 `deadlock detected` lines in the Postgres logs.
+/// The ledger failed none of 120 on tmpfs and none of 100 on disk, with no
+/// deadlocks.
+///
 /// Runs the case `GENERATIVE_PIN_ATTEMPTS` times, each on a fresh database
 /// with 8 drain workers and a 112ms seal, and fails if any attempt diverged
 /// or didn't converge. Unset, it returns at once:
@@ -1316,7 +1324,7 @@ fn hot_key_case_3_11_loads() {
 /// ```text
 /// GENERATIVE_PIN_ATTEMPTS=20 cargo test -p generative \
 ///     --test concurrent_convergence hot_key_case_3_11_converges \
-///     -- --ignored --nocapture
+///     -- --nocapture
 /// ```
 ///
 /// Twenty attempts take two to three minutes. At 19% they would miss the
@@ -1324,9 +1332,6 @@ fn hot_key_case_3_11_loads() {
 /// exit check wants a hundred or more attempts, split over several
 /// processes. It respects `GENERATIVE_CLUSTER_DIR`, so it runs on disk too.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "diverged or never converged in 0-19% of runs, by box load, before #623 D5 \
-            (20/20 after it, unloaded; #624 is #556 milestone E); run with \
-            GENERATIVE_PIN_ATTEMPTS set"]
 async fn hot_key_case_3_11_converges() {
     let Some(attempts) = std::env::var(PIN_ATTEMPTS_ENV).ok().map(|v| {
         v.parse::<usize>()

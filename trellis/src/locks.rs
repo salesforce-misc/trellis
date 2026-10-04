@@ -37,20 +37,23 @@ use std::time::{Duration, Instant};
 ///
 /// Long enough that a lock wait between Trellis's own transactions never
 /// reaches it: a claim waiting behind a page's `segments` update, and drain
-/// pages queued on the same aggregate groups. The retries it forces are for a
-/// transaction that holds a lock for much longer than that: a long
-/// application transaction, a stuck chunk, an operator's `LOCK TABLE`. #617's
-/// drain waited 1 h 50 min; this bounds that to two minutes.
+/// pages queued on the same ledger entries and group rows. The retries it
+/// forces are for a transaction that holds a lock for much longer than that:
+/// a long application transaction, a stuck chunk, an operator's `LOCK
+/// TABLE`. #617's drain waited 1 h 50 min; this bounds that to 30 seconds.
 ///
-/// **Interim value, sized for the aggregate group pre-lock (#326), which #623
-/// D5 deleted.** Drain pages that touched the same groups queued on it one
-/// behind another, so the last of eight workers waited out seven pages. `bench fold-in-ratio` at
-/// ratio 10 (40k groups, every page touching most of them) measured the
-/// longest page transaction, wait included, at 89 s (eight ~28k-record pages
-/// queued together) and 100k-record pages at 47 s in steady state; a 5 s
-/// timeout fired 75 times there, each retry losing its place in the queue.
-/// With the pre-lock gone this can be re-measured and brought back down.
-pub const LOCK_TIMEOUT: Duration = Duration::from_secs(120);
+/// **Sized by #623 D9**, once D5 had deleted the aggregate group pre-lock
+/// (#326) that the interim 120 s was sized for. The shape that queued worst
+/// on the pre-lock, `bench --disk fold-in-ratio --ratios 10` (40k groups at
+/// 400k rows/s, eight workers, every page touching most groups), now has
+/// its longest page transaction, wait included, at 6.6 s (it was 89 s), and
+/// no page waits out the cap at either 30 s or 10 s. The rule was the
+/// smallest of 30 s and 10 s with no timeouts and the longest page under a
+/// third of the cap, which 10 s misses (6.6 s against 3.3 s): a cap that
+/// close to a normal page would turn a slow checkpoint into retries, and
+/// each retry loses its place in the queue. Going lower needs #629's
+/// measurements first.
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The per-attempt `lock_timeout` for DDL on a user table whose lock
 /// conflicts with writers' `ROW EXCLUSIVE` (I6): `CREATE`/`DROP TRIGGER`

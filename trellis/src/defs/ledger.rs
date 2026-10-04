@@ -16,11 +16,10 @@
 //! - **1-1 targets**: the key and the ordering state only. The target row
 //!   holds the values.
 //!
-//! The build writes an aggregate target's ledger, and Apply maintains it for
-//! the targets `staging::ledger` routes (#623 D3, D4): each page locks, reads
-//! and rewrites the entries of the keys it applies, and their group rows are
-//! the sums of the moves. A relationship-fed target's ledger is written by the
-//! build only, until #623 D5.
+//! The build writes an aggregate target's ledger, and Apply maintains it
+//! (`staging::ledger`, #623 D3–D5): each page locks, reads and rewrites the
+//! entries of the keys it applies, and their group rows are the sums of the
+//! moves.
 //!
 //! A routed target also gets `<target>__deltas` ([`aggregate_deltas_ddl`],
 //! #625 F1): the per-group increments a build chunk records instead of
