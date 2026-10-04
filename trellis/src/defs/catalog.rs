@@ -245,6 +245,11 @@ pub enum CatalogError {
         side: RelationshipSide,
         endpoint: String,
     },
+    /// Issue #745: row-level security on the definition's source, or on the
+    /// to-side of a relationship it reads through, applies to a role Trellis
+    /// reads the table as, so its policies would filter Trellis's reads
+    /// (see [`super::row_security`]). Not supported.
+    RowSecurityApplies(super::row_security::RowSecurity),
     /// Issue #429: a relationship endpoint's row-identity key (its primary
     /// key, or the unique index [`ddl::source_primary_key`] falls back to)
     /// has a column whose type isn't on the key allowlist. Every change the
@@ -398,6 +403,7 @@ impl CatalogError {
             CatalogError::TargetTableExists { .. } => ErrorCode::Conflict,
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => ErrorCode::Validation,
+            CatalogError::RowSecurityApplies(_) => ErrorCode::Validation,
             CatalogError::RelationshipEndpointUnsupportedKey { .. } => ErrorCode::Validation,
             CatalogError::Ddl(err) => err.code(),
             CatalogError::DirectBackfill(err) => err.code(),
@@ -486,6 +492,7 @@ impl fmt::Display for CatalogError {
                  inheritance hierarchy) with a primary key. If it is another Trellis instance's \
                  aggregate target, it can't be a relationship endpoint here"
             ),
+            CatalogError::RowSecurityApplies(rls) => write!(f, "{rls}"),
             CatalogError::RelationshipEndpointUnsupportedKey {
                 name,
                 side,
@@ -586,6 +593,7 @@ impl std::error::Error for CatalogError {
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => None,
+            CatalogError::RowSecurityApplies(_) => None,
             CatalogError::RelationshipEndpointUnsupportedKey { .. } => None,
             CatalogError::Ddl(err) => Some(err),
             CatalogError::DirectBackfill(err) => Some(err),
@@ -2451,6 +2459,13 @@ async fn create_definition_inner(
     // check, placed with the key check above because it reads the live
     // source relation (an own-target source is exempt before that query).
     reject_unkeyed_source(&*txn, &qualified_source).await?;
+    // Issue #745: Trellis reads the source, and the to-side of every
+    // relationship the definition reads through, as its own role, so
+    // row-level security that applies to that role would filter the reads.
+    let read_tables: Vec<String> = std::iter::once(qualified_source.clone())
+        .chain(relationships.values().map(|r| r.qualified_to_table.clone()))
+        .collect();
+    reject_row_security(&*txn, pool.schema(), &read_tables).await?;
 
     // Issue #440: registration creates the target here, in the transaction
     // that records the definition, so a failure anywhere after this rolls the
@@ -4743,6 +4758,28 @@ async fn reject_unkeyed_source(
     Err(CatalogError::SourceNotChangeKeyed {
         source_table: qualified_source.to_string(),
     })
+}
+
+/// Issue #745: rejects the first of `tables` (unquoted `schema.table`
+/// identities) whose row-level security applies to the Trellis role, the
+/// ring's owner ([`super::row_security::applying`]; not the session's role,
+/// which may belong to a process that never reads the table) —
+/// [`CatalogError::RowSecurityApplies`]. A table that doesn't exist passes:
+/// the checks that need it report that.
+async fn reject_row_security(
+    client: &impl GenericClient,
+    schema: &str,
+    tables: &[String],
+) -> Result<(), CatalogError> {
+    for table in tables {
+        if let Some(rls) =
+            super::row_security::applying(client, schema, table, super::row_security::Readers::Ring)
+                .await?
+        {
+            return Err(CatalogError::RowSecurityApplies(rls));
+        }
+    }
+    Ok(())
 }
 
 /// Issue #375: rejects a relationship endpoint this instance would capture

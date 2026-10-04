@@ -14,6 +14,13 @@
 //! Trellis role is loud instead: every captured write to the table fails,
 //! naming the capture function. The audit names the cause either way.
 //!
+//! It also reports row-level security that applies to the Trellis role, the
+//! ring's owner, or to the role `self_check` runs as (issue #745,
+//! [`crate::defs::row_security`]). That doesn't break capture, which sees
+//! every change, but it filters every read of the table, the recompute's
+//! included, so a comparison would agree with a wrong answer. The staging
+//! worker's capture pass pauses the table's readers for it.
+//!
 //! [`audit`] reads all of that from the catalog (`pg_trigger`, `pg_proc`,
 //! `pg_inherits` and the `has_*_privilege` functions) for every table a
 //! definition's target depends on, and reports each problem as a
@@ -78,6 +85,7 @@ use crate::capture::sql::{CaptureEvent, function_name, trigger_name};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::regclass_arg;
 use crate::defs::model::{Definition, TransformStatus};
+use crate::defs::row_security::{self, RowSecurity};
 use crate::staging::append::RING_SIZE;
 
 /// One way a table's capture is broken, found by [`audit`]. Each names the
@@ -140,6 +148,14 @@ pub enum CaptureFault {
     /// `child`'s rows puts them in the table's transition tables, keyed as if
     /// they were the table's own.
     InheritanceParent { table: String, child: String },
+    /// The table's row-level security policies apply to the ring's owner, or
+    /// to the role `self_check` runs as (issue #745,
+    /// [`crate::defs::row_security`]). Capture still sees
+    /// every change, but each read of the table, `self_check`'s recompute
+    /// included, sees only the rows the policies allow. Checked on every
+    /// table the definition reads, including one the target-mutation seam
+    /// feeds.
+    RowSecurity(RowSecurity),
 }
 
 impl CaptureFault {
@@ -157,6 +173,7 @@ impl CaptureFault {
             | CaptureFault::Partition { table, .. }
             | CaptureFault::InheritanceChild { table, .. }
             | CaptureFault::InheritanceParent { table, .. } => Some(table),
+            CaptureFault::RowSecurity(rls) => Some(&rls.table),
             CaptureFault::MissingPrivilege { .. } => None,
         }
     }
@@ -235,13 +252,15 @@ impl fmt::Display for CaptureFault {
                 "{child} inherits from {table}, so a statement on {table} captures {child}'s \
                  rows as {table}'s"
             ),
+            CaptureFault::RowSecurity(rls) => write!(f, "{rls}"),
         }
     }
 }
 
 /// Every [`CaptureFault`] on the tables `def` reads, in a deterministic
 /// order: per table (sorted), its trigger and function faults in event
-/// order, then its hierarchy faults; then the privilege faults, per role.
+/// order, then its hierarchy faults, then its row-level security; then the
+/// privilege faults, per role.
 /// Empty for a definition whose capture needn't be installed yet (see the
 /// module doc).
 pub async fn audit(
@@ -258,16 +277,28 @@ pub async fn audit(
     let mut faults = Vec::new();
     // Each role a capture function runs as, and the tables it captures.
     let mut runs_as: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for table in captured_tables(client, def).await? {
-        let Some(installed) = read_installed(client, schema, &table).await? else {
-            // A dropped table: the recompute's own read of it reports that.
-            continue;
-        };
-        for owner in installed.events.iter().filter_map(|e| e.owner.clone()) {
-            runs_as.entry(owner).or_default().insert(table.clone());
+    for (table, captured) in read_tables(client, def).await? {
+        if captured {
+            let Some(installed) = read_installed(client, schema, &table).await? else {
+                // A dropped table: the recompute's own read of it reports that.
+                continue;
+            };
+            for owner in installed.events.iter().filter_map(|e| e.owner.clone()) {
+                runs_as.entry(owner).or_default().insert(table.clone());
+            }
+            faults.extend(installed_faults(&table, &installed));
+            faults.extend(hierarchy_faults(client, &table).await?);
         }
-        faults.extend(installed_faults(&table, &installed));
-        faults.extend(hierarchy_faults(client, &table).await?);
+        if let Some(rls) = row_security::applying(
+            client,
+            schema,
+            &table,
+            row_security::Readers::RingAndSession,
+        )
+        .await?
+        {
+            faults.push(CaptureFault::RowSecurity(rls));
+        }
     }
     for (role, tables) in runs_as {
         let tables: Vec<String> = tables.into_iter().collect();
@@ -276,13 +307,13 @@ pub async fn audit(
     Ok(faults)
 }
 
-/// The tables whose capture feeds `def`: its source and the to-side of each
-/// relationship it reads through, less every table that is a definition's
-/// target here (the seam feeds those). Sorted.
-async fn captured_tables(
+/// The tables `def` reads: its source and the to-side of each relationship
+/// it reads through, sorted, each with whether capture feeds it, which is
+/// every table but a definition's target here (the seam feeds those).
+async fn read_tables(
     client: &impl GenericClient,
     def: &Definition,
-) -> Result<Vec<String>, CatalogError> {
+) -> Result<Vec<(String, bool)>, CatalogError> {
     let mut tables = BTreeSet::from([def.source_table.clone()]);
     let names: BTreeSet<String> = crate::defs::eval::relationship_references(&def.def)
         .into_iter()
@@ -309,7 +340,10 @@ async fn captured_tables(
         .collect();
     Ok(tables
         .into_iter()
-        .filter(|t| !seam_fed.contains(t))
+        .map(|t| {
+            let captured = !seam_fed.contains(&t);
+            (t, captured)
+        })
         .collect())
 }
 

@@ -1,0 +1,188 @@
+//! Row-level security that applies to the Trellis role (issue #745).
+//!
+//! Trellis doesn't support a table whose row-level security policies apply
+//! to its own role. Capture still sees every changed row, because transition
+//! tables ignore RLS, but every path that *reads* a table runs as the Trellis
+//! role, and the policies filter those reads: a build never sees a hidden
+//! row, a per-key Re-derive reads a hidden key as gone and deletes its target
+//! row, a relationship read finds a hidden parent absent, and `self_check`'s
+//! recompute agrees with the wrong answer. So does a capture function's
+//! re-read of the live row (#623 D8a), which runs as the function's owner,
+//! the role that owns the ring.
+//!
+//! Whether a policy actually hides a row depends on the row, so the check is
+//! whether policies *apply* at all. A policy that applies but hides nothing
+//! (`USING (true)`) is refused like any other; exempt the role instead.
+//!
+//! # When policies apply to a role
+//!
+//! Postgres's own rule (`check_enable_rls`), read from the catalog for each
+//! role that reads (see [`Readers`]):
+//!
+//! 1. The table has RLS enabled (`pg_class.relrowsecurity`). If not, nothing
+//!    applies.
+//! 2. A superuser, or a role with `BYPASSRLS` (`pg_roles.rolbypassrls`, its
+//!    own attribute: a role doesn't inherit it from roles it is a member of),
+//!    bypasses RLS, `FORCE` or not.
+//! 3. The table's owner bypasses it unless `FORCE ROW LEVEL SECURITY` is set
+//!    (`relforcerowsecurity`). Ownership is `has_privs_of_role`: the owner
+//!    itself, or a role that inherits the owner's privileges through
+//!    membership, which is what `pg_has_role(..., 'USAGE')` answers. A member
+//!    without `INHERIT` isn't the owner here.
+//! 4. Anyone else gets the policies.
+//!
+//! Every input is a catalog column any role can read, so the check needs no
+//! privilege beyond connecting.
+//!
+//! # Where it is checked
+//!
+//! - **Defining** a transform refuses its source, and the to-side of every
+//!   relationship it reads through, when the policies apply to the ring's
+//!   owner ([`super::catalog::CatalogError::RowSecurityApplies`]). Not the
+//!   session's role: a process that only defines transforms reads no source
+//!   rows, and needn't run as a role that could
+//!   (`docs/embedding.md`, "Who runs what").
+//! - **The staging worker's capture pass** pauses every definition that
+//!   reads a captured table whose policies now apply to the ring's owner or
+//!   to the worker's own role, recording why in `capture_failures`
+//!   (`staging::schema_change::pause_readers_under_row_security`). RLS can
+//!   be enabled or forced, a table handed to another owner, or a role's
+//!   `BYPASSRLS` or membership taken away, after define.
+//! - **`self_check`'s capture audit** reports it for the ring's owner or the
+//!   caller's role, whose recompute it would filter
+//!   (`staging::capture_audit::CaptureFault::RowSecurity`).
+//!
+//! Drain threads in another process, running as another login role, aren't
+//! seen from here: a deployment runs every worker as the Trellis role or a
+//! member of it.
+
+use std::fmt;
+
+use tokio_postgres::GenericClient;
+
+use crate::capture::install::RING_OWNER;
+use crate::defs::ddl::regclass_arg;
+
+/// Row-level security that applies to a role Trellis reads `table` as, found
+/// by [`applying`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RowSecurity {
+    /// The table, as its unquoted `schema.table` identity.
+    pub table: String,
+    /// The role its policies apply to.
+    pub role: String,
+    /// Whether `role` owns the table (itself, or through a role it inherits
+    /// from), so that only `FORCE ROW LEVEL SECURITY` makes the policies
+    /// apply to it. Otherwise it neither owns the table nor has `BYPASSRLS`.
+    pub owner_forced: bool,
+}
+
+impl fmt::Display for RowSecurity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let RowSecurity {
+            table,
+            role,
+            owner_forced,
+        } = self;
+        if *owner_forced {
+            write!(
+                f,
+                "row-level security on {table} applies to role {role}: it owns the table, but \
+                 the table has FORCE ROW LEVEL SECURITY, so Trellis's reads of it see only the \
+                 rows its policies allow. Trellis doesn't support that. Exempt the role with \
+                 ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY, or give it BYPASSRLS"
+            )
+        } else {
+            write!(
+                f,
+                "row-level security on {table} applies to role {role}: it neither owns the table \
+                 nor has BYPASSRLS, so Trellis's reads of it see only the rows its policies \
+                 allow. Trellis doesn't support that. Exempt the role with ALTER ROLE {role} \
+                 BYPASSRLS, or make it the table's owner (without FORCE ROW LEVEL SECURITY)"
+            )
+        }
+    }
+}
+
+/// Which roles [`applying`] checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readers {
+    /// The role that owns the instance's ring, which ran the migrations and
+    /// which the capture functions run as: the Trellis role. A staging
+    /// worker or drain thread runs as it, or as a login role that is a
+    /// member of it.
+    Ring,
+    /// The ring's owner and the session's role, for a check made by a
+    /// session that reads the table itself: the staging worker's capture
+    /// pass, or `self_check`'s recompute.
+    RingAndSession,
+}
+
+/// The row-level security that applies to a role Trellis reads `table` as
+/// (see [`Readers`] and the module doc). `None` if none applies, or there is
+/// no such table. When it applies to both roles, the session's is reported.
+///
+/// `schema` is the instance schema, whose ring's owner is checked, and
+/// `table` an unquoted `schema.table` identity.
+pub async fn applying(
+    client: &impl GenericClient,
+    schema: &str,
+    table: &str,
+    readers: Readers,
+) -> Result<Option<RowSecurity>, tokio_postgres::Error> {
+    let row = client
+        .query_opt(
+            &format!(
+                "select r.rolname::text, \
+                        pg_catalog.pg_has_role(r.oid, c.relowner, 'USAGE') \
+                 from pg_catalog.pg_class c \
+                 cross join pg_catalog.pg_roles r \
+                 where c.oid = pg_catalog.to_regclass($2) \
+                   and (($3 and r.rolname = current_user) or r.oid = {RING_OWNER}) \
+                   and c.relrowsecurity \
+                   and not r.rolsuper and not r.rolbypassrls \
+                   and (c.relforcerowsecurity \
+                        or not pg_catalog.pg_has_role(r.oid, c.relowner, 'USAGE')) \
+                 order by r.rolname <> current_user, r.rolname \
+                 limit 1"
+            ),
+            &[
+                &schema,
+                &regclass_arg(table),
+                &(readers == Readers::RingAndSession),
+            ],
+        )
+        .await?;
+    Ok(row.map(|row| RowSecurity {
+        table: table.to_string(),
+        role: row.get(0),
+        owner_forced: row.get(1),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_message_names_the_remedy_for_each_reason() {
+        let mut rls = RowSecurity {
+            table: "public.t".to_string(),
+            role: "trellis".to_string(),
+            owner_forced: false,
+        };
+        let text = rls.to_string();
+        assert!(
+            text.contains("neither owns the table nor has BYPASSRLS"),
+            "{text}"
+        );
+        assert!(text.contains("ALTER ROLE trellis BYPASSRLS"), "{text}");
+        rls.owner_forced = true;
+        let text = rls.to_string();
+        assert!(text.contains("FORCE ROW LEVEL SECURITY"), "{text}");
+        assert!(
+            text.contains("ALTER TABLE public.t NO FORCE ROW LEVEL SECURITY"),
+            "{text}"
+        );
+    }
+}

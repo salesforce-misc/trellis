@@ -1530,6 +1530,11 @@ pub struct DefinitionStatus {
     ///   (#687). The application's writes go on succeeding, and the other
     ///   definitions on the table keep applying. Recorded in the catalog
     ///   and cleared by resuming the definition, which rebuilds it;
+    /// - or row-level security on a table it reads came to apply to the
+    ///   Trellis role after it was defined (issue #745): its policies would
+    ///   filter every read of the table. The staging worker's capture pass
+    ///   pauses it, with no `columns`. Exempt the role and resume the
+    ///   definition, which rebuilds it and clears this;
     /// - or, while it waits on capture as for `capture_wait`, the staging
     ///   worker's install or widen fails for a reason other than a lock (no
     ///   primary key, a statement that fails, #687). Every pass retries it,

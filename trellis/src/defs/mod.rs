@@ -43,6 +43,7 @@ pub mod oracle;
 mod parser;
 pub mod pg_type;
 pub mod registry;
+pub mod row_security;
 pub mod typed_literal;
 pub mod validate;
 

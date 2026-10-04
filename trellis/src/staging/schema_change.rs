@@ -279,3 +279,61 @@ pub(crate) async fn pause_readers_of_missing(
     txn.commit().await?;
     Ok(true)
 }
+
+/// The staging worker's capture pass's check for row-level security (issue
+/// #745, [`crate::defs::row_security`]): pauses every definition that reads
+/// `table` and isn't paused for a capture failure yet, when the table's
+/// policies now apply to the ring's owner or to this worker's own role,
+/// which read it, recording why in
+/// `capture_failures`. RLS can be enabled or forced, or the table handed to
+/// another owner, after the definitions were accepted. Returns whether any
+/// definition reads the table, in which case the caller leaves the table for
+/// the next pass, whose catalog no longer counts them.
+///
+/// A definition only frozen (paused or quarantined) keeps its status but
+/// gets the record, as for a schema change: its resume is the rebuild either
+/// way, and the next pass pauses it again while the policies still apply.
+pub(crate) async fn pause_readers_under_row_security(
+    client: &mut Client,
+    schema: &str,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    let Some(rls) = crate::defs::row_security::applying(
+        &*client,
+        schema,
+        table,
+        crate::defs::row_security::Readers::RingAndSession,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let readers: Vec<i64> = readers_of(catalog, table, &BTreeSet::new(), true)
+        .into_iter()
+        .filter(|id| {
+            catalog
+                .definitions
+                .iter()
+                .any(|r| r.id == *id && !r.capture_failed)
+        })
+        .collect();
+    if readers.is_empty() {
+        return Ok(false);
+    }
+    let error = row_security_error(&rls);
+    let txn = client.transaction().await?;
+    for id in readers {
+        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error).await? {
+            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// The `capture_failure` sentence for a definition paused because `rls`
+/// applies to a table it reads.
+fn row_security_error(rls: &crate::defs::row_security::RowSecurity) -> String {
+    format!("{rls}; then resume the definition to rebuild it, or drop the definition")
+}

@@ -12,8 +12,10 @@
 //!
 //! Before it regenerates a table's functions, the pass pauses every
 //! definition that reads a column the table no longer has (#622 C6,
-//! [`crate::staging::schema_change::pause_readers_of_missing`]) and leaves
-//! the table for the next pass.
+//! [`crate::staging::schema_change::pause_readers_of_missing`]), or reads a
+//! table whose row-level security now applies to Trellis's role (#745,
+//! [`crate::staging::schema_change::pause_readers_under_row_security`]), and
+//! leaves the table for the next pass.
 //!
 //! # Never waiting on `apply`'s path
 //!
@@ -117,6 +119,24 @@ pub async fn reconcile(
     let mut outcome = PassOutcome::default();
 
     for table in desired {
+        // #745: row-level security that applies to Trellis's role filters
+        // every read of the table, so its readers pause, whatever capture
+        // does.
+        match crate::staging::schema_change::pause_readers_under_row_security(
+            client,
+            schema,
+            &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
         // #622 C6: a definition that reads a column the table no longer has
         // pauses before the table's functions are regenerated, whether or
         // not a write has marked it yet. The next pass's catalog no longer

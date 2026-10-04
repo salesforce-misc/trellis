@@ -39,11 +39,13 @@
 //! ALWAYS` and calling their functions, the functions `SECURITY DEFINER` and
 //! owned by the Trellis role, that role still holding the privileges the
 //! functions use, and the table still outside any partition or inheritance
-//! hierarchy ([`super::capture_audit`], #622 C9). A fault there is reported
-//! as [`Divergence::Capture`], without a recompute comparison: the
-//! convergence wait can't see a broken capture (it is a predicate over ring
-//! rows, and the broken capture writes none), and the comparison would only
-//! show its symptom.
+//! hierarchy ([`super::capture_audit`], #622 C9). It also checks that no
+//! such table's row-level security applies to the Trellis role or the
+//! caller's (#745), which would filter the recompute's reads as well as the
+//! engine's. A fault there is reported as [`Divergence::Capture`], without a
+//! recompute comparison: the convergence wait can't see a broken capture (it
+//! is a predicate over ring rows, and the broken capture writes none), and
+//! the comparison would only show its symptom, or agree with it.
 //!
 //! # Quiescence: "diverged" vs "not yet caught up"
 //!
@@ -242,9 +244,10 @@ pub enum Divergence {
     /// A table the target is computed from isn't being captured as
     /// installed: a trigger is missing, disabled or calls the wrong
     /// function, a capture function is missing or has the wrong owner, the
-    /// role the functions run as lost a privilege, or the table joined a
+    /// role the functions run as lost a privilege, the table joined a
     /// partition or inheritance hierarchy (#622 C9, see
-    /// [`super::capture_audit`]). Its changes may not be reaching the
+    /// [`super::capture_audit`]), or its row-level security applies to the
+    /// Trellis role (#745), which would filter its reads, this audit's too. Its changes may not be reaching the
     /// target at all, so [`self_check`] reports these before, and instead
     /// of, a recompute comparison.
     Capture(CaptureFault),

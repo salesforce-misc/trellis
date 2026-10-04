@@ -62,8 +62,12 @@ segment with one `INSERT … SELECT`:
   (`tests/capture_reread.rs`, at every isolation level).
 - **The re-read needs `SELECT` on the table**, which the Trellis role holds
   as the table's owner; the capture audit reports it missing. On a table
-  with `FORCE ROW LEVEL SECURITY` whose policies hide a row from the
-  Trellis role, the re-read can't find it and stages a delete.
+  whose row-level security policies hide a row from the Trellis role (with
+  `FORCE ROW LEVEL SECURITY`, say, which makes them apply to the owner), the
+  re-read can't find it and stages a delete. That isn't supported (#745):
+  defining refuses such a table, the staging worker pauses its readers if
+  the policies come to apply later, and `self_check` reports it
+  (`defs::row_security`).
 - **Updates** pair the OLD and NEW transition tables by primary key. A row
   whose key changed has no partner, so it becomes a delete of the old key and
   an insert of the new one.

@@ -26,6 +26,44 @@ such a hierarchy after its transform is defined (`ATTACH PARTITION`,
 is the user's
 ([0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)).
 
+**Row-level security must not apply to the Trellis role** (#745). Capture
+sees every changed row, because transition tables ignore row-level security,
+but Trellis reads its sources as its own role: a build, a per-key recompute, a
+relationship's parent lookup and `self_check`'s recompute all run as that role,
+and the capture functions re-read the live row as the role that owns
+Trellis's ring. When a table's policies apply to that role, those reads see
+only the rows the policies allow, and the target silently goes wrong: a hidden
+row never reaches it, and a hidden key reads as deleted. So that isn't
+supported. Policies apply to a role when the table has row-level security
+enabled and the role:
+
+- neither owns the table (itself, or through a role it inherits from) nor has
+  `BYPASSRLS`; or
+- owns it, and the table has `FORCE ROW LEVEL SECURITY`.
+
+A superuser is always exempt. Trellis can't tell whether a policy actually
+hides anything (`USING (true)` hides nothing), so the rule is whether the
+policies apply at all. To exempt the role, either:
+
+- give it `BYPASSRLS` (`ALTER ROLE trellis BYPASSRLS`, which a superuser
+  runs). The attribute isn't inherited, so give it to the role that owns
+  Trellis's ring (the one that ran the migrations) and to any login role the
+  workers connect as; or
+- make it the table's owner, or a member of the owning role, which capture
+  needs anyway ([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)),
+  and don't set `FORCE ROW LEVEL SECURITY`.
+
+Enabling row-level security for your application's roles on a table the
+Trellis role owns needs neither: the owner is exempt. A definition whose source,
+or a relationship's to-side it reads through, has policies that apply to the
+role that owns Trellis's ring is rejected when it is defined, with an error
+naming the table, the role and the fix. Row-level security can also be
+enabled or forced, a table handed to another owner, or `BYPASSRLS` taken
+away, after a transform is defined. The staging worker then pauses every
+transform that reads the table, with the reason on `status()`'s
+`capture_failure`, and `self_check` reports it as a `capture` divergence.
+Exempt the role, then resume the transform, which rebuilds it.
+
 **Key columns need a deterministic collation** (#638). Trellis matches keys by
 their exact text, but a nondeterministic collation's `=` (an ICU collation
 created with `deterministic = false`, such as a case-insensitive one) treats

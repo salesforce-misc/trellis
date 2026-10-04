@@ -102,6 +102,14 @@ So:
   sequences. It has them as their owner, and the schema's `USAGE` through
   membership in the schema's owner when that is another role, unless someone
   revokes them.
+* **No row-level security that applies to the Trellis role** (#745). Trellis
+  reads its source tables as its own role, so policies that apply to it
+  would hide rows from every build and recompute. The owner is exempt
+  unless the table has `FORCE ROW LEVEL SECURITY`, and so is a role with
+  `BYPASSRLS`. Defining a transform over such a table is refused, and the
+  worker pauses a transform whose table comes under such policies later,
+  with the reason on `capture_failure`
+  ([transforms — Source tables](transforms.md#source-tables)).
 * **Leave the capture triggers alone.** Each source table carries five
   triggers named `<schema>_capture_<event>` (`trellis_capture_insert` and so
   on for the default schema; `trellis_capture_begin` is the `BEFORE`
