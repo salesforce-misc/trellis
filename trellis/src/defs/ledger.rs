@@ -417,9 +417,20 @@ pub(crate) fn aggregate_ledger_ddl(
 
 /// An aggregate ledger's secondary indexes, as statements each prefixed with
 /// `; `: the `GROUP BY` index, partial on live members (the only entries a
-/// group is a sum of) and the tombstones by `applied_seg` (what
+/// group is a sum of), and the tombstones by key (what
 /// `staging::retire::collect_tombstones` reads, #623 D7). `group_idents` are
 /// the quoted `GROUP BY` columns.
+///
+/// The tombstone index keys on the key, as the 1-1 ledger's does
+/// ([`one_to_one_ledger_ddl`]), not on `applied_seg` (#775). Every Apply and
+/// every Re-derive moves `applied_seg`, and an update that changes any
+/// indexed column can't be HOT: while the index keyed on it, none of an
+/// aggregate ledger's updates was, so each one wrote a new entry into the
+/// key and `GROUP BY` indexes too. Keyed on the key, an update that keeps
+/// the entry's group and membership changes no indexed column. The GC then
+/// filters `applied_seg` over the tombstones it walks rather than seeking
+/// it, which costs at most the tombstones not yet collectable: the deletes
+/// in segments not yet drained.
 ///
 /// Shared by the ledger's DDL and the aggregate build, which drops them for
 /// its load and builds them again after it. They are left for Postgres to
@@ -437,7 +448,7 @@ pub(crate) fn aggregate_ledger_index_ddl(
     );
     sql.push_str(&format!(
         "; create index on {qualified_ledger} ({}) where {}",
-        quote_ident(APPLIED_SEG_COLUMN),
+        quote_ident(KEY_COLUMN),
         quote_ident(TOMBSTONE_COLUMN),
     ));
     sql
@@ -672,7 +683,7 @@ mod tests {
         );
         assert_eq!(
             ddl,
-            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false) with (fillfactor = 80); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
+            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false) with (fillfactor = 80); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__from_key") where "__tombstone""#
         );
     }
 

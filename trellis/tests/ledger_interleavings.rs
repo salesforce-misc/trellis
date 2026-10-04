@@ -2081,6 +2081,59 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index_one_to_one() {
     the_gc_statement_reads_the_ledger_by_its_tombstone_index(Flavour::OneToOne).await;
 }
 
+/// An update that changes no indexed column, and finds room on its page, is
+/// HOT: it writes no index entry (#775). Every Apply and Re-derive moves an
+/// entry's `applied_seg`, `applied_lsn` or `basis`, and an Apply that keeps
+/// the entry's group changes only its contributions besides, so no ledger
+/// index may read any of them, as a key, an expression or a predicate. The
+/// ledger leaves each page room for those new versions
+/// (`defs::ledger::LEDGER_FILLFACTOR`).
+async fn no_ledger_index_reads_what_an_apply_moves(flavour: Flavour) {
+    let d = start(flavour, &[(1, 1, 10)]).await;
+    let ledger = flavour.ledger();
+    let indexes: Vec<String> = d
+        .ctl
+        .query(
+            "select pg_get_indexdef(indexrelid) from pg_index \
+             where indrelid = $1::text::regclass",
+            &[&ledger],
+        )
+        .await
+        .expect("the ledger's indexes")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(!indexes.is_empty());
+    for index in &indexes {
+        for moved in ["__applied_seg", "__applied_lsn", "__basis", "__arg"] {
+            assert!(
+                !index.contains(moved),
+                "{index} reads {moved}, so no update that moves it is HOT"
+            );
+        }
+    }
+    let options: Vec<String> = d
+        .ctl
+        .query_one(
+            "select coalesce(reloptions, '{}') from pg_class where oid = $1::text::regclass",
+            &[&ledger],
+        )
+        .await
+        .expect("the ledger's storage parameters")
+        .get(0);
+    assert_eq!(options, ["fillfactor=80"]);
+}
+
+#[tokio::test]
+async fn no_ledger_index_reads_what_an_apply_moves_aggregate() {
+    no_ledger_index_reads_what_an_apply_moves(Flavour::AggregateMinMax).await;
+}
+
+#[tokio::test]
+async fn no_ledger_index_reads_what_an_apply_moves_one_to_one() {
+    no_ledger_index_reads_what_an_apply_moves(Flavour::OneToOne).await;
+}
+
 // ------------------------------------- a 1-1 and an aggregate in one page
 
 /// A 1-1 and an aggregate target fed from one source take their entry locks
