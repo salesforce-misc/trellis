@@ -281,8 +281,9 @@ pub(crate) async fn pause_readers_of_missing(
 }
 
 /// The staging worker's capture pass's check for a table Trellis can't read
-/// correctly: pauses every definition that reads `table` and isn't paused
-/// for a capture failure yet, recording why in `capture_failures`, when
+/// or write correctly. It pauses every definition that reads `table` and
+/// isn't paused for a capture failure yet, recording why in
+/// `capture_failures`, when
 ///
 /// - the table's row-level security policies now apply to the ring's owner
 ///   or to this worker's own role, which read it (issue #745,
@@ -293,6 +294,12 @@ pub(crate) async fn pause_readers_of_missing(
 ///   A subscription can be created, or refreshed to include the table,
 ///   after define.
 ///
+/// And (issue #765) it pauses the definition whose target `table` is, when
+/// its policies now apply to this worker's own role, which writes it
+/// ([`crate::defs::row_security::Readers::Target`]): its applies' updates
+/// and deletes would skip the rows they hide, and its inserts would fail.
+/// The ring's owner isn't checked for that: it writes no target.
+///
 /// Returns whether it paused any, in which case the caller leaves the table
 /// for the next pass, whose catalog no longer counts them.
 ///
@@ -301,33 +308,52 @@ pub(crate) async fn pause_readers_of_missing(
 /// way, and the next pass pauses it again while the table is still
 /// unsupported.
 ///
-/// Costs no query for a table no unpaused definition reads.
+/// Costs no query for a table no unpaused definition reads or writes.
 pub(crate) async fn pause_readers_of_unsupported(
     client: &mut Client,
     schema: &str,
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<bool, CaptureError> {
+    let mut pauses: Vec<(i64, String)> = Vec::new();
+    let writers = unpaused_writers(catalog, table);
+    if !writers.is_empty()
+        && let Some(rls) = crate::defs::row_security::applying(
+            &*client,
+            schema,
+            table,
+            crate::defs::row_security::Readers::Target,
+        )
+        .await?
+    {
+        let error = row_security_error(&rls);
+        pauses.extend(writers.into_iter().map(|id| (id, error.clone())));
+    }
     let readers = unpaused_readers(catalog, table);
-    if readers.is_empty() {
+    if !readers.is_empty() {
+        let error = if let Some(rls) = crate::defs::row_security::applying(
+            &*client,
+            schema,
+            table,
+            crate::defs::row_security::Readers::RingAndSession,
+        )
+        .await?
+        {
+            Some(row_security_error(&rls))
+        } else {
+            crate::defs::subscription::subscribed(&*client, table)
+                .await?
+                .map(|sub| subscribed_error(&sub))
+        };
+        if let Some(error) = error {
+            pauses.extend(readers.into_iter().map(|id| (id, error.clone())));
+        }
+    }
+    if pauses.is_empty() {
         return Ok(false);
     }
-    let error = if let Some(rls) = crate::defs::row_security::applying(
-        &*client,
-        schema,
-        table,
-        crate::defs::row_security::Readers::RingAndSession,
-    )
-    .await?
-    {
-        row_security_error(&rls)
-    } else if let Some(sub) = crate::defs::subscription::subscribed(&*client, table).await? {
-        subscribed_error(&sub)
-    } else {
-        return Ok(false);
-    };
     let txn = client.transaction().await?;
-    for id in readers {
+    for (id, error) in pauses {
         if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error).await? {
             tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
@@ -346,6 +372,17 @@ fn subscribed_error(sub: &crate::defs::subscription::Subscribed) -> String {
 /// applies to a table it reads.
 fn row_security_error(rls: &crate::defs::row_security::RowSecurity) -> String {
     format!("{rls}; then resume the definition to rebuild it, or drop the definition")
+}
+
+/// Every definition whose target is `table` (at most one) and that isn't
+/// paused for a capture failure yet.
+fn unpaused_writers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
+    catalog
+        .definitions
+        .iter()
+        .filter(|r| r.target == table && !r.capture_failed)
+        .map(|r| r.id)
+        .collect()
 }
 
 /// Every definition that reads `table` at all, as its source or a

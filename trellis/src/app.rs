@@ -1535,6 +1535,11 @@ pub struct DefinitionStatus {
     ///   filter every read of the table. The staging worker's capture pass
     ///   pauses it, with no `columns`. Exempt the role and resume the
     ///   definition, which rebuilds it and clears this;
+    /// - or row-level security on its own target came to apply to the role
+    ///   the workers write it as (issue #765): its policies would filter
+    ///   apply's writes. The staging worker's capture pass pauses it, with
+    ///   no `columns` and the target as `source_table`. Exempt the role and
+    ///   resume the definition, which rebuilds it and clears this;
     /// - or a logical-replication subscription came to replicate into a
     ///   table it reads after it was defined (issue #751): capture never
     ///   sees the subscription's changes. The staging worker's capture pass

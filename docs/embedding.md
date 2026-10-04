@@ -109,7 +109,14 @@ So:
   `BYPASSRLS`. Defining a transform over such a table is refused, and the
   worker pauses a transform whose table comes under such policies later,
   with the reason on `capture_failure`
-  ([transforms — Source tables](transforms.md#source-tables)).
+  ([transforms — Source tables](transforms.md#source-tables)). The same goes
+  for each target table, which the workers write as their login role (#765):
+  policies that apply to it would skip rows in updates and deletes and fail
+  inserts. A target belongs to the role that defined it, so run the workers
+  as that role or a member of it, and don't force row-level security on the
+  table. The worker pauses a transform whose target comes under such
+  policies, with the reason on `capture_failure`
+  ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
 * **No logical-replication subscription into a table Trellis reads** (#751).
   A subscription's apply worker fires only row-level triggers, so capture
   never sees the changes it applies. Running Trellis on a logical replica's

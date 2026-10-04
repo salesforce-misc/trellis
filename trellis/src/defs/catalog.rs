@@ -248,7 +248,10 @@ pub enum CatalogError {
     /// Issue #745: row-level security on the definition's source, or on the
     /// to-side of a relationship it reads through, applies to a role Trellis
     /// reads the table as, so its policies would filter Trellis's reads
-    /// (see [`super::row_security`]). Not supported.
+    /// (see [`super::row_security`]). Or (issue #765) row-level security on
+    /// its newly created target applies to the session's role, which would
+    /// filter Trellis's writes ([`super::row_security::RowSecurity::target`]).
+    /// Not supported.
     RowSecurityApplies(super::row_security::RowSecurity),
     /// Issue #751: a logical-replication subscription replicates into the
     /// definition's source, or into the to-side of a relationship it reads
@@ -2519,6 +2522,21 @@ async fn create_definition_inner(
         )
         .await?;
     }
+    // Issue #765: Trellis writes the target as the role each worker connects
+    // as, and policies that apply to it would filter those writes. The table
+    // was just created, as the session's role with RLS off, so this only
+    // fires when DDL around the creation (an event trigger) forced RLS on it
+    // or handed it to another owner. The session's role stands in for the
+    // workers' (see [`super::row_security`]).
+    reject_row_security(
+        &*txn,
+        pool.schema(),
+        &[(
+            qualified_target.clone(),
+            super::row_security::Readers::Target,
+        )],
+    )
+    .await?;
 
     let version: i64 = txn
         .query_one(
@@ -3285,9 +3303,9 @@ pub(crate) async fn relationships_from_table_in(
 
 /// Issue #622 (C2): every registered definition, as its id, qualified
 /// `source_table`, parsed text and whether a `schema_changed` marker paused
-/// it (C6, `capture_failures`), plus every relationship. This is the whole
-/// input `crate::capture::columns` needs to decide which columns a table's
-/// capture trigger images.
+/// it (C6, `capture_failures`) and its qualified `target_table` (#765),
+/// plus every relationship. This is the whole input `crate::capture::columns`
+/// needs to decide which columns a table's capture trigger images.
 ///
 /// Definitions in every status count. A table is captured from the moment
 /// something registers a reader of it, before that reader builds, and a
@@ -3297,7 +3315,7 @@ pub(crate) async fn capture_readers(
     client: &impl GenericClient,
 ) -> Result<
     (
-        Vec<(i64, String, TransformDef, bool)>,
+        Vec<(i64, String, TransformDef, bool, String)>,
         Vec<RelationshipDefinition>,
     ),
     CatalogError,
@@ -3305,13 +3323,22 @@ pub(crate) async fn capture_readers(
     let definitions = client
         .query(
             "select d.id, d.source_table, d.definition_text, \
-                    exists (select 1 from capture_failures f where f.transform_id = d.id) \
+                    exists (select 1 from capture_failures f where f.transform_id = d.id), \
+                    d.target_table \
              from transform_definitions d order by d.id",
             &[],
         )
         .await?
         .into_iter()
-        .map(|row| Ok((row.get(0), row.get(1), parse(row.get(2))?, row.get(3))))
+        .map(|row| {
+            Ok((
+                row.get(0),
+                row.get(1),
+                parse(row.get(2))?,
+                row.get(3),
+                row.get(4),
+            ))
+        })
         .collect::<Result<Vec<_>, CatalogError>>()?;
     let relationships = client
         .query(
@@ -4800,7 +4827,8 @@ async fn reject_unkeyed_source(
 /// ([`super::row_security::applying`]): the ring's owner, and the session's
 /// role for a table registration itself reads ([`super::row_security::Readers`];
 /// not otherwise, since the session may belong to a process that never reads
-/// the table) — [`CatalogError::RowSecurityApplies`]. A table that doesn't
+/// the table), or only the session's role for the target it creates (#765)
+/// — [`CatalogError::RowSecurityApplies`]. A table that doesn't
 /// exist passes: the checks that need it report that.
 async fn reject_row_security(
     client: &impl GenericClient,

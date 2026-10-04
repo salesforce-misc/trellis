@@ -18,7 +18,10 @@
 //! ([`crate::staging::schema_change::pause_readers_of_unsupported`]), and
 //! leaves the table for the next pass. Those last two checks also run on
 //! each table another definition targets, which the pass doesn't capture
-//! (the target-mutation seam feeds it) but its readers still read.
+//! (the target-mutation seam feeds it) but its readers still read. There the
+//! pass also pauses the definition that writes the target when its
+//! row-level security now applies to the worker's role, which would filter
+//! the writes (#765).
 //!
 //! # Never waiting on `apply`'s path
 //!
@@ -194,8 +197,11 @@ pub async fn reconcile(
     // #745, #751: a table another definition targets isn't in `desired` (the
     // seam feeds it, not a trigger), but its readers read it as Trellis's
     // role all the same, and the seam doesn't see a subscription's writes to
-    // it either. A seam-fed table whose check pauses a reader, or fails,
-    // isn't current for `ready_definitions` either.
+    // it either. #765: and the definition that targets it writes it as the
+    // worker's role, so row-level security that applies to that role pauses
+    // the writer. This loop runs over every target, read or not. A seam-fed
+    // table whose check pauses a definition, or fails, isn't current for
+    // `ready_definitions` either.
     let mut seam_held: HashSet<String> = HashSet::new();
     let mut seam_fed: Vec<&String> = snapshot
         .targets

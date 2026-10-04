@@ -73,6 +73,8 @@ pub struct CaptureReader {
     /// Until it resumes, which rebuilds it, it reads nothing, so its columns
     /// don't count and the table's capture can drop a column only it read.
     pub capture_failed: bool,
+    /// The qualified `target_table` it writes (#765).
+    pub target: String,
 }
 
 /// The columns [`read_columns`] finds a table's readers need, before the
@@ -213,11 +215,12 @@ pub async fn load_catalog(
     let (definitions, relationships) = crate::defs::catalog::capture_readers(client).await?;
     let definitions = definitions
         .into_iter()
-        .map(|(id, source, def, capture_failed)| CaptureReader {
+        .map(|(id, source, def, capture_failed, target)| CaptureReader {
             id,
             source,
             def,
             capture_failed,
+            target,
         })
         .collect();
     let bookkeeping = [
@@ -407,6 +410,7 @@ mod tests {
                     source: source.to_string(),
                     def: def(text),
                     capture_failed: false,
+                    target: format!("public.target_{}", i + 1),
                 })
                 .collect(),
             relationships,

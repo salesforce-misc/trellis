@@ -64,6 +64,40 @@
 //! Drain threads in another process, running as another login role, aren't
 //! seen from here: a deployment runs every worker as the Trellis role or a
 //! member of it.
+//!
+//! # A definition's target (issue #765)
+//!
+//! Trellis also *writes* each definition's target, and policies that apply
+//! to the writer filter those writes: an `UPDATE` or `DELETE` skips the rows
+//! they hide, leaving them as they were, and an `INSERT` fails their `WITH
+//! CHECK`, raising in the drain. So the same rule applies to a target, for
+//! the role that writes it ([`Readers::Target`]).
+//!
+//! **Which role writes.** Every target write (apply's, a build's, a
+//! rebuild's orphan delete) is plain SQL on a Trellis connection, so it runs
+//! as that connection's login role: the drain thread's or the worker's. No
+//! capture function is involved (targets aren't captured), and nothing
+//! switches role. So the ring's owner isn't checked for a target: in a
+//! deployment whose workers log in as a member of it, the target belongs to
+//! the role that defined it, the ring's owner may own nothing of it, and
+//! checking it would refuse a target the workers write as its owner.
+//!
+//! **When it can fire.** Registration always creates the target, as the
+//! session's role (#440: Trellis never adopts a table), with row-level
+//! security off. So the policies only come to apply to its writer if
+//! someone enables RLS and the writer doesn't own the table (another owner,
+//! or a membership taken away), forces RLS on it, or takes away the
+//! writer's `BYPASSRLS`. Enabling RLS on a target the writer owns, for the
+//! application's roles that read it, fires nothing.
+//!
+//! - **Defining** checks the new target for the session's role right after
+//!   creating it, which only fires when an event trigger turns RLS on for
+//!   new tables and forces it, or hands the table to another owner.
+//! - **The capture pass** checks each target for the worker's own role and
+//!   pauses the definition that writes it. Its readers are checked as for
+//!   any table another definition targets, above.
+//! - **`self_check`'s capture audit** checks the definition's target for the
+//!   caller's role, which reads it to compare.
 
 use std::fmt;
 
@@ -84,6 +118,9 @@ pub struct RowSecurity {
     /// from), so that only `FORCE ROW LEVEL SECURITY` makes the policies
     /// apply to it. Otherwise it neither owns the table nor has `BYPASSRLS`.
     pub owner_forced: bool,
+    /// Whether the table is a definition's target, which Trellis writes
+    /// (issue #765, [`Readers::Target`]), rather than a table it reads.
+    pub target: bool,
 }
 
 impl fmt::Display for RowSecurity {
@@ -92,7 +129,30 @@ impl fmt::Display for RowSecurity {
             table,
             role,
             owner_forced,
+            target,
         } = self;
+        if *target {
+            return if *owner_forced {
+                write!(
+                    f,
+                    "row-level security on target {table} applies to role {role}: it owns the \
+                     table, but the table has FORCE ROW LEVEL SECURITY, so Trellis's writes to it \
+                     are filtered: its updates and deletes skip the rows the policies hide, and \
+                     its inserts fail their WITH CHECK. Trellis doesn't support that. Exempt the role with \
+                     ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY, or give it BYPASSRLS"
+                )
+            } else {
+                write!(
+                    f,
+                    "row-level security on target {table} applies to role {role}: it neither \
+                     owns the table nor has BYPASSRLS, so Trellis's writes to it are filtered: \
+                     its updates and deletes skip the rows the policies hide, and its inserts \
+                     fail their WITH CHECK. Trellis doesn't support that. Exempt the role with ALTER ROLE \
+                     {role} BYPASSRLS, or make it the table's owner again (without FORCE ROW \
+                     LEVEL SECURITY)"
+                )
+            };
+        }
         if *owner_forced {
             write!(
                 f,
@@ -125,6 +185,15 @@ pub enum Readers {
     /// session that reads the table itself: the staging worker's capture
     /// pass, or `self_check`'s recompute.
     RingAndSession,
+    /// The session's role alone, for a definition's target table (issue
+    /// #765). Only the workers write a target (applies, builds, a rebuild's
+    /// orphan delete), each as its connection's login role, and no capture
+    /// function touches one (the target-mutation seam feeds its readers), so
+    /// the ring's owner never writes one unless it is that role. The session
+    /// stands in for the workers: the capture pass's is a worker's, and
+    /// define's and `self_check`'s are assumed to be one. What it finds says
+    /// so ([`RowSecurity::target`]).
+    Target,
 }
 
 /// The row-level security that applies to a role Trellis reads `table` as
@@ -147,7 +216,7 @@ pub async fn applying(
                  from pg_catalog.pg_class c \
                  cross join pg_catalog.pg_roles r \
                  where c.oid = pg_catalog.to_regclass($2) \
-                   and (($3 and r.rolname = current_user) or r.oid = {RING_OWNER}) \
+                   and (($3 and r.rolname = current_user) or ($4 and r.oid = {RING_OWNER})) \
                    and c.relrowsecurity \
                    and not r.rolsuper and not r.rolbypassrls \
                    and (c.relforcerowsecurity \
@@ -158,7 +227,8 @@ pub async fn applying(
             &[
                 &schema,
                 &regclass_arg(table),
-                &(readers == Readers::RingAndSession),
+                &(readers != Readers::Ring),
+                &(readers != Readers::Target),
             ],
         )
         .await?;
@@ -166,6 +236,7 @@ pub async fn applying(
         table: table.to_string(),
         role: row.get(0),
         owner_forced: row.get(1),
+        target: readers == Readers::Target,
     }))
 }
 
@@ -179,6 +250,7 @@ mod tests {
             table: "public.t".to_string(),
             role: "trellis".to_string(),
             owner_forced: false,
+            target: false,
         };
         let text = rls.to_string();
         assert!(
@@ -189,6 +261,28 @@ mod tests {
         rls.owner_forced = true;
         let text = rls.to_string();
         assert!(text.contains("FORCE ROW LEVEL SECURITY"), "{text}");
+        assert!(
+            text.contains("ALTER TABLE public.t NO FORCE ROW LEVEL SECURITY"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_target_s_message_says_its_writes_are_filtered() {
+        // Issue #765.
+        let mut rls = RowSecurity {
+            table: "public.t".to_string(),
+            role: "trellis".to_string(),
+            owner_forced: false,
+            target: true,
+        };
+        let text = rls.to_string();
+        assert!(text.contains("on target public.t"), "{text}");
+        assert!(text.contains("writes to it are filtered"), "{text}");
+        assert!(text.contains("ALTER ROLE trellis BYPASSRLS"), "{text}");
+        rls.owner_forced = true;
+        let text = rls.to_string();
+        assert!(text.contains("writes to it are filtered"), "{text}");
         assert!(
             text.contains("ALTER TABLE public.t NO FORCE ROW LEVEL SECURITY"),
             "{text}"

@@ -21,6 +21,11 @@
 //! included, so a comparison would agree with a wrong answer. The staging
 //! worker's capture pass pauses the table's readers for it.
 //!
+//! The same goes for the definition's target (issue #765), checked for the
+//! role `self_check` runs as, standing in for the workers' role that writes
+//! it: policies that apply to the writer filter apply's updates and deletes
+//! and fail its inserts. The capture pass pauses the target's writer for it.
+//!
 //! And it reports a table a logical-replication subscription replicates
 //! into (issue #751, [`crate::defs::subscription`]). The triggers are all
 //! in place, but the subscription's apply worker fires only row-level
@@ -162,7 +167,10 @@ pub enum CaptureFault {
     /// every change, but each read of the table, `self_check`'s recompute
     /// included, sees only the rows the policies allow. Checked on every
     /// table the definition reads, including one the target-mutation seam
-    /// feeds.
+    /// feeds. Also (issue #765) reported for the definition's own target
+    /// ([`RowSecurity::target`]) when the policies apply to the caller's
+    /// role, standing in for the workers' that write it: their updates and
+    /// deletes skip the rows the policies hide, and their inserts fail.
     RowSecurity(RowSecurity),
     /// A logical-replication subscription replicates into the table (issue
     /// #751, [`crate::defs::subscription`]). Its apply worker fires only
@@ -277,8 +285,8 @@ impl fmt::Display for CaptureFault {
 /// Every [`CaptureFault`] on the tables `def` reads, in a deterministic
 /// order: per table (sorted), its trigger and function faults in event
 /// order, then its hierarchy faults, then its row-level security, then the
-/// subscription that replicates into it; then the privilege faults, per
-/// role.
+/// subscription that replicates into it; then the row-level security on
+/// the definition's target (#765); then the privilege faults, per role.
 /// Empty for a definition whose capture needn't be installed yet (see the
 /// module doc).
 pub async fn audit(
@@ -320,6 +328,19 @@ pub async fn audit(
         if let Some(sub) = subscription::subscribed(client, &table).await? {
             faults.push(CaptureFault::Subscribed(sub));
         }
+    }
+    // #765: the target, which Trellis writes as the worker's role and the
+    // recompute comparison reads as the caller's. The caller's role stands
+    // in for the workers'.
+    if let Some(rls) = row_security::applying(
+        client,
+        schema,
+        &def.target_table,
+        row_security::Readers::Target,
+    )
+    .await?
+    {
+        faults.push(CaptureFault::RowSecurity(rls));
     }
     for (role, tables) in runs_as {
         let tables: Vec<String> = tables.into_iter().collect();
