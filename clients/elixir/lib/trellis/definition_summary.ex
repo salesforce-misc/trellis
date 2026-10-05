@@ -36,9 +36,7 @@ defmodule Trellis.DefinitionSummary do
   defstruct @enforce_keys
 
   @doc false
-  def from_native(
-        %{created_at_micros: micros, backfill_failure: failure, halt: halt} = summary
-      ) do
+  def from_native(%{created_at_micros: micros, backfill_failure: failure, halt: halt} = summary) do
     summary
     |> Map.delete(:created_at_micros)
     |> Map.put(:created_at, Trellis.Time.from_micros(micros))
