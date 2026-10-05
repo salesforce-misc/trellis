@@ -1087,6 +1087,9 @@ pub(crate) async fn run_pending_backfills_for(
 
     let mut settled = 0usize;
     let mut failures = Vec::new();
+    // Read by the pass's first discharge, and shared by the rest: no
+    // discharge changes which definitions are in it.
+    let mut rederive = None;
     for marker in pending {
         if !marker.due {
             tracing::debug!(
@@ -1145,6 +1148,7 @@ pub(crate) async fn run_pending_backfills_for(
             intake_timeout,
             stop,
             ready,
+            &mut rederive,
         )
         .await
         {
@@ -1338,8 +1342,8 @@ async fn plan_waiting_builds(
 /// ([`park_ready_registration_markers`]), and that marker's discharge plans
 /// its build like any other, enumerating for it if it is ring-built.
 ///
-/// Read on `client` before the discharge's transaction opens, like
-/// [`plan_waiting_builds`]. A definition registered after this read is
+/// Read on `client` once per pass, before its first discharge's transaction
+/// opens ([`discharge_marker`]). A definition registered after this read is
 /// counted as a reader, which at worst enumerates for nothing, as before
 /// #732. So is one whose text doesn't parse: its own table's discharge meets
 /// the error in [`plan_waiting_builds`] and backs off (issues #407, #518),
@@ -1376,6 +1380,10 @@ async fn waiting_rederive_builds(client: &tokio_postgres::Client) -> Result<Vec<
 /// ([`go_live_caught_up`]). An error drops the
 /// transaction, which rolls it back, so the marker survives either way the
 /// discharge falls short.
+///
+/// `rederive` is the pass's [`waiting_rederive_builds`], read here if no
+/// discharge before this one in the pass has read it.
+#[allow(clippy::too_many_arguments)]
 async fn discharge_marker(
     client: &mut tokio_postgres::Client,
     marker: &PendingBackfill,
@@ -1384,9 +1392,13 @@ async fn discharge_marker(
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
     ready: Option<&[i64]>,
+    rederive: &mut Option<Vec<i64>>,
 ) -> Result<Discharge, IntakeError> {
-    let rederive = waiting_rederive_builds(client).await?;
-    let builds = plan_waiting_builds(client, &marker.table, ready, &rederive).await?;
+    if rederive.is_none() {
+        *rederive = Some(waiting_rederive_builds(client).await?);
+    }
+    let rederive = rederive.as_deref().unwrap_or_default();
+    let builds = plan_waiting_builds(client, &marker.table, ready, rederive).await?;
     let waiting: Vec<i64> = builds.iter().map(|(id, _)| *id).collect();
     // Definitions whose build reads the table itself, in the background:
     // those this discharge dispatches to chunks or a direct-build job, and
@@ -1395,7 +1407,7 @@ async fn discharge_marker(
         .iter()
         .filter(|(_, build)| !matches!(build, Build::Ring))
         .map(|(id, _)| *id)
-        .chain(rederive)
+        .chain(rederive.iter().copied())
         .collect();
     let ring: Vec<i64> = builds
         .iter()
