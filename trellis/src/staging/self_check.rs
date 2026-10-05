@@ -57,8 +57,8 @@
 //! takes a watermark token, awaits convergence through it (bounded by a
 //! timeout — on timeout it reports [`SelfCheckOutcome::NotCaughtUp`], never a
 //! divergence; any other failure of the wait is an `Err`, see [`caught_up`]),
-//! then reads the target and runs the recompute inside a single
-//! `REPEATABLE READ` transaction ([`compare_once`]).
+//! then reads the target and runs the recompute in a single statement, so
+//! under one snapshot ([`compare_once`]).
 //!
 //! Under [`SelfCheckMode::Standard`], a divergence is only reported as real
 //! if it survives a re-check after a *fresh* await — a genuine divergence is
@@ -136,8 +136,8 @@ pub enum SelfCheckMode {
     /// **Known, accepted limitation: the re-check's guarantee is identity
     /// stability, not value non-transience.** [`await_then_compare`] takes
     /// its watermark token and runs [`converge::await_converged`] on one
-    /// connection borrowed from the pool, then [`compare_once`] opens its
-    /// `REPEATABLE READ` transaction on a separate `pool.get()` call — which
+    /// connection borrowed from the pool, then [`compare_once`] runs its
+    /// statement on a separate `pool.get()` call — which
     /// may hand back a *different* connection. A commit landing in that gap
     /// is visible to the source read but not yet applied to the target. Two
     /// independent passes can each catch this same lag race on the same hot
@@ -191,7 +191,8 @@ pub struct SelfCheckReport {
     /// The keyset cursor a following call should pass as
     /// [`SelfCheckScope::after`] to continue past this page — the key this
     /// page's bound actually ended at, which is the *lower* of the two
-    /// sides' last keys whenever either side hit
+    /// sides' last keys, in the order both sides are paged in (the source
+    /// key's collation, see `page_collation`), whenever either side hit
     /// [`SelfCheckScope::limit`] (keys past it fell off one side's page and
     /// are deliberately left for the next call rather than diffed against a
     /// truncated counterpart). `None` means neither side hit the limit, so
@@ -634,12 +635,10 @@ fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
     }
 }
 
-/// The bounded, single-transaction comparison itself (ADR-0013: "reads the
-/// target and runs the recompute inside a single `REPEATABLE READ`
-/// transaction"). Builds two independently-rendered `SELECT`s — one against
-/// `def`'s source (via [`render_leaf`]), one against the persisted target —
-/// each bounded to `scope`'s keyset page, runs both in the same transaction,
-/// and diffs the results in Rust.
+/// The bounded comparison itself (ADR-0013: the target read and the
+/// recompute share one snapshot). Reads one keyset page of `def`'s source
+/// (recomputed via [`render_leaf`]) and of the persisted target in a single
+/// statement ([`page_sql`]), and diffs the two in Rust ([`diff_page`]).
 async fn compare_once(
     pool: &Pool,
     def: &Definition,
@@ -665,79 +664,31 @@ async fn compare_once(
         .iter()
         .filter(|f| !paused.contains(&f.name))
         .collect();
+    let sql = page_sql(def, pk, &comparable)?;
 
-    // Issue #121: `pk_key_expr` is the source/target's shared key-contract
-    // text at whatever arity `pk` has (a bare `{col}::text` at arity 1,
-    // byte-identical to before this issue). Both queries below page and order
-    // by this same text on both sides, so — while that's not necessarily the
-    // key's own *typed* order at arity > 1 — it's the same order on both
-    // sides, which is all a divergence detector that only ever compares the
-    // two sides key-by-key actually needs (this was already true of a plain
-    // `pk::text` order at arity 1, e.g. a numeric key sorting lexicographically
-    // rather than numerically).
-    let pk_key_expr = ddl::pk_key_sql_expr(pk, None);
-    let source_ident = ddl::qualified_source_table(&def.source_table);
-    let target_ident = ddl::qualified_target_table_ident(&def.target_table);
-
-    let mut recompute_select = vec![pk_key_expr.clone()];
-    for field in &comparable {
-        let leaf = render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
-            target: def.def.target.clone(),
-            detail,
-        })?;
-        recompute_select.push(format!("({leaf})::text"));
-    }
-    let recompute_sql = format!(
-        "select {} from {source_ident} where ($1::text is null or {pk_key_expr} > $1) \
-         order by {pk_key_expr} limit $2",
-        recompute_select.join(", ")
-    );
-
-    let mut persisted_select = vec![pk_key_expr.clone()];
-    for field in &comparable {
-        persisted_select.push(format!("{}::text", quote_ident(&field.name)));
-    }
-    let persisted_sql = format!(
-        "select {} from {target_ident} where ($1::text is null or {pk_key_expr} > $1) \
-         order by {pk_key_expr} limit $2",
-        persisted_select.join(", ")
-    );
-
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-    // Must be the transaction's first statement (Postgres requires `SET
-    // TRANSACTION` before any other command) — only a REPEATABLE READ
-    // transaction holds its snapshot steady across the recompute and
-    // persisted-read queries below.
-    txn.execute("set transaction isolation level repeatable read", &[])
-        .await?;
-
+    // One statement reads both sides, so both read the same snapshot
+    // (ADR-0013's "reads the target and runs the recompute" under one
+    // snapshot), and it trims both pages to the same bound.
+    let client = pool.get().await?;
     let after: Option<&str> = scope.after.as_deref();
-    let recompute_rows = txn
-        .query(recompute_sql.as_str(), &[&after, &scope.limit])
-        .await?;
-    let persisted_rows = txn
-        .query(persisted_sql.as_str(), &[&after, &scope.limit])
-        .await?;
-    txn.commit().await?;
+    let rows = client.query(sql.as_str(), &[&after, &scope.limit]).await?;
 
-    let page = |rows: &[tokio_postgres::Row]| -> Page {
-        rows.iter()
-            .map(|row| {
-                let key: String = row.get(0);
-                let values: Vec<Option<String>> =
-                    (0..comparable.len()).map(|i| row.get(i + 1)).collect();
-                (key, values)
-            })
-            .collect()
-    };
+    let mut recomputed = Page::new();
+    let mut persisted = Page::new();
+    let mut page_end: Option<String> = None;
+    for row in &rows {
+        let is_recomputed: bool = row.get(0);
+        page_end = row.get(1);
+        let key: String = row.get(2);
+        let values: Vec<Option<String>> = (0..comparable.len()).map(|i| row.get(i + 3)).collect();
+        if is_recomputed {
+            recomputed.insert(key, values);
+        } else {
+            persisted.insert(key, values);
+        }
+    }
     let columns: Vec<&str> = comparable.iter().map(|f| f.name.as_str()).collect();
-    let diff = diff_page(
-        &columns,
-        page(&recompute_rows),
-        page(&persisted_rows),
-        scope.limit,
-    );
+    let diff = diff_page(&columns, recomputed, persisted, page_end);
 
     Ok(ComparePass {
         checked_through,
@@ -745,6 +696,147 @@ async fn compare_once(
         next_after: diff.next_after,
         divergences: diff.divergences,
     })
+}
+
+/// The collation [`page_sql`] compares both sides' key text under, so the
+/// source and the target page in one order however their own key columns are
+/// collated (issue #782). A 1-1 target's key is created with its source's
+/// collation (#769), but `alter column … type text collate …` on the source
+/// afterwards leaves the two ordering differently, and two pages read in two
+/// orders hold different keys.
+///
+/// The source key index's collation when the key text is that one column
+/// itself (a not-null collatable key of arity 1, whose `col::text` is the
+/// column): naming the index's own collation keeps the source's index range
+/// scan, and the target's whenever its key has the same collation, which is
+/// always the case until the source is re-collated. After a re-collation the
+/// target's page is read by a sequential scan and a sort, since its index
+/// orders by the other collation; that costs an audit time, never a wrong
+/// answer. Any other key text (a composite key's `array_to_string`, an
+/// integer's `id::text`) is an expression no index orders, so it is compared
+/// under `"C"`, the cheapest to sort.
+///
+/// [`SelfCheckScope::after`] is compared under this collation too, so a
+/// cursor carried across a re-collation of the source key continues in the
+/// new order: keys between the two orders' positions of the cursor may be
+/// skipped or compared twice by that one sweep.
+fn page_collation(pk: &[PrimaryKeyColumn]) -> &str {
+    match pk {
+        [only] if !only.nullable => only.collation.as_deref().unwrap_or(BYTE_ORDER),
+        _ => BYTE_ORDER,
+    }
+}
+
+/// `"C"`, byte order.
+const BYTE_ORDER: &str = r#"pg_catalog."C""#;
+
+/// The statement [`compare_once`] runs: one keyset page of the recompute
+/// over `def`'s source and of the persisted target, each `LIMIT`ed
+/// separately, both ordered and bounded by the key text under one collation
+/// ([`page_collation`]), and both trimmed to the same end in SQL, where that
+/// collation's ordering is.
+///
+/// `$1` is [`SelfCheckScope::after`] and `$2` its `limit`. Each row is
+/// `(recomputed, page_end, key, compared values…)`: `recomputed` says which
+/// side the row is from, and `page_end` is the page's bound, the same on
+/// every row.
+///
+/// Why the trim: the two `LIMIT`ed reads are independent, so whenever a
+/// divergence makes the two sides' key sets differ, their pages end at
+/// *different* keys. A target missing one row inside the page pulls one key
+/// in on the persisted side that the recompute side's own limit cut off.
+/// Diffing the raw pages would report that key as an `ExtraRow` only because
+/// it fell off the other side's page: a deterministic false divergence (it
+/// reproduces on the re-check, so the ADR's re-check can't filter it), and
+/// the cursor would skip past it, so no later page would compare it either.
+/// So whichever side(s) filled the limit bound the page, and the *lowest*
+/// such bound is its end. Keys past it are dropped from both sides and left
+/// for the next page, which starts after `page_end`. A page where neither
+/// side filled the limit reached the end of the keyspace: `page_end` is
+/// null. The lowest bound has to be taken in the order the pages were read
+/// in, which is why it is taken here and not in Rust (whose `String` order is
+/// byte order, `"C"`'s, and not, say, `en-US`'s).
+fn page_sql(
+    def: &Definition,
+    pk: &[PrimaryKeyColumn],
+    comparable: &[&FieldDef],
+) -> Result<String, SelfCheckError> {
+    // `pk_key_sql_expr` is the source/target's shared key-contract text at
+    // whatever arity `pk` has (issue #121): a bare `{col}::text` at arity 1.
+    // Both sides page by it, under one collation, so they page in one order.
+    // That order isn't the key's typed order (an integer key sorts as text),
+    // and needn't be: the audit only ever compares the two sides key by key.
+    let key = format!(
+        "({}) collate {}",
+        ddl::pk_key_sql_expr(pk, None),
+        page_collation(pk)
+    );
+    let source_ident = ddl::qualified_source_table(&def.source_table);
+    let target_ident = ddl::qualified_target_table_ident(&def.target_table);
+
+    let mut recomputed = Vec::with_capacity(comparable.len());
+    let mut persisted = Vec::with_capacity(comparable.len());
+    for (i, field) in comparable.iter().enumerate() {
+        let leaf = render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
+            target: def.def.target.clone(),
+            detail,
+        })?;
+        recomputed.push(format!(", ({leaf})::text as v{i}"));
+        persisted.push(format!(", {}::text as v{i}", quote_ident(&field.name)));
+    }
+    let side = |table: &str, values: &[String]| {
+        format!(
+            "select {key} as k{} from {table} \
+             where ($1::text is null or {key} > $1) order by {key} limit $2",
+            values.concat()
+        )
+    };
+    Ok(format!(
+        "with recomputed as materialized ({}), \
+              persisted as materialized ({}), \
+              page as ( \
+                select least( \
+                  (select max(k) from recomputed having count(*) >= $2), \
+                  (select max(k) from persisted having count(*) >= $2)) as page_end) \
+         select true, page.page_end, recomputed.* from recomputed, page \
+          where page.page_end is null or recomputed.k <= page.page_end \
+         union all \
+         select false, page.page_end, persisted.* from persisted, page \
+          where page.page_end is null or persisted.k <= page.page_end",
+        side(&source_ident, &recomputed),
+        side(&target_ident, &persisted),
+    ))
+}
+
+/// The plan of [`compare_once`]'s statement for `target_table`'s page after
+/// `after`, as `explain`'s text, with sequential scans disabled so that a
+/// table still read by one is a table no index can serve. For tests of the
+/// plan's shape.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_page(
+    pool: &Pool,
+    target_table: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<String, SelfCheckError> {
+    let def = catalog::definition_by_target(pool, target_table)
+        .await?
+        .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
+    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
+    let comparable: Vec<&FieldDef> = def.def.fields.iter().collect();
+    let sql = page_sql(&def, &pk, &comparable)?;
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    txn.batch_execute("set local enable_seqscan to off").await?;
+    let rows = txn
+        .query(format!("explain {sql}").as_str(), &[&after, &limit])
+        .await?;
+    txn.rollback().await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// One side of a [`compare_once`] page: key text to the `::text` value of
@@ -760,47 +852,16 @@ struct PageDiff {
 }
 
 /// The pure half of [`compare_once`]: diffs the recompute page against the
-/// persisted page once both `LIMIT`ed reads are back. `columns` names the
-/// compared columns, in the order each page's value vectors hold them.
-/// `limit` is the bound both reads ran with, so a page holding `limit` keys
-/// is one whose read was cut off.
-fn diff_page(columns: &[&str], mut recomputed: Page, mut persisted: Page, limit: i64) -> PageDiff {
-    // The two `LIMIT`ed reads are keyset-scoped independently, so whenever a
-    // divergence makes the two sides' key sets differ, their pages end at
-    // *different* keys: a target missing one row inside the page pulls one
-    // extra key in on the persisted side that the recompute side's own limit
-    // cut off. Diffing the raw pages would then report that trailing key as a
-    // `ExtraRow`/`MissingRow` purely because it fell off the other side's
-    // page — a deterministic false divergence (it reproduces on the re-check
-    // pass, so the ADR's re-check can't filter it), and `next_after` would
-    // skip past it, never comparing it honestly on the following page.
-    //
-    // So: whichever side(s) actually hit the limit bound this page, and the
-    // *lowest* such bound is the page's real end. Keys past it belong to the
-    // next page and are dropped from both sides here; `next_after` is that
-    // boundary, so the following call picks them up. A page where neither
-    // side hit the limit reached the end of the keyspace — no boundary, and
-    // `next_after` is `None`.
-    //
-    // Page length stands in for the read's row count: every key is a
-    // distinct primary key, so the two are always equal.
-    let recompute_bound = (recomputed.len() as i64 >= limit)
-        .then(|| recomputed.keys().next_back().cloned())
-        .flatten();
-    let persisted_bound = (persisted.len() as i64 >= limit)
-        .then(|| persisted.keys().next_back().cloned())
-        .flatten();
-    let page_end = match (recompute_bound, persisted_bound) {
-        (Some(r), Some(p)) => Some(r.min(p)),
-        (Some(r), None) => Some(r),
-        (None, Some(p)) => Some(p),
-        (None, None) => None,
-    };
-    if let Some(page_end) = &page_end {
-        recomputed.retain(|key, _| key <= page_end);
-        persisted.retain(|key, _| key <= page_end);
-    }
-
+/// persisted page. `columns` names the compared columns, in the order each
+/// page's value vectors hold them. Both pages are already trimmed to
+/// `page_end`, the page's bound ([`page_sql`]), which becomes the cursor for
+/// the next page.
+fn diff_page(
+    columns: &[&str],
+    recomputed: Page,
+    persisted: Page,
+    page_end: Option<String>,
+) -> PageDiff {
     let mut divergences = Vec::new();
     for (key, r_values) in &recomputed {
         match persisted.get(key) {
@@ -1082,7 +1143,7 @@ mod tests {
     fn diff_page_reports_nothing_for_identical_pages_that_reach_the_end_of_the_keyspace() {
         let rows = [("1", "10"), ("2", "20")];
         assert_eq!(
-            diff_page(&["price"], page(&rows), page(&rows), 100),
+            diff_page(&["price"], page(&rows), page(&rows), None),
             PageDiff {
                 rows_compared: 2,
                 next_after: None,
@@ -1097,7 +1158,7 @@ mod tests {
             &["price"],
             page(&[("1", "11"), ("2", "20")]),
             page(&[("1", "9999"), ("3", "30")]),
-            100,
+            None,
         );
         assert_eq!(
             diff.divergences,
@@ -1113,24 +1174,15 @@ mod tests {
         assert_eq!(diff.next_after, None);
     }
 
-    /// Regression, keyset page alignment: the recompute read and the
-    /// persisted read are two independently-`LIMIT`ed queries, so once a real
-    /// divergence makes their key sets differ, their pages end at different
-    /// keys. Here the target is missing row `2` and the limit is 3, so the
-    /// recompute page is `{1,2,3}` while the persisted page is `{1,3,4}`.
-    /// Diffing those raw would report key `4` as an `ExtraRow` only because it
-    /// fell off the recompute side's page. That false divergence reproduces
-    /// on the re-check, so the re-check can't filter it, and `next_after`
-    /// would then skip past `4`, so no later page would compare it either.
-    /// Only the genuine `MissingRow { 2 }` may be reported, and `next_after`
-    /// must land on `3`.
+    /// A page's bound, worked out in SQL ([`page_sql`]), is the cursor for
+    /// the next page, and every key either side kept is compared once.
     #[test]
-    fn diff_page_does_not_invent_a_divergence_from_the_two_sides_ending_at_different_keys() {
+    fn diff_page_carries_the_page_end_to_the_cursor() {
         let diff = diff_page(
             &["price"],
             page(&[("1", "10"), ("2", "20"), ("3", "30")]),
-            page(&[("1", "10"), ("3", "30"), ("4", "40")]),
-            3,
+            page(&[("1", "10"), ("3", "30")]),
+            Some("3".to_string()),
         );
         assert_eq!(
             diff,
@@ -1138,29 +1190,6 @@ mod tests {
                 rows_compared: 3,
                 next_after: Some("3".to_string()),
                 divergences: vec![missing("2")],
-            }
-        );
-    }
-
-    #[test]
-    fn diff_page_bounds_the_page_by_whichever_side_alone_hit_the_limit() {
-        // The target has an extra row `0` ahead of everything, so only the
-        // persisted side fills its limit, ending at `2`. The recompute side's
-        // `3` belongs to the next page.
-        let diff = diff_page(
-            &["price"],
-            page(&[("1", "10"), ("2", "20"), ("3", "30")]),
-            page(&[("0", "0"), ("1", "10"), ("2", "20")]),
-            3,
-        );
-        assert_eq!(
-            diff,
-            PageDiff {
-                rows_compared: 3,
-                next_after: Some("2".to_string()),
-                divergences: vec![Divergence::ExtraRow {
-                    key: "0".to_string()
-                }],
             }
         );
     }

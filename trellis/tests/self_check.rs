@@ -23,18 +23,19 @@
 //! runs a live `Client`, because a genuinely lagging pipeline is its subject.
 //! It never waits for convergence.
 //!
-//! The comparison's pure logic (page alignment, divergence classification,
-//! the re-check's filter) is unit-tested in `staging::self_check::tests`
+//! The comparison's pure logic (divergence classification, the re-check's
+//! filter) is unit-tested in `staging::self_check::tests`
 //! (`trellis/src/staging/self_check.rs`). These tests cover what needs
 //! Postgres: that the rendered recompute SQL runs and agrees with what the
-//! engine persisted, the keyset paging, and the paused-column read.
+//! engine persisted, the keyset paging and its page alignment (under the
+//! key's collation, #782), and the paused-column read.
 //!
 //! **A deliberately out-of-scope race** (judgment call, flagged rather than
 //! silently skipped): ADR-0013's re-check-on-divergence design also guards
 //! against a *sub-transaction* race — a brand-new commit landing in the
 //! narrow window between `self_check`'s own internal `await_converged`
-//! succeeding and the `REPEATABLE READ` transaction it opens immediately
-//! after actually establishing its snapshot. That window is microseconds
+//! succeeding and the statement it runs immediately after actually
+//! establishing its snapshot. That window is microseconds
 //! wide with no artificial delay hook in the production code to widen it
 //! (adding one purely for this test wasn't judged worth the production-code
 //! complexity), so it isn't reproduced deterministically here.
@@ -660,10 +661,10 @@ async fn self_check_excludes_a_paused_column_from_the_comparison() {
 /// page would never compare it honestly either. Only the genuine
 /// `MissingRow { 2 }` may be reported, and `next_after` must land on `3`.
 ///
-/// `staging::self_check`'s own
-/// `diff_page_does_not_invent_a_divergence_from_the_two_sides_ending_at_different_keys`
-/// unit-tests the alignment itself. This end of it covers the real keyset
-/// SQL, and that the next page picks up exactly where this one stopped.
+/// The alignment is done in SQL (`staging::self_check::page_sql`), so this
+/// covers it, and that the next page picks up exactly where this one
+/// stopped. The tests under "Paging under the key's collation" below cover
+/// it under a key collation that isn't byte order.
 #[tokio::test]
 async fn a_bounded_page_does_not_invent_a_divergence_from_the_two_sides_ending_at_different_keys() {
     let cluster = TestCluster::start();
@@ -1311,6 +1312,258 @@ async fn a_seam_fed_source_and_a_paused_definition_are_not_audited() {
         (trellis::defs::model::TransformStatus::Paused, vec![]),
         "once it's paused"
     );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Paging under the key's collation (issue #782)
+// ---------------------------------------------------------------------------
+
+/// Twelve source rows keyed `k01`, `K02`, `k03`, … (lower case for an odd
+/// number, upper case for an even one). The test database's default
+/// collation is ICU `en-US` (`testkit::cluster`), which orders them by their
+/// digits; `"C"` (byte order) puts every `K…` before every `k…`.
+fn mixed_case_words() -> Vec<(String, String)> {
+    (1..=12)
+        .map(|i| {
+            let key = format!("{}{i:02}", if i % 2 == 0 { 'K' } else { 'k' });
+            let image = format!(r#"{{"id":"{key}","v":"{i}"}}"#);
+            (key, image)
+        })
+        .collect()
+}
+
+/// A converged `word_values` 1-1 target over [`mixed_case_words`], its
+/// source key and its target key both under the database's default
+/// collation.
+async fn words_fixture(db: &TestDatabase) -> (Trellis, Client) {
+    let words = mixed_case_words();
+    let rows: Vec<(&str, &str)> = words
+        .iter()
+        .map(|(key, image)| (key.as_str(), image.as_str()))
+        .collect();
+    converged_fixture(
+        db,
+        "create table words (id text primary key, v integer)",
+        "words",
+        "TRANSFORM word_values FROM words SELECT v AS v",
+        &rows,
+    )
+    .await
+}
+
+/// Re-collates the source key of [`words_fixture`] to `"C"`. The target key
+/// keeps the default collation it was created with, so the two sides' keys
+/// now order differently.
+async fn recollate_words(raw: &Client) {
+    raw.batch_execute(r#"alter table words alter column id type text collate "C""#)
+        .await
+        .expect("re-collate the source key");
+}
+
+/// Every page of an audit of `target`, `limit` keys at a time, from the
+/// start of the keyspace to its end: every divergence any page reported, and
+/// the sum of the pages' `rows_compared`.
+async fn audit_every_page(trellis: &Trellis, target: &str, limit: i64) -> (Vec<Divergence>, i64) {
+    let mut divergences = Vec::new();
+    let mut compared = 0;
+    let mut after = None;
+    for _ in 0..100 {
+        let report = trellis
+            .self_check(
+                target,
+                SelfCheckScope { after, limit },
+                SelfCheckMode::Standard,
+                GENEROUS_TIMEOUT,
+            )
+            .await
+            .expect("self_check");
+        compared += report.rows_compared;
+        match report.outcome {
+            SelfCheckOutcome::Converged => {}
+            SelfCheckOutcome::Diverged(found) => divergences.extend(found),
+            other => panic!("expected a comparison, got {other:?}"),
+        }
+        if report.next_after.is_none() {
+            return (divergences, compared);
+        }
+        after = report.next_after;
+    }
+    panic!("the audit of {target} did not reach the end of its keyspace in 100 pages");
+}
+
+/// A source key re-collated after define orders differently from its 1-1
+/// target's key. An audit paged three keys at a time must still compare
+/// every key exactly once and find nothing, rather than read each side's
+/// page in its own order and report the keys the two pages don't share.
+#[tokio::test]
+async fn a_re_collated_source_key_pages_without_false_divergences() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    recollate_words(&raw).await;
+
+    let (divergences, compared) = audit_every_page(&trellis, "word_values", 3).await;
+    assert_eq!(divergences, vec![], "nothing diverged");
+    assert_eq!(compared, 12, "every key compared once");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A target row missing at a page boundary, under a key collation that
+/// isn't byte order (`en-US`: `k01 < K02 < k03 < K04`), is reported, and
+/// nothing else is. `k03` ends the source side's first three-key page, and
+/// the target side's page runs on to `K04` in its place. The page has to end
+/// at `k03` by the key's own ordering for `k03` to be reported and `K04` not
+/// to be.
+#[tokio::test]
+async fn a_missing_row_at_a_page_boundary_is_reported_under_the_key_s_collation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    raw.execute("delete from word_values where id = 'k03'", &[])
+        .await
+        .expect("delete a target row");
+
+    let (divergences, compared) = audit_every_page(&trellis, "word_values", 3).await;
+    assert_eq!(
+        divergences,
+        vec![Divergence::MissingRow {
+            key: "k03".to_string()
+        }]
+    );
+    assert_eq!(compared, 12, "every key compared once");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// After the source key is re-collated to `"C"` (`K02 < K04 < K06 < K08 <
+/// … < k01`), a target row missing at a page boundary of that order (`K06`)
+/// and a target row with no source row are each reported, and nothing else
+/// is: comparing the two sides under one ordering hides no real divergence.
+#[tokio::test]
+async fn real_divergences_across_page_boundaries_are_reported_after_a_re_collation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    recollate_words(&raw).await;
+    raw.batch_execute(
+        "delete from word_values where id = 'K06'; \
+         insert into word_values (id, v) values ('k07x', 7)",
+    )
+    .await
+    .expect("seed a missing and an extra target row");
+
+    let (mut divergences, compared) = audit_every_page(&trellis, "word_values", 3).await;
+    divergences.sort_by_key(|d| format!("{d:?}"));
+    assert_eq!(
+        divergences,
+        vec![
+            Divergence::ExtraRow {
+                key: "k07x".to_string()
+            },
+            Divergence::MissingRow {
+                key: "K06".to_string()
+            },
+        ]
+    );
+    assert_eq!(compared, 13, "every key of either side compared once");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The target has an extra row, `K00`, ahead of every source key, so only
+/// the persisted side's three-key page ends early, at `K02` (`en-US`: `K00 <
+/// k01 < K02 < k03`). The page ends there, and the recompute side's `k03` is
+/// left to the next page rather than reported missing.
+#[tokio::test]
+async fn a_page_ends_at_the_lower_of_the_two_sides_last_keys_in_the_key_s_order() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    raw.execute("insert into word_values (id, v) values ('K00', 0)", &[])
+        .await
+        .expect("insert an extra target row");
+
+    let report = trellis
+        .self_check(
+            "word_values",
+            SelfCheckScope {
+                after: None,
+                limit: 3,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+    match report.outcome {
+        SelfCheckOutcome::Diverged(divergences) => assert_eq!(
+            divergences,
+            vec![Divergence::ExtraRow {
+                key: "K00".to_string()
+            }]
+        ),
+        other => panic!("expected Diverged with the extra row, got {other:?}"),
+    }
+    assert_eq!(report.next_after, Some("K02".to_string()));
+    assert_eq!(report.rows_compared, 3, "K00, k01 and K02");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The lines of `explain`'s text that read a table by a sequential scan.
+fn seq_scans(explained: &str) -> Vec<&str> {
+    explained
+        .lines()
+        .filter(|line| line.contains("Seq Scan"))
+        .collect()
+}
+
+/// While the source and target keys share a collation, as a 1-1 target's
+/// key is created with its source's, both sides of a page are read by their
+/// primary-key index: naming the key's own collation costs no index.
+#[tokio::test]
+async fn a_page_reads_both_sides_by_their_key_index() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = words_fixture(&db).await;
+
+    let explained =
+        trellis::staging::self_check::explain_page(&db.pool, "word_values", Some("k03"), 3)
+            .await
+            .expect("explain the page");
+    assert_eq!(seq_scans(&explained), Vec::<&str>::new(), "{explained}");
+    assert!(explained.contains("words_pkey"), "{explained}");
+    assert!(explained.contains("word_values_pkey"), "{explained}");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// After the source key is re-collated, the page is compared under the
+/// source key's new collation: the source is still read by its index, and
+/// the target, whose index orders by its own collation, by a scan. This is
+/// the documented cost of auditing a target whose key no longer orders like
+/// its source's (`staging::self_check::page_collation`).
+#[tokio::test]
+async fn a_page_after_a_re_collation_reads_the_source_by_its_key_index() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    recollate_words(&raw).await;
+
+    let explained =
+        trellis::staging::self_check::explain_page(&db.pool, "word_values", Some("K04"), 3)
+            .await
+            .expect("explain the page");
+    assert!(explained.contains("words_pkey"), "{explained}");
+    assert_eq!(
+        seq_scans(&explained).len(),
+        1,
+        "only the target is scanned: {explained}"
+    );
+    assert!(!explained.contains("word_values_pkey"), "{explained}");
 
     trellis.shutdown().await.expect("shutdown");
 }

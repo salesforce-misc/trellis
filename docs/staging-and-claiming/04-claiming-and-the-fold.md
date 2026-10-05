@@ -406,7 +406,7 @@ auditor a quiescent read. It is **not** how the shipped auditor works.
 The self-check auditor is `Trellis::self_check`
 ([ADR-0013](../decisions/0013-self-check-production-recompute-audit.md)), and it gets
 its quiescence a different way: it awaits convergence through a watermark, reads the
-target and its recompute inside one `REPEATABLE READ` transaction, and reports a
+target and its recompute in one statement, under one snapshot, and reports a
 divergence only if it *survives a fresh await*. Its strict mode assumes writes to the
 audited tables are stopped by the caller, not that Trellis pauses its own claim path.
 No caught-up-read guarantee depends on suspending claiming fleet-wide, so the pause

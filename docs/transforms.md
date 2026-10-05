@@ -135,7 +135,12 @@ the key into ranges and reads them in order, and it keeps comparing keys under
 the collation it planned them with until it finishes (#769). For the rest of
 that build, its range reads can't use the key's rebuilt index, so each one scans
 the source table. On a large source that makes the rest of the build much
-slower. A 1-1 target keeps the key collation it was created with.
+slower. A 1-1 target keeps the key collation it was created with. `self_check`
+pages the source and the target under the source key's collation, so it still
+compares them correctly, but it reads each page of such a target with a scan of
+the target table instead of its key index (#782). A sweep that straddles
+the change can skip or repeat keys, because its `next_after` cursor continues
+in the new order, so start a new sweep after it.
 
 One consequence is worth stating plainly: **an aggregate target does not qualify
 as a source table.** Its grouping columns may be `NULL`, so its identity is a
