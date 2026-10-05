@@ -611,7 +611,9 @@ async fn await_then_compare(
     let token = {
         let client = pool.get().await?;
         let token = converge::watermark_token(&**client).await?;
-        if !caught_up(converge::await_converged(&client, token, timeout).await)? {
+        // #799: on the audited definition's own held keys only. A key a
+        // sibling holds is applied here as usual.
+        if !caught_up(converge::await_converged_for(&client, token, timeout, def.id).await)? {
             return Ok(AwaitOutcome::NotCaughtUp { attempted: token });
         }
         token

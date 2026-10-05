@@ -1142,6 +1142,9 @@ async fn fail_range_chunk(
             backfill::narrow_one_to_one_chunk(
                 &*txn,
                 &source_table,
+                target_table
+                    .split_once('.')
+                    .map_or(target_table.as_str(), |(_, target)| target),
                 lo,
                 hi,
                 key_collations.as_deref(),
@@ -1177,9 +1180,15 @@ async fn fail_range_chunk(
             ChunkFailure::Split { mid }
         }
         Some(backfill::ChunkNarrowing::Key(key)) => {
-            crate::staging::quarantine::evict_build_key(&txn, &source_table, &key, error)
-                .await
-                .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
+            crate::staging::quarantine::evict_build_key(
+                &txn,
+                chunk.definition_id,
+                &source_table,
+                &key,
+                error,
+            )
+            .await
+            .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
             record_failure(&txn, chunk.id, attempts, charged, error, Duration::ZERO).await?;
             ChunkFailure::Quarantined {
                 key,
@@ -1216,17 +1225,10 @@ async fn fail_range_chunk(
 
     let outcome = match outcome {
         ChunkFailure::Quarantined { key, .. } => {
-            let (_, target) = target_table
-                .split_once('.')
-                .expect("target_table is always schema-qualified (issue #73)");
-            let fuse_tripped = crate::staging::quarantine::trip_build_fuse(
-                pool,
-                chunk.definition_id,
-                target,
-                &source_table,
-            )
-            .await
-            .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
+            let fuse_tripped =
+                crate::staging::quarantine::trip_build_fuse(pool, chunk.definition_id)
+                    .await
+                    .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
             ChunkFailure::Quarantined { key, fuse_tripped }
         }
         outcome => outcome,
@@ -2992,6 +2994,7 @@ mod tests {
             backfill::narrow_one_to_one_chunk(
                 &raw,
                 "public.words",
+                "words_copy",
                 lo.as_deref(),
                 hi,
                 Some(&planned.key_collations),

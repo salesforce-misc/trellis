@@ -807,8 +807,10 @@ impl Trellis {
     }
 
     /// Poison-quarantine entries recorded since `watermark`, oldest first —
-    /// the keys the apply path gave up on. A running client surfaces these so
-    /// a whole-table failure (every row poisoned) doesn't sit silently.
+    /// the keys the apply path gave up on, each for the definition whose
+    /// apply failed (#799: every other definition reading the key keeps
+    /// applying it). A running client surfaces these so a whole-table
+    /// failure (every row poisoned) doesn't sit silently.
     pub async fn poisoned_since(
         &self,
         watermark: SystemTime,
@@ -816,18 +818,21 @@ impl Trellis {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "select src_table, key, last_error, poisoned_at \
-                 from poison where poisoned_at > $1 order by poisoned_at",
+                "select split_part(d.target_table, '.', 2), p.src_table, p.key, p.last_error, \
+                        p.poisoned_at \
+                 from poison p join transform_definitions d on d.id = p.transform_id \
+                 where p.poisoned_at > $1 order by p.poisoned_at, d.id",
                 &[&watermark],
             )
             .await?;
         Ok(rows
             .into_iter()
             .map(|row| PoisonEntry {
-                src_table: row.get(0),
-                key: row.get(1),
-                last_error: row.get(2),
-                poisoned_at: row.get(3),
+                transform: row.get(0),
+                src_table: row.get(1),
+                key: row.get(2),
+                last_error: row.get(3),
+                poisoned_at: row.get(4),
             })
             .collect())
     }
@@ -977,9 +982,9 @@ impl Trellis {
     /// `staging::quarantine`'s module doc comment for why that's a
     /// dedicated table rather than reusing `poison`: a column-level failure
     /// never evicts the row, so it can't live in the same table whose row
-    /// presence means "excluded from folding entirely"). For a whole
+    /// presence means "left out of the definition's apply"). For a whole
     /// `transform` target, pulls from `poison` filtered to that transform's
-    /// own source table — the coarser, whole-key fuse's own detail.
+    /// own rows — the coarser, whole-key fuse's own detail.
     pub async fn sample_quarantined(
         &self,
         target: &str,
@@ -1014,57 +1019,26 @@ impl Trellis {
             },
             QuarantineTarget::Transform(t) => {
                 // Issue #73: `t` is bare — same `split_part` match as
-                // `status`/`quarantine_status`.
-                let source_row = client
+                // `status`/`quarantine_status`. Whole-key poison is per
+                // transform (#799), so the sample is this definition's own
+                // rows, whatever spelling of its source they carry.
+                let id: i64 = client
                     .query_opt(
-                        "select source_table from transform_definitions \
+                        "select id from transform_definitions \
                          where split_part(target_table, '.', 2) = $1",
                         &[t],
                     )
                     .await?
-                    .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
-                // Issue #72: `transform_definitions.source_table` is fully
-                // qualified, and as of issue #267 so is every `src_table`
-                // `staging::apply` emits — a definition chained off another's
-                // target table used to stage its downstream trigger (and so
-                // its poisoned rows) under `ddl::neighbor_table_name`'s
-                // deliberately bare name, which this query's `bare` arm
-                // existed to catch. Both arms are kept regardless: `poison`
-                // rows are durable, so rows recorded before that fix still
-                // carry the bare spelling, and this crate's own integration
-                // fixtures stage bare names by hand. Matching against both
-                // forms keeps this query correct either way rather than
-                // picking one and silently going empty for the other.
-                //
-                // Issue #283 has since made the qualified spelling `poison`'s
-                // canonical *key*, not just what new rows happen to carry:
-                // `staging::quarantine` resolves `src_table` once and both
-                // writes and reads it canonically, and
-                // `V33__quarantine_canonical_src_table.sql` folded the
-                // pre-existing bare rows into their qualified counterpart. The
-                // bare arm below is therefore no longer load-bearing for
-                // ordinary installations and is kept only for the spellings
-                // that fold deliberately declines (a bare suffix ambiguous
-                // across two schemas, or a source nothing in the catalog can
-                // resolve) plus fixtures that hand-stage bare rows after the
-                // migration ran. Unlike the counting/charging sites that issue
-                // fixed, this is a read-only operator sample with no budget
-                // behind it, so matching a set of spellings here cannot re-split
-                // anything — see `quarantine::canonical_and_raw`'s doc comment
-                // for that same distinction on the delete paths.
-                let qualified: String = source_row.get(0);
-                let bare = qualified
-                    .split_once('.')
-                    .map(|(_, table)| table.to_string())
-                    .unwrap_or_else(|| qualified.clone());
+                    .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?
+                    .get(0);
                 match &after {
                     Some((after_src, after_key)) => {
                         client
                             .query(
                                 "select src_table, key, last_error from poison \
-                                 where src_table in ($1, $2) and (src_table, key) > ($3, $4) \
-                                 order by src_table, key limit $5",
-                                &[&qualified, &bare, after_src, after_key, &limit],
+                                 where transform_id = $1 and (src_table, key) > ($2, $3) \
+                                 order by src_table, key limit $4",
+                                &[&id, after_src, after_key, &limit],
                             )
                             .await?
                     }
@@ -1072,9 +1046,9 @@ impl Trellis {
                         client
                             .query(
                                 "select src_table, key, last_error from poison \
-                                 where src_table in ($1, $2) \
-                                 order by src_table, key limit $3",
-                                &[&qualified, &bare, &limit],
+                                 where transform_id = $1 \
+                                 order by src_table, key limit $2",
+                                &[&id, &limit],
                             )
                             .await?
                     }
@@ -1811,6 +1785,8 @@ impl Applied {
 /// One poison-quarantine entry, as [`Trellis::poisoned_since`] reports it.
 #[derive(Debug, Clone)]
 pub struct PoisonEntry {
+    /// The bare target of the definition the key is held for (#799).
+    pub transform: String,
     pub src_table: String,
     pub key: String,
     pub last_error: String,

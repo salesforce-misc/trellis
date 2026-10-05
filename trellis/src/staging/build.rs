@@ -53,8 +53,8 @@
 //! A chunk re-derives every source key in a `(lo, hi]` range of the source's
 //! primary key, in the caller's one transaction:
 //!
-//! 1. read the keys in the range, leaving out the quarantined ones
-//!    (`poison`), as the drain does;
+//! 1. read the keys in the range, leaving out the ones quarantined for the
+//!    definition (`poison`, per transform since #799), as the drain does;
 //! 2. lock their ledger entries as a page does
 //!    ([`super::ledger::lock_entries`]: placeholders for keys with no entry,
 //!    then a sorted `for update`), under the short [`CHUNK_LOCK_TIMEOUT`] so
@@ -315,19 +315,24 @@ pub async fn run_chunk(
     let (range_where, lo, hi) = chunk_range(ledger, lo, hi)?;
     let mut params = crate::defs::backfill::range_params(&lo, &hi);
 
-    // 1. The keys in the range, but for the quarantined ones (#625 F-A5):
-    // the drain leaves a `poison` key out of every page, and so does the
-    // build, until `release_key` re-derives it.
+    // 1. The keys in the range, but for the ones quarantined for this
+    // definition (#625 F-A5, per transform since #799): the drain leaves
+    // such a key out of the definition's apply, and so does the build, until
+    // `release_key` re-derives it.
     let started = Instant::now();
     let source_param = format!("${}", params.len() + 1);
+    let target_param = format!("${}", params.len() + 2);
     let mut key_params = params.clone();
     key_params.push(&source_table);
+    key_params.push(&ledger.target);
     let keys: Vec<String> = txn
         .query(
             &format!(
                 "select {k} from {} s where {range_where} \
                  and not exists (select 1 from poison p \
-                                 where p.src_table = {source_param} and p.key = {k})",
+                                 join transform_definitions d on d.id = p.transform_id \
+                                 where p.src_table = {source_param} and p.key = {k} \
+                                   and d.target_table = {target_param})",
                 ddl::qualified_source_table(source_table),
                 k = ddl::pk_key_sql_expr(pk, Some("s")),
             ),
@@ -470,8 +475,8 @@ pub struct SweepOutcome {
 /// them from the first with `None`), and picks the live ones the build
 /// hasn't re-derived: those whose `basis` is null (written by Apply alone)
 /// or is a snapshot taken before the build's start, `start_xid` (the
-/// snapshot's `xmax` is at or before it). A quarantined key (`poison`) is
-/// left as it is, as a chunk leaves it (#625 F-A5). Then it locks them as a chunk does
+/// snapshot's `xmax` is at or before it). A key quarantined for the
+/// definition (`poison`) is left as it is, as a chunk leaves it (#625 F-A5). Then it locks them as a chunk does
 /// ([`lock_chunk_entries`]) and re-derives them in one statement
 /// ([`ledger::sweep_statement`]), which reads the source by each key: a key
 /// with no row any more (deleted while the definition was frozen) becomes a
@@ -514,11 +519,14 @@ pub async fn sweep_batch(
                         (select k from w order by k desc limit 1), \
                         array(select k from w where stale \
                                 and not exists (select 1 from poison p \
-                                                where p.src_table = $4 and p.key = w.k) \
+                                                join transform_definitions d \
+                                                  on d.id = p.transform_id \
+                                                where p.src_table = $4 and p.key = w.k \
+                                                  and d.target_table = $5) \
                               order by k)",
                 ledger_ident = ledger.ledger_ident(),
             ),
-            &[&start_xid, &scan, &cursor, &source_table],
+            &[&start_xid, &scan, &cursor, &source_table, &ledger.target],
         )
         .await?;
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
@@ -1949,8 +1957,15 @@ impl FieldPlan {
         let (lo, hi) = (lo.map(decode).transpose()?, decode(hi)?);
         let keys = {
             let client = pool.get().await?;
-            crate::defs::backfill::range_keys(&**client, &definition.source_table, &pk, &lo, &hi)
-                .await?
+            crate::defs::backfill::range_keys(
+                &**client,
+                &definition.source_table,
+                &definition.def.target,
+                &pk,
+                &lo,
+                &hi,
+            )
+            .await?
         };
         if keys.is_empty() {
             return Ok(ChunkPlan::Field(FieldPlan::Empty));

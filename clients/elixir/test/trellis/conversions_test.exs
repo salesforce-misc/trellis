@@ -259,6 +259,7 @@ defmodule Trellis.ConversionsTest do
   test "a poison time becomes a DateTime" do
     assert %PoisonEntry{poisoned_at: @time, key: "42"} =
              PoisonEntry.from_native(%{
+               transform: "orders_view",
                src_table: "public.orders",
                key: "42",
                last_error: "boom",

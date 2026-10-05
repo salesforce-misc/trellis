@@ -44,23 +44,26 @@ end
 defmodule Trellis.PoisonEntry do
   @moduledoc """
   One source row the apply path gave up on, as `Trellis.poisoned_since/2`
-  lists it: its fully-qualified `src_table`, its `key` as Trellis renders it,
-  the error that poisoned it, and when.
+  lists it: the `transform` it's held for (every other transform reading the
+  row keeps applying it), its fully-qualified `src_table`, its `key` as
+  Trellis renders it, the error that poisoned it, and when.
   """
 
   @type t :: %__MODULE__{
+          transform: String.t(),
           src_table: String.t(),
           key: String.t(),
           last_error: String.t(),
           poisoned_at: DateTime.t()
         }
 
-  @enforce_keys [:src_table, :key, :last_error, :poisoned_at]
+  @enforce_keys [:transform, :src_table, :key, :last_error, :poisoned_at]
   defstruct @enforce_keys
 
   @doc false
   def from_native(%{poisoned_at_micros: micros} = entry) do
     %__MODULE__{
+      transform: entry.transform,
       src_table: entry.src_table,
       key: entry.key,
       last_error: entry.last_error,

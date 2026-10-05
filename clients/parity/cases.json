@@ -86,6 +86,7 @@
       "last_error": {"nullable": "string"}
     },
     "PoisonEntry": {
+      "transform": "string",
       "src_table": "string",
       "key": "string",
       "last_error": "string",
@@ -330,7 +331,7 @@
     {"about": "A write the target's own constraint refuses poisons its key. Last, because a poisoned key holds await_converged back (#588).", "op": "sql", "args": ["alter table parity_gizmo_prices add constraint parity_cheap check (price < 100)"]},
     {"op": "now", "save": "before_poison"},
     {"op": "sql", "args": ["insert into parity_gizmos (id, price) values (1, 5), (2, 500)"]},
-    {"op": "poisoned_since", "args": [{"$ref": "before_poison"}], "until": {"list": [{"record": "PoisonEntry", "fields": {"src_table": {"eq": "public.parity_gizmos"}, "key": {"eq": "2"}}}]}, "waiting_for": "parity_gizmos key 2 to be poisoned", "save": "poisoned"},
+    {"op": "poisoned_since", "args": [{"$ref": "before_poison"}], "until": {"list": [{"record": "PoisonEntry", "fields": {"transform": {"eq": "parity_gizmo_prices"}, "src_table": {"eq": "public.parity_gizmos"}, "key": {"eq": "2"}}}]}, "waiting_for": "parity_gizmos key 2 to be poisoned", "save": "poisoned"},
     {"about": "The watermark is exclusive and its time round-trips to the microsecond, so nothing is newer than the entry itself.", "op": "poisoned_since", "args": [{"$ref": "poisoned.0.poisoned_at"}], "expect": {"list": []}},
     {"about": "A whole transform's sample is its poisoned keys.", "op": "sample_quarantined", "args": ["parity_gizmo_prices"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": [{"record": "PoisonSample", "fields": {"src_table": {"eq": "public.parity_gizmos"}, "key": {"eq": "2"}}}]}, "next_cursor": "string"}}},
     {"op": "shutdown", "expect": null}

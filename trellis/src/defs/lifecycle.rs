@@ -31,13 +31,15 @@
 //!    cascade` takes `backfill_chunks` with it,
 //!    `V20__backfill_chunks.sql`), the edges leading *into* its schema node,
 //!    and its per-column quarantine bookkeeping (`column_status`,
-//!    `column_deaths`, `column_failures`, `column_pause_cascades`). Everything
-//!    keyed to the *source* table and co-owned with sibling definitions —
-//!    ring segments, claims, `poison`/`poison_held`/`key_deaths`, the
-//!    `transform_fuse_gate` row — is untouched, because a sibling reading the
-//!    same source is still using it and a drain worker may be mid-batch over
-//!    it right now. A chunk a worker holds at drop time is released on its own
-//!    heartbeat/TTL, never force-cleared.
+//!    `column_deaths`, `column_failures`, `column_pause_cascades`). Its
+//!    whole-key quarantine (`poison`, `poison_held`, `key_deaths` and its
+//!    `transform_fuse_gate` row) is per transform since #799 and goes with
+//!    the definition row by `on delete cascade` too. Everything keyed to the
+//!    *source* table and co-owned with sibling definitions — ring segments,
+//!    claims, and the siblings' own quarantine — is untouched, because a
+//!    sibling reading the same source is still using it and a drain worker
+//!    may be mid-batch over it right now. A chunk a worker holds at drop time
+//!    is released on its own heartbeat/TTL, never force-cleared.
 //!
 //! 3. **It does not cascade.** A definition chaining off the target being
 //!    dropped refuses the drop and is named in the error
@@ -325,10 +327,10 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // are not FK'd, and therefore why this has to be an explicit delete
     // rather than a cascade).
     //
-    // What is *not* here is the point: `poison`, `poison_held`, `key_deaths`
-    // and `transform_fuse_gate` are keyed to the **source** table and shared
-    // with every sibling definition reading it, so a drop leaves the whole-key
-    // poison band exactly as it found it.
+    // The whole-key quarantine (`poison`, `poison_held`, `key_deaths`,
+    // `transform_fuse_gate`) is keyed by the definition's id since #799, and
+    // goes with its row below by `on delete cascade`. A sibling on the same
+    // source keeps its own.
     for table in ["column_status", "column_deaths", "column_failures"] {
         txn.execute(
             &format!("delete from {table} where transform_table = $1"),

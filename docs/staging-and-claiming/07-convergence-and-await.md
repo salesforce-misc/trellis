@@ -41,7 +41,9 @@ against one committed snapshot. True iff all three hold (numbered 2–4, as in
 3. **no non-active slot holds a still-pending row with `origin_lsn <= token`**,
    under one shared definition of "pending";
 4. **no parked quarantine row has `origin_lsn <= token`** — the poison band
-   ([06](06-cleanup-and-reclaim.md)).
+   ([06](06-cleanup-and-reclaim.md)). Held rows are per transform; a
+   wait scoped to one transform (`await_converged_for`, the self-check
+   auditor's) counts only that transform's.
 
 `origin_lsn` is the **oldest un-reflected trigger position** carried by a pending
 change. It LEAST-merges in the fold ([04](04-claiming-and-the-fold.md)) — a re-stage
@@ -145,7 +147,7 @@ whose contract *is* cluster-wide.
 
 **The one exclusion is parked quarantine work, reported rather than swallowed.**
 Parked work is un-applied work no worker will ever claim — only an operator release
-re-admits it — so a gate that waited on it would hang with no peer to finish it,
+or the transform's resume clears it — so a gate that waited on it would hang with no peer to finish it,
 turning a quarantine into a wedge. It is dropped as a whole **arm**, never by
 narrowing the shared row predicate, and the outstanding count is carried back so the
 result is explicitly partial. Note the asymmetry: the *drain-to-convergence helper*

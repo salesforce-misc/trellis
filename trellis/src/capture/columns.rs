@@ -178,6 +178,22 @@ pub fn readers_of(
     ids
 }
 
+/// The definitions that read through `rel`, in any status: every one on its
+/// from-side whose fields name it. In id order.
+pub fn relationship_readers<'c>(
+    catalog: &'c CaptureCatalog,
+    rel: &RelationshipDefinition,
+) -> Vec<&'c CaptureReader> {
+    let from = rel.qualified_from_table();
+    let mut readers: Vec<&CaptureReader> = catalog
+        .definitions
+        .iter()
+        .filter(|reader| reader.source == from && reads_through(&reader.def, rel))
+        .collect();
+    readers.sort_unstable_by_key(|reader| reader.id);
+    readers
+}
+
 /// The columns of its own source `def` reads directly: every source column
 /// its fields reference ([`crate::defs::oracle::referenced_source_columns`])
 /// and its plain `GROUP BY` columns.

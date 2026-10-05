@@ -46,7 +46,8 @@ These are the tools the entries refer to:
   deletes target rows the source no longer backs
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). It doesn't replay
   buffered changes, so it repairs anything that's wrong because a change was
-  missed.
+  missed. It also releases every key the definition holds in quarantine, and
+  only that definition's.
 * **`request_backfill(source_table)`** (Rust, Ruby and Elixir) queues a re-read
   of one source table for every definition that reads it, without pausing them.
   It's the cheapest repair when you know which table missed changes.
@@ -164,7 +165,7 @@ quarantine (see [Repair caveats](#repair-caveats)).
 scale, and a change between deterministic collations. `int` → `bigint` is
 safe for the values but not for Trellis's copies; see entry 4.
 
-**Planned work:** #760, which now also covers #767 and is blocked by #799.
+**Planned work:** #760, which also covers #767.
 A fix is built and passing, held unmerged until the false-positive study in
 the issue is signed off. The fix pauses the definition's readers with a
 `capture_failure` naming the column, in two cases:
@@ -173,7 +174,7 @@ the issue is signed off. The fix pauses the definition's readers with a
 * the change re-renders stored keys, compared against the type recorded at
   define.
 
-It ships with #767 as one PR, and #759 follows #799.
+It ships with #767 as one PR, and #759 follows it.
 
 **Audit caveat:** after a source key is re-collated, `self_check` pages the
 source and the target under the source key's collation, so it compares them
@@ -203,9 +204,10 @@ its type:
 
 **Effect:** loud, but not self-healing. Trellis's copies keep the old type,
 so the first value that doesn't fit fails every write to that row with
-`22003` (out of range) or `22001` (too long). The key is poisoned and stays
-held (see [Repair caveats](#repair-caveats)). Rows written before that are
-fine.
+`22003` (out of range) or `22001` (too long). The key is poisoned for each
+definition whose copy is too narrow, and stays held there, while the other
+definitions reading it keep applying it (see
+[Repair caveats](#repair-caveats)). Rows written before that are fine.
 
 A one-sided widening of a join pair (`line_items.product_id` to `bigint`
 while `products.id` stays `integer`) also breaks the same-type rule that
@@ -219,8 +221,10 @@ pause the owning definitions. Resume will then widen the copies
 (`ALTER … TYPE`, under `ACCESS EXCLUSIVE`) and rebuild.
 
 **Repair:** `DROP TRANSFORM` and define it again. `PAUSE`/`RESUME` doesn't help
-today, because the rebuild writes into the same narrow tables. Keys that are
-already quarantined may stay held (see [Repair caveats](#repair-caveats)).
+today, because the rebuild writes into the same narrow tables, and a key that
+still doesn't fit is quarantined again. The drop deletes the definition's
+quarantined keys with it, so the new definition starts with none (see
+[Repair caveats](#repair-caveats)).
 
 ## 5. Capture switched off and back on between two reconcile passes
 
@@ -566,14 +570,19 @@ while the column is paused.
   it can fail row by row or write values of the wrong type. When the schema
   changed under a definition, `DROP TRANSFORM` and define it again. #708 is
   decided (resume will run define's validation first) and not yet built.
-* **Quarantined keys stay held (#759).** A key that's quarantined after
-  repeated apply failures keeps its parked work and its poison row. Entries
-  3 and 4 can cause such failures.
-  `RESUME TRANSFORM` doesn't clear them today, so that key's target row stays
-  stale. There's no supported release in production: `release_key` is
-  test-only. Quarantine is keyed by source table, so dropping and redefining
-  the transform isn't known to clear it either. Resume is decided to clear
-  every poisoned key and rebuild, in the #760/#767 PR.
+* **Quarantined keys stay held until a resume or a drop (#759).** A key
+  that's quarantined after repeated apply failures is held for the definition
+  whose apply failed, with its parked work and its poison row, and that
+  definition's target row for it stays stale. Every other definition reading
+  the same source keeps applying the key, so two definitions can disagree on
+  it. Entries 3 and 4 can cause such failures. There's no supported per-key
+  release in production: `release_key` is test-only until #759. What clears a
+  held key:
+  * `RESUME TRANSFORM` deletes every key the resumed definition holds, and
+    only its own, and its rebuild re-derives them from the source. A key
+    whose cause is still there fails again and is quarantined again.
+  * `DROP TRANSFORM` deletes the definition's held keys with it, so defining
+    it again starts with none.
 * **Resuming a field that's awaiting capture (#687).** A `RESUME` of a field
   whose status shows `capture_wait` unpauses it before its capture is widened,
   so its rows fail with `MissingColumn`. Let the wait finish first.

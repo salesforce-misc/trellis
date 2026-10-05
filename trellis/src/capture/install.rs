@@ -96,8 +96,10 @@
 //!    applies every ring row drained after its discharge dispatches it, and a
 //!    row staged before the widen lacks the new column: the reader fails it
 //!    with `EvalError::MissingColumn` and the key is quarantined. The rows
-//!    can be in the ring, in `poison_held` waiting for release, or re-staged
-//!    by a drain (a deferred relationship reverse keeps its images).
+//!    can be in the ring or re-staged by a drain (a deferred relationship
+//!    reverse keeps its images). A row held in `poison_held` never reaches
+//!    a reader with its images: its release re-stages an image-less
+//!    `Recompute` that re-derives the key from its live row.
 //!
 //! **The capture gate closes the second gap.** Holding the table lock, the
 //! install or widen reads `pg_current_wal_insert_lsn()` and records it on
@@ -160,10 +162,9 @@
 //!
 //! What the gate costs: a new definition waits for the table's pending
 //! changes to drain before its build starts, normally one seal and drain.
-//! A key of the table held in `poison_held` from before the widen holds the
-//! gate until it is released or discarded, which is an operator's call; the
-//! alternative is that the release poisons the key again for every reader,
-//! because the new one can't evaluate it.
+//! A key held in `poison_held` doesn't hold the gate (#799): it is held for
+//! the definitions that hold it, never for the new one, and its release
+//! re-derives it from the live row rather than replaying its images.
 //!
 //! Every install and widen sets the gate, not only a widen: an install can
 //! follow an uninstall whose last rows haven't drained, and those were imaged

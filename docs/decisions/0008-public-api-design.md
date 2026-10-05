@@ -114,8 +114,8 @@ every healthy column in the same `TRANSFORM` into quarantine.
 **Decision:** see [ADR-0003](0003-quarantine-storage-and-api.md) for the full
 storage and fuse design. What it settles (`V21__column_quarantine.sql`):
 
-* Whole-key fuse exception detail stays one record per poisoned **source row**
-  (`poison`, unchanged). Column-grain detail lives in a separate
+* Whole-key fuse exception detail is one record per **source row** poisoned
+  for a transform (`poison`). Column-grain detail lives in a separate
   `column_failures` table, one row per `(transform, column, src_table, key)`.
 * A new `column_status` table tracks which columns are `paused`, separate from
   and finer than the transform's overall lifecycle status. A `live` transform

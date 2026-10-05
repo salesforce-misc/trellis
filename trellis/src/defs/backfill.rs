@@ -621,6 +621,7 @@ async fn backfill_one_to_one(
 pub(crate) async fn range_keys(
     client: &impl GenericClient,
     source_table: &str,
+    target: &str,
     pk: &[PrimaryKeyColumn],
     lo: &Option<Vec<String>>,
     hi: &[String],
@@ -635,6 +636,7 @@ pub(crate) async fn range_keys(
         not_quarantined(pk, params.len() + 1),
     );
     params.push(&source_table);
+    params.push(&target);
     Ok(client
         .query(
             &format!(
@@ -786,6 +788,7 @@ async fn write_one_to_one_range(
         not_quarantined(pk, params.len() + 1),
     );
     params.push(&source_table);
+    params.push(&def.target);
     let insert_sql = format!(
         "insert into {target} ({insert_cols}) \
          select {select_exprs} from {source} as {SOURCE_ALIAS} where {where_clause} \
@@ -905,12 +908,19 @@ pub(crate) async fn execute_one_to_one_chunk(
 const SOURCE_ALIAS: &str = "__trellis_src";
 
 /// SQL predicate over a source row aliased [`SOURCE_ALIAS`]: its key isn't
-/// quarantined (`poison`) for the source table bound as `$param`, the
-/// canonical (qualified) identity quarantine keys on.
+/// quarantined (`poison`) for the source table bound as `$param` (the
+/// canonical, qualified identity quarantine keys on) and the definition whose
+/// bare target is bound as `$param + 1`. Whole-key poison is per transform
+/// (#799), so a key held for a sibling definition on the same source is
+/// written as usual.
 fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
     format!(
-        "not exists (select 1 from poison p where p.src_table = ${param} and p.key = {})",
-        ddl::pk_key_sql_expr(pk, Some(SOURCE_ALIAS))
+        "not exists (select 1 from poison p \
+                     join transform_definitions d on d.id = p.transform_id \
+                     where p.src_table = ${param} and p.key = {} \
+                       and split_part(d.target_table, '.', 2) = ${})",
+        ddl::pk_key_sql_expr(pk, Some(SOURCE_ALIAS)),
+        param + 1,
     )
 }
 
@@ -957,6 +967,7 @@ pub(crate) enum ChunkNarrowing {
 pub(crate) async fn narrow_one_to_one_chunk(
     client: &impl GenericClient,
     source_table: &str,
+    target: &str,
     lo: Option<&str>,
     hi: &str,
     key_collations: Option<&[Option<String>]>,
@@ -982,6 +993,7 @@ pub(crate) async fn narrow_one_to_one_chunk(
         not_quarantined(&pk, params.len() + 1),
     );
     params.push(&source_table);
+    params.push(&target);
 
     let keys: i64 = client
         .query_one(

@@ -1855,7 +1855,9 @@ async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
     let mut f = Fixture::new(50, &[ONE]).await;
     f.raw
         .batch_execute(
-            "insert into poison (src_table, key, last_error) values ('public.src', '17', 'test')",
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, 'public.src', '17', 'test' from transform_definitions \
+             where source_table = 'public.src'",
         )
         .await
         .expect("quarantine key 17");

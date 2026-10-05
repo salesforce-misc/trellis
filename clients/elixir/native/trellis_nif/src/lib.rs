@@ -338,6 +338,7 @@ struct QuarantineEntryTerm {
 /// One poisoned key, as `poisoned_since/2` lists it.
 #[derive(NifMap)]
 struct PoisonEntryTerm {
+    transform: String,
     src_table: String,
     key: String,
     last_error: String,
@@ -604,6 +605,7 @@ fn poisoned_since(
         .map(|entry| {
             let entry = PlainPoisonEntry::from(entry);
             PoisonEntryTerm {
+                transform: entry.transform,
                 src_table: entry.src_table,
                 key: entry.key,
                 last_error: entry.last_error,

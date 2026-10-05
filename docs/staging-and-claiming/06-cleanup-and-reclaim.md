@@ -93,44 +93,79 @@ an innocent batch-mate is neither charged nor evicted. If no single key reproduc
 surfaced, not blamed. Bisection finds a failing key in about `2·log2(n)` probes
 rather than `n`, and a per-call probe cap bounds the rest.
 
+Blame also names the **transform**: a key that fails alone is probed again
+with the transforms reading its table directly left out but one, to find the
+one(s) whose apply it fails in. One that still fails with every direct reader left
+out fails in the work done for the transforms reading the table through a
+relationship, and is charged to each of them. A failure in the source itself (an
+image that won't decode) fails for every reader, and is charged once per
+transform that hits it.
+
 **2. Count deaths per key, off the immutable rows.** Batch rows are immutable and
-carry no counter, so the counter lives in its own table keyed by `(table, key)`. A
-**clean** drain clears the counters for the keys it applied, so a transient death
-does not accumulate toward a false eviction.
+carry no counter, so the counter lives in its own table keyed by `(transform,
+table, key)`. A **clean** drain clears the counters for the keys it applied, for
+every transform that applied them, so a transient death does not accumulate
+toward a false eviction.
 
 **3. Evict past a threshold, and hold the work.** At `deaths >= N` (default 5; `0`
-disables), the key's folded record is copied to a marker table, its contribution
-parked, and the batch **re-folded without it** and retried. Survivors drain, the
-batch reaches `drained`, the ring keeps moving.
+disables), the key is marked poisoned **for that transform**, its contribution
+parked for it, and the batch recomputed **without it in that transform's apply**
+and retried. Every other transform reading the key keeps applying it. Survivors
+drain, the batch reaches `drained`, the ring keeps moving. A transform whose
+poisoned keys reach the same threshold is quarantined; the count is its own, never
+a sibling's.
 
 **4. The parked work — not the marker — is the source of truth.** The marker is
-*per key*, but the fold excludes poisoned keys **globally**, so a healthy *later*
-change to a poisoned key in a different batch would vanish when that batch
-retired. Therefore **every batch that excludes a poisoned key parks its own folded
-contribution before it marks drained, in the same transaction**, keyed
-`(table, key, batch)`.
+*per transform and key*, and the transform's apply leaves the poisoned key out of
+**every** later batch, so a later change to it in a different batch would vanish
+for that transform when that batch retired. Therefore **every batch that leaves a
+poisoned key out of a transform parks its own folded contribution for that
+transform before it marks drained, in the same transaction**, keyed
+`(transform, table, key, batch)`.
 
 ```sql
 -- inside the Phase-3 transaction, before the drained mark
-INSERT INTO poison_held (src_table, key, seg_seq, op, lsn, old_image, new_image, origin_lsn, ...)
-SELECT ... -- this batch's fold, restricted to already-poisoned keys
-ON CONFLICT (src_table, key, seg_seq) DO NOTHING;
+INSERT INTO poison_held (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, origin_lsn, ...)
+SELECT ... -- this batch's fold, restricted to keys poisoned for the transform
+ON CONFLICT (transform_id, src_table, key, seg_seq) DO NOTHING;
 ```
+
+A batch parks for a transform only while the transform still holds the key: a
+release or resume that deleted the key's rows after the batch was computed has
+the key re-derived from its live row, and a row parked after it would be held
+for a key nothing holds, blocking every later read.
+
+The fold itself runs once per key per batch. A relationship's reverse work
+for a to-side key skips it only once every transform reading through the
+relationship that isn't frozen holds the key, or none is left that isn't frozen
+(a define or resume of its first reader refreshes its projection). A change
+every reader holds is dropped from the batch before its images are decoded.
 
 It is deliberately **not** bucket-scoped: it parks the whole batch's contribution,
 complete and idempotent on the extended key, so a co-worker on another bucket
 parking the same rows is a no-op, not a conflict.
 
 **Release is operator-driven, one transaction:** stage one `Recompute` of the key
-into the active batch, then delete the held rows, the marker, and the death
-counter (`release_key`, #623 D3). The held rows are not replayed: a replayed row
-would carry the releaser's `row_txid`, not its source commit's, so a replay could
-regress a ledger entry a later Re-derive already moved past. The `Recompute`
-is a Re-derive of the key from its current row on every target that reads it
-([05](05-apply-and-exactly-once-deltas.md#the-ledger)). It keeps the held rows'
-earliest origin position, so the key's band stays blocked until the release
-actually drains — the key is never in neither place, which would make the
-read-your-writes predicate lie ([07](07-convergence-and-await.md)).
+into the active batch, then delete the transform's held rows, its marker, and its
+death counter for the key (`release_key`, #623 D3). The
+held rows are not replayed: a replayed row would carry the releaser's `row_txid`,
+not its source commit's, so a replay could regress a ledger entry a later
+Re-derive already moved past. The `Recompute` is a Re-derive of the key from its
+current row on every target that reads it
+([05](05-apply-and-exactly-once-deltas.md#the-ledger)): idempotent for a transform
+that applied the key all along, and parked again for one that still holds it. It
+keeps the held rows' earliest origin position, so the key's band stays blocked
+until the release actually drains — the key is never in neither place, which
+would make the read-your-writes predicate lie ([07](07-convergence-and-await.md)).
+A resume of the transform releases every key it holds: it deletes its held rows,
+marker and death counters, and its rebuild re-derives the keys from the source.
+
+**A held key blocks its own transform's band, not a sibling's.** The
+cluster-wide await counts every transform's held rows, since it waits on
+everything. A wait scoped to one transform (the self-check auditor's) counts only
+that transform's, because a sibling applies the key as usual. A new transform's
+capture gate (`table_changes_pending_through`) counts none: a held row is never
+replayed with its images, and the new transform holds no key.
 
 **What must never be quarantined.** The halting errors are deterministic yet
 caused by the *declared schema*, not the data — a source key the drain can't use

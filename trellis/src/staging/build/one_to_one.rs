@@ -15,8 +15,9 @@
 //! against a page is the key's entry on the 1-1 slim ledger (#623 D6,
 //! `super::super::one_to_one_ledger`), as it orders a page against a page:
 //!
-//! 1. read the keys in the range, leaving out the quarantined ones
-//!    (`poison`) and any with a `NULL` part, as the old 1-1 range build did;
+//! 1. read the keys in the range, leaving out the ones quarantined for the
+//!    definition (`poison`, #799) and any with a `NULL` part, as the old 1-1
+//!    range build did;
 //! 2. lock their entries in key order (`one_to_one_ledger::lock_entries`:
 //!    an entry for each key with none, then the others `for update`), under
 //!    the build's short [`super::CHUNK_LOCK_TIMEOUT`];
@@ -235,8 +236,10 @@ async fn run_range(
     // old range build's write and `fail_chunk`'s narrowing count them.
     let started = Instant::now();
     let source_param = format!("${}", params.len() + 1);
+    let target_param = format!("${}", params.len() + 2);
     let mut key_params = params.clone();
     key_params.push(&plan.source_table);
+    key_params.push(&plan.target);
     let k_expr = ddl::pk_key_sql_expr(&plan.pk, Some("s"));
     let not_null: Vec<String> = pk_idents
         .iter()
@@ -247,7 +250,9 @@ async fn run_range(
             &format!(
                 "select {k_expr} from {} s where {range_where} and {} \
                  and not exists (select 1 from poison p \
-                                 where p.src_table = {source_param} and p.key = {k_expr})",
+                                 join transform_definitions d on d.id = p.transform_id \
+                                 where p.src_table = {source_param} and p.key = {k_expr} \
+                                   and d.target_table = {target_param})",
                 ddl::qualified_source_table(&plan.source_table),
                 not_null.join(" and "),
             ),
@@ -428,11 +433,14 @@ pub async fn sweep_batch(
                         (select k from w order by k desc limit 1), \
                         array(select k from w where stale \
                                 and not exists (select 1 from poison p \
-                                                where p.src_table = $4 and p.key = w.k) \
+                                                join transform_definitions d \
+                                                  on d.id = p.transform_id \
+                                                where p.src_table = $4 and p.key = w.k \
+                                                  and d.target_table = $5) \
                               order by k)",
                 ledger = one_to_one_ledger::ledger_ident(&plan.target),
             ),
-            &[&start_xid, &scan, &cursor, &plan.source_table],
+            &[&start_xid, &scan, &cursor, &plan.source_table, &plan.target],
         )
         .await?;
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());

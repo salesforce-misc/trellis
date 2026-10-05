@@ -92,6 +92,14 @@ during the pause stay stale until the drain re-derives them, and rows the source
 appear the same way. The deletes go through the target-mutation seam like any other
 target write, so a live definition reading this target drops them too.
 
+Resume also releases every key the definition holds in quarantine: it deletes the
+definition's own `poison`, `poison_held` and `key_deaths` rows in the same transaction.
+The re-derivation covers every key from the source, so the parked work is superseded
+rather than replayed, and a key whose cause is still there fails again and is quarantined
+again. Whole-key poison is per transform, so every other definition's held keys are
+untouched
+([ADR-0003](0003-quarantine-storage-and-api.md#releasing-held-keys)).
+
 A long pause is not free: the cost of resuming scales with the data, not with the length
 of the pause. This is the contract, stated so a caller does not expect a cheap resume.
 
@@ -125,9 +133,9 @@ therefore means *dropping* the dependents first, not merely pausing them.
 
 Only per-definition backfill work is keyed to the definition and removed with it; a chunk
 a drain worker holds is released on its own heartbeat. Everything else that in-flight work
-touches — ring segments, claims, the poison band — is keyed to the *source* table and
-co-owned by every definition reading it. A drop never deletes that shared state out from
-under a running worker. The pause is what makes this safe: once paused, the fold no longer
+touches — ring segments and claims — is keyed to the *source* table and co-owned by every
+definition reading it, and each sibling definition's quarantine is its own. A drop never
+deletes that state out from under a running worker. The pause is what makes this safe: once paused, the fold no longer
 dispatches to the target, so a batch still draining for the source skips it while its
 siblings continue, and the drop then removes only what the target itself owns.
 
@@ -135,8 +143,9 @@ siblings continue, and the drop then removes only what the target itself owns.
 
 Target-keyed quarantine bookkeeping — the per-column status a target accumulates — is
 dropped with the target; its forensic value goes with the data. The whole-key poison band
-is keyed to the source table and shared with sibling definitions, so a drop leaves it
-untouched.
+is per definition too (`poison`, `poison_held` and `key_deaths` carry the definition's id),
+and goes with the definition row by `on delete cascade`, so a definition defined again
+starts with no held keys. A sibling definition on the same source keeps its own.
 
 ### Capture shrinks by reconciliation
 
@@ -176,6 +185,6 @@ decide the operation and composes it behind the facade, returning plain data.
 - A long pause costs a full re-enumeration of the source to resume, because the change
   stream is drained for siblings while paused.
 - Removal is safe under load: it quiesces through the pause and touches only
-  definition-owned rows, never shared source-keyed staging or poison state.
+  definition-owned rows, never shared source-keyed staging state or a sibling's poison.
 - A framework migration's rollback is honest: pause-then-drop, idempotent in both
   directions, even though it does not share the host's migration transaction.

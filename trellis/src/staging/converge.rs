@@ -122,14 +122,19 @@ pub async fn converged_through(
     client: &impl GenericClient,
     token: PgLsn,
 ) -> Result<bool, StagingError> {
-    let row = client.query_one(&converged_sql("$1"), &[&token]).await?;
+    let row = client
+        .query_one(&converged_sql("$1", None), &[&token])
+        .await?;
     Ok(row.get(0))
 }
 
 /// [`converged_through`]'s query, one boolean column, with the token spelled
 /// as the SQL expression `token`: `$1` for the typed query above, or an
 /// inlined `pg_lsn` literal for [`await_converged`]'s simple-protocol poll.
-fn converged_sql(token: &str) -> String {
+///
+/// `held_by` scopes condition 4 to one definition's held keys (#799,
+/// [`await_converged_for`]); `None` counts every definition's.
+fn converged_sql(token: &str, held_by: Option<i64>) -> String {
     // `origin_lsn` is nullable — a row of unknown origin (a backfill
     // `Recompute`, say) reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
     // "unknown" to "conservatively old" — a NULL must gate exactly like the
@@ -164,9 +169,13 @@ fn converged_sql(token: &str) -> String {
         )
     });
 
+    let held_by = match held_by {
+        Some(transform_id) => format!("transform_id = {transform_id} and "),
+        None => String::new(),
+    };
     let condition4 = format!(
         "select 1 from poison_held \
-         where origin_lsn is null or origin_lsn <= {token}"
+         where {held_by}(origin_lsn is null or origin_lsn <= {token})"
     );
 
     // Invariant this leans on: a physical `seg_N` only holds rows while it has
@@ -279,7 +288,7 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 
 /// Whether some change to `table` that carries an image and whose origin is
 /// at or below `gate` hasn't drained yet: it sits in a ring slot a batch
-/// still has to claim, or is held in `poison_held`. The capture gate a
+/// still has to claim. The capture gate a
 /// trigger install or widen sets on its marker (`capture::install`, issue
 /// #622) holds the marker's discharge while this is true, so no row staged
 /// by the replaced capture function reaches a definition that starts
@@ -298,6 +307,13 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// to-side is `table` counts as a change to `table` too (issue #622 C5: a
 /// widen of a to-side must not let a deferred reverse carrying the old
 /// images through). Such rows never reach `poison_held`.
+///
+/// A row held in `poison_held` doesn't count (#799). Its release stages an
+/// image-less `Recompute` (`quarantine::release_key`), so its images never
+/// reach a reader, and it is held for the definitions whose key it is, never
+/// for one the discharge dispatches: a new definition holds no key, and a
+/// resume deletes the resumed definition's held keys. A gate that waited on
+/// one would hold a definition on another definition's quarantine.
 ///
 /// Scans each slot for `table`'s rows: no index serves `src_table`. It runs
 /// once per discharge pass, and only for a gated marker.
@@ -324,12 +340,7 @@ pub async fn table_changes_pending_through(
                )"
         )
     });
-    let sql = format!(
-        "select exists ({arms} union all \
-             select 1 from poison_held p \
-             where p.src_table = $1 and p.{IMAGED} \
-               and (p.origin_lsn is null or p.origin_lsn <= $2))"
-    );
+    let sql = format!("select exists ({arms})");
     let row = client.query_one(&sql, &[&table, &gate]).await?;
     Ok(row.get(0))
 }
@@ -376,10 +387,41 @@ pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, Stagi
 ///
 /// Takes a plain [`Client`], not a transaction: each poll is its own
 /// implicit transaction, and the timeout it sets must not outlive it.
+///
+/// Cluster-wide: a key any definition holds in quarantine keeps blocking a
+/// token at or above its band (condition 4). [`await_converged_for`] waits
+/// on one definition's held keys only (#799).
 pub async fn await_converged(
     client: &Client,
     token: PgLsn,
     timeout: Duration,
+) -> Result<(), StagingError> {
+    poll_converged(client, token, timeout, None).await
+}
+
+/// [`await_converged`], with condition 4 counting only the keys the
+/// definition `transform_id` holds in quarantine (#799). Whole-key poison is
+/// per transform, so a key another definition holds is applied by this one
+/// as usual and gives it nothing to wait for. Its own held keys still
+/// block, as they block every cluster-wide wait. The ring's pending rows
+/// (conditions 2 and 3) count in full, as for [`await_converged`]. The
+/// self-check auditor waits with it on the definition it audits.
+pub async fn await_converged_for(
+    client: &Client,
+    token: PgLsn,
+    timeout: Duration,
+    transform_id: i64,
+) -> Result<(), StagingError> {
+    poll_converged(client, token, timeout, Some(transform_id)).await
+}
+
+/// [`await_converged`]'s poll loop, with condition 4 scoped by `held_by`
+/// ([`converged_sql`]).
+async fn poll_converged(
+    client: &Client,
+    token: PgLsn,
+    timeout: Duration,
+    held_by: Option<i64>,
 ) -> Result<(), StagingError> {
     const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
     const MAX_BACKOFF: Duration = Duration::from_millis(250);
@@ -392,7 +434,7 @@ pub async fn await_converged(
     };
     // `PgLsn`'s `Display` is Postgres's own `X/Y` hex form: nothing to escape.
     let token_literal = format!("'{token}'::pg_lsn");
-    let converged = converged_sql(&token_literal);
+    let converged = converged_sql(&token_literal, held_by);
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let rows = poll_within_deadline(client, &wait, &converged).await?;

@@ -1167,7 +1167,10 @@ async fn a_superseded_delete_writes_back_a_key_a_lost_reinsert_restored() {
 }
 
 /// Parks customer `id`'s change as a poisoned key's batch would: the change
-/// is in `poison_held`, not the ring, and the key is marked poisoned.
+/// is in `poison_held`, not the ring, and the key is marked poisoned for
+/// `order_names`, the definition reading customers through the relationship
+/// (#799: whole-key poison is per transform). It is the relationship's only
+/// reader, so its reverse work leaves the key out.
 async fn park_customer_change(
     client: &Client,
     id: i32,
@@ -1178,8 +1181,9 @@ async fn park_customer_change(
     let key = id.to_string();
     client
         .execute(
-            "insert into poison (src_table, key, last_error) \
-             values ('public.customers', $1, 'test')",
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, 'public.customers', $1, 'test' from transform_definitions \
+             where target_table like '%.order_names'",
             &[&key],
         )
         .await
@@ -1187,9 +1191,10 @@ async fn park_customer_change(
     client
         .execute(
             "insert into poison_held \
-                 (src_table, key, seg_seq, op, lsn, old_image, new_image, hop_gen) \
-             values ('public.customers', $1, 1, $2, pg_current_wal_insert_lsn(), \
-                     $3::text::jsonb, $4::text::jsonb, 0)",
+                 (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, hop_gen) \
+             select id, 'public.customers', $1, 1, $2, pg_current_wal_insert_lsn(), \
+                    $3::text::jsonb, $4::text::jsonb, 0 \
+             from transform_definitions where target_table like '%.order_names'",
             &[&key, &op, &old_image, &new_image],
         )
         .await
@@ -1220,7 +1225,7 @@ async fn releasing_a_parked_to_side_rename_advances_the_projection() {
         Some(r#"{"id":"1","name":"ann2"}"#),
     )
     .await;
-    trellis::staging::release_key(&db.pool, "public.customers", "1")
+    trellis::staging::release_key(&db.pool, "order_names", "public.customers", "1")
         .await
         .expect("release the parked customer");
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -1254,7 +1259,7 @@ async fn releasing_a_parked_to_side_delete_removes_the_projection_row() {
         None,
     )
     .await;
-    trellis::staging::release_key(&db.pool, "public.customers", "1")
+    trellis::staging::release_key(&db.pool, "order_names", "public.customers", "1")
         .await
         .expect("release the parked customer");
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -1301,7 +1306,7 @@ async fn releasing_a_parked_rename_whose_segment_is_still_draining_advances_the_
         Some(r#"{"id":"1","name":"ann2"}"#),
     )
     .await;
-    trellis::staging::release_key(&db.pool, "public.customers", "1")
+    trellis::staging::release_key(&db.pool, "order_names", "public.customers", "1")
         .await
         .expect("release the parked customer");
     // The other bucket finishes; the parked rename is never applied.

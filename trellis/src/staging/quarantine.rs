@@ -15,10 +15,13 @@
 //! here rather than getting its own variant.
 //!
 //! **Isolation and eviction** ([`isolate_and_evict`]) is what turns "a
-//! non-transient failure happened" into "this specific key is the cause" —
-//! never the other way around. **Parking** ([`park_batch_contribution`]) is
-//! what keeps a poisoned key's *later* healthy changes from vanishing while
-//! it's excluded; it is called from [`super::apply::compute`]/
+//! non-transient failure happened" into "this specific key is the cause, in
+//! this definition's apply" — never the other way around. Whole-key poison
+//! is per transform (#799): an evicted key is left out of the apply of the
+//! definition it fails in, and every other definition reading it keeps
+//! applying it. **Parking** ([`park_batch_contribution`]) is what keeps a
+//! poisoned key's *later* changes held for that definition while it's
+//! excluded; it is called from [`super::apply::compute`]/
 //! [`super::apply::apply_and_mark_drained`], not from this module's own
 //! callers, because it must run inside the same Phase-3 transaction as the
 //! rest of the batch's apply. **Release** ([`release_key`]) is the
@@ -33,7 +36,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
-#[cfg(any(test, feature = "internals"))]
 use std::time::SystemTime;
 
 #[cfg(any(test, feature = "internals"))]
@@ -82,8 +84,8 @@ pub const DEFAULT_COLUMN_DEATH_THRESHOLD: i32 = DEFAULT_DEATH_THRESHOLD;
 /// tier"): another sibling of [`DEFAULT_DEATH_THRESHOLD`] and
 /// [`DEFAULT_COLUMN_DEATH_THRESHOLD`], same value, named separately for the
 /// same independent-tunability reason those two document. This one counts
-/// *distinct evicted keys for one `src_table`* — see
-/// [`trip_transform_fuse_if_crossed`] — rather than repeated attempts
+/// *distinct keys poisoned for one definition* (#799) — see
+/// `quarantine_if_crossed` — rather than repeated attempts
 /// against one key or distinct poisoned rows for one `(transform, column)`
 /// pair.
 pub const DEFAULT_TRANSFORM_DEATH_THRESHOLD: i32 = DEFAULT_DEATH_THRESHOLD;
@@ -291,53 +293,61 @@ pub(super) async fn source_table_missing(
 // The poison marker
 // ---------------------------------------------------------------------
 
-/// Which of `candidates` (a folded batch's non-truncate `(src_table, key)`
-/// pairs) are already evicted, per the `poison` marker table — the query
-/// [`super::apply::compute`] runs before evaluating anything, so a poisoned
-/// key never reaches `f()` at all: the fold excludes it **globally**, not
-/// just from this one failing batch.
+/// Which definitions each of `candidates` (a folded batch's non-truncate
+/// `(src_table, key)` pairs) is poisoned for, per the `poison` marker table:
+/// the read [`super::apply::compute`] runs before evaluating anything. Whole-key
+/// poison is per transform (#799): a poisoned key is left out of the apply of
+/// each definition it's poisoned for, and every other reader applies it as
+/// usual. A pair poisoned for no definition is absent from the map.
 ///
 /// **`candidates` must already carry the canonical `src_table` identity**
 /// (issue #283) — `poison` is keyed on it, so a raw bare spelling matches
 /// nothing here and the key it names is re-evaluated (and re-poisoned) despite
 /// already being evicted. [`super::apply::compute`], the only caller, resolves
 /// each distinct source table through [`CanonicalSrcTables`] before building
-/// this list, and compares the returned set against the same canonical pairs.
+/// this list, and looks the returned map up with the same canonical pairs.
 pub(super) async fn poisoned_keys_among(
     pool: &Pool,
     candidates: &[(&str, &str)],
-) -> Result<HashSet<(String, String)>, ApplyError> {
+) -> Result<HashMap<(String, String), HashSet<i64>>, ApplyError> {
+    let mut poisoned: HashMap<(String, String), HashSet<i64>> = HashMap::new();
     if candidates.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(poisoned);
     }
     let client = pool.get().await?;
     let src_tables: Vec<&str> = candidates.iter().map(|(t, _)| *t).collect();
     let keys: Vec<&str> = candidates.iter().map(|(_, k)| *k).collect();
     let rows = client
         .query(
-            "select p.src_table, p.key from poison p \
+            "select distinct p.src_table, p.key, p.transform_id from poison p \
              join unnest($1::text[], $2::text[]) as u(src_table, key) \
                on p.src_table = u.src_table and p.key = u.key",
             &[&src_tables, &keys],
         )
         .await?;
-    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    for row in rows {
+        poisoned
+            .entry((row.get(0), row.get(1)))
+            .or_default()
+            .insert(row.get(2));
+    }
+    Ok(poisoned)
 }
 
-/// Parks `changes` — a batch's own folded contribution for keys already in
-/// the `poison` marker — into `poison_held`, keyed `(src_table, key,
-/// seg_seq)` and idempotent on that triple. Must run **inside the same
-/// Phase-3 transaction** as the rest of the batch's apply, before the
-/// drained mark — see the module doc comment's "Parked work... is the
-/// source of truth" and doc 06's matching section: this is what stops a
-/// healthy later change to a poisoned key from vanishing when the batch
-/// that excluded it retires.
+/// Parks `changes` — a batch's own folded contribution for keys already
+/// poisoned for a definition, each paired with that definition's id — into
+/// `poison_held`, keyed `(transform_id, src_table, key, seg_seq)` and
+/// idempotent on that key. Must run **inside the same Phase-3 transaction**
+/// as the rest of the batch's apply, before the drained mark — see the
+/// module doc comment's "Parked work... is the source of truth" and doc 06's
+/// matching section: this is what keeps a held key's band blocked for as
+/// long as the definition holds it.
 pub(super) async fn park_batch_contribution(
     txn: &Transaction<'_>,
     seg_seq: i64,
-    changes: &[FoldedChange],
+    changes: &[(i64, FoldedChange)],
 ) -> Result<(), ApplyError> {
-    for change in changes {
+    for (transform_id, change) in changes {
         let op = folded_change_op(change);
         // Issue #315: a recompute's prior-image hint rides in `old_image`,
         // exactly as it does in the ring, so `release_key` replays it.
@@ -348,12 +358,13 @@ pub(super) async fn park_batch_contribution(
         };
         txn.execute(
             "insert into poison_held \
-                 (src_table, key, seg_seq, op, lsn, old_image, new_image, \
+                 (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, \
                   origin_lsn, src_changed, hop_gen, group_key) \
-             values ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, \
-                      $8, $9, $10, $11) \
-             on conflict (src_table, key, seg_seq) do nothing",
+             values ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb, \
+                      $9, $10, $11, $12) \
+             on conflict (transform_id, src_table, key, seg_seq) do nothing",
             &[
+                transform_id,
                 &change.src_table,
                 &change.key,
                 &seg_seq,
@@ -392,6 +403,10 @@ fn folded_change_op(change: &FoldedChange) -> &'static str {
 /// drain clears the counters for the keys it just applied, so a transient
 /// death does not accumulate toward a false eviction."
 ///
+/// Per transform (#799), a definition the key is poisoned for skipped it, so
+/// its counter is kept: only the definitions the key isn't poisoned for
+/// applied it.
+///
 /// **`keys` must already carry the canonical `src_table` identity** (issue
 /// #283), for the same reason [`poisoned_keys_among`]'s candidates must:
 /// [`record_key_death`] writes under it, so clearing by a raw bare spelling
@@ -408,9 +423,12 @@ pub(super) async fn clear_key_deaths(
     let src_tables: Vec<&str> = keys.iter().map(|(t, _)| t.as_str()).collect();
     let ks: Vec<&str> = keys.iter().map(|(_, k)| k.as_str()).collect();
     txn.execute(
-        "delete from key_deaths \
+        "delete from key_deaths d \
          using unnest($1::text[], $2::text[]) as u(src_table, key) \
-         where key_deaths.src_table = u.src_table and key_deaths.key = u.key",
+         where d.src_table = u.src_table and d.key = u.key \
+           and not exists (select 1 from poison p \
+                           where p.transform_id = d.transform_id \
+                             and p.src_table = d.src_table and p.key = d.key)",
         &[&src_tables, &ks],
     )
     .await?;
@@ -421,9 +439,10 @@ pub(super) async fn clear_key_deaths(
 // Isolate before blaming
 // ---------------------------------------------------------------------
 
-/// Increments `key_deaths` for `(src_table, key)` and returns the new
-/// count — an upsert, since the counter's row may not exist yet for a key's
-/// first attributed failure.
+/// Increments `key_deaths` for `transform_id`'s `(src_table, key)` and
+/// returns the new count — an upsert, since the counter's row may not exist
+/// yet for a key's first attributed failure. Per transform (#799): each
+/// definition a key fails for counts its own deaths toward its own eviction.
 ///
 /// `src_table` is the canonical identity, not the ring spelling (issue #283):
 /// two spellings of one logical source used to maintain two independent
@@ -431,32 +450,35 @@ pub(super) async fn clear_key_deaths(
 /// to twice as many real failures to fire.
 async fn record_key_death(
     client: &impl GenericClient,
+    transform_id: i64,
     src_table: &str,
     key: &str,
     last_error: &str,
 ) -> Result<i32, ApplyError> {
     let row = client
         .query_one(
-            "insert into key_deaths (src_table, key, deaths, last_error, last_death_at) \
-             values ($1, $2, 1, $3, now()) \
-             on conflict (src_table, key) do update set \
+            "insert into key_deaths \
+                 (transform_id, src_table, key, deaths, last_error, last_death_at) \
+             values ($1, $2, $3, 1, $4, now()) \
+             on conflict (transform_id, src_table, key) do update set \
                  deaths = key_deaths.deaths + 1, \
                  last_error = excluded.last_error, \
                  last_death_at = now() \
              returning deaths",
-            &[&src_table, &key, &last_error],
+            &[&transform_id, &src_table, &key, &last_error],
         )
         .await?;
     Ok(row.get(0))
 }
 
 /// One key [`isolate_and_evict`]'s probe loop reproduced an
-/// [`FailureClass::Isolate`] failure for, carrying **both** spellings of its
-/// source table (issue #283) because the two halves of that function need
-/// different ones: quarantine's own counter/marker tables are keyed on
-/// `canonical_src_table`, while matching the key back to the ring row it came
-/// from (its parked contribution, and the `retry_folded` exclusion) has to use
-/// `raw_src_table`, the spelling `folded` actually holds.
+/// [`FailureClass::Isolate`] failure for, attributed to one definition
+/// (#799), carrying **both** spellings of its source table (issue #283)
+/// because the two halves of that function need different ones: quarantine's
+/// own counter/marker tables are keyed on `canonical_src_table`, while
+/// matching the key back to the ring row it came from (its parked
+/// contribution) has to use `raw_src_table`, the spelling `folded` actually
+/// holds.
 #[derive(Clone)]
 struct PoisonedProbe {
     /// The ring row's own `src_table`, verbatim.
@@ -464,13 +486,29 @@ struct PoisonedProbe {
     /// [`qualified_src_table`] of the above — quarantine's canonical key.
     canonical_src_table: String,
     key: String,
+    /// The definition whose apply the failure is attributed to.
+    culprit: Culprit,
+}
+
+/// A definition [`attribute`] found a pinned key's failure in: the one its
+/// key is charged and, past the threshold, poisoned for (#799).
+#[derive(Clone)]
+struct Culprit {
+    transform_id: i64,
+    /// Its bare target, for logs.
+    target: String,
+    /// Its `fuse_rearmed_at` when attribution read it, before probing it. A
+    /// resume stamps a new one and deletes the definition's poison, so an
+    /// eviction that finds it changed would poison the rebuilt definition
+    /// for a failure of the one before it, and is skipped ([`evict_for`]).
+    epoch: Option<SystemTime>,
     last_error: String,
 }
 
-/// Marks `(src_table, key)` poisoned (idempotent — a re-eviction after
-/// release refreshes the marker rather than erroring) and parks this
-/// batch's own folded contribution for it, in one transaction — the
-/// eviction act itself. `contribution` is the one [`FoldedChange`] this
+/// Marks `transform_id`'s `(src_table, key)` poisoned (idempotent — a
+/// re-eviction after release refreshes the marker rather than erroring) and
+/// parks this batch's own folded contribution for it, in one transaction —
+/// the eviction act itself. `contribution` is the one [`FoldedChange`] this
 /// batch folded for the key (if any); a key can in principle cross the
 /// threshold in a batch that folded no record for it at all only via a
 /// race with a concurrent isolate elsewhere, which is not a live path here
@@ -479,23 +517,29 @@ struct PoisonedProbe {
 async fn evict_key(
     txn: &Transaction<'_>,
     seg_seq: i64,
-    src_table: &str,
-    key: &str,
-    last_error: &str,
+    probe: &PoisonedProbe,
     contribution: Option<&FoldedChange>,
 ) -> Result<(), ApplyError> {
+    let culprit = &probe.culprit;
     tracing::warn!(
-        src_table = %src_table,
-        key = %key,
-        last_error = %last_error,
-        "evicting a key to the poison table; it crossed the row-level death threshold"
+        transform = %culprit.target,
+        src_table = %probe.canonical_src_table,
+        key = %probe.key,
+        last_error = %culprit.last_error,
+        "evicting a key to the poison table for one definition; it crossed the row-level \
+         death threshold, and every other definition reading it keeps applying it"
     );
     txn.execute(
-        "insert into poison (src_table, key, last_error) \
-         values ($1, $2, $3) \
-         on conflict (src_table, key) do update set \
+        "insert into poison (transform_id, src_table, key, last_error) \
+         values ($1, $2, $3, $4) \
+         on conflict (transform_id, src_table, key) do update set \
              last_error = excluded.last_error, poisoned_at = now()",
-        &[&src_table, &key, &last_error],
+        &[
+            &culprit.transform_id,
+            &probe.canonical_src_table,
+            &probe.key,
+            &culprit.last_error,
+        ],
     )
     .await?;
     if let Some(change) = contribution {
@@ -507,8 +551,8 @@ async fn evict_key(
         // `converge` gates on forever. Replaying it later under the qualified
         // name is also what issue #267 made the ring invariant anyway.
         let mut parked = change.clone();
-        parked.src_table = src_table.to_string();
-        park_batch_contribution(txn, seg_seq, std::slice::from_ref(&parked)).await?;
+        parked.src_table = probe.canonical_src_table.clone();
+        park_batch_contribution(txn, seg_seq, &[(culprit.transform_id, parked)]).await?;
     }
     Ok(())
 }
@@ -521,6 +565,8 @@ async fn evict_key(
 /// "isolation reproduced nothing".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChargedKey {
+    /// The bare target of the definition the death was charged to (#799).
+    pub transform: String,
     /// Canonical identity (issue #283) — the one the `key_deaths` row is under.
     pub src_table: String,
     pub key: String,
@@ -535,8 +581,9 @@ pub enum IsolationOutcome {
     /// [`DEFAULT_DEATH_THRESHOLD`]'s doc comment), so nothing was probed or
     /// charged.
     FuseDisabled,
-    /// No single key reproduced an isolate-eligible failure on its own: the
-    /// failure is not attributable to a key, so nothing was charged.
+    /// No single key reproduced an isolate-eligible failure on its own that
+    /// could be attributed to a definition (#799): the failure is not
+    /// attributable to a key, so nothing was charged.
     NothingReproduced,
     /// Isolation ran [`MAX_ISOLATION_PROBES`] probes without pinning the
     /// failure on any key, and stopped with parts of the batch unprobed (issue
@@ -556,13 +603,14 @@ pub enum IsolationOutcome {
     /// but none reached the threshold, so nothing was evicted. Every entry in
     /// `charged` is below the threshold.
     ChargedBelowThreshold { charged: Vec<ChargedKey> },
-    /// At least one key crossed the threshold and was evicted: `retry_folded`
-    /// is `folded` with every now-evicted key removed, ready for
-    /// [`super::apply::drain_once`] to recompute and reapply. `charged` lists
-    /// any *other* keys that reproduced the failure in the same probe pass but
-    /// stayed below the threshold — they are still in `retry_folded`.
+    /// At least one key crossed the threshold and was poisoned for the
+    /// definition it fails in: [`super::apply::drain_once`] recomputes the
+    /// batch, which now leaves the key out of that definition's apply only
+    /// (#799), and reapplies it. `evicted` counts the `(definition, key)`
+    /// pairs poisoned. `charged` lists any *other* keys that reproduced the
+    /// failure in the same probe pass but stayed below the threshold.
     Evicted {
-        retry_folded: Vec<FoldedChange>,
+        evicted: usize,
         charged: Vec<ChargedKey>,
     },
 }
@@ -573,7 +621,7 @@ pub enum IsolationOutcome {
 const DESCRIBED_CHARGED_KEYS: usize = 5;
 
 /// Renders `charged` for a log field, e.g.
-/// `public.gizmos key=2 (1/5 deaths), public.gizmos key=7 (3/5 deaths)`,
+/// `gizmo_view: public.gizmos key=2 (1/5 deaths), gizmo_view: public.gizmos key=7 (3/5 deaths)`,
 /// capped at [`DESCRIBED_CHARGED_KEYS`] entries plus an "and N more" tail.
 pub(crate) fn describe_charged_keys(charged: &[ChargedKey], threshold: i32) -> String {
     let mut out = charged
@@ -581,8 +629,8 @@ pub(crate) fn describe_charged_keys(charged: &[ChargedKey], threshold: i32) -> S
         .take(DESCRIBED_CHARGED_KEYS)
         .map(|c| {
             format!(
-                "{} key={} ({}/{} deaths)",
-                c.src_table, c.key, c.deaths, threshold
+                "{}: {} key={} ({}/{} deaths)",
+                c.transform, c.src_table, c.key, c.deaths, threshold
             )
         })
         .collect::<Vec<_>>()
@@ -609,6 +657,7 @@ fn partition_by_threshold(
             evict_now.push(probe);
         } else {
             below.push(ChargedKey {
+                transform: probe.culprit.target,
                 src_table: probe.canonical_src_table,
                 key: probe.key,
                 deaths,
@@ -921,8 +970,9 @@ async fn probe_records(
     claimed_by: &str,
     wake_channel: &str,
     records: &[FoldedChange],
+    focus: Option<&apply::ProbeFocus<'_>>,
 ) -> Result<Option<ApplyError>, ApplyError> {
-    let plan = match apply::compute(pool, records).await {
+    let plan = match apply::compute_focused(pool, records, focus).await {
         Ok(plan) => plan,
         Err(err) => return Ok(Some(err)),
     };
@@ -1004,6 +1054,12 @@ async fn probe_records(
 ///
 /// `folded`'s truncates and deferred relationship reverses are never probed.
 ///
+/// **Charged to a definition, not to the key (#799).** A record that fails
+/// alone is probed again to find which definition's apply it fails in
+/// (`attribute`), and its death, its eviction and the whole-transform fuse
+/// are that definition's alone. A record that fails alone but in no one
+/// definition (only with two of them together) is charged to nobody.
+///
 /// Returns (see [`IsolationOutcome`]'s variants):
 /// - `Ok(FuseDisabled)` if `threshold == 0`, without probing anything.
 /// - `Ok(NothingReproduced)` if no single key reproduced an isolate-eligible
@@ -1017,8 +1073,8 @@ async fn probe_records(
 /// - `Ok(ChargedBelowThreshold { .. })` if keys reproduced and were charged
 ///   but none reached `threshold`; the caller surfaces the original failure,
 ///   exactly as for `NothingReproduced`, but can say which keys it pinned.
-/// - `Ok(Evicted { retry_folded, .. })` if at least one key crossed the death
-///   threshold and was evicted.
+/// - `Ok(Evicted { .. })` if at least one key crossed the death threshold and
+///   was poisoned for the definition it fails in.
 /// - `Err(_)` if a probe itself hit a [`FailureClass::Halting`] error: this
 ///   propagates immediately, unattributed to any key, per doc 06's "What
 ///   must never be quarantined" — discovered during isolation is no
@@ -1127,10 +1183,7 @@ fn log_isolation_finished(
         Ok(outcome) => {
             let pinned = match outcome {
                 IsolationOutcome::ChargedBelowThreshold { charged } => charged.len(),
-                IsolationOutcome::Evicted {
-                    retry_folded,
-                    charged,
-                } => records.saturating_sub(retry_folded.len()) + charged.len(),
+                IsolationOutcome::Evicted { evicted, charged } => evicted + charged.len(),
                 _ => 0,
             };
             let outcome = outcome.label();
@@ -1229,7 +1282,8 @@ async fn isolate_and_evict_probing(
     while let Some(run) = bisector.next_run() {
         stats.probes += 1;
         let records = &candidates[run.clone()];
-        let Some(err) = probe_records(pool, seg_seq, claimed_by, wake_channel, records).await?
+        let Some(err) =
+            probe_records(pool, seg_seq, claimed_by, wake_channel, records, None).await?
         else {
             bisector.record(run, ProbeVerdict::Clean);
             continue;
@@ -1289,15 +1343,42 @@ async fn isolate_and_evict_probing(
         None
     };
 
+    // #799: a record that fails alone is charged to the definition(s) it
+    // fails in, never to the key across every reader of its table.
     let mut poisoned: Vec<PoisonedProbe> = Vec::with_capacity(bisection.failing.len());
     for (index, err) in bisection.failing {
         let change = &candidates[index];
-        poisoned.push(PoisonedProbe {
-            raw_src_table: change.src_table.clone(),
-            canonical_src_table: canonical_srcs.get(pool, &change.src_table).await?,
-            key: change.key.clone(),
-            last_error: err.to_string(),
-        });
+        let canonical = canonical_srcs.get(pool, &change.src_table).await?;
+        let culprits = attribute(
+            pool,
+            AttributionProbe {
+                seg_seq,
+                claimed_by,
+                wake_channel,
+            },
+            change,
+            &canonical,
+            &err,
+            stats,
+        )
+        .await?;
+        if culprits.is_empty() {
+            tracing::warn!(
+                seg_seq,
+                src_table = %canonical,
+                key = %change.key,
+                error = %err,
+                "a key fails alone, but not in any one definition's apply; charging nothing"
+            );
+        }
+        for culprit in culprits {
+            poisoned.push(PoisonedProbe {
+                raw_src_table: change.src_table.clone(),
+                canonical_src_table: canonical.clone(),
+                key: change.key.clone(),
+                culprit,
+            });
+        }
     }
 
     if poisoned.is_empty() {
@@ -1318,9 +1399,10 @@ async fn isolate_and_evict_probing(
         for probe in poisoned {
             let deaths = record_key_death(
                 &**client,
+                probe.culprit.transform_id,
                 &probe.canonical_src_table,
                 &probe.key,
-                &probe.last_error,
+                &probe.culprit.last_error,
             )
             .await?;
             charged.push((probe, deaths));
@@ -1332,62 +1414,241 @@ async fn isolate_and_evict_probing(
         return Ok(IsolationOutcome::ChargedBelowThreshold { charged });
     }
 
+    // One definition at a time, in id order, so two concurrent evictions
+    // spanning the same definitions take their fuse gates (issue #159,
+    // `take_fuse_gate`) in one order. Each definition's gate is taken before
+    // its definition row and its `poison` rows, so no transaction holding one
+    // of those waits on a gate another transaction holding it waits on.
+    let mut by_transform: std::collections::BTreeMap<i64, Vec<&PoisonedProbe>> =
+        std::collections::BTreeMap::new();
+    for probe in &evict_now {
+        by_transform
+            .entry(probe.culprit.transform_id)
+            .or_default()
+            .push(probe);
+    }
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    for probe in &evict_now {
-        let contribution = folded
-            .iter()
-            .find(|c| !c.is_truncate && c.src_table == probe.raw_src_table && c.key == probe.key);
-        evict_key(
-            &txn,
-            seg_seq,
-            &probe.canonical_src_table,
-            &probe.key,
-            &probe.last_error,
-            contribution,
-        )
-        .await?;
-    }
-    // Sorted (and deduped) — the dedup is what this is for, but the sort now
-    // also fixes the order in which this transaction takes the per-source
-    // fuse gates (issue #159, `take_fuse_gate`), so two concurrent evictions
-    // spanning the same two sources cannot grab them in opposite orders. No
-    // new cycle against the `poison` row locks either: the `evict_key` loop
-    // above has already taken every one of them before the first gate is
-    // touched, so a transaction waiting on a gate is never itself holding one
-    // while a gate-holder waits on it.
-    //
-    // Deduped on the *canonical* identity (issue #283), which is also what
-    // makes the gate and both counts below single-keyed for a source staged
-    // under two spellings: two raw spellings of one logical table are one
-    // entry here, taking one gate and counting one combined budget, instead of
-    // two independent half-budgets neither of which ever reached the threshold.
-    let mut evicted_src_tables: Vec<&str> = evict_now
-        .iter()
-        .map(|p| p.canonical_src_table.as_str())
-        .collect();
-    evicted_src_tables.sort_unstable();
-    evicted_src_tables.dedup();
-    for src_table in evicted_src_tables {
-        trip_transform_fuse_if_crossed(&txn, pool, src_table).await?;
+    let mut evicted = 0;
+    for (transform_id, probes) in by_transform {
+        if !evict_for(&txn, transform_id, probes[0].culprit.epoch).await? {
+            continue;
+        }
+        for probe in probes {
+            let contribution = folded.iter().find(|c| {
+                !c.is_truncate && c.src_table == probe.raw_src_table && c.key == probe.key
+            });
+            evict_key(&txn, seg_seq, probe, contribution).await?;
+            evicted += 1;
+        }
+        quarantine_if_crossed(&txn, transform_id, &not_frozen_sql()).await?;
     }
     txn.commit().await?;
 
-    // Raw, not canonical: this set is matched against `folded`'s own ring
-    // spellings just below.
-    let evicted: HashSet<(&str, &str)> = evict_now
+    if evicted == 0 {
+        // Every culprit was frozen or resumed while isolation probed it: the
+        // retry recomputes without them, so the original failure is likely
+        // gone, and if not the next isolation attributes it afresh.
+        return Ok(IsolationOutcome::ChargedBelowThreshold { charged });
+    }
+    Ok(IsolationOutcome::Evicted { evicted, charged })
+}
+
+/// Where [`attribute`]'s probes run: the page's segment and claim.
+#[derive(Clone, Copy)]
+struct AttributionProbe<'a> {
+    seg_seq: i64,
+    claimed_by: &'a str,
+    wake_channel: &'a str,
+}
+
+/// The definitions a record that fails alone (`change`, of canonical source
+/// `src_table`, with error `err`) fails in (#799), each probed on its own:
+///
+/// 1. With every definition that applies the record directly left out (the
+///    readers of its source that aren't already poisoned for its key), what
+///    is left is the work done for the definitions reading the table through
+///    a relationship (the to-side's reverse recomputes and settled
+///    projection). If that fails, the failure is theirs, and it is charged to
+///    each of them the key isn't already poisoned for: their share of the
+///    work is skipped only once every one of them holds the key
+///    ([`super::apply::compute`]).
+/// 2. Otherwise, with one direct reader, it's that one.
+/// 3. Otherwise each direct reader is probed alone, the others left out, and
+///    every one that fails is charged. A record that fails only with two of
+///    them together fails in none alone, and is charged to nobody, as
+///    bisection charges nobody for a failure only a combination of records
+///    reproduces.
+///
+/// A probe that hits a transient error or a version fence miss charges
+/// nothing for the definition it probed. One that hits a halting error or a
+/// lost claim propagates, as bisection's own do. Each probe counts toward
+/// [`MAX_ISOLATION_PROBES`]; at the limit, the record is charged to nobody on
+/// this drain.
+async fn attribute(
+    pool: &Pool,
+    at: AttributionProbe<'_>,
+    change: &FoldedChange,
+    src_table: &str,
+    err: &ApplyError,
+    stats: &mut IsolationStats,
+) -> Result<Vec<Culprit>, ApplyError> {
+    let readers = catalog::transforms_for_source(pool, src_table).await?;
+    let (poisoned, epochs) = {
+        let client = pool.get().await?;
+        let poisoned: HashSet<i64> = client
+            .query(
+                "select transform_id from poison where src_table = $1 and key = $2",
+                &[&src_table, &change.key],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let epochs: HashMap<i64, Option<SystemTime>> = client
+            .query("select id, fuse_rearmed_at from transform_definitions", &[])
+            .await?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        (poisoned, epochs)
+    };
+    let culprit = |id: i64, target: &str, last_error: String| Culprit {
+        transform_id: id,
+        target: target.to_string(),
+        epoch: epochs.get(&id).copied().flatten(),
+        last_error,
+    };
+    let direct: Vec<&crate::defs::model::Definition> = readers
         .iter()
-        .map(|p| (p.raw_src_table.as_str(), p.key.as_str()))
+        .filter(|def| !poisoned.contains(&def.id))
         .collect();
-    let retry_folded: Vec<FoldedChange> = folded
-        .iter()
-        .filter(|c| c.is_truncate || !evicted.contains(&(c.src_table.as_str(), c.key.as_str())))
-        .cloned()
+    let records = std::slice::from_ref(change);
+
+    // 1. The relationship readers' share alone. With none the key isn't
+    // already poisoned for, there is no such share left to fail: every
+    // direct reader left out drops the record whole.
+    let rel_readers: Vec<(i64, String)> = apply::relationship_readers_of(pool, src_table)
+        .await?
+        .into_iter()
+        .filter(|(id, _)| !poisoned.contains(id))
         .collect();
-    Ok(IsolationOutcome::Evicted {
-        retry_folded,
-        charged,
+    if !rel_readers.is_empty() {
+        let Some(shared) =
+            attribution_probe(pool, at, records, src_table, &change.key, None, stats).await?
+        else {
+            return Ok(Vec::new());
+        };
+        if let Some(shared_err) = shared {
+            return Ok(rel_readers
+                .iter()
+                .map(|(id, target)| culprit(*id, target, shared_err.to_string()))
+                .collect());
+        }
+    }
+
+    // 2. The one direct reader.
+    if let [def] = direct.as_slice() {
+        return Ok(vec![culprit(def.id, &def.def.target, err.to_string())]);
+    }
+
+    // 3. Each direct reader alone.
+    let mut culprits = Vec::new();
+    for def in direct {
+        let probed = attribution_probe(
+            pool,
+            at,
+            records,
+            src_table,
+            &change.key,
+            Some(def.id),
+            stats,
+        )
+        .await?;
+        if let Some(Some(def_err)) = probed {
+            culprits.push(culprit(def.id, &def.def.target, def_err.to_string()));
+        }
+    }
+    Ok(culprits)
+}
+
+/// One of [`attribute`]'s probes: `records` applied with every direct reader
+/// of `src_table` but `only` left out for `key`. `Some(None)` when it applies
+/// cleanly, `Some(Some(err))` when it fails with an [`FailureClass::Isolate`]
+/// error, and `None` when it settles nothing (a transient error, a version
+/// fence miss, or the probe limit). A halting error or a lost claim
+/// propagates.
+async fn attribution_probe(
+    pool: &Pool,
+    at: AttributionProbe<'_>,
+    records: &[FoldedChange],
+    src_table: &str,
+    key: &str,
+    only: Option<i64>,
+    stats: &mut IsolationStats,
+) -> Result<Option<Option<ApplyError>>, ApplyError> {
+    if stats.probes >= MAX_ISOLATION_PROBES {
+        stats.stopped.get_or_insert(IsolationStop::ProbeLimit);
+        return Ok(None);
+    }
+    stats.probes += 1;
+    let focus = apply::ProbeFocus {
+        src_table,
+        key,
+        only,
+    };
+    let Some(err) = probe_records(
+        pool,
+        at.seg_seq,
+        at.claimed_by,
+        at.wake_channel,
+        records,
+        Some(&focus),
+    )
+    .await?
+    else {
+        return Ok(Some(None));
+    };
+    if is_claim_lost(&err) {
+        return Err(err);
+    }
+    Ok(match classify(&err) {
+        FailureClass::Halting => return Err(err),
+        FailureClass::Isolate => Some(Some(err)),
+        FailureClass::Transient | FailureClass::VersionFenceMiss => None,
     })
+}
+
+/// Takes `transform_id`'s fuse gate and its definition row, and says whether
+/// it may still be poisoned (#799): it isn't frozen, and no resume has
+/// stamped a new `fuse_rearmed_at` since attribution read `epoch`. A resume
+/// deletes the definition's poison and rebuilds it, so a key its old self
+/// failed on must not land after the resume and hold a key of the rebuilt
+/// one. The row lock (`for no key update`, the lock the fuse's own status
+/// write takes) holds off a resume until this transaction ends, and the gate
+/// comes first, as the fuse has always taken it (issue #159).
+async fn evict_for(
+    txn: &Transaction<'_>,
+    transform_id: i64,
+    epoch: Option<SystemTime>,
+) -> Result<bool, ApplyError> {
+    take_fuse_gate(txn, transform_id).await?;
+    let current = txn
+        .query_opt(
+            "select 1 from transform_definitions \
+             where id = $1 and fuse_rearmed_at is not distinct from $2 \
+               and status = any($3) \
+             for no key update",
+            &[&transform_id, &epoch, &TransformStatus::dispatchable()],
+        )
+        .await?;
+    if current.is_none() {
+        tracing::debug!(
+            transform_id,
+            "not poisoning a key for a definition frozen or resumed while isolation probed it"
+        );
+    }
+    Ok(current.is_some())
 }
 
 /// Resolves a ring row's raw `src_table` to the fully-qualified identity
@@ -1503,39 +1764,33 @@ impl CanonicalSrcTables {
 // survived a probe run *alone* and still wasn't attributable to a single
 // calculated field (whether or not [`attribute_column_failure`] separately
 // also charged a column fuse alongside it — the two tiers are independent,
-// see that function's own doc comment). So the `poison` marker table this
-// module already maintains *is* the distinct-evicted-key count this fuse
-// needs — no new counter table, unlike [`key_deaths`]/`column_deaths`'s
-// incrementally-maintained counters: `poison` is already keyed one row per
-// `(src_table, key)`, so `count(*) where src_table = $1` is already exactly
-// "how many distinct keys for this source are currently evicted," with no
-// write-amplification tradeoff to make. Issue #160 narrowed *which* of those
-// rows a given definition is charged for (only those evicted since its last
-// resume re-armed the fuse — see `trip_transform_fuse_if_crossed`), but the
-// table is still the whole counter.
+// see that function's own doc comment). Whole-key poison is per transform
+// (#799), so the `poison` rows of one definition *are* the distinct-evicted-key
+// count its fuse needs — no counter table of its own, unlike
+// [`key_deaths`]/`column_deaths`'s incrementally-maintained counters, and a
+// definition is charged for its own evictions only, never for a sibling's on
+// the same source. A resume deletes the definition's rows
+// ([`resume_transform`]), which is what re-arms its fuse.
 //
 // What `poison` cannot supply on its own is *serialization* between two
-// concurrent evictions for the same source (issue #159): each counts inside
-// its own transaction and cannot see the other's uncommitted insert, so two
-// workers landing the 4th and 5th eviction at once both counted 4 and
-// neither tripped. That is what `transform_fuse_gate`/[`take_fuse_gate`]
-// adds — one per-`src_table` row lock, in exactly the shape
-// [`record_key_death`] already uses for `key_deaths`, taken before any
-// counting happens. It still introduces no duplicated count anywhere; see
-// `V30__transform_fuse_gate.sql` for why the counts themselves stayed on
-// `poison`.
+// concurrent evictions for the same definition (issue #159): each counts
+// inside its own transaction and cannot see the other's uncommitted insert,
+// so two workers landing the 4th and 5th eviction at once both counted 4 and
+// neither tripped. That is what `transform_fuse_gate`/[`take_fuse_gate`] adds
+// — one row lock per definition, in exactly the shape [`record_key_death`]
+// already uses for `key_deaths`, taken before any counting happens.
 
-/// Takes `src_table`'s whole-transform-fuse gate on `txn` and holds it until
-/// that transaction ends: the serialization point issue #159 was missing.
-/// Every eviction transaction that is about to ask "has this source crossed
-/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]?" passes through this one row first,
-/// so two of them for the same source can never both answer from a snapshot
-/// taken before the other's `poison` insert landed.
+/// Takes `transform_id`'s whole-transform-fuse gate on `txn` and holds it
+/// until that transaction ends: the serialization point issue #159 was
+/// missing. Every eviction transaction that is about to ask "has this
+/// definition crossed [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]?" passes through
+/// this one row first, so two of them for the same definition can never both
+/// answer from a snapshot taken before the other's `poison` insert landed.
 ///
 /// An `INSERT ... ON CONFLICT DO UPDATE`, not a `SELECT ... FOR UPDATE`, for
 /// the same reason [`record_key_death`]/`charge_column_failure` use that
 /// shape for `key_deaths`/`column_deaths`: the gate row may not exist yet
-/// (first-ever eviction for this source), and `FOR UPDATE` over zero rows
+/// (first-ever eviction for this definition), and `FOR UPDATE` over zero rows
 /// locks nothing at all — two concurrent first evictions would each sail
 /// straight through. `ON CONFLICT` covers both halves: Postgres's speculative
 /// insertion makes the losing *inserter* wait on the winner's transaction,
@@ -1543,175 +1798,71 @@ impl CanonicalSrcTables {
 /// exists) makes every later caller wait on the row lock.
 ///
 /// Deliberately no `RETURNING` and no maintained count: the threshold
-/// decision stays a `count(*)` over `poison`, which is the only table that
-/// can also answer #160's windowed, per-definition form of the same
-/// question. `V30__transform_fuse_gate.sql` has the full rationale.
-async fn take_fuse_gate(txn: &Transaction<'_>, src_table: &str) -> Result<(), ApplyError> {
+/// decision stays a `count(*)` over the definition's `poison` rows.
+/// `V30__transform_fuse_gate.sql` has the full rationale.
+async fn take_fuse_gate(txn: &Transaction<'_>, transform_id: i64) -> Result<(), ApplyError> {
     txn.execute(
-        "insert into transform_fuse_gate (src_table, checks, last_checked_at) \
+        "insert into transform_fuse_gate (transform_id, checks, last_checked_at) \
          values ($1, 1, now()) \
-         on conflict (src_table) do update set \
+         on conflict (transform_id) do update set \
              checks = transform_fuse_gate.checks + 1, \
              last_checked_at = now()",
-        &[&src_table],
+        &[&transform_id],
     )
     .await?;
     Ok(())
 }
 
-/// Checks whether `src_table`'s whole-transform fuse has crossed
-/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] and, if so, quarantines every
-/// transform definition [`crate::defs::catalog::transforms_for_source`]
-/// resolves for it (a source table can back more than one transform — each
-/// one independently pays for its own source's poisoned-key breadth, so
-/// every one of them trips together rather than picking just one).
+/// Checks whether `transform_id`'s whole-transform fuse has crossed
+/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] distinct keys poisoned for it, and
+/// quarantines it if so, in `txn` — the transaction that just poisoned its
+/// key(s), so the count sees them before they commit.
 ///
-/// Must run **inside the same transaction** [`isolate_and_evict`] just used
-/// to insert this call's own triggering eviction(s) into `poison` — the
-/// `count(*)` below is read against `txn` itself (not a fresh pool
-/// connection) specifically so it observes those just-inserted, not-yet-committed
-/// rows; a separate connection would undercount until commit and could miss
-/// the exact eviction that crosses the threshold.
+/// **Concurrent evictions for one definition are serialized first** (issue
+/// #159), by [`take_fuse_gate`], before the count runs. Reading `poison` from
+/// `txn` is what makes this call see *its own* new rows, but it is also
+/// exactly what made it blind to a *sibling* transaction's concurrent,
+/// not-yet-committed ones: two workers each poisoning a key (say the 4th and
+/// 5th) each counted 4, neither crossed the threshold-of-5, and the transform
+/// stayed live past its fuse point until some later, unrelated eviction
+/// happened to re-run the check. The gate's row lock forces those two into an
+/// order; the second one through does not begin counting until the first has
+/// committed, and — READ COMMITTED, one fresh snapshot per statement — its
+/// count then includes the sibling's rows. Idempotent: the gate is a row lock
+/// the transaction already holds when [`isolate_and_evict`] took it first.
 ///
-/// **Concurrent evictions for one source are serialized first** (issue
-/// #159), by [`take_fuse_gate`], before either count below runs. Reading
-/// `poison` from `txn` is what makes this call see *its own* new rows, but it
-/// is also exactly what made it blind to a *sibling* transaction's
-/// concurrent, not-yet-committed ones: two workers each poisoning a key for
-/// the same source (say the source's 4th and 5th) each counted 4, neither
-/// crossed the threshold-of-5, and the transform stayed live past its fuse
-/// point until some later, unrelated eviction happened to re-run the check.
-/// The gate's per-`src_table` row lock forces those two into an order; the
-/// second one through does not begin counting until the first has committed,
-/// and — READ COMMITTED, one fresh snapshot per statement — both counts below
-/// then include the sibling's rows. This never changes *whether* a genuine
-/// threshold crossing trips, only how promptly: the fuse could always
-/// undercount, never overcount, so no previously-correct non-trip becomes a
-/// false trip.
-///
-/// **The count is windowed by the resuming operator's re-arm point** (issue
-/// #160): only `poison` rows whose `poisoned_at` is *after* the definition's
-/// `transform_definitions.fuse_rearmed_at` count toward the threshold. Before
-/// this, [`resume_transform`] left `poison` untouched, so a `src_table` that
-/// had ever reached five evicted keys kept that count forever and the next
-/// single new eviction — for any key, for any reason — re-tripped the fuse
-/// immediately; the intended "five fresh failures re-trips" degraded into
-/// "one failure re-trips, forever." See `V29__transform_fuse_rearm.sql` for
-/// why re-arming (this option) beats deleting the `src_table`'s `poison` rows
-/// on resume: those rows are the fold's global exclusion *marker* and may own
-/// parked `poison_held` work, and they are shared by every transform on the
-/// same source (only one of which is being resumed). `fuse_rearmed_at` is
-/// `null` for a never-resumed definition, read here as `-infinity` — i.e.
-/// identical to the pre-#160 unwindowed count.
-///
-/// The count is therefore per *definition* rather than one shared count for
-/// `src_table`: sibling transforms on the same source are resumed
-/// independently, so each one carries its own budget. That is a strictly
-/// finer-grained version of the previous behaviour (with no resume anywhere,
-/// every sibling sees the same number the single old query returned).
-///
-/// The two mechanisms compose without either knowing about the other: the
-/// gate decides *when* a transaction is allowed to count, the re-arm window
-/// decides *which* `poison` rows that count includes. Both windowed and
-/// unwindowed counts still read `poison` directly, so a per-definition window
-/// needs no gate of its own — once the gate has been passed, every committed
-/// sibling row is visible to both, whatever their `poisoned_at`.
-///
-/// `src_table` is routed through [`qualified_src_table`] before the catalog
-/// lookup (issue #281): a bare spelling handed straight to
-/// [`catalog::transforms_for_source`] silently resolves to *no* definitions,
-/// so the fuse would cross its threshold and then quarantine nothing at all.
-///
-/// The old unwindowed `count(*)` survives as a cheap guard in front of the
-/// loop: a window can only ever *remove* `poison` rows from the count, so a
-/// source below threshold in total is below it for every definition, and the
-/// per-definition work (plus the `catalog` lookup's second pool connection,
-/// taken while `txn` is open) is skipped entirely — the same fast path every
-/// eviction below threshold took before #160.
-///
-/// Idempotent, and never relabels a freeze: a definition already frozen
+/// Never relabels a freeze: a definition already frozen
 /// ([`TransformStatus::Quarantined`] or [`TransformStatus::Paused`]) is left
-/// alone (no write, no log line) on every later eviction that keeps
-/// `src_table` above threshold, including when the freeze landed after this
-/// call read its candidates (issue #338, see [`quarantine_if_crossed`]).
+/// alone (no write, no log line), including when the freeze landed after the
+/// eviction read its candidates (issue #338, see [`quarantine_if_crossed`]).
 ///
 /// `pub` rather than module-private only so the issue-#159 regression test
 /// (`tests/quarantine.rs`) can drive two genuinely overlapping eviction
 /// transactions through it directly: the race lives in the window between one
 /// transaction's `poison` insert and its commit, which two full
 /// `drain_once`/`isolate_and_evict` pipelines cannot be made to interleave
-/// deterministically from the outside.
+/// deterministically from the outside. [`isolate_and_evict`] takes the same
+/// two steps itself, with the definition row's staleness check between them
+/// (`evict_for`).
+#[cfg(any(test, feature = "internals"))]
 pub async fn trip_transform_fuse_if_crossed(
     txn: &Transaction<'_>,
-    pool: &Pool,
-    src_table: &str,
+    transform_id: i64,
 ) -> Result<(), ApplyError> {
-    // Issue #283: resolve the canonical identity *first*, before the gate and
-    // both counts — all three key on it, and so does every write
-    // `isolate_and_evict` made on the way here. Deliberately ahead of the
-    // pre-threshold fast path below, which used to be the reason this
-    // resolution sat further down (it takes a pool connection while `txn` is
-    // open — see `pool.rs`'s note on that hazard): the fast path's own count is
-    // one of the queries that has to be canonically keyed, so it can't run
-    // first. The cost is bounded to the case that needs it — an
-    // already-qualified `src_table`, which since issue #267 is every spelling
-    // `apply.rs` emits, short-circuits inside `qualified_src_table` with no
-    // database access at all, and the gate this eviction is about to take is
-    // not yet held when the connection is acquired.
-    let src_table = &qualified_src_table(pool, src_table).await?;
-
-    // Issue #159's serialization point, before either count below. Must come
-    // first: a count taken ahead of the gate could be stale by the time the
-    // gate is granted, which is the whole bug. Keyed canonically (issue #283),
-    // so two workers evicting one logical source under two different spellings
-    // queue on one gate row instead of taking two independent locks and
-    // serializing against nothing.
-    take_fuse_gate(txn, src_table).await?;
-
-    // Unwindowed guard, kept from the pre-#160 shape: every definition's
-    // windowed count is a *subset* of this one (the window only ever removes
-    // `poison` rows, never adds them), so a source table below threshold in
-    // total cannot have any single definition at or above it, and the whole
-    // per-definition loop below — including the `catalog` call's second pool
-    // connection, acquired while this eviction's own `txn` is still open —
-    // can be skipped outright. Every eviction pays this one indexed
-    // `count(*)`; only a genuinely threshold-deep source pays for the rest.
-    let poisoned_total: i64 = txn
-        .query_one(
-            "select count(*) from poison where src_table = $1",
-            &[&src_table],
-        )
-        .await?
-        .get(0);
-    if poisoned_total < DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64 {
-        return Ok(());
-    }
-
-    // Already canonical (resolved at the top of this function, issue #283) —
-    // which is exactly the form `transforms_for_source` requires (issue #281).
-    let definitions = catalog::transforms_for_source(pool, src_table).await?;
-    // Defense in depth for the issue-#281 class: "threshold crossed, nothing
-    // to quarantine" is never a normal outcome — `poison` rows only exist for
-    // a source some definition was evaluating — so say so out loud rather than
-    // returning silently, which is exactly what made the original bug
-    // invisible. Not a `debug_assert!`: a source table legitimately dropped
-    // (or every definition on it dropped) between the eviction and this lookup
-    // reaches here too, and that is not a programming error.
-    if definitions.is_empty() {
-        tracing::warn!(
-            src_table = %src_table,
-            poisoned_total,
-            "whole-transform fuse threshold crossed but no definitions resolved for this \
-             source; nothing quarantined"
-        );
-    }
-    // An applying definition: a Re-derive build applies from its start
-    // (#625 F2), so its fuse trips from `backfilling` too.
-    let applying = crate::defs::model::applying_sql("t");
-    for def in &definitions {
-        quarantine_if_crossed(txn, src_table, def.id, &def.def.target, &applying).await?;
-    }
+    take_fuse_gate(txn, transform_id).await?;
+    quarantine_if_crossed(txn, transform_id, &not_frozen_sql()).await?;
     Ok(())
+}
+
+/// A SQL predicate over a definition's row `t`: it isn't frozen. The states
+/// a drain's eviction may quarantine a definition from: an applying one,
+/// and one building (a relationship reader can be charged for the reverse
+/// work of a to-side key before it goes live, #799).
+fn not_frozen_sql() -> String {
+    let frozen = [TransformStatus::Paused, TransformStatus::Quarantined]
+        .map(|status| format!("'{}'", status.as_str()))
+        .join(", ");
+    format!("t.status not in ({frozen})")
 }
 
 /// The `poison_held.seg_seq` a build's parked re-derive ([`evict_build_key`])
@@ -1722,14 +1873,15 @@ pub async fn trip_transform_fuse_if_crossed(
 /// the image readers last saw, which the build's re-derive doesn't know.
 pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
 
-/// Quarantines `key` of `src_table` (canonical) because a backfill chunk
-/// narrowed its failure, `last_error`, to that key alone
-/// (`defs::chunk_queue::fail_chunk`, #616), in the caller's transaction.
-/// It is the chunk-shaped counterpart of a drain's eviction
-/// ([`isolate_and_evict`]):
+/// Quarantines `key` of `src_table` (canonical) for the building definition
+/// `transform_id`, because a backfill chunk narrowed its failure,
+/// `last_error`, to that key alone (`defs::chunk_queue::fail_chunk`, #616),
+/// in the caller's transaction. It is the chunk-shaped counterpart of a
+/// drain's eviction ([`isolate_and_evict`]):
 ///
-/// - a `poison` row, so the drain leaves the key out of every batch and the
-///   build's chunks leave it out of their writes;
+/// - a `poison` row, so the build's chunks leave the key out of their writes
+///   and, once the definition applies, the drain leaves it out of the
+///   definition's apply;
 /// - a death in `key_deaths`, with the error;
 /// - a parked `recompute` in `poison_held`, so [`release_key`] re-stages the
 ///   key as a re-derive once its cause is fixed. It carries the WAL insert
@@ -1743,116 +1895,88 @@ pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
 /// once the caller has committed, by [`trip_build_fuse`].
 pub(crate) async fn evict_build_key(
     txn: &Transaction<'_>,
+    transform_id: i64,
     src_table: &str,
     key: &str,
     last_error: &str,
 ) -> Result<(), ApplyError> {
-    record_key_death(txn, src_table, key, last_error).await?;
+    record_key_death(txn, transform_id, src_table, key, last_error).await?;
     txn.execute(
-        "insert into poison (src_table, key, last_error) \
-         values ($1, $2, $3) \
-         on conflict (src_table, key) do update set \
+        "insert into poison (transform_id, src_table, key, last_error) \
+         values ($1, $2, $3, $4) \
+         on conflict (transform_id, src_table, key) do update set \
              last_error = excluded.last_error, poisoned_at = now()",
-        &[&src_table, &key, &last_error],
+        &[&transform_id, &src_table, &key, &last_error],
     )
     .await?;
     txn.execute(
-        "insert into poison_held (src_table, key, seg_seq, op, origin_lsn) \
-         values ($1, $2, $3, 'recompute', pg_current_wal_insert_lsn()) \
-         on conflict (src_table, key, seg_seq) do nothing",
-        &[&src_table, &key, &BUILD_PARK_SEG_SEQ],
+        "insert into poison_held (transform_id, src_table, key, seg_seq, op, origin_lsn) \
+         values ($1, $2, $3, $4, 'recompute', pg_current_wal_insert_lsn()) \
+         on conflict (transform_id, src_table, key, seg_seq) do nothing",
+        &[&transform_id, &src_table, &key, &BUILD_PARK_SEG_SEQ],
     )
     .await?;
     Ok(())
 }
 
-/// Checks the whole-transform fuse after a build quarantined a key of
-/// `src_table` ([`evict_build_key`]), in a transaction of its own: every
-/// applying definition on the source, as after a drain's eviction
-/// ([`trip_transform_fuse_if_crossed`]), and the building definition
-/// `definition_id` itself, which that check skips because it isn't applying
-/// yet. A build whose chunks fail on [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]
-/// keys is quarantined like a live definition whose drain does, so a failure
-/// that only looks like a data error (it narrows to whichever key a chunk
-/// tries alone) stops after that many keys. Returns whether the building
-/// definition was quarantined.
+/// Checks the building definition `definition_id`'s whole-transform fuse
+/// after a build quarantined one of its keys ([`evict_build_key`]), in a
+/// transaction of its own. A build whose chunks fail on
+/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] keys is quarantined like a live
+/// definition whose drain does, so a failure that only looks like a data
+/// error (it narrows to whichever key a chunk tries alone) stops after that
+/// many keys. Only the building definition's own count is checked (#799):
+/// its keys are poisoned for it alone. Returns whether it was quarantined.
 ///
 /// Separate from the eviction's transaction so the fuse's gate is never taken
 /// while the chunk queue holds the definition row, which the drain's fuse
 /// takes after the gate.
-pub(crate) async fn trip_build_fuse(
-    pool: &Pool,
-    definition_id: i64,
-    target: &str,
-    src_table: &str,
-) -> Result<bool, ApplyError> {
+pub(crate) async fn trip_build_fuse(pool: &Pool, definition_id: i64) -> Result<bool, ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    trip_transform_fuse_if_crossed(&txn, pool, src_table).await?;
-    let tripped = quarantine_if_crossed(
-        &txn,
-        src_table,
-        definition_id,
-        target,
-        "t.status = 'backfilling'",
-    )
-    .await?;
+    take_fuse_gate(&txn, definition_id).await?;
+    let tripped = quarantine_if_crossed(&txn, definition_id, "t.status = 'backfilling'").await?;
     txn.commit().await?;
     Ok(tripped)
 }
 
-/// One candidate's half of [`trip_transform_fuse_if_crossed`]: quarantines
-/// `def` if its windowed `poison` count for `src_table` has crossed
+/// Quarantines definition `id` if the keys poisoned for it have crossed
 /// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]. Returns whether it did.
 ///
-/// `def` comes from the caller's unlocked candidate read
-/// ([`catalog::transforms_for_source`], on a pool connection), so by the time
+/// The caller nominated `id` from an earlier, unlocked read, so by the time
 /// this runs the row may have moved on: an operator may have paused it, or
-/// paused and resumed it (issue #338). The read only nominates candidates.
-/// The verdict is one conditional `UPDATE` that re-checks, against the row as
-/// it is when the write happens, both that the definition is still in a
-/// state the fuse may freeze (an applying one, the same set the candidate read
-/// filtered on) and that its count crosses the threshold under its current
-/// `fuse_rearmed_at` window. Under READ COMMITTED a row changed by a
+/// paused and resumed it (issue #338). The verdict is one conditional
+/// `UPDATE` that re-checks, against the row as it is when the write happens,
+/// both that the definition is still in a state the fuse may freeze and that
+/// its count crosses the threshold. Under READ COMMITTED a row changed by a
 /// transaction that commits while this `UPDATE` waits on it is re-evaluated
 /// against the committed version, so a pause that lands mid-statement is seen
 /// too. A paused definition therefore stays `paused`, the way
 /// [`crate::defs::lifecycle::pause_transform`] leaves a quarantined one
 /// `quarantined`: both triggers are the same freeze, and the label records
-/// which one fired first.
-///
-/// `fuse_rearmed_at` is read from the definition's row rather than carried
-/// on `Definition`: it is pure fuse bookkeeping with no other reader, so
-/// widening the catalog's public model (and every construction site of it)
-/// for one call site isn't worth it. The row lock this takes is the same one
-/// the unconditional write it replaced took, and only when the definition
-/// actually trips.
+/// which one fired first. A resume deletes the definition's `poison` rows, so
+/// a resumed definition's count starts again from zero (#799).
 ///
 /// `may_freeze` is a SQL predicate over the definition's row `t` saying
-/// which states it may be frozen from: an applying one
-/// (`defs::model::applying_sql`) for a drain's eviction, `backfilling` for a
-/// build's ([`trip_build_fuse`]).
+/// which states it may be frozen from: any that isn't frozen
+/// ([`not_frozen_sql`]) for a drain's eviction, `backfilling` for a build's
+/// ([`trip_build_fuse`]).
 async fn quarantine_if_crossed(
     txn: &Transaction<'_>,
-    src_table: &str,
     id: i64,
-    target: &str,
     may_freeze: &str,
 ) -> Result<bool, ApplyError> {
-    const WINDOWED_COUNT: &str = "(select count(*) from poison p \
-         where p.src_table = $3 \
-           and p.poisoned_at > coalesce(t.fuse_rearmed_at, '-infinity'::timestamptz))";
+    const COUNT: &str = "(select count(*) from poison p where p.transform_id = t.id)";
     let tripped = txn
         .query_opt(
             &format!(
                 "update transform_definitions t set status = $1 \
-                 where t.id = $2 and {may_freeze} and {WINDOWED_COUNT} >= $4 \
-                 returning {WINDOWED_COUNT}"
+                 where t.id = $2 and {may_freeze} and {COUNT} >= $3 \
+                 returning split_part(t.target_table, '.', 2), {COUNT}"
             ),
             &[
                 &TransformStatus::Quarantined.as_str(),
                 &id,
-                &src_table,
                 &(DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64),
             ],
         )
@@ -1860,10 +1984,10 @@ async fn quarantine_if_crossed(
     let Some(row) = tripped else {
         return Ok(false);
     };
-    let poisoned_count: i64 = row.get(0);
+    let target: String = row.get(0);
+    let poisoned_count: i64 = row.get(1);
     tracing::warn!(
         transform = %target,
-        src_table = %src_table,
         poisoned_count,
         "whole-transform fuse tripped; quarantining"
     );
@@ -2613,26 +2737,21 @@ async fn reads_paused_sibling(
 /// again or used to complete the definition (issues #360/#397,
 /// `defs::chunk_queue::finish_chunk`/`release_chunk`/`reclaim_stale_chunks`).
 ///
-/// **The trip half of this contract** lives in
-/// [`trip_transform_fuse_if_crossed`], called from [`isolate_and_evict`]
-/// once a batch of evictions lands: when `src_table`'s distinct-evicted-key
-/// count (the `poison` marker table) crosses
-/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`], every transform definition
-/// subscribed to that source is quarantined (issue #105 — this used to have
-/// no writer at all; `resume_transform` predates it and was written first so
-/// the trip mechanism would have somewhere correct to land).
+/// **The trip half of this contract** lives in [`isolate_and_evict`]'s
+/// eviction (`quarantine_if_crossed`): when the count of keys poisoned for
+/// a definition crosses [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`], that
+/// definition is quarantined (issue #105; per definition since #799).
 ///
-/// **Re-arms that fuse** (issue #160) by stamping
-/// `transform_definitions.fuse_rearmed_at`, so the resumed transform gets a
-/// fresh [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] budget of *new* evictions
-/// rather than re-tripping on the very next one (the `poison` rows that
-/// tripped it are still there — see
-/// [`trip_transform_fuse_if_crossed`]'s doc comment and
-/// `V29__transform_fuse_rearm.sql` for why they're windowed out rather than
-/// deleted). This deliberately does **not** touch `key_deaths`: that's the
-/// independent per-key fuse tier, cleared by a clean drain of the key itself
-/// (`clear_key_deaths`), and a resume makes no claim about any individual
-/// key's health — only about the transform's.
+/// **Releases every key the definition holds** (#799): its own `poison`,
+/// `poison_held` and `key_deaths` rows are deleted in the same transaction,
+/// and the fresh build re-derives every key from the source, so the parked
+/// work is superseded rather than replayed. Every other definition's rows
+/// are untouched: whole-key poison is per transform, so a sibling on the same
+/// source keeps its own held keys. Deleting the rows is also what re-arms
+/// the fuse (issue #160): the resumed definition starts from a count of zero.
+/// `fuse_rearmed_at` is stamped too, as the resume's epoch: a backfill chunk
+/// of the old build is stale against it (issues #360/#397), and an eviction
+/// whose attribution read the old one poisons nothing (`evict_for`).
 #[tracing::instrument(name = "quarantine.resume_transform", skip(pool), fields(transform = %target))]
 pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
@@ -2696,17 +2815,9 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     }
 
     // `fuse_rearmed_at = now()` in the same statement, not a separate one:
-    // re-arming the whole-transform fuse is part of the same atomic
-    // "this transform starts over" transition as the status drop (issue
-    // #160). `now()` is the transaction timestamp, and every later eviction
-    // stamps `poison.poisoned_at` from its own, strictly later transaction,
-    // so `trip_transform_fuse_if_crossed`'s strict `>` comparison gives this
-    // transform a full, fresh `DEFAULT_TRANSFORM_DEATH_THRESHOLD` budget of
-    // post-resume evictions. Keys still sitting in `poison` from before the
-    // resume are deliberately left there — they remain globally excluded
-    // from folding (and their parked `poison_held` work remains releasable
-    // via `release_key`), they just no longer count toward this transform's
-    // fuse.
+    // it is this resume's epoch, part of the same atomic "this transform
+    // starts over" transition as the status drop (issue #160), and what a
+    // stale chunk or eviction checks against.
     //
     // `build = null` too (#625 F2): a definition paused during a Re-derive
     // build is no longer under one. The staging worker's next pass starts a
@@ -2792,6 +2903,19 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
                 .await?;
         catalog::refresh_relationship_projections_by_id_in_txn(&*txn, &refresh).await?;
     }
+    // #799: release every key this definition holds. The fresh build below
+    // re-derives each from the source, so its parked work is superseded, not
+    // replayed, and the key is applied again from the build's go-live on.
+    // Only this definition's rows: a sibling on the same source keeps its
+    // own. Deleting them is also what gives the resumed definition a fresh
+    // whole-transform fuse.
+    for table in ["poison", "poison_held", "key_deaths"] {
+        txn.execute(
+            &format!("delete from {table} where transform_id = $1"),
+            &[&id],
+        )
+        .await?;
+    }
     // #622 C6: a transform paused by a schema change stops being reported as
     // such the moment it is resumed. Its columns count for capture again from
     // here, so the next reconcile widens the source's capture to them before
@@ -2820,7 +2944,15 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 
 /// Operator-driven release, one transaction: stages one image-less
 /// `Recompute` of `(src_table, key)` into the active batch, then deletes the
-/// key's `poison_held` rows, its marker, and its death counter.
+/// key's `poison_held` rows, its marker, and its death counter for the
+/// definition whose bare target is `transform` (#799: whole-key poison is
+/// per transform, and so is its release). Another definition holding the
+/// same key keeps holding it.
+///
+/// The `Recompute` reaches every reader of the key's table, not only
+/// `transform`: one that doesn't hold the key re-derives it from the live
+/// row, which is idempotent, and one that does parks it, as it parks every
+/// change to a key it holds.
 ///
 /// The parked rows are discarded, not replayed (#623 D3, the D split's
 /// finding 7). A replayed CDC row would carry the releaser's `row_txid`, not
@@ -2848,7 +2980,12 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 ///
 /// Returns how many held rows were released.
 #[cfg(any(test, feature = "internals"))]
-pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usize, ApplyError> {
+pub async fn release_key(
+    pool: &Pool,
+    transform: &str,
+    src_table: &str,
+    key: &str,
+) -> Result<usize, ApplyError> {
     // Issue #283: quarantine's tables are keyed canonically, but this is an
     // operator entry point that may be handed either spelling of a source, and
     // rows written before the V33 fold (or under a spelling V33 could not
@@ -2861,15 +2998,25 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    let transform_id: i64 = txn
+        .query_opt(
+            "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
+            &[&transform],
+        )
+        .await?
+        .ok_or_else(|| ApplyError::TransformNotFound {
+            transform: transform.to_string(),
+        })?
+        .get(0);
 
     let held = txn
         .query(
             "select old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table, \
                     new_image::text, lsn \
              from poison_held \
-             where src_table = any($1::text[]) and key = $2 \
+             where transform_id = $3 and src_table = any($1::text[]) and key = $2 \
              order by seg_seq asc, held_seq asc",
-            &[&names, &key],
+            &[&names, &key, &transform_id],
         )
         .await?;
 
@@ -2904,18 +3051,21 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     }
 
     txn.execute(
-        "delete from poison_held where src_table = any($1::text[]) and key = $2",
-        &[&names, &key],
+        "delete from poison_held \
+         where transform_id = $3 and src_table = any($1::text[]) and key = $2",
+        &[&names, &key, &transform_id],
     )
     .await?;
     txn.execute(
-        "delete from poison where src_table = any($1::text[]) and key = $2",
-        &[&names, &key],
+        "delete from poison \
+         where transform_id = $3 and src_table = any($1::text[]) and key = $2",
+        &[&names, &key, &transform_id],
     )
     .await?;
     txn.execute(
-        "delete from key_deaths where src_table = any($1::text[]) and key = $2",
-        &[&names, &key],
+        "delete from key_deaths \
+         where transform_id = $3 and src_table = any($1::text[]) and key = $2",
+        &[&names, &key, &transform_id],
     )
     .await?;
     // Issue #754: the `Recompute` builds no reverse record, so a to-one
@@ -3091,7 +3241,12 @@ mod unit_tests {
             raw_src_table: src.trim_start_matches("public.").to_string(),
             canonical_src_table: src.to_string(),
             key: key.to_string(),
-            last_error: "boom".to_string(),
+            culprit: Culprit {
+                transform_id: 1,
+                target: "t".to_string(),
+                epoch: None,
+                last_error: "boom".to_string(),
+            },
         }
     }
 
@@ -3491,13 +3646,14 @@ mod unit_tests {
             stopped: None,
         };
         let charged = ChargedKey {
+            transform: "order_totals".to_string(),
             src_table: "public.orders".to_string(),
             key: "3".to_string(),
             deaths: 1,
         };
         // Ten records, two evicted, one more charged below the threshold.
         let evicted = IsolationOutcome::Evicted {
-            retry_folded: (1..=8).map(|k| folded_key(&k.to_string())).collect(),
+            evicted: 2,
             charged: vec![charged.clone()],
         };
         log_isolation_finished(
@@ -3680,11 +3836,13 @@ mod unit_tests {
             below,
             vec![
                 ChargedKey {
+                    transform: "t".to_string(),
                     src_table: "public.gizmos".to_string(),
                     key: "2".to_string(),
                     deaths: 1,
                 },
                 ChargedKey {
+                    transform: "t".to_string(),
                     src_table: "public.widgets".to_string(),
                     key: "4".to_string(),
                     deaths: 4,
@@ -3697,13 +3855,14 @@ mod unit_tests {
     #[test]
     fn describe_charged_keys_names_each_key_and_its_death_count() {
         let charged = vec![ChargedKey {
+            transform: "gizmo_view".to_string(),
             src_table: "public.gizmos".to_string(),
             key: "2".to_string(),
             deaths: 1,
         }];
         assert_eq!(
             describe_charged_keys(&charged, 5),
-            "public.gizmos key=2 (1/5 deaths)"
+            "gizmo_view: public.gizmos key=2 (1/5 deaths)"
         );
     }
 
@@ -3711,6 +3870,7 @@ mod unit_tests {
     fn describe_charged_keys_caps_the_list() {
         let charged: Vec<ChargedKey> = (0..8)
             .map(|i| ChargedKey {
+                transform: "v".to_string(),
                 src_table: "public.t".to_string(),
                 key: i.to_string(),
                 deaths: 2,
@@ -3719,9 +3879,9 @@ mod unit_tests {
         let described = describe_charged_keys(&charged, 5);
         assert_eq!(
             described,
-            "public.t key=0 (2/5 deaths), public.t key=1 (2/5 deaths), \
-             public.t key=2 (2/5 deaths), public.t key=3 (2/5 deaths), \
-             public.t key=4 (2/5 deaths), and 3 more"
+            "v: public.t key=0 (2/5 deaths), v: public.t key=1 (2/5 deaths), \
+             v: public.t key=2 (2/5 deaths), v: public.t key=3 (2/5 deaths), \
+             v: public.t key=4 (2/5 deaths), and 3 more"
         );
     }
 
@@ -4239,7 +4399,9 @@ mod unit_tests {
         let src_table = "public.orders".to_string();
         for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
             raw.execute(
-                "insert into poison (src_table, key, last_error) values ($1, $2, 'test')",
+                "insert into poison (transform_id, src_table, key, last_error) \
+                 select id, $1, $2, 'test' from transform_definitions \
+                 where target_table like '%.order_totals'",
                 &[&src_table, &format!("k{i}")],
             )
             .await
@@ -4262,18 +4424,12 @@ mod unit_tests {
     /// Runs the fuse's per-definition write for `def` (a candidate from an
     /// earlier, unlocked read) in its own transaction, as the eviction
     /// transaction would, and returns whether it quarantined.
-    async fn trip_candidate(pool: &Pool, src_table: &str, def: &Definition) -> bool {
+    async fn trip_candidate(pool: &Pool, def: &Definition) -> bool {
         let mut client = pool.get().await.expect("pool connection");
         let txn = client.transaction().await.expect("begin");
-        let tripped = quarantine_if_crossed(
-            &txn,
-            src_table,
-            def.id,
-            &def.def.target,
-            &crate::defs::model::applying_sql("t"),
-        )
-        .await
-        .expect("fuse write");
+        let tripped = quarantine_if_crossed(&txn, def.id, &not_frozen_sql())
+            .await
+            .expect("fuse write");
         txn.commit().await.expect("commit");
         tripped
     }
@@ -4302,7 +4458,7 @@ mod unit_tests {
             .expect("pause");
 
         assert!(
-            !trip_candidate(&pool, &src_table, &candidates[0]).await,
+            !trip_candidate(&pool, &candidates[0]).await,
             "the fuse must not claim a definition an operator froze after its read"
         );
         assert_eq!(status_of(&raw).await, "paused");
@@ -4351,7 +4507,7 @@ mod unit_tests {
             .await
             .expect("pause, uncommitted");
 
-        let fuse = trip_candidate(&pool, &src_table, &candidates[0]);
+        let fuse = trip_candidate(&pool, &candidates[0]);
         let commit_pause = async {
             let mut blocked = false;
             for _ in 0..3000 {
@@ -4387,13 +4543,11 @@ mod unit_tests {
     }
 
     /// Issue #338's wider window: a pause *and* resume both landing between
-    /// the fuse's read and its write. The resume re-armed the fuse and handed
-    /// the definition back for a fresh build, so the stale read's verdict no
-    /// longer applies to it. Two things in the write stop it, and either alone
-    /// would: the definition is no longer applying, and its re-armed window
-    /// counts none of the pre-resume `poison` rows. (The pre-#338 code passed
-    /// this too, through its separate windowed count; the pin is against a
-    /// fix that re-checks the status but trusts a count taken earlier.)
+    /// the fuse's read and its write. The resume deleted the definition's
+    /// `poison` rows (#799) and handed it back for a fresh build, so the stale
+    /// read's verdict no longer applies to it: the write's own count finds
+    /// none of the pre-resume rows. (The pin is against a fix that re-checks
+    /// the status but trusts a count taken earlier.)
     #[tokio::test]
     async fn a_pause_and_resume_between_the_fuse_read_and_write_is_not_quarantined() {
         let cluster = testkit::TestCluster::start();
@@ -4417,7 +4571,7 @@ mod unit_tests {
             .expect("resume");
 
         assert!(
-            !trip_candidate(&pool, &src_table, &candidates[0]).await,
+            !trip_candidate(&pool, &candidates[0]).await,
             "the fuse must not quarantine a definition resumed after its read"
         );
         assert_eq!(status_of(&raw).await, "waiting_to_backfill");
@@ -4440,7 +4594,7 @@ mod unit_tests {
             "the live definition is a fuse candidate"
         );
 
-        assert!(trip_candidate(&pool, &src_table, &candidates[0]).await);
+        assert!(trip_candidate(&pool, &candidates[0]).await);
         assert_eq!(status_of(&raw).await, "quarantined");
     }
 }

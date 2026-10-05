@@ -328,7 +328,9 @@ async fn a_chunk_leaves_a_quarantined_key_out() {
     let (d, plan) = start_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
     d.ctl
         .batch_execute(
-            "insert into poison (src_table, key, last_error) values ('public.src', '2', 'test')",
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, 'public.src', '2', 'test' from transform_definitions \
+             where source_table = 'public.src'",
         )
         .await
         .expect("quarantine key 2");

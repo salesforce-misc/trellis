@@ -721,9 +721,8 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
 /// each fail every real apply attempt; `isolate_and_evict` evicts all five
 /// together (every attempt fails all five alike, so each of their per-key
 /// `key_deaths` counters crosses its own threshold in the same call), and
-/// once `poison` holds five distinct keys for `s4`,
-/// `trip_transform_fuse_if_crossed` quarantines `t4` in that same
-/// transaction. From there the lifecycle is identical to the sibling test:
+/// once `poison` holds five distinct keys for `t4`, the eviction
+/// quarantines `t4` in that same transaction. From there the lifecycle is identical to the sibling test:
 /// `resume_transform` drops it to `waiting_to_backfill`, and the re-backfill
 /// correctly re-derives every real row from current source state (the five
 /// poisoned keys are synthetic, non-numeric key strings with no
@@ -833,12 +832,15 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     )
     .await
     .expect("run_pending_backfills discharges the resume's own marker");
-    // Not `drain_to_quiescence`: the five bad-key evictions above parked
-    // permanently-unreleasable `poison_held` rows (their key can never cast
-    // to `s4.id`'s `bigint`, so releasing them would just fail identically),
-    // and `has_pending` counts a parked row as pending forever — waiting for
-    // it to clear would spin all 16 rounds and panic even once `t4` is
-    // correctly live again.
+    // The resume deleted the five bad keys' `poison`/`poison_held` rows
+    // (#799), which no release could ever have cleared: their key can never
+    // cast to `s4.id`'s `bigint`.
+    let held: i64 = raw
+        .query_one("select count(*) from poison_held", &[])
+        .await
+        .expect("count held rows")
+        .get(0);
+    assert_eq!(held, 0, "the resume releases every key the definition held");
     drain_until_live(&db.pool, &mut raw, "t4").await;
 
     assert_eq!(
@@ -869,14 +871,12 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
 /// eviction forever.
 ///
 /// Before the fix, `resume_transform` moved the status out of `quarantined`
-/// but left the `poison` rows that tripped the fuse in place, and
-/// `trip_transform_fuse_if_crossed` counted *every* `poison` row for the
-/// source table — so the count was already at 5 (the threshold) before any
-/// new eviction even landed, and eviction number six re-quarantined the
-/// transform immediately. The decided semantics (`V29__transform_fuse_rearm.sql`,
-/// issue #160's option (b)) are that a resume *re-arms* the fuse by stamping
-/// `transform_definitions.fuse_rearmed_at`, so only evictions after that
-/// instant count: history and parked work are preserved, the budget is not.
+/// but left the `poison` rows that tripped the fuse in place, and the fuse
+/// counted *every* `poison` row for the source table — so the count was
+/// already at 5 (the threshold) before any new eviction even landed, and
+/// eviction number six re-quarantined the transform immediately. Since #799
+/// a resume deletes the definition's own `poison` rows before its fresh
+/// build, so its fuse counts only the evictions after it.
 ///
 /// This test pins both halves of that: exactly one new eviction after a
 /// resume must **not** re-trip, and a full further threshold's worth of new
@@ -968,10 +968,8 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
         "resume_transform must stamp the fuse's re-arm point"
     );
 
-    // Phase 2: exactly one new eviction. The five pre-resume `poison` rows
-    // are deliberately still there (they are the fold's global exclusion
-    // marker and own parked `poison_held` work) — they just must not count
-    // toward the re-armed budget any more.
+    // Phase 2: exactly one new eviction. The resume deleted the five
+    // pre-resume `poison` rows (#799), so only the new one is left.
     evict_keys_for_real(&db.pool, &mut raw, &s6, &["bad-6"]).await;
 
     let poisoned_total: i64 = raw
@@ -980,9 +978,8 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
         .expect("count poison")
         .get(0);
     assert_eq!(
-        poisoned_total, 6,
-        "the resume must preserve the pre-resume poison rows (audit trail + parked work), not \
-         delete them"
+        poisoned_total, 1,
+        "the resume releases the definition's pre-resume keys; only the new eviction is held"
     );
     assert_eq!(
         status_of(&raw, "t6").await,

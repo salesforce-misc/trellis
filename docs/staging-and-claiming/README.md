@@ -103,8 +103,8 @@ high-volume ones be append-only and vacuum-free.
 | `segments` (registry) | one row per live batch, updated | state machine, fence, bucket mask |
 | `seg_claims` | one row per in-flight bucket | the claim; its primary key *is* the exclusion |
 | `drainers` | one row per live worker | share denominator for fair fan-out |
-| `poison` / `poison_held` / `key_deaths` | per quarantined key | keeps a killer change from wedging the system |
-| `transform_fuse_gate` | one row per poisoned source table | serializes concurrent evictions' fuse checks (issue #159) |
+| `poison` / `poison_held` / `key_deaths` | per quarantined key and transform | keeps a killer change from wedging the system |
+| `transform_fuse_gate` | one row per transform with a poisoned key | serializes concurrent evictions' fuse checks (issue #159) |
 
 ## Reading order
 

@@ -791,10 +791,14 @@ async fn issue_539_aggregate() {
 /// without key 1.
 async fn issue_550(flavour: Flavour) {
     let mut d = start(flavour, A_Z_B).await;
+    // Whole-key poison is per transform (#799): key 1 is held for the one
+    // definition on the source.
     d.ctl
         .execute(
-            "insert into poison (src_table, key, last_error) values ($1, '1', 'test')",
-            &[&SRC],
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, '1', 'test' from transform_definitions \
+             where target_table = $2",
+            &[&SRC, &flavour.target()],
         )
         .await
         .expect("poison key 1");
@@ -806,7 +810,8 @@ async fn issue_550(flavour: Flavour) {
     d.stage_recomputes(SRC, &["1"]).await;
     let c_batch = d.seal().await;
     d.drain(c_batch, "b").await;
-    trellis::staging::release_key(d.pool(), SRC, "1")
+    let (_, target) = flavour.target().split_once('.').expect("qualified target");
+    trellis::staging::release_key(d.pool(), target, SRC, "1")
         .await
         .expect("release key 1");
     assert_oracle(&mut d, flavour).await;
@@ -3512,9 +3517,13 @@ async fn a_parked_parent_born_and_deleted_on_a_non_key_to_col() {
         d.rows(expected).await,
         "before the scenario"
     );
+    // Held for `agg`, the relationship's only reader (#799), so its reverse
+    // work leaves the key out and the drain parks the change.
     d.ctl
         .execute(
-            "insert into poison (src_table, key, last_error) values ($1, '5', 'test')",
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, '5', 'test' from transform_definitions \
+             where split_part(target_table, '.', 2) = 'agg'",
             &[&PAR],
         )
         .await
@@ -3526,7 +3535,7 @@ async fn a_parked_parent_born_and_deleted_on_a_non_key_to_col() {
     write(&d, "delete from public.par where id = 5").await;
     let p_batch = d.seal().await;
     d.drain(p_batch, "b").await;
-    let released = trellis::staging::release_key(d.pool(), PAR, "5")
+    let released = trellis::staging::release_key(d.pool(), "agg", PAR, "5")
         .await
         .expect("release par key 5");
     assert_eq!(released, 1, "the drain parked parent 5's change");

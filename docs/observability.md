@@ -209,10 +209,11 @@ pause are arcs of one lifecycle:
   ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
 * **`quarantined`** — the whole-transform fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
-  transform back to `waiting_to_backfill`, re-runs the backfill, and **re-arms**
-  the fuse: already-evicted keys stay evicted (and releasable one at a time, with
-  their parked changes intact) but no longer count against the resumed transform,
-  so it gets a fresh eviction budget rather than re-tripping on the next one.
+  transform back to `waiting_to_backfill`, deletes the keys it holds in
+  quarantine (its own only; another transform's held keys stay held) and
+  re-derives every key from the source. The fuse starts again from zero, so the
+  transform gets a fresh eviction budget rather than re-tripping on the next one,
+  and a key whose cause is still there is quarantined again.
 * **`paused`** — frozen, holding its last value, and not maintained
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). Either an operator ran
   `PAUSE TRANSFORM`, or Trellis paused it because it can't keep it correct:
@@ -301,7 +302,9 @@ A transient failure (a lost connection, a lock conflict) is retried with backoff
 counts toward nothing. A failure on a row's data (SQLSTATE class `22` or `23`) is split
 down to the row's key, which is quarantined as the drain quarantines a key
 ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)); the build finishes without
-it and `Trellis::sample_quarantined` lists it. Any other failure is retried, and its
+it and `Trellis::sample_quarantined` lists it. The key is held for this transform only:
+every other transform reading the table keeps applying it, and the whole-transform fuse
+counts it against this transform alone. Any other failure is retried, and its
 fifth charged attempt pauses the transform (an aggregate's or relationship-enriched
 transform's build, which can't be narrowed to a key, is paused the same way). Fix the
 cause and resume the transform, which rebuilds it. Meanwhile

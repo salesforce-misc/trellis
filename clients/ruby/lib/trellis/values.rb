@@ -204,9 +204,10 @@ module Trellis
   end
 
   # One source row the apply path gave up on, as Trellis.poisoned_since
-  # lists it: its fully-qualified src_table, its key as Trellis renders it,
-  # the error that poisoned it, and when (poisoned_at, a Time).
-  PoisonEntry = Data.define(:src_table, :key, :last_error, :poisoned_at) do
+  # lists it: the transform it's held for (every other transform reading the
+  # row keeps applying it), its fully-qualified src_table, its key as Trellis
+  # renders it, the error that poisoned it, and when (poisoned_at, a Time).
+  PoisonEntry = Data.define(:transform, :src_table, :key, :last_error, :poisoned_at) do
     def self.from_native(hash)
       new(**hash.except(:poisoned_at_micros),
           poisoned_at: EpochMicros.to_time(hash.fetch(:poisoned_at_micros)))

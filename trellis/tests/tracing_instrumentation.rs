@@ -584,7 +584,8 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
                 && e.message().contains("still below the death threshold")
         })
         .unwrap_or_else(|| panic!("expected a WARN event naming the charged key: {events:#?}"));
-    let expected = format!("{DEFAULT_SCHEMA}.orders key=1 (1/5 deaths)");
+    // #799: a death is charged to the definition the key fails in.
+    let expected = format!("spans_charge_totals: {DEFAULT_SCHEMA}.orders key=1 (1/5 deaths)");
     assert_eq!(
         charged.fields.get("charged").map(String::as_str),
         Some(expected.as_str())

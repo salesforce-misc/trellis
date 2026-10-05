@@ -9,6 +9,9 @@
 //! own test conventions ("reach past the mechanism, insert directly" for
 //! whichever half of a scenario this module itself doesn't produce).
 
+#[path = "support/drain_driver.rs"]
+mod drain_driver;
+
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -171,11 +174,27 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     def
 }
 
-async fn insert_poison_marker(client: &Client, src_table: &str, key: &str) {
+/// The id of the definition whose bare target is `target`: whole-key poison
+/// is keyed by it (#799).
+async fn transform_id(client: &Client, target: &str) -> i64 {
+    client
+        .query_one(
+            "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("no definition {target:?}: {e}"))
+        .get(0)
+}
+
+/// Marks `(src_table, key)` poisoned for the definition `transform`.
+async fn insert_poison_marker(client: &Client, transform: &str, src_table: &str, key: &str) {
+    let id = transform_id(client, transform).await;
     client
         .execute(
-            "insert into poison (src_table, key, last_error) values ($1, $2, 'test')",
-            &[&src_table, &key],
+            "insert into poison (transform_id, src_table, key, last_error) \
+             values ($1, $2, $3, 'test')",
+            &[&id, &src_table, &key],
         )
         .await
         .expect("insert poison marker");
@@ -184,6 +203,7 @@ async fn insert_poison_marker(client: &Client, src_table: &str, key: &str) {
 #[allow(clippy::too_many_arguments)]
 async fn insert_poison_held(
     client: &Client,
+    transform: &str,
     src_table: &str,
     key: &str,
     seg_seq: i64,
@@ -192,11 +212,13 @@ async fn insert_poison_held(
     new_image: Option<&str>,
     origin_lsn: Option<u64>,
 ) {
+    let id = transform_id(client, transform).await;
     client
         .execute(
             "insert into poison_held \
-                 (src_table, key, seg_seq, op, lsn, old_image, new_image, origin_lsn, hop_gen) \
-             values ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, $8, 0)",
+                 (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, \
+                  origin_lsn, hop_gen) \
+             values ($9, $1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, $8, 0)",
             &[
                 &src_table,
                 &key,
@@ -206,6 +228,7 @@ async fn insert_poison_held(
                 &old_image,
                 &new_image,
                 &origin_lsn.map(PgLsn::from),
+                &id,
             ],
         )
         .await
@@ -270,9 +293,10 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
         .await
         .expect("seed orders row");
 
-    insert_poison_marker(&client, "orders", "1").await;
+    insert_poison_marker(&client, "order_totals", "orders", "1").await;
     insert_poison_held(
         &client,
+        "order_totals",
         "orders",
         "1",
         1,
@@ -291,7 +315,7 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
         "a parked poison_held row with origin_lsn <= token must gate convergence"
     );
 
-    let replayed = trellis::staging::release_key(&db.pool, "orders", "1")
+    let replayed = trellis::staging::release_key(&db.pool, "order_totals", "orders", "1")
         .await
         .expect("release_key");
     assert_eq!(replayed, 1);
@@ -421,8 +445,8 @@ async fn a_clean_drain_clears_death_counters() {
     let orders = qualify_fixture_table("orders");
     client
         .execute(
-            "insert into key_deaths (src_table, key, deaths, last_error) \
-             values ($1, '1', 3, 'earlier isolate attempt')",
+            "insert into key_deaths (transform_id, src_table, key, deaths, last_error) \
+             select id, $1, '1', 3, 'earlier isolate attempt' from transform_definitions",
             &[&orders],
         )
         .await
@@ -469,7 +493,7 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
 
     let orders = qualify_fixture_table("orders");
     // Key "2" is already poisoned from some earlier, unrelated failure.
-    insert_poison_marker(&client, &orders, "2").await;
+    insert_poison_marker(&client, "order_totals", &orders, "2").await;
 
     insert_cdc_row(
         &client,
@@ -520,7 +544,7 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
         "the excluding batch must have parked its own contribution for key 2"
     );
 
-    let replayed = trellis::staging::release_key(&db.pool, &orders, "2")
+    let replayed = trellis::staging::release_key(&db.pool, "order_totals", &orders, "2")
         .await
         .expect("release_key");
     assert_eq!(replayed, 1);
@@ -1087,19 +1111,21 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     );
 }
 
-/// Scenario: `poison_held` is idempotent on `(src_table, key, seg_seq)` — a
-/// retried park for the exact same batch and key must not duplicate or
-/// overwrite the row already parked for it.
+/// Scenario: `poison_held` is idempotent on `(transform_id, src_table, key,
+/// seg_seq)` — a retried park for the exact same definition, batch and key
+/// must not duplicate or overwrite the row already parked for it.
 #[tokio::test]
 async fn poison_held_is_idempotent_on_table_key_batch() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
 
     let insert = "insert into poison_held \
-                      (src_table, key, seg_seq, op, old_image, new_image, hop_gen) \
-                  values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0) \
-                  on conflict (src_table, key, seg_seq) do nothing";
+                      (transform_id, src_table, key, seg_seq, op, old_image, new_image, hop_gen) \
+                  select id, $1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0 \
+                  from transform_definitions \
+                  on conflict (transform_id, src_table, key, seg_seq) do nothing";
 
     client
         .execute(
@@ -1228,12 +1254,13 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
         .expect("seed orders row");
 
     let orders = qualify_fixture_table("orders");
-    insert_poison_marker(&client, &orders, "1").await;
+    insert_poison_marker(&client, "order_totals", &orders, "1").await;
     // Two excluding batches' own parked contributions for the same key,
     // inserted out of seg_seq order here to prove release doesn't just
     // replay insertion order.
     insert_poison_held(
         &client,
+        "order_totals",
         &orders,
         "1",
         2,
@@ -1245,6 +1272,7 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
     .await;
     insert_poison_held(
         &client,
+        "order_totals",
         &orders,
         "1",
         1,
@@ -1255,7 +1283,7 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
     )
     .await;
 
-    let replayed = trellis::staging::release_key(&db.pool, &orders, "1")
+    let replayed = trellis::staging::release_key(&db.pool, "order_totals", &orders, "1")
         .await
         .expect("release_key");
     assert_eq!(replayed, 2);
@@ -1549,8 +1577,8 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
 
     client
         .execute(
-            "insert into key_deaths (src_table, key, deaths, last_error) \
-             values ('orders', '1', 10, 'earlier isolate attempts')",
+            "insert into key_deaths (transform_id, src_table, key, deaths, last_error) \
+             select id, 'orders', '1', 10, 'earlier isolate attempts' from transform_definitions",
             &[],
         )
         .await
@@ -1706,10 +1734,16 @@ async fn transform_status(client: &Client, target: &str) -> String {
 /// what `quarantine::evict_key` writes, staged directly (this file's
 /// "reach past the mechanism, insert directly" convention) so the test below
 /// controls exactly when each eviction commits.
-async fn poison_in_txn(txn: &tokio_postgres::Transaction<'_>, src_table: &str, key: &str) {
+async fn poison_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    transform_id: i64,
+    src_table: &str,
+    key: &str,
+) {
     txn.execute(
-        "insert into poison (src_table, key, last_error) values ($1, $2, 'test')",
-        &[&src_table, &key],
+        "insert into poison (transform_id, src_table, key, last_error) \
+         values ($1, $2, $3, 'test')",
+        &[&transform_id, &src_table, &key],
     )
     .await
     .expect("insert poison marker inside a transaction");
@@ -1786,11 +1820,12 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
     let client = connect_raw(db.dsn()).await;
     seed_order_totals(&db, &client).await;
     let orders = qualify_fixture_table("orders");
+    let id = transform_id(&client, "order_totals").await;
 
     // Already committed: two short of the threshold, so neither transaction
     // below can cross it on the strength of its own single new eviction.
     for i in 0..(DEFAULT_TRANSFORM_DEATH_THRESHOLD - 2) {
-        insert_poison_marker(&client, &orders, &format!("settled-{i}")).await;
+        insert_poison_marker(&client, "order_totals", &orders, &format!("settled-{i}")).await;
     }
     assert_eq!(
         transform_status(&client, "order_totals").await,
@@ -1805,8 +1840,8 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
     // Worker A: poison one more key, check the fuse (sees `threshold - 1`,
     // correctly declines), and — post-fix — hold the gate until step 3.
     let txn_a = client_a.transaction().await.expect("begin worker a");
-    poison_in_txn(&txn_a, &orders, "concurrent-a").await;
-    trip_transform_fuse_if_crossed(&txn_a, &db.pool, &orders)
+    poison_in_txn(&txn_a, id, &orders, "concurrent-a").await;
+    trip_transform_fuse_if_crossed(&txn_a, id)
         .await
         .expect("worker a's fuse check");
     assert_eq!(
@@ -1817,8 +1852,8 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
 
     let worker_b = async {
         let txn_b = client_b.transaction().await.expect("begin worker b");
-        poison_in_txn(&txn_b, &orders, "concurrent-b").await;
-        trip_transform_fuse_if_crossed(&txn_b, &db.pool, &orders)
+        poison_in_txn(&txn_b, id, &orders, "concurrent-b").await;
+        trip_transform_fuse_if_crossed(&txn_b, id)
             .await
             .expect("worker b's fuse check");
         txn_b.commit().await.expect("commit worker b");
@@ -1856,139 +1891,6 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
         "quarantined",
         "a threshold's worth of poisoned keys reached by two concurrent evictions must trip the \
          whole-transform fuse just as promptly as one worker reaching it alone (issue #159)"
-    );
-}
-
-// ---------------------------------------------------------------------
-// Issue #281: the whole-transform fuse must resolve a *bare* `src_table`
-// before asking the catalog what to quarantine.
-// ---------------------------------------------------------------------
-
-/// A threshold's worth of `poison` rows must still trip the whole-transform
-/// fuse when the fuse check itself is handed the **bare** spelling of their
-/// source table (`orders`, not `public.orders`).
-///
-/// `trip_transform_fuse_if_crossed` used to hand its raw `src_table` straight
-/// to `catalog::transforms_for_source`, whose contract (issue #74, ADR-0007)
-/// requires an already-qualified name and whose non-qualified behaviour is to
-/// return an *empty* definition set rather than an error. So for a bare
-/// `src_table` the fuse counted its way past the threshold, logged nothing,
-/// quarantined nothing, and returned `Ok(())` — the poisoning defence silently
-/// absent for exactly the sources it was supposed to protect.
-///
-/// Issue #267 stopped `staging::apply` *emitting* a bare `src_table` going
-/// forward, but bare names still reach this function from durable pre-#267 ring
-/// rows, and from this crate's own integration fixtures (this file included)
-/// that stage `src_table` by hand. Pre-fix this test's final assertion sees
-/// `live`; post-fix the bare name is resolved through
-/// `catalog::resolve_graph_identity` exactly as every `apply.rs` call site
-/// already resolves it, and the fuse trips.
-///
-/// The `poison` rows themselves are staged **qualified** here, and were bare
-/// when this test landed with #281: issue #283 made the qualified identity
-/// `poison`'s canonical key rather than merely a spelling it might hold, so
-/// staging them bare now models legacy on-disk state that
-/// `V33__quarantine_canonical_src_table.sql` folds, not anything the live code
-/// produces. What #281 is actually about — the *argument* reaching the fuse
-/// bare, and having to be resolved before the catalog can answer with any
-/// definitions at all — is unchanged and still exactly what this test drives.
-/// The fold itself is covered by
-/// `the_v33_fold_combines_dual_spelling_quarantine_rows`, and the
-/// two-spellings-one-budget property by
-/// `two_spellings_of_one_source_charge_one_combined_fuse_budget`.
-#[tokio::test]
-async fn a_bare_src_table_still_trips_the_whole_transform_fuse() {
-    use trellis::staging::quarantine::{
-        DEFAULT_TRANSFORM_DEATH_THRESHOLD, trip_transform_fuse_if_crossed,
-    };
-
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    seed_order_totals(&db, &client).await;
-
-    // Deliberately bare: no `qualify_fixture_table`, i.e. exactly what a
-    // pre-#267 durable ring row (or a hand-staging fixture) leaves behind, and
-    // what the fuse check below is handed.
-    let bare = "orders";
-    assert!(
-        !bare.contains('.'),
-        "the whole point of this test is an unqualified spelling"
-    );
-    let orders = qualify_fixture_table(bare);
-    for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
-        insert_poison_marker(&client, &orders, &format!("bare-{i}")).await;
-    }
-    assert_eq!(
-        transform_status(&client, "order_totals").await,
-        "live",
-        "the fixture must start live — a non-live definition is invisible to \
-         `transforms_for_source` in the first place"
-    );
-
-    let mut fuse_client = db.pool.get().await.expect("pool connection");
-    let txn = fuse_client.transaction().await.expect("begin");
-    trip_transform_fuse_if_crossed(&txn, &db.pool, bare)
-        .await
-        .expect("fuse check must not error on a bare src_table");
-    txn.commit().await.expect("commit");
-
-    assert_eq!(
-        transform_status(&client, "order_totals").await,
-        "quarantined",
-        "a threshold's worth of poison rows under a bare `src_table` must quarantine the \
-         transform on that source, not silently resolve to zero definitions (issue #281)"
-    );
-}
-
-/// The `RelationshipReverseDeferred` sentinel `src_table`
-/// (`apply::relationship_reverse_deferred_src_table` — U+001F-prefixed, and
-/// neither bare nor qualified) is issue #281's one genuinely unresolvable
-/// spelling: it names no physical table and no definition's target, so the
-/// bare-name resolution the fix adds *cannot* succeed for it. It must fall
-/// through to the pre-existing "no definitions, nothing to do" outcome rather
-/// than surfacing `CatalogError::SourceTableNotFound` as a brand-new
-/// `ApplyError` from inside an eviction transaction.
-///
-/// (`isolate_and_evict` already skips deferred-reverse rows before they can
-/// reach the fuse at all — see
-/// `isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_reverse`
-/// above — so this pins the belt-and-braces behaviour of the `pub` function
-/// itself, which is also what a hand-written `poison` row for a since-dropped
-/// source table would hit.)
-#[tokio::test]
-async fn an_unresolvable_src_table_leaves_the_fuse_a_quiet_no_op() {
-    use trellis::staging::quarantine::{
-        DEFAULT_TRANSFORM_DEATH_THRESHOLD, trip_transform_fuse_if_crossed,
-    };
-
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    seed_order_totals(&db, &client).await;
-
-    for unresolvable in [
-        "\u{1f}trellis-rel-reverse-deferred:7",
-        "long_since_dropped_table",
-    ] {
-        for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
-            insert_poison_marker(&client, unresolvable, &format!("k-{i}")).await;
-        }
-        let mut fuse_client = db.pool.get().await.expect("pool connection");
-        let txn = fuse_client.transaction().await.expect("begin");
-        trip_transform_fuse_if_crossed(&txn, &db.pool, unresolvable)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("fuse check must not error on the unresolvable {unresolvable:?}: {e}")
-            });
-        txn.commit().await.expect("commit");
-    }
-
-    assert_eq!(
-        transform_status(&client, "order_totals").await,
-        "live",
-        "an unresolvable `src_table` names no definition, so it must quarantine nothing — \
-         least of all an unrelated live transform on a real source"
     );
 }
 
@@ -2082,20 +1984,13 @@ async fn two_spellings_of_one_source_charge_one_combined_fuse_budget() {
         let retry = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
             .await
             .expect("isolate_and_evict must not error on an unevaluable change");
-        let IsolationOutcome::Evicted {
-            retry_folded: retry,
-            ..
-        } = retry
-        else {
+        let IsolationOutcome::Evicted { evicted, .. } = retry else {
             panic!(
                 "the key staged under {src_table:?} must have been evicted at threshold 1, \
                  got {retry:?}"
             )
         };
-        assert!(
-            retry.is_empty(),
-            "the evicted key was the batch's only change, so nothing is left to retry"
-        );
+        assert_eq!(evicted, 1, "the batch's only key, for its only reader");
     }
 
     assert_eq!(
@@ -2144,6 +2039,7 @@ async fn below_threshold_charge_is_reported_distinctly_from_nothing_reproduced()
     assert_eq!(
         charged,
         vec![ChargedKey {
+            transform: "order_totals".to_string(),
             src_table: qualified.clone(),
             key: "7".to_string(),
             deaths: 1,
@@ -2154,14 +2050,10 @@ async fn below_threshold_charge_is_reported_distinctly_from_nothing_reproduced()
     let second = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 2)
         .await
         .expect("second isolate_and_evict");
-    let IsolationOutcome::Evicted {
-        retry_folded,
-        charged,
-    } = second
-    else {
+    let IsolationOutcome::Evicted { evicted, charged } = second else {
         panic!("the second charge reaches the threshold of 2 and must evict, got {second:?}")
     };
-    assert!(retry_folded.is_empty(), "the only key was evicted");
+    assert_eq!(evicted, 1, "the only key was evicted");
     assert!(charged.is_empty(), "no other key was charged");
     assert!(poison_marker_exists(&client, &qualified, "7").await);
 }
@@ -2203,270 +2095,6 @@ async fn two_spellings_of_one_row_charge_one_death_counter() {
         poison_marker_exists(&client, &qualified, "1").await,
         "the combined counter must reach the threshold and evict the key — pre-fix the two split \
          counters reached 2 and 1 and it never did (issue #283)"
-    );
-}
-
-/// Issue #159's serialization row lock (`transform_fuse_gate`) must serialize
-/// two concurrent evictions for one logical source **across spellings** — it was
-/// keyed per spelling, so two workers evicting the same source under different
-/// names took two different lock rows and serialized against nothing, which is
-/// the exact race that table exists to close.
-///
-/// Same forced interleaving as
-/// `concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse`
-/// (see its doc comment for why each ordering holds by construction rather than
-/// by timing), with one difference: worker A checks the fuse under the bare
-/// spelling and worker B under the qualified one. Pre-fix neither blocks on the
-/// other and neither trips — A counts zero rows under its bare name, B counts
-/// `threshold - 1` under its own — so the final assertion sees `live`. Post-fix
-/// both resolve to one gate row, B cannot count until A commits, and B's count
-/// includes A's row and trips.
-#[tokio::test]
-async fn the_fuse_gate_serializes_two_spellings_of_one_source() {
-    use std::time::Duration;
-
-    use trellis::staging::quarantine::{
-        DEFAULT_TRANSFORM_DEATH_THRESHOLD, trip_transform_fuse_if_crossed,
-    };
-
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    seed_order_totals(&db, &client).await;
-    let qualified = qualify_fixture_table("orders");
-    let bare = "orders";
-
-    for i in 0..(DEFAULT_TRANSFORM_DEATH_THRESHOLD - 2) {
-        insert_poison_marker(&client, &qualified, &format!("settled-{i}")).await;
-    }
-    assert_eq!(
-        transform_status(&client, "order_totals").await,
-        "live",
-        "the fixture must start live — a quarantined definition is skipped by the fuse check"
-    );
-
-    let mut client_a = db.pool.get().await.expect("pool connection for worker a");
-    let mut client_b = db.pool.get().await.expect("pool connection for worker b");
-
-    // Worker A: one more eviction, checked under the *bare* spelling.
-    let txn_a = client_a.transaction().await.expect("begin worker a");
-    poison_in_txn(&txn_a, &qualified, "concurrent-a").await;
-    trip_transform_fuse_if_crossed(&txn_a, &db.pool, bare)
-        .await
-        .expect("worker a's fuse check");
-    assert_eq!(
-        transform_status(&client, "order_totals").await,
-        "live",
-        "worker a alone only reaches `threshold - 1` visible keys, so it must not trip the fuse"
-    );
-
-    let mut worker_b_blocked = false;
-    let worker_b = async {
-        let txn_b = client_b.transaction().await.expect("begin worker b");
-        poison_in_txn(&txn_b, &qualified, "concurrent-b").await;
-        // The *qualified* spelling, against worker A's bare one.
-        trip_transform_fuse_if_crossed(&txn_b, &db.pool, &qualified)
-            .await
-            .expect("worker b's fuse check");
-        txn_b.commit().await.expect("commit worker b");
-    };
-    let release_worker_a = async {
-        for _ in 0..200 {
-            if backends_waiting_on_a_lock(&client).await > 0 {
-                worker_b_blocked = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        txn_a.commit().await.expect("commit worker a");
-    };
-    tokio::join!(worker_b, release_worker_a);
-
-    assert!(
-        worker_b_blocked,
-        "worker b must have parked on the one shared gate row while worker a held it — two \
-         spellings of one source that take two different lock rows serialize against nothing \
-         (issues #159, #283)"
-    );
-    assert_eq!(
-        transform_status(&client, "order_totals").await,
-        "quarantined",
-        "the second worker through the gate must count both spellings' evictions and trip the fuse"
-    );
-}
-
-/// `V33__quarantine_canonical_src_table.sql` must fold pre-existing bare rows
-/// into their qualified counterpart: `key_deaths.deaths` **summed**, the marker
-/// tables deduplicated, and every bare row gone afterwards.
-///
-/// Runs the migration's own SQL text (not a paraphrase of it) a second time,
-/// against dual-spelling rows staged directly — the migration itself has of
-/// course already run against this database, and every statement in it is
-/// idempotent and re-runnable by construction, which is what makes replaying it
-/// a legitimate way to test the fold. The `create temporary table` it opens with
-/// is local to this connection and dropped again at the end of the script.
-#[tokio::test]
-async fn the_v33_fold_combines_dual_spelling_quarantine_rows() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    seed_order_totals(&db, &client).await;
-    let qualified = qualify_fixture_table("orders");
-    let bare = "orders";
-
-    // A key poisoned under both spellings; a key poisoned only bare.
-    insert_poison_marker(&client, &qualified, "both").await;
-    insert_poison_marker(&client, bare, "both").await;
-    insert_poison_marker(&client, bare, "bare-only").await;
-
-    // Death counters to sum: 4 + 3 for the shared key, 2 for the bare-only one.
-    client
-        .execute(
-            "insert into key_deaths (src_table, key, deaths, last_error, last_death_at) values \
-                 ($1, 'both', 4, 'from the qualified row', now() - interval '1 hour'), \
-                 ($2, 'both', 3, 'from the bare row', now()), \
-                 ($2, 'bare-only', 2, 'bare only', now())",
-            &[&qualified, &bare],
-        )
-        .await
-        .expect("seed dual-spelling key_deaths rows");
-
-    // Held work under the bare spelling only, for the already-qualified key:
-    // the fold has to carry it across or `release_key` would never find it.
-    insert_poison_held(
-        &client,
-        bare,
-        "both",
-        1,
-        "insert",
-        None,
-        Some(r#"{"price":"1.00","tax":"0.10"}"#),
-        Some(1),
-    )
-    .await;
-
-    // The gate's own bookkeeping, one row per spelling.
-    client
-        .execute(
-            "insert into transform_fuse_gate (src_table, checks) values ($1, 7), ($2, 5)",
-            &[&qualified, &bare],
-        )
-        .await
-        .expect("seed dual-spelling gate rows");
-
-    // One `column_failures` row under each spelling for the same physical row
-    // and the same `(transform, column)` — the split dedup that let one
-    // stubborn row charge `column_deaths` twice.
-    client
-        .execute(
-            "insert into column_failures (transform_table, column_name, src_table, key, error) \
-             values ('public.order_totals', 'total', $1, 'both', 'qualified'), \
-                    ('public.order_totals', 'total', $2, 'both', 'bare')",
-            &[&qualified, &bare],
-        )
-        .await
-        .expect("seed dual-spelling column_failures rows");
-
-    client
-        .batch_execute(include_str!(
-            "../migrations/V33__quarantine_canonical_src_table.sql"
-        ))
-        .await
-        .expect("replay the V33 fold");
-
-    for table in [
-        "poison",
-        "poison_held",
-        "key_deaths",
-        "column_failures",
-        "transform_fuse_gate",
-    ] {
-        let leftover: i64 = client
-            .query_one(
-                &format!("select count(*) from {table} where src_table = $1"),
-                &[&bare],
-            )
-            .await
-            .expect("count bare rows")
-            .get(0);
-        assert_eq!(
-            leftover, 0,
-            "{table} must hold no bare-spelled rows once the fold has run"
-        );
-    }
-
-    assert_eq!(
-        poison_rows_for(&client, &qualified).await,
-        2,
-        "the shared key must have deduplicated and the bare-only key must have been carried across"
-    );
-    assert!(
-        poison_marker_exists(&client, &qualified, "bare-only").await,
-        "a key poisoned only under the bare spelling must survive the fold, qualified"
-    );
-
-    assert_eq!(
-        key_deaths_count(&client, &qualified, "both").await,
-        Some(7),
-        "the two split death counters for one physical row must be summed, not clobbered"
-    );
-    assert_eq!(
-        key_deaths_count(&client, &qualified, "bare-only").await,
-        Some(2),
-        "a counter that only ever existed bare must be carried across unchanged"
-    );
-    let last_error: String = client
-        .query_one(
-            "select last_error from key_deaths where src_table = $1 and key = 'both'",
-            &[&qualified],
-        )
-        .await
-        .expect("read the folded last_error")
-        .get(0);
-    assert_eq!(
-        last_error, "from the bare row",
-        "the surviving diagnostic must be whichever spelling's row died more recently"
-    );
-
-    let held: i64 = client
-        .query_one(
-            "select count(*) from poison_held where src_table = $1 and key = 'both'",
-            &[&qualified],
-        )
-        .await
-        .expect("count folded held rows")
-        .get(0);
-    assert_eq!(held, 1, "the bare row's parked work must be carried across");
-
-    let (checks, gate_rows): (i64, i64) = {
-        let row = client
-            .query_one(
-                "select (select checks from transform_fuse_gate where src_table = $1), \
-                        (select count(*) from transform_fuse_gate)",
-                &[&qualified],
-            )
-            .await
-            .expect("read the folded gate row");
-        (row.get(0), row.get(1))
-    };
-    assert_eq!(
-        gate_rows, 1,
-        "one lock row per logical source, not per spelling"
-    );
-    assert_eq!(checks, 12, "the gate's check bookkeeping must combine");
-
-    let failures: i64 = client
-        .query_one(
-            "select count(*) from column_failures where key = 'both'",
-            &[],
-        )
-        .await
-        .expect("count folded column_failures rows")
-        .get(0);
-    assert_eq!(
-        failures, 1,
-        "the split dedup key must collapse to one row for one physical row (issue #283) — this is \
-         the one place the dual spelling over-counted rather than under-counted"
     );
 }
 
@@ -2743,4 +2371,527 @@ async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
         vec![(1, "0.00".to_string()), (2, "1.00".to_string())],
         "keys 2, 3 and 4 applied; key 1 is held"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #799: whole-key poison is per transform. One definition's key
+// failure holds the key for that definition only; every other reader of
+// the source keeps applying it.
+// ---------------------------------------------------------------------
+
+/// [`seed_order_totals`] plus a second reader of `orders`, `order_prices`,
+/// whose target refuses a price of 100 or more: a constraint on its target,
+/// which fails `order_prices`' write for such a key and nobody else's.
+async fn seed_two_readers(db: &TestDatabase, client: &Client) {
+    let def = seed_order_totals(db, client).await;
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    let prices = create_definition(
+        &db.pool,
+        "TRANSFORM order_prices FROM orders SELECT price AS price",
+        &source_columns,
+    )
+    .await
+    .expect("create order_prices definition");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(
+        &db.pool,
+        &prices.def,
+        "public",
+        &pk,
+        &source_columns,
+        &prices.def.source,
+    )
+    .await
+    .expect("create order_prices table");
+    client
+        .batch_execute("alter table public.order_prices add constraint cheap check (price < 100)")
+        .await
+        .expect("constrain order_prices");
+}
+
+/// The ring table writers currently append to.
+async fn active_ring_table(client: &Client) -> String {
+    let slot: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    format!("seg_{slot}")
+}
+
+/// Writes `orders` row `(id, price, tax)` and stages its CDC insert or
+/// update into the active ring table, as capture would.
+async fn write_order(client: &Client, id: i32, price: &str, tax: &str) {
+    let existed = client
+        .query_opt("select 1 from orders where id = $1", &[&id])
+        .await
+        .expect("read orders")
+        .is_some();
+    client
+        .execute(
+            "insert into orders (id, price, tax) values ($1, $2::text::numeric, $3::text::numeric) \
+             on conflict (id) do update set price = excluded.price, tax = excluded.tax",
+            &[&id, &price, &tax],
+        )
+        .await
+        .expect("write the orders row");
+    let image = format!(r#"{{"id":"{id}","price":"{price}","tax":"{tax}"}}"#);
+    let (op, old_image) = if existed {
+        ("update", Some(image.as_str()))
+    } else {
+        ("insert", None)
+    };
+    insert_cdc_row(
+        client,
+        &active_ring_table(client).await,
+        &qualify_fixture_table("orders"),
+        &id.to_string(),
+        op,
+        old_image,
+        Some(&image),
+    )
+    .await;
+}
+
+/// Seals the active segment and drains it until the page commits. Each failed
+/// drain charges every key that fails alone one death, and the drain whose
+/// charge crosses the threshold evicts the key and commits the rest of the
+/// page. Returns how many drains failed first.
+async fn drain_through_evictions(client: &mut Client, pool: &trellis::Pool) -> usize {
+    let seg_seq = seal_active_segment(client).await;
+    let mut failures = 0;
+    loop {
+        match drain_result(pool, seg_seq).await {
+            Ok(Some(_)) => return failures,
+            Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
+            Err(_) => {
+                failures += 1;
+                assert!(failures <= 20, "the page never committed");
+            }
+        }
+    }
+}
+
+/// `(target, src_table, key)` for every `poison` row, in that order.
+async fn poisoned_for(client: &Client) -> Vec<(String, String, String)> {
+    client
+        .query(
+            "select split_part(d.target_table, '.', 2), p.src_table, p.key \
+             from poison p join transform_definitions d on d.id = p.transform_id \
+             order by 1, 2, 3",
+            &[],
+        )
+        .await
+        .expect("read poison")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+
+/// The single text value `sql` returns, or `None` for no row.
+async fn text_of(client: &Client, sql: &str) -> Option<String> {
+    client
+        .query_opt(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .map(|row| row.get(0))
+}
+
+/// How many rows of `table` (a quarantine table) belong to `target`.
+async fn rows_for(client: &Client, table: &str, target: &str) -> i64 {
+    client
+        .query_one(
+            &format!(
+                "select count(*) from {table} t join transform_definitions d \
+                 on d.id = t.transform_id where split_part(d.target_table, '.', 2) = $1"
+            ),
+            &[&target],
+        )
+        .await
+        .expect("count quarantine rows")
+        .get(0)
+}
+
+/// The blast radius (#799): `order_prices`' write of key 1 fails (its target
+/// refuses the price), so isolation charges the key to `order_prices` alone
+/// and, at the death threshold, holds it there. `order_totals` keeps applying
+/// key 1, both the change that failed and a later one, while `order_prices`
+/// parks them.
+async fn hold_key_1_for_order_prices(db: &TestDatabase, client: &mut Client) {
+    seed_two_readers(db, client).await;
+    write_order(client, 1, "500", "2").await;
+    write_order(client, 2, "20", "1").await;
+    let failures = drain_through_evictions(client, &db.pool).await;
+    assert_eq!(
+        failures,
+        trellis::staging::DEFAULT_DEATH_THRESHOLD as usize - 1,
+        "every drain below the threshold surfaces the failure, and the one that crosses it \
+         evicts the key and commits"
+    );
+}
+
+#[tokio::test]
+async fn a_key_one_definition_fails_on_stays_live_in_every_other_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    hold_key_1_for_order_prices(&db, &mut client).await;
+    let orders = qualify_fixture_table("orders");
+
+    assert_eq!(
+        poisoned_for(&client).await,
+        vec![("order_prices".to_string(), orders.clone(), "1".to_string())],
+        "the key is held for the definition whose write failed, and only for it"
+    );
+    assert_eq!(
+        text_of(&client, "select total::text from order_totals where id = 1").await,
+        Some("502".to_string()),
+        "order_totals applied the change order_prices failed on"
+    );
+    assert_eq!(
+        text_of(&client, "select price::text from order_prices where id = 1").await,
+        None,
+        "order_prices holds key 1"
+    );
+    assert_eq!(
+        text_of(&client, "select price::text from order_prices where id = 2").await,
+        Some("20".to_string()),
+        "the rest of the page applied to order_prices"
+    );
+    assert_eq!(
+        rows_for(&client, "key_deaths", "order_totals").await,
+        0,
+        "order_totals was never charged"
+    );
+
+    // A later change to key 1 reaches order_totals and is parked for
+    // order_prices.
+    write_order(&client, 1, "600", "3").await;
+    assert_eq!(drain_through_evictions(&mut client, &db.pool).await, 0);
+    assert_eq!(
+        text_of(&client, "select total::text from order_totals where id = 1").await,
+        Some("603".to_string()),
+        "order_totals keeps updating key 1"
+    );
+    assert_eq!(
+        text_of(&client, "select price::text from order_prices where id = 1").await,
+        None
+    );
+    assert_eq!(
+        rows_for(&client, "poison_held", "order_prices").await,
+        2,
+        "the evicting page's change and the later one are both held for order_prices"
+    );
+    assert_eq!(rows_for(&client, "poison_held", "order_totals").await, 0);
+}
+
+/// Rule 6 (#799): a wait scoped to a definition gates on its own held keys
+/// only. `order_prices` holds key 1, so a cluster-wide wait and a wait on
+/// `order_prices` don't converge, while one on `order_totals` does.
+#[tokio::test]
+async fn a_held_key_gates_its_own_definitions_wait_and_not_a_siblings() {
+    use std::time::Duration;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    hold_key_1_for_order_prices(&db, &mut client).await;
+    let token = converge::watermark_token(&client)
+        .await
+        .expect("watermark token");
+
+    let totals = transform_id(&client, "order_totals").await;
+    let prices = transform_id(&client, "order_prices").await;
+    converge::await_converged_for(&client, token, Duration::ZERO, totals)
+        .await
+        .expect("order_totals holds nothing, so its wait converges");
+    assert!(
+        converge::await_converged_for(&client, token, Duration::ZERO, prices)
+            .await
+            .is_err(),
+        "order_prices' held key gates its own wait"
+    );
+    assert!(
+        converge::await_converged(&client, token, Duration::ZERO)
+            .await
+            .is_err(),
+        "a cluster-wide wait counts every definition's held keys"
+    );
+}
+
+/// Resume (#799 rule 5): resuming `order_prices` deletes its own `poison`,
+/// `poison_held` and `key_deaths` rows before its fresh build, and leaves the
+/// key `order_totals` holds exactly as it was.
+#[tokio::test]
+async fn resuming_a_definition_releases_its_own_held_keys_only() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    hold_key_1_for_order_prices(&db, &mut client).await;
+    let orders = qualify_fixture_table("orders");
+
+    // order_totals holds key 2, with parked work of its own.
+    insert_poison_marker(&client, "order_totals", &orders, "2").await;
+    insert_poison_held(
+        &client,
+        "order_totals",
+        &orders,
+        "2",
+        1,
+        "update",
+        None,
+        Some(r#"{"price":"20","tax":"1"}"#),
+        Some(10),
+    )
+    .await;
+    assert!(rows_for(&client, "key_deaths", "order_prices").await > 0);
+
+    // Frozen by hand, as `PAUSE TRANSFORM` freezes it.
+    client
+        .batch_execute(
+            "update transform_definitions set status = 'paused' \
+             where split_part(target_table, '.', 2) = 'order_prices'",
+        )
+        .await
+        .expect("pause order_prices");
+    trellis::staging::quarantine::resume_transform(&db.pool, "order_prices")
+        .await
+        .expect("resume order_prices");
+
+    for table in ["poison", "poison_held", "key_deaths"] {
+        assert_eq!(
+            rows_for(&client, table, "order_prices").await,
+            0,
+            "{table}: the resume releases every key order_prices held"
+        );
+    }
+    assert_eq!(
+        poisoned_for(&client).await,
+        vec![("order_totals".to_string(), orders, "2".to_string())],
+        "order_totals' held key is untouched"
+    );
+    assert_eq!(rows_for(&client, "poison_held", "order_totals").await, 1);
+}
+
+/// Release (#799 rule 4): releasing `order_prices`' key 1, once its cause is
+/// gone, stages a `Recompute` that re-derives the key for `order_prices` from
+/// the live row. It reaches `order_totals` too, as an idempotent re-derive,
+/// which leaves its row as it was.
+#[tokio::test]
+async fn releasing_a_key_re_derives_it_for_its_definition_and_leaves_a_sibling_unchanged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    hold_key_1_for_order_prices(&db, &mut client).await;
+    let orders = qualify_fixture_table("orders");
+
+    client
+        .batch_execute("alter table public.order_prices drop constraint cheap")
+        .await
+        .expect("fix the cause");
+    let released = trellis::staging::release_key(&db.pool, "order_prices", &orders, "1")
+        .await
+        .expect("release key 1 for order_prices");
+    assert_eq!(released, 1, "the evicting page's change was held");
+    assert_eq!(poisoned_for(&client).await, vec![]);
+    for table in ["poison_held", "key_deaths"] {
+        assert_eq!(rows_for(&client, table, "order_prices").await, 0, "{table}");
+    }
+
+    assert_eq!(drain_through_evictions(&mut client, &db.pool).await, 0);
+    assert_eq!(
+        text_of(&client, "select price::text from order_prices where id = 1").await,
+        Some("500".to_string()),
+        "order_prices re-derived key 1 from its live row"
+    );
+    assert_eq!(
+        text_of(&client, "select total::text from order_totals where id = 1").await,
+        Some("502".to_string()),
+        "order_totals' row is unchanged"
+    );
+}
+
+/// The whole-transform fuse (#799 rule 1) counts a definition's own held
+/// keys: `order_totals` holding four keys and `order_prices` four more trips
+/// neither, though the source has eight held keys, and `order_prices`' fifth
+/// eviction trips it alone.
+#[tokio::test]
+async fn a_definitions_fuse_trips_on_its_own_evictions_only() {
+    use trellis::staging::quarantine::DEFAULT_TRANSFORM_DEATH_THRESHOLD;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_two_readers(&db, &client).await;
+    let orders = qualify_fixture_table("orders");
+    let below = DEFAULT_TRANSFORM_DEATH_THRESHOLD - 1;
+
+    for i in 0..below {
+        insert_poison_marker(&client, "order_totals", &orders, &format!("held-{i}")).await;
+    }
+    for id in 11..11 + below {
+        write_order(&client, id, "500", "1").await;
+    }
+    drain_through_evictions(&mut client, &db.pool).await;
+    assert_eq!(
+        rows_for(&client, "poison", "order_prices").await,
+        below as i64
+    );
+    assert_eq!(transform_status(&client, "order_prices").await, "live");
+    assert_eq!(transform_status(&client, "order_totals").await, "live");
+
+    write_order(&client, 99, "500", "1").await;
+    drain_through_evictions(&mut client, &db.pool).await;
+    assert_eq!(
+        transform_status(&client, "order_prices").await,
+        "quarantined",
+        "order_prices' own fifth held key trips its fuse"
+    );
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "live",
+        "order_totals is charged for its own held keys only"
+    );
+    assert_eq!(
+        text_of(
+            &client,
+            "select total::text from order_totals where id = 99"
+        )
+        .await,
+        Some("501".to_string()),
+        "order_totals applied every key order_prices failed on"
+    );
+}
+
+/// A to-side key whose relationship work fails (#799): its image lacks the
+/// relationship's `to_col`, which only the reverse work for the definitions
+/// reading `par` through `parent` reads. Isolation finds the key fails with
+/// `par`'s direct reader left out, so it holds the key for the relationship's
+/// reader, `src_w`, whose share of the work then leaves it out, and `par_w`,
+/// which reads `par` directly, applies it. Released, the key's `Recompute`
+/// re-derives it from the live row, which has the column.
+#[tokio::test]
+async fn a_to_side_key_failing_in_its_relationship_work_is_held_for_its_relationship_readers() {
+    const PAR: &str = "public.par";
+    let mut d = drain_driver::Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code text unique, w numeric); \
+         create table public.src (id integer primary key, p text); \
+         insert into public.par values (1, 'a', 10); \
+         insert into public.src values (1, 'a');",
+        &[
+            ("id", ValueType::Numeric),
+            ("w", ValueType::Numeric),
+            ("p", ValueType::Text),
+        ],
+        &["RELATIONSHIP parent FROM src.p TO par.code"],
+        &[
+            "TRANSFORM src_w FROM public.src SELECT parent.w AS pw",
+            "TRANSFORM par_w FROM public.par SELECT w AS w",
+        ],
+        &[PAR, "public.src"],
+    )
+    .await;
+
+    // Key 5's row, written past capture, and a change for it staged by hand
+    // with an image that lacks `code`.
+    d.ctl
+        .batch_execute(
+            "set session_replication_role = replica; \
+             insert into public.par values (5, 'e', 9); \
+             reset session_replication_role",
+        )
+        .await
+        .expect("write par 5 uncaptured");
+    let ring = active_ring_table(&d.ctl).await;
+    insert_cdc_row(
+        &d.ctl,
+        &ring,
+        PAR,
+        "5",
+        "insert",
+        None,
+        Some(r#"{"id":"5","w":"9"}"#),
+    )
+    .await;
+    let seg_seq = d.seal().await;
+    let mut failures = 0;
+    while drain_result(d.pool(), seg_seq).await.is_err() {
+        failures += 1;
+        assert!(failures <= 20, "the page never committed");
+    }
+    assert_eq!(
+        failures,
+        trellis::staging::DEFAULT_DEATH_THRESHOLD as usize - 1
+    );
+
+    assert_eq!(
+        poisoned_for(&d.ctl).await,
+        vec![("src_w".to_string(), PAR.to_string(), "5".to_string())],
+        "the key is held for the relationship's reader, not par's direct reader"
+    );
+    assert_eq!(
+        text_of(&d.ctl, "select w::text from public.par_w where id = 5").await,
+        Some("9".to_string()),
+        "par_w applied the key"
+    );
+    assert_eq!(rows_for(&d.ctl, "poison_held", "src_w").await, 1);
+
+    trellis::staging::release_key(d.pool(), "src_w", PAR, "5")
+        .await
+        .expect("release par 5 for src_w");
+    let seg_seq = d.seal().await;
+    assert!(
+        drain_result(d.pool(), seg_seq).await.is_ok(),
+        "the release's Recompute reads the live row, which has `code`"
+    );
+    assert_eq!(poisoned_for(&d.ctl).await, vec![]);
+}
+
+/// #799 with #663: a definition that holds a key and is then paused by a
+/// halt is frozen, so the drain no longer reads its poison at all. A later
+/// change to the key is neither applied nor parked for it (its resume
+/// rebuilds it), and the sibling keeps applying the key. The resume clears
+/// the halt and the held key together.
+#[tokio::test]
+async fn a_halted_definitions_held_key_is_neither_parked_again_nor_left_after_its_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    hold_key_1_for_order_prices(&db, &mut client).await;
+    let orders = qualify_fixture_table("orders");
+
+    // Paused by a halt, as `staging::halt` pauses a closure.
+    client
+        .execute(
+            "with d as ( \
+                 update transform_definitions set status = 'paused' \
+                 where split_part(target_table, '.', 2) = 'order_prices' returning id) \
+             insert into capture_failures (transform_id, source_table, columns, error, kind) \
+             select id, $1, '{}', 'the drain halted', 'halt' from d",
+            &[&orders],
+        )
+        .await
+        .expect("halt order_prices");
+
+    write_order(&client, 1, "700", "4").await;
+    assert_eq!(drain_through_evictions(&mut client, &db.pool).await, 0);
+    assert_eq!(
+        text_of(&client, "select total::text from order_totals where id = 1").await,
+        Some("704".to_string()),
+        "order_totals keeps applying key 1"
+    );
+    assert_eq!(
+        rows_for(&client, "poison_held", "order_prices").await,
+        1,
+        "nothing more is parked for a frozen definition: its resume rebuilds it"
+    );
+
+    trellis::staging::quarantine::resume_transform(&db.pool, "order_prices")
+        .await
+        .expect("resume order_prices");
+    for table in ["poison", "poison_held", "key_deaths", "capture_failures"] {
+        assert_eq!(rows_for(&client, table, "order_prices").await, 0, "{table}");
+    }
 }

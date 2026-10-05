@@ -423,18 +423,24 @@ async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_release
     let mut client = connect_raw(db.dsn()).await;
     seed_sales(&db.pool, &client).await;
     client
-        .batch_execute(
-            "insert into public.sales values (4, 'a', 1000); \
-             insert into poison_held (src_table, key, seg_seq, op, lsn, new_image) \
-             values ('public.sales', '4', 1, 'insert', pg_current_wal_insert_lsn(), \
-                     '{\"id\":\"4\",\"sku\":\"a\",\"amount\":\"1000\"}')",
-        )
+        .batch_execute("insert into public.sales values (4, 'a', 1000)")
         .await
-        .expect("commit the change and park its CDC");
+        .expect("commit the change");
 
     build_sku_totals_to_go_live(&db.pool, &client).await;
+    // Whole-key poison is per transform (#799), so the parked CDC is
+    // sku_totals', recorded once the definition exists.
+    client
+        .batch_execute(
+            "insert into poison_held (transform_id, src_table, key, seg_seq, op, lsn, new_image) \
+             select id, 'public.sales', '4', 1, 'insert', pg_current_wal_insert_lsn(), \
+                    '{\"id\":\"4\",\"sku\":\"a\",\"amount\":\"1000\"}' \
+             from transform_definitions where target_table = 'public.sku_totals'",
+        )
+        .await
+        .expect("park the change's CDC");
 
-    let replayed = trellis::staging::release_key(&db.pool, "public.sales", "4")
+    let replayed = trellis::staging::release_key(&db.pool, "sku_totals", "public.sales", "4")
         .await
         .expect("release the parked key");
     assert_eq!(replayed, 1);

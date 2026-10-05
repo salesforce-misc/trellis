@@ -1031,16 +1031,17 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
 ///   the target and goes with it; its forensic value is about rows that are
 ///   about to stop existing.
 /// - the whole-key poison band (`poison`, `poison_held`, `key_deaths`) and the
-///   fuse gate are keyed to the **source** table and co-owned by every
-///   definition reading it, so a drop leaves them exactly as it found them. A
-///   drain worker may be mid-batch over that source right now, for a sibling
-///   that is still live.
+///   fuse gate are per transform (#799): the dropped definition's rows go
+///   with it, by `on delete cascade`, and a sibling reading the same source
+///   keeps its own, exactly as the drop found them. A drain worker may be
+///   mid-batch over that source right now, for the sibling that is still
+///   live.
 ///
 /// The rows are seeded directly rather than provoked through a real poisoning,
 /// because what's under test is which rows a drop removes, not how they came
 /// to exist.
 #[tokio::test]
-async fn dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band() {
+async fn dropping_takes_target_owned_quarantine_rows_and_leaves_a_siblings_poison() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -1087,24 +1088,33 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band(
     .await
     .expect("seed column_pause_cascades");
 
+    // The same key held for both definitions.
+    let both = "select id from transform_definitions \
+                where split_part(target_table, '.', 2) in ('order_rollup', 'order_echo')";
     raw.execute(
-        "insert into poison (src_table, key, last_error) values ($1, '1', 'boom')",
+        &format!(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, '1', 'boom' from ({both}) d"
+        ),
         &[&qualified_source],
     )
     .await
-    .expect("seed the source-keyed poison band");
+    .expect("seed the poison band");
     raw.execute(
-        "insert into key_deaths (src_table, key, deaths, last_error) values ($1, '1', 2, 'boom')",
+        &format!(
+            "insert into key_deaths (transform_id, src_table, key, deaths, last_error) \
+             select id, $1, '1', 2, 'boom' from ({both}) d"
+        ),
         &[&qualified_source],
     )
     .await
     .expect("seed key_deaths");
     raw.execute(
-        "insert into transform_fuse_gate (src_table) values ($1)",
-        &[&qualified_source],
+        &format!("insert into transform_fuse_gate (transform_id) select id from ({both}) d"),
+        &[],
     )
     .await
-    .expect("seed the per-source fuse gate");
+    .expect("seed the fuse gates");
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -1150,22 +1160,26 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band(
         "a cascade edge naming the dropped target on either end goes with it"
     );
 
-    // Source-keyed and shared: untouched.
-    assert_eq!(
-        count(&raw, "select count(*) from poison").await,
-        1,
-        "the whole-key poison band is keyed to the source and shared with siblings"
-    );
-    assert_eq!(
-        count(&raw, "select count(*) from key_deaths").await,
-        1,
-        "key_deaths is the independent per-key fuse tier, also source-keyed"
-    );
-    assert_eq!(
-        count(&raw, "select count(*) from transform_fuse_gate").await,
-        1,
-        "the per-source fuse serialization row survives its reader"
-    );
+    // Per transform (#799): the dropped definition's rows go with it, and
+    // the sibling's stay.
+    let echo = "(select id from transform_definitions \
+                 where split_part(target_table, '.', 2) = 'order_echo')";
+    for table in ["poison", "key_deaths", "transform_fuse_gate"] {
+        assert_eq!(
+            count(&raw, &format!("select count(*) from {table}")).await,
+            1,
+            "{table}: the dropped definition's row goes with it, the sibling's stays"
+        );
+        assert_eq!(
+            count(
+                &raw,
+                &format!("select count(*) from {table} where transform_id = {echo}")
+            )
+            .await,
+            1,
+            "{table}: the row left is the sibling's"
+        );
+    }
 }
 
 /// Per-definition backfill work is the one thing keyed to the definition, and

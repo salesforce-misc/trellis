@@ -27,9 +27,9 @@
 //!
 //! [`Trellis::poisoned_since`] *is* surfaced here, called with `UNIX_EPOCH`
 //! as the watermark. Despite its name suggesting a point-in-time delta, the
-//! underlying `poison` table (see `trellis/migrations/V13__quarantine.sql`
+//! underlying `poison` table (see `trellis/migrations/V71__poison_per_transform.sql`
 //! and `trellis::staging::quarantine`) is a live marker of which
-//! `(src_table, key)` pairs are *currently* evicted, not an append-only
+//! `(src_table, key)` pairs are *currently* held for which definition, not an append-only
 //! log — rows are deleted on release, not just inserted on poison. So
 //! `poisoned_since(UNIX_EPOCH)` returns exactly today's outstanding
 //! quarantine set, which is precisely the "what's poisoned right now"
@@ -144,8 +144,8 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
     let mut out = format!("Quarantined source rows: {}\n", poisoned.len());
     for entry in poisoned {
         out.push_str(&format!(
-            "  table={} key={:?} error={:?}\n",
-            entry.src_table, entry.key, entry.last_error
+            "  transform={} table={} key={:?} error={:?}\n",
+            entry.transform, entry.src_table, entry.key, entry.last_error
         ));
     }
     out
@@ -481,6 +481,7 @@ mod tests {
         use trellis::PoisonEntry;
 
         let entry = PoisonEntry {
+            transform: "order_totals".to_string(),
             src_table: "orders".to_string(),
             key: "42".to_string(),
             last_error: "division by zero".to_string(),
@@ -488,6 +489,7 @@ mod tests {
         };
         let formatted = format_poisoned(std::slice::from_ref(&entry));
         assert!(formatted.contains("Quarantined source rows: 1"));
+        assert!(formatted.contains("transform=order_totals"));
         assert!(formatted.contains("table=orders"));
         assert!(formatted.contains("key=\"42\""));
         assert!(formatted.contains("error=\"division by zero\""));

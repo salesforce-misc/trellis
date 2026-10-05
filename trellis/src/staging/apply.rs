@@ -25,7 +25,7 @@
 //! blocked on aggregate transform-defs) would call before it.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5073,18 +5073,19 @@ pub struct ApplyPlan {
     /// this used to be a documented propagation gap).
     aggregate_clears: HashMap<String, AggregateClearPlan>,
     /// Issue #16: the (non-truncate) folded records whose `(src_table,
-    /// key)` is already in the `poison` marker table — excluded from every
-    /// map above (the fold excludes a poisoned key *globally*, not just
-    /// from evaluation), and instead parked into `poison_held` by
-    /// [`apply_and_mark_drained`], in the same Phase-3 transaction, before
-    /// the drained mark. See `quarantine::park_batch_contribution`'s doc
-    /// comment for why this must happen even when this batch didn't cause
-    /// the key's eviction.
-    poisoned_park: Vec<FoldedChange>,
-    /// Issue #16: every non-truncate, non-poisoned `(src_table, key)` this
-    /// batch computed against — cleared from `key_deaths` by
+    /// key)` is poisoned for a definition that reads it, each paired with
+    /// that definition's id — left out of that definition's plan only
+    /// (#799: every other reader applies it), and instead parked into
+    /// `poison_held` for it by [`apply_and_mark_drained`], in the same
+    /// Phase-3 transaction, before the drained mark. See
+    /// `quarantine::park_batch_contribution`'s doc comment for why this must
+    /// happen even when this batch didn't cause the key's eviction.
+    poisoned_park: Vec<(i64, FoldedChange)>,
+    /// Issue #16: every non-truncate `(src_table, key)` this batch computed
+    /// against for at least one definition — cleared from `key_deaths` by
     /// [`apply_and_mark_drained`] on a successful commit, per doc 06's "a
-    /// clean drain clears the counters for the keys it just applied."
+    /// clean drain clears the counters for the keys it just applied", for
+    /// every definition the key isn't poisoned for (#799).
     applied_keys: Vec<(String, String)>,
     /// Issue #30's reverse recompute: when a *to-side* (related) row changed,
     /// each `(from_table, from_key_text, hop_gen)` here is a from-side row
@@ -5329,6 +5330,164 @@ async fn from_side_key(
     Ok(None)
 }
 
+/// Each of `changes`' [`KeyExclusion`] (#799), or `None` when every one is
+/// empty, the common case, which costs no allocation: `changes` are the folded
+/// changes to `source_key` (canonical), `defs` the definitions that apply
+/// it directly, `inbound_rels` the relationships whose to-side it is, and
+/// `poisoned` the batch's poison ([`quarantine::poisoned_keys_among`]).
+///
+/// A relationship's reverse work leaves a key out only when the relationship
+/// has a reader that isn't frozen and every such reader holds the key: it
+/// keeps the settled projection and the from-side's rows current for all of
+/// them at once. Its readers are read only when one of `changes` is
+/// poisoned. `focus` overrides one key's direct readers for an isolation
+/// probe, and never a relationship's.
+async fn key_exclusions(
+    pool: &Pool,
+    source_key: &str,
+    changes: &[&FoldedChange],
+    defs: &[crate::defs::model::Definition],
+    inbound_rels: &[RelationshipDefinition],
+    poisoned: &HashMap<(String, String), HashSet<i64>>,
+    focus: Option<&ProbeFocus<'_>>,
+) -> Result<Option<Vec<KeyExclusion>>, ApplyError> {
+    let lookup = |key: &str| poisoned.get(&(source_key.to_string(), key.to_string()));
+    let any_poisoned = !poisoned.is_empty() && changes.iter().any(|c| lookup(&c.key).is_some());
+    if !any_poisoned && focus.is_none() {
+        return Ok(None);
+    }
+    let rel_readers = if any_poisoned && !inbound_rels.is_empty() {
+        relationship_reader_map(pool).await?
+    } else {
+        HashMap::new()
+    };
+    let no_readers: Vec<(i64, String)> = Vec::new();
+    let exclusions: Vec<KeyExclusion> = changes
+        .iter()
+        .map(|change| {
+            let poisoned_for = lookup(&change.key);
+            let mut exclusion = KeyExclusion::default();
+            for def in defs {
+                let excluded = focus
+                    .and_then(|focus| focus.excludes(source_key, &change.key, def.id))
+                    .unwrap_or_else(|| poisoned_for.is_some_and(|ids| ids.contains(&def.id)));
+                if excluded {
+                    exclusion.defs.insert(def.id);
+                    exclusion.park_for.insert(def.id);
+                }
+            }
+            if let Some(ids) = poisoned_for {
+                for rel in inbound_rels {
+                    let readers = rel_readers.get(&rel.id).unwrap_or(&no_readers);
+                    if !readers.is_empty() && readers.iter().all(|(id, _)| ids.contains(id)) {
+                        exclusion.rels.insert(rel.id);
+                    }
+                    for (id, _) in readers {
+                        if ids.contains(id) {
+                            exclusion.park_for.insert(*id);
+                        }
+                    }
+                }
+            }
+            exclusion
+        })
+        .collect();
+    Ok((!exclusions.iter().all(KeyExclusion::is_empty)).then_some(exclusions))
+}
+
+/// Whether `exclusions` ([`key_exclusions`]) leave change `i` out of the
+/// reverse work of relationship `rel`.
+fn skips_relationship(exclusions: &Option<Vec<KeyExclusion>>, i: usize, rel: i64) -> bool {
+    exclusions
+        .as_ref()
+        .is_some_and(|exclusions| exclusions[i].rels.contains(&rel))
+}
+
+/// One definition's share of a source's `changes` and their decoded images
+/// (`rows`, `old_rows`): every change but those `exclusions` leave out of
+/// `transform_id` (#799). Borrowed when it leaves out none, the common case.
+#[allow(clippy::type_complexity)]
+fn definition_share<'c, 'f>(
+    transform_id: i64,
+    changes: &'c [&'f FoldedChange],
+    rows: &'c [Option<Row>],
+    old_rows: &'c [Option<Row>],
+    exclusions: &Option<Vec<KeyExclusion>>,
+) -> (
+    Cow<'c, [&'f FoldedChange]>,
+    Cow<'c, [Option<Row>]>,
+    Cow<'c, [Option<Row>]>,
+) {
+    let Some(exclusions) = exclusions
+        .as_ref()
+        .filter(|exclusions| exclusions.iter().any(|e| e.defs.contains(&transform_id)))
+    else {
+        return (
+            Cow::Borrowed(changes),
+            Cow::Borrowed(rows),
+            Cow::Borrowed(old_rows),
+        );
+    };
+    let keep: Vec<usize> = (0..changes.len())
+        .filter(|&i| !exclusions[i].defs.contains(&transform_id))
+        .collect();
+    (
+        Cow::Owned(keep.iter().map(|&i| changes[i]).collect()),
+        Cow::Owned(keep.iter().map(|&i| rows[i].clone()).collect()),
+        Cow::Owned(keep.iter().map(|&i| old_rows[i].clone()).collect()),
+    )
+}
+
+/// The definitions that aren't frozen and read through each relationship,
+/// by relationship id, each with its bare target, in id order (#799).
+async fn relationship_reader_map(
+    pool: &Pool,
+) -> Result<HashMap<i64, Vec<(i64, String)>>, ApplyError> {
+    let client = pool.get().await?;
+    let catalog = crate::capture::columns::load_catalog(&**client, pool.schema()).await?;
+    let unfrozen: HashSet<i64> = client
+        .query(
+            "select id from transform_definitions where status = any($1)",
+            &[&crate::defs::model::TransformStatus::dispatchable()],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    Ok(catalog
+        .relationships
+        .iter()
+        .map(|rel| {
+            let readers = crate::capture::columns::relationship_readers(&catalog, rel)
+                .into_iter()
+                .filter(|reader| unfrozen.contains(&reader.id))
+                .map(|reader| (reader.id, reader.def.target.clone()))
+                .collect();
+            (rel.id, readers)
+        })
+        .collect())
+}
+
+/// The definitions that aren't frozen and read `table` (canonical) through a
+/// relationship to it, each with its bare target, in id order (#799): whose
+/// share of a to-side key's work isolation charges a failure in it to
+/// (`quarantine::attribute`).
+pub(super) async fn relationship_readers_of(
+    pool: &Pool,
+    table: &str,
+) -> Result<Vec<(i64, String)>, ApplyError> {
+    let rels = catalog::relationships_to_table(pool, table).await?;
+    if rels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut by_rel = relationship_reader_map(pool).await?;
+    let mut readers: BTreeMap<i64, String> = BTreeMap::new();
+    for rel in rels {
+        readers.extend(by_rel.remove(&rel.id).unwrap_or_default());
+    }
+    Ok(readers.into_iter().collect())
+}
+
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
 /// folded change's `f()` against the transform currently reading its
 /// source table, grouped by (unqualified) `src_table` so each source's
@@ -5348,21 +5507,73 @@ async fn from_side_key(
 /// — an event carries the same `src_table`/`changes` information without
 /// that cost). [`apply_target`] (Phase 3) is this tree's next, more
 /// fine-grained span, one per consuming transform.
+pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, ApplyError> {
+    compute_focused(pool, folded, None).await
+}
+
+/// One key an isolation probe (`quarantine::attribute`, #799) applies with
+/// every definition that reads its table directly left out, but `only`:
+/// the probe that tells which definition's apply a key fails in. The key's
+/// poison for the definitions reading it through a relationship stands as
+/// it is, so with `only` `None` the probe applies just their share.
+pub(super) struct ProbeFocus<'a> {
+    /// Canonical, as `poison` keys it.
+    pub src_table: &'a str,
+    pub key: &'a str,
+    pub only: Option<i64>,
+}
+
+impl ProbeFocus<'_> {
+    /// Whether this focus leaves `key` of `src_table` out of `transform_id`.
+    /// `None` for a key it doesn't name.
+    fn excludes(&self, src_table: &str, key: &str, transform_id: i64) -> Option<bool> {
+        (self.src_table == src_table && self.key == key).then_some(self.only != Some(transform_id))
+    }
+}
+
+/// Which work a folded change's key is left out of (#799): the direct
+/// readers it's poisoned for, and the relationships whose every reader it's
+/// poisoned for.
+#[derive(Default)]
+struct KeyExclusion {
+    /// Readers of the change's own table (`defs` ids) that skip it.
+    defs: HashSet<i64>,
+    /// Relationships to the change's table (ids) whose reverse work skips it.
+    rels: HashSet<i64>,
+    /// Every definition the change is parked for: each one above, and each
+    /// relationship reader the key is poisoned for.
+    park_for: BTreeSet<i64>,
+}
+
+impl KeyExclusion {
+    /// Whether it leaves the change out of nothing.
+    fn is_empty(&self) -> bool {
+        self.defs.is_empty() && self.rels.is_empty() && self.park_for.is_empty()
+    }
+}
+
+/// [`compute`], with `focus` overriding one key's direct readers for an
+/// isolation probe.
 #[tracing::instrument(
     name = "staging.compute",
-    skip(pool, folded),
+    skip(pool, folded, focus),
     fields(
         folded = folded.len(),
         poisoned = tracing::field::Empty,
         sources = tracing::field::Empty,
     )
 )]
-pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, ApplyError> {
-    // Issue #16: exclude already-poisoned keys before anything else touches
-    // them — the fold excludes a poisoned key globally, not just from this
-    // one batch's evaluation. Truncate sentinels are never candidates: a
-    // truncate is whole-keyspace, not a key quarantine can attribute
-    // anything to.
+pub(super) async fn compute_focused(
+    pool: &Pool,
+    folded: &[FoldedChange],
+    focus: Option<&ProbeFocus<'_>>,
+) -> Result<ApplyPlan, ApplyError> {
+    // Issue #16: find the already-poisoned keys before anything else touches
+    // them. Whole-key poison is per transform (#799): a poisoned key is left
+    // out of the apply of each definition it's poisoned for, decided per
+    // source below, and every other reader applies it. Truncate sentinels
+    // are never candidates: a truncate is whole-keyspace, not a key
+    // quarantine can attribute anything to.
     //
     // Issue #283: every quarantine table — `poison` included — is keyed on the
     // *canonical* (qualified, where resolvable) identity of a source table, not
@@ -5422,7 +5633,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // `RelationshipReverseRecord` in its own loop, right after `by_source`'s
     // — see that loop's comment.
     let mut relationship_reverse_deferrals: Vec<&FoldedChange> = Vec::new();
-    let mut poisoned_park: Vec<FoldedChange> = Vec::new();
+    let mut poisoned_park: Vec<(i64, FoldedChange)> = Vec::new();
     let mut applied_keys: Vec<(String, String)> = Vec::new();
     for change in folded {
         if change.is_truncate {
@@ -5433,30 +5644,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             relationship_reverse_deferrals.push(change);
             continue;
         }
-        // Canonical on all three lines below, per this function's `poisoned`
-        // comment above (issue #283): the exclusion match, the parked row's own
-        // `src_table` (`poison_held` is keyed canonically, and issue #267 made
-        // the qualified spelling the ring invariant a release would replay it
+        // Canonical, per this function's `poisoned` comment above (issue
+        // #283): the exclusion match, the parked row's own `src_table`
+        // (`poison_held` is keyed canonically, and issue #267 made the
+        // qualified spelling the ring invariant a release would replay it
         // under anyway), and `applied_keys`, whose only consumer is
         // `clear_key_deaths` against the canonically-keyed `key_deaths`.
-        let canonical_src_table = canonical_of(&change.src_table);
-        if poisoned.contains(&(canonical_src_table.clone(), change.key.clone())) {
-            let mut parked = change.clone();
-            parked.src_table = canonical_src_table;
-            poisoned_park.push(parked);
-            continue;
-        }
         by_source
-            .entry(canonical_src_table.clone())
+            .entry(canonical_of(&change.src_table))
             .or_default()
             .push(change);
-        applied_keys.push((canonical_src_table, change.key.clone()));
-    }
-    if !poisoned_park.is_empty() {
-        tracing::warn!(
-            excluded = poisoned_park.len(),
-            "batch excludes already-poisoned keys, parking this batch's own contribution"
-        );
     }
     tracing::Span::current().record("sources", by_source.len());
 
@@ -5522,7 +5719,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         RelationshipProjectionClear,
     > = std::collections::BTreeMap::new();
 
-    for (source_key, changes) in by_source {
+    for (source_key, mut changes) in by_source {
         tracing::debug!(
             src_table = %source_key,
             changes = changes.len(),
@@ -5597,6 +5794,95 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // Issue #784: a `to_col` that is this table's row identity has the
         // ring key as its only value (`touched_join_values`).
         let key_col = ddl::sole_key_column(&pk);
+
+        // #799: which work each change is left out of (see `KeyExclusion`).
+        // A change poisoned for a reader of this table is left out of that
+        // reader's apply only, and parked for it; one poisoned for every
+        // reader of a relationship to this table is left out of that
+        // relationship's reverse work. A change left out of everything is
+        // dropped here, before its images are decoded, so a failure that is
+        // really in the source (an image that won't decode) stops once every
+        // reader holds the key. A clean commit clears the death counters of
+        // every definition that applied the rest (`clear_key_deaths`).
+        let exclusions = key_exclusions(
+            pool,
+            &source_key,
+            &changes,
+            &defs,
+            &inbound_rels,
+            &poisoned,
+            focus,
+        )
+        .await?;
+        // #785 review: a change a relationship's reverse work leaves out (its
+        // key is poisoned for every reader of the relationship) has its
+        // release re-staged as an image-less `Recompute`
+        // (`quarantine::release_key`), whose reverse names only the first
+        // parked pre-image and the live row. A non-key `to_col` value the fold
+        // erased between them lives only in this change's `to_col_values`,
+        // which nothing parks, and a child may have read the parent live under
+        // it. So its children are re-derived now, as for a change the
+        // relationship applies. A key `to_col`'s only value is the ring key,
+        // which the release's `Recompute` names itself.
+        for (change, exclusion) in changes.iter().zip(exclusions.iter().flatten()) {
+            if exclusion.rels.is_empty() || change.to_col_values.is_empty() {
+                continue;
+            }
+            for rel in inbound_rels
+                .iter()
+                .filter(|rel| exclusion.rels.contains(&rel.id))
+            {
+                let mut key_hops: HashMap<String, i32> = HashMap::new();
+                let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
+                for (column, value) in &change.to_col_values {
+                    if *column == rel.def.to_col {
+                        key_hops.insert(value.clone(), change.hop_gen);
+                        key_src_changed
+                            .insert(value.clone(), (change.src_changed, change.origin_lsn));
+                    }
+                }
+                accumulate_from_side_recomputes(
+                    pool,
+                    rel,
+                    &key_hops,
+                    &key_src_changed,
+                    &mut reverse_recomputes,
+                )
+                .await?;
+            }
+        }
+        let exclusions = match exclusions {
+            None => {
+                applied_keys.extend(changes.iter().map(|c| (source_key.clone(), c.key.clone())));
+                None
+            }
+            Some(exclusions) => {
+                let mut kept: Vec<&FoldedChange> = Vec::with_capacity(changes.len());
+                let mut kept_exclusions: Vec<KeyExclusion> = Vec::with_capacity(changes.len());
+                for (change, exclusion) in changes.into_iter().zip(exclusions) {
+                    for &transform_id in &exclusion.park_for {
+                        let mut parked = change.clone();
+                        parked.src_table = source_key.clone();
+                        poisoned_park.push((transform_id, parked));
+                    }
+                    let readers = defs.len() + inbound_rels.len();
+                    if readers > 0
+                        && exclusion.defs.len() == defs.len()
+                        && exclusion.rels.len() == inbound_rels.len()
+                    {
+                        continue;
+                    }
+                    applied_keys.push((source_key.clone(), change.key.clone()));
+                    kept.push(change);
+                    kept_exclusions.push(exclusion);
+                }
+                changes = kept;
+                Some(kept_exclusions)
+            }
+        };
+        if changes.is_empty() {
+            continue;
+        }
 
         // Decoded/re-read once per change here — not once per (definition,
         // change) — since every definition subscribed to this source
@@ -5694,6 +5980,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
                 let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (i, change) in changes.iter().enumerate() {
+                    if skips_relationship(&exclusions, i, rel.id) {
+                        continue;
+                    }
                     let mut note = |value: &Option<String>, hop: i32| {
                         if let Some(text) = value {
                             key_hops
@@ -5801,6 +6090,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     .or_insert((change.src_changed, change.origin_lsn));
             };
             for (i, change) in changes.iter().enumerate() {
+                if skips_relationship(&exclusions, i, rel.id) {
+                    continue;
+                }
                 let image_less = change.old_image.is_none() && change.new_image.is_none();
                 if image_less || change.has_recompute {
                     // An image-less change carries no image of its own:
@@ -5861,6 +6153,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 }
             };
             for (i, change) in changes.iter().enumerate() {
+                if skips_relationship(&exclusions, i, rel.id) {
+                    continue;
+                }
                 // Issue #244: an image-less change (both of the *change's
                 // own* images absent — a bare recompute trigger) is never a
                 // parent state transition, so it never becomes a delta
@@ -5907,6 +6202,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         }
 
         for (def, ledger_shape) in defs.iter().zip(ledger_shapes) {
+            // #799: this definition's share, without the changes whose key
+            // is poisoned for it (parked above).
+            let (changes, rows, old_rows) =
+                definition_share(def.id, &changes, &rows, &old_rows, &exclusions);
+            if changes.is_empty() {
+                continue;
+            }
             // #623 D3: a plain aggregate on the ledger takes the records as
             // they are; Phase 3 evaluates them (`super::ledger`).
             if let Some(shape) = ledger_shape {
@@ -5926,7 +6228,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         ))
                     }
                 };
-                for change in &changes {
+                for change in changes.iter() {
                     target_plan.push(change);
                     buffer_transform_apply_metrics(
                         &def.def.target,
@@ -6016,7 +6318,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     &def.def,
                     &rows,
                     Some(&old_rows),
-                    Some(changes.as_slice()),
+                    Some(&changes[..]),
                 )
                 .await?;
                 // Issue #130: merge this definition's touched-parent keys
@@ -6223,37 +6525,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         });
     }
 
-    // #785 review: a parked change (its key is poisoned) never reaches the
-    // by-source loop, and its release re-stages it as an image-less
-    // `Recompute` (`quarantine::release_key`), whose reverse names only the
-    // first parked pre-image and the live row. A non-key `to_col` value the
-    // fold erased between them lives only in this change's `to_col_values`,
-    // which nothing parks, and a child may have read the parent live under
-    // it. So its children are re-derived now, as for an unpoisoned change. A
-    // key `to_col`'s only value is the ring key, which the release's
-    // `Recompute` names itself.
-    for change in &poisoned_park {
-        if change.to_col_values.is_empty() {
-            continue;
-        }
-        for rel in catalog::relationships_to_table(pool, &change.src_table).await? {
-            let mut key_hops: HashMap<String, i32> = HashMap::new();
-            let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
-            for (column, value) in &change.to_col_values {
-                if *column == rel.def.to_col {
-                    key_hops.insert(value.clone(), change.hop_gen);
-                    key_src_changed.insert(value.clone(), (change.src_changed, change.origin_lsn));
-                }
-            }
-            accumulate_from_side_recomputes(
-                pool,
-                &rel,
-                &key_hops,
-                &key_src_changed,
-                &mut reverse_recomputes,
-            )
-            .await?;
-        }
+    if !poisoned_park.is_empty() {
+        tracing::warn!(
+            parked = poisoned_park.len(),
+            "batch leaves already-poisoned keys out of the definitions they're poisoned for, \
+             parking this batch's own contribution for each"
+        );
     }
 
     // Truncate clears (issue #60): for each truncated src_table, resolve its
@@ -9580,30 +9857,32 @@ async fn classify_and_retry(
                 Err(probe_err) => return Err(probe_err),
             };
             match outcome {
-                quarantine::IsolationOutcome::Evicted {
-                    retry_folded,
-                    charged,
-                } => {
+                // #799: the key is poisoned for the definition it fails in
+                // only, so the retry recomputes the same records, and leaves
+                // the key out of that definition's apply alone.
+                quarantine::IsolationOutcome::Evicted { evicted, charged } => {
                     if charged.is_empty() {
                         tracing::warn!(
                             seg_seq,
-                            remaining = retry_folded.len(),
-                            "isolated and evicted at least one poisoned key; retrying without it"
+                            evicted,
+                            "isolated a key and poisoned it for the definition it fails in; \
+                             retrying without it there"
                         );
                     } else {
                         tracing::warn!(
                             seg_seq,
-                            remaining = retry_folded.len(),
+                            evicted,
                             threshold = quarantine::DEFAULT_DEATH_THRESHOLD,
                             charged = %quarantine::describe_charged_keys(
                                 &charged,
                                 quarantine::DEFAULT_DEATH_THRESHOLD,
                             ),
-                            "isolated and evicted at least one poisoned key; retrying without it \
-                             (other failing keys charged, still below the death threshold)"
+                            "isolated a key and poisoned it for the definition it fails in; \
+                             retrying without it there (other failing keys charged, still below \
+                             the death threshold)"
                         );
                     }
-                    Ok(Some(retry_folded))
+                    Ok(None)
                 }
                 // Warn, not debug: the operator should see which key is
                 // heading for eviction, and nothing else logs this surfaced

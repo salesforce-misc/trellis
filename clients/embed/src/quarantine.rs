@@ -54,6 +54,10 @@ impl From<&QuarantineEntry> for PlainQuarantineEntry {
 /// on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainPoisonEntry {
+    /// The bare target of the definition the key is held for: whole-key
+    /// poison is per transform, and every other definition reading the key
+    /// keeps applying it.
+    pub transform: String,
     /// The fully-qualified `schema.table` the key is from.
     pub src_table: String,
     /// The key, as `trellis` renders it.
@@ -66,6 +70,7 @@ pub struct PlainPoisonEntry {
 impl From<&PoisonEntry> for PlainPoisonEntry {
     fn from(entry: &PoisonEntry) -> Self {
         PlainPoisonEntry {
+            transform: entry.transform.clone(),
             src_table: entry.src_table.clone(),
             key: entry.key.clone(),
             last_error: entry.last_error.clone(),
@@ -196,6 +201,7 @@ mod tests {
     #[test]
     fn a_poison_entry_crosses_with_its_time_in_microseconds() {
         let entry = PoisonEntry {
+            transform: "order_totals".to_string(),
             src_table: "public.orders".to_string(),
             key: "42".to_string(),
             last_error: "new row violates check constraint".to_string(),
@@ -205,6 +211,7 @@ mod tests {
         assert_eq!(
             PlainPoisonEntry::from(&entry),
             PlainPoisonEntry {
+                transform: "order_totals".to_string(),
                 src_table: "public.orders".to_string(),
                 key: "42".to_string(),
                 last_error: "new row violates check constraint".to_string(),

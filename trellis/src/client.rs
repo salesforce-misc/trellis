@@ -3304,7 +3304,7 @@ mod backfill_chunk_failure_tests {
             .execute("update public.nums set x = 1 where id = 1", &[])
             .await
             .expect("fix the row");
-        crate::staging::quarantine::release_key(&f.pool, "public.nums", "1")
+        crate::staging::quarantine::release_key(&f.pool, "doubles", "public.nums", "1")
             .await
             .expect("release the key");
         drain_ring(&f.pool, &mut f.raw).await;

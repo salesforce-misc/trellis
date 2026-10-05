@@ -164,6 +164,7 @@ defmodule Trellis.QuarantineTest do
       end)
 
     assert %Trellis.PoisonEntry{
+             transform: "gizmo_prices",
              src_table: "public.gizmos",
              key: "2",
              last_error: last_error,

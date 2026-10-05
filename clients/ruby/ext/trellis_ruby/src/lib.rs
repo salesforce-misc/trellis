@@ -906,6 +906,7 @@ fn poison_entry_hash(ruby: &Ruby, entry: PlainPoisonEntry) -> Result<RHash, Erro
     record(
         ruby,
         [
+            ("transform", ruby.into_value(entry.transform)),
             ("src_table", ruby.into_value(entry.src_table)),
             ("key", ruby.into_value(entry.key)),
             ("last_error", ruby.into_value(entry.last_error)),

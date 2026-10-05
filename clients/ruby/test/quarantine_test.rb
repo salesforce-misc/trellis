@@ -133,7 +133,8 @@ class QuarantineTest < Minitest::Test
         assert_equal 1, entries.length
         entry = entries.first
         assert_instance_of Trellis::PoisonEntry, entry
-        assert_equal ["public.gizmos", "2"], [entry.src_table, entry.key]
+        assert_equal ["gizmo_prices", "public.gizmos", "2"],
+                     [entry.transform, entry.src_table, entry.key]
         assert_match "cheap", entry.last_error
         assert_instance_of Time, entry.poisoned_at
         assert_operator entry.poisoned_at, :>, before
