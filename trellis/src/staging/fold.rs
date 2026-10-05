@@ -126,8 +126,9 @@ pub struct FoldedChange {
     /// Issue #133: the real union of every raw row's `group_key` array in
     /// this `(src_table, key)` group — every join-key value any of the
     /// group's rows' own `old_image`/`new_image` touched for some
-    /// relationship's `from_col` or `to_col` (#784), deduplicated, with
-    /// nulls filtered. Unlike
+    /// relationship's `from_col`, or for a to-side the one `to_col`
+    /// `capture::columns::to_side_group_key_column` names (#784),
+    /// deduplicated, with nulls filtered. Unlike
     /// `new_image`/`old_image` (arg-extremes over the group, picking one
     /// row's value), this is a genuine set union across *every* row, which
     /// is exactly what makes it survive the fold's own "first old image,

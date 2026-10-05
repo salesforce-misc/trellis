@@ -1035,15 +1035,40 @@ async fn from_side_keys(
             let client = pool.get().await?;
             let col_ident = quote_ident(from_col);
             let pg_type = key_column_pg_type(pool, from_table, from_col).await?;
-            let filter = key_array_filter(&col_ident, pg_type.as_deref());
-            let sql = format!(
-                "select {pk}, {col_ident}::text \
-                 from {tbl} \
-                 where {filter}",
-                pk = ddl::pk_key_sql_expr(from_pk, None),
-                tbl = ddl::qualified_source_table(from_table),
-            );
-            let rows = client.query(&sql, &[join_keys]).await?;
+            let sql = |pg_type: Option<&str>| {
+                format!(
+                    "select {pk}, {col_ident}::text \
+                     from {tbl} \
+                     where {filter}",
+                    pk = ddl::pk_key_sql_expr(from_pk, None),
+                    tbl = ddl::qualified_source_table(from_table),
+                    filter = key_array_filter(&col_ident, pg_type),
+                )
+            };
+            let rows = match client.query(&sql(pg_type.as_deref()), &[join_keys]).await {
+                Ok(rows) => rows,
+                // #784 review: a key that isn't `from_col`'s type can't match
+                // a row, but the typed cast rejects it, failing the batch
+                // for good. A to-side's ring `group_key` from capture
+                // functions older than the catalog (a relationship dropped
+                // since they were installed, before the reconcile pass
+                // regenerates them) can name another column's values. Match
+                // by text instead: the same rows, without the index.
+                Err(e)
+                    if pg_type.is_some()
+                        && e.code().is_some_and(|c| c.code().starts_with("22")) =>
+                {
+                    tracing::warn!(
+                        from_table,
+                        from_col,
+                        error = %e,
+                        "a reverse lookup's keys don't all cast to the join column's type; \
+                         matching them by text"
+                    );
+                    client.query(&sql(None), &[join_keys]).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), Some(r.get::<_, String>(1))))
@@ -4868,17 +4893,43 @@ struct RelationshipProjectionClear {
     lsn: Option<PgLsn>,
 }
 
-/// Every join value `change`'s raw ring rows touched, from the ring's
-/// `group_key` (#133): a to-side's images carry its inbound relationships'
-/// `to_col` there (#784), a from-side's its outbound ones' `from_col`. The
-/// fold keeps only a key's first pre-image and last post-image, so a value
-/// the key held only in between, or one a key born and deleted inside the
-/// batch held, survives only here. The values aren't labelled by
-/// relationship, so on a table that is both a to-side and a from-side some
-/// belong to another relationship: at worst they re-derive a few from-side
-/// rows needlessly, which a Re-derive makes harmless.
-fn touched_join_keys(change: &FoldedChange) -> impl Iterator<Item = &String> {
-    change.group_key.iter().flatten()
+/// Where `compute` finds the join values a to-side change's raw ring rows
+/// gave one inbound relationship's `to_col`, including any the fold erased
+/// from both folded images (#784): a parent born and deleted inside the
+/// batch, or one re-keyed through a value and on. A child may have read the
+/// parent live under such a value (an aggregate's ledger write does, #623
+/// D5), and no reverse record names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TouchedJoinValues {
+    /// The `to_col` is the to-side's whole, non-nullable primary key, so
+    /// the ring key is its only value.
+    RingKey,
+    /// The ring's `group_key` carries the `to_col`'s values and nothing
+    /// else's ([`crate::capture::columns::to_side_group_key_column`]).
+    GroupKey,
+    /// Neither: a value the fold erased goes untracked (#784's known gap).
+    Untracked,
+}
+
+impl TouchedJoinValues {
+    fn of(to_col: &str, key_col: Option<&str>, group_key_col: Option<&str>) -> Self {
+        if key_col == Some(to_col) {
+            TouchedJoinValues::RingKey
+        } else if group_key_col == Some(to_col) {
+            TouchedJoinValues::GroupKey
+        } else {
+            TouchedJoinValues::Untracked
+        }
+    }
+
+    /// The values `change` touched.
+    fn of_change(self, change: &FoldedChange) -> Vec<&String> {
+        match self {
+            TouchedJoinValues::RingKey => vec![&change.key],
+            TouchedJoinValues::GroupKey => change.group_key.iter().flatten().collect(),
+            TouchedJoinValues::Untracked => Vec::new(),
+        }
+    }
 }
 
 /// The image [`compute`] decodes as a change's *old side*: its folded
@@ -5293,6 +5344,23 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
         let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
+        // Issue #784: which column's values this to-side's ring rows carry
+        // beyond their images, decided as capture and the seam decide it.
+        let key_col = super::target_mutations::sole_key_column(&pk);
+        let group_key_col: Option<String> = match source_key.split_once('.') {
+            Some((schema, table)) if !inbound_rels.is_empty() => {
+                let client = pool.get().await?;
+                let outbound =
+                    catalog::relationships_from_table_in(&**client, schema, table).await?;
+                crate::capture::columns::to_side_group_key_column(
+                    outbound.iter().map(|r| r.def.from_col.as_str()),
+                    inbound_rels.iter().map(|r| r.def.to_col.as_str()),
+                    key_col,
+                )
+                .map(str::to_string)
+            }
+            _ => None,
+        };
 
         // Decoded/re-read once per change here — not once per (definition,
         // change) — since every definition subscribed to this source
@@ -5387,6 +5455,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // `src_changed` among those same changes — see
                 // `earliest_src_changed`'s doc comment for why the two use
                 // opposite merge directions.
+                let touched =
+                    TouchedJoinValues::of(&rel.def.to_col, key_col, group_key_col.as_deref());
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
                 let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (i, change) in changes.iter().enumerate() {
@@ -5413,8 +5483,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         note(&key, change.hop_gen);
                     }
                     // Issue #784: every key the fold erased from both
-                    // images, as `touched_join_keys` says.
-                    for key in touched_join_keys(change) {
+                    // images, as `TouchedJoinValues` says.
+                    for key in touched.of_change(change) {
                         note(&Some(key.clone()), change.hop_gen);
                     }
                 }
@@ -5478,9 +5548,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // key the fold erased from both of this record's images: a
             // parent born and deleted inside the batch (no image on either
             // side), or one re-keyed through a value and on. Those keys come
-            // from the ring's `group_key` (`touched_join_keys`), and their
-            // from-side rows are re-derived here like an image-less
+            // from the ring key or `group_key` (`TouchedJoinValues`), and
+            // their from-side rows are re-derived here like an image-less
             // record's, since no reverse record names them.
+            let touched = TouchedJoinValues::of(&rel.def.to_col, key_col, group_key_col.as_deref());
             let mut key_hops: HashMap<String, i32> = HashMap::new();
             let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
             let mut note_key = |key: String, change: &FoldedChange| {
@@ -5519,7 +5590,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             note_key(join_text.clone(), change);
                         }
                     }
-                    for key in touched_join_keys(change) {
+                    for key in touched.of_change(change) {
                         note_key(key.clone(), change);
                     }
                 } else {
@@ -5529,7 +5600,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     let old_key =
                         relationship_key_text(&old_rows[i], &rel.def.to_col, &rel.def.name)?;
                     let new_key = relationship_key_text(&rows[i], &rel.def.to_col, &rel.def.name)?;
-                    for key in touched_join_keys(change) {
+                    for key in touched.of_change(change) {
                         if Some(key) != old_key.as_ref() && Some(key) != new_key.as_ref() {
                             note_key(key.clone(), change);
                         }
@@ -5857,13 +5928,15 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // one of them (an aggregate's ledger write does, #623 D5), and no
         // reverse record is left to re-derive it, so its children are
         // re-derived here, as `compute`'s by-source loop does for the
-        // parent's own rows (`touched_join_keys`).
+        // parent's own rows (`TouchedJoinValues`). A deferred row's
+        // `group_key` holds only this relationship's keys, since its
+        // `src_table` is the relationship's own.
         if shape.needs_recompute_fallback {
             let old_key = relationship_key_text(&old_row, &shape.to_col, &shape.name)?;
             let new_key = relationship_key_text(&new_row, &shape.to_col, &shape.name)?;
             let mut key_hops: HashMap<String, i32> = HashMap::new();
             let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
-            for key in touched_join_keys(change) {
+            for key in change.group_key.iter().flatten() {
                 if Some(key) != old_key.as_ref() && Some(key) != new_key.as_ref() {
                     key_hops.insert(key.clone(), 0);
                     key_src_changed.insert(key.clone(), (change.src_changed, change.origin_lsn));

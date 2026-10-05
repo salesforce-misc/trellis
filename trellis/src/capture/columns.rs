@@ -25,12 +25,15 @@
 //!    (`staging::apply::from_side_change_in_flight`), and a missing value
 //!    there silently passes the guard.
 //! 4. **For every relationship whose to-side is `T`:**
-//!    - its `to_col`, which is in the ring's `group_key` too. A to-side
-//!      row's reverse path re-derives the children of every join value its
-//!      batch's rows touched, including ones the fold erased from both
-//!      folded images: a parent born and deleted inside one batch, or
-//!      re-keyed through a value and on (#784). A child may have read the
-//!      parent live under that value in between;
+//!    - its `to_col`. A to-side row's reverse path re-derives the children
+//!      of every join value its batch's rows touched, including ones the
+//!      fold erased from both folded images: a parent born and deleted
+//!      inside one batch, or re-keyed through a value and on (#784). A child
+//!      may have read the parent live under that value in between. When the
+//!      `to_col` is `T`'s whole primary key, the ring key is that value. When
+//!      it isn't, the ring's `group_key` carries its values, but only while
+//!      no other column's values share the array
+//!      ([`to_side_group_key_column`]);
 //!    - every to-side column a definition reads through it
 //!      ([`crate::defs::eval::relationship_references`], fields and `GROUP
 //!      BY`);
@@ -89,9 +92,45 @@ pub struct ReadColumns {
     /// Every column an image must carry.
     pub columns: BTreeSet<String>,
     /// The subset whose values make up the ring's `group_key`: every
-    /// outbound relationship's `from_col` and every inbound one's `to_col`
-    /// (#784).
+    /// outbound relationship's `from_col`. [`capture_spec`] adds an inbound
+    /// one's `to_col` when [`to_side_group_key_column`] names it.
     pub group_key: BTreeSet<String>,
+    /// Every inbound relationship's `to_col` (#784).
+    pub to_cols: BTreeSet<String>,
+}
+
+/// The inbound `to_col` whose values a to-side's ring `group_key` carries
+/// (#784), or `None`.
+///
+/// The reverse path needs every value a to-side row's `to_col` held inside
+/// a batch, including ones the fold erased from both folded images. When
+/// the `to_col` is the table's whole, non-nullable primary key (`key_col`),
+/// the ring key is that value, so nothing more is needed. Otherwise the
+/// values ride in `group_key`. But `group_key` is one unlabelled array, and
+/// its values are only usable as one column's: mixed with a `from_col`'s
+/// or another `to_col`'s, a reader would take them for its own, staging
+/// spurious Re-derives on every write and casting them to the wrong type
+/// (`staging::apply::from_side_keys`). So the `to_col` goes in only when it
+/// is the one column there: the table has no outbound relationship, and
+/// every inbound one that isn't keyed by `key_col` joins on the same
+/// column. Elsewhere such a value goes untracked, a gap #784's PR records.
+///
+/// Capture, the target-mutation seam and `staging::apply::compute` all
+/// decide this here, so a reader only trusts a `group_key` its writers
+/// built the same way.
+pub(crate) fn to_side_group_key_column<'a>(
+    mut outbound_from_cols: impl Iterator<Item = &'a str>,
+    inbound_to_cols: impl Iterator<Item = &'a str>,
+    key_col: Option<&str>,
+) -> Option<&'a str> {
+    if outbound_from_cols.next().is_some() {
+        return None;
+    }
+    let mut columns: BTreeSet<&str> = inbound_to_cols.filter(|c| Some(*c) != key_col).collect();
+    match columns.len() {
+        1 => columns.pop_first(),
+        _ => None,
+    }
 }
 
 /// The columns [`CaptureCatalog`]'s readers need from `table`'s images
@@ -113,7 +152,7 @@ pub fn read_columns(catalog: &CaptureCatalog, table: &str) -> ReadColumns {
         }
         if rel.qualified_to_table() == table {
             read.columns.insert(rel.def.to_col.clone());
-            read.group_key.insert(rel.def.to_col.clone());
+            read.to_cols.insert(rel.def.to_col.clone());
             let from = rel.qualified_from_table();
             for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
                 if reader.source == from {
@@ -329,6 +368,17 @@ pub async fn capture_spec(
     }
 
     let mut read = read_columns(catalog, table);
+    let key_col = match key.as_slice() {
+        [only] => Some(only.as_str()),
+        _ => None,
+    };
+    let to_col = to_side_group_key_column(
+        read.group_key.iter().map(String::as_str),
+        read.to_cols.iter().map(String::as_str),
+        key_col,
+    )
+    .map(str::to_string);
+    read.group_key.extend(to_col);
     let missing: BTreeSet<String> = read
         .columns
         .iter()
@@ -566,11 +616,8 @@ mod tests {
             read.columns,
             set(&["country", "name", "retired_col", "user_id"])
         );
-        assert_eq!(
-            read.group_key,
-            set(&["user_id"]),
-            "a to-side's group key is its to_col (#784)"
-        );
+        assert!(read.group_key.is_empty(), "a to-side has no from_col");
+        assert_eq!(read.to_cols, set(&["user_id"]));
     }
 
     /// `a_to_side_images_its_to_col_and_every_column_read_through_it`'s
@@ -680,7 +727,7 @@ mod tests {
         );
         let read = read_columns(&catalog, "public.orders");
         assert_eq!(read.columns, set(&["amount", "user_id"]));
-        assert_eq!(read.group_key, set(&["user_id"]));
+        assert_eq!(read.to_cols, set(&["user_id"]));
         let from = read_columns(&catalog, "public.users");
         assert_eq!(from.columns, set(&["id"]));
         assert_eq!(from.group_key, set(&["id"]));
@@ -713,12 +760,42 @@ mod tests {
         );
         let posts = read_columns(&catalog, "public.posts");
         assert_eq!(posts.columns, set(&["author_id", "id", "title"]));
-        assert_eq!(posts.group_key, set(&["author_id", "id"]));
+        assert_eq!(posts.group_key, set(&["author_id"]));
+        assert_eq!(posts.to_cols, set(&["id"]));
         let users = read_columns(&catalog, "public.users");
         assert_eq!(users.columns, set(&["id"]));
-        assert_eq!(users.group_key, set(&["id"]));
+        assert!(users.group_key.is_empty());
         let comments = read_columns(&catalog, "public.comments");
         assert_eq!(comments.columns, set(&["post_id"]));
         assert_eq!(comments.group_key, set(&["post_id"]));
+    }
+
+    /// #784 review: a to-side's `to_col` joins the ring's `group_key` only
+    /// when nothing else's values would share it, and never when the ring
+    /// key already is the value.
+    #[test]
+    fn a_to_cols_values_join_the_group_key_only_alone() {
+        let none: [&str; 0] = [];
+        let pick = |from: &[&'static str], to: &[&'static str], key: Option<&str>| {
+            to_side_group_key_column(from.iter().copied(), to.iter().copied(), key)
+                .map(str::to_string)
+        };
+        // A non-key to_col alone, or two relationships on the same one.
+        assert_eq!(pick(&none, &["code"], Some("id")).as_deref(), Some("code"));
+        assert_eq!(
+            pick(&none, &["code", "code"], Some("id")).as_deref(),
+            Some("code")
+        );
+        // The ring key already is a key to_col's value.
+        assert_eq!(pick(&none, &["id"], Some("id")), None);
+        assert_eq!(
+            pick(&none, &["id", "code"], Some("id")).as_deref(),
+            Some("code")
+        );
+        // A composite key never stands for one column.
+        assert_eq!(pick(&none, &["id"], None).as_deref(), Some("id"));
+        // A from_col, or a second to_col, would share the array.
+        assert_eq!(pick(&["author_id"], &["code"], Some("id")), None);
+        assert_eq!(pick(&none, &["code", "slug"], Some("id")), None);
     }
 }

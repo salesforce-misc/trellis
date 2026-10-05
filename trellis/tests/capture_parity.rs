@@ -351,11 +351,7 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
         strings(&["id", "name"]),
         "unread is not imaged"
     );
-    assert_eq!(
-        parent.group_key(),
-        strings(&["id"]),
-        "a to-side's group key is its to_col (#784)"
-    );
+    assert!(parent.group_key().is_empty());
     let comp = &specs["public.comp"];
     assert_eq!(comp.key(), strings(&["post", "tag"]), "declared key order");
     assert_eq!(comp.columns(), strings(&["post", "tag", "weight"]));

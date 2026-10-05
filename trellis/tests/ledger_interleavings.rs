@@ -35,6 +35,7 @@ mod drain_driver;
 
 use drain_driver::Driver;
 use tokio_postgres::types::PgLsn;
+use trellis::capture::install::Progress;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
@@ -3037,4 +3038,211 @@ async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_avg() {
 #[tokio::test]
 async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_min_max() {
     a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateMinMax).await;
+}
+
+/// #784 review: a parent table that is also a from-side, `par.owner` to
+/// `usr.handle`, a `text` column, while `src.p` joins `par.id`, an
+/// `integer`. Its ring `group_key` holds `owner`'s values, which aren't
+/// `par.id`'s, so the reverse path mustn't read them as `parent`'s join
+/// values: cast to `integer` for the lookup, `'alice'` failed the batch on
+/// every drain.
+#[tokio::test]
+async fn a_parent_that_is_also_a_from_side_of_another_type_drains_a_plain_update() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, sum(p.w), count(*) from public.src s \
+                    left join public.par p on p.id = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.usr (handle text primary key, z integer); \
+         create table public.par (id integer primary key, owner text, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.usr values ('alice', 1); \
+         insert into public.par values (1, 'alice', 10), (2, 'alice', 20); \
+         insert into public.src values (1, 1, 1), (2, 1, 2);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &[
+            "RELATIONSHIP owner FROM par.owner TO usr.handle",
+            "RELATIONSHIP parent FROM src.p TO par.id",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["public.usr", PAR, SRC],
+    )
+    .await;
+    write(&d, "update public.par set w = 11 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    d.settle().await;
+    assert_eq!(d.rows(actual).await, d.rows(expected).await);
+}
+
+/// #784 review: the same shape with `owner` an `integer` that names
+/// another parent's id. A plain update of parent 1, whose owner is 2,
+/// re-derives parent 1's children and no others: reading `group_key`'s
+/// `owner` value as one of `parent`'s keys would re-derive parent 2's on
+/// every write. Then parent 5 is born and deleted in one batch after child 1
+/// read it, which the ring key still catches with `group_key` out of play.
+#[tokio::test]
+async fn a_parent_that_is_also_a_from_side_re_derives_only_its_own_children() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, count(p.w), count(*) from public.src s \
+                    left join public.par p on p.id = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.usr (id integer primary key, z integer); \
+         create table public.par (id integer primary key, owner integer, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.usr values (2, 1); \
+         insert into public.par values (1, 2, 10), (2, 2, 20); \
+         insert into public.src values (1, 1, 1), (2, 1, 2);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &[
+            "RELATIONSHIP owner FROM par.owner TO usr.id",
+            "RELATIONSHIP parent FROM src.p TO par.id",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &["public.usr", PAR, SRC],
+    )
+    .await;
+    let ring = "(select * from seg_0 union all select * from seg_1 \
+                union all select * from seg_2 union all select * from seg_3) r";
+    let before = d
+        .rows(&format!("select coalesce(max(change_id), 0) from {ring}"))
+        .await;
+    let before = before[0].trim_matches(|c| c == '(' || c == ')').to_string();
+    write(&d, "update public.par set w = 11 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    let staged = d
+        .rows(&format!(
+            "select key from {ring} \
+             where src_table = 'public.src' and change_id > {before} \
+             group by key order by key"
+        ))
+        .await;
+    assert_eq!(staged, vec!["(1)".to_string()], "only parent 1's child");
+    d.settle().await;
+
+    write(&d, "update public.src set g = 3, p = 5 where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 2, 57)").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.settle().await;
+    assert_eq!(d.rows(actual).await, d.rows(expected).await);
+}
+
+/// #784 review: a to-side's capture functions older than the catalog. They
+/// were installed while `par` was also a from-side, so its ring `group_key`
+/// holds `owner`'s values. With that relationship gone, `group_key` is
+/// where `parent`'s erased `code` values live (no other column shares it
+/// now), so the reverse path reads the stale `'alice'` as one, until the
+/// reconcile pass regenerates the functions. Its lookup by `src.p`, an
+/// `integer`, must still drain: `'alice'` matches no row.
+#[tokio::test]
+async fn a_to_sides_stale_group_key_of_another_type_still_drains() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, sum(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.usr (handle text primary key, z integer); \
+         create table public.par (id integer primary key, code integer unique, \
+                                  owner text, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.usr values ('alice', 1); \
+         insert into public.par values (1, 100, 'alice', 10), (2, 200, 'alice', 20); \
+         insert into public.src values (1, 1, 100), (2, 1, 200);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &[
+            "RELATIONSHIP owner FROM par.owner TO usr.handle",
+            "RELATIONSHIP parent FROM src.p TO par.code",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &["public.usr", PAR, SRC],
+    )
+    .await;
+    write(
+        &d,
+        &format!("delete from {DEFAULT_SCHEMA}.relationship_definitions where name = 'owner'"),
+    )
+    .await;
+    write(&d, "update public.par set w = 11 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    d.settle().await;
+    assert_eq!(d.rows(actual).await, d.rows(expected).await);
+}
+
+/// #784 review: a relationship declared onto a to-side that is already
+/// captured. `par` is captured for `parent`, which joins its primary key, so
+/// its ring `group_key` is empty. Declaring `by_code`, which joins
+/// `par.code`, puts `code` there, and the capture reconcile widens `par`'s
+/// functions to write it: without that, a `code` value the fold erases
+/// would go untracked.
+#[tokio::test]
+async fn a_relationship_onto_a_captured_to_side_widens_its_group_key() {
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code integer unique, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer, q integer); \
+         insert into public.par values (1, 100, 10); \
+         insert into public.src values (1, 1, 1, 100);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &["RELATIONSHIP parent FROM src.p TO par.id"],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    let ring = "(select * from seg_0 union all select * from seg_1 \
+                union all select * from seg_2 union all select * from seg_3) r";
+    let last_group_key = format!(
+        "select group_key from {ring} where src_table = 'public.par' \
+         order by change_id desc limit 1"
+    );
+    write(&d, "update public.par set code = 101, w = 11 where id = 1").await;
+    assert_eq!(d.rows(&last_group_key).await, vec!["()".to_string()]);
+
+    trellis::defs::create_relationship(d.pool(), "RELATIONSHIP by_code FROM src.q TO par.code")
+        .await
+        .expect("declare by_code");
+    let catalog = trellis::capture::columns::load_catalog(&d.ctl, DEFAULT_SCHEMA)
+        .await
+        .expect("load the catalog");
+    let spec = trellis::capture::columns::capture_spec(&d.ctl, &catalog, PAR)
+        .await
+        .expect("capture spec");
+    assert_eq!(spec.group_key(), ["code".to_string()]);
+    let action = trellis::capture::install::plan(
+        &trellis::capture::install::installed(&d.ctl, DEFAULT_SCHEMA, PAR)
+            .await
+            .expect("read the installed capture"),
+        &spec,
+    );
+    assert_eq!(action, trellis::capture::install::CaptureAction::Widen);
+    let widened = trellis::capture::install::reconcile(&mut d.ctl, DEFAULT_SCHEMA, &spec, None)
+        .await
+        .expect("widen par's capture");
+    assert!(
+        matches!(widened, Progress::Done(_)),
+        "an unbounded widen lands"
+    );
+    write(&d, "update public.par set code = 102 where id = 1").await;
+    assert_eq!(
+        d.rows(&last_group_key).await,
+        vec![r#"("{101,102}")"#.to_string()]
+    );
 }

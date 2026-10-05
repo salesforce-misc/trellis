@@ -118,12 +118,12 @@ pub enum StagedChange {
         hop_gen: i32,
         /// Issue #133: the union of every join-key value this row's own
         /// change touched — every column that is some relationship's
-        /// `from_col`, or (#784) some to-one or to-many relationship's
-        /// `to_col`, read from `old_image` (if present) and `new_image`
-        /// (if present). Populated by a capture trigger (from the columns
-        /// its spec names, `capture::sql`) or the target-mutation seam for an
-        /// endpoint target; `None` when this row's `src_table` is no
-        /// relationship's endpoint. A row staged by capture
+        /// `from_col`, or (#784) the one inbound relationship's `to_col`
+        /// `capture::columns::to_side_group_key_column` names, read from
+        /// `old_image` (if present) and `new_image` (if present). Populated
+        /// by a capture trigger (from the columns its spec names,
+        /// `capture::sql`) or the target-mutation seam for an endpoint
+        /// target; `None` when no such column exists. A row staged by capture
         /// functions older than a relationship (before the reconcile pass
         /// widened them to its `from_col`) lacks that column's values; a
         /// definition reading through the relationship isn't dispatched
