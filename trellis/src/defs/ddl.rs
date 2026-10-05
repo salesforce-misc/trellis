@@ -1572,11 +1572,13 @@ pub(crate) async fn target_table_ddl(
         "create table {} (",
         qualified_target_table(target_schema, def),
     );
-    // The key columns keep the source key's collation (issue #769): a
-    // Re-derive build's chunk reads the target by the same `(lo, hi]` range
-    // as the source, under the source key's collation
-    // (`staging::build::one_to_one::chunk_pick`), and only a target key of
-    // that collation lets the target's own index serve that range.
+    // The key columns keep the source key's collation (issue #769), so the
+    // target orders its keys as its source does. A Re-derive build's chunk
+    // reads the target by the same `(lo, hi]` range as the source
+    // (`staging::build::one_to_one::chunk_pick`). That range names the
+    // source key's collation explicitly, so it selects the same keys on
+    // both sides whatever the target's collation is; the target's index
+    // serves the chunk through its `= any(keys)` filter either way.
     let pk_cols: Vec<String> = pk
         .iter()
         .map(|c| {

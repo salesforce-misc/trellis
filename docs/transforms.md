@@ -116,15 +116,10 @@ column Trellis uses as a key:
 
 The error names the column and its collation. A deterministic collation other
 than the default, such as `"C"`, is fine. A 1-1 target's key columns take the
-source key's collation. An aggregate target's key columns take the database
-default collation, which Postgres always makes deterministic.
-
-Changing a source key's collation to another deterministic one (`alter column …
-type text collate …`) is safe while its definitions are building. A build splits
-the key into ranges and reads them in order, and it keeps comparing keys under
-the collation it planned them with until it finishes (#769). For the rest of
-that build, its range reads can't use the key's rebuilt index, so they're
-slower.
+source key's collation, so a relationship that joins a column to a 1-1 target's
+key needs that column to have the source key's collation. An aggregate target's
+key columns take the database default collation, which Postgres always makes
+deterministic.
 
 The same goes for a column that a field passes to `STRPOS` or `REGEXP_COUNT`,
 directly or through `COALESCE`, another field or a relationship path. Postgres
@@ -133,6 +128,14 @@ collation, while Trellis would compute them from the exact text, so such a
 definition, or an `ALTER TRANSFORM` that adds or alters such a field, is
 rejected. `CHAR_LENGTH` and `OCTET_LENGTH` don't depend on collation, so they
 accept any column.
+
+Changing a source key's collation to another deterministic one (`alter column …
+type text collate …`) is safe while its definitions are building. A build splits
+the key into ranges and reads them in order, and it keeps comparing keys under
+the collation it planned them with until it finishes (#769). For the rest of
+that build, its range reads can't use the key's rebuilt index, so each one scans
+the source table. On a large source that makes the rest of the build much
+slower. A 1-1 target keeps the key collation it was created with.
 
 One consequence is worth stating plainly: **an aggregate target does not qualify
 as a source table.** Its grouping columns may be `NULL`, so its identity is a
