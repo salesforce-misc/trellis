@@ -57,9 +57,9 @@ use trellis_embed::{
     PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
     PlainDivergence, PlainError, PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship,
     PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES,
-    decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
-    relationship_cardinality_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
+    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -650,6 +650,7 @@ fn symbol_words() -> impl Iterator<Item = &'static str> {
         .chain(PlainApplied::KINDS)
         .chain(SELF_CHECK_OUTCOMES)
         .chain(DIVERGENCE_KINDS)
+        .chain(capture_failure_kind_names())
 }
 
 /// A hash from symbol keys to `fields`' values: the shape every record
@@ -698,6 +699,10 @@ fn definition_summary_hash(ruby: &Ruby, summary: PlainDefinitionSummary) -> Resu
         .backfill_failure
         .map(|failure| backfill_failure_hash(ruby, failure))
         .transpose()?;
+    let halt = summary
+        .halt
+        .map(|halt| capture_failure_hash(ruby, halt))
+        .transpose()?;
     record(
         ruby,
         [
@@ -711,6 +716,7 @@ fn definition_summary_hash(ruby: &Ruby, summary: PlainDefinitionSummary) -> Resu
                 ruby.into_value(summary.created_at_micros),
             ),
             ("backfill_failure", ruby.into_value(failure)),
+            ("halt", ruby.into_value(halt)),
         ],
     )
 }
@@ -763,6 +769,7 @@ fn capture_failure_hash(ruby: &Ruby, failure: PlainCaptureFailure) -> Result<RHa
     record(
         ruby,
         [
+            ("kind", word_symbol(ruby, failure.kind).as_value()),
             ("source_table", ruby.into_value(failure.source_table)),
             ("columns", ruby.into_value(failure.columns)),
             ("error", ruby.into_value(failure.error)),
@@ -980,6 +987,11 @@ fn divergence_kinds(ruby: &Ruby) -> RArray {
     word_symbols(ruby, DIVERGENCE_KINDS)
 }
 
+/// Every kind symbol a capture failure can carry.
+fn capture_failure_kinds(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, capture_failure_kind_names())
+}
+
 /// Every statement kind `trellis`'s grammar has, for the test asserting
 /// `apply`'s round trip covers each one.
 fn statement_kinds() -> Vec<&'static str> {
@@ -1006,6 +1018,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("applied_kinds", function!(applied_kinds, 0))?;
     native.define_module_function("self_check_outcomes", function!(self_check_outcomes, 0))?;
     native.define_module_function("divergence_kinds", function!(divergence_kinds, 0))?;
+    native.define_module_function("capture_failure_kinds", function!(capture_failure_kinds, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
 
     let handle = native.define_class("Handle", ruby.class_object())?;

@@ -51,10 +51,12 @@ Demanding a present-and-drained successor would strand a batch forever whenever
 its successor retired first — a lock skip can retire *s+1* and leave *s*
 ineligible, leaking a ring slot into a permanent `RingFull` wedge.
 
-**Condition 4 is why an undrainable batch is an instance-wide stop**, not a
+**Condition 4 is why an undrainable batch would be an instance-wide stop**, not a
 per-table one: one batch stuck below the boundary makes *every* candidate
-ineligible, so the ring fills and seals fail. That is the intended semantic for a
-genuine schema error ([05](05-apply-and-exactly-once-deltas.md)) — and the reason
+ineligible, so the ring fills and seals fail. That is why no failure class may
+leave a batch undrainable: a genuine schema error pauses the definitions it
+reaches so the batch drains without them
+([05](05-apply-and-exactly-once-deltas.md#failure-classification)), and
 quarantine exists for everything that is *not* one.
 
 ## Who runs the sweeps
@@ -81,11 +83,12 @@ A change that reliably crashes the apply must not wedge its batch forever — bu
 silently skipping it makes a caller waiting on that change wait forever, or worse,
 be told it converged.
 
-**1. Isolate before blaming.** On a non-transient, non-halting apply failure, the
-batch is bisected with `BEGIN … ROLLBACK` probes: each half is applied on its own,
-and only a half that fails is split and probed again, down to single records. Blame
-lands only on the specific key(s) that fail on their own, so an innocent batch-mate
-is neither charged nor evicted. If no single key reproduces it, the error is
+**1. Isolate before blaming.** On a non-transient, non-halting apply failure (a
+halting one pauses its closure instead — see *What must never be quarantined*
+below), the batch is bisected with `BEGIN … ROLLBACK` probes: each half is
+applied on its own, and only a half that fails is split and probed again, down to
+single records. Blame lands only on the specific key(s) that fail on their own, so
+an innocent batch-mate is neither charged nor evicted. If no single key reproduces it, the error is
 surfaced, not blamed. Bisection finds a failing key in about `2·log2(n)` probes
 rather than `n`, and a per-call probe cap bounds the rest.
 
@@ -128,11 +131,16 @@ earliest origin position, so the key's band stays blocked until the release
 actually drains — the key is never in neither place, which would make the
 read-your-writes predicate lie ([07](07-convergence-and-await.md)).
 
-**What must never be quarantined.** Two error classes are deterministic and
-key-attributable yet caused by the *declared schema*, not the data — a tripped hop
-bound (a real value cycle) and a relationship endpoint that is not a source
-column. Quarantining either converts a loud, actionable error into a key that
-blocks reads forever. They propagate, the instance stops, and that is correct.
+**What must never be quarantined.** The halting errors are deterministic yet
+caused by the *declared schema*, not the data — a source key the drain can't use
+(`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a tripped hop bound (a real value
+cycle), and an aggregate target off the ledger (`AggregateOffLedger`). Every key
+reproduces them, so quarantining would blame one key for nobody's fault and turn
+a loud, actionable error into a key that blocks reads forever. Instead the drain
+pauses the closure the failure reaches — left `paused` with a `capture_failures`
+row of `kind` `halt` — and drains the batch without it, so the ring keeps
+retiring and every other definition keeps converging
+([05](05-apply-and-exactly-once-deltas.md#failure-classification), #663).
 
 ## The one sanctioned exception to immutability
 

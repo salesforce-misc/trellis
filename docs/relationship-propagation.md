@@ -87,7 +87,7 @@ Two structural facts shape several cells:
 
 ## Endpoint requirements
 
-A relationship `CREATE RELATIONSHIP` accepts must never halt the instance later
+A relationship `CREATE RELATIONSHIP` accepts must never halt its definitions later
 over something that was knowable when it was declared (issue #429). So every
 requirement the paths above place on a relationship's two endpoint tables and
 its join columns is checked at create time, in one place:
@@ -104,7 +104,7 @@ is one, the column.
 | The join columns have the same type, type modifier and collation | the pair | Trellis never casts a join key (#590). The key lookups cast one side's keys to the other side's type, so an `integer`/`bigint` pair raises 22003 on a key above 2^31, a modifier mismatch (`varchar(50)`/`varchar(255)`, `timestamp(3)`/`timestamp(6)`) truncates or rounds a key onto another row, and two different non-default collations make the oracle's and backfill's `a.x = b.y` raise 42P22. | `assert_joinable_as_is` |
 | A join column's collation, if any, is deterministic | the pair | A nondeterministic collation's `=` matches strings that differ (by case, say), while the engine matches join keys by their exact text (#590). | `assert_deterministic_join_collation` |
 | Capture can key the endpoint's changes: it is a plain table with a primary key, outside any partition or inheritance hierarchy | from, to; not this instance's own targets | An endpoint the instance doesn't own is captured by triggers, which key each change by its primary key (#375). | `reject_unkeyed_relationship_endpoint` → `catalog::change_keyed` |
-| The endpoint's key (its primary key, or the unique index standing in for one) has only types on the key allowlist | from, to; own targets included | Apply keys every change the relationship propagates by it: the to-side's own staged changes (`apply::compute`'s per-source lookup and its `TRUNCATE` loop), and the from-side rows a to-side change re-derives (`accumulate_from_side_recomputes`, `build_reverse_relationship_shape`, the `TRUNCATE` loop's from-side walk). That lookup rejects an unsupported type, and the rejection halts the instance (#429). An aggregate target's key is its `GROUP BY` columns, so owning the endpoint doesn't exempt it. | `ddl::source_primary_key_in_txn`, the runtime's own lookup |
+| The endpoint's key (its primary key, or the unique index standing in for one) has only types on the key allowlist | from, to; own targets included | Apply keys every change the relationship propagates by it: the to-side's own staged changes (`apply::compute`'s per-source lookup and its `TRUNCATE` loop), and the from-side rows a to-side change re-derives (`accumulate_from_side_recomputes`, `build_reverse_relationship_shape`, the `TRUNCATE` loop's from-side walk). That lookup rejects an unsupported type, and the rejection halts every definition reading the endpoint, and everything downstream of them (#429, #663). An aggregate target's key is its `GROUP BY` columns, so owning the endpoint doesn't exempt it. | `ddl::source_primary_key_in_txn`, the runtime's own lookup |
 | The endpoint's key columns have deterministic collations | from, to; own targets included | The same key, matched by its exact text: a nondeterministic collation's `=` and unique index treat strings that differ (by case, say) as one key (#638). An own target's key takes the database default, which is always deterministic. | `assert_deterministic_key_collation_in_txn` |
 | An endpoint that is one of this instance's targets is `live` | from, to | The seam is such an endpoint's only change feed, and a build's writes land outside it (#403). | `reject_non_live_upstream` |
 | The name is unique on the qualified from-table | from | A relationship's identity is `(from_schema, from_table, name)` (#288). | inline query |
@@ -119,7 +119,9 @@ Out of scope: the source schema changing after the relationship is created,
 such as a key's type changing or its primary key being dropped. The source
 schema belongs to the user
 ([ADR-0005](decisions/0005-source-schema-is-user-owned.md)), and such drift
-can still halt the instance at apply time.
+can still halt, at apply time, the definitions that read the table and those
+downstream of them: each is left `paused` with a `halt` capture failure until
+resumed (#663).
 
 ## The obligation table
 

@@ -89,7 +89,8 @@ defmodule Trellis.ApplyTest do
              %DefinitionSummary{
                target_table: "public.pet_weights",
                created_at: %DateTime{},
-               backfill_failure: nil
+               backfill_failure: nil,
+               halt: nil
              }
            ] =
              Enum.filter(Trellis.definitions!(trellis), &(&1.id == definition.id))

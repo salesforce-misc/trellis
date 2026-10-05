@@ -16,7 +16,8 @@
       "source_version": "integer",
       "status": {"word_in": "transform_status"},
       "created_at": "time",
-      "backfill_failure": {"nullable": {"record": "BackfillFailure"}}
+      "backfill_failure": {"nullable": {"record": "BackfillFailure"}},
+      "halt": {"nullable": {"record": "CaptureFailure"}}
     },
     "Status": {
       "status": {"word_in": "transform_status"},
@@ -33,6 +34,7 @@
       "blockers": {"list_of": "string"}
     },
     "CaptureFailure": {
+      "kind": {"word_in": "capture_failure_kind"},
       "source_table": "string",
       "columns": {"list_of": "string"},
       "error": "string",
@@ -207,7 +209,7 @@
     },
     {"op": "apply", "args": ["TRANSFORM parity_doubled FROM parity_ledger SELECT n + n AS doubled"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
     {"op": "apply", "args": ["TRANSFORM parity_gizmo_prices FROM parity_gizmos SELECT price AS price"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
-    {"op": "definitions", "expect": {"list_of": {"record": "DefinitionSummary", "fields": {"backfill_failure": null}}}},
+    {"op": "definitions", "expect": {"list_of": {"record": "DefinitionSummary", "fields": {"backfill_failure": null, "halt": null}}}},
     {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null}}},
     {"about": "A column that isn't paused is live, with no pause time or error.", "op": "quarantine_status", "args": ["parity_prices.price"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices.price"}, "state": {"word": "live"}, "paused_at": null, "last_error": null}}},
     {"about": "A whole transform reports its lifecycle status as its state.", "op": "quarantine_status", "args": ["parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
@@ -343,14 +345,20 @@
     {
       "about": "A capture lock wait and a capture failure (#687), which need a held lock or a broken source table, so a live run can't produce them cheaply: their times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}},
-      "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}}}
+      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}},
+      "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"kind": {"word": "capture"}, "source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}}}
     },
     {
       "about": "A time a microsecond before the epoch lands on that microsecond, not a second off.",
       "type": "DefinitionSummary",
-      "native": {"id": 7, "target_table": "public.t", "source_table": "public.s", "source_version": 2, "status": {"$word": "live"}, "created_at_micros": -1, "backfill_failure": null},
-      "expect": {"record": "DefinitionSummary", "fields": {"id": {"eq": 7}, "created_at": {"time_micros": -1}, "backfill_failure": null}}
+      "native": {"id": 7, "target_table": "public.t", "source_table": "public.s", "source_version": 2, "status": {"$word": "live"}, "created_at_micros": -1, "backfill_failure": null, "halt": null},
+      "expect": {"record": "DefinitionSummary", "fields": {"id": {"eq": 7}, "created_at": {"time_micros": -1}, "backfill_failure": null, "halt": null}}
+    },
+    {
+      "about": "A definition the drain halted on (#663), which needs a source whose key the drain can't use, so a live run can't produce it cheaply: the halt is a CaptureFailure of kind halt, and its time is rehydrated from epoch microseconds exactly.",
+      "type": "DefinitionSummary",
+      "native": {"id": 8, "target_table": "public.t", "source_table": "public.s", "source_version": 2, "status": {"$word": "paused"}, "created_at_micros": 1727222400123456, "backfill_failure": null, "halt": {"kind": {"$word": "halt"}, "source_table": "public.s", "columns": [], "error": "the drain halted: source table 'public.s' has no primary key; fix the cause, then resume the definition to rebuild it, or drop the definition", "detected_at_micros": 1727222400123459}},
+      "expect": {"record": "DefinitionSummary", "fields": {"status": {"word": "paused"}, "backfill_failure": null, "halt": {"record": "CaptureFailure", "fields": {"kind": {"word": "halt"}, "source_table": {"eq": "public.s"}, "columns": {"list": []}, "detected_at": {"time_micros": 1727222400123459}}}}}
     },
     {
       "about": "An outcome newer than the binding is still a success, with no detail.",

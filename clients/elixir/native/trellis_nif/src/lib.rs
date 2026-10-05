@@ -49,9 +49,10 @@ use trellis_embed::{
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainError, PlainPoisonEntry, PlainQuarantineEntry,
     PlainRelationship, PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport,
-    SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
-    relationship_cardinality_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -184,20 +185,22 @@ impl From<PlainCaptureWait> for CaptureWaitTerm {
 
 #[derive(NifMap)]
 struct CaptureFailureTerm {
+    kind: Atom,
     source_table: String,
     columns: Vec<String>,
     error: String,
     detected_at_micros: i64,
 }
 
-impl From<PlainCaptureFailure> for CaptureFailureTerm {
-    fn from(failure: PlainCaptureFailure) -> Self {
-        CaptureFailureTerm {
+impl CaptureFailureTerm {
+    fn new(env: Env, failure: PlainCaptureFailure) -> NifReply<Self> {
+        Ok(CaptureFailureTerm {
+            kind: word_atom(env, failure.kind)?,
             source_table: failure.source_table,
             columns: failure.columns,
             error: failure.error,
             detected_at_micros: failure.detected_at_micros,
-        }
+        })
     }
 }
 
@@ -246,6 +249,7 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
         .chain(PlainApplied::KINDS)
         .chain(SELF_CHECK_OUTCOMES)
         .chain(DIVERGENCE_KINDS)
+        .chain(capture_failure_kind_names())
         .chain(LOG_LEVELS)
 }
 
@@ -272,6 +276,7 @@ struct DefinitionSummaryTerm {
     status: Atom,
     created_at_micros: i64,
     backfill_failure: Option<BackfillFailureTerm>,
+    halt: Option<CaptureFailureTerm>,
 }
 
 /// A relationship `apply/2` registered.
@@ -545,6 +550,10 @@ fn definitions(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<Definition
                 status: word_atom(env, summary.status)?,
                 created_at_micros: summary.created_at_micros,
                 backfill_failure: summary.backfill_failure.map(BackfillFailureTerm::from),
+                halt: summary
+                    .halt
+                    .map(|halt| CaptureFailureTerm::new(env, halt))
+                    .transpose()?,
             })
         })
         .collect()
@@ -748,7 +757,10 @@ fn status(
         status: word_atom(env, status.status)?,
         backfill_failure: status.backfill_failure.map(BackfillFailureTerm::from),
         capture_wait: status.capture_wait.map(CaptureWaitTerm::from),
-        capture_failure: status.capture_failure.map(CaptureFailureTerm::from),
+        capture_failure: status
+            .capture_failure
+            .map(|failure| CaptureFailureTerm::new(env, failure))
+            .transpose()?,
     }))
 }
 
@@ -805,6 +817,12 @@ fn self_check_outcomes(env: Env) -> NifReply<Vec<Atom>> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn divergence_kinds(env: Env) -> NifReply<Vec<Atom>> {
     word_atoms(env, DIVERGENCE_KINDS.to_vec())
+}
+
+/// Every kind atom a capture failure can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn capture_failure_kinds(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, capture_failure_kind_names())
 }
 
 /// Every level atom `take_log_records/1` can return.

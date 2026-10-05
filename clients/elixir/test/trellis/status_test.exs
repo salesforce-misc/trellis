@@ -50,6 +50,7 @@ defmodule Trellis.StatusTest do
           blockers: ["pid 42 holds RowExclusiveLock"]
         },
         capture_failure: %{
+          kind: :capture,
           source_table: "public.lines",
           columns: ["qty"],
           error: "column \"qty\" was dropped",
@@ -69,11 +70,43 @@ defmodule Trellis.StatusTest do
                blockers: ["pid 42 holds RowExclusiveLock"]
              },
              capture_failure: %Trellis.CaptureFailure{
+               kind: :capture,
                source_table: "public.lines",
                columns: ["qty"],
                error: "column \"qty\" was dropped",
                detected_at: ~U[2024-09-25 00:00:00.654321Z]
              }
            } = status
+  end
+
+  test "a definition summary's halt becomes a capture failure of kind halt" do
+    summary =
+      Trellis.DefinitionSummary.from_native(%{
+        id: 1,
+        target_table: "public.t",
+        source_table: "public.s",
+        source_version: 1,
+        status: :paused,
+        created_at_micros: 1_727_222_400_654_321,
+        backfill_failure: nil,
+        halt: %{
+          kind: :halt,
+          source_table: "public.s",
+          columns: [],
+          error: "the drain halted",
+          detected_at_micros: 1_727_222_400_654_321
+        }
+      })
+
+    assert %Trellis.DefinitionSummary{
+             status: :paused,
+             halt: %Trellis.CaptureFailure{
+               kind: :halt,
+               source_table: "public.s",
+               columns: [],
+               error: "the drain halted",
+               detected_at: ~U[2024-09-25 00:00:00.654321Z]
+             }
+           } = summary
   end
 end

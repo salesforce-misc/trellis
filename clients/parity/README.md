@@ -92,7 +92,7 @@ comparison.
 | `"string"`, `"integer"`, `"boolean"`, `"time"` | any value of that type |
 | `{"eq": v}` | exactly `v` |
 | `{"word": w}` | the word `w` |
-| `{"word_in": set}` | a word from a closed set the extension reports: `transform_status`, `quarantine_state`, `cardinality`, `applied_kind`, `self_check_outcome`, `divergence_kind` |
+| `{"word_in": set}` | a word from a closed set the extension reports: `transform_status`, `quarantine_state`, `cardinality`, `applied_kind`, `self_check_outcome`, `divergence_kind`, `capture_failure_kind` |
 | `{"time_micros": n}` | the time `n` microseconds from the epoch |
 | `{"error": code}` | an error with that code |
 | `{"ref": path}` | the same canonical value as a saved result |

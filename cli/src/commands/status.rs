@@ -15,7 +15,8 @@
 //! keyspace lifecycle status (issue #55's `TransformStatus`:
 //! `waiting_to_backfill`/`backfilling`/`live`/`quarantined`), plus, on a
 //! line of its own, the failure of its source's backfill if that keeps
-//! failing (`backfill_failure`, issue #461) — and every
+//! failing (`backfill_failure`, issue #461), and on another why the drain
+//! halted on it, if it did (`halt`, issue #663) — and every
 //! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! "Decision 5" and the amendment to
@@ -179,6 +180,16 @@ fn format_definitions(definitions: &[DefinitionSummary]) -> String {
                     failure.last_error
                 ));
             }
+            // Issue #663: the drain halted on it, so it stays paused until
+            // the cause is fixed and it is resumed.
+            if let Some(halt) = &def.halt {
+                line.push_str(&format!(
+                    "    halted on {} at {}: error={:?}\n",
+                    halt.source_table,
+                    format_timestamp(halt.detected_at),
+                    halt.error
+                ));
+            }
             line
         })
         .collect()
@@ -320,6 +331,7 @@ mod tests {
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
+            halt: None,
         };
         let formatted = format_definitions(std::slice::from_ref(&def));
         assert!(formatted.contains("id=7"));
@@ -339,6 +351,7 @@ mod tests {
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
+            halt: None,
         };
         let formatted = format_definitions(std::slice::from_ref(&def));
         assert_eq!(formatted.lines().count(), 1, "got {formatted:?}");
@@ -362,6 +375,7 @@ mod tests {
                 last_error: "table \"public.orders\" has no primary key".to_string(),
                 next_attempt_at,
             }),
+            halt: None,
         };
         let formatted = format_definitions(std::slice::from_ref(&def));
         assert_eq!(
@@ -371,6 +385,36 @@ mod tests {
              backfill of public.orders failing: attempts=3 \
              next_attempt_at=2024-01-01 00:00:00 UTC \
              error=\"table \\\"public.orders\\\" has no primary key\"\n"
+        );
+    }
+
+    #[test]
+    fn a_halt_is_shown_under_its_definition() {
+        // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
+        let detected_at = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::Paused,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: Some(trellis::CaptureFailure {
+                kind: trellis::CaptureFailureKind::Halt,
+                source_table: "public.orders".to_string(),
+                columns: Vec::new(),
+                error: "the drain halted: no primary key".to_string(),
+                detected_at,
+            }),
+        };
+        let formatted = format_definitions(std::slice::from_ref(&def));
+        assert_eq!(
+            formatted,
+            "  id=7 source=public.orders target=public.order_totals \
+             status=paused created_at=1970-01-01 00:00:00 UTC\n    \
+             halted on public.orders at 2024-01-01 00:00:00 UTC: \
+             error=\"the drain halted: no primary key\"\n"
         );
     }
 
@@ -391,6 +435,7 @@ mod tests {
                     .to_string(),
                 next_attempt_at: UNIX_EPOCH,
             }),
+            halt: None,
         };
         let formatted = format_definitions(std::slice::from_ref(&def));
         assert_eq!(formatted.lines().count(), 2, "got {formatted:?}");

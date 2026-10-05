@@ -363,6 +363,46 @@ worker process can be scaled to zero well after a healthy start), and treat
 `false` as "every transform in this fleet may be silently stuck," not as a
 transient blip to retry past.
 
+### Halted definitions
+
+The worker checks say the fleet is running; they can't say a definition has
+stopped. A halting failure (a source key the drain can't use, a propagation
+wave past the hop bound, or an aggregate off the ledger) pauses the
+definitions it reaches, and every other definition keeps converging (#663,
+[observability — A halting failure](observability.md#a-halting-failure)). A
+halted definition reports `paused`, the same word as an operator pause, so
+check `DefinitionSummary::halt` rather than the status: it is set only on a
+halted definition, and carries the table the failure named, the error and when
+it was found. One `definitions()` call answers for every definition:
+
+```rust
+let halted: Vec<_> = trellis
+    .definitions()
+    .await?
+    .into_iter()
+    .filter(|summary| summary.halt.is_some())
+    .collect();
+if !halted.is_empty() {
+    // Each stays paused, and its target stale, until it is fixed and
+    // resumed — page someone.
+}
+```
+
+In Elixir, `halt` is a `%Trellis.CaptureFailure{kind: :halt}` or
+`nil`; in Ruby, a `Trellis::CaptureFailure` with `kind` `:halt`, or `nil`:
+
+```elixir
+halted = Enum.filter(Trellis.definitions!(trellis), & &1.halt)
+```
+
+```ruby
+halted = Trellis.definitions.select(&:halt)
+```
+
+Poll it on the same timer as the worker checks. Clear a halt by fixing its
+cause and resuming each halted definition (`RESUME TRANSFORM`), in any order;
+resuming while the cause persists halts it again.
+
 ## Migrations and transactions
 
 **Trellis never joins your migration's transaction.** `migrate`, `define` and

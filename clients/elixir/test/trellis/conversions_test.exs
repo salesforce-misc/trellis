@@ -52,6 +52,8 @@ defmodule Trellis.ConversionsTest do
 
     assert Trellis.Native.divergence_kinds() ==
              {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column, :capture]}
+
+    assert Trellis.Native.capture_failure_kinds() == {:ok, [:capture, :halt]}
   end
 
   test "a self-check report's divergences become structs" do
@@ -128,7 +130,7 @@ defmodule Trellis.ConversionsTest do
   defp native_summary do
     native_definition()
     |> Map.delete(:source_columns)
-    |> Map.merge(%{created_at_micros: @micros, backfill_failure: nil})
+    |> Map.merge(%{created_at_micros: @micros, backfill_failure: nil, halt: nil})
   end
 
   defp native_relationship do
@@ -202,7 +204,7 @@ defmodule Trellis.ConversionsTest do
   end
 
   test "creation times become DateTimes" do
-    assert %DefinitionSummary{created_at: @time, backfill_failure: nil} =
+    assert %DefinitionSummary{created_at: @time, backfill_failure: nil, halt: nil} =
              DefinitionSummary.from_native(native_summary())
 
     assert %RelationshipSummary{created_at: @time, cardinality: :many} =

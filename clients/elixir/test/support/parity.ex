@@ -27,6 +27,7 @@ defmodule Trellis.Parity do
   def word_set("applied_kind"), do: words(Trellis.Native.applied_kinds())
   def word_set("self_check_outcome"), do: words(Trellis.Native.self_check_outcomes())
   def word_set("divergence_kind"), do: words(Trellis.Native.divergence_kinds())
+  def word_set("capture_failure_kind"), do: words(Trellis.Native.capture_failure_kinds())
 
   defp words({:ok, atoms}), do: Enum.map(atoms, &Atom.to_string/1)
 

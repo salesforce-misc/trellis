@@ -22,7 +22,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::capture::install::{Installed, installed};
 use trellis::capture::reconcile;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
+use trellis::{CaptureFailureKind, Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = "trellis";
 
@@ -374,6 +374,11 @@ async fn renaming_a_read_column_pauses_its_reader_and_never_fails_a_write() {
         .expect("ta is registered");
     assert_eq!(reported.status, TransformStatus::Paused);
     let failure = reported.capture_failure.expect("the reason is reported");
+    assert_eq!(
+        failure.kind,
+        CaptureFailureKind::Capture,
+        "not a halt (#663)"
+    );
     assert_eq!(failure.source_table, "public.u");
     assert_eq!(failure.columns, vec!["a".to_string()]);
     assert!(
@@ -1293,6 +1298,24 @@ async fn halt_record(raw: &Client, target: &str) -> Option<(String, String)> {
     .map(|row| (row.get(0), row.get(1)))
 }
 
+/// The targets [`Trellis::definitions`] reports a halt on (#663), each
+/// checked to be a halt, in id order.
+async fn halted_targets(trellis: &Trellis) -> Vec<String> {
+    let mut halted = Vec::new();
+    for summary in trellis.definitions().await.expect("definitions") {
+        if let Some(halt) = summary.halt {
+            assert_eq!(
+                halt.kind,
+                CaptureFailureKind::Halt,
+                "{}",
+                summary.target_table
+            );
+            halted.push(summary.target_table);
+        }
+    }
+    halted
+}
+
 async fn halting_stops(pool: &trellis::Pool) -> i64 {
     trellis::staging::halting_stop_stats(pool)
         .await
@@ -1404,7 +1427,10 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
         assert!(error.contains("character"), "{target}: {error}");
         let reported = trellis.status(target).await.expect("status").expect(target);
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
-        assert!(reported.capture_failure.is_some(), "{target}");
+        let failure = reported.capture_failure.expect(target);
+        assert_eq!(failure.kind, CaptureFailureKind::Halt, "{target}");
+        assert_eq!(failure.source_table, "public.users", "{target}");
+        assert_eq!(failure.error, error, "{target}");
     }
     for target in ["posts_plain", "o_copy"] {
         assert_eq!(
@@ -1415,6 +1441,15 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
         assert_eq!(halt_record(&raw, target).await, None, "{target}");
     }
     assert_eq!(halting_stops(&db.pool).await, stops + 1);
+    // The health read: one listing names every halted definition and why.
+    assert_eq!(
+        halted_targets(&trellis).await,
+        HALT_CLOSURE
+            .iter()
+            .map(|t| format!("public.{t}"))
+            .collect::<Vec<_>>(),
+        "definitions() reports the halt on exactly the closure"
+    );
 
     for poll in 0..20 {
         app.batch_execute(&format!(
@@ -1457,6 +1492,14 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
             .unwrap_or_else(|e| panic!("resume {target}: {e}"));
     }
     bring_live(&mut raw, &db.pool, &HALT_CLOSURE_ALL).await;
+    assert!(
+        halted_targets(&trellis).await.is_empty(),
+        "a resume ends the halt"
+    );
+    for target in HALT_CLOSURE {
+        let reported = trellis.status(target).await.expect("status").expect(target);
+        assert_eq!(reported.capture_failure, None, "{target}");
+    }
     assert_eq!(
         rows(&raw, "select name from public.users_copy order by name").await,
         rows(&raw, "select name from public.users order by name").await,
@@ -1488,6 +1531,66 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
         )
         .await,
         "named_copy rebuilt"
+    );
+}
+
+/// Issue #663: resuming a halted closure before its cause is fixed rebuilds
+/// it, meets the same failure, and halts it again: a new episode, with its
+/// own stop. The members resume in any order, here downstream first.
+#[tokio::test]
+async fn resuming_a_halted_closure_before_the_key_is_fixed_halts_it_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = halt_closure_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    let stops = halting_stops(&db.pool).await;
+
+    app.batch_execute(
+        "alter table public.users alter column handle type character(8); \
+         update public.users set name = 'Annie' where handle = 'ann';",
+    )
+    .await
+    .expect("retype the key and write it");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(halting_stops(&db.pool).await, stops + 1);
+
+    for target in HALT_CLOSURE.iter().rev() {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|e| panic!("resume {target}: {e}"));
+    }
+    for round in 0..8 {
+        app.batch_execute(&format!(
+            "update public.users set name = 'Ann {round}' where handle = 'ann'"
+        ))
+        .await
+        .expect("write the halted table");
+        full_pass(&mut raw, &db.pool).await;
+        run_backfill_chunks(&db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    }
+    // Each member is paused again by whichever meets the key first: the
+    // drain's halt, or a build of its own that keeps failing (`users_copy`'s
+    // Re-derive build reads `users` by that key).
+    for target in HALT_CLOSURE {
+        let reported = trellis.status(target).await.expect("status").expect(target);
+        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+        let cause = match (&reported.capture_failure, &reported.backfill_failure) {
+            (Some(failure), _) => {
+                assert_eq!(failure.kind, CaptureFailureKind::Halt, "{target}");
+                &failure.error
+            }
+            (None, Some(failure)) => &failure.last_error,
+            (None, None) => panic!("{target} is paused with no reason: {reported:?}"),
+        };
+        assert!(cause.contains("character(8)"), "{target}: {cause}");
+    }
+    assert_eq!(
+        halting_stops(&db.pool).await,
+        stops + 2,
+        "the second halt is a new episode"
     );
 }
 

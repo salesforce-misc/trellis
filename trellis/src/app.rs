@@ -511,7 +511,11 @@ impl Trellis {
     /// Every registered transform definition, oldest first. Each status is
     /// the one [`Trellis::status`] reports: a `live` definition reading an
     /// upstream that isn't `live` shows [`TransformStatus::CatchingUp`]
-    /// (issue #497).
+    /// (issue #497). Each also carries why its build keeps failing, if it
+    /// does, and why the drain halted on it, if it did (issue #663), so one
+    /// listing shows every stuck definition: a health check that lists them
+    /// and finds a [`DefinitionSummary::halt`] has a definition stopped until
+    /// an operator fixes the cause and resumes it.
     pub async fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
         let mut client = self.pool.get().await?;
         // One repeatable-read transaction, so the reported statuses are
@@ -525,18 +529,24 @@ impl Trellis {
         // Issue #461: the same `pending_backfill` and failing-chunk joins
         // `status` reads its `backfill_failure` from, in the one listing
         // query (`table_name` is the table's primary key, and the chunk join
-        // takes one chunk, so each adds at most one row per definition).
+        // takes one chunk, so each adds at most one row per definition), and
+        // the definition's halt (#663; `capture_failures` is keyed by it).
         let rows = txn
             .query(
                 &format!(
                     "select d.id, d.target_table, d.source_table, d.source_version, d.created_at, \
                             pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                             pb.last_error as backfill_last_error, \
-                            pb.next_attempt_at as backfill_next_attempt_at, {CHUNK_FAILURE_COLUMNS} \
+                            pb.next_attempt_at as backfill_next_attempt_at, {CHUNK_FAILURE_COLUMNS}, \
+                            cf.source_table as capture_table, cf.columns as capture_columns, \
+                            cf.error as capture_error, cf.detected_at as capture_detected_at, \
+                            cf.kind as capture_kind \
                      from transform_definitions d \
                      left join pending_backfill pb \
                        on pb.table_name = d.source_table and pb.last_error is not null \
                      {CHUNK_FAILURE_JOIN} \
+                     left join capture_failures cf \
+                       on cf.transform_id = d.id and cf.kind = 'halt' \
                      order by d.id"
                 ),
                 &[],
@@ -556,6 +566,7 @@ impl Trellis {
                     status: reported[&id],
                     created_at: row.get(4),
                     backfill_failure: backfill_failure(&row),
+                    halt: capture_failure(&row),
                 }
             })
             .collect())
@@ -617,6 +628,7 @@ impl Trellis {
                             {CHUNK_FAILURE_COLUMNS}, \
                             cf.source_table as capture_table, cf.columns as capture_columns, \
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
+                            cf.kind as capture_kind, \
                             exists (select 1 from column_status cs \
                                     where cs.transform_table = $1 and cs.awaiting_capture) \
                               as awaiting_capture \
@@ -698,6 +710,7 @@ impl Trellis {
         let failure = rows.iter().find_map(|row| {
             let error: Option<String> = row.get(6);
             error.map(|error| CaptureFailure {
+                kind: CaptureFailureKind::Capture,
                 source_table: row.get(0),
                 columns: row.get(7),
                 error,
@@ -1464,14 +1477,15 @@ fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
         })
 }
 
-/// The [`CaptureFailure`] in a row of [`Trellis::status`]'s query:
-/// `capture_failures`' `source_table`, `columns`, `error` and
-/// `detected_at`, selected as `capture_table`, `capture_columns`,
-/// `capture_error` and `capture_detected_at` from a left join on the
-/// definition's id.
+/// The [`CaptureFailure`] in a row of [`Trellis::status`]'s or
+/// [`Trellis::definitions`]' query: `capture_failures`' `kind`,
+/// `source_table`, `columns`, `error` and `detected_at`, selected as
+/// `capture_kind`, `capture_table`, `capture_columns`, `capture_error` and
+/// `capture_detected_at` from a left join on the definition's id.
 fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
     row.get::<_, Option<String>>("capture_table")
         .map(|source_table| CaptureFailure {
+            kind: CaptureFailureKind::from_persisted(row.get("capture_kind")),
             source_table,
             columns: row.get("capture_columns"),
             error: row.get("capture_error"),
@@ -1548,7 +1562,17 @@ pub struct DefinitionStatus {
     /// - or, while it waits on capture as for `capture_wait`, the staging
     ///   worker's install or widen fails for a reason other than a lock (no
     ///   primary key, a statement that fails, #687). Every pass retries it,
-    ///   and it clears once one succeeds. Recorded like `capture_wait`.
+    ///   and it clears once one succeeds. Recorded like `capture_wait`;
+    /// - or the drain halted on it (issue #663), with
+    ///   [`CaptureFailureKind::Halt`]: a failure no retry or quarantine gets
+    ///   past (a key the drain can't use, a propagation wave past the hop
+    ///   bound, an aggregate off the ledger) reached it, so the drain paused
+    ///   it, everything else reading what it reads, and everything
+    ///   downstream of them, and drained the rest. Fix the cause and resume
+    ///   the definition, which rebuilds it and clears this.
+    ///
+    /// Every case but the halt has [`CaptureFailureKind::Capture`]. A
+    /// definition an operator paused has none.
     pub capture_failure: Option<CaptureFailure>,
 }
 
@@ -1556,18 +1580,58 @@ pub struct DefinitionStatus {
 /// #687); see [`DefinitionStatus::capture_failure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureFailure {
-    /// The qualified captured table.
+    /// Whether capture broke, or the drain halted on the definition (#663).
+    pub kind: CaptureFailureKind,
+    /// The qualified captured table. For a halt, the table (or tables,
+    /// joined with `", "`) the halting failure named, or the target, for an
+    /// aggregate off the ledger.
     pub source_table: String,
     /// The columns the failure is about: the renamed or dropped ones the
     /// definition reads (every missing column of the table when a
     /// primary-key column went), the old key columns when the key was
     /// redefined, or the missing column an install names. Empty for a
-    /// failure that isn't about a column.
+    /// failure that isn't about a column, and for a halt.
     pub columns: Vec<String>,
     /// A sentence naming the cause and, for a pause, what to do.
     pub error: String,
     /// When the drain or the staging worker first found it.
     pub detected_at: SystemTime,
+}
+
+/// What a [`CaptureFailure`] is (issue #663): `capture_failures.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptureFailureKind {
+    /// Capture of a table the definition reads is broken: a schema change,
+    /// row-level security, a subscription, or a failing install or widen.
+    Capture,
+    /// The drain halted on the definition: a failure no retry or quarantine
+    /// gets past reached it, so the drain paused it with the rest of the
+    /// failure's closure (`staging::halt`).
+    Halt,
+}
+
+impl CaptureFailureKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [CaptureFailureKind; 2] =
+        [CaptureFailureKind::Capture, CaptureFailureKind::Halt];
+
+    /// The word `capture_failures.kind` stores: `capture` or `halt`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaptureFailureKind::Capture => "capture",
+            CaptureFailureKind::Halt => "halt",
+        }
+    }
+
+    /// The kind `capture_failures.kind` stores. Its check constraint (V70)
+    /// admits only these two.
+    fn from_persisted(kind: &str) -> Self {
+        match kind {
+            "halt" => CaptureFailureKind::Halt,
+            "capture" => CaptureFailureKind::Capture,
+            other => panic!("capture_failures.kind held unrecognized value '{other}'"),
+        }
+    }
 }
 
 /// What a definition's capture is waiting on (issue #622 C5): the staging
@@ -1633,6 +1697,12 @@ pub struct DefinitionSummary {
     /// it does: the same value [`DefinitionStatus::backfill_failure`] reports
     /// (issue #461).
     pub backfill_failure: Option<BackfillFailure>,
+    /// Set while the drain has halted on this definition (issue #663): the
+    /// [`DefinitionStatus::capture_failure`] [`Trellis::status`] reports for
+    /// it, always with [`CaptureFailureKind::Halt`]. The definition is
+    /// `paused`. Listing every definition is the health read for halts: any
+    /// with this set is stopped until the cause is fixed and it is resumed.
+    pub halt: Option<CaptureFailure>,
 }
 
 /// One registered relationship declaration, as [`Trellis::relationships`]

@@ -895,7 +895,7 @@ pub async fn install_definition(
         KeySpace::Aggregate { .. } => {
             // Issue #371: live apply reads the source's primary key through
             // `ddl::source_primary_key` for an aggregate too, and a key type
-            // it refuses halts the instance there. Refuse it here instead,
+            // it refuses halts its readers there. Refuse it here instead,
             // before any DDL, exactly as the 1-1 arm above does.
             ddl::source_primary_key(pool, &qualified_source)
                 .await
@@ -2516,7 +2516,7 @@ async fn create_definition_inner(
     // Issue #371: every key-space, not just `OneToOne`. Live apply calls
     // `ddl::source_primary_key` on an aggregate's source too
     // (`staging::apply`'s by-source and TRUNCATE loops), and
-    // `quarantine::classify` halts the instance on the key-type error it
+    // `quarantine::classify` halts the table's readers on the key-type error it
     // returns — so an aggregate over a `numeric`-keyed table, or chained off
     // a `numeric`-grouped aggregate (whose identity is its `GROUP BY` key),
     // used to be accepted here and then halt on its first live change.
@@ -2940,7 +2940,7 @@ struct ValidatedRelationship {
 
 /// Every requirement Trellis has of a relationship's endpoint tables and
 /// join columns, checked before [`create_relationship`] writes anything
-/// (issue #429). A relationship this accepts must never halt the instance
+/// (issue #429). A relationship this accepts must never halt its definitions
 /// later over something that was knowable when it was declared. Each check
 /// calls the same function, or reads the same allowlist, as the runtime path
 /// it protects, so the two can't drift apart. The full list, with the path
@@ -3072,7 +3072,7 @@ async fn validate_relationship(
 ///   through `accumulate_from_side_recomputes`,
 ///   `build_reverse_relationship_shape` and the `TRUNCATE` loop's from-side
 ///   walk. All of them call [`ddl::source_primary_key`], which rejects a key
-///   type off the allowlist, and that rejection halts the instance. This is
+///   type off the allowlist, and that rejection halts the table's readers. This is
 ///   that same function, so the gate here is exactly the runtime one. Own
 ///   targets are not exempt: a 1-1 target mirrors its source's (already
 ///   gated) key, but an aggregate target's key is its `GROUP BY` columns.

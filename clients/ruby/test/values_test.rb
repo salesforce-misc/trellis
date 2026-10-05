@@ -46,7 +46,7 @@ class ValuesTest < Minitest::Test
       capture_wait: { table: "public.orders", operation: "widen",
                       lock_mode: "ShareRowExclusiveLock", waiting_since_micros: MICROS,
                       observed_at_micros: MICROS + 1, blockers: ["pid 42 holds RowExclusiveLock"] },
-      capture_failure: { source_table: "public.lines", columns: ["qty"],
+      capture_failure: { kind: :capture, source_table: "public.lines", columns: ["qty"],
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS }
     )
     assert_equal Trellis::Status.new(
@@ -58,7 +58,7 @@ class ValuesTest < Minitest::Test
         blockers: ["pid 42 holds RowExclusiveLock"]
       ),
       capture_failure: Trellis::CaptureFailure.new(
-        source_table: "public.lines", columns: ["qty"], error: "column \"qty\" was dropped",
+        kind: :capture, source_table: "public.lines", columns: ["qty"], error: "column \"qty\" was dropped",
         detected_at: Trellis::EpochMicros.to_time(MICROS)
       )
     ), status
@@ -69,7 +69,8 @@ class ValuesTest < Minitest::Test
       id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
       status: :waiting_to_backfill, created_at_micros: MICROS,
       backfill_failure: { source_table: "public.s", attempts: 2, last_error: "timeout",
-                          next_attempt_at_micros: MICROS }
+                          next_attempt_at_micros: MICROS },
+      halt: nil
     )
     assert_equal Trellis::DefinitionSummary.new(
       id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
@@ -77,8 +78,22 @@ class ValuesTest < Minitest::Test
       backfill_failure: Trellis::BackfillFailure.new(
         source_table: "public.s", attempts: 2, last_error: "timeout",
         next_attempt_at: Trellis::EpochMicros.to_time(MICROS)
-      )
+      ),
+      halt: nil
     ), summary
+  end
+
+  def test_a_definition_summarys_halt_becomes_a_capture_failure_of_kind_halt
+    summary = Trellis::DefinitionSummary.from_native(
+      id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
+      status: :paused, created_at_micros: MICROS, backfill_failure: nil,
+      halt: { kind: :halt, source_table: "public.s", columns: [],
+              error: "the drain halted", detected_at_micros: MICROS }
+    )
+    assert_equal Trellis::CaptureFailure.new(
+      kind: :halt, source_table: "public.s", columns: [], error: "the drain halted",
+      detected_at: Trellis::EpochMicros.to_time(MICROS)
+    ), summary.halt
   end
 
   def test_an_applied_carries_only_its_kinds_fields
@@ -131,5 +146,6 @@ class ValuesTest < Minitest::Test
     assert_equal %i[converged not_caught_up diverged], Trellis::Native.self_check_outcomes
     assert_equal %i[cell missing_row extra_row missing_column extra_column capture],
                  Trellis::Native.divergence_kinds
+    assert_equal %i[capture halt], Trellis::Native.capture_failure_kinds
   end
 end

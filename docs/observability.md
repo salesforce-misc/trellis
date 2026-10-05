@@ -18,7 +18,7 @@ where they're stuck, and what work is pending or blocked. The counterpart to
 * **Structured logs** — through a facade that can export OpenTelemetry.
 * **Transform status** — every transform carries an observable lifecycle status
   (`waiting_to_backfill` → `backfilling` → `catching_up` → `live`, plus
-  `quarantined` and `paused`), so an
+  `quarantined` and `paused`, which a halting failure also uses), so an
   operator can tell a new transform is still populating rather than live — the
   right-sized answer to the silent-stall problem (#14).
 * **Fleet-level worker liveness** — `Trellis::has_live_drain_workers`
@@ -295,6 +295,46 @@ Meanwhile `DefinitionStatus::backfill_failure` carries the failing chunk's
 error, attempt count and next attempt time, ahead of any failure of the
 source table's marker. A transform paused this way keeps the error there
 until it is resumed, and its next attempt time is the time it paused.
+
+### A halting failure
+
+Some failures are no row's fault, so every key of the page reproduces them:
+a source key the drain can't use (the table lost its primary key, or the key
+changed to a type Trellis can't key by), a propagation wave past the hop bound,
+or an aggregate target off the ledger. Retrying the page would fail it forever,
+and quarantining a key would blame one for nobody's fault. Instead the drain
+**halts** the definitions the failure reaches (#663) and drains the page
+without them:
+
+* **What it pauses.** For a key error, every definition that reads the table,
+  as its source or as a relationship's to-side. For a hop bound outside a
+  cycle, the readers of the table the wave ran away through, not the
+  definition that wrote it; inside a cycle, every member. For an aggregate off
+  the ledger, the definition that writes that target. In every case, also
+  everything downstream of those, so no hop target goes quietly stale. Every
+  other definition keeps converging, and the staging ring keeps retiring.
+* **How it shows.** A halted definition is `paused`, like an operator pause,
+  with no new status word. What tells it apart is
+  `DefinitionStatus::capture_failure`: its `kind` is `halt` (rather than
+  `capture`, a capture trigger that failed), with the table the failure named,
+  the error and the time it halted. `Trellis::definitions` carries the same
+  value as `DefinitionSummary::halt`, so one call finds every halted
+  definition ([embedding — health checks](embedding.md#halted-definitions)), and
+  the CLI's `trellis status` prints it on an indented line under each one.
+* **One episode, one signal.** A halt logs one error line naming every
+  definition it paused, and increments the single-row `halting_stops` table:
+  `stop_count`, plus `last_reason` and `last_stopped_at` for the latest. A
+  peer worker meeting the same failure, or a retry meeting it again, finds the
+  closure already paused and records nothing, so the count is of episodes,
+  not attempts. A halt that pauses nothing, which isn't believed reachable,
+  falls back to surfacing the error, and the drain worker re-claims the page
+  at its poll interval under a collapsed warning (#660).
+* **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
+  in any order; each resume rebuilds that definition as for any pause, and
+  clears its halt. Resuming while the cause persists halts it again, as a new
+  episode with its own count and error line. A Re-derive-built definition
+  rebuilt over a source whose key still can't be used may instead be paused by
+  its own build, with the error on `backfill_failure`, as above.
 
 ## Dependencies
 

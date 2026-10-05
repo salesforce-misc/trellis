@@ -18,7 +18,8 @@ module Parity
     "cardinality" => -> { Trellis::Native.cardinality_names },
     "applied_kind" => -> { Trellis::Native.applied_kinds },
     "self_check_outcome" => -> { Trellis::Native.self_check_outcomes },
-    "divergence_kind" => -> { Trellis::Native.divergence_kinds }
+    "divergence_kind" => -> { Trellis::Native.divergence_kinds },
+    "capture_failure_kind" => -> { Trellis::Native.capture_failure_kinds }
   }.freeze
 
   # The fixture's operations, each as a call on this binding. `args` are the

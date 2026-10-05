@@ -10,12 +10,15 @@
 //! `definitions()` lists) has the creation time but no source columns.
 //! [`DefinitionStatus`] (what `status()` polls) flattens here too, with its
 //! backfill failure's retry time, its capture wait's times and its capture
-//! failure's detection time in epoch microseconds.
+//! failure's detection time in epoch microseconds. A capture failure's kind
+//! crosses as its word, one of [`capture_failure_kind_names`], which a host
+//! turns into an atom or symbol from that set, allocated at load.
 
 use std::collections::BTreeMap;
 
 use trellis::{
-    BackfillFailure, CaptureFailure, CaptureWait, Definition, DefinitionStatus, DefinitionSummary,
+    BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, Definition, DefinitionStatus,
+    DefinitionSummary,
 };
 
 use crate::{epoch_micros, transform_status};
@@ -70,6 +73,9 @@ pub struct PlainDefinitionSummary {
     /// Set while the definition's build keeps failing; see
     /// [`DefinitionSummary::backfill_failure`].
     pub backfill_failure: Option<PlainBackfillFailure>,
+    /// Set while the drain has halted on the definition; see
+    /// [`DefinitionSummary::halt`].
+    pub halt: Option<PlainCaptureFailure>,
 }
 
 impl From<&DefinitionSummary> for PlainDefinitionSummary {
@@ -85,6 +91,7 @@ impl From<&DefinitionSummary> for PlainDefinitionSummary {
                 .backfill_failure
                 .as_ref()
                 .map(PlainBackfillFailure::from),
+            halt: summary.halt.as_ref().map(PlainCaptureFailure::from),
         }
     }
 }
@@ -127,6 +134,8 @@ pub struct PlainCaptureWait {
 /// A [`CaptureFailure`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainCaptureFailure {
+    /// `capture` or `halt`, as [`CaptureFailureKind::as_str`] spells it.
+    pub kind: &'static str,
     /// The fully-qualified `schema.table` whose capture is broken.
     pub source_table: String,
     /// The columns the failure is about; empty when it isn't about one.
@@ -183,12 +192,19 @@ impl From<&CaptureWait> for PlainCaptureWait {
 impl From<&CaptureFailure> for PlainCaptureFailure {
     fn from(failure: &CaptureFailure) -> Self {
         PlainCaptureFailure {
+            kind: failure.kind.as_str(),
             source_table: failure.source_table.clone(),
             columns: failure.columns.clone(),
             error: failure.error.clone(),
             detected_at_micros: epoch_micros(failure.detected_at),
         }
     }
+}
+
+/// Every word [`PlainCaptureFailure::kind`] can be: the set a host allocates
+/// its kind names from at load time.
+pub fn capture_failure_kind_names() -> Vec<&'static str> {
+    CaptureFailureKind::ALL.iter().map(|k| k.as_str()).collect()
 }
 
 impl From<&BackfillFailure> for PlainBackfillFailure {
@@ -265,6 +281,7 @@ mod tests {
             status: TransformStatus::Live,
             created_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_123_456),
             backfill_failure: None,
+            halt: None,
         };
 
         let plain = PlainDefinitionSummary::from(&summary);
@@ -279,6 +296,7 @@ mod tests {
                 status: "live",
                 created_at_micros: 1_727_222_400_123_456,
                 backfill_failure: None,
+                halt: None,
             }
         );
     }
@@ -298,6 +316,7 @@ mod tests {
                 last_error: "permission denied for table orders".to_string(),
                 next_attempt_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
             }),
+            halt: None,
         };
 
         assert_eq!(
@@ -309,6 +328,46 @@ mod tests {
                 next_attempt_at_micros: 1_727_222_400_654_321,
             })
         );
+    }
+
+    #[test]
+    fn a_summary_carries_its_halt_with_its_kind_word() {
+        let summary = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 3,
+            status: TransformStatus::Paused,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: Some(CaptureFailure {
+                kind: CaptureFailureKind::Halt,
+                source_table: "public.orders".to_string(),
+                columns: Vec::new(),
+                error: "the drain halted".to_string(),
+                detected_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_000_004),
+            }),
+        };
+
+        assert_eq!(
+            PlainDefinitionSummary::from(&summary).halt,
+            Some(PlainCaptureFailure {
+                kind: "halt",
+                source_table: "public.orders".to_string(),
+                columns: Vec::new(),
+                error: "the drain halted".to_string(),
+                detected_at_micros: 1_727_222_400_000_004,
+            })
+        );
+    }
+
+    #[test]
+    fn every_capture_failure_kind_word_is_in_the_load_time_set_once() {
+        let names = capture_failure_kind_names();
+        assert_eq!(names, vec!["capture", "halt"]);
+        for kind in CaptureFailureKind::ALL {
+            assert!(names.contains(&kind.as_str()));
+        }
     }
 
     #[test]
@@ -376,6 +435,7 @@ mod tests {
                 blockers: vec!["pid 42 (client backend) holds RowExclusiveLock".to_string()],
             }),
             capture_failure: Some(CaptureFailure {
+                kind: CaptureFailureKind::Capture,
                 source_table: "public.lines".to_string(),
                 columns: vec!["qty".to_string()],
                 error: "capture of public.lines needs column \"qty\"".to_string(),
@@ -399,6 +459,7 @@ mod tests {
         assert_eq!(
             plain.capture_failure,
             Some(PlainCaptureFailure {
+                kind: "capture",
                 source_table: "public.lines".to_string(),
                 columns: vec!["qty".to_string()],
                 error: "capture of public.lines needs column \"qty\"".to_string(),

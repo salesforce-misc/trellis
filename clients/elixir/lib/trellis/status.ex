@@ -16,9 +16,12 @@ defmodule Trellis.Status do
     * `capture_wait` is set while installing or widening capture on a table
       it reads waits for a lock another session holds. It clears once that
       session lets go.
-    * `capture_failure` is set while capture of a table it reads is broken:
-      a schema change paused it (resume it once fixed), or installing
-      capture keeps failing (it clears once the cause is fixed).
+    * `capture_failure` is set while capture of a table it reads is broken,
+      or the drain halted on it: a schema change paused it (resume it once
+      fixed), installing capture keeps failing (it clears once the cause is
+      fixed), or, with `kind` `:halt`, a failure no retry gets past reached
+      it, so the drain paused it and what depends on it (resume it once
+      fixed). A transform an operator paused has none.
 
   Every process sees them, whichever one runs the staging worker.
   """
@@ -89,24 +92,30 @@ end
 
 defmodule Trellis.CaptureFailure do
   @moduledoc """
-  Why capture of `source_table` is broken: `error` is a sentence naming the
-  cause, `columns` the columns it is about (empty when it isn't about a
-  column), and `detected_at` when it was first found.
+  Why capture of `source_table` is broken, or why the drain halted on the
+  transform: `kind` is `:capture` or `:halt`, `error` is a sentence naming
+  the cause, `columns` the columns it is about (empty when it isn't about a
+  column, and for a halt), and `detected_at` when it was first found.
   """
 
+  @typedoc "Whether capture broke or the drain halted."
+  @type kind :: :capture | :halt
+
   @type t :: %__MODULE__{
+          kind: kind(),
           source_table: String.t(),
           columns: [String.t()],
           error: String.t(),
           detected_at: DateTime.t()
         }
 
-  @enforce_keys [:source_table, :columns, :error, :detected_at]
+  @enforce_keys [:kind, :source_table, :columns, :error, :detected_at]
   defstruct @enforce_keys
 
   @doc false
   def from_native(%{detected_at_micros: micros} = failure) do
     %__MODULE__{
+      kind: failure.kind,
       source_table: failure.source_table,
       columns: failure.columns,
       error: failure.error,

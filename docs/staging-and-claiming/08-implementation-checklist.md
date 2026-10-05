@@ -33,9 +33,12 @@ A condensed checklist. Each item links to the document that argues for it.
 - [ ] **Enumerate which measures are invertible.** Everything else goes on a
       recompute path. Never approximate an inverse.
       → [05](05-apply-and-exactly-once-deltas.md)
-- [ ] **An undrainable item stops the whole instance, on purpose** — write the
-      metric at the same time, so "stopped" and "slow" stay distinguishable.
-      → [06](06-cleanup-and-reclaim.md)
+- [ ] **No item may stay undrainable** — one would stop the whole instance. A
+      schema error pauses the definitions it reaches and drains without them;
+      write the halting-stop metric at the same time, so "halted" and "slow"
+      stay distinguishable.
+      → [05](05-apply-and-exactly-once-deltas.md#failure-classification),
+      [06](06-cleanup-and-reclaim.md)
 
 ## Build order
 
