@@ -716,12 +716,21 @@ impl LiveRowsQuery<'_> {
 /// nested loop over a sequential scan of the source. This is the same split
 /// `target_mutations::read_new_images` makes (issue #433).
 ///
-/// Each arm also restricts every non-`NULL` key column to its array
-/// (`t.<col> = any(<array>)`), which the join already implies, so the
+/// A single-column key's non-`NULL` arm also restricts the column to its
+/// array (`t.<col> = any(<array>)`), which the join already implies, so the
 /// source's side of whatever join the planner picks is bounded by the batch
 /// (#778). Without it, a source analyzed while small and grown since was
 /// read in full for a page's 5,000 keys: a hash join over a sequential scan
 /// of 1.15M rows, 143 ms against 11 ms.
+///
+/// A composite key is never restricted this way. One `= any` per column
+/// makes the planner multiply the columns' selectivities, expect a row or
+/// two from the source, and compare every bounded row with every key,
+/// quadratic in the batch even with fresh statistics: 1,474 ms against 13
+/// ms for 5,000 keys of a four-column key at 1M rows, and 946 ms on a
+/// two-column key at 20M rows. The cost is that a composite key whose
+/// source's statistics lag can still be hashed against a sequential scan
+/// of the source.
 pub(super) fn live_rows_query<'a>(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
@@ -759,7 +768,9 @@ pub(super) fn live_rows_query<'a>(
                 if !null {
                     next_param += 1;
                     let array = format!("${next_param}::text[]::{}[]", column.data_type);
-                    bounds.push(format!("t.{} = any({array})", quote_ident(&column.name)));
+                    if pk.len() == 1 {
+                        bounds.push(format!("t.{} = any({array})", quote_ident(&column.name)));
+                    }
                     arrays.push(array);
                     u_cols.push(pk_keyset_col(i));
                 }
@@ -4233,12 +4244,20 @@ mod tests {
     }
 
     /// Issue #778: a [`live_rows_query`] batch reads only its keys' rows of
-    /// a source whose statistics lag its size, at a single-column and a
-    /// composite key. Each source is analyzed at 100 rows and then grown to
-    /// 400k with autovacuum off. Left to the join alone, the planner hashed
-    /// a 5,000-key batch against a sequential scan of the source (or, with
-    /// sequential scans off, a full scan of its key's index); each arm's
-    /// `= any` restriction caps the source's side at the batch.
+    /// a single-column key's source whose statistics lag its size: analyzed
+    /// at 100 rows, then grown to 400k with autovacuum off. Left to the join
+    /// alone, the planner hashed a 5,000-key batch against a sequential scan
+    /// of the source (or, with sequential scans off, a full scan of its
+    /// key's index); the arm's `= any` restriction caps the source's side at
+    /// the batch.
+    ///
+    /// A composite key is left unrestricted, and with fresh statistics it
+    /// must not be matched by comparing every source row with every key:
+    /// here a four-column key at 1M rows. One `= any` per column made the
+    /// planner expect a row from the source and loop over every key for
+    /// each bounded row (1,474 ms against 13 ms).
+    ///
+    /// Either way every key must find its own row.
     #[tokio::test]
     async fn live_rows_query_reads_only_the_batch_while_source_statistics_lag() {
         let cluster = testkit::TestCluster::start();
@@ -4253,18 +4272,20 @@ mod tests {
             .batch_execute(
                 "create table single (id int primary key, total int) \
                      with (autovacuum_enabled = false); \
-                 create table composite (g int, h text, total int, primary key (g, h)) \
+                 create table composite (g int, h text, i int, j text, total int, \
+                                         primary key (g, h, i, j)) \
                      with (autovacuum_enabled = false); \
                  insert into single select i, i from generate_series(1, 100) i; \
-                 insert into composite select i, 'k' || i, i from generate_series(1, 100) i; \
-                 analyze single; analyze composite; \
+                 analyze single; \
                  insert into single select i, i from generate_series(101, 400000) i; \
-                 insert into composite select i, 'k' || i, i \
-                     from generate_series(101, 400000) i;",
+                 insert into composite select i, 'k' || i, i, 'j' || i, i \
+                     from generate_series(1, 1000000) i; \
+                 analyze composite;",
             )
             .await
-            .expect("seed sources whose statistics lag");
-        for table in ["public.single", "public.composite"] {
+            .expect("seed the sources");
+        // (source, whether its key is a single column: bounded, with lagging statistics)
+        for (table, single) in [("public.single", true), ("public.composite", false)] {
             let pk = ddl::identity_key_columns(&client, table)
                 .await
                 .expect("identity");
@@ -4283,33 +4304,56 @@ mod tests {
             let keys: Vec<&str> = owned.iter().map(String::as_str).collect();
             assert_eq!(keys.len(), 5000);
             let query = live_rows_query(table, &pk, &columns, &keys).expect("query");
+            assert_eq!(
+                query.sql.contains("= any("),
+                single,
+                "{table}: only a single-column key is bounded:\n{}",
+                query.sql
+            );
             let plan: String = client
-                .query(&format!("explain {}", query.sql), &query.params())
+                .query(
+                    &format!("explain (analyze, timing off) {}", query.sql),
+                    &query.params(),
+                )
                 .await
                 .expect("explain")
                 .into_iter()
                 .map(|row| row.get::<_, String>(0))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let source = &table["public.".len()..];
-            let scans: Vec<&str> = plan
-                .lines()
-                .filter(|line| line.contains(&format!(" on {source} ")))
-                .collect();
-            assert!(
-                !scans.is_empty(),
-                "{table}: no scan of the source in:\n{plan}"
-            );
-            for scan in scans {
-                let rows: f64 = scan
-                    .split("rows=")
-                    .nth(1)
-                    .and_then(|rest| rest.split(' ').next())
-                    .and_then(|rows| rows.parse().ok())
-                    .expect("a row estimate");
+            if single {
+                let source = &table["public.".len()..];
+                let scans: Vec<&str> = plan
+                    .lines()
+                    .filter(|line| line.contains(&format!(" on {source} ")))
+                    .collect();
                 assert!(
-                    !scan.contains("Seq Scan") && rows <= keys.len() as f64,
-                    "{table}: the source must be read through the batch's keys, got:\n{plan}"
+                    !scans.is_empty(),
+                    "{table}: no scan of the source in:\n{plan}"
+                );
+                for scan in scans {
+                    let rows: f64 = scan
+                        .split("rows=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(' ').next())
+                        .and_then(|rows| rows.parse().ok())
+                        .expect("a row estimate");
+                    assert!(
+                        !scan.contains("Seq Scan") && rows <= keys.len() as f64,
+                        "{table}: the source must be read through the batch's keys, \
+                         got:\n{plan}"
+                    );
+                }
+            } else {
+                let filtered: u64 = plan
+                    .lines()
+                    .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                    .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                    .sum();
+                assert!(
+                    filtered < keys.len() as u64,
+                    "{table}: the source must be matched to the keys without comparing \
+                     every row with every key, got:\n{plan}"
                 );
             }
             let found: std::collections::HashSet<String> = client
