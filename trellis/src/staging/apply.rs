@@ -5182,8 +5182,8 @@ async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyErro
 /// own changes. Without this a write to the to-side halted the drain on the
 /// from-side's key though no reader would apply what it staged. A reader
 /// that isn't frozen halts the page, which pauses it (`super::halt`, #663),
-/// and so does a from-side that is gone. A new reader rebuilds from the source too, so the skip needs no
-/// fence.
+/// and so does a from-side that is gone. A new reader rebuilds from the
+/// source too, so the skip needs no fence.
 async fn from_side_key(
     pool: &Pool,
     qualified_from_table: &str,

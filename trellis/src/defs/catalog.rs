@@ -1193,9 +1193,10 @@ pub(crate) async fn applying_readers(
 /// The drain asks this only when `table`'s primary key can't be used
 /// (`staging::apply::compute`, issue #768), to tell a table whose rows no
 /// reader needs, which it skips, from one a reader still needs, which halts
-/// the page and pauses its readers (`staging::halt`, #663). A definition waiting for its build, or under a chunked or direct one,
-/// doesn't apply the rows yet, but it does need them: a to-side's rows keep
-/// the relationship's settled projection current, and its go-live catch-up
+/// the page and pauses its readers (`staging::halt`, #663). A definition
+/// waiting for its build, or under a chunked or direct one, doesn't apply
+/// the rows yet, but it does need them: a to-side's rows keep the
+/// relationship's settled projection current, and its go-live catch-up
 /// re-derives every from-side row from that projection. Only a frozen
 /// definition gives them up, and its resume rebuilds it
 /// (`staging::quarantine::resume_transform`).
