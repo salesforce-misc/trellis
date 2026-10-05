@@ -813,7 +813,7 @@ pub(crate) async fn plan_one_to_one_chunks(
     client: &impl GenericClient,
     def: &TransformDef,
     source_table: &str,
-) -> Result<Vec<(Option<String>, String)>, BackfillError> {
+) -> Result<PlannedRanges, BackfillError> {
     let _ = substitute_all_fields(def)?;
     let pk = ddl::source_primary_key_in_txn(client, source_table).await?;
     let source = ddl::qualified_source_table(source_table);
@@ -826,10 +826,23 @@ pub(crate) async fn plan_one_to_one_chunks(
     // rather than widening the schema, and degenerates to the bound's own
     // single value, verbatim, at arity 1 (byte-identical to before this
     // issue). [`execute_one_to_one_chunk`] decodes it back the same way.
-    Ok(ranges
-        .into_iter()
-        .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
-        .collect())
+    Ok(PlannedRanges {
+        ranges: ranges
+            .into_iter()
+            .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
+            .collect(),
+        key_collations: ddl::key_collations(&pk),
+    })
+}
+
+/// A 1-1 range build's plan ([`plan_one_to_one_chunks`]): its encoded
+/// `(lo, hi]` ranges, and the collations of the source key's columns they
+/// were walked under, which every chunk reads its range under
+/// (`backfill_chunks.key_collations`, issue #769).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedRanges {
+    pub(crate) ranges: Vec<(Option<String>, String)>,
+    pub(crate) key_collations: Vec<Option<String>>,
 }
 
 /// Executes exactly one previously-[`plan_one_to_one_chunks`]-enumerated
@@ -839,6 +852,7 @@ pub(crate) async fn plan_one_to_one_chunks(
 /// Idempotent overwrite, like every chunk write in this module (ADR-0007): a
 /// worker that reclaims this chunk after a peer died mid-write redoes it
 /// safely.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_one_to_one_chunk(
     pool: &Pool,
     def: &TransformDef,
@@ -846,9 +860,13 @@ pub(crate) async fn execute_one_to_one_chunk(
     source_table: &str,
     lo: Option<&str>,
     hi: &str,
+    key_collations: Option<&[Option<String>]>,
     fence: ClaimFence<'_>,
 ) -> Result<(), BackfillError> {
-    let pk = source_primary_key(pool, source_table).await?;
+    let mut pk = source_primary_key(pool, source_table).await?;
+    // Under the collations the range was planned under, not the key's own
+    // now (issue #769).
+    ddl::pin_key_collations(&mut pk, key_collations);
     let substituted = substitute_all_fields(def)?;
     let mut client = pool.get().await?;
     // The exact inverse of [`plan_one_to_one_chunks`]'s encode: a genuine
@@ -933,14 +951,18 @@ pub(crate) enum ChunkNarrowing {
 /// quarantined ones as the write does, and either names the one key or the
 /// key that splits them in half. The split point is found the way
 /// [`discover_pk_ranges`] finds a chunk's upper bound: the largest key of the
-/// first half, in the primary key's own order.
+/// first half, in the primary key's own order. `key_collations` are the ones
+/// the chunk's build planned its ranges under (`backfill_chunks.key_collations`,
+/// issue #769), which the range is read and split under.
 pub(crate) async fn narrow_one_to_one_chunk(
     client: &impl GenericClient,
     source_table: &str,
     lo: Option<&str>,
     hi: &str,
+    key_collations: Option<&[Option<String>]>,
 ) -> Result<ChunkNarrowing, BackfillError> {
-    let pk = ddl::source_primary_key_in_txn(client, source_table).await?;
+    let mut pk = ddl::source_primary_key_in_txn(client, source_table).await?;
+    ddl::pin_key_collations(&mut pk, key_collations);
     let decode = |text: &str| -> Result<Vec<String>, BackfillError> {
         Ok(ddl::split_pk_key(&pk, source_table, text)?
             .into_iter()
@@ -985,9 +1007,16 @@ pub(crate) async fn narrow_one_to_one_chunk(
         }
         keys => {
             let col_list = pk_idents.join(", ");
+            let order_by = pk_idents
+                .iter()
+                .zip(&pk)
+                .map(|(c, col)| col.ordered(c))
+                .collect::<Vec<_>>()
+                .join(", ");
             let order_desc = pk_idents
                 .iter()
-                .map(|c| format!("s.{c} desc"))
+                .zip(&pk)
+                .map(|(c, col)| format!("{} desc", col.ordered(&format!("s.{c}"))))
                 .collect::<Vec<_>>()
                 .join(", ");
             let mid_select = pk_idents
@@ -1000,7 +1029,7 @@ pub(crate) async fn narrow_one_to_one_chunk(
                     &format!(
                         "select {mid_select} from \
                          (select {col_list} from {source} as {SOURCE_ALIAS} \
-                          where {where_clause} order by {col_list} limit {}) s \
+                          where {where_clause} order by {order_by} limit {}) s \
                          order by {order_desc} limit 1",
                         keys / 2
                     ),
@@ -1085,6 +1114,15 @@ async fn walk_pk_ranges(
 ) -> Result<Vec<(Option<Vec<String>>, Vec<String>)>, BackfillError> {
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let col_list = pk_idents.join(", ");
+    // Every comparison and sort here is under each column's
+    // [`PrimaryKeyColumn::collation`] (issue #769), as the chunks that read
+    // these ranges compare.
+    let order_by = pk_idents
+        .iter()
+        .zip(pk)
+        .map(|(c, col)| col.ordered(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     // Qualified with the inner subquery's own alias (`s.`), not bare column
     // names: the outer `select` below casts each column to `::text`, and an
     // unaliased `<col>::text` output column is named after `<col>` itself
@@ -1104,7 +1142,8 @@ async fn walk_pk_ranges(
     // what the output side happens to be named.
     let order_desc = pk_idents
         .iter()
-        .map(|c| format!("s.{c} desc nulls last"))
+        .zip(pk)
+        .map(|(c, col)| format!("{} desc nulls last", col.ordered(&format!("s.{c}"))))
         .collect::<Vec<_>>()
         .join(", ");
     let hi_select = pk_idents
@@ -1145,7 +1184,7 @@ async fn walk_pk_ranges(
                         &format!(
                             "select {hi_select} from \
                              (select {col_list} from {source} where {not_null_filter} \
-                              order by {col_list} limit {rows}) s \
+                              order by {order_by} limit {rows}) s \
                              order by {order_desc} limit 1"
                         ),
                         &[],
@@ -1162,7 +1201,7 @@ async fn walk_pk_ranges(
                             "select {hi_select} from \
                              (select {col_list} from {source} \
                               where {where_clause} and {not_null_filter} \
-                              order by {col_list} limit {rows}) s \
+                              order by {order_by} limit {rows}) s \
                              order by {order_desc} limit 1"
                         ),
                         &params,
@@ -1194,7 +1233,12 @@ fn pk_row_cmp(
     op: &str,
     param_offset: usize,
 ) -> String {
-    let cols = pk_idents.join(", ");
+    let cols = pk_idents
+        .iter()
+        .zip(pk)
+        .map(|(ident, c)| c.ordered(ident))
+        .collect::<Vec<_>>()
+        .join(", ");
     let binds = pk
         .iter()
         .enumerate()
@@ -2390,6 +2434,32 @@ async fn backfill_relationship_one_to_one(
 mod tests {
     use super::super::ast::{FieldDef, Operator, Predicate};
     use super::*;
+
+    /// Issue #769: every column of a key range is compared under its
+    /// recorded collation, and a column with none bare, so an index of that
+    /// collation serves the range.
+    #[test]
+    fn a_key_range_names_each_column_s_collation() {
+        let pk = vec![
+            PrimaryKeyColumn {
+                name: "name".to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+                collation: Some(r#"pg_catalog."default""#.to_string()),
+            },
+            PrimaryKeyColumn {
+                name: "n".to_string(),
+                data_type: "integer".to_string(),
+                nullable: false,
+                collation: None,
+            },
+        ];
+        let idents = vec![r#"t."name""#.to_string(), r#"t."n""#.to_string()];
+        assert_eq!(
+            pk_range_where(&idents, &pk, &Some(vec![String::new(), String::new()])),
+            r#"(t."name" collate pg_catalog."default", t."n") > ($1::text::text, $2::text::integer) and (t."name" collate pg_catalog."default", t."n") <= ($3::text::text, $4::text::integer)"#
+        );
+    }
 
     fn col(name: &str) -> Expr {
         Expr::Column(name.to_string())

@@ -1197,6 +1197,7 @@ async fn a_source_table_with_a_timestamptz_primary_key_is_accepted() {
             name: "occurred_at".to_string(),
             data_type: "timestamp with time zone".to_string(),
             nullable: false,
+            collation: None,
         }]
     );
 }

@@ -94,6 +94,13 @@ pub(crate) fn buildable(definition: &Definition) -> bool {
 }
 
 impl OneToOnePlan {
+    /// Pins the source key's collations to the ones a build chunk's range
+    /// was planned under (`ddl::pin_key_collations`, issue #769). The
+    /// chunk reads the target by the same range, under the same collations.
+    pub(super) fn pin_key_collations(&mut self, recorded: Option<&[Option<String>]>) {
+        ddl::pin_key_collations(&mut self.pk, recorded);
+    }
+
     /// The plan for the definition whose target is `target` (its bare name),
     /// or `None` when there is no such definition or it isn't a 1-1 target
     /// the Re-derive build serves ([`buildable`]).

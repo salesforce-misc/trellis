@@ -191,6 +191,12 @@ pub struct ClaimedChunk {
     /// target columns a [`ChunkWork::Plan`] or [`ChunkWork::Rederive`] row
     /// writes. `None` for a whole build.
     pub fields: Option<Vec<String>>,
+    /// The collations of the source key's columns this chunk's ranges were
+    /// planned under (`backfill_chunks.key_collations`, issue #769), which
+    /// its range is read under; see `ddl::PrimaryKeyColumn::collation`.
+    /// `None` until a Re-derive plan job's first batch records them, and for
+    /// a kind with no key range.
+    pub key_collations: Option<Vec<Option<String>>>,
 }
 
 /// What one `backfill_chunks` row builds.
@@ -251,9 +257,10 @@ pub const OLD_BUILD_KINDS: [&str; 2] = [KIND_RANGE, KIND_DIRECT];
 /// Dispatches a plain (non-relationship) 1-1 definition's build onto the
 /// durable queue, inside the backfill discharge's own transaction (ADR-0016):
 /// moves `definition_id` `waiting_to_backfill` -> `backfilling` and persists
-/// `ranges` (from [`backfill::plan_one_to_one_chunks`]) as its
+/// `planned`'s ranges (from [`backfill::plan_one_to_one_chunks`]) as its
 /// `backfill_chunks` rows, so the status and the work that drives it commit
-/// together (issue #404's rule) or not at all.
+/// together (issue #404's rule) or not at all. Each row records the key
+/// collations the ranges were walked under (`key_collations`, issue #769).
 ///
 /// Each chunk records the definition's `fuse_rearmed_at` as of this dispatch
 /// (see [`STALE`]), read under the row lock the status update takes, the same
@@ -270,8 +277,9 @@ pub const OLD_BUILD_KINDS: [&str; 2] = [KIND_RANGE, KIND_DIRECT];
 pub(crate) async fn dispatch_one_to_one(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
-    ranges: &[(Option<String>, String)],
+    planned: &backfill::PlannedRanges,
 ) -> Result<Option<TransformStatus>, CatalogError> {
+    let ranges = &planned.ranges;
     if !start_backfilling(txn, definition_id).await? {
         return Ok(None);
     }
@@ -294,13 +302,14 @@ pub(crate) async fn dispatch_one_to_one(
         .map(|(lo, hi)| (lo.as_deref(), hi.as_str()))
         .unzip();
     txn.execute(
-        "insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at) \
-         select d.id, 'range', r.lo, r.hi, d.fuse_rearmed_at \
+        "insert into backfill_chunks \
+             (definition_id, kind, lo, hi, fuse_rearmed_at, key_collations) \
+         select d.id, 'range', r.lo, r.hi, d.fuse_rearmed_at, $4 \
          from unnest($2::text[], $3::text[]) with ordinality as r(lo, hi, n) \
          cross join transform_definitions d \
          where d.id = $1 \
          order by r.n",
-        &[&definition_id, &los, &his],
+        &[&definition_id, &los, &his, &planned.key_collations],
     )
     .await?;
     tracing::info!(
@@ -613,7 +622,8 @@ pub async fn claim_chunks_of(
              set claimed_by = $1, claimed_at = now() \
              from candidate \
              where c.id = candidate.id \
-             returning c.id, c.definition_id, c.lo, c.hi, c.kind, c.fields",
+             returning c.id, c.definition_id, c.lo, c.hi, c.kind, c.fields, \
+                       c.key_collations",
             &[&claimed_by, &limit, &dispatchable, &kinds],
         )
         .await?;
@@ -638,6 +648,7 @@ pub async fn claim_chunks_of(
                 definition_id: row.get(1),
                 work,
                 fields: row.get(5),
+                key_collations: row.get(6),
             })
         })
         .collect()
@@ -1102,7 +1113,8 @@ async fn fail_range_chunk(
     let Some(row) = txn
         .query_opt(
             &format!(
-                "select {STALE}, bc.attempts + 1, bc.charged, d.source_table, d.target_table \
+                "select {STALE}, bc.attempts + 1, bc.charged, d.source_table, d.target_table, \
+                        bc.key_collations \
                  from backfill_chunks bc \
                  join transform_definitions d on d.id = bc.definition_id \
                  where bc.id = $1 and bc.claimed_by = $2 and not bc.done \
@@ -1123,26 +1135,35 @@ async fn fail_range_chunk(
     let charged: i32 = row.get(2);
     let source_table: String = row.get(3);
     let target_table: String = row.get(4);
+    let key_collations: Option<Vec<Option<String>>> = row.get(5);
 
     let narrowed = match (kind, narrow) {
-        (FailureKind::Data, Some((lo, hi))) => {
-            Some(backfill::narrow_one_to_one_chunk(&*txn, &source_table, lo, hi).await?)
-        }
+        (FailureKind::Data, Some((lo, hi))) => Some(
+            backfill::narrow_one_to_one_chunk(
+                &*txn,
+                &source_table,
+                lo,
+                hi,
+                key_collations.as_deref(),
+            )
+            .await?,
+        ),
         _ => None,
     };
     let outcome = match narrowed {
         Some(backfill::ChunkNarrowing::Split { mid }) => {
             // This row keeps the lower half, and a new one takes the upper
-            // half, of the same kind (a 1-1 range or a Re-derive chunk) and
-            // field scope (#625 F8b). Both carry the failure so far, so
-            // `status` keeps reporting it while the build narrows, and the
-            // build's `fuse_rearmed_at`, so a resume supersedes both alike.
+            // half, of the same kind (a 1-1 range or a Re-derive chunk),
+            // field scope (#625 F8b) and key collations (#769). Both carry
+            // the failure so far, so `status` keeps reporting it while the
+            // build narrows, and the build's `fuse_rearmed_at`, so a resume
+            // supersedes both alike.
             txn.execute(
                 "insert into backfill_chunks \
                      (definition_id, kind, lo, hi, fuse_rearmed_at, attempts, charged, \
-                      last_error, next_attempt_at, fields) \
+                      last_error, next_attempt_at, fields, key_collations) \
                  select definition_id, kind, $2, hi, fuse_rearmed_at, $3, charged, $4, now(), \
-                        fields \
+                        fields, key_collations \
                  from backfill_chunks where id = $1",
                 &[&chunk.id, &mid, &attempts, &error],
             )
@@ -1416,6 +1437,7 @@ pub async fn run_claimed_chunk(
             &definition.source_table,
             lo.as_deref(),
             hi,
+            chunk.key_collations.as_deref(),
             fence,
         )
         .await
@@ -2867,6 +2889,138 @@ mod tests {
         assert!(
             writing.commit().await.is_err(),
             "the stalled worker's transaction is gone with its session"
+        );
+    }
+
+    /// Issue #769: a range build's chunks read their ranges under the key
+    /// collations the ranges were walked under, so an `alter column … type
+    /// text collate …` between two chunks neither drops nor repeats a key.
+    /// The test database's default collation is ICU `en-US`, which orders
+    /// `k0001 < K0002 < k0003`; `"C"` orders every `K…` before every `k…`,
+    /// so after the `alter` the ranges planned before it, read under `"C"`,
+    /// would hold only the upper-case keys.
+    #[tokio::test]
+    async fn range_chunks_keep_the_key_order_they_were_planned_under() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let text = "TRANSFORM words_copy FROM words SELECT a + a AS x";
+        raw.batch_execute(
+            "create table public.words (id text primary key, a numeric); \
+             insert into public.words \
+             select case when g % 2 = 0 then 'K' else 'k' end || lpad(g::text, 4, '0'), g \
+             from generate_series(1, 200) g; \
+             create table public.words_copy (id text primary key, x numeric); \
+             insert into source_table_versions (source_table, version) \
+             values ('public.words', 1)",
+        )
+        .await
+        .expect("seed source");
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.words")
+            .await
+            .expect("make the source another definition's target");
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.words_copy', 'public.words', 1, $1, 'waiting_to_backfill') \
+                 returning id",
+                &[&text],
+            )
+            .await
+            .expect("seed definition")
+            .get(0);
+
+        // Ten-row ranges, walked under the key's collation now.
+        let pk = crate::defs::ddl::source_primary_key_in_txn(&raw, "public.words")
+            .await
+            .expect("source key");
+        assert_eq!(
+            crate::defs::ddl::key_collations(&pk),
+            vec![Some(r#"pg_catalog."default""#.to_string())]
+        );
+        let planned = backfill::PlannedRanges {
+            ranges: backfill::next_pk_ranges(&raw, "public.words", &pk, None, 10, usize::MAX)
+                .await
+                .expect("walk the key"),
+            key_collations: crate::defs::ddl::key_collations(&pk),
+        };
+        assert_eq!(planned.ranges.len(), 20);
+        {
+            let mut client = pool.get().await.expect("connection");
+            let txn = client.transaction().await.expect("begin");
+            dispatch_one_to_one(&txn, id, &planned)
+                .await
+                .expect("dispatch");
+            txn.commit().await.expect("commit");
+        }
+
+        let run_next = async || -> bool {
+            let mut held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
+            let Some(chunk) = held.pop() else {
+                return false;
+            };
+            assert_eq!(
+                chunk.key_collations.as_deref(),
+                Some(planned.key_collations.as_slice()),
+                "every chunk records the collations its range was walked under"
+            );
+            run_claimed_chunk(
+                &pool,
+                &chunk,
+                WORKER,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("run chunk");
+            finish_chunk(&pool, &chunk, WORKER)
+                .await
+                .expect("finish chunk");
+            true
+        };
+        assert!(run_next().await, "the first chunk");
+        raw.batch_execute(r#"alter table public.words alter column id type text collate "C""#)
+            .await
+            .expect("re-collate the key");
+
+        // A failing chunk's narrowing splits its range in the planned order
+        // too: (K0010, K0020] holds k0011 … K0020, ten keys, of which the
+        // fifth is k0015. Under "C" it would hold K0012 … K0020, five keys.
+        let (lo, hi) = &planned.ranges[1];
+        assert_eq!(
+            backfill::narrow_one_to_one_chunk(
+                &raw,
+                "public.words",
+                lo.as_deref(),
+                hi,
+                Some(&planned.key_collations),
+            )
+            .await
+            .expect("narrow"),
+            backfill::ChunkNarrowing::Split {
+                mid: "k0015".to_string()
+            }
+        );
+
+        while run_next().await {}
+        let missing: Vec<String> = raw
+            .query(
+                "select w.id from public.words w \
+                 where not exists (select 1 from public.words_copy c \
+                                   where c.id = w.id and c.x = w.a + w.a) \
+                 order by w.id",
+                &[],
+            )
+            .await
+            .expect("compare")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            missing,
+            Vec::<String>::new(),
+            "every source row was written"
         );
     }
 }

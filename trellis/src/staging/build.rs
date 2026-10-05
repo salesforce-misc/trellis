@@ -31,7 +31,10 @@
 //!   empty at its start, so it gets no sweep.
 //! - **Plan** ([`run_plan`]). A drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
-//!   rows, [`PLAN_BATCH`] per transaction (Q13).
+//!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
+//!   compare the key under the collations the walk started under, which the
+//!   rows record (`backfill_chunks.key_collations`, #769), so re-collating
+//!   the key mid-build doesn't reorder it under the ranges.
 //! - **Work order** ([`work_once`], B6). A drain worker takes segments first,
 //!   then a merge when a building target has deltas, then one chunk, and a
 //!   chunk only under the ring's backlog bound ([`chunk_allowed`]). A chunk's
@@ -1657,9 +1660,18 @@ async fn run_rederive(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
+    // The range is read under the key collations its plan job walked under
+    // (issue #769), whatever the key's collation is now.
+    let key_collations = chunk.key_collations.as_deref();
     let plan = match &chunk.fields {
-        None => ChunkPlan::Whole(AnyPlan::for_definition(pool, &definition).await?),
-        Some(fields) => FieldPlan::for_chunk(pool, &definition, fields, lo, hi).await?,
+        None => {
+            let mut plan = AnyPlan::for_definition(pool, &definition).await?;
+            plan.pin_key_collations(key_collations);
+            ChunkPlan::Whole(plan)
+        }
+        Some(fields) => {
+            FieldPlan::for_chunk(pool, &definition, fields, lo, hi, key_collations).await?
+        }
     };
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
@@ -1811,11 +1823,13 @@ impl FieldPlan {
         fields: &[String],
         lo: Option<&str>,
         hi: &str,
+        key_collations: Option<&[Option<String>]>,
     ) -> Result<ChunkPlan, ChunkQueueError> {
-        if let Some(plan) = one_to_one::OneToOnePlan::for_definition(pool, definition)
+        if let Some(mut plan) = one_to_one::OneToOnePlan::for_definition(pool, definition)
             .await
             .map_err(build_error)?
         {
+            plan.pin_key_collations(key_collations);
             // With every field that reads one of `fields` by alias in the
             // definition as it is now (issue #748): a later edit can add a
             // reader of a field this build releases (one awaiting its
@@ -1843,9 +1857,10 @@ impl FieldPlan {
                 ),
             ));
         }
-        let pk = ddl::source_primary_key(pool, &definition.source_table)
+        let mut pk = ddl::source_primary_key(pool, &definition.source_table)
             .await
             .map_err(build_error)?;
+        ddl::pin_key_collations(&mut pk, key_collations);
         let decode = |text: &str| -> Result<Vec<String>, ChunkQueueError> {
             Ok(ddl::split_pk_key(&pk, &definition.source_table, text)
                 .map_err(build_error)?
@@ -1893,6 +1908,15 @@ enum AnyPlan {
 }
 
 impl AnyPlan {
+    /// Pins the source key's collations to the ones the chunk's range was
+    /// planned under (`ddl::pin_key_collations`, issue #769).
+    fn pin_key_collations(&mut self, recorded: Option<&[Option<String>]>) {
+        match self {
+            AnyPlan::Ledger(plan) => plan.ledger.pin_source_key_collations(recorded),
+            AnyPlan::OneToOne(plan) => plan.pin_key_collations(recorded),
+        }
+    }
+
     /// `definition`'s plan, or [`BackfillError::Unsupported`] when its shape
     /// no longer takes a Re-derive build.
     ///
@@ -1936,9 +1960,15 @@ async fn run_plan(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
-    let pk = ddl::source_primary_key(pool, &definition.source_table)
+    // The walk compares under the collations the job's first batch walked
+    // under, and every chunk records them (issue #769): an `alter column …
+    // collate …` between two batches, or between a batch and a chunk, would
+    // otherwise reorder the key under the boundaries already enqueued.
+    let mut pk = ddl::source_primary_key(pool, &definition.source_table)
         .await
         .map_err(build_error)?;
+    ddl::pin_key_collations(&mut pk, chunk.key_collations.as_deref());
+    let key_collations = ddl::key_collations(&pk);
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
         chunk.id,
@@ -1986,27 +2016,34 @@ async fn run_plan(
             .map(|(lo, hi)| (lo.as_deref(), hi.as_str()))
             .unzip();
         txn.execute(
-            "insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at, fields) \
-             select bc.definition_id, $4, r.lo, r.hi, bc.fuse_rearmed_at, bc.fields \
+            "insert into backfill_chunks \
+                 (definition_id, kind, lo, hi, fuse_rearmed_at, fields, key_collations) \
+             select bc.definition_id, $4, r.lo, r.hi, bc.fuse_rearmed_at, bc.fields, $5 \
              from unnest($2::text[], $3::text[]) with ordinality as r(lo, hi, n) \
              cross join backfill_chunks bc \
              where bc.id = $1 \
              order by r.n",
-            &[&chunk.id, &los, &his, &chunk_queue::KIND_REDERIVE],
+            &[
+                &chunk.id,
+                &los,
+                &his,
+                &chunk_queue::KIND_REDERIVE,
+                &key_collations,
+            ],
         )
         .await?;
         if finished {
             txn.execute(
                 "update backfill_chunks set lo = $2, done = true, claimed_by = null, \
-                     claimed_at = null \
+                     claimed_at = null, key_collations = $3 \
                  where id = $1",
-                &[&chunk.id, &next],
+                &[&chunk.id, &next, &key_collations],
             )
             .await?;
         } else {
             txn.execute(
-                "update backfill_chunks set lo = $2 where id = $1",
-                &[&chunk.id, &next],
+                "update backfill_chunks set lo = $2, key_collations = $3 where id = $1",
+                &[&chunk.id, &next, &key_collations],
             )
             .await?;
         }

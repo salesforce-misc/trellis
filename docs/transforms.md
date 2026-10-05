@@ -115,8 +115,16 @@ column Trellis uses as a key:
   [Relationships](#relationships)).
 
 The error names the column and its collation. A deterministic collation other
-than the default, such as `"C"`, is fine. The target's own key columns take the
-database default collation, which Postgres always makes deterministic.
+than the default, such as `"C"`, is fine. A 1-1 target's key columns take the
+source key's collation. An aggregate target's key columns take the database
+default collation, which Postgres always makes deterministic.
+
+Changing a source key's collation to another deterministic one (`alter column …
+type text collate …`) is safe while its definitions are building. A build splits
+the key into ranges and reads them in order, and it keeps comparing keys under
+the collation it planned them with until it finishes (#769). For the rest of
+that build, its range reads can't use the key's rebuilt index, so they're
+slower.
 
 The same goes for a column that a field passes to `STRPOS` or `REGEXP_COUNT`,
 directly or through `COALESCE`, another field or a relationship path. Postgres

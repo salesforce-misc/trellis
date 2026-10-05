@@ -601,6 +601,12 @@ impl LedgerTargetPlan {
         &self.source_pk
     }
 
+    /// Pins the source key's collations to the ones a build chunk's range
+    /// was planned under (`ddl::pin_key_collations`, issue #769).
+    pub(super) fn pin_source_key_collations(&mut self, recorded: Option<&[Option<String>]>) {
+        ddl::pin_key_collations(&mut self.source_pk, recorded);
+    }
+
     /// Adds a Re-derive of source key `key`, with no provenance (the orphan
     /// sweep's, `intake::resume_orphans`).
     pub(crate) fn push_rederive(&mut self, key: String) {

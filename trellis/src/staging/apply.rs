@@ -4083,6 +4083,7 @@ mod tests {
                 name: name.to_string(),
                 data_type: "integer".to_string(),
                 nullable: true,
+                collation: None,
             })
             .collect();
 
@@ -4433,6 +4434,7 @@ mod tests {
             name: "id".to_string(),
             data_type: "bigint".to_string(),
             nullable: false,
+            collation: None,
         }]
     }
 

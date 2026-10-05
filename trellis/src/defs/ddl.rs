@@ -161,6 +161,60 @@ pub struct PrimaryKeyColumn {
     /// `GROUP BY` columns are deliberately nullable — issue #110's whole
     /// subject.
     pub nullable: bool,
+    /// The collation the key's index orders this column by, as a quoted,
+    /// qualified name ready to interpolate after `collate`
+    /// (`pg_catalog."default"`, `pg_catalog."C"`), or `None` for a type
+    /// with no collation (`integer`, `uuid`).
+    ///
+    /// Every `(lo, hi]` range a build compares this column against names it
+    /// explicitly ([`PrimaryKeyColumn::ordered`], issue #769). A build plans
+    /// its ranges in one transaction and reads them in later ones, and an
+    /// `alter column … type text collate …` between the two reorders the
+    /// column under the ranges, so a build records the collations it
+    /// planned under (`backfill_chunks.key_collations`) and every later read
+    /// of its ranges compares under those ([`pin_key_collations`]). Naming
+    /// the index's own collation, not `"C"`, keeps the index range scan: a
+    /// comparison under any other collation can't use the index.
+    pub collation: Option<String>,
+}
+
+impl PrimaryKeyColumn {
+    /// `expr`, a reference to this column, as an ordering operand: under
+    /// [`collation`](Self::collation) when the column has one.
+    pub(crate) fn ordered(&self, expr: &str) -> String {
+        match &self.collation {
+            Some(collation) => format!("{expr} collate {collation}"),
+            None => expr.to_string(),
+        }
+    }
+}
+
+/// `pk`'s collations, in key order, as a build records them with its ranges
+/// ([`PrimaryKeyColumn::collation`]).
+pub(crate) fn key_collations(pk: &[PrimaryKeyColumn]) -> Vec<Option<String>> {
+    pk.iter().map(|c| c.collation.clone()).collect()
+}
+
+/// Pins `pk`, the source's key as read now, to `recorded`, the collations
+/// its build planned its ranges under ([`PrimaryKeyColumn::collation`],
+/// issue #769), so a range planned before an `alter column … collate …`
+/// still selects exactly the keys it did. A column only takes a recorded
+/// collation when it has one now as well: a column whose type changed to or
+/// from a collatable one orders by its type, which a collation can't pin.
+/// `None` (a build with nothing recorded) and a key of another arity, which
+/// can't decode the build's bounds anyway, leave `pk` as it is.
+pub(crate) fn pin_key_collations(pk: &mut [PrimaryKeyColumn], recorded: Option<&[Option<String>]>) {
+    let Some(recorded) = recorded else {
+        return;
+    };
+    if recorded.len() != pk.len() {
+        return;
+    }
+    for (column, collation) in pk.iter_mut().zip(recorded) {
+        if column.collation.is_some() && collation.is_some() {
+            column.collation.clone_from(collation);
+        }
+    }
 }
 
 /// Why target-table DDL could not be generated or executed.
@@ -504,7 +558,14 @@ pub(crate) async fn identity_key_columns(
              )
              select a.attname::text,
                     pg_catalog.format_type(a.atttypid, a.atttypmod),
-                    not a.attnotnull
+                    not a.attnotnull,
+                    (select pg_catalog.format('%I.%I', n.nspname, co.collname)
+                     from pg_catalog.pg_collation co
+                     join pg_catalog.pg_namespace n on n.oid = co.collnamespace
+                     -- `indkey` and `indcollation` are vectors subscripted
+                     -- from 0, which `array_position` returns.
+                     where co.oid = i.indcollation[
+                         pg_catalog.array_position(i.indkey, a.attnum)])
              from pg_index i
              join chosen_index c on c.indexrelid = i.indexrelid
              join pg_attribute a
@@ -520,6 +581,7 @@ pub(crate) async fn identity_key_columns(
             name: row.get(0),
             data_type: row.get(1),
             nullable: row.get(2),
+            collation: row.get(3),
         })
         .collect())
 }
@@ -1510,9 +1572,21 @@ pub(crate) async fn target_table_ddl(
         "create table {} (",
         qualified_target_table(target_schema, def),
     );
+    // The key columns keep the source key's collation (issue #769): a
+    // Re-derive build's chunk reads the target by the same `(lo, hi]` range
+    // as the source, under the source key's collation
+    // (`staging::build::one_to_one::chunk_pick`), and only a target key of
+    // that collation lets the target's own index serve that range.
     let pk_cols: Vec<String> = pk
         .iter()
-        .map(|c| format!("{} {}", quote_ident(&c.name), c.data_type))
+        .map(|c| {
+            let collate = c
+                .collation
+                .as_ref()
+                .map(|collation| format!(" collate {collation}"))
+                .unwrap_or_default();
+            format!("{} {}{collate}", quote_ident(&c.name), c.data_type)
+        })
         .collect();
     sql.push_str(&pk_cols.join(", "));
     for field in &def.fields {
@@ -2041,6 +2115,7 @@ mod tests {
                 name: (*name).to_string(),
                 data_type: "text".to_string(),
                 nullable: true,
+                collation: None,
             })
             .collect()
     }
@@ -2147,11 +2222,13 @@ mod tests {
                 name: "warehouse".to_string(),
                 data_type: "text".to_string(),
                 nullable: false,
+                collation: None,
             },
             PrimaryKeyColumn {
                 name: "sku".to_string(),
                 data_type: "text".to_string(),
                 nullable: true,
+                collation: None,
             },
         ];
         assert_eq!(
@@ -2541,11 +2618,13 @@ mod tests {
                 name: "warehouse".to_string(),
                 data_type: "text".to_string(),
                 nullable: false,
+                collation: None,
             },
             PrimaryKeyColumn {
                 name: "sku".to_string(),
                 data_type: "text".to_string(),
                 nullable: true,
+                collation: None,
             },
         ];
         assert_eq!(
@@ -2571,11 +2650,13 @@ mod tests {
                 name: "warehouse".to_string(),
                 data_type: "text".to_string(),
                 nullable: false,
+                collation: None,
             },
             PrimaryKeyColumn {
                 name: "sku".to_string(),
                 data_type: "text".to_string(),
                 nullable: true,
+                collation: None,
             },
         ];
 
@@ -2656,5 +2737,49 @@ mod tests {
             qualified_target_table("analytics", &def()),
             "\"analytics\".\"order_totals\""
         );
+    }
+
+    fn keyed(collations: &[Option<&str>]) -> Vec<PrimaryKeyColumn> {
+        collations
+            .iter()
+            .enumerate()
+            .map(|(i, collation)| PrimaryKeyColumn {
+                name: format!("k{i}"),
+                data_type: if collation.is_some() {
+                    "text"
+                } else {
+                    "integer"
+                }
+                .to_string(),
+                nullable: false,
+                collation: collation.map(str::to_string),
+            })
+            .collect()
+    }
+
+    /// Issue #769: a build's key range compares under the collations its
+    /// ranges were planned under, and only where the column has one now.
+    #[test]
+    fn pinning_takes_the_recorded_collation_of_each_collatable_column() {
+        let c = Some(r#"pg_catalog."C""#.to_string());
+        let mut pk = keyed(&[Some(r#"pg_catalog."default""#), None]);
+        pin_key_collations(&mut pk, Some(&[c.clone(), c.clone()]));
+        assert_eq!(key_collations(&pk), vec![c.clone(), None]);
+        assert_eq!(pk[0].ordered("s.k0"), r#"s.k0 collate pg_catalog."C""#);
+        assert_eq!(pk[1].ordered("s.k1"), "s.k1");
+    }
+
+    #[test]
+    fn pinning_leaves_a_key_with_nothing_recorded_or_another_arity_as_it_is() {
+        let now = keyed(&[
+            Some(r#"pg_catalog."default""#),
+            Some(r#"pg_catalog."default""#),
+        ]);
+        let c = Some(r#"pg_catalog."C""#.to_string());
+        for recorded in [None, Some(vec![c.clone()]), Some(vec![None, None])] {
+            let mut pk = now.clone();
+            pin_key_collations(&mut pk, recorded.as_deref());
+            assert_eq!(pk, now, "{recorded:?}");
+        }
     }
 }

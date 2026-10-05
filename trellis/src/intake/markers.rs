@@ -1246,7 +1246,7 @@ enum Discharge {
 enum Build {
     /// A plain 1-1 definition: these `(lo, hi]` primary-key chunk
     /// boundaries, enqueued as `backfill_chunks` rows.
-    Chunks(Vec<(Option<String>, String)>),
+    Chunks(crate::defs::backfill::PlannedRanges),
     /// An aggregate or relationship-enriched 1-1 definition: one direct-build
     /// job, enqueued as a `backfill_chunks` row (issue #419).
     Direct,

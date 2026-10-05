@@ -1,0 +1,13 @@
+-- #769: the collations a build's `(lo, hi]` key ranges were planned under.
+--
+-- A chunk's bounds are compared against the source key by a later
+-- transaction than the one that walked them. An `alter column ... type text
+-- collate ...` in between reorders the key, so ranges walked under the old
+-- order no longer partition it under the new one, and a key can fall in no
+-- remaining range. Every read of a chunk's range compares under the
+-- collations recorded here instead (`ddl::PrimaryKeyColumn::collation`).
+--
+-- One quoted, qualified collation name per key column, in key order, `null`
+-- for a column whose type has none. A `range` row gets them at dispatch, a
+-- `rederive` row from its plan job, and a `plan` row on its first batch.
+alter table backfill_chunks add column key_collations text[];
