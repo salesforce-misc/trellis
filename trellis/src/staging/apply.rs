@@ -4407,6 +4407,96 @@ mod tests {
         }
     }
 
+    /// Issue #790: a composite-key 1-1 target's pre-lock
+    /// ([`composite_lock_statement`]) reads only its keys' rows while the
+    /// target's statistics lag its size: analyzed at 100 rows, then grown to
+    /// 400k with autovacuum off. Left to the keyset join alone, the planner
+    /// hashed 5,000 keys against a sequential scan of the target;
+    /// [`pk_keyset_bound`] caps the target's side at the keys. It must
+    /// still lock every key, so a bound that drops one fails here too.
+    #[tokio::test]
+    async fn the_composite_pre_lock_reads_only_its_keys_while_target_statistics_lag() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table composite (a int, b text, total int, primary key (a, b)) \
+                     with (autovacuum_enabled = false); \
+                 insert into composite select i, 'k' || i, i from generate_series(1, 100) i; \
+                 analyze composite; \
+                 insert into composite select i, 'k' || i, i \
+                     from generate_series(101, 400000) i;",
+            )
+            .await
+            .expect("seed a target whose statistics lag");
+        let pk = ddl::identity_key_columns(&client, "public.composite")
+            .await
+            .expect("identity");
+        let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
+        let rows: Vec<(String, Vec<String>)> = client
+            .query(
+                &format!(
+                    "select {key_sql}, t.a::text, t.b from composite t \
+                     where t.total % 79 = 0 limit 5000"
+                ),
+                &[],
+            )
+            .await
+            .expect("keys")
+            .into_iter()
+            .map(|row| (row.get(0), vec![row.get(1), row.get(2)]))
+            .collect();
+        assert_eq!(rows.len(), 5000);
+        let parts: Vec<&Vec<String>> = rows.iter().map(|(_, parts)| parts).collect();
+        let arrays = transpose_pk_parts(pk.len(), &parts);
+        let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+        let sql = composite_lock_statement("public.composite", &pk, &key_sql);
+        let txn = client.transaction().await.expect("begin");
+        let plan: String = txn
+            .query(&format!("explain {sql}"), &params)
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let scans: Vec<&str> = plan
+            .lines()
+            .filter(|line| line.contains(" on composite "))
+            .collect();
+        assert!(!scans.is_empty(), "no scan of the target in:\n{plan}");
+        for scan in scans {
+            let estimate: f64 = scan
+                .split("rows=")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|rows| rows.parse().ok())
+                .expect("a row estimate");
+            assert!(
+                !scan.contains("Seq Scan") && estimate <= rows.len() as f64,
+                "the target must be read through the keys, got:\n{plan}"
+            );
+        }
+        let locked: std::collections::HashSet<String> = txn
+            .query(&sql, &params)
+            .await
+            .expect("lock")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            locked,
+            rows.into_iter().map(|(key, _)| key).collect(),
+            "every key is locked"
+        );
+    }
+
     /// Issue #531: only a record at or below its relationship's refresh
     /// stamp takes the live-row check. A relationship never refreshed, or a
     /// record above the stamp (every change after the refresh), reads
@@ -6619,6 +6709,53 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
         .join(" and ")
 }
 
+/// `<alias>.<col0> = any($start::text[]::t0[]) and …` — restricts each of
+/// `alias`'s `pk` columns to its own [`pk_keyset_unnest`] array, starting at
+/// the same bind parameter. A join with [`pk_keyset_match`] already implies
+/// it, but the planner can't see that: with the target's statistics behind
+/// its size, it hashed the keyset against a sequential scan of the whole
+/// target (#790). The restriction caps the target's side of any join at
+/// the keys.
+fn pk_keyset_bound(pk: &[PrimaryKeyColumn], alias: &str, start: usize) -> String {
+    pk.iter()
+        .enumerate()
+        .map(|(i, c)| {
+            format!(
+                "{alias}.{} = any(${}::text[]::{}[])",
+                quote_ident(&c.name),
+                start + i,
+                c.data_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// [`apply_target`]'s pre-lock for a composite key (issue #121): the target
+/// rows of a bound keyset relation ([`pk_keyset_unnest`] at `$1`), `select`ing
+/// `columns`, locked `for update of t` in key order. No one column's `=
+/// any(...)` test identifies a row of a composite key, so the pre-lock joins
+/// the target to the keyset and locks only the real table's rows
+/// (`unnest(...)`'s derived rows aren't real table rows Postgres could lock).
+///
+/// The join is also restricted by [`pk_keyset_bound`] (#790): at 1M rows
+/// analyzed at 100, a 5,000-key pre-lock of a narrow target hashed a
+/// sequential scan of it, 121 ms against 24 ms through its key's index.
+fn composite_lock_statement(target_ident: &str, pk: &[PrimaryKeyColumn], columns: &str) -> String {
+    format!(
+        "select {columns} from {target_ident} as t join {} on ({}) \
+         where {} \
+         order by {} for update of t",
+        pk_keyset_unnest(pk, 1),
+        pk_keyset_match(pk, "t"),
+        pk_keyset_bound(pk, "t", 1),
+        pk.iter()
+            .map(|c| format!("t.{}", quote_ident(&c.name)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 /// The per-column bind arrays [`pk_keyset_unnest`] needs, transposed from
 /// `rows` (each an already-[`decode_target_pk_parts`]-decoded key, in `pk`'s
 /// own declared column order) so column `j`'s array is every row's `j`th
@@ -7179,24 +7316,15 @@ async fn apply_target(
         )
         .await?
     } else {
-        // Issue #121: a composite key has no single column an `= any(...)`
-        // array test could name, so the pre-lock instead joins the target to
-        // a bound keyset relation and locks only the real table's rows
-        // (`for update of t` — `unnest(...)`'s derived rows aren't real table
-        // rows Postgres could lock).
+        // Issue #121: a composite key is matched against a bound keyset
+        // relation instead; see `composite_lock_statement`.
         let arrays = transpose_pk_parts(arity, &lock_key_parts);
         let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
         txn.query(
-            &format!(
-                "select {lock_key_expr}{prior_select} from {target_ident} as t join {} on ({}) \
-                 order by {} for update of t",
-                pk_keyset_unnest(&plan.pk, 1),
-                pk_keyset_match(&plan.pk, "t"),
-                plan.pk
-                    .iter()
-                    .map(|c| format!("t.{}", quote_ident(&c.name)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+            &composite_lock_statement(
+                &target_ident,
+                &plan.pk,
+                &format!("{lock_key_expr}{prior_select}"),
             ),
             &params,
         )

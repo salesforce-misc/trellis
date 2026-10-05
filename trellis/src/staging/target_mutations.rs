@@ -645,6 +645,16 @@ impl NewImagesQuery<'_> {
 /// indexable: on a 500k-group aggregate target, a 500-key batch with one
 /// NULL group took 8.5s against 0.4ms without it. This is the same split
 /// `intake::resume_orphans` makes per NULL pattern.
+///
+/// Each arm's join also restricts every non-`NULL` identity column to its
+/// array (`t.<col> = any(<array>)`), which the match already implies, so
+/// the target's side of whatever join the planner picks is bounded by the
+/// batch (#790, as `apply::live_rows_query` does for the source since
+/// #778). A condition in a left join's `on` that names only the target
+/// filters the target's scan. Without it, a target analyzed while small and
+/// grown since was read in full: at 1M rows, a 5,000-key batch hashed a
+/// sequential scan of the target, 102 ms (single-column key) and 152 ms
+/// (composite) against 31 and 35 ms through the index.
 fn new_images_query<'a>(
     target: &str,
     image_columns: &[String],
@@ -706,16 +716,20 @@ fn new_images_query<'a>(
             ];
             let mut aliases = vec!["key".to_string(), "prior".to_string()];
             let mut matched = Vec::with_capacity(pk.len());
+            let mut bounds = Vec::new();
             for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
                 let col = quote_ident(&column.name);
                 if null {
                     matched.push(format!("t.{col} is null"));
                 } else {
-                    arrays.push(format!("{}::text[]::{}[]", param(), column.data_type));
+                    let array = format!("{}::text[]::{}[]", param(), column.data_type);
+                    bounds.push(format!("t.{col} = any({array})"));
+                    arrays.push(array);
                     aliases.push(pk_keyset_col(i));
                     matched.push(format!("t.{col} = k.{}", pk_keyset_col(i)));
                 }
             }
+            matched.extend(bounds);
             format!(
                 "select k.key, \
                         case when t.ctid is null then null \
@@ -1224,5 +1238,128 @@ mod tests {
             plan.contains("Seq Scan"),
             "the pre-#433 shape should not be able to probe the index, got:\n{plan}"
         );
+    }
+
+    /// Issue #790: `read_new_images` reads only its batch's rows of a target
+    /// whose statistics lag its size, at a 1-1 target's single-column key
+    /// and an aggregate target's nullable composite identity (with
+    /// `NULL`-bearing keys, so one arm per pattern). Each target is analyzed
+    /// at 100 rows and then grown to 400k with autovacuum off. Left to the
+    /// join alone, the planner hashed a 5,000-key batch against a sequential
+    /// scan of the target; each arm's `= any` restriction caps the target's
+    /// side at the batch. Every key must still come back with its row, so a
+    /// restriction that drops a key fails here too.
+    #[tokio::test]
+    async fn read_new_images_reads_only_the_batch_while_target_statistics_lag() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table single (id int primary key, total int) \
+                     with (autovacuum_enabled = false); \
+                 create table composite (g int, h text, total int, \
+                                         unique nulls not distinct (g, h)) \
+                     with (autovacuum_enabled = false); \
+                 insert into single select i, i from generate_series(1, 100) i; \
+                 insert into composite select i, 'k' || i, i from generate_series(1, 100) i; \
+                 analyze single; analyze composite; \
+                 insert into single select i, i from generate_series(101, 400000) i; \
+                 insert into composite select i, 'k' || i, i \
+                     from generate_series(101, 400000) i; \
+                 insert into composite values (null, 'k1', 0), (5, null, 0);",
+            )
+            .await
+            .expect("seed targets whose statistics lag");
+        let txn = client.transaction().await.expect("begin");
+        let cases = [
+            ("public.single", "t.total % 79 = 0", 1),
+            (
+                "public.composite",
+                "t.g is null or t.h is null or t.total % 79 = 0",
+                3,
+            ),
+        ];
+        for (table, batch, patterns) in cases {
+            let key_columns = ddl::identity_key_columns(&txn, table)
+                .await
+                .expect("identity");
+            let columns = live_row_columns(&txn, table).await.expect("columns");
+            let key_sql = ddl::pk_key_sql_expr(&key_columns, Some("t"));
+            let keys: BTreeMap<String, KeyMutation> = txn
+                .query(
+                    &format!(
+                        "select {key_sql} from {table} t where {batch} \
+                         order by t.total limit 5000"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get(0),
+                        KeyMutation {
+                            prior_image: None,
+                            hop_gen: 0,
+                            src_changed: None,
+                            origin_lsn: None,
+                        },
+                    )
+                })
+                .collect();
+            assert_eq!(keys.len(), 5000);
+            let feed = EndpointFeed {
+                key_columns,
+                group_key_columns: Vec::new(),
+            };
+            let query = new_images_query(table, &columns, &feed, &keys).expect("query");
+            assert_eq!(
+                query.arms.len(),
+                patterns,
+                "{table}: one arm per NULL pattern"
+            );
+            let plan: String = txn
+                .query(&format!("explain {}", query.sql), &query.params())
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let target = &table["public.".len()..];
+            let scans: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains(&format!(" on {target} ")))
+                .collect();
+            assert!(
+                !scans.is_empty(),
+                "{table}: no scan of the target in:\n{plan}"
+            );
+            for scan in scans {
+                let rows: f64 = scan
+                    .split("rows=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|rows| rows.parse().ok())
+                    .expect("a row estimate");
+                assert!(
+                    !scan.contains("Seq Scan") && rows <= keys.len() as f64,
+                    "{table}: the target must be read through the batch's keys, got:\n{plan}"
+                );
+            }
+            let got = read_new_images(&txn, table, &columns, &feed, &keys)
+                .await
+                .expect("re-read");
+            let missing: Vec<&String> = keys
+                .keys()
+                .filter(|key| got.get(*key).is_none_or(|new| new.image.is_none()))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{table}: every key finds its own row, missing {missing:?}"
+            );
+        }
     }
 }
