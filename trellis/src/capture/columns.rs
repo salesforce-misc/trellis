@@ -25,7 +25,12 @@
 //!    (`staging::apply::from_side_change_in_flight`), and a missing value
 //!    there silently passes the guard.
 //! 4. **For every relationship whose to-side is `T`:**
-//!    - its `to_col`;
+//!    - its `to_col`, which is in the ring's `group_key` too. A to-side
+//!      row's reverse path re-derives the children of every join value its
+//!      batch's rows touched, including ones the fold erased from both
+//!      folded images: a parent born and deleted inside one batch, or
+//!      re-keyed through a value and on (#784). A child may have read the
+//!      parent live under that value in between;
 //!    - every to-side column a definition reads through it
 //!      ([`crate::defs::eval::relationship_references`], fields and `GROUP
 //!      BY`);
@@ -84,7 +89,8 @@ pub struct ReadColumns {
     /// Every column an image must carry.
     pub columns: BTreeSet<String>,
     /// The subset whose values make up the ring's `group_key`: every
-    /// outbound relationship's `from_col`.
+    /// outbound relationship's `from_col` and every inbound one's `to_col`
+    /// (#784).
     pub group_key: BTreeSet<String>,
 }
 
@@ -107,6 +113,7 @@ pub fn read_columns(catalog: &CaptureCatalog, table: &str) -> ReadColumns {
         }
         if rel.qualified_to_table() == table {
             read.columns.insert(rel.def.to_col.clone());
+            read.group_key.insert(rel.def.to_col.clone());
             let from = rel.qualified_from_table();
             for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
                 if reader.source == from {
@@ -559,7 +566,11 @@ mod tests {
             read.columns,
             set(&["country", "name", "retired_col", "user_id"])
         );
-        assert!(read.group_key.is_empty(), "a to-side has no group key");
+        assert_eq!(
+            read.group_key,
+            set(&["user_id"]),
+            "a to-side's group key is its to_col (#784)"
+        );
     }
 
     /// `a_to_side_images_its_to_col_and_every_column_read_through_it`'s
@@ -669,6 +680,7 @@ mod tests {
         );
         let read = read_columns(&catalog, "public.orders");
         assert_eq!(read.columns, set(&["amount", "user_id"]));
+        assert_eq!(read.group_key, set(&["user_id"]));
         let from = read_columns(&catalog, "public.users");
         assert_eq!(from.columns, set(&["id"]));
         assert_eq!(from.group_key, set(&["id"]));
@@ -701,9 +713,10 @@ mod tests {
         );
         let posts = read_columns(&catalog, "public.posts");
         assert_eq!(posts.columns, set(&["author_id", "id", "title"]));
-        assert_eq!(posts.group_key, set(&["author_id"]));
+        assert_eq!(posts.group_key, set(&["author_id", "id"]));
         let users = read_columns(&catalog, "public.users");
         assert_eq!(users.columns, set(&["id"]));
+        assert_eq!(users.group_key, set(&["id"]));
         let comments = read_columns(&catalog, "public.comments");
         assert_eq!(comments.columns, set(&["post_id"]));
         assert_eq!(comments.group_key, set(&["post_id"]));

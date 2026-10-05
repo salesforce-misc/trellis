@@ -117,7 +117,8 @@ pub struct CaptureSpec {
     /// Every column an image carries, sorted. Includes every key column.
     columns: Vec<String>,
     /// The columns whose values make up the ring's `group_key` (every
-    /// outbound relationship's `from_col`, #133), in the table's physical
+    /// outbound relationship's `from_col`, #133, and every inbound one's
+    /// `to_col`, #784), in the table's physical
     /// column order. The order is load-bearing: it is the element order every
     /// ring row's `group_key` array has had (issue #133), and a reader
     /// comparing arrays relies on it.

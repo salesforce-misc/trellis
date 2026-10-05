@@ -118,11 +118,12 @@ pub enum StagedChange {
         hop_gen: i32,
         /// Issue #133: the union of every join-key value this row's own
         /// change touched — every column that is some relationship's
-        /// `from_col`, read from `old_image` (if present) and `new_image`
+        /// `from_col`, or (#784) some to-one or to-many relationship's
+        /// `to_col`, read from `old_image` (if present) and `new_image`
         /// (if present). Populated by a capture trigger (from the columns
-        /// its spec names, `capture::sql`) or the target-mutation seam for a
-        /// from-side endpoint target; `None` when this row's `src_table` has
-        /// no outbound relationship at all. A row staged by capture
+        /// its spec names, `capture::sql`) or the target-mutation seam for an
+        /// endpoint target; `None` when this row's `src_table` is no
+        /// relationship's endpoint. A row staged by capture
         /// functions older than a relationship (before the reconcile pass
         /// widened them to its `from_col`) lacks that column's values; a
         /// definition reading through the relationship isn't dispatched
@@ -266,6 +267,14 @@ pub enum StagedChange {
         /// `hop_gen` field on this variant at all — see this op's own
         /// migration/doc comment for why retrying must never touch it.
         retry_count: i32,
+        /// The join keys this reverse's images name, old and new (#784).
+        /// Retries of one key fold to their first old and last new image,
+        /// like the parent's own rows, so a key only a folded-away retry
+        /// named (a parent born and deleted across two retries, or re-keyed
+        /// through a value) survives only in this union. A child may have
+        /// read the parent live under it, so the retry re-derives its
+        /// children too.
+        group_key: Option<Vec<String>>,
     },
 }
 
@@ -370,6 +379,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 origin_lsn,
                 relationship_id,
                 retry_count,
+                group_key,
             } => ChangeRow {
                 src_table,
                 key,
@@ -380,7 +390,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 origin_lsn: *origin_lsn,
                 src_changed: *src_changed,
                 hop_gen: 0,
-                group_key: None,
+                group_key: group_key.as_deref(),
                 retry_count: *retry_count,
                 relationship_id: Some(*relationship_id),
             },

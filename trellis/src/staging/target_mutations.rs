@@ -149,8 +149,9 @@
 //! - **`lsn`** is the write token, so the fold's first/last image rules
 //!   order one key's seam rows by the order their writers committed.
 //! - **`group_key`** is the union of the target's outbound relationships'
-//!   `from_col` values across both images, the same rule a capture trigger
-//!   applies to a changed row (`capture::sql`).
+//!   `from_col` values and its inbound ones' `to_col` values (#784) across
+//!   both images, the same rule a capture trigger applies to a changed row
+//!   (`capture::sql`, `capture::columns`).
 //! - **`origin_lsn`** stays `None`, as for a `Recompute` (see "The write
 //!   token").
 //!
@@ -228,8 +229,9 @@ struct EndpointFeed {
     /// recorded key encodes (`ddl::pk_key_sql_expr`), used to re-read each
     /// key's new image.
     key_columns: Vec<PrimaryKeyColumn>,
-    /// The `from_col` of every relationship whose from-side is this target,
-    /// sorted and deduplicated; empty when it is only ever a to-side.
+    /// The `from_col` of every relationship whose from-side is this target
+    /// and the `to_col` of every one whose to-side it is (#784), sorted and
+    /// deduplicated.
     group_key_columns: Vec<String>,
 }
 
@@ -254,12 +256,15 @@ async fn resolve_endpoint_feed(
         // so the target falls back to image-less recomputes.
         return Ok(None);
     }
-    let mut group_key_columns = match target.split_once('.') {
-        Some((schema, table)) => catalog::relationships_from_table_in(txn, schema, table)
-            .await?
-            .into_iter()
-            .map(|r| r.def.from_col)
-            .collect(),
+    let mut group_key_columns: Vec<String> = match target.split_once('.') {
+        Some((schema, table)) => {
+            let from = catalog::relationships_from_table_in(txn, schema, table).await?;
+            let to = catalog::relationships_to_table_in(txn, schema, table).await?;
+            from.into_iter()
+                .map(|r| r.def.from_col)
+                .chain(to.into_iter().map(|r| r.def.to_col))
+                .collect()
+        }
         None => Vec::new(),
     };
     group_key_columns.sort();

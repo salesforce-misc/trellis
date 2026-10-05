@@ -2598,6 +2598,8 @@ enum RelFlavour {
     Field,
     /// The parent's value as the group key: `GROUP BY parent.w`.
     GroupKey,
+    /// Whether a child has a parent with a value: `COUNT(parent.w)` (#784).
+    Count,
 }
 
 impl RelFlavour {
@@ -2611,12 +2613,18 @@ impl RelFlavour {
                 "TRANSFORM agg FROM public.src GROUP BY parent.w \
                  SELECT SUM(g) AS total, COUNT(*) AS n"
             }
+            RelFlavour::Count => {
+                "TRANSFORM agg FROM public.src GROUP BY g \
+                 SELECT COUNT(parent.w) AS total, COUNT(*) AS n"
+            }
         }
     }
 
     fn actual(self) -> &'static str {
         match self {
-            RelFlavour::Field => "select g, total, n from public.agg order by g",
+            RelFlavour::Field | RelFlavour::Count => {
+                "select g, total, n from public.agg order by g"
+            }
             RelFlavour::GroupKey => "select w, total, n from public.agg order by w",
         }
     }
@@ -2630,6 +2638,10 @@ impl RelFlavour {
             RelFlavour::GroupKey => {
                 "select p.w, sum(s.g), count(*) from public.src s \
                  left join public.par p on p.id = s.p group by p.w order by p.w"
+            }
+            RelFlavour::Count => {
+                "select s.g, count(p.w), count(*) from public.src s \
+                 left join public.par p on p.id = s.p group by s.g order by s.g"
             }
         }
     }
@@ -2798,6 +2810,137 @@ async fn a_to_side_truncate_racing_a_child_field() {
 #[tokio::test]
 async fn a_to_side_truncate_racing_a_child_group_key() {
     a_to_side_truncate_racing_a_child(RelFlavour::GroupKey).await;
+}
+
+/// #784: a parent born and deleted inside one batch, which a child read
+/// while it lived. Child 1 moves to group 3 and onto parent 5, which doesn't
+/// exist yet, and its batch drains after parent 5 is inserted, so its Apply
+/// reads parent 5 live (57). Parent 5 is then deleted, and its insert and
+/// delete seal into one batch, which folds to no image on either side: the
+/// key had no row before the batch and has none after. The child's entry
+/// still holds parent 5's value, so the parent's batch must re-derive the
+/// children of every key its rows touched, not only those of its folded
+/// images. Without that, group 3 keeps `w = 57` (`SUM` 57, `COUNT` 1, or a
+/// `GROUP BY` row for 57) where the oracle has none.
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    write(&d, "update public.src set g = 3, p = 5 where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 57)").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_field() {
+    a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_group_key() {
+    a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::GroupKey).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_in_one_batch_after_a_child_read_it_count() {
+    a_parent_born_and_deleted_in_one_batch_after_a_child_read_it(RelFlavour::Count).await;
+}
+
+/// #784 as the generative tier hit it: the same parent born and deleted
+/// while a child read it, but with both of the parent's changes deferred
+/// by the reverse guard's in-flight check (#132's guard (c)), since a
+/// child's change to the same join key is undrained each time. A deferred
+/// reverse is re-staged under the join key, so the two deferrals fold
+/// together like the parent's own rows would, to no image on either side.
+///
+/// Child 1 points at parent 5 before it exists. Parent 5's insert drains
+/// first and is deferred (child 1's change is pending); child 1's batch
+/// then drains and reads parent 5 live (57). Parent 5's delete drains next,
+/// deferred along with the insert's retry, because child 2's move onto
+/// parent 5 is pending. Both retries land in child 2's batch and fold.
+/// Without the fix the folded retry is dropped, and child 1 keeps 57.
+async fn a_parent_born_and_deleted_across_deferred_reverses(flavour: RelFlavour) {
+    let mut d = start_rel(flavour).await;
+    write(&d, "update public.src set g = 3, p = 5 where id = 1").await;
+    let c1_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 57)").await;
+    let insert_batch = d.seal().await;
+    d.drain(insert_batch, "a").await;
+    d.drain(c1_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let delete_batch = d.seal().await;
+    write(&d, "update public.src set p = 5 where id = 2").await;
+    d.drain(delete_batch, "a").await;
+    let retry_batch = d.seal().await;
+    d.drain(retry_batch, "a").await;
+    assert_rel_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_across_deferred_reverses_field() {
+    a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::Field).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_across_deferred_reverses_group_key() {
+    a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::GroupKey).await;
+}
+
+#[tokio::test]
+async fn a_parent_born_and_deleted_across_deferred_reverses_count() {
+    a_parent_born_and_deleted_across_deferred_reverses(RelFlavour::Count).await;
+}
+
+/// #784's other shape: a parent's join value passes through a key inside
+/// one batch, and a child read it under that key. The relationship joins on
+/// `par.code`, a unique column that isn't the primary key, so re-keying it
+/// is an update of one ring key. Child 1 points at code 900 before any
+/// parent has it; parent 1 moves to code 900, the child's batch drains and
+/// reads parent 1 live (10), and parent 1 moves on to code 500. Parent 1's
+/// batch folds to old code 100 and new code 500, and code 900 appears in
+/// neither image, so re-deriving the children of the folded images alone
+/// leaves child 1 counting parent 1's value under a code no parent has.
+#[tokio::test]
+async fn a_parent_rekeyed_through_a_childs_key_inside_one_batch() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, sum(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code integer unique, w numeric); \
+         create table public.src (id integer primary key, g integer, p integer); \
+         insert into public.par values (1, 100, 10), (2, 200, 20); \
+         insert into public.src values (1, 1, 100), (2, 1, 200);",
+        &[
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &["RELATIONSHIP parent FROM src.p TO par.code"],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "before the scenario"
+    );
+    write(&d, "update public.src set g = 2, p = 900 where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "update public.par set code = 900 where id = 1").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "update public.par set code = 500 where id = 1").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "target (left) differs from the oracle (right)"
+    );
 }
 
 /// One page that holds every kind of record step 3 tells apart (#775):

@@ -3369,6 +3369,27 @@ pub(crate) async fn relationships_from_table_in(
     rows.iter().map(relationship_from_row).collect()
 }
 
+/// Every relationship whose to-side is `to_schema.to_table`, the inbound
+/// mirror of [`relationships_from_table_in`], on a caller-supplied client:
+/// `staging::target_mutations` resolves a to-side endpoint target's join-key
+/// columns in the writing transaction (#784).
+pub(crate) async fn relationships_to_table_in(
+    client: &impl GenericClient,
+    to_schema: &str,
+    to_table: &str,
+) -> Result<Vec<RelationshipDefinition>, CatalogError> {
+    let rows = client
+        .query(
+            &format!(
+                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
+                 where to_schema = $1 and to_table = $2 order by id"
+            ),
+            &[&to_schema, &to_table],
+        )
+        .await?;
+    rows.iter().map(relationship_from_row).collect()
+}
+
 /// Issue #622 (C2): every registered definition, as its id, qualified
 /// `source_table`, parsed text and whether a `schema_changed` marker paused
 /// it (C6, `capture_failures`) and its qualified `target_table` (#765),

@@ -838,6 +838,7 @@ async fn a_deferred_older_reverse_does_not_undo_a_projection_refresh() {
             origin_lsn: None,
             relationship_id,
             retry_count: 1,
+            group_key: None,
         },
     )
     .await;
@@ -991,6 +992,7 @@ async fn an_escalated_older_reverse_does_not_undo_a_projection_refresh() {
             origin_lsn: None,
             relationship_id,
             retry_count: apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD - 1,
+            group_key: None,
         },
     )
     .await;

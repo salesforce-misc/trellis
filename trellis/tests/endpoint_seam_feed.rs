@@ -252,7 +252,11 @@ async fn a_seam_row_on_a_target_to_side_advances_its_to_one_projection() {
         row.new_image.as_deref(),
         Some(r#"{"id": "1", "doubled": "100"}"#)
     );
-    assert_eq!(row.group_key, None, "t is no relationship's from-side");
+    assert_eq!(
+        row.group_key.as_deref(),
+        Some(&["1".to_string()][..]),
+        "t's group key is the relationship's to_col, id (#784)"
+    );
     let token = row
         .lsn
         .expect("an image-bearing seam row carries the write token");
