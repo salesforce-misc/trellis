@@ -312,16 +312,7 @@ pub async fn run_chunk(
     let ledger = &plan.ledger;
     let source_table = ledger.source_table();
     let pk = ledger.source_pk();
-    let decode = |text: &str| -> Result<Vec<String>, ApplyError> {
-        Ok(ddl::split_pk_key(pk, source_table, text)?
-            .into_iter()
-            .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
-            .collect())
-    };
-    let lo = lo.map(decode).transpose()?;
-    let hi = decode(hi)?;
-    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let range_where = crate::defs::backfill::pk_range_where(&pk_idents, pk, &lo);
+    let (range_where, lo, hi) = chunk_range(ledger, lo, hi)?;
     let mut params = crate::defs::backfill::range_params(&lo, &hi);
 
     // 1. The keys in the range, but for the quarantined ones (#625 F-A5):
@@ -363,7 +354,7 @@ pub async fn run_chunk(
     let keys_param = format!("${}", params.len() + 1);
     params.push(&key_refs);
     let sql = ledger::chunk_statement(ledger, &range_where, &keys_param);
-    let row = txn.query_one(&sql, &params).await?;
+    let row = ledger::query_one_by_entry_key(txn, &sql, &params).await?;
     metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
     // Test-only pause point (#623 D1), directly after the chunk's one
     // read-and-write statement. See `super::interleave`.
@@ -385,6 +376,34 @@ pub async fn run_chunk(
         keys: keys.len(),
         delta_rows,
     })
+}
+
+/// A chunk's `(lo, hi]` over `ledger`'s source key, `lo` and `hi` encoded
+/// keys as [`run_chunk`] takes them: the range's predicate over the bare key
+/// columns, binding `$1..$n`, and the decoded bounds its parameters
+/// (`defs::backfill::range_params`) borrow.
+#[allow(clippy::type_complexity)]
+fn chunk_range(
+    ledger: &LedgerTargetPlan,
+    lo: Option<&str>,
+    hi: &str,
+) -> Result<(String, Option<Vec<String>>, Vec<String>), ApplyError> {
+    let source_table = ledger.source_table();
+    let pk = ledger.source_pk();
+    let decode = |text: &str| -> Result<Vec<String>, ApplyError> {
+        Ok(ddl::split_pk_key(pk, source_table, text)?
+            .into_iter()
+            .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
+            .collect())
+    };
+    let lo = lo.map(decode).transpose()?;
+    let hi = decode(hi)?;
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    Ok((
+        crate::defs::backfill::pk_range_where(&pk_idents, pk, &lo),
+        lo,
+        hi,
+    ))
 }
 
 /// A chunk's or a sweep batch's entry lock ([`ledger::lock_entries`]),
@@ -524,9 +543,8 @@ pub async fn sweep_batch(
         params.push(part);
     }
     let started = Instant::now();
-    let row = txn
-        .query_one(&ledger::sweep_statement(ledger), &params)
-        .await?;
+    let row =
+        ledger::query_one_by_entry_key(txn, &ledger::sweep_statement(ledger), &params).await?;
     metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
     let delta_rows: i64 = row.get(1);
     tracing::debug!(
@@ -634,6 +652,59 @@ pub async fn explain_merge(
         .map(|row| row.get::<_, String>(0))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+/// The plans of a build's two Re-derive statements over `keys` (encoded,
+/// as a chunk's key read returns them), as `explain`'s text, each labelled,
+/// under the settings a chunk and a sweep batch run them with (#778): the
+/// chunk's over `(lo, hi]` ([`run_chunk`]) and the sweep batch's
+/// ([`sweep_batch`]). For tests of the plans' shape. It locks and writes
+/// nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_rederive(
+    txn: &Transaction<'_>,
+    plan: &BuildPlan,
+    lo: Option<&str>,
+    hi: &str,
+    keys: &[&str],
+) -> Result<Vec<(&'static str, String)>, ApplyError> {
+    let ledger = &plan.ledger;
+    let explain = |rows: Vec<tokio_postgres::Row>| {
+        rows.iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let (range_where, lo, hi) = chunk_range(ledger, lo, hi)?;
+    let mut params = crate::defs::backfill::range_params(&lo, &hi);
+    let keys_param = format!("${}", params.len() + 1);
+    let keys = keys.to_vec();
+    params.push(&keys);
+    let chunk = explain(
+        ledger::query_by_entry_key(
+            txn,
+            &format!(
+                "explain {}",
+                ledger::chunk_statement(ledger, &range_where, &keys_param)
+            ),
+            &params,
+        )
+        .await?,
+    );
+    let parts = ledger::sweep_key_params(ledger, &keys)?;
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&keys];
+    for part in &parts {
+        params.push(part);
+    }
+    let sweep = explain(
+        ledger::query_by_entry_key(
+            txn,
+            &format!("explain {}", ledger::sweep_statement(ledger)),
+            &params,
+        )
+        .await?,
+    );
+    Ok(vec![("chunk statement", chunk), ("sweep statement", sweep)])
 }
 
 /// One statement: the merge partitions of the delta table `deltas` (quoted,

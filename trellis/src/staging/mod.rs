@@ -97,9 +97,13 @@ pub use claim::{
     DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, reclaim_stale_drainers, register_drainer,
 };
 pub use error::StagingError;
+#[cfg(any(test, feature = "internals"))]
+pub use ledger::explain_page as explain_ledger_page;
 pub use liveness::{
     DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release_segments,
 };
+#[cfg(any(test, feature = "internals"))]
+pub use one_to_one_ledger::explain_page as explain_one_to_one_ledger_page;
 pub use retire::{collect_tombstones, retire_drained_segments};
 pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // `self_check`'s non-error types are reached through `lib.rs`'s own

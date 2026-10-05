@@ -1208,6 +1208,9 @@ fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
 /// `image_columns` are the seam's prior-image columns (`None`: no reader).
 /// Returns [`GroupUpsert`]'s columns.
 ///
+/// `old` and `upd` read the ledger only through `$9`'s keys, and the
+/// statement runs under [`ENTRY_PLAN_SETTINGS`] (#778).
+///
 /// The fresh entries are kept out of the ledger reads, not filtered out of
 /// them (#775): a page's every key may be fresh, and a read of the ledger
 /// joined against a list of them is a plan the planner can get wrong while
@@ -1254,7 +1257,7 @@ fn ledger_statement(
                  {applied} = case when v.__rederive then l.{applied} else v.__lsn end, \
                  {seg} = {stamp} \
              from v \
-             where l.{key} = v.__k and not v.__fresh \
+             where l.{key} = any($9::text[]) and l.{key} = v.__k and not v.__fresh \
                and (v.__rederive or ({predicate})) \
              returning {returning} \
          ), \
@@ -1375,7 +1378,9 @@ pub(super) fn sweep_key_params(
 
 /// [`chunk_statement`] and [`sweep_statement`]'s shared body. `src_from` is
 /// what follows `from <source> s` in the source read: the join and filter
-/// that pick the keys' rows. `keys` is the locked keys' `text[]` parameter.
+/// that pick the keys' rows. `keys` is the locked keys' `text[]` parameter,
+/// which also bounds the entry rewrite's read of the ledger. The caller runs
+/// it under [`ENTRY_PLAN_SETTINGS`] (#778).
 fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> String {
     let shape = &plan.shape;
     let q = |c: &str| quote_ident(c);
@@ -1427,7 +1432,7 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
                  {member} = v.__present, {tombstone} = not v.__present, \
                  {basis} = snap.__snap, {seg} = {stamp} \
              from v, snap \
-             where l.{key} = v.__k \
+             where l.{key} = any({keys}::text[]) and l.{key} = v.__k \
              returning {returning} \
          ), \
          {moves_and_deltas}, \
@@ -1894,6 +1899,73 @@ pub(super) async fn finish_groups(
     Ok((written, deleted))
 }
 
+/// The plan settings of a statement that reads or writes a ledger by its
+/// entries' keys (#778): no sequential scan, so the ledger is reached
+/// through its key's index, and the statement costs the keys it is given
+/// rather than the ledger's size. [`ENTRY_PLAN_RESET`] puts them back after
+/// the statement. They pin the entry lock ([`lock_statement`]), a page's
+/// statement ([`ledger_statement`]), a build chunk's and a sweep batch's
+/// ([`rederive_statement`]) and a 1-1 page's entry update
+/// (`super::one_to_one_ledger::update_entries`).
+///
+/// Left to itself, the planner read the whole ledger for a page's few
+/// thousand keys whenever it priced that cheaper, which it does while a
+/// fast-growing ledger has no statistics yet, or ones from when it was
+/// small: the lock as a sequential scan and a sort, and the entry update as
+/// a hash join of the page's records to a sequential scan of the ledger.
+/// The paged benchmark spent 200–345 ms a page on that scan, at up to
+/// 1.15M entries, until `autoanalyze` caught up (#775).
+///
+/// The setting alone isn't enough for a join. With sequential scans off,
+/// the planner hashed a scan of the ledger's whole key index instead. So
+/// each statement that joins the ledger to its keys also restricts the
+/// ledger to them (`l.key = any(<keys>)`), which bounds the ledger's side of
+/// whatever join the planner picks. Hash and merge joins stay on: the
+/// statements also join their CTEs to each other (`moves`, the upsert's
+/// result back to `d`), where a nested loop would be quadratic in the page.
+/// A bitmap scan of the key's index is fine: it reads only the keys too.
+pub(super) const ENTRY_PLAN_SETTINGS: &str = "set local enable_seqscan = off";
+
+/// Undoes [`ENTRY_PLAN_SETTINGS`] for the rest of the transaction.
+pub(super) const ENTRY_PLAN_RESET: &str = "set local enable_seqscan to default";
+
+/// Runs `sql` under [`ENTRY_PLAN_SETTINGS`], and puts the settings back
+/// after it: the one place a page's (and a build chunk's) ledger statements
+/// keyed by entry run, and the plan their `explain` tests read. An error
+/// leaves the settings on, but it also aborts `txn`, and a `set local` ends
+/// with the transaction.
+pub(super) async fn query_by_entry_key(
+    txn: &Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    txn.batch_execute(ENTRY_PLAN_SETTINGS).await?;
+    let rows = txn.query(sql, params).await?;
+    txn.batch_execute(ENTRY_PLAN_RESET).await?;
+    Ok(rows)
+}
+
+/// [`query_by_entry_key`] for a statement that returns exactly one row.
+pub(super) async fn query_one_by_entry_key(
+    txn: &Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<tokio_postgres::Row, tokio_postgres::Error> {
+    txn.batch_execute(ENTRY_PLAN_SETTINGS).await?;
+    let row = txn.query_one(sql, params).await?;
+    txn.batch_execute(ENTRY_PLAN_RESET).await?;
+    Ok(row)
+}
+
+/// The entry lock's `select … for update` on the ledger `ledger` (quoted,
+/// qualified): every entry of the keys `$1` (`text[]`), in key order (I5).
+/// One row per entry locked. Shared with the 1-1 ledger
+/// (`super::one_to_one_ledger::lock_entries`).
+pub(super) fn lock_statement(ledger: &str) -> String {
+    let key = quote_ident(schema::KEY_COLUMN);
+    format!("select 1 from {ledger} where {key} = any($1::text[]) order by {key} for update")
+}
+
 /// How [`lock_entries`] makes the entries of keys that have none.
 pub(super) enum NewEntries<'a> {
     /// A non-member placeholder each: a build chunk's, which re-derives
@@ -2011,16 +2083,10 @@ pub(super) async fn lock_entries(
         .filter(|k| !inserted.contains(*k))
         .collect();
     if !existing.is_empty() && !skip_lock {
-        let locked = txn
-            .execute(
-                &format!(
-                    "select 1 from {ledger} where {key_col} = any($1::text[]) \
-                     order by {key_col} for update"
-                ),
-                &[&existing],
-            )
-            .await?;
-        if (locked as usize) < existing.len() {
+        let locked = query_by_entry_key(txn, &lock_statement(ledger), &[&existing])
+            .await?
+            .len();
+        if locked < existing.len() {
             return Err(ApplyError::LedgerEntryCollected {
                 target: plan.target.clone(),
             });
@@ -2207,23 +2273,23 @@ pub(crate) async fn apply_ledger_target(
         .copied()
         .filter(|k| !fresh.contains(*k))
         .collect();
-    let rows = txn
-        .query(
-            &sql,
-            &[
-                &keys,
-                &flags,
-                &lsns,
-                &txids,
-                &images,
-                &snapshot,
-                &entry_seg,
-                &plan.target,
-                &stale_keys,
-                &fresh_flags,
-            ],
-        )
-        .await?;
+    let rows = query_by_entry_key(
+        txn,
+        &sql,
+        &[
+            &keys,
+            &flags,
+            &lsns,
+            &txids,
+            &images,
+            &snapshot,
+            &entry_seg,
+            &plan.target,
+            &stale_keys,
+            &fresh_flags,
+        ],
+    )
+    .await?;
     let groups: Vec<WrittenGroup> = rows
         .iter()
         .filter_map(|row| WrittenGroup::from_row(row, 0))
@@ -2264,6 +2330,83 @@ pub(crate) async fn apply_ledger_target(
         (hop_gen, src_changed, origin.flatten())
     })
     .await
+}
+
+/// The plans of a page's statements that read `target`'s ledger by entry
+/// key (#778), as `explain`'s text, each labelled, under the settings a
+/// page runs them with: the entry lock ([`lock_statement`]) and the page's
+/// statement ([`ledger_statement`]), for a page of Applies to `keys`, which
+/// already have entries. `target` is the target's bare name. For tests of
+/// the plans' shape. It locks and writes nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_page(
+    pool: &crate::pool::Pool,
+    target: &str,
+    keys: &[&str],
+) -> Result<Vec<(&'static str, String)>, ApplyError> {
+    let Some(definition) = crate::defs::catalog::definition_by_target(pool, target).await? else {
+        return Err(ApplyError::TransformNotFound {
+            transform: target.to_string(),
+        });
+    };
+    let Some(shape) = route_definition(pool, &definition).await? else {
+        return Err(ApplyError::AggregateOffLedger {
+            target: definition.target_table,
+        });
+    };
+    let pk = ddl::source_primary_key(pool, &definition.source_table).await?;
+    let mut client = pool.get().await?;
+    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
+    let plan = LedgerTargetPlan::new(
+        &definition.target_table,
+        &definition.source_table,
+        pk,
+        identity,
+        shape,
+    );
+    let n = keys.len();
+    let rederive = vec![false; n];
+    let lsns: Vec<Option<String>> = vec![Some("0/10".to_string()); n];
+    let txids: Vec<Option<&str>> = vec![Some("100"); n];
+    let images: Vec<Option<&str>> = vec![None; n];
+    let snapshot: Option<String> = None;
+    let fresh = vec![false; n];
+    let txn = client.transaction().await?;
+    let explain = |rows: Vec<tokio_postgres::Row>| {
+        rows.iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let lock = explain(
+        query_by_entry_key(
+            &txn,
+            &format!("explain {}", lock_statement(&plan.ledger_ident)),
+            &[&keys],
+        )
+        .await?,
+    );
+    let page = explain(
+        query_by_entry_key(
+            &txn,
+            &format!("explain {}", ledger_statement(&plan, None, true, false)),
+            &[
+                &keys,
+                &rederive,
+                &lsns,
+                &txids,
+                &images,
+                &snapshot,
+                &1_i64,
+                &plan.target,
+                &keys,
+                &fresh,
+            ],
+        )
+        .await?,
+    );
+    txn.rollback().await?;
+    Ok(vec![("entry lock", lock), ("page statement", page)])
 }
 
 /// Empties a ledger target for a source `TRUNCATE` (the D split's Q6),

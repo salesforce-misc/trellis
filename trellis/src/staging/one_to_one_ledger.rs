@@ -153,16 +153,14 @@ pub(crate) async fn lock_entries(
         .filter(|k| !inserted.keys.contains(*k))
         .collect();
     if !existing.is_empty() && !skip_lock {
-        let locked = txn
-            .execute(
-                &format!(
-                    "select 1 from {ledger} where {key_col} = any($1::text[]) \
-                     order by {key_col} for update"
-                ),
-                &[&existing],
-            )
-            .await?;
-        if (locked as usize) < existing.len() {
+        let locked = super::ledger::query_by_entry_key(
+            txn,
+            &super::ledger::lock_statement(&ledger),
+            &[&existing],
+        )
+        .await?
+        .len();
+        if locked < existing.len() {
             return Err(ApplyError::LedgerEntryCollected {
                 target: target.to_string(),
             });
@@ -274,14 +272,6 @@ pub(crate) async fn update_entries(
     if changes.is_empty() {
         return Ok(HashSet::new());
     }
-    let q = |c: &str| quote_ident(c);
-    let (key, basis, applied, seg, tombstone) = (
-        q(schema::KEY_COLUMN),
-        q(schema::BASIS_COLUMN),
-        q(schema::APPLIED_LSN_COLUMN),
-        q(schema::APPLIED_SEG_COLUMN),
-        q(schema::TOMBSTONE_COLUMN),
-    );
     let keys: Vec<&str> = changes.iter().map(|c| c.key).collect();
     let rederive: Vec<bool> = changes.iter().map(|c| c.apply.is_none()).collect();
     let lsns: Vec<Option<String>> = changes
@@ -290,42 +280,111 @@ pub(crate) async fn update_entries(
         .collect();
     let txids: Vec<Option<&str>> = changes.iter().map(|c| c.apply.map(|(_, t)| t)).collect();
     let present: Vec<bool> = changes.iter().map(|c| c.present).collect();
+    let rows = super::ledger::query_by_entry_key(
+        txn,
+        &update_statement(target, predicate),
+        &[
+            &keys, &rederive, &lsns, &txids, &present, &target, &snapshot, &seg_seq,
+        ],
+    )
+    .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// [`update_entries`]' statement on `target`'s ledger. Binds `$1` the keys,
+/// `$2` the Re-derive flags, `$3` the `lsn`s and `$4` the `row_txid`s (null
+/// for a Re-derive), `$5` whether each key has a row after its change, `$6`
+/// the target, `$7` the Re-derive read's snapshot and `$8` the page's
+/// latest segment. Returns the keys it changed. It reads the ledger only
+/// through `$1`'s keys, and runs under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (#778).
+fn update_statement(target: &str, predicate: bool) -> String {
+    let q = |c: &str| quote_ident(c);
+    let (key, basis, applied, seg, tombstone) = (
+        q(schema::KEY_COLUMN),
+        q(schema::BASIS_COLUMN),
+        q(schema::APPLIED_LSN_COLUMN),
+        q(schema::APPLIED_SEG_COLUMN),
+        q(schema::TOMBSTONE_COLUMN),
+    );
     let predicate = if predicate {
         super::ledger::apply_predicate(true)
     } else {
         "true".to_string()
     };
-    let rows = txn
-        .query(
+    format!(
+        "with v as ( \
+             select u.__k, u.__rederive, u.__lsn::pg_lsn as __lsn, \
+                    u.__txid::xid8 as __txid, u.__present \
+             from unnest($1::text[], $2::bool[], $3::text[], $4::text[], $5::bool[]) \
+                  as u(__k, __rederive, __lsn, __txid, __present) \
+         ), \
+         fl as (select floor from ledger_truncate_floor where target_table = $6) \
+         update {ledger} l set \
+             {basis} = case when v.__rederive then $7::text::pg_snapshot else l.{basis} end, \
+             {applied} = case when v.__rederive then l.{applied} else v.__lsn end, \
+             {seg} = {stamp}, \
+             {tombstone} = not v.__present \
+         from v \
+         where l.{key} = any($1::text[]) and l.{key} = v.__k \
+           and (v.__rederive or ({predicate})) \
+         returning l.{key}",
+        ledger = ledger_ident(target),
+        stamp =
+            schema::tombstone_seg_sql(Some(&format!("l.{seg}")), "not v.__present", "$8::bigint"),
+    )
+}
+
+/// The plans of a page's statements that read the 1-1 target `target`'s
+/// ledger by entry key (#778), as `explain`'s text, each labelled, under the
+/// settings a page runs them with: the entry lock
+/// (`super::ledger::lock_statement`) and [`update_entries`]' statement, for
+/// a page of Applies to `keys`, which already have entries. `target` is the
+/// target's qualified identity. For tests of the plans' shape. It locks and
+/// writes nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_page(
+    pool: &crate::pool::Pool,
+    target: &str,
+    keys: &[&str],
+) -> Result<Vec<(&'static str, String)>, ApplyError> {
+    let n = keys.len();
+    let rederive = vec![false; n];
+    let lsns: Vec<Option<String>> = vec![Some("0/10".to_string()); n];
+    let txids: Vec<Option<&str>> = vec![Some("100"); n];
+    let present = vec![true; n];
+    let snapshot: Option<String> = None;
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let explain = |rows: Vec<tokio_postgres::Row>| {
+        rows.iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let lock = explain(
+        super::ledger::query_by_entry_key(
+            &txn,
             &format!(
-                "with v as ( \
-                     select u.__k, u.__rederive, u.__lsn::pg_lsn as __lsn, \
-                            u.__txid::xid8 as __txid, u.__present \
-                     from unnest($1::text[], $2::bool[], $3::text[], $4::text[], $5::bool[]) \
-                          as u(__k, __rederive, __lsn, __txid, __present) \
-                 ), \
-                 fl as (select floor from ledger_truncate_floor where target_table = $6) \
-                 update {ledger} l set \
-                     {basis} = case when v.__rederive then $7::text::pg_snapshot else l.{basis} end, \
-                     {applied} = case when v.__rederive then l.{applied} else v.__lsn end, \
-                     {seg} = {stamp}, \
-                     {tombstone} = not v.__present \
-                 from v \
-                 where l.{key} = v.__k and (v.__rederive or ({predicate})) \
-                 returning l.{key}",
-                ledger = ledger_ident(target),
-                stamp = schema::tombstone_seg_sql(
-                    Some(&format!("l.{seg}")),
-                    "not v.__present",
-                    "$8::bigint"
-                ),
+                "explain {}",
+                super::ledger::lock_statement(&ledger_ident(target))
             ),
+            &[&keys],
+        )
+        .await?,
+    );
+    let update = explain(
+        super::ledger::query_by_entry_key(
+            &txn,
+            &format!("explain {}", update_statement(target, true)),
             &[
-                &keys, &rederive, &lsns, &txids, &present, &target, &snapshot, &seg_seq,
+                &keys, &rederive, &lsns, &txids, &present, &target, &snapshot, &1_i64,
             ],
         )
-        .await?;
-    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+        .await?,
+    );
+    txn.rollback().await?;
+    Ok(vec![("entry lock", lock), ("entry update", update)])
 }
 
 /// Empties a 1-1 target's ledger for a source `TRUNCATE` and raises its

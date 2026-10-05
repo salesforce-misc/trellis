@@ -2305,6 +2305,99 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index_one_to_one() {
     the_gc_statement_reads_the_ledger_by_its_tombstone_index(Flavour::OneToOne).await;
 }
 
+/// The page's statements that read a ledger by entry key reach the entries
+/// through the key's index while the ledger's statistics lag its growth
+/// (#778): never analyzed (`empty`), or analyzed while it held a handful of
+/// entries (`stale`), and then grown by a large insert, as a fast-filling
+/// ledger is before `autoanalyze` catches up. Left to the planner, the
+/// page's entry update joined its records to a sequential scan of the
+/// whole ledger, which cost 200–345 ms a page in the paged benchmark.
+async fn the_page_statements_read_the_ledger_by_key(flavour: Flavour) {
+    let mut unbounded = Vec::new();
+    for stats in ["empty", "stale"] {
+        let d = start(flavour, &[]).await;
+        let ledger = flavour.ledger();
+        let ledger_name = ledger.rsplit('.').next().expect("a table name");
+        let (columns, values) = match flavour {
+            Flavour::OneToOne => ("__from_key", "i::text"),
+            _ => ("__from_key, g, __member", "i::text, i % 400, true"),
+        };
+        let load = |from: i32, to: i32| {
+            format!(
+                "insert into {ledger} ({columns}) \
+                 select {values} from generate_series({from}, {to}) i"
+            )
+        };
+        d.ctl
+            .batch_execute(&format!(
+                "alter table {ledger} set (autovacuum_enabled = false)"
+            ))
+            .await
+            .expect("keep autoanalyze off the ledger");
+        if stats == "stale" {
+            d.ctl
+                .batch_execute(&format!("{}; analyze {ledger}", load(1, 100)))
+                .await
+                .expect("load and analyze a small ledger");
+        }
+        let from = if stats == "stale" { 101 } else { 1 };
+        d.ctl
+            .batch_execute(&load(from, 400_000))
+            .await
+            .expect("grow the ledger");
+        let keys: Vec<String> = (1..=5_000).map(|i| (i * 79).to_string()).collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let plans = match flavour {
+            Flavour::OneToOne => {
+                trellis::staging::explain_one_to_one_ledger_page(d.pool(), flavour.target(), &keys)
+                    .await
+            }
+            _ => trellis::staging::explain_ledger_page(d.pool(), "agg", &keys).await,
+        }
+        .expect("explain the page's statements");
+        for (statement, explained) in plans {
+            // Every read of the ledger is bounded by the page's keys: no
+            // sequential scan, and no index scan over the whole ledger
+            // feeding a hash join, which `enable_seqscan = off` alone
+            // leaves the planner.
+            let bounded = !explained.lines().any(|line| {
+                line.contains("Scan")
+                    && line.contains(&format!(" on {ledger_name} "))
+                    && (line.contains("Seq Scan") || estimated_rows(line) > keys.len())
+            }) && explained
+                .lines()
+                .any(|line| line.contains("Index Cond: (__from_key = "));
+            if !bounded {
+                unbounded.push(format!("{stats} statistics, {statement}:\n{explained}"));
+            }
+        }
+    }
+    assert!(
+        unbounded.is_empty(),
+        "every read of the ledger is by the page's keys:\n{}",
+        unbounded.join("\n")
+    );
+}
+
+/// The row estimate of an `explain` line's node: its `rows=`.
+fn estimated_rows(line: &str) -> usize {
+    line.split("rows=")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn the_page_statements_read_the_ledger_by_key_aggregate() {
+    the_page_statements_read_the_ledger_by_key(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn the_page_statements_read_the_ledger_by_key_one_to_one() {
+    the_page_statements_read_the_ledger_by_key(Flavour::OneToOne).await;
+}
+
 /// Whether key `id`'s entry on `flavour`'s ledger is a heap-only tuple: the
 /// new version of a HOT update, which wrote no index entry.
 async fn heap_only(d: &Driver, flavour: Flavour, id: i32) -> bool {

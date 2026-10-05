@@ -1375,6 +1375,110 @@ async fn the_merge_plan_survives_empty_statistics() {
     );
 }
 
+/// A build's Re-derive statements reach the ledger through the key's
+/// index, and the source through its primary key, while the ledger's
+/// statistics lag its growth (#778): never analyzed (`empty`), or analyzed
+/// while it held a handful of entries (`stale`), and then grown by a large
+/// insert, as a build fills it. Left to the planner, the chunk's entry
+/// rewrite joined its keys to a scan of the whole ledger, as the 1-1
+/// chunk's did before `CHUNK_PLAN_SETTINGS` (#625 F8a).
+#[tokio::test]
+async fn the_rederive_statements_read_the_ledger_by_key() {
+    let mut unbounded = Vec::new();
+    for stats in ["empty", "stale"] {
+        let (d, plan) = start_build_with(
+            Flavour::Sum,
+            "insert into public.src select i, i % 400, i from generate_series(1, 400000) i;",
+        )
+        .await;
+        let load = |from: i32, to: i32| {
+            format!(
+                "insert into public.agg__ledger (__from_key, g, __arg0, __member) \
+                 select i::text, i % 400, i, true from generate_series({from}, {to}) i"
+            )
+        };
+        d.ctl
+            .batch_execute("alter table public.agg__ledger set (autovacuum_enabled = false)")
+            .await
+            .expect("keep autoanalyze off the ledger");
+        if stats == "stale" {
+            d.ctl
+                .batch_execute(&format!("{}; analyze public.agg__ledger", load(1, 100)))
+                .await
+                .expect("load and analyze a small ledger");
+        }
+        let from = if stats == "stale" { 101 } else { 1 };
+        d.ctl
+            .batch_execute(&load(from, 400_000))
+            .await
+            .expect("grow the ledger");
+        let keys: Vec<String> = (10_001..=15_000).map(|i: i32| i.to_string()).collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut client = d.db.pool.get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        let plans = build::explain_rederive(&txn, &plan, Some("10000"), "15000", &keys)
+            .await
+            .expect("explain the Re-derive statements");
+        txn.rollback().await.expect("roll back");
+        for (statement, explained) in plans {
+            let bounded = !explained.lines().any(|line| {
+                line.contains("Seq Scan")
+                    || (line.contains("Scan")
+                        && line.contains(" on agg__ledger ")
+                        && estimated_rows(line) > keys.len())
+            }) && explained
+                .lines()
+                .any(|line| line.contains("Index Cond: (__from_key = "));
+            if !bounded {
+                unbounded.push(format!("{stats} statistics, {statement}:\n{explained}"));
+            }
+        }
+    }
+    assert!(
+        unbounded.is_empty(),
+        "every read of the ledger is by the keys:\n{}",
+        unbounded.join("\n")
+    );
+}
+
+/// The Re-derive statements' plan settings end with each statement (#778):
+/// the rest of the chunk's transaction plans as usual. The second chunk over
+/// the range finds its entries, so it takes their lock as well.
+#[tokio::test]
+async fn the_entry_plan_settings_end_with_each_statement() {
+    let (d, plan) = start_build_with(
+        Flavour::Sum,
+        "insert into public.src select i, i % 20, i from generate_series(1, 200) i;",
+    )
+    .await;
+    d.chunk(&plan, None, "200").await;
+    let mut client = d.db.pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let outcome = build::run_chunk(&txn, &plan, None, "200")
+        .await
+        .expect("chunk");
+    assert_eq!(outcome.keys, 200, "{outcome:?}");
+    let seqscan: String = txn
+        .query_one("select current_setting('enable_seqscan')", &[])
+        .await
+        .expect("read the plan setting")
+        .get(0);
+    assert_eq!(
+        seqscan, "on",
+        "the chunk's transaction plans as usual after its statements"
+    );
+    txn.commit().await.expect("commit");
+}
+
+/// The row estimate of an `explain` line's node: its `rows=`.
+fn estimated_rows(line: &str) -> usize {
+    line.split("rows=")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|rows| rows.parse().ok())
+        .unwrap_or(0)
+}
+
 /// The merge statement's plan settings end with the statement (#625 F2b):
 /// the rest of the merger's transaction, the empty-group delete and the
 /// seam's statements, plans as usual.
