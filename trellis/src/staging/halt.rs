@@ -154,3 +154,161 @@ fn closure(catalog: &CaptureCatalog, seed: &Seed, unfrozen: &HashSet<i64>) -> BT
     }
     members
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::capture::columns::CaptureReader;
+    use crate::defs::ast::RelationshipDef;
+    use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
+    use crate::defs::parse;
+
+    /// `(source, target, text)` per definition, ids from 1, with `author`
+    /// (`posts.author` to `users.handle`) declared.
+    fn catalog(definitions: &[(&str, &str, &str)]) -> CaptureCatalog {
+        CaptureCatalog {
+            definitions: definitions
+                .iter()
+                .enumerate()
+                .map(|(i, (source, target, text))| CaptureReader {
+                    id: i as i64 + 1,
+                    source: source.to_string(),
+                    def: parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}")),
+                    capture_failed: false,
+                    target: target.to_string(),
+                })
+                .collect(),
+            relationships: vec![RelationshipDefinition {
+                id: 1,
+                from_schema: "public".to_string(),
+                to_schema: "public".to_string(),
+                def: RelationshipDef {
+                    name: "author".to_string(),
+                    from_table: "posts".to_string(),
+                    from_col: "author".to_string(),
+                    to_table: "users".to_string(),
+                    to_col: "handle".to_string(),
+                },
+                cardinality: RelationshipCardinality::ToOne,
+                warnings: Vec::new(),
+            }],
+            projection_columns: HashMap::new(),
+        }
+    }
+
+    fn all(catalog: &CaptureCatalog) -> HashSet<i64> {
+        catalog.definitions.iter().map(|r| r.id).collect()
+    }
+
+    fn tables(tables: &[&str]) -> Seed {
+        Seed::Tables(tables.iter().map(|t| t.to_string()).collect())
+    }
+
+    /// A key seed reaches the table's direct reader, the definition reading
+    /// it as a relationship's to-side, and what reads either one's target,
+    /// to any depth, and nothing else.
+    #[test]
+    fn a_key_seed_reaches_readers_relationship_readers_and_their_downstream() {
+        let catalog = catalog(&[
+            (
+                "public.users",
+                "public.users_copy",
+                "TRANSFORM users_copy FROM users SELECT name AS name",
+            ),
+            (
+                "public.posts",
+                "public.posts_named",
+                "TRANSFORM posts_named FROM posts SELECT author.name AS name",
+            ),
+            (
+                "public.posts",
+                "public.posts_plain",
+                "TRANSFORM posts_plain FROM posts SELECT author AS author",
+            ),
+            (
+                "public.posts_named",
+                "public.named_copy",
+                "TRANSFORM named_copy FROM posts_named SELECT name AS name",
+            ),
+            (
+                "public.named_copy",
+                "public.named_copy_2",
+                "TRANSFORM named_copy_2 FROM named_copy SELECT name AS name",
+            ),
+            (
+                "public.posts_plain",
+                "public.plain_copy",
+                "TRANSFORM plain_copy FROM posts_plain SELECT author AS author",
+            ),
+        ]);
+        assert_eq!(
+            closure(&catalog, &tables(&["public.users"]), &all(&catalog)),
+            BTreeSet::from([1, 2, 4, 5])
+        );
+    }
+
+    /// A hop bound's seed is the cycle's tables: every definition on the
+    /// cycle, and what is downstream of it, whichever table the wave ran
+    /// away through.
+    #[test]
+    fn a_hop_bound_seed_reaches_the_cycle_and_its_downstream() {
+        let catalog = catalog(&[
+            ("public.a", "public.b", "TRANSFORM b FROM a SELECT v AS v"),
+            ("public.b", "public.c", "TRANSFORM c FROM b SELECT v AS v"),
+            ("public.c", "public.a", "TRANSFORM a FROM c SELECT v AS v"),
+            ("public.c", "public.d", "TRANSFORM d FROM c SELECT v AS v"),
+            ("public.x", "public.y", "TRANSFORM y FROM x SELECT v AS v"),
+        ]);
+        for table in ["public.a", "public.b", "public.c"] {
+            assert_eq!(
+                closure(&catalog, &tables(&[table]), &all(&catalog)),
+                BTreeSet::from([1, 2, 3, 4]),
+                "{table}"
+            );
+        }
+    }
+
+    /// A frozen definition is neither a member nor followed: it applies
+    /// nothing, so what reads its target reads nothing new.
+    #[test]
+    fn a_frozen_definition_is_left_out_and_not_followed() {
+        let catalog = catalog(&[
+            ("public.a", "public.b", "TRANSFORM b FROM a SELECT v AS v"),
+            ("public.b", "public.c", "TRANSFORM c FROM b SELECT v AS v"),
+            ("public.a", "public.e", "TRANSFORM e FROM a SELECT v AS v"),
+        ]);
+        let unfrozen = HashSet::from([2, 3]);
+        assert_eq!(
+            closure(&catalog, &tables(&["public.a"]), &unfrozen),
+            BTreeSet::from([3])
+        );
+    }
+
+    /// An aggregate off the ledger names its target bare: the seed is the
+    /// definition writing it, and what is downstream of it.
+    #[test]
+    fn a_target_seed_reaches_its_writer_and_its_downstream() {
+        let catalog = catalog(&[
+            (
+                "public.s",
+                "public.agg",
+                "TRANSFORM agg FROM s GROUP BY g SELECT g AS g, SUM(v) AS total",
+            ),
+            (
+                "public.agg",
+                "public.agg_copy",
+                "TRANSFORM agg_copy FROM agg SELECT total AS total",
+            ),
+            ("public.s", "public.t", "TRANSFORM t FROM s SELECT v AS v"),
+        ]);
+        for target in ["agg", "public.agg"] {
+            assert_eq!(
+                closure(&catalog, &Seed::Target(target.to_string()), &all(&catalog)),
+                BTreeSet::from([1, 2]),
+                "{target}"
+            );
+        }
+    }
+}
