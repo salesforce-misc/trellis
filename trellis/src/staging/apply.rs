@@ -1049,11 +1049,17 @@ async fn from_side_keys(
                 Ok(rows) => rows,
                 // #784 review: a key that isn't `from_col`'s type can't match
                 // a row, but the typed cast rejects it, failing the batch
-                // for good. A to-side's ring `group_key` from capture
-                // functions older than the catalog (a relationship dropped
-                // since they were installed, before the reconcile pass
-                // regenerates them) can name another column's values. Match
-                // by text instead: the same rows, without the index.
+                // for good. A to-side's ring `group_key` written by capture
+                // functions older than the catalog can name another column's
+                // values: a row written before a relationship was dropped
+                // from the table (or before the reconcile pass regenerated
+                // its functions) still holds them when it drains, and
+                // regenerating the functions doesn't rewrite it, so every
+                // retry would fail the same way. Match by text instead. A
+                // join column's own values match the same rows as typed
+                // (a relationship's columns share one text-stable type); any
+                // other value matches none, or a row whose text happens to
+                // equal it, which costs only an idempotent Re-derive.
                 Err(e)
                     if pg_type.is_some()
                         && e.code().is_some_and(|c| c.code().starts_with("22")) =>

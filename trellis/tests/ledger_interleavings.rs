@@ -3246,3 +3246,55 @@ async fn a_relationship_onto_a_captured_to_side_widens_its_group_key() {
         vec![r#"("{101,102}")"#.to_string()]
     );
 }
+
+/// #784's known gap, pinned: a to-side two relationships join on different
+/// non-key columns, `par.code` (a to-one) and `par.fk` (a to-many), the
+/// shape the generative suite draws when one definition reads its second
+/// table through a to-one and another through a to-many. Neither `to_col`
+/// is `par`'s primary key, and they can't share the ring's unlabelled
+/// `group_key` (`capture::columns::to_side_group_key_column`), so neither is
+/// tracked. Parent 5 is born and deleted in one batch after child 1 read
+/// it live under code `'e'`, as in
+/// `a_parent_born_and_deleted_in_one_batch_after_a_child_read_it`, and
+/// nothing names `'e'` to re-derive: group 3 keeps `COUNT` 1 where the
+/// oracle has 0. With `kids` dropped, `code` is tracked and this passes.
+/// Closing it needs `group_key`'s values labelled per column.
+#[tokio::test]
+#[ignore = "#784 known gap: a to-side two relationships join on different non-key columns"]
+async fn a_parent_born_and_deleted_on_a_to_side_joined_by_two_non_key_columns() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, count(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code text unique, fk text, w numeric); \
+         create table public.src (id integer primary key, g integer, p text, k text); \
+         insert into public.par values (1, 'a', 'x', 10), (2, 'b', 'y', 20); \
+         insert into public.src values (1, 1, 'a', 'k1'), (2, 1, 'b', 'k2');",
+        &[("id", ValueType::Numeric), ("g", ValueType::Numeric)],
+        &[
+            "RELATIONSHIP parent FROM src.p TO par.code",
+            "RELATIONSHIP kids FROM src.k TO par.fk",
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "before the scenario"
+    );
+    write(&d, "update public.src set g = 3, p = 'e' where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 'e', 'z', 57)").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "target (left) differs from the oracle (right)"
+    );
+}
