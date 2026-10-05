@@ -117,8 +117,10 @@ small; duplicating it is the price of an honest audit.
 The correctness promise is conditional on being caught up to an LSN, so `self_check`
 must never report a merely-lagging target as diverged. It takes a watermark token,
 awaits convergence through it (bounded by a timeout; on timeout it reports "not caught
-up," never a divergence), and reads the target and runs the recompute inside a single
-`REPEATABLE READ` transaction.
+up," never a divergence), and reads the target and runs the recompute under one
+snapshot. *Amended by #782:* that was a `REPEATABLE READ` transaction holding two
+queries; it is now one statement that reads both sides, which gives it one snapshot
+under any isolation level.
 
 A snapshot alone is not sufficient under live load: a single snapshot pins source and
 target at one instant, but a correctly-working target legitimately lags its source by

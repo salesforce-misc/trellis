@@ -191,8 +191,9 @@ pub struct SelfCheckReport {
     /// The keyset cursor a following call should pass as
     /// [`SelfCheckScope::after`] to continue past this page — the key this
     /// page's bound actually ended at, which is the *lower* of the two
-    /// sides' last keys, in the order both sides are paged in (the source
-    /// key's collation, see `page_collation`), whenever either side hit
+    /// sides' last keys, in the order both sides are paged in (a
+    /// single-column text key's own collation when it's deterministic, else
+    /// `"C"`, see `page_collation`), whenever either side hit
     /// [`SelfCheckScope::limit`] (keys past it fell off one side's page and
     /// are deliberately left for the next call rather than diffed against a
     /// truncated counterpart). `None` means neither side hit the limit, so
@@ -664,12 +665,13 @@ async fn compare_once(
         .iter()
         .filter(|f| !paused.contains(&f.name))
         .collect();
-    let sql = page_sql(def, pk, &comparable)?;
 
     // One statement reads both sides, so both read the same snapshot
     // (ADR-0013's "reads the target and runs the recompute" under one
     // snapshot), and it trims both pages to the same bound.
     let client = pool.get().await?;
+    let collation = page_collation(&client, pk).await?;
+    let sql = page_sql(def, pk, &collation, &comparable)?;
     let after: Option<&str> = scope.after.as_deref();
     let rows = client.query(sql.as_str(), &[&after, &scope.limit]).await?;
 
@@ -716,15 +718,43 @@ async fn compare_once(
 /// integer's `id::text`) is an expression no index orders, so it is compared
 /// under `"C"`, the cheapest to sort.
 ///
+/// The index's collation must be deterministic, though, so `"C"` takes its
+/// place when it isn't. Define refuses a nondeterministic key collation
+/// (#638), but an `alter` of the source key to one afterwards isn't refused,
+/// and under one two distinct keys can compare equal: a page's `limit` could
+/// cut between a target key and an extra target row tying with it, and the
+/// next page's `> after` would skip the one cut, hiding it from every sweep.
+/// A deterministic collation breaks every tie by bytes, so distinct keys are
+/// never equal under it, and membership by byte equality ([`diff_page`])
+/// agrees with the page's order.
+///
 /// [`SelfCheckScope::after`] is compared under this collation too, so a
 /// cursor carried across a re-collation of the source key continues in the
 /// new order: keys between the two orders' positions of the cursor may be
 /// skipped or compared twice by that one sweep.
-fn page_collation(pk: &[PrimaryKeyColumn]) -> &str {
-    match pk {
-        [only] if !only.nullable => only.collation.as_deref().unwrap_or(BYTE_ORDER),
-        _ => BYTE_ORDER,
-    }
+async fn page_collation(
+    client: &tokio_postgres::Client,
+    pk: &[PrimaryKeyColumn],
+) -> Result<String, SelfCheckError> {
+    let index_collation = match pk {
+        [only] if !only.nullable => only.collation.as_deref(),
+        _ => None,
+    };
+    let Some(collation) = index_collation else {
+        return Ok(BYTE_ORDER.to_string());
+    };
+    let deterministic: Option<bool> = client
+        .query_opt(
+            "select co.collisdeterministic from pg_catalog.pg_collation co \
+             where co.oid = pg_catalog.to_regcollation($1)",
+            &[&collation],
+        )
+        .await?
+        .map(|row| row.get(0));
+    Ok(match deterministic {
+        Some(true) => collation.to_string(),
+        _ => BYTE_ORDER.to_string(),
+    })
 }
 
 /// `"C"`, byte order.
@@ -732,7 +762,7 @@ const BYTE_ORDER: &str = r#"pg_catalog."C""#;
 
 /// The statement [`compare_once`] runs: one keyset page of the recompute
 /// over `def`'s source and of the persisted target, each `LIMIT`ed
-/// separately, both ordered and bounded by the key text under one collation
+/// separately, both ordered and bounded by the key text under `collation`
 /// ([`page_collation`]), and both trimmed to the same end in SQL, where that
 /// collation's ordering is.
 ///
@@ -759,6 +789,7 @@ const BYTE_ORDER: &str = r#"pg_catalog."C""#;
 fn page_sql(
     def: &Definition,
     pk: &[PrimaryKeyColumn],
+    collation: &str,
     comparable: &[&FieldDef],
 ) -> Result<String, SelfCheckError> {
     // `pk_key_sql_expr` is the source/target's shared key-contract text at
@@ -766,11 +797,7 @@ fn page_sql(
     // Both sides page by it, under one collation, so they page in one order.
     // That order isn't the key's typed order (an integer key sorts as text),
     // and needn't be: the audit only ever compares the two sides key by key.
-    let key = format!(
-        "({}) collate {}",
-        ddl::pk_key_sql_expr(pk, None),
-        page_collation(pk)
-    );
+    let key = format!("({}) collate {collation}", ddl::pk_key_sql_expr(pk, None));
     let source_ident = ddl::qualified_source_table(&def.source_table);
     let target_ident = ddl::qualified_target_table_ident(&def.target_table);
 
@@ -824,8 +851,9 @@ pub async fn explain_page(
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
     let pk = ddl::source_primary_key(pool, &def.source_table).await?;
     let comparable: Vec<&FieldDef> = def.def.fields.iter().collect();
-    let sql = page_sql(&def, &pk, &comparable)?;
     let mut client = pool.get().await?;
+    let collation = page_collation(&client, &pk).await?;
+    let sql = page_sql(&def, &pk, &collation, &comparable)?;
     let txn = client.transaction().await?;
     txn.batch_execute("set local enable_seqscan to off").await?;
     let rows = txn

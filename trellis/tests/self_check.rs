@@ -1473,6 +1473,66 @@ async fn real_divergences_across_page_boundaries_are_reported_after_a_re_collati
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// An extra target row, `k03a`, sorting right after a page boundary and
+/// before the next source key (`en-US`: `k03 < k03a < K04`, where `"C"` puts
+/// it after every `K…`). The first page ends at `k03` on both sides; the
+/// second starts with `k03a` on the persisted side only, which pushes that
+/// side's page end down to `k05`, so the recompute side's `K06` is left to
+/// the third page. The extra row is reported, and nothing else.
+#[tokio::test]
+async fn an_extra_target_row_just_past_a_page_boundary_is_reported_under_the_key_s_collation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    raw.execute("insert into word_values (id, v) values ('k03a', 3)", &[])
+        .await
+        .expect("insert an extra target row");
+
+    let (divergences, compared) = audit_every_page(&trellis, "word_values", 3).await;
+    assert_eq!(
+        divergences,
+        vec![Divergence::ExtraRow {
+            key: "k03a".to_string()
+        }]
+    );
+    assert_eq!(compared, 13, "every key of either side compared once");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A source key re-collated after define to a *nondeterministic* collation
+/// (case-insensitive here; define refuses one, #638, but a later `alter`
+/// isn't refused). Under it, `k03` and an extra target row `K03` compare
+/// equal, so paging by it would let a page's `limit` cut between the two and
+/// the next page's `> k03` skip whichever was cut: the extra row is never
+/// compared, or `k03` is reported missing when it isn't. Distinct keys must
+/// never tie in the order the pages are read in.
+#[tokio::test]
+async fn a_re_collation_to_a_nondeterministic_collation_hides_no_row_at_a_page_boundary() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = words_fixture(&db).await;
+    raw.batch_execute(
+        "create collation case_insensitive \
+           (provider = icu, locale = 'und-u-ks-level2', deterministic = false); \
+         alter table words alter column id type text collate case_insensitive; \
+         insert into word_values (id, v) values ('K03', 3)",
+    )
+    .await
+    .expect("re-collate the source key and seed a tying extra target row");
+
+    let (divergences, compared) = audit_every_page(&trellis, "word_values", 3).await;
+    assert_eq!(
+        divergences,
+        vec![Divergence::ExtraRow {
+            key: "K03".to_string()
+        }]
+    );
+    assert_eq!(compared, 13, "every key of either side compared once");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// The target has an extra row, `K00`, ahead of every source key, so only
 /// the persisted side's three-key page ends early, at `K02` (`en-US`: `K00 <
 /// k01 < K02 < k03`). The page ends there, and the recompute side's `k03` is
