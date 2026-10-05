@@ -657,10 +657,13 @@ async fn read_live_rows_batch(
     if keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
     let row_columns = live_row_columns(&**client, source_table).await?;
     let query = live_rows_query(source_table, pk, &row_columns, keys)?;
-    let db_rows = client.query(&query.sql, &query.params()).await?;
+    // A transaction only for `query_by_entry_key`'s `set local`.
+    let txn = client.transaction().await?;
+    let db_rows = super::ledger::query_by_entry_key(&txn, &query.sql, &query.params()).await?;
+    txn.commit().await?;
     let mut rows: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
         let key: String = db_row.get(0);
@@ -716,21 +719,32 @@ impl LiveRowsQuery<'_> {
 /// nested loop over a sequential scan of the source. This is the same split
 /// `target_mutations::read_new_images` makes (issue #433).
 ///
-/// A single-column key's non-`NULL` arm also restricts the column to its
-/// array (`t.<col> = any(<array>)`), which the join already implies, so the
-/// source's side of whatever join the planner picks is bounded by the batch
-/// (#778). Without it, a source analyzed while small and grown since was
-/// read in full for a page's 5,000 keys: a hash join over a sequential scan
-/// of 1.15M rows, 143 ms against 11 ms.
+/// Every caller runs the statement under `super::ledger::ENTRY_PLAN_SETTINGS`
+/// (no sequential scan), and a single-column key's non-`NULL` arm also
+/// restricts the column to its array (`t.<col> = any(<array>)`), which the
+/// join already implies, so the source's side of whatever join the planner
+/// picks is read through the key's index and bounded by the batch (#778).
+/// It takes both while the source's statistics lag its size (analyzed while
+/// small, grown since), for a page's 5,000 keys:
+///
+/// - Neither: a hash join over a sequential scan of the source, 100 ms at
+///   1.15M rows on PostgreSQL 16 and 17.
+/// - The bound alone: still a sequential scan on PostgreSQL 16, which prices
+///   an index scan for 5,000 values far above 17's estimate: 28 ms at 1.15M rows,
+///   and 41 ms at 2M, where the unbounded join had gone back to probing the
+///   index (23 ms). PostgreSQL 17 reads the index: 10–15 ms.
+/// - No sequential scan alone: a scan of the key's whole index, 31 ms.
+/// - Both: 15–19 ms on PostgreSQL 16, 10–15 ms on 17.
 ///
 /// A composite key is never restricted this way. One `= any` per column
 /// makes the planner multiply the columns' selectivities, expect a row or
 /// two from the source, and compare every bounded row with every key,
 /// quadratic in the batch even with fresh statistics: 1,474 ms against 13
 /// ms for 5,000 keys of a four-column key at 1M rows, and 946 ms on a
-/// two-column key at 20M rows. The cost is that a composite key whose
-/// source's statistics lag can still be hashed against a sequential scan
-/// of the source.
+/// two-column key at 20M rows. Without a sequential scan to hash, it probes
+/// the key's index once per key whether or not its statistics lag (18 ms on
+/// PostgreSQL 16 for 5,000 keys at 400k rows analyzed at 100, against 70 ms
+/// for the hash join over a sequential scan).
 pub(super) fn live_rows_query<'a>(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
@@ -4243,13 +4257,15 @@ mod tests {
         );
     }
 
-    /// Issue #778: a [`live_rows_query`] batch reads only its keys' rows of
-    /// a single-column key's source whose statistics lag its size: analyzed
-    /// at 100 rows, then grown to 400k with autovacuum off. Left to the join
+    /// Issue #778: a [`live_rows_query`] batch, run as its callers run it
+    /// (under `ENTRY_PLAN_SETTINGS`), reads only its keys' rows of a
+    /// single-column key's source whose statistics lag its size: analyzed at
+    /// 100 rows, then grown to 400k with autovacuum off. Left to the join
     /// alone, the planner hashed a 5,000-key batch against a sequential scan
     /// of the source (or, with sequential scans off, a full scan of its
-    /// key's index); the arm's `= any` restriction caps the source's side at
-    /// the batch.
+    /// key's index). With the arm's `= any` restriction but sequential scans
+    /// on, PostgreSQL 16 still scanned the source and filtered it (CI); 17
+    /// read the index.
     ///
     /// A composite key is left unrestricted, and with fresh statistics it
     /// must not be matched by comparing every source row with every key:
@@ -4262,7 +4278,7 @@ mod tests {
     async fn live_rows_query_reads_only_the_batch_while_source_statistics_lag() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
             .await
             .expect("connect");
         tokio::spawn(async move {
@@ -4310,52 +4326,51 @@ mod tests {
                 "{table}: only a single-column key is bounded:\n{}",
                 query.sql
             );
-            let plan: String = client
-                .query(
-                    &format!("explain (analyze, timing off) {}", query.sql),
-                    &query.params(),
-                )
-                .await
-                .expect("explain")
-                .into_iter()
-                .map(|row| row.get::<_, String>(0))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if single {
-                let source = &table["public.".len()..];
-                let scans: Vec<&str> = plan
-                    .lines()
-                    .filter(|line| line.contains(&format!(" on {source} ")))
-                    .collect();
+            let txn = client.transaction().await.expect("begin");
+            let plan: String = crate::staging::ledger::query_by_entry_key(
+                &txn,
+                &format!("explain (analyze, timing off) {}", query.sql),
+                &query.params(),
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+            txn.commit().await.expect("commit");
+            let source = &table["public.".len()..];
+            let scans: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains(&format!(" on {source} ")))
+                .collect();
+            assert!(
+                !scans.is_empty(),
+                "{table}: no scan of the source in:\n{plan}"
+            );
+            for scan in scans {
+                let rows: f64 = scan
+                    .split("rows=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|rows| rows.parse().ok())
+                    .expect("a row estimate");
                 assert!(
-                    !scans.is_empty(),
-                    "{table}: no scan of the source in:\n{plan}"
-                );
-                for scan in scans {
-                    let rows: f64 = scan
-                        .split("rows=")
-                        .nth(1)
-                        .and_then(|rest| rest.split(' ').next())
-                        .and_then(|rows| rows.parse().ok())
-                        .expect("a row estimate");
-                    assert!(
-                        !scan.contains("Seq Scan") && rows <= keys.len() as f64,
-                        "{table}: the source must be read through the batch's keys, \
-                         got:\n{plan}"
-                    );
-                }
-            } else {
-                let filtered: u64 = plan
-                    .lines()
-                    .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
-                    .map(|n| n.trim().parse::<u64>().expect("a row count"))
-                    .sum();
-                assert!(
-                    filtered < keys.len() as u64,
-                    "{table}: the source must be matched to the keys without comparing \
-                     every row with every key, got:\n{plan}"
+                    !scan.contains("Seq Scan") && rows <= keys.len() as f64,
+                    "{table}: the source must be read through the batch's keys, \
+                     got:\n{plan}"
                 );
             }
+            let filtered: u64 = plan
+                .lines()
+                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                .sum();
+            assert!(
+                filtered < keys.len() as u64,
+                "{table}: the source must be matched to the keys without comparing \
+                 every row with every key, got:\n{plan}"
+            );
             let found: std::collections::HashSet<String> = client
                 .query(&query.sql, &query.params())
                 .await

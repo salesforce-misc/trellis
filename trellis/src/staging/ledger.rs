@@ -1906,7 +1906,9 @@ pub(super) async fn finish_groups(
 /// the statement. They pin the entry lock ([`lock_statement`]), a page's
 /// statement ([`ledger_statement`]), a build chunk's and a sweep batch's
 /// ([`rederive_statement`]) and a 1-1 page's entry update
-/// (`super::one_to_one_ledger::update_entries`).
+/// (`super::one_to_one_ledger::update_entries`). They also pin every read
+/// of a source by a batch's keys (`super::apply::live_rows_query`), which
+/// a source's lagging statistics price the same way.
 ///
 /// Left to itself, the planner read the whole ledger for a page's few
 /// thousand keys whenever it priced that cheaper, which it does while a
@@ -2226,7 +2228,7 @@ pub(crate) async fn apply_ledger_target(
              union all select m.k, m.doc::text, null::bigint from ({}) m",
             query.docs
         );
-        for row in txn.query(&sql, &query.params()).await? {
+        for row in query_by_entry_key(txn, &sql, &query.params()).await? {
             let key: Option<String> = row.get(0);
             let value: String = row.get(1);
             match key {

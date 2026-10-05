@@ -215,7 +215,7 @@ pub(crate) async fn read_rows(
     let mut rows: HashMap<String, Row> = HashMap::new();
     let mut snapshot = String::new();
     let mut seg = 0;
-    for row in txn.query(&sql, &query.params()).await? {
+    for row in super::ledger::query_by_entry_key(txn, &sql, &query.params()).await? {
         match row.get::<_, Option<String>>(0) {
             None => {
                 seg = row
