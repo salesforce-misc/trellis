@@ -220,3 +220,206 @@ async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
     );
     assert_eq!(pending_marker_count(&client).await, 0);
 }
+
+async fn status_of(client: &Client, target: &str) -> String {
+    client
+        .query_one(
+            "select status from transform_definitions \
+             where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read a definition's status")
+        .get(0)
+}
+
+async fn discharge(client: &mut Client) {
+    markers::run_pending_backfills(
+        client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+}
+
+/// Issue #732: a definition the Re-derive build will start reads its source
+/// itself, from its own chunks, so a discharge that runs before its start (a
+/// capture gate holding the start, say) has no reader to enumerate the table
+/// for. Both Re-derive shapes: a plain aggregate (#625 F3) and a plain 1-1
+/// target (F8a).
+#[tokio::test]
+async fn a_table_only_waiting_rederive_builds_read_is_not_enumerated() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key, grp text, n bigint); \
+             insert into widgets (id, grp, n) values (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)",
+        )
+        .await
+        .expect("seed source");
+    let columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("grp".to_string(), ValueType::Text),
+        ("n".to_string(), ValueType::Numeric),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM widget_totals FROM widgets GROUP BY grp SELECT grp AS grp, SUM(n) AS total",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("register a plain aggregate");
+    install_definition(
+        &db.pool,
+        "TRANSFORM widget_copy FROM widgets SELECT n AS n",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("register a plain 1-1 target");
+
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    capture(&mut client, std::slice::from_ref(&table)).await;
+    assert_eq!(
+        pending_marker_count(&client).await,
+        1,
+        "capture parks a marker"
+    );
+    discharge(&mut client).await;
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        0,
+        "nothing reads the table until the Re-derive builds start, and they read it themselves"
+    );
+    assert!(
+        !trellis::staging::has_pending(&client)
+            .await
+            .expect("has_pending"),
+        "the discharge staged nothing"
+    );
+    assert_eq!(
+        pending_marker_count(&client).await,
+        0,
+        "the marker is discharged"
+    );
+    for target in ["widget_totals", "widget_copy"] {
+        assert_eq!(
+            status_of(&client, target).await,
+            "waiting_to_backfill",
+            "the discharge leaves {target} to the Re-derive build's start"
+        );
+    }
+}
+
+/// Issue #732: leaving a waiting Re-derive build out of the discharge's
+/// readers doesn't leave out the others. A table a `live` definition also
+/// reads is still enumerated for it.
+#[tokio::test]
+async fn a_waiting_rederive_build_beside_a_live_reader_still_enumerates() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute("create table widgets (id bigint primary key, grp text, n bigint)")
+        .await
+        .expect("create source");
+    let columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("grp".to_string(), ValueType::Text),
+        ("n".to_string(), ValueType::Numeric),
+    ]);
+    trellis::defs::create_definition(
+        &db.pool,
+        "TRANSFORM widget_copy FROM widgets SELECT n AS n",
+        &columns,
+    )
+    .await
+    .expect("register a live plain 1-1 target");
+    assert_eq!(status_of(&client, "widget_copy").await, "live");
+
+    client
+        .batch_execute(
+            "insert into widgets (id, grp, n) values (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)",
+        )
+        .await
+        .expect("seed source");
+    install_definition(
+        &db.pool,
+        "TRANSFORM widget_totals FROM widgets GROUP BY grp SELECT grp AS grp, SUM(n) AS total",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("register a plain aggregate");
+
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    let before = recompute_count(&client, &table).await;
+    capture(&mut client, std::slice::from_ref(&table)).await;
+    discharge(&mut client).await;
+
+    assert_eq!(
+        recompute_count(&client, &table).await - before,
+        3,
+        "the live reader still gets every row"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+    assert_eq!(
+        status_of(&client, "widget_totals").await,
+        "waiting_to_backfill"
+    );
+}
+
+/// Issue #732: a waiting Re-derive build doesn't read a table its source
+/// merely has a relationship to (a definition reading through one isn't
+/// Re-derive-built yet), so a marker on that table has no reader either.
+#[tokio::test]
+async fn a_waiting_rederive_builds_related_table_is_not_enumerated() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.authors (id integer primary key, grp text); \
+             create table public.posts (id integer primary key, author_id integer, words integer); \
+             insert into public.authors (id, grp) values (1, 'a'), (2, 'b'); \
+             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5)",
+        )
+        .await
+        .expect("seed authors + posts");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM authors_per_grp FROM authors GROUP BY grp SELECT grp AS grp, COUNT(id) AS n",
+        &HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("grp".to_string(), ValueType::Text),
+        ]),
+        "public",
+    )
+    .await
+    .expect("register a plain aggregate on authors");
+
+    capture(&mut client, &["public.posts".to_string()]).await;
+    discharge(&mut client).await;
+
+    assert_eq!(recompute_count(&client, "public.posts").await, 0);
+    assert_eq!(pending_marker_count(&client).await, 0);
+    assert_eq!(
+        status_of(&client, "authors_per_grp").await,
+        "waiting_to_backfill"
+    );
+}

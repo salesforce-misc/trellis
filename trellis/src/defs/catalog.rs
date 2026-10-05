@@ -6388,8 +6388,10 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
 /// ([`crate::intake::markers::run_pending_backfills`]) skips enumerating
 /// a table this says `false` for (issue #417), since nothing would consume the
 /// `Recompute` rows; it excludes the definitions it just dispatched to chunked
-/// builds, which read the table themselves (issue #418), and every definition
-/// a Re-derive build is running for, whose chunks do too (#625 F2).
+/// builds, which read the table themselves (issue #418), and every
+/// `waiting_to_backfill` definition the Re-derive build will start (issue
+/// #732). This leaves out every definition a Re-derive build is running for,
+/// whose chunks read the table too (#625 F2).
 pub(crate) async fn table_has_reader(
     client: &impl GenericClient,
     qualified_table: &str,
