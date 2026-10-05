@@ -4903,6 +4903,7 @@ mod tests {
             &mut 1,
             &mut FenceMissBackoff::new(),
             &mut TransientRetry::new(),
+            &mut false,
             wrapped,
         )
         .await;
@@ -5084,7 +5085,7 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
 /// string.
 ///
 /// Issue #768: a key that no longer passes the key gate (a type off the
-/// allowlist, or no key at all) halts the drain while any definition that
+/// allowlist, or no key at all) halts the page while any definition that
 /// isn't frozen reads the table ([`catalog::has_unfrozen_reader`], under the
 /// canonical `source_key`), directly or through a relationship: one that
 /// applies would key its rows wrongly or not at all, and one still waiting
@@ -5103,9 +5104,9 @@ fn old_side_image(change: &FoldedChange) -> Option<&String> {
 /// its edit each bump their source's, so a page can't commit a skip after a
 /// reader it didn't see.
 ///
-/// The halt is the stance while a reader isn't frozen (#703 R2 would pause
-/// that reader in the drain): the capture pass that pauses every reader of a
-/// retyped key (#760) ends it, since the next attempt finds none.
+/// The halt pauses every such reader and what is downstream of it
+/// (`super::halt`, #663, which is #703 R2's "pause the reader in the
+/// drain"), so the page's retry finds none and skips the table.
 async fn source_key_for_apply(
     pool: &Pool,
     qualified_source: &str,
@@ -5180,8 +5181,8 @@ async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyErro
 /// other reader the caller stages none, as `compute` skips the from-side's
 /// own changes. Without this a write to the to-side halted the drain on the
 /// from-side's key though no reader would apply what it staged. A reader
-/// that isn't frozen halts it as before, and so does a from-side that is
-/// gone. A new reader rebuilds from the source too, so the skip needs no
+/// that isn't frozen halts the page, which pauses it (`super::halt`, #663),
+/// and so does a from-side that is gone. A new reader rebuilds from the source too, so the skip needs no
 /// fence.
 async fn from_side_key(
     pool: &Pool,
@@ -8166,7 +8167,8 @@ pub(crate) async fn apply_page(
     if !hop_bound_tables.is_empty() {
         hop_bound_tables.sort();
         hop_bound_tables.dedup();
-        tracing::error!(
+        // Debug: the drain's halt (#663) logs the closure it pauses for it.
+        tracing::debug!(
             hop_gen = worst_hop_gen,
             tables = ?hop_bound_tables,
             "downstream propagation exceeded the hop bound; a wave may have run away"
@@ -9112,6 +9114,8 @@ async fn drain_batch(
 
     let mut backoff = FenceMissBackoff::new();
     let mut transient = TransientRetry::new();
+    // Whether this call has retried a halt that paused nothing (#663).
+    let mut halt_retried = false;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -9154,6 +9158,7 @@ async fn drain_batch(
                     &mut attempt,
                     &mut backoff,
                     &mut transient,
+                    &mut halt_retried,
                     err,
                 )
                 .await?
@@ -9205,6 +9210,7 @@ async fn drain_batch(
                     &mut attempt,
                     &mut backoff,
                     &mut transient,
+                    &mut halt_retried,
                     err,
                 )
                 .await?
@@ -9225,9 +9231,11 @@ async fn drain_batch(
 /// Returns `Ok(Some(retry_folded))` if isolation evicted at least one key —
 /// the caller must retry with `folded` replaced by `retry_folded`.
 /// `Ok(None)` means "retry with `folded` unchanged" (a version fence
-/// miss or a transient failure, within [`MAX_APPLY_ATTEMPTS`]).
-/// `Err(_)` propagates `err` (or a probe's own halting error) unmodified,
-/// once retries are exhausted or the failure must never be retried at all —
+/// miss or a transient failure, within [`MAX_APPLY_ATTEMPTS`], or a halt,
+/// see [`halt`]).
+/// `Err(_)` propagates `err` (or a probe's own halting error, once its halt
+/// paused nothing, see [`halt`]) unmodified, once retries are exhausted or
+/// the failure must never be retried at all —
 /// which includes an isolate attempt that evicted nothing, whether no key
 /// reproduced the failure or the keys that did are still below the death
 /// threshold. That ends the drain call; the next drain cycle re-reads the
@@ -9243,6 +9251,7 @@ async fn classify_and_retry(
     attempts: &mut u32,
     backoff: &mut FenceMissBackoff,
     transient: &mut TransientRetry,
+    halt_retried: &mut bool,
     err: ApplyError,
 ) -> Result<Option<Vec<FoldedChange>>, ApplyError> {
     let attempt = *attempts;
@@ -9334,17 +9343,9 @@ async fn classify_and_retry(
             }
             Ok(None)
         }
-        // Halting schema diagnosis: never quarantine, propagate loudly
-        // after recording the stop metric.
-        quarantine::FailureClass::Halting => {
-            tracing::error!(
-                seg_seq,
-                error = %err,
-                "halting failure classification; never quarantined, propagating loudly"
-            );
-            quarantine::record_halting_stop(pool, &err.to_string()).await?;
-            Err(err)
-        }
+        // Halting schema diagnosis: never quarantine. Pause what it
+        // reaches and retry without it (#663).
+        quarantine::FailureClass::Halting => halt(pool, seg_seq, attempts, halt_retried, err).await,
         // Everything else: bisect the folded records down to the ones that
         // fail alone to attribute the failure to specific key(s) (issue
         // #655), evicting any past the death
@@ -9362,7 +9363,7 @@ async fn classify_and_retry(
                 );
                 return Err(err);
             }
-            match quarantine::isolate_and_evict(
+            let outcome = match quarantine::isolate_and_evict(
                 pool,
                 seg_seq,
                 claimed_by,
@@ -9370,8 +9371,19 @@ async fn classify_and_retry(
                 folded,
                 quarantine::DEFAULT_DEATH_THRESHOLD,
             )
-            .await?
+            .await
             {
+                Ok(outcome) => outcome,
+                // A probe's own halting failure is no different from the
+                // page's (doc 06's "What must never be quarantined").
+                Err(probe_err)
+                    if quarantine::classify(&probe_err) == quarantine::FailureClass::Halting =>
+                {
+                    return halt(pool, seg_seq, attempts, halt_retried, probe_err).await;
+                }
+                Err(probe_err) => return Err(probe_err),
+            };
+            match outcome {
                 quarantine::IsolationOutcome::Evicted {
                     retry_folded,
                     charged,
@@ -9469,6 +9481,46 @@ async fn classify_and_retry(
             }
         }
     }
+}
+
+/// [`classify_and_retry`]'s halting arm (#663): pauses every definition the
+/// halting failure `err` reaches ([`super::halt::halt_closure`]) and retries
+/// the page, whose recompute leaves them out. The retry is free, as for a
+/// dropped source: it runs without the failing input rather than repeating
+/// it. One error line per halt, from the call that paused the closure.
+///
+/// A halt that paused nothing (a peer paused the closure first, or the
+/// failure persists without one) retries once per [`drain_batch`] call, for
+/// the peer's case, then surfaces `err` as before, so the page can't spin.
+async fn halt(
+    pool: &Pool,
+    seg_seq: i64,
+    attempts: &mut u32,
+    halt_retried: &mut bool,
+    err: ApplyError,
+) -> Result<Option<Vec<FoldedChange>>, ApplyError> {
+    let paused = super::halt::halt_closure(pool, &err).await?;
+    if !paused.is_empty() {
+        tracing::error!(
+            seg_seq,
+            paused = ?paused,
+            error = %err,
+            "halting failure; paused every definition it reaches until resumed, and retrying \
+             the page without them"
+        );
+        *attempts -= 1;
+        return Ok(None);
+    }
+    if !*halt_retried {
+        *halt_retried = true;
+        tracing::debug!(
+            seg_seq,
+            error = %err,
+            "halting failure whose closure is already paused; retrying the page once"
+        );
+        return Ok(None);
+    }
+    Err(err)
 }
 
 /// The next batch a free worker should pick up: the lowest-`seg_seq`

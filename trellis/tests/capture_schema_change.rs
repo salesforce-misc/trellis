@@ -1252,6 +1252,330 @@ async fn retyped_to_side_setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool
     trellis
 }
 
+/// [`retyped_to_side_setup`] plus `users_copy`, a direct reader of `users`,
+/// and `named_copy`, a downstream hop target reading `posts_named` (#663):
+/// the closure a halt on `users` reaches is `users_copy`, `posts_named`
+/// (through the relationship) and `named_copy`. All live.
+async fn halt_closure_setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+    let trellis = retyped_to_side_setup(dsn, raw, pool).await;
+    for text in [
+        "TRANSFORM users_copy FROM public.users SELECT name AS name",
+        "TRANSFORM named_copy FROM posts_named SELECT name AS name",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(raw, pool, &HALT_CLOSURE_ALL).await;
+    trellis
+}
+
+/// What a halt on `users` pauses in [`halt_closure_setup`].
+const HALT_CLOSURE: [&str; 3] = ["posts_named", "users_copy", "named_copy"];
+
+/// Every definition [`halt_closure_setup`] registers.
+const HALT_CLOSURE_ALL: [&str; 5] = [
+    "posts_named",
+    "users_copy",
+    "named_copy",
+    "posts_plain",
+    "o_copy",
+];
+
+/// The `kind` and `error` of `target`'s `capture_failures` record, if any.
+async fn halt_record(raw: &Client, target: &str) -> Option<(String, String)> {
+    raw.query_opt(
+        "select f.kind, f.error from capture_failures f \
+         join transform_definitions d on d.id = f.transform_id \
+         where split_part(d.target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read the capture failure")
+    .map(|row| (row.get(0), row.get(1)))
+}
+
+async fn halting_stops(pool: &trellis::Pool) -> i64 {
+    trellis::staging::halting_stop_stats(pool)
+        .await
+        .expect("halting_stop_stats")
+        .stop_count
+}
+
+/// Counts the `ERROR` events logged on this thread while its guard lives,
+/// keeping each one's fields for the failure message.
+mod error_log {
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    pub struct Errors(pub Arc<Mutex<Vec<String>>>);
+
+    struct Fields(String);
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?} ", field.name()));
+        }
+    }
+
+    struct ErrorLayer(Errors);
+
+    impl<S: tracing::Subscriber> Layer<S> for ErrorLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.0.lock().unwrap().push(fields.0);
+            }
+        }
+    }
+
+    /// As `client::log_capture::install_capture`: a permanently live no-op
+    /// dispatcher keeps `tracing`'s cached callsite interest computed over
+    /// every live dispatcher, so another test's thread can't cache a shared
+    /// callsite as "never" for this one.
+    pub fn install() -> (tracing::subscriber::DefaultGuard, Errors) {
+        static KEEP_INTEREST_GLOBAL: LazyLock<tracing::Dispatch> =
+            LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        LazyLock::force(&KEEP_INTEREST_GLOBAL);
+        let errors = Errors::default();
+        let subscriber = tracing_subscriber::registry().with(ErrorLayer(errors.clone()));
+        (tracing::subscriber::set_default(subscriber), errors)
+    }
+}
+
+/// Issue #663: a page holding a write to a table whose key the drain can't
+/// use, beside an unrelated table's write. The drain used to fail the page
+/// every poll, forever, logging and counting a stop each time. Now it
+/// pauses the halt's closure (`users_copy` reads `users`, `posts_named`
+/// reads it through `author`, `named_copy` reads `posts_named`), records
+/// why, and commits the rest of the page. Over many more polls with more
+/// writes to `users`, the stop is counted and logged once. Once the key is
+/// fixed, resuming each one rebuilds it to what a fresh build derives.
+#[tokio::test]
+async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains() {
+    use trellis::staging::{StagedWatermark, apply, has_pending, seal};
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = halt_closure_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    let stops = halting_stops(&db.pool).await;
+    let (_guard, errors) = error_log::install();
+
+    app.batch_execute(
+        "alter table public.users alter column handle type character(8); \
+         update public.users set name = 'Annie' where handle = 'ann'; \
+         update public.o set v = 11 where id = 1;",
+    )
+    .await
+    .expect("retype the key, and write it and the unrelated table");
+    let sealed = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, sealed.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    let outcome = apply::drain_once(
+        &db.pool,
+        sealed.sealed_seg_seq,
+        "capture_schema_change_test",
+        1,
+        "trellis_capture_schema_change_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("the halt pauses its closure and the page commits");
+    assert!(outcome.is_some_and(|o| o.batch_drained), "the page drains");
+    assert_eq!(
+        rows(&raw, "select id::text, v::text from public.o_copy").await,
+        vec![vec![Some("1".to_string()), Some("11".to_string())]],
+        "the unrelated definition's write committed with the page"
+    );
+    for target in HALT_CLOSURE {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Paused,
+            "{target}"
+        );
+        let (kind, error) = halt_record(&raw, target)
+            .await
+            .unwrap_or_else(|| panic!("{target} has no halt record"));
+        assert_eq!(kind, "halt", "{target}");
+        assert!(error.contains("character"), "{target}: {error}");
+        let reported = trellis.status(target).await.expect("status").expect(target);
+        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+        assert!(reported.capture_failure.is_some(), "{target}");
+    }
+    for target in ["posts_plain", "o_copy"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+        assert_eq!(halt_record(&raw, target).await, None, "{target}");
+    }
+    assert_eq!(halting_stops(&db.pool).await, stops + 1);
+
+    for poll in 0..20 {
+        app.batch_execute(&format!(
+            "update public.users set name = 'Ann {poll}' where handle = 'ann'; \
+             update public.o set v = {poll} where id = 1;"
+        ))
+        .await
+        .expect("write the halted table and the unrelated one");
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    }
+    assert!(
+        !has_pending(&raw).await.expect("has_pending"),
+        "every segment retired"
+    );
+    assert_eq!(
+        rows(&raw, "select v::text from public.o_copy").await,
+        vec![vec![Some("19".to_string())]],
+        "the unrelated definition kept applying"
+    );
+    assert_eq!(
+        halting_stops(&db.pool).await,
+        stops + 1,
+        "one stop per halt"
+    );
+    let logged = errors.0.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "one error line per halt: {logged:#?}");
+    assert!(
+        HALT_CLOSURE.iter().all(|t| logged[0].contains(t)),
+        "the line names the closure: {}",
+        logged[0]
+    );
+
+    app.batch_execute("alter table public.users alter column handle type varchar(16)")
+        .await
+        .expect("fix the key");
+    for target in HALT_CLOSURE {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|e| panic!("resume {target}: {e}"));
+    }
+    bring_live(&mut raw, &db.pool, &HALT_CLOSURE_ALL).await;
+    assert_eq!(
+        rows(&raw, "select name from public.users_copy order by name").await,
+        rows(&raw, "select name from public.users order by name").await,
+        "users_copy rebuilt"
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.posts_named order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select p.id::text, u.name from public.posts p \
+             left join public.users u on u.handle = p.author order by p.id"
+        )
+        .await,
+        "posts_named rebuilt"
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.named_copy order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name from public.posts_named order by id"
+        )
+        .await,
+        "named_copy rebuilt"
+    );
+}
+
+/// Issue #663: two workers draining different buckets of one page both meet
+/// the halt. Whichever pauses the closure first records the stop; the other
+/// finds it frozen, records none, and drains its share too. And a halt on a
+/// closure already paused pauses and records nothing.
+#[tokio::test]
+async fn peers_halting_on_one_closure_record_one_stop() {
+    use trellis::staging::apply::{self, ApplyError};
+    use trellis::staging::{MIN_ROWS_TO_SPLIT, StagedWatermark, halt_closure, seal};
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let _trellis = halt_closure_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    let stops = halting_stops(&db.pool).await;
+
+    app.batch_execute(&format!(
+        "alter table public.users alter column handle type character(8); \
+         insert into public.users select 'u' || n, 'U' || n \
+         from generate_series(1, {}) n;",
+        MIN_ROWS_TO_SPLIT * 2
+    ))
+    .await
+    .expect("retype the key, and write enough rows to split the page");
+    let sealed = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, sealed.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    let drain = |claimed_by: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let mut shares = 0;
+            while apply::drain_once(
+                &pool,
+                sealed.sealed_seg_seq,
+                claimed_by,
+                2,
+                "trellis_capture_schema_change_test",
+                &StagedWatermark::saturated(),
+            )
+            .await?
+            .is_some()
+            {
+                shares += 1;
+            }
+            Ok::<_, ApplyError>(shares)
+        }
+    };
+    let (a, b) = tokio::join!(drain("worker-a"), drain("worker-b"));
+    let (a, b) = (a.expect("worker-a drains"), b.expect("worker-b drains"));
+    assert!(a > 0 && b > 0, "each worker drained a share: {a}, {b}");
+    let seg = raw
+        .query_one(
+            "select state from segments where seg_seq = $1",
+            &[&sealed.sealed_seg_seq],
+        )
+        .await
+        .expect("read the segment");
+    let state: String = seg.get(0);
+    assert_eq!(state, "drained", "both shares drained");
+    for target in HALT_CLOSURE {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Paused,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        halting_stops(&db.pool).await,
+        stops + 1,
+        "one stop for both"
+    );
+
+    let again = ApplyError::from(trellis::defs::ddl::DdlError::UnsupportedPrimaryKeyType {
+        source_table: "public.users".to_string(),
+        column: "handle".to_string(),
+        pg_type: "character".to_string(),
+    });
+    let paused = halt_closure(&db.pool, &again).await.expect("halt again");
+    assert!(
+        paused.is_empty(),
+        "the closure is already paused: {paused:?}"
+    );
+    assert_eq!(halting_stops(&db.pool).await, stops + 1, "no stop for it");
+}
+
 /// Issue #768: a to-side's primary key retyped off the key allowlist
 /// (`character(8)`, whose `::text` drops the padding an image keeps) once
 /// every definition reading the table is paused. The drain reads the key of
@@ -1314,12 +1638,14 @@ async fn a_to_side_key_retyped_off_the_allowlist_does_not_halt_the_drain_once_it
     assert_eq!(status(&raw, "posts_plain").await, TransformStatus::Live);
 }
 
-/// Issue #768's other half: while a definition still applies a to-side's
-/// rows, a primary key retyped off the allowlist halts the drain as before
-/// (#703 R2 would pause it in the drain instead). Nothing is dropped for a
-/// reader that would apply it.
+/// Issue #768's other half, as #663 changed it: while a definition still
+/// applies a to-side's rows, a primary key retyped off the allowlist halts
+/// the drain, which now pauses that reader (#703 R2's "pause the reader in
+/// the drain") rather than failing the page. Its rows drain with the page,
+/// and the resume rebuilds it. A definition of the from-side that doesn't
+/// read the to-side keeps applying.
 #[tokio::test]
-async fn a_to_side_key_retyped_off_the_allowlist_still_halts_the_drain_while_a_reader_applies() {
+async fn a_to_side_key_retyped_off_the_allowlist_pauses_the_reader_that_applies_and_drains() {
     use trellis::staging::{StagedWatermark, apply, seal};
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1337,7 +1663,7 @@ async fn a_to_side_key_retyped_off_the_allowlist_still_halts_the_drain_while_a_r
     seal::seal_phase2(&raw, outcome.sealed_seg_seq, "capture_schema_change_wake")
         .await
         .expect("seal phase 2");
-    let err = apply::drain_once(
+    let outcome = apply::drain_once(
         &db.pool,
         outcome.sealed_seg_seq,
         "capture_schema_change_test",
@@ -1346,10 +1672,17 @@ async fn a_to_side_key_retyped_off_the_allowlist_still_halts_the_drain_while_a_r
         &StagedWatermark::saturated(),
     )
     .await
-    .expect_err("the drain halts while posts_named applies the to-side");
+    .expect("the drain pauses posts_named and drains the page");
+    assert!(outcome.is_some_and(|o| o.batch_drained), "the page drains");
+    assert_eq!(status(&raw, "posts_named").await, TransformStatus::Paused);
+    assert_eq!(status(&raw, "posts_plain").await, TransformStatus::Live);
+    let (kind, error) = halt_record(&raw, "posts_named")
+        .await
+        .expect("a halt record");
+    assert_eq!(kind, "halt");
     assert!(
-        err.to_string().contains("character"),
-        "the halt names the unsupported key type: {err}"
+        error.contains("character"),
+        "the halt names the unsupported key type: {error}"
     );
 }
 
@@ -1418,10 +1751,9 @@ async fn resuming_a_reader_refreshes_the_projection_its_skipped_to_side_rows_mis
 /// re-derives every from-side row from the relationship's settled
 /// projection, which the to-side's rows keep current. Skipping them while
 /// it builds would let it go live on the names from before them, so the
-/// drain halts, as for a reader that applies.
+/// drain halts on it, as for a reader that applies, which (#663) pauses it.
 #[tokio::test]
-async fn a_to_side_key_retyped_off_the_allowlist_halts_the_drain_while_a_reader_waits_for_its_build()
- {
+async fn a_to_side_key_retyped_off_the_allowlist_pauses_a_reader_waiting_for_its_build() {
     use trellis::staging::{StagedWatermark, apply, seal};
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1451,7 +1783,7 @@ async fn a_to_side_key_retyped_off_the_allowlist_halts_the_drain_while_a_reader_
     seal::seal_phase2(&raw, outcome.sealed_seg_seq, "capture_schema_change_wake")
         .await
         .expect("seal phase 2");
-    let err = apply::drain_once(
+    let outcome = apply::drain_once(
         &db.pool,
         outcome.sealed_seg_seq,
         "capture_schema_change_test",
@@ -1460,10 +1792,16 @@ async fn a_to_side_key_retyped_off_the_allowlist_halts_the_drain_while_a_reader_
         &StagedWatermark::saturated(),
     )
     .await
-    .expect_err("the drain halts while posts_renamed waits for its build");
+    .expect("the drain pauses posts_renamed and drains the page");
+    assert!(outcome.is_some_and(|o| o.batch_drained), "the page drains");
+    assert_eq!(status(&raw, "posts_renamed").await, TransformStatus::Paused);
+    let (kind, error) = halt_record(&raw, "posts_renamed")
+        .await
+        .expect("a halt record");
+    assert_eq!(kind, "halt");
     assert!(
-        err.to_string().contains("character"),
-        "the halt names the unsupported key type: {err}"
+        error.contains("character"),
+        "the halt names the unsupported key type: {error}"
     );
 }
 

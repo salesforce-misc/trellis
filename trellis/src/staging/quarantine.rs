@@ -57,8 +57,7 @@ use super::watermark::StagedWatermark;
 /// The fuse threshold ADR-0003 left open, decided here: a key evicts once
 /// [`record_key_death`] returns a count at or past this many. `0` disables
 /// eviction entirely (see [`isolate_and_evict`]) — an operator who has set
-/// this to `0` has chosen to let a poisoning key stop the instance via the
-/// same instance-wide-stop mechanism a halting schema error uses (doc 06,
+/// this to `0` has chosen to let a poisoning key wedge the instance (doc 06,
 /// condition 4: an undrainable batch below the retirement boundary wedges
 /// every candidate), rather than have this module evict silently. Not yet
 /// wired to any per-instance or per-transform config surface — this crate
@@ -101,7 +100,8 @@ pub enum FailureClass {
     Transient,
     /// Reload the schema and retry; back off on consecutive misses only.
     VersionFenceMiss,
-    /// Propagate loudly; never quarantine. The instance stops.
+    /// Never quarantine. The drain pauses every definition the failure
+    /// reaches, and the rest of the batch commits (`staging::halt`, #663).
     Halting,
     /// Everything else: isolate before blaming (see [`isolate_and_evict`]).
     Isolate,
@@ -161,7 +161,7 @@ pub fn classify(err: &ApplyError) -> FailureClass {
 
 /// The last [`ApplyError`] on `err`'s [`std::error::Error::source`] chain,
 /// `err` itself if it nests none. See [`classify`].
-fn innermost_apply_error(err: &ApplyError) -> &ApplyError {
+pub(super) fn innermost_apply_error(err: &ApplyError) -> &ApplyError {
     let mut innermost = err;
     let mut link = std::error::Error::source(err);
     while let Some(err) = link {
@@ -1022,7 +1022,8 @@ async fn probe_records(
 /// - `Err(_)` if a probe itself hit a [`FailureClass::Halting`] error: this
 ///   propagates immediately, unattributed to any key, per doc 06's "What
 ///   must never be quarantined" — discovered during isolation is no
-///   different from discovered on the whole batch. Likewise
+///   different from discovered on the whole batch, so the caller halts on it
+///   the same way (`staging::halt`, #663). Likewise
 ///   `Err(ApplyError::ClaimLost)` if a probe found the claim gone (issue
 ///   #620), with nothing charged.
 ///
@@ -1243,18 +1244,9 @@ async fn isolate_and_evict_probing(
             return Err(err);
         }
         let verdict = match classify(&err) {
-            FailureClass::Halting => {
-                tracing::error!(
-                    src_table = %records[0].src_table,
-                    key = %records[0].key,
-                    records = records.len(),
-                    error = %err,
-                    "halting failure diagnosing an isolation probe; propagating, never \
-                     quarantined"
-                );
-                record_halting_stop(pool, &err.to_string()).await?;
-                return Err(err);
-            }
+            // Unattributed to any key: `apply::classify_and_retry` halts
+            // on it as on the page's own (#663).
+            FailureClass::Halting => return Err(err),
             FailureClass::Isolate => {
                 if let [change] = records {
                     // ADR-0003's amendment, layered alongside (not instead
@@ -3048,16 +3040,18 @@ async fn canonical_and_raw(pool: &Pool, src_table: &str) -> Result<Vec<String>, 
 /// distinguishable from the outside. A plain counter table, matching this
 /// crate's existing convention for small operational state (`drainers`)
 /// rather than a Prometheus-style dependency this crate has none of today.
-pub async fn record_halting_stop(pool: &Pool, reason: &str) -> Result<(), ApplyError> {
-    let client = pool.get().await?;
-    client
-        .execute(
-            "update halting_stops \
+///
+/// Runs in the transaction that pauses the halt's closure
+/// (`staging::halt::halt_closure`, #663), and only when it paused one, so
+/// the count is of episodes, not of attempts.
+pub async fn record_halting_stop(txn: &Transaction<'_>, reason: &str) -> Result<(), ApplyError> {
+    txn.execute(
+        "update halting_stops \
              set stop_count = stop_count + 1, last_reason = $1, last_stopped_at = now() \
              where id",
-            &[&reason],
-        )
-        .await?;
+        &[&reason],
+    )
+    .await?;
     Ok(())
 }
 

@@ -24,6 +24,8 @@
 //! - [`schema_change`] is the drain's barrier for a capture function's
 //!   `schema_changed` marker (#622 C6): it pauses the definitions that read
 //!   a renamed or dropped column before anything later applies to them.
+//! - [`halt`] is what a halting failure parks (#663): every definition it
+//!   reaches, so the rest of the drain's page commits.
 //! - [`retire`] is stage 06's retirement half (issue #13/#58): freeing a
 //!   `drained` segment's ring slot once nobody can still need it.
 //! - [`quarantine`] is stage 06's other half (issue #16): isolate, evict,
@@ -63,6 +65,7 @@ pub mod claim;
 pub mod converge;
 pub mod error;
 pub mod fold;
+pub(crate) mod halt;
 #[cfg(any(test, feature = "test-util"))]
 pub mod interleave;
 pub(crate) mod ledger;
@@ -153,6 +156,8 @@ pub use claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS};
 pub use converge::{converged_through, pending_count};
 #[cfg(any(test, feature = "internals"))]
 pub use fold::{BucketFilter, FoldedChange, LastChange, PageKey, fold, merge_folded_changes};
+#[cfg(any(test, feature = "internals"))]
+pub use halt::halt_closure;
 #[cfg(any(test, feature = "internals"))]
 pub use liveness::{FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff};
 #[cfg(any(test, feature = "internals"))]

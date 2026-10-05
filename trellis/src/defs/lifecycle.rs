@@ -184,11 +184,39 @@ pub(crate) async fn pause_for_capture_failure(
     columns: &[String],
     error: &str,
 ) -> Result<bool, CatalogError> {
+    pause_with_record(txn, id, source_table, columns, error, "capture").await
+}
+
+/// [`pause_for_capture_failure`] for a drain's halt (#663,
+/// `staging::halt`): pauses definition `id` because a page failed with a
+/// halting error on `source_table` that it reads, directly, through a
+/// relationship, or downstream of a definition that does. The record's
+/// `kind` is `halt`. Returns whether this call paused it.
+pub(crate) async fn pause_for_halt(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    error: &str,
+) -> Result<bool, CatalogError> {
+    pause_with_record(txn, id, source_table, &[], error, "halt").await
+}
+
+/// Records why `id` pauses in `capture_failures`, under `kind`, unless a
+/// record already stands, and pauses it unless it's frozen. Returns whether
+/// it paused it.
+async fn pause_with_record(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    columns: &[String],
+    error: &str,
+    kind: &str,
+) -> Result<bool, CatalogError> {
     txn.execute(
-        "insert into capture_failures (transform_id, source_table, columns, error) \
-         select id, $2, $3, $4 from transform_definitions where id = $1 \
+        "insert into capture_failures (transform_id, source_table, columns, error, kind) \
+         select id, $2, $3, $4, $5 from transform_definitions where id = $1 \
          on conflict (transform_id) do nothing",
-        &[&id, &source_table, &columns, &error],
+        &[&id, &source_table, &columns, &error, &kind],
     )
     .await?;
     let paused = txn

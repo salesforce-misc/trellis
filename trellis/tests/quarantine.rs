@@ -539,26 +539,9 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
     );
 }
 
-/// Scenario: a halting schema diagnosis (the hop bound) must never be
-/// quarantined — it propagates loudly, and increments the halting-stop
-/// metric, regardless of how few or many keys it touches.
-#[tokio::test]
-async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    let def = seed_order_totals(&db, &client).await;
-    client
-        .execute(
-            "insert into orders (id, price, tax) values (1, 10.00, 1.50)",
-            &[],
-        )
-        .await
-        .expect("seed orders row");
-
-    // A second definition reading order_totals, so it has a downstream
-    // reader of its own — required for the hop-bound check to trip at all.
+/// A second definition reading `order_totals`, so it has a downstream
+/// reader of its own — required for the hop-bound check to trip at all.
+async fn seed_order_summary(db: &TestDatabase, def: &TransformDef) {
     let order_totals_columns = numeric_columns(&["id", "total"]);
     let summary_def = create_definition(
         &db.pool,
@@ -580,6 +563,29 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
     )
     .await
     .expect("create order_summary table");
+}
+
+/// Scenario: a halting schema diagnosis (the hop bound) must never be
+/// quarantined, regardless of how few or many keys it touches. Issue #663:
+/// it pauses the definitions the runaway wave reaches (`order_summary`,
+/// which reads the table it ran away through), records why and counts one
+/// halting stop, and the rest of the page commits without them.
+#[tokio::test]
+async fn a_halting_schema_error_is_never_quarantined_and_pauses_what_it_reaches() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let def = seed_order_totals(&db, &client).await;
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.50)",
+            &[],
+        )
+        .await
+        .expect("seed orders row");
+
+    seed_order_summary(&db, &def).await;
 
     // Already at the hop bound: applying and propagating once more must trip
     // it.
@@ -611,8 +617,8 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
     )
     .await;
     match result {
-        Err(ApplyError::HopBoundExceeded { .. }) => {}
-        other => panic!("expected HopBoundExceeded to propagate, got {other:?}"),
+        Ok(Some(outcome)) => assert!(outcome.batch_drained, "the page drains"),
+        other => panic!("expected the halt to pause what it reaches and drain, got {other:?}"),
     }
 
     assert!(
@@ -624,7 +630,40 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
         .await
         .expect("halting_stop_stats after");
     assert_eq!(after.stop_count, before.stop_count + 1);
-    assert!(after.last_reason.is_some());
+    assert!(
+        after
+            .last_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("hop bound")),
+        "{:?}",
+        after.last_reason
+    );
+
+    let halted = client
+        .query(
+            "select split_part(d.target_table, '.', 2), d.status, f.kind \
+             from transform_definitions d \
+             left join capture_failures f on f.transform_id = d.id order by d.id",
+            &[],
+        )
+        .await
+        .expect("read statuses");
+    let halted: Vec<(String, String, Option<String>)> = halted
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    let (_, summary_status, summary_kind) = halted
+        .iter()
+        .find(|(target, ..)| target == "order_summary")
+        .expect("order_summary");
+    assert_eq!(summary_status, "paused", "{halted:?}");
+    assert_eq!(summary_kind.as_deref(), Some("halt"), "{halted:?}");
+    let (_, totals_status, totals_kind) = halted
+        .iter()
+        .find(|(target, ..)| target == "order_totals")
+        .expect("order_totals");
+    assert_ne!(totals_status, "paused", "{halted:?}");
+    assert_eq!(*totals_kind, None, "{halted:?}");
 
     let written: i64 = client
         .query_one("select count(*) from order_totals where id = 1", &[])
@@ -632,9 +671,111 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
         .expect("count order_totals rows")
         .get(0);
     assert_eq!(
-        written, 0,
-        "the transaction that discovered the hop bound must have rolled back entirely"
+        written, 1,
+        "the retry without the paused reader applies the page's own write"
     );
+}
+
+/// Issue #663: a halting failure only an isolation probe meets is halted on
+/// like the page's own. The page fails on key 2, whose total breaks a check
+/// on `order_totals` before propagation runs, so isolation probes it. The
+/// probe of key 1 alone writes, then runs past the hop bound: that pauses
+/// `order_summary`, counted as one stop, and the page retries without it.
+/// Key 2 alone keeps failing, so it is charged on each drain, then evicted,
+/// and the page drains with key 1's write. The stop isn't counted again.
+#[tokio::test]
+async fn a_halting_failure_an_isolation_probe_meets_pauses_what_it_reaches() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let def = seed_order_totals(&db, &client).await;
+    seed_order_summary(&db, &def).await;
+    client
+        .batch_execute("alter table order_totals add constraint small check (total < 1000)")
+        .await
+        .expect("constrain order_totals");
+    let orders = qualify_fixture_table("orders");
+    insert_cdc_row_with_hop_gen(
+        &client,
+        "seg_0",
+        &orders,
+        "1",
+        "insert",
+        None,
+        Some(r#"{"price":"10.00","tax":"1.50"}"#),
+        MAX_HOP_GEN,
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        &orders,
+        "2",
+        "insert",
+        None,
+        Some(r#"{"price":"5000.00","tax":"1.00"}"#),
+    )
+    .await;
+    let before = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats before");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let mut drains = 0;
+    loop {
+        drains += 1;
+        assert!(drains <= 10, "the page never drained");
+        match apply::drain_once(
+            &db.pool,
+            seg_seq,
+            "worker",
+            1,
+            "trellis_quarantine_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        {
+            Ok(_) => break,
+            Err(err) => assert!(
+                err.to_string().contains("small"),
+                "only the check on key 2 surfaces: {err}"
+            ),
+        }
+        let after = trellis::staging::halting_stop_stats(&db.pool)
+            .await
+            .expect("halting_stop_stats");
+        assert_eq!(after.stop_count, before.stop_count + 1, "drain {drains}");
+    }
+    assert!(segment_state_is_drained(&client, seg_seq).await);
+    assert_eq!(transform_status(&client, "order_summary").await, "paused");
+    let kind: String = client
+        .query_one(
+            "select f.kind from capture_failures f \
+             join transform_definitions d on d.id = f.transform_id \
+             where split_part(d.target_table, '.', 2) = 'order_summary'",
+            &[],
+        )
+        .await
+        .expect("order_summary's record")
+        .get(0);
+    assert_eq!(kind, "halt");
+    assert_ne!(transform_status(&client, "order_totals").await, "paused");
+    let after = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats after");
+    assert_eq!(after.stop_count, before.stop_count + 1);
+    assert!(
+        poison_marker_exists(&client, &orders, "2").await,
+        "key 2 evicted"
+    );
+    assert!(!poison_marker_exists(&client, &orders, "1").await);
+    let written: i64 = client
+        .query_one("select count(*) from order_totals where id = 1", &[])
+        .await
+        .expect("count order_totals rows")
+        .get(0);
+    assert_eq!(written, 1, "key 1 applied once its reader paused");
 }
 
 /// Scenario: a composite source primary key used to be exactly as structural
