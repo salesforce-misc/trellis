@@ -882,22 +882,29 @@ For the debate on #618; each has a recommendation where one exists.
    index keys on (0 of 1.2M updates were HOT, the build's included; the two
    indexes an update writes are 285 of the 682 B), and a ledger is built
    full (`fillfactor` 100), which keeps even the 1-1 ledger, whose indexes
-   allow HOT, at 13–16% HOT updates. *#775 took both, and a third:*
-   ledgers are built at `fillfactor` 80 and both kinds index their
-   tombstones by key, so a run of contiguous 1,000-row updates goes from
-   0% to 45% HOT on an aggregate ledger (8% to 45% on a 1-1 one); and a
-   page's Apply of a key with no entry writes the entry in the insert that
-   locks it, as the 1-1 ledger already did, rather than a placeholder its
-   statement rewrites. That rewrite set the entry's group and membership,
-   which the `GROUP BY` index reads, so no fillfactor could make it HOT,
-   and it was most of the ledger's WAL under an insert-only load: at 400
-   and 4,000 groups and 8 workers WAL per folded row fell from 1.10–1.20
-   KB to 755–810 B (1.7x the pre-D control's, under the 2x bar). The
-   400-group in-window rate did not move (CPU per row stayed ~50 µs, 2.5x
-   the old path's); end to end it gained 5–12%. The `fillfactor` alone made
-   that load worse (WAL +5–13%), and with the direct insert it changes
-   nothing there but the ledger's size (+16%); it is kept for update
-   loads. **No separate tablespace is
+   allow HOT, at 13–16% HOT updates. *#775:* only a tombstone now carries
+   `__applied_seg` (I4's amendment), so an Apply or Re-derive that leaves
+   an entry live in its group changes no indexed column, while the GC
+   keeps its seek: on contiguous 1,000-row `amt` updates of a 1M-entry
+   `SUM` ledger, 16% of the updates were HOT (0% before) and WAL per row
+   fell 4%. The rest is page room. `fillfactor` 80 lifted HOT to 45% on
+   that load but gained nothing on the round's loads, and cost a 10–16%
+   larger ledger and a 4–9% slower 10M build, so ledgers stay at 100. The
+   larger win was elsewhere: a page's Apply of a key with no entry now
+   writes the entry in the insert that locks it, as the 1-1 ledger
+   already did, rather than a placeholder its statement rewrites. That
+   rewrite set the entry's group and membership, which the `GROUP BY`
+   index reads, so no fillfactor could make it HOT, and under an
+   insert-only load it was most of the ledger's WAL. On disk at 8 workers,
+   WAL per folded row fell from 1,134/1,168/1,497 B to 749/802/970 B at
+   400/4,000/40,000 groups (1.68x and 1.72x the pre-D control's at 400
+   and 4,000, under the 2x bar), Postgres CPU per row from 51–60 µs to
+   37–42 µs, and the in-window rate rose from 146k/108k/87k to
+   163k/146k/105k rows/s. With 5,000-row pages the cheaper page moves the
+   ceiling to the group rows: 8 workers queue on the groups every page
+   shares, and fold about 5% slower in the window and 25–30% slower end to
+   end than D9, whose pages spent that time in a whole-ledger scan; 4
+   workers fold faster than 8 (109k against 59k for D9 at 4). **No separate tablespace is
    documented:** at ~3x a narrow source the ledger is sized like any other
    derived table, and nothing measured so far shows its I/O needs a device
    of its own.
