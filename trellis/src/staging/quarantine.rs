@@ -3401,6 +3401,7 @@ mod unit_tests {
             has_recompute: false,
             ends_in_delete: false,
             last_change: None,
+            to_col_values: Vec::new(),
         }
     }
 

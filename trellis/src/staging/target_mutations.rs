@@ -149,10 +149,8 @@
 //! - **`lsn`** is the write token, so the fold's first/last image rules
 //!   order one key's seam rows by the order their writers committed.
 //! - **`group_key`** is the union of the target's outbound relationships'
-//!   `from_col` values across both images, plus an inbound one's `to_col`
-//!   values when `capture::columns::to_side_group_key_column` names it
-//!   (#784): the same rule a capture trigger applies to a changed row
-//!   (`capture::sql`, `capture::columns`).
+//!   `from_col` values across both images, the same rule a capture trigger
+//!   applies to a changed row (`capture::sql`).
 //! - **`origin_lsn`** stays `None`, as for a `Recompute` (see "The write
 //!   token").
 //!
@@ -231,8 +229,7 @@ struct EndpointFeed {
     /// key's new image.
     key_columns: Vec<PrimaryKeyColumn>,
     /// The `from_col` of every relationship whose from-side is this target,
-    /// plus the inbound `to_col` `capture::columns::to_side_group_key_column`
-    /// names (#784), sorted and deduplicated.
+    /// sorted and deduplicated; empty when it is only ever a to-side.
     group_key_columns: Vec<String>,
 }
 
@@ -257,21 +254,12 @@ async fn resolve_endpoint_feed(
         // so the target falls back to image-less recomputes.
         return Ok(None);
     }
-    let mut group_key_columns: Vec<String> = match target.split_once('.') {
-        Some((schema, table)) => {
-            let from = catalog::relationships_from_table_in(txn, schema, table).await?;
-            let to = catalog::relationships_to_table_in(txn, schema, table).await?;
-            let to_col = crate::capture::columns::to_side_group_key_column(
-                from.iter().map(|r| r.def.from_col.as_str()),
-                to.iter().map(|r| r.def.to_col.as_str()),
-                sole_key_column(&key_columns),
-            )
-            .map(str::to_string);
-            from.into_iter()
-                .map(|r| r.def.from_col)
-                .chain(to_col)
-                .collect()
-        }
+    let mut group_key_columns = match target.split_once('.') {
+        Some((schema, table)) => catalog::relationships_from_table_in(txn, schema, table)
+            .await?
+            .into_iter()
+            .map(|r| r.def.from_col)
+            .collect(),
         None => Vec::new(),
     };
     group_key_columns.sort();
@@ -280,16 +268,6 @@ async fn resolve_endpoint_feed(
         key_columns,
         group_key_columns,
     }))
-}
-
-/// The column a single-column, non-nullable row identity is keyed by: the
-/// one whose text the ring key is (`ddl::pk_key_sql_expr`). A nullable
-/// column's key can be the `NULL` sentinel instead, so it doesn't count.
-pub(crate) fn sole_key_column(key_columns: &[PrimaryKeyColumn]) -> Option<&str> {
-    match key_columns {
-        [only] if !only.nullable => Some(only.name.as_str()),
-        _ => None,
-    }
 }
 
 /// Every key one transaction changed in every target table it wrote, keyed

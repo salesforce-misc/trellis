@@ -1210,3 +1210,142 @@ async fn the_group_key_union_returns_every_staged_text_unchanged() {
     assert_eq!(got, expected);
     assert_eq!(find(&folded, "empty").group_key, None);
 }
+
+/// `(src_table, key, op, lsn, old_image, new_image)`.
+type RingRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    u64,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+/// #785: a to-side's non-key `to_col` values, read out of every raw row's
+/// new image and labelled by column, so a value the fold erases from both
+/// folded images survives. `par` is joined on `code` and `fk`, neither its
+/// primary key, and on `id`, which is: the ring key is `id`'s value, so the
+/// fold doesn't read it. Key 5 is born and deleted (its `'e'`/`'z'` are in
+/// no folded image), key 1's `code` passes through `'m'`, and `orders`,
+/// which is no to-side, gets none.
+#[tokio::test]
+async fn to_col_values_union_every_raw_rows_new_image_by_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.par (id integer primary key, code text unique, fk text); \
+             create table public.src (id integer primary key, p text, k text, q integer)",
+        )
+        .await
+        .expect("create the tables");
+    for rel in [
+        "RELATIONSHIP parent FROM src.p TO par.code",
+        "RELATIONSHIP kids FROM src.k TO par.fk",
+        "RELATIONSHIP by_id FROM src.q TO par.id",
+    ] {
+        trellis::defs::create_relationship(&db.pool, rel)
+            .await
+            .unwrap_or_else(|e| panic!("{rel}: {e}"));
+    }
+    // (src_table, key, op, lsn, old_image, new_image)
+    let rows: [RingRow; 6] = [
+        (
+            "public.par",
+            "5",
+            "insert",
+            10,
+            None,
+            Some(r#"{"id":"5","code":"e","fk":"z"}"#),
+        ),
+        (
+            "public.par",
+            "5",
+            "delete",
+            20,
+            Some(r#"{"id":"5","code":"e","fk":"z"}"#),
+            None,
+        ),
+        (
+            "public.par",
+            "1",
+            "update",
+            30,
+            Some(r#"{"id":"1","code":"a","fk":"x"}"#),
+            Some(r#"{"id":"1","code":"m","fk":"x"}"#),
+        ),
+        (
+            "public.par",
+            "1",
+            "update",
+            40,
+            Some(r#"{"id":"1","code":"m","fk":"x"}"#),
+            Some(r#"{"id":"1","code":"b","fk":null}"#),
+        ),
+        (
+            "orders",
+            "1",
+            "insert",
+            50,
+            None,
+            Some(r#"{"id":"1","code":"c"}"#),
+        ),
+        (
+            "orders",
+            "1",
+            "update",
+            60,
+            Some(r#"{"id":"1","code":"c"}"#),
+            Some(r#"{"id":"1","code":"d"}"#),
+        ),
+    ];
+    for (src_table, key, op, lsn, old_image, new_image) in rows {
+        client
+            .execute(
+                "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, origin_lsn, \
+                                    src_changed, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, $4, now(), 0)",
+                &[
+                    &src_table,
+                    &key,
+                    &op,
+                    &PgLsn::from(lsn),
+                    &old_image,
+                    &new_image,
+                ],
+            )
+            .await
+            .expect("insert a ring row");
+    }
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+    let pairs = |key: &str, src_table: &str| -> Vec<(String, String)> {
+        folded
+            .iter()
+            .find(|f| f.key == key && f.src_table == src_table)
+            .unwrap_or_else(|| panic!("{src_table} {key} missing: {folded:?}"))
+            .to_col_values
+            .clone()
+    };
+    let owned = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(c, v)| (c.to_string(), v.to_string()))
+            .collect()
+    };
+    let born = folded.iter().find(|f| f.key == "5").expect("key 5 folds");
+    assert_eq!((&born.old_image, &born.new_image), (&None, &None));
+    assert_eq!(
+        pairs("5", "public.par"),
+        owned(&[("code", "e"), ("fk", "z")])
+    );
+    assert_eq!(
+        pairs("1", "public.par"),
+        owned(&[("code", "b"), ("code", "m"), ("fk", "x")])
+    );
+    assert!(pairs("1", "orders").is_empty());
+}

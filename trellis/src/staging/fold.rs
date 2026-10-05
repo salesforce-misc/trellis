@@ -126,9 +126,7 @@ pub struct FoldedChange {
     /// Issue #133: the real union of every raw row's `group_key` array in
     /// this `(src_table, key)` group — every join-key value any of the
     /// group's rows' own `old_image`/`new_image` touched for some
-    /// relationship's `from_col`, or for a to-side the one `to_col`
-    /// `capture::columns::to_side_group_key_column` names (#784),
-    /// deduplicated, with nulls filtered. Unlike
+    /// relationship's `from_col`, deduplicated, with nulls filtered. Unlike
     /// `new_image`/`old_image` (arg-extremes over the group, picking one
     /// row's value), this is a genuine set union across *every* row, which
     /// is exactly what makes it survive the fold's own "first old image,
@@ -222,6 +220,25 @@ pub struct FoldedChange {
     /// `lsn`. A ledger target re-derives such a record instead of applying
     /// it (`super::ledger`).
     pub last_change: Option<LastChange>,
+    /// Issue #785: every `(to_col, value)` pair a raw row's new image held,
+    /// for each `to_col` an inbound relationship joins this key's table on
+    /// (bar one that is the table's whole row identity, whose only value is
+    /// the ring key), sorted and deduplicated, with nulls filtered. A
+    /// to-side's reverse path re-derives the children of every such value,
+    /// since a child may have read the parent live under one the fold
+    /// erased from both folded images: a parent born and deleted inside the
+    /// batch, or one re-keyed through a value and on (#784). Like
+    /// `group_key`, it is a union across every row, so it survives the fold.
+    ///
+    /// New images alone are enough. A value a child could have read is one
+    /// the parent held when some transaction committed, and the last
+    /// statement of that transaction to write the row imaged it as its new
+    /// image (the live row, #623 D8a). The value before the batch's first
+    /// row is the folded `old_image`'s, which the reverse record names
+    /// already.
+    ///
+    /// Empty when its table is no such to-side.
+    pub to_col_values: Vec<(String, String)>,
 }
 
 /// The change a [`FoldedChange`] applies to a ledger target (#623 D3,
@@ -247,6 +264,51 @@ pub struct LastChange {
 const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
      group_key, appended_at, change_id, route, op, relationship_id, retry_count, row_txid";
+
+/// The `to_col`s [`fold_sql`] reads out of a to-side key's raw new images
+/// into [`FoldedChange::to_col_values`] (#785): every inbound relationship's
+/// `(to-table, to_col)`, as parallel arrays, but for a `to_col` that is its
+/// to-side's whole, non-nullable row identity, whose only value is the ring
+/// key (`staging::apply::compute` reads that one there).
+///
+/// Read from the catalog in the fold's own transaction. A relationship
+/// declared after it is read, and before `compute` reads the catalog, has
+/// its erased values untracked for that one batch, like a row captured
+/// before its capture functions were widened to image the `to_col`.
+#[derive(Debug, Default)]
+struct ToColumns {
+    tables: Vec<String>,
+    columns: Vec<String>,
+}
+
+impl ToColumns {
+    async fn load(txn: &Transaction<'_>) -> Result<Self, StagingError> {
+        let rows = txn
+            .query(
+                "select distinct to_schema || '.' || to_table, to_col \
+                 from relationship_definitions order by 1, 2",
+                &[],
+            )
+            .await?;
+        let mut to = ToColumns::default();
+        let mut key_columns: HashMap<String, Option<String>> = HashMap::new();
+        for row in rows {
+            let table: String = row.get(0);
+            let column: String = row.get(1);
+            if !key_columns.contains_key(&table) {
+                let key = crate::defs::ddl::identity_key_columns(txn, &table).await?;
+                let sole = crate::defs::ddl::sole_key_column(&key).map(str::to_string);
+                key_columns.insert(table.clone(), sole);
+            }
+            if key_columns[&table].as_deref() == Some(column.as_str()) {
+                continue;
+            }
+            to.tables.push(table);
+            to.columns.push(column);
+        }
+        Ok(to)
+    }
+}
 
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
 /// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
@@ -347,7 +409,7 @@ const PAGE_TABLE: &str = "trellis_drain_page";
 const FOLDED_COLUMNS: &str = "src_table, key, new_image, old_image, src_changed, origin_lsn, \
      lsn, hop_gen, first_seen, group_key, is_truncate, relationship_reverse_deferred, \
      retry_count, prior_image, row_count, has_recompute, ends_in_delete, last_lsn, \
-     last_row_txid";
+     last_row_txid, to_col_values";
 
 /// Folds `bucket`'s share of `seg_seq`, from strictly after `after` (the
 /// start when `None`), into this session's [`PAGE_TABLE`], indexed on its
@@ -374,6 +436,7 @@ pub(crate) async fn materialize_share(
 ) -> Result<u64, StagingError> {
     txn.batch_execute(FOLD_WORK_MEM).await?;
     let (window_sql, fence_params) = fenced_window(txn, seg_seq, FOLD_COLUMNS).await?;
+    let to = ToColumns::load(txn).await?;
 
     let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
         .iter()
@@ -381,6 +444,8 @@ pub(crate) async fn materialize_share(
         .collect();
     params.push(&bucket.bucket_count);
     params.push(&bucket.buckets);
+    params.push(&to.tables);
+    params.push(&to.columns);
     params.push(&PAGE_SENTINEL_KEY);
     let sentinel_idx = params.len();
     let range = push_after(&mut params, sentinel_idx, after);
@@ -425,7 +490,7 @@ pub(crate) async fn read_page(
     let sql = read_page_sql(after.is_some());
     let rows = client.query(&sql, &params).await?;
     let next = (rows.len() > cap).then(|| PageKey {
-        route: rows[cap - 1].get(19),
+        route: rows[cap - 1].get(20),
         src_table: rows[cap - 1].get(0),
         key: rows[cap - 1].get(1),
     });
@@ -461,6 +526,7 @@ async fn fold_scoped(
     txn.batch_execute(FOLD_WORK_MEM).await?;
 
     let (window_sql, fence_params) = fenced_window(txn, seg_seq, FOLD_COLUMNS).await?;
+    let to = ToColumns::load(txn).await?;
     let limit = limit.map(|l| l as i64);
 
     let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
@@ -469,6 +535,8 @@ async fn fold_scoped(
         .collect();
     params.push(&bucket.bucket_count);
     params.push(&bucket.buckets);
+    params.push(&to.tables);
+    params.push(&to.columns);
     let tail = match &limit {
         Some(limit) => {
             params.push(limit);
@@ -508,12 +576,25 @@ fn folded_from_row(row: &tokio_postgres::Row) -> FoldedChange {
             .get::<_, Option<PgLsn>>(17)
             .zip(row.get::<_, Option<String>>(18))
             .map(|(lsn, row_txid)| LastChange { lsn, row_txid }),
+        to_col_values: to_col_pairs(row.get(19)),
     }
+}
+
+/// [`fold_sql`]'s `to_col_values`, `[to_col, value, to_col, value, …]`, as
+/// pairs.
+fn to_col_pairs(flat: Option<Vec<String>>) -> Vec<(String, String)> {
+    let mut flat = flat.unwrap_or_default().into_iter();
+    let mut pairs = Vec::new();
+    while let (Some(column), Some(value)) = (flat.next(), flat.next()) {
+        pairs.push((column, value));
+    }
+    pairs
 }
 
 /// The fold statement over `window_sql` (the fenced window, binding
 /// `$1..=$fence_param_count`), with the bucket count and bucket list bound
-/// as the next two parameters. `range` is appended to the `filtered` rows'
+/// as the next two parameters and [`ToColumns`]' two arrays as the two
+/// after those. `range` is appended to the `filtered` rows'
 /// predicate (a resume's `after` bound, issue #620; empty for the whole
 /// share), `extra` to the select list after [`FOLDED_COLUMNS`] (the page
 /// key's route when materializing; empty otherwise) and `tail` to the
@@ -527,6 +608,8 @@ fn fold_sql(
 ) -> String {
     let bucket_count_idx = fence_param_count + 1;
     let buckets_idx = fence_param_count + 2;
+    let to_tables_idx = fence_param_count + 3;
+    let to_columns_idx = fence_param_count + 4;
 
     // The discriminator (docs/.../04-claiming-and-the-fold.md, "The two
     // kinds of missing image"): "does this row carry any image at all", not
@@ -611,6 +694,15 @@ fn fold_sql(
     // Issue #392's `has_recompute` is a plain `bool_or`, adding no sort or
     // pass.
     //
+    // Issue #785: `to_col_values` reads each `to_col` `ToColumns` names for
+    // the key's table out of every raw row's new image, as a flat
+    // `[to_col, value, …]` array (pairs, sorted). Its aggregate collects
+    // only those tables' images, so the filter costs every other row one
+    // array test, and the subquery parses each collected image once. Even a
+    // group of one row needs its values: the cross-segment merge
+    // (`merge_folded_changes`) folds it with the key's later segments, which
+    // can erase its new image.
+    //
     // #622 C6: a `schema_changed` marker is no change to any key. The drain
     // acts on it before the fold (`staging::schema_change`), so `filtered`
     // leaves it out and no folded change ever carries its key.
@@ -631,6 +723,10 @@ fn fold_sql(
                      filter (where (old_image is not null or new_image is not null \
                                     or op = 'delete') \
                                and op <> 'recompute'))";
+    let to_images = format!(
+        "array_agg(new_image) filter (where new_image is not null and op <> 'recompute' \
+                                         and src_table = any(${to_tables_idx}::text[]))"
+    );
     format!(
         "with fenced as ({window_sql}), \
          truncates as materialized ( \
@@ -674,7 +770,16 @@ fn fold_sql(
              bool_or(op = 'recompute') as has_recompute, \
              coalesce({last}[1][2] = 'delete', false) as ends_in_delete, \
              ({last}[1][3])::pg_lsn as last_lsn, \
-             {last}[1][4] as last_row_txid{extra} \
+             {last}[1][4] as last_row_txid, \
+             (select array_agg(u.x order by p.c, p.v, u.o) \
+                from (select distinct tc.c, im.i ->> tc.c as v \
+                        from unnest(({to_images})::jsonb[]) as im(i), \
+                             unnest(${to_tables_idx}::text[], ${to_columns_idx}::text[]) \
+                                 as tc(t, c) \
+                       where tc.t = filtered.src_table \
+                         and im.i ->> tc.c is not null) p \
+                cross join lateral (values (1, p.c), (2, p.v)) as u(o, x)) \
+                 as to_col_values{extra} \
          from filtered \
          group by src_table, key{tail}"
     )
@@ -775,6 +880,8 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 /// - `row_count`: the sum — [`fold`]'s `count(*)` over both segments' rows
 ///   (issue #409).
 /// - `has_recompute`: OR, as [`fold`]'s `bool_or` (issue #392).
+/// - `to_col_values`: the sorted, deduplicated union, as `group_key`'s
+///   (issue #785).
 fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     let src_changed = earlier.src_changed.max(later.src_changed);
     let hop_gen = if src_changed.is_some() {
@@ -902,6 +1009,13 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         has_recompute: earlier.has_recompute || later.has_recompute,
         ends_in_delete,
         last_change,
+        to_col_values: {
+            let mut values = earlier.to_col_values;
+            values.extend(later.to_col_values);
+            values.sort();
+            values.dedup();
+            values
+        },
     }
 }
 
@@ -966,6 +1080,7 @@ mod merge_tests {
             has_recompute: false,
             ends_in_delete: false,
             last_change: None,
+            to_col_values: Vec::new(),
         }
     }
 
@@ -1240,6 +1355,40 @@ mod merge_tests {
         assert_eq!(merged[0].group_key, Some(vec!["only".to_string()]));
     }
 
+    /// Issue #785: a key born in one segment and deleted in the next merges
+    /// to no image on either side, so the earlier segment's `to_col` values
+    /// survive only in the union, as `group_key`'s do.
+    #[test]
+    fn to_col_values_cross_segment_merge_is_a_sorted_deduplicated_union() {
+        let pair = |c: &str, v: &str| (c.to_string(), v.to_string());
+        let mut born = base("5");
+        born.new_image = Some(r#"{"code":"e"}"#.to_string());
+        born.to_col_values = vec![pair("code", "e"), pair("fk", "z")];
+        let mut deleted = base("5");
+        deleted.ends_in_delete = true;
+        deleted.to_col_values = vec![pair("code", "e")];
+        let merged = merge_folded_changes(vec![vec![born], vec![deleted]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].new_image, None);
+        assert_eq!(
+            merged[0].to_col_values,
+            vec![pair("code", "e"), pair("fk", "z")]
+        );
+    }
+
+    #[test]
+    fn to_col_values_decode_from_the_folds_flat_pairs() {
+        let flat = ["code", "e", "fk", "z"].map(String::from).to_vec();
+        assert_eq!(
+            to_col_pairs(Some(flat)),
+            vec![
+                ("code".to_string(), "e".to_string()),
+                ("fk".to_string(), "z".to_string())
+            ]
+        );
+        assert!(to_col_pairs(None).is_empty());
+    }
+
     /// Issue #134 review follow-up: two `relationship_reverse_deferred`
     /// records for the same relationship+parent key, hand-staged so the
     /// segment that sealed *first* (`per_segment`'s own `earlier` argument)
@@ -1347,6 +1496,15 @@ mod plan_tests {
     use crate::config::DEFAULT_SCHEMA;
     use crate::staging::seal;
 
+    /// [`ToColumns`] naming the plan tests' `orders` a to-side joined on its
+    /// images' `v` (#785).
+    fn to_side_orders() -> ToColumns {
+        ToColumns {
+            tables: vec!["orders".to_string()],
+            columns: vec!["v".to_string()],
+        }
+    }
+
     /// Issue #492: the fold reads the fenced window a fixed number of times,
     /// however large the batch. The truncate-void filter used to be a `not
     /// exists` over the whole `fenced` CTE, which Postgres planned as a
@@ -1439,6 +1597,11 @@ mod plan_tests {
                 .collect();
             params.push(&bucket.bucket_count);
             params.push(&bucket.buckets);
+            // #785: `orders` as a to-side on `v`, so the plan holds
+            // `to_col_values`' aggregate and subquery too.
+            let to = to_side_orders();
+            params.push(&to.tables);
+            params.push(&to.columns);
 
             let plan = txn
                 .query(
@@ -1724,7 +1887,8 @@ mod plan_tests {
     /// Asserts on the plan shape rather than timing: whatever the statistics
     /// say, the fold must contain no join over the keys. The one nested loop
     /// it may plan is the truncate-void anti-join, whose inner side is the
-    /// materialized handful of truncate rows (#492).
+    /// materialized handful of truncate rows (#492), besides those inside a
+    /// per-group subplan, which reads only its own group's aggregates.
     #[tokio::test]
     async fn a_refilled_slot_with_stale_statistics_plans_no_nested_loop_over_keys() {
         const ROWS: i64 = 2_000;
@@ -1794,6 +1958,9 @@ mod plan_tests {
             .collect();
         params.push(&bucket.bucket_count);
         params.push(&bucket.buckets);
+        let to = to_side_orders();
+        params.push(&to.tables);
+        params.push(&to.columns);
 
         let plan = txn
             .query(&format!("explain {sql}"), &params)
@@ -1811,7 +1978,20 @@ mod plan_tests {
                 .any(|line| line.contains("Seq Scan on seg_0") && line.contains("rows=1 ")),
             "expected the refilled slot to be estimated at one row:\n{plan}"
         );
+        // A `SubPlan` runs once per group over that group's own aggregates
+        // (`group_key`'s flatten, #785's `to_col_values` pairs), so its
+        // joins are over one key's values, never over the batch's keys: it
+        // may plan a nested loop, but must never read the window.
+        let mut in_subplan = false;
         for line in plan.lines() {
+            in_subplan |= line.trim_start().starts_with("SubPlan");
+            if in_subplan {
+                assert!(
+                    !line.contains("on fenced") && !line.contains("on seg_"),
+                    "a per-group subplan must not read the window:\n{plan}"
+                );
+                continue;
+            }
             assert!(
                 !line.contains("Nested Loop") || line.contains("Nested Loop Anti Join"),
                 "the fold must plan no nested-loop join other than the truncate-void \

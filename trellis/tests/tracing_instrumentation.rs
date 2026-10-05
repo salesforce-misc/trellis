@@ -460,6 +460,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
             lsn: PgLsn::from(1),
             row_txid: "1".to_string(),
         }),
+        to_col_values: Vec::new(),
     }];
 
     let result = isolate_and_evict(

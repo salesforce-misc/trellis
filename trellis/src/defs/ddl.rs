@@ -178,6 +178,16 @@ pub struct PrimaryKeyColumn {
     pub collation: Option<String>,
 }
 
+/// The column a single-column, non-nullable row identity is keyed by: the
+/// one whose text the ring key is ([`pk_key_sql_expr`]). A nullable
+/// column's key can be the `NULL` sentinel instead, so it doesn't count.
+pub(crate) fn sole_key_column(key_columns: &[PrimaryKeyColumn]) -> Option<&str> {
+    match key_columns {
+        [only] if !only.nullable => Some(only.name.as_str()),
+        _ => None,
+    }
+}
+
 impl PrimaryKeyColumn {
     /// `expr`, a reference to this column, as an ordering operand: under
     /// [`collation`](Self::collation) when the column has one.
