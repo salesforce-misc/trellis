@@ -1909,9 +1909,10 @@ pub(super) async fn finish_groups(
 /// (`super::one_to_one_ledger::update_entries`). They also pin every read
 /// of a source by a batch's keys (`super::apply::live_rows_query`), the
 /// endpoint feed's re-read of a target by its keys
-/// (`super::target_mutations::read_new_images`) and the resume sweep's
-/// delete by key (`crate::intake::resume_orphans`), which a table's lagging
-/// statistics price the same way.
+/// (`super::target_mutations::read_new_images`), the resume sweep's delete
+/// by key (`crate::intake::resume_orphans`) and a composite-key 1-1
+/// target's pre-lock (`super::apply::lock_composite_keys`), which a table's
+/// lagging statistics price the same way.
 ///
 /// Left to itself, the planner read the whole ledger for a page's few
 /// thousand keys whenever it priced that cheaper, which it does while a
