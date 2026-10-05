@@ -929,36 +929,30 @@ fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
     }
 }
 
-/// Restricts `cols` to the keyset's own arrays (`<col> = any($i::text[]::<type>[])`,
-/// `$i` being column `i`'s array), which [`keyset_match_cols`] already implies,
+/// Restricts a single-column key to the keyset's own array (` and <col> =
+/// any($1::text[]::<type>[])`), which [`keyset_match_cols`] already implies,
 /// so the target's side of whatever join the planner picks is bounded by the
 /// keys (#790). At 1M rows analyzed at 100, a 5,000-key delete hashed a
-/// sequential scan of the target, 128 ms (single-column key) and 166 ms
-/// (composite) against 32 and 39 ms through its index.
+/// sequential scan of the target, 128 ms against 32 ms through its index.
 ///
-/// Only for a keyset with one [`null_patterns`] entry, the usual case, and
-/// there only on its non-`NULL` columns. With more than one, the match is an
-/// `or` of the patterns, which no hash or merge join can take, so the
-/// planner already probes the index once per key through a `BitmapOr` (40
-/// ms for the same 5,000 keys in three patterns). An `or` of per-pattern
-/// bounds there turned that into a nested loop over the bounded target
-/// rows, matching each against every key: 1.3 s. An array-typed column is
-/// left out too: its keyset values are cast one by one (see
-/// [`delete_statement`]), and a bound casts the array whole. Empty when
-/// nothing is bounded.
+/// Empty otherwise:
+/// - **A composite key.** One bound per column makes the planner expect a
+///   row or two from the target and compare every bounded row with every
+///   key, quadratic in the batch even with fresh statistics: 2.6 s against
+///   33 ms for 5,000 keys of a four-column key at 3M rows. See
+///   `apply::composite_lock_statement`.
+/// - **A keyset with a `NULL` key**, which has two [`null_patterns`]. The
+///   match is then an `or` of the patterns, which no hash or merge join can
+///   take, so the planner already probes the index once per key.
+/// - **An array-typed column.** Its keyset values are cast one by one (see
+///   [`delete_statement`]), and a bound casts the array whole.
 fn keyset_bound(cols: &[String], key_cols: &[PrimaryKeyColumn], patterns: &[Vec<bool>]) -> String {
-    let [pattern] = patterns else {
-        return String::new();
-    };
-    cols.iter()
-        .zip(key_cols)
-        .zip(pattern)
-        .enumerate()
-        .filter(|(_, ((_, c), null))| !**null && !c.data_type.ends_with(']'))
-        .map(|(i, ((col, c), _))| {
-            format!(" and {col} = any(${}::text[]::{}[])", i + 1, c.data_type)
-        })
-        .collect()
+    match (cols, key_cols, patterns) {
+        ([col], [c], [pattern]) if pattern == &[false] && !c.data_type.ends_with(']') => {
+            format!(" and {col} = any($1::text[]::{}[])", c.data_type)
+        }
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1399,13 +1393,17 @@ mod db_tests {
     }
 
     /// Issue #790: [`delete_statement`] reads only its keys' rows of a
-    /// target whose statistics lag its size: analyzed at 100 rows, then
-    /// grown to 400k with autovacuum off. Left to the keyset join alone, the
-    /// planner hashed 5,000 keys against a sequential scan of the target;
-    /// [`keyset_bound`] caps the target's side at the keys. A batch with
-    /// `NULL`-bearing keys in more than one pattern isn't bounded, and still
-    /// probes the index per key. Every key must still be deleted, so a bound
-    /// that drops one fails here too.
+    /// single-column key's target whose statistics lag its size: analyzed at
+    /// 100 rows, then grown to 400k with autovacuum off. Left to the keyset
+    /// join alone, the planner hashed 5,000 keys against a sequential scan of
+    /// the target; [`keyset_bound`] caps the target's side at the keys.
+    ///
+    /// A composite key isn't bounded. With fresh statistics, a four-column
+    /// key at 2M rows must not be matched by comparing every target row with
+    /// every key, which one bound per column made the planner do (2.6 s
+    /// against 33 ms at 3M rows). A batch with `NULL`-bearing keys in more
+    /// than one pattern isn't bounded either, and still probes the index per
+    /// key while statistics lag. Every key must still be deleted.
     #[tokio::test]
     async fn the_sweep_delete_reads_only_its_keys_while_target_statistics_lag() {
         let cluster = testkit::TestCluster::start();
@@ -1417,6 +1415,12 @@ mod db_tests {
              create table public.composite (g int, h text, total int, \
                                             unique nulls not distinct (g, h)) \
                  with (autovacuum_enabled = false); \
+             create table public.wide (a int, b text, c int, d text, total int, \
+                                       unique nulls not distinct (a, b, c, d)) \
+                 with (autovacuum_enabled = false); \
+             insert into public.wide select i, 'k' || i, i, 'd' || i, i \
+                 from generate_series(1, 2000000) i; \
+             analyze public.wide; \
              insert into public.single select i, i from generate_series(1, 100) i; \
              insert into public.composite select i, 'k' || i, i from generate_series(1, 100) i; \
              analyze public.single; analyze public.composite; \
@@ -1430,7 +1434,7 @@ mod db_tests {
         .expect("seed targets whose statistics lag");
         let cases = [
             ("public.single", "t.total % 79 = 0", true),
-            ("public.composite", "t.total > 0 and t.total % 79 = 0", true),
+            ("public.wide", "t.total % 79 = 0", false),
             (
                 "public.composite",
                 "t.g is null or t.h is null or t.total % 79 = 0",
@@ -1496,22 +1500,27 @@ mod db_tests {
             assert_eq!(
                 sql.contains("= any("),
                 bounded,
-                "{table}: bounded only with one NULL pattern:\n{sql}"
+                "{table}: bounded only for a single-column key with one NULL pattern:\n{sql}"
             );
             let status = target.status.as_str();
             let mut params: Vec<&(dyn ToSql + Sync)> =
                 arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
             params.push(&target.id);
             params.push(&status);
-            let txn = raw.transaction().await.expect("begin");
-            let plan: String = txn
-                .query(&format!("explain {sql}"), &params)
+            let mut txn = raw.transaction().await.expect("begin");
+            let explain = txn.savepoint("explain").await.expect("savepoint");
+            let plan: String = explain
+                .query(&format!("explain (analyze, timing off) {sql}"), &params)
                 .await
                 .expect("explain")
                 .into_iter()
                 .map(|row| row.get::<_, String>(0))
                 .collect::<Vec<_>>()
                 .join("\n");
+            explain
+                .rollback()
+                .await
+                .expect("roll back the explain's delete");
             let name = &table["public.".len()..];
             let scans: Vec<&str> = plan
                 .lines()
@@ -1533,6 +1542,16 @@ mod db_tests {
                     "{table}: the target must be read through the keys, got:\n{plan}"
                 );
             }
+            let filtered: u64 = plan
+                .lines()
+                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                .sum();
+            assert!(
+                filtered < rows.len() as u64,
+                "{table}: the target must be matched to the keys without comparing \
+                 every row with every key, got:\n{plan}"
+            );
             let deleted: std::collections::HashSet<String> = txn
                 .query(&sql, &params)
                 .await

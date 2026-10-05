@@ -646,15 +646,18 @@ impl NewImagesQuery<'_> {
 /// NULL group took 8.5s against 0.4ms without it. This is the same split
 /// `intake::resume_orphans` makes per NULL pattern.
 ///
-/// Each arm's join also restricts every non-`NULL` identity column to its
-/// array (`t.<col> = any(<array>)`), which the match already implies, so
-/// the target's side of whatever join the planner picks is bounded by the
-/// batch (#790, as `apply::live_rows_query` does for the source since
-/// #778). A condition in a left join's `on` that names only the target
-/// filters the target's scan. Without it, a target analyzed while small and
-/// grown since was read in full: at 1M rows, a 5,000-key batch hashed a
-/// sequential scan of the target, 102 ms (single-column key) and 152 ms
-/// (composite) against 31 and 35 ms through the index.
+/// A single-column identity's non-`NULL` arm also restricts the column to
+/// its array (`t.<col> = any(<array>)`), which the match already implies,
+/// so the target's side of whatever join the planner picks is bounded by
+/// the batch (#790). A condition in a left join's `on` that names only the
+/// target filters the target's scan. Without it, a target analyzed while
+/// small and grown since was read in full: at 1M rows, a 5,000-key batch
+/// hashed a sequential scan of the target, 102 ms against 31 ms through the
+/// index.
+///
+/// A composite identity is never restricted this way: see
+/// `apply::composite_lock_statement` for why one `= any` per column is
+/// worse than the scan it avoids.
 fn new_images_query<'a>(
     target: &str,
     image_columns: &[String],
@@ -723,7 +726,9 @@ fn new_images_query<'a>(
                     matched.push(format!("t.{col} is null"));
                 } else {
                     let array = format!("{}::text[]::{}[]", param(), column.data_type);
-                    bounds.push(format!("t.{col} = any({array})"));
+                    if pk.len() == 1 {
+                        bounds.push(format!("t.{col} = any({array})"));
+                    }
                     arrays.push(array);
                     aliases.push(pk_keyset_col(i));
                     matched.push(format!("t.{col} = k.{}", pk_keyset_col(i)));
@@ -1240,15 +1245,22 @@ mod tests {
         );
     }
 
-    /// Issue #790: `read_new_images` reads only its batch's rows of a target
-    /// whose statistics lag its size, at a 1-1 target's single-column key
-    /// and an aggregate target's nullable composite identity (with
-    /// `NULL`-bearing keys, so one arm per pattern). Each target is analyzed
-    /// at 100 rows and then grown to 400k with autovacuum off. Left to the
-    /// join alone, the planner hashed a 5,000-key batch against a sequential
-    /// scan of the target; each arm's `= any` restriction caps the target's
-    /// side at the batch. Every key must still come back with its row, so a
-    /// restriction that drops a key fails here too.
+    /// Issue #790: `read_new_images` reads only its batch's rows of a
+    /// single-column key's target whose statistics lag its size (analyzed at
+    /// 100 rows, then grown to 400k with autovacuum off). Left to the join
+    /// alone, the planner hashed a 5,000-key batch against a sequential scan
+    /// of the target; the arm's `= any` restriction caps the target's side
+    /// at the batch.
+    ///
+    /// A composite identity is left unrestricted, and with fresh statistics
+    /// it must not be matched by comparing every row with every key: here an
+    /// aggregate's nullable four-column identity at 1M rows, with
+    /// `NULL`-bearing keys (so one arm per pattern). One `= any` per column
+    /// made the planner expect a row from the target and loop over every key
+    /// for each bounded row, 12.5M comparisons for 5,000 keys (316 ms against
+    /// 16 ms).
+    ///
+    /// Either way every key must come back with its row.
     #[tokio::test]
     async fn read_new_images_reads_only_the_batch_while_target_statistics_lag() {
         let cluster = testkit::TestCluster::start();
@@ -1258,29 +1270,30 @@ mod tests {
             .batch_execute(
                 "create table single (id int primary key, total int) \
                      with (autovacuum_enabled = false); \
-                 create table composite (g int, h text, total int, \
-                                         unique nulls not distinct (g, h)) \
+                 create table composite (g int, h text, i int, j text, total int, \
+                                         unique nulls not distinct (g, h, i, j)) \
                      with (autovacuum_enabled = false); \
                  insert into single select i, i from generate_series(1, 100) i; \
-                 insert into composite select i, 'k' || i, i from generate_series(1, 100) i; \
-                 analyze single; analyze composite; \
+                 analyze single; \
                  insert into single select i, i from generate_series(101, 400000) i; \
-                 insert into composite select i, 'k' || i, i \
-                     from generate_series(101, 400000) i; \
-                 insert into composite values (null, 'k1', 0), (5, null, 0);",
+                 insert into composite select i, 'k' || i, i, 'j' || i, i \
+                     from generate_series(1, 1000000) i; \
+                 insert into composite values (null, 'k1', 1, 'j1', 0), (5, null, 5, 'j5', 0); \
+                 analyze composite;",
             )
             .await
-            .expect("seed targets whose statistics lag");
+            .expect("seed the targets");
         let txn = client.transaction().await.expect("begin");
         let cases = [
-            ("public.single", "t.total % 79 = 0", 1),
+            ("public.single", "t.total % 79 = 0", 1, true),
             (
                 "public.composite",
                 "t.g is null or t.h is null or t.total % 79 = 0",
                 3,
+                false,
             ),
         ];
-        for (table, batch, patterns) in cases {
+        for (table, batch, patterns, bounded) in cases {
             let key_columns = ddl::identity_key_columns(&txn, table)
                 .await
                 .expect("identity");
@@ -1320,8 +1333,17 @@ mod tests {
                 patterns,
                 "{table}: one arm per NULL pattern"
             );
+            assert_eq!(
+                query.sql.contains("= any("),
+                bounded,
+                "{table}: only a single-column key is bounded:\n{}",
+                query.sql
+            );
             let plan: String = txn
-                .query(&format!("explain {}", query.sql), &query.params())
+                .query(
+                    &format!("explain (analyze, timing off) {}", query.sql),
+                    &query.params(),
+                )
                 .await
                 .expect("explain")
                 .into_iter()
@@ -1349,6 +1371,16 @@ mod tests {
                     "{table}: the target must be read through the batch's keys, got:\n{plan}"
                 );
             }
+            let filtered: u64 = plan
+                .lines()
+                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                .sum();
+            assert!(
+                filtered < keys.len() as u64,
+                "{table}: the target must be matched to the keys without comparing \
+                 every row with every key, got:\n{plan}"
+            );
             let got = read_new_images(&txn, table, &columns, &feed, &keys)
                 .await
                 .expect("re-read");

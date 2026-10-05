@@ -1233,3 +1233,125 @@ async fn a_min_max_target_endpoints_prior_images_carry_its_old_extremes() {
         "each store took its region's new maximum minus its old one"
     );
 }
+
+/// A composite-key 1-1 target that is a relationship's from-side. Its writes
+/// go through `apply_target`'s composite pre-lock, the one place an
+/// update's prior image can come from (Postgres 17's `RETURNING` can't name
+/// the pre-update row). Every key a drain moves to another parent must be
+/// staged as an update whose old image and `group_key` name the parent it
+/// left. A key the pre-lock missed would still be written, but staged as an
+/// image-less insert naming only its new parent, so the parent it left
+/// would never hear of it (#790's review).
+#[tokio::test]
+async fn a_composite_key_from_side_targets_seam_rows_carry_every_keys_prior_image() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.lines_src (order_id integer, line_no integer, customer integer, \
+                                        primary key (order_id, line_no)); \
+         create table public.lines (order_id integer, line_no integer, customer integer, \
+                                    primary key (order_id, line_no)); \
+         create table public.line_view (order_id integer, line_no integer, cname text, \
+                                        primary key (order_id, line_no)); \
+         insert into public.lines_src values (1, 1, 1), (1, 2, 1), (2, 1, 3), (2, 3, 1); \
+         create table public.customers (id integer primary key, name text); \
+         insert into public.customers values (1, 'A'), (2, 'B'), (3, 'C')",
+    )
+    .await
+    .expect("create sources");
+    one_to_one_ledgers(&raw, &["lines", "line_view"]).await;
+    let columns = int_columns(&["order_id", "line_no", "customer"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.lines FROM public.lines_src SELECT customer AS customer",
+        &columns,
+    )
+    .await
+    .expect("install lines");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP buyer FROM lines.customer TO customers.id",
+    )
+    .await
+    .expect("a relationship whose from-side is a composite-key target");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.line_view FROM public.lines SELECT buyer.name AS cname",
+        &columns,
+    )
+    .await
+    .expect("install a reader through the relationship");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    // Three lines move to customer 2 in one drain; line (2, 3) stays put.
+    raw.execute(
+        "update public.lines_src set customer = 2 \
+         where (order_id, line_no) in ((1, 1), (1, 2), (2, 1))",
+        &[],
+    )
+    .await
+    .expect("update the source");
+    for (order, line, old) in [("1", "1", "1"), ("1", "2", "1"), ("2", "1", "3")] {
+        stage_source_update(
+            &mut raw,
+            "public.lines_src",
+            &format!("{order}\u{1f}{line}"),
+            &format!(r#"{{"order_id":"{order}","line_no":"{line}","customer":"{old}"}}"#),
+            &format!(r#"{{"order_id":"{order}","line_no":"{line}","customer":"2"}}"#),
+        )
+        .await;
+    }
+    drain_round(&db.pool, &mut raw).await;
+
+    let slot: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    type Staged = (String, Option<String>, Option<String>, Option<Vec<String>>);
+    let staged: BTreeMap<String, Staged> = raw
+        .query(
+            &format!(
+                "select key, op, old_image ->> 'customer', new_image ->> 'customer', group_key \
+                 from seg_{slot} where src_table = 'public.lines'"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the ring")
+        .into_iter()
+        .map(|row| (row.get(0), (row.get(1), row.get(2), row.get(3), row.get(4))))
+        .collect();
+    let update = |old: &str, groups: &[&str]| -> Staged {
+        (
+            "update".to_string(),
+            Some(old.to_string()),
+            Some("2".to_string()),
+            Some(groups.iter().map(|g| g.to_string()).collect()),
+        )
+    };
+    assert_eq!(
+        staged,
+        BTreeMap::from([
+            ("1\u{1f}1".to_string(), update("1", &["1", "2"])),
+            ("1\u{1f}2".to_string(), update("1", &["1", "2"])),
+            ("2\u{1f}1".to_string(), update("3", &["2", "3"])),
+        ]),
+        "every moved key's seam row carries its prior image and the parent it left"
+    );
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select order_id || '/' || line_no, cname from public.line_view"
+        )
+        .await,
+        BTreeMap::from([
+            ("1/1".to_string(), "B".to_string()),
+            ("1/2".to_string(), "B".to_string()),
+            ("2/1".to_string(), "B".to_string()),
+            ("2/3".to_string(), "A".to_string()),
+        ]),
+    );
+}
