@@ -6724,7 +6724,15 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// (84 ms against 4 ms for 500 keys over 1,000 tenants). Unbounded, a
 /// composite key is probed per key while its statistics are fresh, and can
 /// still be hashed against a sequential scan while they lag (139 ms against
-/// 27 ms bounded, two columns at 1M rows).
+/// 27 ms bounded, two columns at 1M rows), unless the statement also runs
+/// under `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), as the
+/// source read, the endpoint feed's re-read and the sweep delete do.
+///
+/// The bound alone isn't enough on PostgreSQL 16, which prices an index scan
+/// for thousands of `= any` values far above 17's estimate: it scanned a
+/// 400k-row table analyzed at 100 and filtered it by the bound, where 17
+/// read the index. So each statement that takes the bound also runs under
+/// those settings.
 pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
     key.len() == 1
 }

@@ -586,7 +586,7 @@ async fn read_new_images(
         return Ok(HashMap::new());
     }
     let query = new_images_query(target, image_columns, feed, keys)?;
-    let rows = txn.query(&query.sql, &query.params()).await?;
+    let rows = super::ledger::query_by_entry_key(txn, &query.sql, &query.params()).await?;
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -653,7 +653,9 @@ impl NewImagesQuery<'_> {
 /// target filters the target's scan. Without it, a target analyzed while
 /// small and grown since was read in full: at 1M rows, a 5,000-key batch
 /// hashed a sequential scan of the target, 102 ms against 31 ms through the
-/// index.
+/// index. [`read_new_images`] also runs it under `ENTRY_PLAN_SETTINGS` (no
+/// sequential scan): PostgreSQL 16, unlike 17, still scanned a 400k-row
+/// target and filtered it by the bound.
 ///
 /// A composite identity is never restricted this way: see
 /// [`bounds_keyset_by_array`] for why one `= any` per column is worse
@@ -1250,7 +1252,9 @@ mod tests {
     /// 100 rows, then grown to 400k with autovacuum off). Left to the join
     /// alone, the planner hashed a 5,000-key batch against a sequential scan
     /// of the target; the arm's `= any` restriction caps the target's side
-    /// at the batch.
+    /// at the batch. The statement is explained the way [`read_new_images`]
+    /// runs it, under `ENTRY_PLAN_SETTINGS`: with the bound alone,
+    /// PostgreSQL 16 still scanned the target and filtered it (CI).
     ///
     /// A composite identity is left unrestricted, and with fresh statistics
     /// it must not be matched by comparing every row with every key: here an
@@ -1339,17 +1343,17 @@ mod tests {
                 "{table}: only a single-column key is bounded:\n{}",
                 query.sql
             );
-            let plan: String = txn
-                .query(
-                    &format!("explain (analyze, timing off) {}", query.sql),
-                    &query.params(),
-                )
-                .await
-                .expect("explain")
-                .into_iter()
-                .map(|row| row.get::<_, String>(0))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let plan: String = crate::staging::ledger::query_by_entry_key(
+                &txn,
+                &format!("explain (analyze, timing off) {}", query.sql),
+                &query.params(),
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
             let target = &table["public.".len()..];
             let scans: Vec<&str> = plan
                 .lines()

@@ -1907,8 +1907,11 @@ pub(super) async fn finish_groups(
 /// statement ([`ledger_statement`]), a build chunk's and a sweep batch's
 /// ([`rederive_statement`]) and a 1-1 page's entry update
 /// (`super::one_to_one_ledger::update_entries`). They also pin every read
-/// of a source by a batch's keys (`super::apply::live_rows_query`), which
-/// a source's lagging statistics price the same way.
+/// of a source by a batch's keys (`super::apply::live_rows_query`), the
+/// endpoint feed's re-read of a target by its keys
+/// (`super::target_mutations::read_new_images`) and the resume sweep's
+/// delete by key (`crate::intake::resume_orphans`), which a table's lagging
+/// statistics price the same way.
 ///
 /// Left to itself, the planner read the whole ledger for a page's few
 /// thousand keys whenever it priced that cheaper, which it does while a
@@ -1936,7 +1939,7 @@ pub(super) const ENTRY_PLAN_RESET: &str = "set local enable_seqscan to default";
 /// keyed by entry run, and the plan their `explain` tests read. An error
 /// leaves the settings on, but it also aborts `txn`, and a `set local` ends
 /// with the transaction.
-pub(super) async fn query_by_entry_key(
+pub(crate) async fn query_by_entry_key(
     txn: &Transaction<'_>,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],

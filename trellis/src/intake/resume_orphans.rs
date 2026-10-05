@@ -472,7 +472,7 @@ impl Sweep {
             arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         params.push(&target.id);
         params.push(&status);
-        let rows = txn.query(&sql, &params).await?;
+        let rows = crate::staging::ledger::query_by_entry_key(txn, &sql, &params).await?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -935,6 +935,9 @@ fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
 /// so the target's side of whatever join the planner picks is bounded by the
 /// keys (#790). At 1M rows analyzed at 100, a 5,000-key delete hashed a
 /// sequential scan of the target, 128 ms against 32 ms through its index.
+/// The delete also runs under `ENTRY_PLAN_SETTINGS` (no sequential scan):
+/// PostgreSQL 16, unlike 17, still scanned a 400k-row target and filtered it
+/// by the bound.
 ///
 /// Empty otherwise:
 /// - **A composite key** ([`bounds_keyset_by_array`]). One bound per column
@@ -1406,7 +1409,10 @@ mod db_tests {
     /// single-column key's target whose statistics lag its size: analyzed at
     /// 100 rows, then grown to 400k with autovacuum off. Left to the keyset
     /// join alone, the planner hashed 5,000 keys against a sequential scan of
-    /// the target; [`keyset_bound`] caps the target's side at the keys.
+    /// the target; [`keyset_bound`] caps the target's side at the keys. The
+    /// delete is explained the way [`Sweep::delete`] runs it, under
+    /// `ENTRY_PLAN_SETTINGS`: with the bound alone, PostgreSQL 16 still
+    /// scanned the target and filtered it (CI).
     ///
     /// A composite key isn't bounded. With fresh statistics, a four-column
     /// key at 2M rows must not be matched by comparing every target row with
@@ -1519,14 +1525,17 @@ mod db_tests {
             params.push(&status);
             let mut txn = raw.transaction().await.expect("begin");
             let explain = txn.savepoint("explain").await.expect("savepoint");
-            let plan: String = explain
-                .query(&format!("explain (analyze, timing off) {sql}"), &params)
-                .await
-                .expect("explain")
-                .into_iter()
-                .map(|row| row.get::<_, String>(0))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let plan: String = crate::staging::ledger::query_by_entry_key(
+                &explain,
+                &format!("explain (analyze, timing off) {sql}"),
+                &params,
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
             explain
                 .rollback()
                 .await
