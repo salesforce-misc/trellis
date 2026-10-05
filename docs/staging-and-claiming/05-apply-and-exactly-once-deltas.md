@@ -665,7 +665,7 @@ key, or a schema error into a silently parked one. The classification:
 |---|---|---|
 | **Transient** | serialization/deadlock (`40001`/`40P01`), lock-not-available, statement timeout, dropped connection | retry with backoff; **charge nothing to any key** — a transient failure is not attributable. A lock timeout retries for up to three `lock_timeout`s with the claim held rather than five attempts ([I7](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)) |
 | **Version fence miss** | a definition changed mid-drain | reload the schema and retry; back off on *consecutive* misses only |
-| **Halting schema diagnosis** | a source key the drain can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`); a tripped hop bound (`HopBoundExceeded`, a real cross-table value cycle); an aggregate target off the ledger (`AggregateOffLedger`) | **pause the closure it reaches, loudly**; never quarantine. Quarantining would blame one key for a failure every key reproduces, and turn a loud, actionable error into a key that blocks reads forever |
+| **Halting schema diagnosis** | a source key the drain can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`); a tripped hop bound (`HopBoundExceeded`, a cross-table value cycle or a run-away wave); an aggregate target off the ledger (`AggregateOffLedger`) | **pause the closure it reaches, loudly**; never quarantine. Quarantining would blame one key for a failure every key reproduces, and turn a loud, actionable error into a key that blocks reads forever |
 | **Claim lost** | a page's claim check or completion finds a held bucket's claim gone | surface; never isolate. The page rolled back, and whoever holds the buckets now resumes from the last committed cursor |
 | **Everything else** | a genuinely poisonous change | isolate and charge — see [06](06-cleanup-and-reclaim.md) |
 
@@ -691,8 +691,9 @@ sources. One halt is one episode — one error line, and one increment of the
 halting-stop counter (count plus last reason), so "halted" and "slow" stay
 distinguishable. Resuming while the cause persists halts it again as a new
 episode, and a closure's members can be resumed in any order. A halt that pauses
-nothing — not believed reachable — falls back to surfacing the error, and the
-worker re-claims at the poll interval under a collapsed warning (#660).
+nothing because a peer already paused the closure retries the page once. One
+that still pauses nothing (not believed reachable) surfaces the error, and the
+worker re-claims the page at the poll interval under a collapsed warning (#660).
 
 ## Invariants
 

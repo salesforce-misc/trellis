@@ -373,7 +373,8 @@ definitions it reaches, and every other definition keeps converging (#663,
 halted definition reports `paused`, the same word as an operator pause, so
 check `DefinitionSummary::halt` rather than the status: it is set only on a
 halted definition, and carries the table the failure named, the error and when
-it was found. One `definitions()` call answers for every definition:
+it was found. For an aggregate off the ledger, that table is the aggregate's
+target, not a source. One `definitions()` call answers for every definition:
 
 ```rust
 let halted: Vec<_> = trellis

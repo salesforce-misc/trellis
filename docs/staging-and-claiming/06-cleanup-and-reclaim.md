@@ -53,11 +53,12 @@ ineligible, leaking a ring slot into a permanent `RingFull` wedge.
 
 **Condition 4 is why an undrainable batch would be an instance-wide stop**, not a
 per-table one: one batch stuck below the boundary makes *every* candidate
-ineligible, so the ring fills and seals fail. That is why no failure class may
+ineligible, so the ring fills and seals fail. That is why no failure class must
 leave a batch undrainable: a genuine schema error pauses the definitions it
 reaches so the batch drains without them
 ([05](05-apply-and-exactly-once-deltas.md#failure-classification)), and
-quarantine exists for everything that is *not* one.
+quarantine exists for everything that is *not* one. The one fallback that
+re-claims instead is a halt that pauses nothing (see 05).
 
 ## Who runs the sweeps
 

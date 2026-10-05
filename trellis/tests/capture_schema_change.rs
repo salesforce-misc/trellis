@@ -1573,13 +1573,16 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_halts_it_again() {
     }
     // Each member is paused again by whichever meets the key first: the
     // drain's halt, or a build of its own that keeps failing (`users_copy`'s
-    // Re-derive build reads `users` by that key).
+    // Re-derive build reads `users` by that key). At least one must be the
+    // drain's halt, or the second episode never happened.
+    let mut halted = 0;
     for target in HALT_CLOSURE {
         let reported = trellis.status(target).await.expect("status").expect(target);
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
         let cause = match (&reported.capture_failure, &reported.backfill_failure) {
             (Some(failure), _) => {
                 assert_eq!(failure.kind, CaptureFailureKind::Halt, "{target}");
+                halted += 1;
                 &failure.error
             }
             (None, Some(failure)) => &failure.last_error,
@@ -1587,6 +1590,7 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_halts_it_again() {
         };
         assert!(cause.contains("character(8)"), "{target}: {cause}");
     }
+    assert!(halted > 0, "no member was halted again by the drain");
     assert_eq!(
         halting_stops(&db.pool).await,
         stops + 2,

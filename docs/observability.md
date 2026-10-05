@@ -326,9 +326,10 @@ without them:
   `stop_count`, plus `last_reason` and `last_stopped_at` for the latest. A
   peer worker meeting the same failure, or a retry meeting it again, finds the
   closure already paused and records nothing, so the count is of episodes,
-  not attempts. A halt that pauses nothing, which isn't believed reachable,
-  falls back to surfacing the error, and the drain worker re-claims the page
-  at its poll interval under a collapsed warning (#660).
+  not attempts. A halt that pauses nothing because a peer already paused the
+  closure retries the page once. One that still pauses nothing (not believed
+  reachable) surfaces the error, and the drain worker re-claims the page at
+  its poll interval under a collapsed warning (#660).
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. Resuming while the cause persists halts it again, as a new
