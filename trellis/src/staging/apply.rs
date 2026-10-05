@@ -715,6 +715,13 @@ impl LiveRowsQuery<'_> {
 /// indexable: one `NULL`-keyed group in a batch turned the refetch into a
 /// nested loop over a sequential scan of the source. This is the same split
 /// `target_mutations::read_new_images` makes (issue #433).
+///
+/// Each arm also restricts every non-`NULL` key column to its array
+/// (`t.<col> = any(<array>)`), which the join already implies, so the
+/// source's side of whatever join the planner picks is bounded by the batch
+/// (#778). Without it, a source analyzed while small and grown since was
+/// read in full for a page's 5,000 keys: a hash join over a sequential scan
+/// of 1.15M rows, 143 ms against 11 ms.
 pub(super) fn live_rows_query<'a>(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
@@ -747,10 +754,13 @@ pub(super) fn live_rows_query<'a>(
         .map(|pattern| {
             let mut arrays = Vec::new();
             let mut u_cols = Vec::new();
+            let mut bounds = Vec::new();
             for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
                 if !null {
                     next_param += 1;
-                    arrays.push(format!("${next_param}::text[]::{}[]", column.data_type));
+                    let array = format!("${next_param}::text[]::{}[]", column.data_type);
+                    bounds.push(format!("t.{} = any({array})", quote_ident(&column.name)));
+                    arrays.push(array);
                     u_cols.push(pk_keyset_col(i));
                 }
             }
@@ -765,10 +775,12 @@ pub(super) fn live_rows_query<'a>(
                     u_cols.join(", ")
                 )
             };
+            let mut cond = vec![live_rows_join_cond(pk, pattern)];
+            cond.extend(bounds);
             format!(
                 "select {k_expr} as k, {doc_expr} as doc from {source_ident} t{keyset} \
                  where {}",
-                live_rows_join_cond(pk, pattern),
+                cond.join(" and "),
             )
         })
         .collect();
@@ -4218,6 +4230,101 @@ mod tests {
             plan.contains("Seq Scan"),
             "the pre-#446 shape should not be able to probe the index, got:\n{plan}"
         );
+    }
+
+    /// Issue #778: a [`live_rows_query`] batch reads only its keys' rows of
+    /// a source whose statistics lag its size, at a single-column and a
+    /// composite key. Each source is analyzed at 100 rows and then grown to
+    /// 400k with autovacuum off. Left to the join alone, the planner hashed
+    /// a 5,000-key batch against a sequential scan of the source (or, with
+    /// sequential scans off, a full scan of its key's index); each arm's
+    /// `= any` restriction caps the source's side at the batch.
+    #[tokio::test]
+    async fn live_rows_query_reads_only_the_batch_while_source_statistics_lag() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table single (id int primary key, total int) \
+                     with (autovacuum_enabled = false); \
+                 create table composite (g int, h text, total int, primary key (g, h)) \
+                     with (autovacuum_enabled = false); \
+                 insert into single select i, i from generate_series(1, 100) i; \
+                 insert into composite select i, 'k' || i, i from generate_series(1, 100) i; \
+                 analyze single; analyze composite; \
+                 insert into single select i, i from generate_series(101, 400000) i; \
+                 insert into composite select i, 'k' || i, i \
+                     from generate_series(101, 400000) i;",
+            )
+            .await
+            .expect("seed sources whose statistics lag");
+        for table in ["public.single", "public.composite"] {
+            let pk = ddl::identity_key_columns(&client, table)
+                .await
+                .expect("identity");
+            let columns = live_row_columns(&client, table).await.expect("columns");
+            let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
+            let owned: Vec<String> = client
+                .query(
+                    &format!("select {key_sql} from {table} t where t.total % 79 = 0 limit 5000"),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            let keys: Vec<&str> = owned.iter().map(String::as_str).collect();
+            assert_eq!(keys.len(), 5000);
+            let query = live_rows_query(table, &pk, &columns, &keys).expect("query");
+            let plan: String = client
+                .query(&format!("explain {}", query.sql), &query.params())
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let source = &table["public.".len()..];
+            let scans: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains(&format!(" on {source} ")))
+                .collect();
+            assert!(
+                !scans.is_empty(),
+                "{table}: no scan of the source in:\n{plan}"
+            );
+            for scan in scans {
+                let rows: f64 = scan
+                    .split("rows=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|rows| rows.parse().ok())
+                    .expect("a row estimate");
+                assert!(
+                    !scan.contains("Seq Scan") && rows <= keys.len() as f64,
+                    "{table}: the source must be read through the batch's keys, got:\n{plan}"
+                );
+            }
+            let found: std::collections::HashSet<String> = client
+                .query(&query.sql, &query.params())
+                .await
+                .expect("read")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(
+                found,
+                owned.iter().cloned().collect(),
+                "{table}: every key finds its own row"
+            );
+        }
     }
 
     /// Issue #531: only a record at or below its relationship's refresh
