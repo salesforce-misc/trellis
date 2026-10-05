@@ -2799,3 +2799,99 @@ async fn a_to_side_truncate_racing_a_child_field() {
 async fn a_to_side_truncate_racing_a_child_group_key() {
     a_to_side_truncate_racing_a_child(RelFlavour::GroupKey).await;
 }
+
+/// One page that holds every kind of record step 3 tells apart (#775):
+/// Applies its lock's insert wrote (`$10`'s fresh records, moved into their
+/// groups from their images: a new key in an existing group, one with a
+/// NULL argument, one with a NULL group key, and an insert and delete that
+/// fold into a tombstone), beside the keys it reads and updates (`$9`): an
+/// existing key moving groups, an existing key deleted, a new key's
+/// Re-derive on its placeholder, and a change from before a truncate that
+/// gets a placeholder at the floor and is refused. The target must equal
+/// the oracle, so each fresh record's move equals the entry its insert
+/// wrote, and the two key lists stay aligned with the records.
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    write(&d, "truncate public.src").await;
+    d.settle().await;
+    write(
+        &d,
+        "insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 30)",
+    )
+    .await;
+    d.settle().await;
+    assert_oracle(&mut d, flavour).await;
+
+    write(
+        &d,
+        "update public.src set g = 2, v = 11 where id = 1; \
+         delete from public.src where id = 2; \
+         insert into public.src values (4, 1, 40), (5, 2, null), (6, null, 60), (7, 1, 70), \
+                                       (8, 3, 80); \
+         delete from public.src where id = 7",
+    )
+    .await;
+    d.stage_recomputes(SRC, &["8"]).await;
+    let mut client = d.pool().get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    trellis::staging::append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: SRC.to_string(),
+            key: "9".to_string(),
+            op: CdcOp::Insert,
+            lsn: Some(PgLsn::from(1)),
+            old_image: None,
+            new_image: Some(r#"{"id":"9","g":"1","v":"90"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the pre-truncate change");
+    txn.commit().await.expect("commit");
+    drop(client);
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    let entries: Vec<String> = d
+        .rows(&format!(
+            "select __from_key || ':' || (__applied_lsn is not null)::text || ':' || \
+                    __member::text || ':' || __tombstone::text \
+             from {} order by __from_key",
+            flavour.ledger()
+        ))
+        .await;
+    assert_eq!(
+        entries,
+        [
+            "(1:true:true:false)",
+            "(2:true:false:true)",
+            "(3:true:true:false)",
+            "(4:true:true:false)",
+            "(5:true:true:false)",
+            "(6:true:true:false)",
+            "(7:true:false:true)",
+            "(8:false:true:false)",
+            "(9:false:false:false)",
+        ],
+        "each key's entry: applied, member, tombstone"
+    );
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_aggregate() {
+    a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_avg() {
+    a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateAvg).await;
+}
+
+#[tokio::test]
+async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle_min_max() {
+    a_page_mixing_fresh_and_read_entries_equals_the_oracle(Flavour::AggregateMinMax).await;
+}
