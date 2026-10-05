@@ -736,11 +736,9 @@ impl LiveRowsQuery<'_> {
 /// - No sequential scan alone: a scan of the key's whole index, 31 ms.
 /// - Both: 15–19 ms on PostgreSQL 16, 10–15 ms on 17.
 ///
-/// A composite key is never restricted this way. One `= any` per column
-/// makes the planner multiply the columns' selectivities, expect a row or
-/// two from the source, and compare every bounded row with every key,
-/// quadratic in the batch even with fresh statistics: 1,474 ms against 13
-/// ms for 5,000 keys of a four-column key at 1M rows, and 946 ms on a
+/// A composite key is never restricted this way ([`bounds_keyset_by_array`]):
+/// one `= any` per column took 1,474 ms against 13 ms for 5,000 keys of a
+/// four-column key at 1M rows with fresh statistics, and 946 ms on a
 /// two-column key at 20M rows. Without a sequential scan to hash, it probes
 /// the key's index once per key whether or not its statistics lag (18 ms on
 /// PostgreSQL 16 for 5,000 keys at 400k rows analyzed at 100, against 70 ms
@@ -782,7 +780,7 @@ pub(super) fn live_rows_query<'a>(
                 if !null {
                     next_param += 1;
                     let array = format!("${next_param}::text[]::{}[]", column.data_type);
-                    if pk.len() == 1 {
+                    if bounds_keyset_by_array(pk) {
                         bounds.push(format!("t.{} = any({array})", quote_ident(&column.name)));
                     }
                     arrays.push(array);
@@ -6703,6 +6701,34 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
         .join(" and ")
 }
 
+/// Whether a join of a keyset to a table keyed by `key` should also restrict
+/// the key's column to the keyset's own array (`t.<col> = any(<array>)`),
+/// which the join already implies: only when `key` is a single column. Every
+/// keyset join that takes such a bound asks here (#778, #790).
+///
+/// The bound caps the table's side of whatever join the planner picks at the
+/// keyset. Without it, a table analyzed while small and grown since is read
+/// in full: at 1M rows analyzed at 100, a 5,000-key batch hashed a
+/// sequential scan of the table, 3 to 13 times slower than through its key's
+/// index.
+///
+/// A composite key isn't bounded. The planner multiplies one bound per
+/// column's selectivities as if they were independent, but a composite key's
+/// columns are each nearly as selective as the whole key, so it expects the
+/// bounded table to yield a row or two. It then loops over that scan and
+/// compares every bounded row with every key, quadratic in the batch,
+/// statistics fresh or not: 5,000 keys took 2.3 s to lock on a 1M-row target
+/// with a four-column key (25 ms unbounded), and 1.8 s on a 20M-row target
+/// with a two-column key (19 ms). A leading-column bound alone avoids that,
+/// but reads a whole tenant when the leading column is a low-cardinality one
+/// (84 ms against 4 ms for 500 keys over 1,000 tenants). Unbounded, a
+/// composite key is probed per key while its statistics are fresh, and can
+/// still be hashed against a sequential scan while they lag (139 ms against
+/// 27 ms bounded, two columns at 1M rows).
+pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
+    key.len() == 1
+}
+
 /// [`apply_target`]'s pre-lock for a composite key (issue #121): the target
 /// rows of a bound keyset relation ([`pk_keyset_unnest`] at `$1`), `select`ing
 /// `columns`, locked `for update of t` in key order. No one column's `=
@@ -6711,20 +6737,7 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// (`unnest(...)`'s derived rows aren't real table rows Postgres could lock).
 ///
 /// The join is deliberately not also restricted by one `t.<col> = any(<its
-/// array>)` per key column, the bound a single-column key's statements take
-/// (#778, #790). The planner multiplies those columns' selectivities as if
-/// they were independent, but a composite key's columns are each nearly as
-/// selective as the whole key, so it expects the bounded target to yield a
-/// row or two. It then loops over that scan and compares every bounded row
-/// with every key, quadratic in the batch, statistics fresh or not: 5,000
-/// keys took 2.3 s to lock on a 1M-row target with a four-column key (25
-/// ms unbounded), and 1.8 s on a 20M-row target with a two-column key (19
-/// ms). A leading-column bound alone avoids that, but reads a whole tenant
-/// when the leading column is a low-cardinality one (84 ms against 4 ms for
-/// 500 keys over 1,000 tenants). Unbounded, a composite key is probed per
-/// key while its statistics are fresh, and can still be hashed against a
-/// sequential scan while they lag (139 ms against 27 ms bounded, two
-/// columns at 1M rows).
+/// array>)` per key column: see [`bounds_keyset_by_array`].
 fn composite_lock_statement(target_ident: &str, pk: &[PrimaryKeyColumn], columns: &str) -> String {
     format!(
         "select {columns} from {target_ident} as t join {} on ({}) \

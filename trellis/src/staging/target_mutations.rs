@@ -186,8 +186,8 @@ use tokio_postgres::types::{PgLsn, ToSql};
 
 use super::append::{self, CdcOp, StagedChange};
 use super::apply::{
-    ApplyError, MAX_HOP_GEN, earliest_src_changed, live_row_columns, pk_keyset_col,
-    row_as_text_jsonb_sql,
+    ApplyError, MAX_HOP_GEN, bounds_keyset_by_array, earliest_src_changed, live_row_columns,
+    pk_keyset_col, row_as_text_jsonb_sql,
 };
 use super::fold::earliest_origin;
 use crate::defs::catalog;
@@ -656,8 +656,8 @@ impl NewImagesQuery<'_> {
 /// index.
 ///
 /// A composite identity is never restricted this way: see
-/// `apply::composite_lock_statement` for why one `= any` per column is
-/// worse than the scan it avoids.
+/// [`bounds_keyset_by_array`] for why one `= any` per column is worse
+/// than the scan it avoids.
 fn new_images_query<'a>(
     target: &str,
     image_columns: &[String],
@@ -726,7 +726,7 @@ fn new_images_query<'a>(
                     matched.push(format!("t.{col} is null"));
                 } else {
                     let array = format!("{}::text[]::{}[]", param(), column.data_type);
-                    if pk.len() == 1 {
+                    if bounds_keyset_by_array(pk) {
                         bounds.push(format!("t.{col} = any({array})"));
                     }
                     arrays.push(array);

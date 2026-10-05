@@ -185,6 +185,7 @@ use crate::defs::model::RelationshipCardinality;
 use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
 use crate::defs::{TransformStatus, parse};
 use crate::pool::quote_ident;
+use crate::staging::apply::bounds_keyset_by_array;
 use crate::staging::target_mutations::TargetMutations;
 
 use super::IntakeError;
@@ -936,23 +937,32 @@ fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
 /// sequential scan of the target, 128 ms against 32 ms through its index.
 ///
 /// Empty otherwise:
-/// - **A composite key.** One bound per column makes the planner expect a
-///   row or two from the target and compare every bounded row with every
-///   key, quadratic in the batch even with fresh statistics: 2.6 s against
-///   33 ms for 5,000 keys of a four-column key at 3M rows. See
-///   `apply::composite_lock_statement`.
+/// - **A composite key** ([`bounds_keyset_by_array`]). One bound per column
+///   makes the planner expect a row or two from the target and compare every
+///   bounded row with every key, quadratic in the batch even with fresh
+///   statistics: 2.6 s against 33 ms for 5,000 keys of a four-column key at
+///   3M rows.
 /// - **A keyset with a `NULL` key**, which has two [`null_patterns`]. The
 ///   match is then an `or` of the patterns, which no hash or merge join can
 ///   take, so the planner already probes the index once per key.
 /// - **An array-typed column.** Its keyset values are cast one by one (see
 ///   [`delete_statement`]), and a bound casts the array whole.
 fn keyset_bound(cols: &[String], key_cols: &[PrimaryKeyColumn], patterns: &[Vec<bool>]) -> String {
-    match (cols, key_cols, patterns) {
-        ([col], [c], [pattern]) if pattern == &[false] && !c.data_type.ends_with(']') => {
-            format!(" and {col} = any($1::text[]::{}[])", c.data_type)
-        }
-        _ => String::new(),
+    let [pattern] = patterns else {
+        return String::new();
+    };
+    if !bounds_keyset_by_array(key_cols) {
+        return String::new();
     }
+    cols.iter()
+        .zip(key_cols)
+        .zip(pattern)
+        .enumerate()
+        .filter(|(_, ((_, c), null))| !**null && !c.data_type.ends_with(']'))
+        .map(|(i, ((col, c), _))| {
+            format!(" and {col} = any(${}::text[]::{}[])", i + 1, c.data_type)
+        })
+        .collect()
 }
 
 #[cfg(test)]
