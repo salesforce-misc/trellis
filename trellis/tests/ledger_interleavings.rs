@@ -3388,3 +3388,154 @@ async fn a_parent_rekeyed_through_a_childs_key_on_a_to_side_joined_by_two_non_ke
         "target (left) differs from the oracle (right)"
     );
 }
+
+/// #785 review: `a_parent_born_and_deleted_in_one_batch_after_a_child_read_it`
+/// on a non-key `to_col` whose parent key is quarantined, so the drain parks
+/// the parent's folded change. Its release re-stages an image-less
+/// `Recompute`, which names only the first parked pre-image (none: the
+/// parent was born in the batch) and the live row (none: it was deleted), so
+/// `'e'` survives only in the parked change's `to_col_values`. The drain
+/// re-derives its children when it parks the change; without that, group 3
+/// keeps `COUNT` 1 where the oracle has 0. #784 covered this through the
+/// parked rows' `group_key`.
+#[tokio::test]
+async fn a_parked_parent_born_and_deleted_on_a_non_key_to_col() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, count(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code text unique, w numeric); \
+         create table public.src (id integer primary key, g integer, p text); \
+         insert into public.par values (1, 'a', 10), (2, 'b', 20); \
+         insert into public.src values (1, 1, 'a'), (2, 1, 'b');",
+        &[("id", ValueType::Numeric), ("g", ValueType::Numeric)],
+        &["RELATIONSHIP parent FROM src.p TO par.code"],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "before the scenario"
+    );
+    d.ctl
+        .execute(
+            "insert into poison (src_table, key, last_error) values ($1, '5', 'test')",
+            &[&PAR],
+        )
+        .await
+        .expect("poison par key 5");
+    write(&d, "update public.src set g = 3, p = 'e' where id = 1").await;
+    let c_batch = d.seal().await;
+    write(&d, "insert into public.par values (5, 'e', 57)").await;
+    d.drain(c_batch, "a").await;
+    write(&d, "delete from public.par where id = 5").await;
+    let p_batch = d.seal().await;
+    d.drain(p_batch, "b").await;
+    let released = trellis::staging::release_key(d.pool(), PAR, "5")
+        .await
+        .expect("release par key 5");
+    assert_eq!(released, 1, "the drain parked parent 5's change");
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "target (left) differs from the oracle (right)"
+    );
+}
+
+/// #785 review, a known gap pinned (it fails on main too): an application
+/// `AFTER ROW` trigger re-keys a parent's non-key `to_col` again in a nested
+/// statement, `'a' -> 'x'` and then `'x' -> 'y'`. The nested statement's
+/// capture runs first, so the key's earliest ring row is `('x', 'y')` and
+/// the outer one, later, is `('a', 'y')` (#680). The fold keeps the
+/// earliest old image, `'x'`, an uncommitted intermediate, so no folded
+/// image names the committed `'a'` and neither does any new image: child 1,
+/// still pointing at `'a'`, is never re-derived. Group 1 keeps `COUNT` 2
+/// where the oracle has 1. Unioning old images into `to_col_values` would
+/// fix this aggregate, but not the 1-1 below, whose projection of `'a'` the
+/// reverse record never clears.
+#[tokio::test]
+#[ignore = "#785 review: the fold's earliest old image can be a nested statement's intermediate"]
+async fn a_nested_rekey_of_a_non_key_to_col_re_derives_the_committed_value() {
+    let actual = "select g, total, n from public.agg order by g";
+    let expected = "select s.g, count(p.w), count(*) from public.src s \
+                    left join public.par p on p.code = s.p group by s.g order by s.g";
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code text unique, w numeric); \
+         create table public.src (id integer primary key, g integer, p text); \
+         insert into public.par values (1, 'a', 10), (2, 'b', 20); \
+         insert into public.src values (1, 1, 'a'), (2, 1, 'b'); \
+         create function public.par_bounce() returns trigger language plpgsql as $$ \
+         begin \
+           if new.code = 'x' then update public.par set code = 'y' where id = new.id; end if; \
+           return null; \
+         end $$; \
+         create trigger par_bounce after update on public.par \
+           for each row execute function public.par_bounce();",
+        &[("id", ValueType::Numeric), ("g", ValueType::Numeric)],
+        &["RELATIONSHIP parent FROM src.p TO par.code"],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT COUNT(parent.w) AS total, COUNT(*) AS n"],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "before the scenario"
+    );
+    write(&d, "update public.par set code = 'x' where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "target (left) differs from the oracle (right)"
+    );
+}
+
+/// #785 review, a known gap pinned (it fails on main too):
+/// `a_nested_rekey_of_a_non_key_to_col_re_derives_the_committed_value` read
+/// by a 1-1 target through the parent projection. Child 1 keeps `pw` 10
+/// where the oracle has none, because the projection row for `'a'` stays.
+#[tokio::test]
+#[ignore = "#785 review: the fold's earliest old image can be a nested statement's intermediate"]
+async fn a_nested_rekey_of_a_non_key_to_col_clears_the_committed_projection() {
+    let actual = "select id::text, pw::text from public.one order by id";
+    let expected = "select s.id::text, p.w::text from public.src s \
+                    left join public.par p on p.code = s.p order by s.id";
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code text unique, w numeric); \
+         create table public.src (id integer primary key, g integer, p text); \
+         insert into public.par values (1, 'a', 10), (2, 'b', 20); \
+         insert into public.src values (1, 1, 'a'), (2, 1, 'b'); \
+         create function public.par_bounce() returns trigger language plpgsql as $$ \
+         begin \
+           if new.code = 'x' then update public.par set code = 'y' where id = new.id; end if; \
+           return null; \
+         end $$; \
+         create trigger par_bounce after update on public.par \
+           for each row execute function public.par_bounce();",
+        &[("id", ValueType::Numeric), ("g", ValueType::Numeric)],
+        &["RELATIONSHIP parent FROM src.p TO par.code"],
+        &["TRANSFORM one FROM public.src SELECT g AS g, parent.w AS pw"],
+        &[PAR, SRC],
+    )
+    .await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "before the scenario"
+    );
+    write(&d, "update public.par set code = 'x' where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "target (left) differs from the oracle (right)"
+    );
+}

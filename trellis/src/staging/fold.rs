@@ -698,7 +698,10 @@ fn fold_sql(
     // the key's table out of every raw row's new image, as a flat
     // `[to_col, value, …]` array (pairs, sorted). Its aggregate collects
     // only those tables' images, so the filter costs every other row one
-    // array test, and the subquery parses each collected image once. Even a
+    // array test, and the subquery parses each collected image once. The
+    // `case` skips the subquery for a group with no such image: a subplan
+    // runs once per group, and even an empty one cost every fold about 14%
+    // (#785 review, 50,000 rows of a table that is no to-side). Even a
     // group of one row needs its values: the cross-segment merge
     // (`merge_folded_changes`) folds it with the key's later segments, which
     // can erase its new image.
@@ -771,6 +774,7 @@ fn fold_sql(
              coalesce({last}[1][2] = 'delete', false) as ends_in_delete, \
              ({last}[1][3])::pg_lsn as last_lsn, \
              {last}[1][4] as last_row_txid, \
+             case when {to_images} is not null then \
              (select array_agg(u.x order by p.c, p.v, u.o) \
                 from (select distinct tc.c, im.i ->> tc.c as v \
                         from unnest(({to_images})::jsonb[]) as im(i), \
@@ -779,7 +783,7 @@ fn fold_sql(
                        where tc.t = filtered.src_table \
                          and im.i ->> tc.c is not null) p \
                 cross join lateral (values (1, p.c), (2, p.v)) as u(o, x)) \
-                 as to_col_values{extra} \
+             end as to_col_values{extra} \
          from filtered \
          group by src_table, key{tail}"
     )
@@ -1630,6 +1634,37 @@ mod plan_tests {
                      once, not once per row:\n{plan}"
                 );
             }
+
+            // #785 review: with no to-side among the window's tables, the
+            // `to_col_values` subquery never runs. It is a per-group subplan,
+            // so even an empty one cost every fold about 14%.
+            let elsewhere = ToColumns {
+                tables: vec!["public.par".to_string()],
+                columns: vec!["code".to_string()],
+            };
+            params.truncate(params.len() - 2);
+            params.push(&elsewhere.tables);
+            params.push(&elsewhere.columns);
+            let plan = txn
+                .query(
+                    &format!("explain (analyze, costs off, timing off) {sql}"),
+                    &params,
+                )
+                .await
+                .expect("explain analyze the fold")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let to_col_scan = plan
+                .lines()
+                .find(|line| line.contains("Function Scan on tc"))
+                .unwrap_or_else(|| panic!("expected the to_col_values subquery:\n{plan}"));
+            assert!(
+                to_col_scan.contains("never executed"),
+                "with_truncate={with_truncate}: the to_col_values subquery must not run \
+                 for a group of no to-side:\n{plan}"
+            );
         }
     }
 
@@ -1982,12 +2017,22 @@ mod plan_tests {
         // (`group_key`'s flatten, #785's `to_col_values` pairs), so its
         // joins are over one key's values, never over the batch's keys: it
         // may plan a nested loop, but must never read the window.
-        let mut in_subplan = false;
+        // A subplan's block is the lines indented deeper than its own
+        // `SubPlan` line, so a node printed after it is checked again.
+        let mut subplan_indent: Option<usize> = None;
         for line in plan.lines() {
-            in_subplan |= line.trim_start().starts_with("SubPlan");
-            if in_subplan {
+            let indent = line.len() - line.trim_start().len();
+            if subplan_indent.is_some_and(|at| indent <= at) {
+                subplan_indent = None;
+            }
+            if line.trim_start().starts_with("SubPlan") {
+                subplan_indent = Some(indent);
+            }
+            if subplan_indent.is_some() {
                 assert!(
-                    !line.contains("on fenced") && !line.contains("on seg_"),
+                    !line.contains("on fenced")
+                        && !line.contains("on truncates")
+                        && !line.contains("on seg_"),
                     "a per-group subplan must not read the window:\n{plan}"
                 );
                 continue;

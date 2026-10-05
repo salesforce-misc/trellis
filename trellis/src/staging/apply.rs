@@ -5934,6 +5934,39 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         });
     }
 
+    // #785 review: a parked change (its key is poisoned) never reaches the
+    // by-source loop, and its release re-stages it as an image-less
+    // `Recompute` (`quarantine::release_key`), whose reverse names only the
+    // first parked pre-image and the live row. A non-key `to_col` value the
+    // fold erased between them lives only in this change's `to_col_values`,
+    // which nothing parks, and a child may have read the parent live under
+    // it. So its children are re-derived now, as for an unpoisoned change. A
+    // key `to_col`'s only value is the ring key, which the release's
+    // `Recompute` names itself.
+    for change in &poisoned_park {
+        if change.to_col_values.is_empty() {
+            continue;
+        }
+        for rel in catalog::relationships_to_table(pool, &change.src_table).await? {
+            let mut key_hops: HashMap<String, i32> = HashMap::new();
+            let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
+            for (column, value) in &change.to_col_values {
+                if *column == rel.def.to_col {
+                    key_hops.insert(value.clone(), change.hop_gen);
+                    key_src_changed.insert(value.clone(), (change.src_changed, change.origin_lsn));
+                }
+            }
+            accumulate_from_side_recomputes(
+                pool,
+                &rel,
+                &key_hops,
+                &key_src_changed,
+                &mut reverse_recomputes,
+            )
+            .await?;
+        }
+    }
+
     // Truncate clears (issue #60): for each truncated src_table, resolve its
     // targets via the catalog and record a full clear for each — the same
     // "resolve targets from the catalog" step the by-source loop above runs
