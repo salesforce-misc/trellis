@@ -466,13 +466,7 @@ impl Sweep {
         let arrays: Vec<Vec<Option<String>>> = (0..arity)
             .map(|j| keys.iter().map(|key| key[j].clone()).collect())
             .collect();
-        let sql = delete_statement(target, &arrays);
-        let status = target.status.as_str();
-        let mut params: Vec<&(dyn ToSql + Sync)> =
-            arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-        params.push(&target.id);
-        params.push(&status);
-        let rows = crate::staging::ledger::query_by_entry_key(txn, &sql, &params).await?;
+        let rows = delete_keys(txn, target, &arrays).await?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -804,6 +798,23 @@ fn ledger_orphan_branch_sql(
         quote_ident(TOMBSTONE_COLUMN),
         ddl::pk_key_sql_expr(source_pk, Some("s")),
     )
+}
+
+/// Runs [`delete_statement`] for `arrays` under `ENTRY_PLAN_SETTINGS`
+/// (through `ledger::query_by_entry_key`), and returns the deleted rows:
+/// [`Sweep::delete`]'s statement as it runs, which its plan test runs too.
+async fn delete_keys(
+    txn: &Transaction<'_>,
+    target: &SweptTarget,
+    arrays: &[Vec<Option<String>>],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    let sql = delete_statement(target, arrays);
+    let status = target.status.as_str();
+    let mut params: Vec<&(dyn ToSql + Sync)> =
+        arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+    params.push(&target.id);
+    params.push(&status);
+    crate::staging::ledger::query_by_entry_key(txn, &sql, &params).await
 }
 
 /// [`Sweep::delete`]'s statement: deletes `target`'s rows whose key is one
@@ -1571,13 +1582,18 @@ mod db_tests {
                 "{table}: the target must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
             );
-            let deleted: std::collections::HashSet<String> = txn
-                .query(&sql, &params)
+            let before = seq_scans_in_txn(&txn, table).await;
+            let deleted: std::collections::HashSet<String> = delete_keys(&txn, &target, &arrays)
                 .await
                 .expect("delete")
                 .into_iter()
                 .map(|row| row.get(0))
                 .collect();
+            assert_eq!(
+                seq_scans_in_txn(&txn, table).await,
+                before,
+                "{table}: the sweep's delete must not scan the target, as its plan above doesn't"
+            );
             txn.rollback().await.expect("roll back");
             assert_eq!(
                 deleted,
@@ -1585,6 +1601,21 @@ mod db_tests {
                 "{table}: every key is deleted"
             );
         }
+    }
+
+    /// How many sequential scans of `table` this transaction has started so
+    /// far (`pg_stat_xact_user_tables` counts the open transaction's own).
+    /// The plan above is explained through `query_by_entry_key`; this checks
+    /// that [`delete_keys`] runs it that way too, which PostgreSQL 16 would
+    /// otherwise plan as a scan of a stale target (#790).
+    async fn seq_scans_in_txn(txn: &Transaction<'_>, table: &str) -> i64 {
+        txn.query_one(
+            "select seq_scan from pg_stat_xact_user_tables where relid = $1::text::regclass",
+            &[&table],
+        )
+        .await
+        .expect("the transaction's scan count")
+        .get(0)
     }
 }
 

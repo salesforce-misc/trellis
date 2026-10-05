@@ -1385,9 +1385,15 @@ mod tests {
                 "{table}: the target must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
             );
+            let before = seq_scans_in_txn(&txn, table).await;
             let got = read_new_images(&txn, table, &columns, &feed, &keys)
                 .await
                 .expect("re-read");
+            assert_eq!(
+                seq_scans_in_txn(&txn, table).await,
+                before,
+                "{table}: read_new_images must not scan the target, as its plan above doesn't"
+            );
             let missing: Vec<&String> = keys
                 .keys()
                 .filter(|key| got.get(*key).is_none_or(|new| new.image.is_none()))
@@ -1397,5 +1403,20 @@ mod tests {
                 "{table}: every key finds its own row, missing {missing:?}"
             );
         }
+    }
+
+    /// How many sequential scans of `table` this transaction has started so
+    /// far (`pg_stat_xact_user_tables` counts the open transaction's own).
+    /// The plan test explains its statement through `query_by_entry_key`;
+    /// this checks that [`read_new_images`] runs it that way too, which
+    /// PostgreSQL 16 would otherwise plan as a scan of a stale target (#790).
+    async fn seq_scans_in_txn(txn: &Transaction<'_>, table: &str) -> i64 {
+        txn.query_one(
+            "select seq_scan from pg_stat_xact_user_tables where relid = $1::text::regclass",
+            &[&table],
+        )
+        .await
+        .expect("the transaction's scan count")
+        .get(0)
     }
 }
