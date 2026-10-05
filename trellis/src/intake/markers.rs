@@ -1341,7 +1341,9 @@ async fn plan_waiting_builds(
 /// Read on `client` before the discharge's transaction opens, like
 /// [`plan_waiting_builds`]. A definition registered after this read is
 /// counted as a reader, which at worst enumerates for nothing, as before
-/// #732.
+/// #732. So is one whose text doesn't parse: its own table's discharge meets
+/// the error in [`plan_waiting_builds`] and backs off (issues #407, #518),
+/// and every other table's discharge goes on without it.
 async fn waiting_rederive_builds(client: &tokio_postgres::Client) -> Result<Vec<i64>, IntakeError> {
     let ids: Vec<i64> = client
         .query(
@@ -1354,8 +1356,10 @@ async fn waiting_rederive_builds(client: &tokio_postgres::Client) -> Result<Vec<
         .collect();
     let mut rederive = Vec::new();
     for id in ids {
-        let Some(definition) = crate::defs::catalog::definition_by_id_in(client, id).await? else {
-            continue;
+        let definition = match crate::defs::catalog::definition_by_id_in(client, id).await {
+            Ok(Some(definition)) => definition,
+            Ok(None) | Err(crate::defs::catalog::CatalogError::Parse(_)) => continue,
+            Err(err) => return Err(err.into()),
         };
         if crate::staging::build::qualifies(client, &definition).await? {
             rederive.push(id);
@@ -2722,6 +2726,57 @@ mod catch_up_tests {
             retry_in.is_some(),
             "a failed marker has a next-attempt time"
         );
+    }
+
+    /// Issue #732: the discharge reads every waiting definition in the
+    /// catalog to find the Re-derive build's ([`waiting_rederive_builds`]),
+    /// but one whose text doesn't parse fails only its own table's discharge,
+    /// as before. Another table's marker still discharges.
+    #[tokio::test]
+    async fn an_unparseable_waiting_definition_fails_only_its_own_tables_discharge() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.t (id bigint primary key); \
+                 insert into public.t values (1); \
+                 create table public.other (id bigint primary key); \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.other', 1);",
+            )
+            .await
+            .expect("seed the source tables");
+        register_reader(&db, "public.t", "t_reader").await;
+        capture_for_test(&mut client, &["public.t"]).await;
+        client
+            .execute(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.other', 1, 'not a transform', 'waiting_to_backfill')",
+                &[],
+            )
+            .await
+            .expect("seed an unparseable definition on another table");
+
+        let failures = run_pending_backfills_until(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+            &|| false,
+        )
+        .await
+        .expect("a failing marker must not fail the pass");
+        assert!(
+            failures.is_empty(),
+            "another table's broken definition doesn't fail this discharge, got {:?}",
+            failures
+                .iter()
+                .map(|failure| failure.error.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(retry_state(&client, "public.t").await, None);
     }
 
     /// Issue #407: a park that lands while a discharge of the same table is
