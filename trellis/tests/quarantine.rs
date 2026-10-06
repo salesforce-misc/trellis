@@ -2969,3 +2969,77 @@ async fn a_held_key_is_left_out_of_a_relationship_whose_every_reader_is_frozen()
         "the only definition the drain could charge holds the key"
     );
 }
+
+/// Review of #799: a page parks a change for the definition its key was held
+/// for when the page was computed, in its apply's own transaction. A release
+/// (or a resume, rule 5) that lands in between deletes the key's `poison`
+/// and `poison_held` rows, and re-derives the key from its live row. The page
+/// must then park nothing: a held row for a key nothing holds is named by no
+/// release, and blocks every watermark token from then on.
+#[tokio::test]
+async fn a_page_parks_nothing_for_a_key_released_after_it_was_computed() {
+    use trellis::staging::{claim, fold};
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    hold_key_1_for_order_prices(&db, &mut client).await;
+    let orders = qualify_fixture_table("orders");
+    client
+        .batch_execute("alter table public.order_prices drop constraint cheap")
+        .await
+        .expect("fix the cause");
+
+    write_order(&client, 1, "60", "3").await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    let mut phase1 = db.pool.get().await.expect("connection");
+    let txn = phase1.transaction().await.expect("begin phase 1");
+    claim::claim(&txn, seg_seq, "worker", 1)
+        .await
+        .expect("claim");
+    let share = claim::held_share(&*txn, seg_seq, "worker")
+        .await
+        .expect("held_share");
+    let folded = fold::fold(&txn, seg_seq, share.filter(share.buckets()))
+        .await
+        .expect("fold");
+    txn.commit().await.expect("commit phase 1");
+    let plan = apply::compute(&db.pool, &folded).await.expect("compute");
+
+    // Released between the page's compute and its apply.
+    trellis::staging::release_key(&db.pool, "order_prices", &orders, "1")
+        .await
+        .expect("release key 1 for order_prices");
+
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "worker",
+        &plan,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply the page");
+    txn.commit().await.expect("commit phase 3");
+    assert_eq!(
+        rows_for(&client, "poison_held", "order_prices").await,
+        0,
+        "nothing is parked for a key no longer held"
+    );
+
+    // The release's Recompute re-derives the key, the page's change included.
+    assert_eq!(drain_through_evictions(&mut client, &db.pool).await, 0);
+    assert_eq!(
+        text_of(&client, "select price::text from order_prices where id = 1").await,
+        Some("60".to_string())
+    );
+    let token = converge::watermark_token(&client)
+        .await
+        .expect("watermark token");
+    converge::await_converged(&client, token, std::time::Duration::from_secs(5))
+        .await
+        .expect("nothing is left holding the band");
+}

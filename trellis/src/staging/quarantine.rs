@@ -342,11 +342,37 @@ pub(super) async fn poisoned_keys_among(
 /// module doc comment's "Parked work... is the source of truth" and doc 06's
 /// matching section: this is what keeps a held key's band blocked for as
 /// long as the definition holds it.
+///
+/// **Parks only while the definition still holds the key.** `changes` were
+/// chosen from `poison` when the page was computed, outside this transaction.
+/// A resume (rule 5 of #799) or a release since then deleted the key's
+/// `poison` and `poison_held` rows, and a row parked after that would be held
+/// for a key nothing holds: no release would ever name it, and it would block
+/// every watermark token from then on (`converge`'s condition 4). The resume
+/// or release re-derives the key from its live row, so the skipped change
+/// is covered. The definitions' rows are locked `for key share` first, the
+/// lock the insert's foreign key takes anyway: a resume holds its definition's
+/// row `for update` while it deletes, so a page that parks for it either
+/// parks before the resume deletes (and the resume deletes its rows too) or
+/// waits for the resume to commit and then finds the key no longer held. A
+/// release takes no definition lock, so one that commits between the check
+/// and this transaction's commit can still leave a parked row behind.
 pub(super) async fn park_batch_contribution(
     txn: &Transaction<'_>,
     seg_seq: i64,
     changes: &[(i64, FoldedChange)],
 ) -> Result<(), ApplyError> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let mut ids: Vec<i64> = changes.iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    txn.execute(
+        "select 1 from transform_definitions where id = any($1) order by id for key share",
+        &[&ids],
+    )
+    .await?;
     for (transform_id, change) in changes {
         let op = folded_change_op(change);
         // Issue #315: a recompute's prior-image hint rides in `old_image`,
@@ -360,8 +386,11 @@ pub(super) async fn park_batch_contribution(
             "insert into poison_held \
                  (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, \
                   origin_lsn, src_changed, hop_gen, group_key) \
-             values ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb, \
-                      $9, $10, $11, $12) \
+             select $1::bigint, $2::text, $3::text, $4::bigint, $5::text, $6::pg_lsn, \
+                    $7::text::jsonb, $8::text::jsonb, $9::pg_lsn, $10::timestamptz, \
+                    $11::integer, $12::text[] \
+             where exists (select 1 from poison p \
+                           where p.transform_id = $1 and p.src_table = $2 and p.key = $3) \
              on conflict (transform_id, src_table, key, seg_seq) do nothing",
             &[
                 transform_id,
