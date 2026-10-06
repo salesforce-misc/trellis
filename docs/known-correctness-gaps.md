@@ -78,7 +78,6 @@ These are the tools the entries refer to:
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain: pauses what it reaches, or logs only; build: `backfill_failure` | #813, #817 |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
-| 14 | A field alias that shadows a source column read by an aggregate | target never builds | logs only | #695 |
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #528, test ignored |
 | 16 | `self_check` audits 1-1 targets only | yes | n/a | none filed |
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
@@ -474,24 +473,6 @@ way Rails dumps `schema_migrations`. It isn't built yet.
   targets were restored.
 * For a schema-loaded database, drop the target tables and run the defining
   migrations ([embedding](embedding.md)).
-
-## 14. A field alias that shadows a source column
-
-**Trigger:** an aggregate whose field alias is the name of a source column
-another field aggregates, e.g.
-`SELECT grp, SUM(val) AS val, MIN(val) AS lo …`. `lo` then reads as
-`MIN(SUM(val))`.
-
-**Effect:** define accepts it, but every build attempt fails. The transform
-stays `waiting_to_backfill` forever, with no reason on status. No wrong data
-is written, but the target never fills.
-
-**Detected?** Warn logs only.
-
-**Planned work:** #695 is open, with no fix yet.
-
-**Repair:** `DROP TRANSFORM`, then define it again with an alias that doesn't
-shadow a source column.
 
 ## 15. A from-side change pending across a to-side `TRUNCATE`
 

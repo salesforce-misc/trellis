@@ -452,6 +452,22 @@ fn substitute_field_aliases(
         }
         Expr::FunctionCall { name, args } => {
             charge_budget(budget, 1)?;
+            // An aggregate's argument reads source columns, never another
+            // aggregate field by alias (SQL's rule; see
+            // `validate::aggregate_field_names`). `SUM(val) AS val,
+            // MIN(val) AS lo` must stay `MIN(val)` over the source column,
+            // not nest into `MIN(SUM(val))`.
+            let aggregate_scope;
+            let fields_by_name = if super::registry::lookup_aggregate_function(name).is_some() {
+                let aggregates = super::validate::aggregate_field_names(
+                    fields_by_name.iter().map(|(n, e)| (*n, *e)),
+                );
+                aggregate_scope =
+                    super::validate::without_aggregate_fields(fields_by_name, &aggregates);
+                &aggregate_scope
+            } else {
+                fields_by_name
+            };
             let args = args
                 .iter()
                 .map(|arg| {
@@ -2754,6 +2770,45 @@ mod tests {
         let def = def_with(vec![field("price", col("price"))]);
         let out = substitute_all_fields(&def).expect("no cycle");
         assert_eq!(render_expr_sql(&out[0]), r#""price""#);
+    }
+
+    /// Issue #695: inside an aggregate's argument, the name of another
+    /// aggregate field is the source column (SQL's rule), so `MIN(val)` after
+    /// `SUM(val) AS val` is not inlined into `MIN(SUM(val))`. Outside an
+    /// aggregate's argument the name is still the field.
+    #[test]
+    fn substitute_reads_a_source_column_in_an_aggregate_argument() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
+             MIN(val) AS lo, MAX(val) + 1 AS hi, val + COUNT(*) AS mean",
+        )
+        .expect("parse");
+        let out = substitute_all_fields(&def).expect("no cycle");
+        let sql: Vec<String> = out.iter().map(render_expr_sql).collect();
+        assert_eq!(sql[2], r#"min("val")"#);
+        assert_eq!(sql[3], r#"(max("val") + 1::numeric)"#);
+        assert_eq!(
+            sql[4], r#"(sum("val") + count(*))"#,
+            "a name outside an aggregate's argument still inlines the field"
+        );
+    }
+
+    /// An aggregate argument still reads a field that isn't an aggregate:
+    /// `(id + 1) AS adj, SUM(adj)`.
+    #[test]
+    fn substitute_still_inlines_a_non_aggregate_field_into_an_aggregate_argument() {
+        let def = def_with(vec![
+            field("adj", add(col("a"), Expr::NumberLiteral("1".to_string()))),
+            field(
+                "t",
+                Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![col("adj")],
+                },
+            ),
+        ]);
+        let out = substitute_all_fields(&def).expect("no cycle");
+        assert_eq!(render_expr_sql(&out[1]), r#"sum(("a" + 1::numeric))"#);
     }
 
     /// A cyclic alias chain (`a = b + 1, b = a + 1`) must fall back to the ring

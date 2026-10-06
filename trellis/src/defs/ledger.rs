@@ -659,6 +659,25 @@ mod tests {
         );
     }
 
+    /// Issue #695: a field named after a source column that another field
+    /// aggregates doesn't change what the other aggregates read.
+    #[test]
+    fn a_field_named_like_a_source_column_shares_the_source_columns_ledger_column() {
+        let (contribs, substituted, group_by) = plan(
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, SUM(val) AS val, MIN(val) AS lo, \
+             MAX(val) AS hi",
+        );
+        assert_eq!(args(&contribs), vec![("__arg0", &col("val"))]);
+        assert_eq!(
+            super::super::oracle::render_expr_sql(&over_ledger(
+                &substituted["lo"],
+                &contribs,
+                &group_by
+            )),
+            r#"min("__arg0")"#
+        );
+    }
+
     #[test]
     fn a_relationship_group_key_outside_an_aggregate_reads_its_ledger_column() {
         let (contribs, substituted, group_by) = plan(

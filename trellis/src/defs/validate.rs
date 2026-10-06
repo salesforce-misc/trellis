@@ -263,6 +263,13 @@ pub enum ValidationError {
     /// down to one value before it can appear in the target, and a bare
     /// reference to a non-grouping-key source column doesn't do that.
     UngroupedColumnReference { field: String, column: String },
+    /// A field's aggregate call takes, as its argument, the name of another
+    /// field that is itself an aggregate (`SUM(x) AS total, MAX(total)`), and
+    /// no source column has that name. A name in an aggregate's argument
+    /// resolves to a source column, never to an aggregate field, so there is
+    /// nothing for it to read; reading the field would nest one aggregate in
+    /// another.
+    AggregateOfAggregateField { field: String, reference: String },
     /// An [`super::ast::KeySpace::Aggregate`] definition has a calculated
     /// field whose name matches one of its grouping columns, but whose
     /// expression isn't a bare passthrough of that same column (e.g.
@@ -822,6 +829,12 @@ impl fmt::Display for ValidationError {
                  SUM/MIN/MAX/AVG; a non-grouping-key column must be aggregated, not referenced \
                  bare"
             ),
+            ValidationError::AggregateOfAggregateField { field, reference } => write!(
+                f,
+                "calculated field '{field}' aggregates '{reference}', which is another \
+                 aggregate field, not a source column; an aggregate's argument can't be \
+                 another aggregate (use the source column the aggregate reads instead)"
+            ),
             ValidationError::GroupingColumnFieldMustBePassthrough { field } => write!(
                 f,
                 "calculated field '{field}' shares its name with a GROUP BY column, so it must \
@@ -1207,10 +1220,30 @@ pub fn validate(
         }
     }
 
+    let aggregates = aggregate_field_names(def.fields.iter().map(|f| (f.name.as_str(), &f.expr)));
     let mut deps: HashMap<&str, Vec<String>> = HashMap::with_capacity(def.fields.len());
     for field in &def.fields {
         let mut refs = Vec::new();
-        collect_columns(&field.expr, &mut refs);
+        let mut aggregate_args = Vec::new();
+        collect_reads(
+            &field.expr,
+            &aggregates,
+            false,
+            &mut refs,
+            &mut aggregate_args,
+        );
+        // Inside an aggregate's argument, the name of an aggregate field is a
+        // source column. When it isn't one, the argument would nest an
+        // aggregate in an aggregate.
+        if let Some(reference) = aggregate_args
+            .into_iter()
+            .find(|name| !source_columns.contains_key(name))
+        {
+            return Err(ValidationError::AggregateOfAggregateField {
+                field: field.name.clone(),
+                reference,
+            });
+        }
 
         let mut calc_deps = Vec::new();
         for column in refs {
@@ -1527,6 +1560,111 @@ pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 collect_columns(arg, out);
+            }
+        }
+    }
+}
+
+/// Whether `expr` contains an aggregate call (`SUM`, `COUNT`, ...).
+fn has_aggregate_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            super::registry::lookup_aggregate_function(name).is_some()
+                || args.iter().any(has_aggregate_call)
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => has_aggregate_call(lhs) || has_aggregate_call(rhs),
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::RelationshipPath { .. } => false,
+    }
+}
+
+/// The names of the calculated fields whose value is an aggregate: the ones
+/// that contain an aggregate call, and the ones that read another such field
+/// by name, however indirectly.
+///
+/// An aggregate's argument never reads one of these by name. Folding an
+/// aggregate's value is not something another aggregate can do, so a name
+/// that matches one of them inside an aggregate's argument is a source
+/// column, as in SQL: `SUM(val) AS val, MIN(val) AS lo` takes the minimum of
+/// the source column `val`, not of the sum. A field that is not an aggregate
+/// (`(id + 1) AS adj, SUM(adj)`) is still read by name there.
+pub(crate) fn aggregate_field_names<'a>(
+    fields: impl IntoIterator<Item = (&'a str, &'a Expr)>,
+) -> HashSet<&'a str> {
+    let fields: Vec<(&str, &Expr)> = fields.into_iter().collect();
+    let mut aggregates: HashSet<&str> = fields
+        .iter()
+        .filter(|(_, expr)| has_aggregate_call(expr))
+        .map(|(name, _)| *name)
+        .collect();
+    loop {
+        let mut grew = false;
+        for (name, expr) in &fields {
+            if aggregates.contains(name) {
+                continue;
+            }
+            let mut reads = Vec::new();
+            collect_columns(expr, &mut reads);
+            if reads
+                .iter()
+                .any(|read| read != name && aggregates.contains(read.as_str()))
+            {
+                aggregates.insert(name);
+                grew = true;
+            }
+        }
+        if !grew {
+            return aggregates;
+        }
+    }
+}
+
+/// `fields` without the aggregate fields: what an aggregate's argument can
+/// read by name (see [`aggregate_field_names`]).
+pub(crate) fn without_aggregate_fields<'a, V: Copy>(
+    fields: &HashMap<&'a str, V>,
+    aggregates: &HashSet<&str>,
+) -> HashMap<&'a str, V> {
+    fields
+        .iter()
+        .filter(|(name, _)| !aggregates.contains(**name))
+        .map(|(name, value)| (*name, *value))
+        .collect()
+}
+
+/// [`collect_columns`] split by what each column name resolves to. `fields`
+/// gets the names read as another calculated field or as a source column
+/// (the caller tells them apart); `aggregate_args` gets the names that sit
+/// in an aggregate's argument and match an aggregate field, which resolve to
+/// source columns (see [`aggregate_field_names`]).
+pub(crate) fn collect_reads(
+    expr: &Expr,
+    aggregates: &HashSet<&str>,
+    in_aggregate_arg: bool,
+    fields: &mut Vec<String>,
+    aggregate_args: &mut Vec<String>,
+) {
+    match expr {
+        Expr::Column(name) if in_aggregate_arg && aggregates.contains(name.as_str()) => {
+            aggregate_args.push(name.clone());
+        }
+        Expr::Column(name) => fields.push(name.clone()),
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::RelationshipPath { .. } => {}
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_reads(lhs, aggregates, in_aggregate_arg, fields, aggregate_args);
+            collect_reads(rhs, aggregates, in_aggregate_arg, fields, aggregate_args);
+        }
+        Expr::FunctionCall { name, args } => {
+            let in_arg =
+                in_aggregate_arg || super::registry::lookup_aggregate_function(name).is_some();
+            for arg in args {
+                collect_reads(arg, aggregates, in_arg, fields, aggregate_args);
             }
         }
     }
@@ -2081,6 +2219,17 @@ fn infer_expr(
             let aggregate_spec = super::registry::lookup_aggregate_function(name);
             let is_aggregate = aggregate_spec.is_some();
             let spec = super::registry::lookup_function(name).or(aggregate_spec);
+            // An aggregate's argument reads source columns, not aggregate
+            // fields (see `aggregate_field_names`).
+            let aggregate_scope;
+            let fields_by_name = if is_aggregate {
+                let aggregates =
+                    aggregate_field_names(fields_by_name.iter().map(|(n, f)| (*n, &f.expr)));
+                aggregate_scope = without_aggregate_fields(fields_by_name, &aggregates);
+                &aggregate_scope
+            } else {
+                fields_by_name
+            };
             let Some(spec) = spec else {
                 for arg in args {
                     infer_expr(
@@ -4238,5 +4387,80 @@ mod tests {
         );
         let d = parsed("TRANSFORM t FROM s SELECT char_length(title) AS n");
         assert_eq!(collation_refusing_function_reads(&d), vec![]);
+    }
+
+    /// Issue #695: inside an aggregate's argument, a field's name that matches
+    /// a source column reads the source column, so the definition validates
+    /// and `lo` has the source column's type, not the sum's.
+    #[test]
+    fn an_aggregate_argument_reads_the_source_column_not_a_field_of_that_name() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
+             COUNT(*) AS row_count, MIN(val) AS lo, MAX(val) AS hi",
+        );
+        let int4 = ValueType::Integer(crate::integer::IntWidth::Int4);
+        let source_columns = HashMap::from([
+            ("grp".to_string(), ValueType::Text),
+            ("val".to_string(), int4),
+        ]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+        assert_eq!(types["lo"], int4, "MIN of the int4 source column");
+        assert_eq!(
+            types["val"],
+            ValueType::Integer(crate::integer::IntWidth::Int8),
+            "SUM of an int4 is an int8"
+        );
+    }
+
+    /// A name that is no source column and names another aggregate field
+    /// would nest an aggregate: refused, not left to fail every build.
+    #[test]
+    fn an_aggregate_of_another_aggregate_field_is_rejected() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS total, \
+             MAX(total) AS biggest",
+        );
+        let source_columns = numeric_columns(&["grp", "val"]);
+        assert_eq!(
+            validate(&d, &source_columns, &HashMap::new()),
+            Err(ValidationError::AggregateOfAggregateField {
+                field: "biggest".to_string(),
+                reference: "total".to_string(),
+            })
+        );
+        // Through a field that reads one: `double` is an aggregate too.
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS total, \
+             total + total AS double, MAX(double) AS biggest",
+        );
+        assert!(matches!(
+            validate(&d, &source_columns, &HashMap::new()),
+            Err(ValidationError::AggregateOfAggregateField { .. })
+        ));
+    }
+
+    /// An aggregate argument still reads a field that isn't an aggregate.
+    #[test]
+    fn an_aggregate_argument_still_reads_a_non_aggregate_field() {
+        let d = def(vec![
+            FieldDef {
+                name: "adj".to_string(),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(col("id")),
+                    rhs: Box::new(Expr::NumberLiteral("1".to_string())),
+                },
+            },
+            FieldDef {
+                name: "t".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![col("adj")],
+                },
+            },
+        ]);
+        let source_columns = numeric_columns(&["id"]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 }

@@ -804,9 +804,20 @@ impl AliasReaders {
     pub fn of(def: &TransformDef) -> Self {
         let names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
         let mut readers: HashMap<String, Vec<String>> = HashMap::new();
+        let aggregates = super::validate::aggregate_field_names(
+            def.fields.iter().map(|f| (f.name.as_str(), &f.expr)),
+        );
         for field in &def.fields {
+            // A name in an aggregate's argument that matches an aggregate
+            // field is a source column, not a read of that field.
             let mut columns = Vec::new();
-            super::validate::collect_columns(&field.expr, &mut columns);
+            super::validate::collect_reads(
+                &field.expr,
+                &aggregates,
+                false,
+                &mut columns,
+                &mut Vec::new(),
+            );
             for column in columns {
                 if column != field.name && names.contains(column.as_str()) {
                     let entry = readers.entry(column).or_default();
@@ -1461,6 +1472,7 @@ fn eval_aggregate_expr(
         // here: a `GROUP BY` group always has at least one row).
         Expr::FunctionCall { name, args } if name == "COUNT" && args.len() == 1 => {
             let relationships = RelationshipContext::default();
+            let fields_by_name = &aggregate_argument_scope(fields_by_name);
             let mut count: i64 = 0;
             for row in rows {
                 let mut per_row_cache = HashMap::new();
@@ -1561,6 +1573,19 @@ fn eval_row_scalar(
     }
 }
 
+/// The fields an aggregate's argument can read by name: `fields_by_name`
+/// without the aggregate fields, whose names mean source columns there (see
+/// [`super::validate::aggregate_field_names`]).
+#[cfg(any(test, feature = "test-util"))]
+fn aggregate_argument_scope<'a>(
+    fields_by_name: &HashMap<&'a str, &'a FieldDef>,
+) -> HashMap<&'a str, &'a FieldDef> {
+    let aggregates = super::validate::aggregate_field_names(
+        fields_by_name.iter().map(|(name, f)| (*name, &f.expr)),
+    );
+    super::validate::without_aggregate_fields(fields_by_name, &aggregates)
+}
+
 #[cfg(any(test, feature = "test-util"))]
 /// Folds `SUM`/`MIN`/`MAX`/`AVG` over `arg_expr` evaluated against every row
 /// in the group, matching Postgres's NULL handling for these aggregates: a
@@ -1588,6 +1613,7 @@ fn fold_aggregate(
     // to-many relationship's aggregate-wrapped enrichment); a bare path in an
     // aggregate argument therefore errors as unknown, defense-in-depth.
     let relationships = RelationshipContext::default();
+    let fields_by_name = &aggregate_argument_scope(fields_by_name);
 
     // Issue #115: `JSONB_AGG` folds *rows*, not non-NULL values — see
     // `eval_to_many_aggregate`'s matching branch and `crate::jsonb`'s module
@@ -4071,5 +4097,35 @@ mod tests {
                 "got {err:?}"
             );
         }
+    }
+
+    /// Issue #695: an aggregate's argument reads the source column when a
+    /// field of the same name is itself an aggregate, so `MIN(val)` after
+    /// `SUM(val) AS val` is the minimum of the rows, not of the sum.
+    #[test]
+    fn an_aggregate_argument_reads_the_source_column_not_a_field_of_that_name() {
+        let d = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
+             COUNT(*) AS row_count, MIN(val) AS lo, MAX(val) AS hi, COUNT(val) AS seen",
+        )
+        .expect("parse");
+        let rows = vec![
+            row(&[("grp", Some("1")), ("val", Some("5"))]),
+            row(&[("grp", Some("1")), ("val", Some("7"))]),
+            row(&[("grp", Some("1")), ("val", Some("2"))]),
+        ];
+        let result = evaluate_aggregate(
+            &d,
+            &rows,
+            &numeric_types(&["grp", "val"]),
+            &mut RegexCache::new(),
+        )
+        .unwrap();
+        let text = |field: &str| result[field].as_ref().unwrap().to_string();
+        assert_eq!(text("val"), "14");
+        assert_eq!(text("row_count"), "3");
+        assert_eq!(text("lo"), "2");
+        assert_eq!(text("hi"), "7");
+        assert_eq!(text("seen"), "3");
     }
 }
