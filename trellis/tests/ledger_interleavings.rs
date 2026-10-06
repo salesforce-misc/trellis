@@ -595,23 +595,40 @@ async fn a_rederive_absorbed_update_leaves_an_older_capture_skippable_only_by_vi
 /// truncate's; applied, it would bring back a row the source no longer has.
 /// On either ledger the key's Apply would write its entry in the lock's
 /// insert (#623 D6, #775), so that insert must check the floor itself.
+///
+/// The refused change leaves no entry behind (#774): the lock's insert gave
+/// its key a placeholder, which nothing then writes, and which the
+/// tombstone GC would never collect.
 async fn a_change_from_before_a_truncate_does_not_come_back(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
     write(&d, "truncate public.src").await;
     d.settle().await;
     assert_eq!(d.rows(flavour.actual()).await, Vec::<String>::new());
 
+    stage_pre_truncate_insert(&d, "1", r#"{"id":"1","g":"1","v":"10"}"#).await;
+    assert_oracle(&mut d, flavour).await;
+    assert_eq!(
+        d.rows(&format!("select __from_key from {}", flavour.ledger()))
+            .await,
+        Vec::<String>::new(),
+        "the refused change left an entry behind"
+    );
+}
+
+/// Stages an insert of `key` with `image` at `lsn` 1, below any truncate's
+/// floor: a change from before the truncate that reaches a page after it.
+async fn stage_pre_truncate_insert(d: &Driver, key: &str, image: &str) {
     let mut client = d.pool().get().await.expect("pool");
     let txn = client.transaction().await.expect("begin");
     trellis::staging::append(
         &txn,
         &[StagedChange::Cdc {
             src_table: SRC.to_string(),
-            key: "1".to_string(),
+            key: key.to_string(),
             op: CdcOp::Insert,
             lsn: Some(PgLsn::from(1)),
             old_image: None,
-            new_image: Some(r#"{"id":"1","g":"1","v":"10"}"#.to_string()),
+            new_image: Some(image.to_string()),
             origin_lsn: None,
             src_changed: None,
             hop_gen: 0,
@@ -621,8 +638,6 @@ async fn a_change_from_before_a_truncate_does_not_come_back(flavour: Flavour) {
     .await
     .expect("stage the pre-truncate change");
     txn.commit().await.expect("commit");
-    drop(client);
-    assert_oracle(&mut d, flavour).await;
 }
 
 #[tokio::test]
@@ -638,6 +653,88 @@ async fn a_change_from_before_a_truncate_does_not_bring_back_an_aggregate_entry(
 #[tokio::test]
 async fn a_change_from_before_a_truncate_does_not_bring_back_a_min_max_entry() {
     a_change_from_before_a_truncate_does_not_come_back(Flavour::AggregateMinMax).await;
+}
+
+/// A truncate and an insert in one source transaction (#774). The truncate
+/// floor refuses every change at or below the truncate's ring `lsn`, so the
+/// insert applies only because its `lsn` is strictly above the truncate's.
+/// Each trigger reads `pg_current_wal_insert_lsn()`, and the truncate's
+/// trigger then writes its own ring row, which moves the insert position on
+/// before the insert's trigger reads it.
+async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_insert(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
+    write(
+        &d,
+        "begin; truncate public.src; insert into public.src values (7, 1, 70); commit",
+    )
+    .await;
+    let ring: Vec<String> = (0..4)
+        .map(|slot| format!("select op, key, lsn from {DEFAULT_SCHEMA}.seg_{slot}"))
+        .collect();
+    assert_eq!(
+        d.rows(&format!(
+            "select t.lsn < i.lsn from ({ring}) t, ({ring}) i \
+             where t.op = 'truncate' and i.op = 'insert' and i.key = '7'",
+            ring = ring.join(" union all ")
+        ))
+        .await,
+        ["(t)"],
+        "the insert's lsn is strictly above the truncate's"
+    );
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_one_to_one_row() {
+    a_truncate_then_an_insert_in_one_transaction_keeps_the_insert(Flavour::OneToOne).await;
+}
+
+#[tokio::test]
+async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_aggregate_entry() {
+    a_truncate_then_an_insert_in_one_transaction_keeps_the_insert(Flavour::Aggregate).await;
+}
+
+/// A folded truncate with no ring `lsn` could raise no truncate floor, so a
+/// change from before it could apply over it later (#774). None reaches the
+/// drain (the capture trigger stamps every truncate row, and
+/// `StagedChange::Truncate` requires an `lsn`), and if one did, Phase 2
+/// fails with a halting error naming the table rather than planning a clear
+/// with no floor.
+#[tokio::test]
+async fn a_truncate_without_an_lsn_halts_instead_of_clearing_without_a_floor() {
+    let d = start(Flavour::OneToOne, &[(1, 1, 10)]).await;
+    let truncate = trellis::staging::FoldedChange {
+        src_table: SRC.to_string(),
+        key: trellis::staging::TRUNCATE_SENTINEL_KEY.to_string(),
+        new_image: None,
+        old_image: None,
+        src_changed: None,
+        origin_lsn: None,
+        lsn: None,
+        hop_gen: 0,
+        first_seen: std::time::SystemTime::now(),
+        group_key: None,
+        is_truncate: true,
+        relationship_reverse_deferred: None,
+        retry_count: 0,
+        prior_image: None,
+        row_count: 1,
+        has_recompute: false,
+        ends_in_delete: false,
+        last_change: None,
+        to_col_values: Vec::new(),
+    };
+    let err = apply::compute(d.pool(), &[truncate])
+        .await
+        .expect_err("a truncate with no lsn must not plan a clear");
+    assert!(
+        matches!(&err, apply::ApplyError::TruncateWithoutLsn { src_table } if src_table == SRC),
+        "{err:?}"
+    );
+    assert_eq!(
+        trellis::staging::quarantine::classify(&err),
+        trellis::staging::quarantine::FailureClass::Halting
+    );
 }
 
 // ----------------------------------------------------------------- exp 2, 10
@@ -2906,6 +3003,25 @@ async fn a_to_side_truncate_racing_a_child_group_key() {
     a_to_side_truncate_racing_a_child(RelFlavour::GroupKey).await;
 }
 
+/// A change from before a source truncate on a target that reads a
+/// relationship, where a new key's entry is a non-member placeholder the
+/// page's statement then writes. The floor refuses the change, and its
+/// placeholder doesn't outlive the page (#774).
+#[tokio::test]
+async fn a_change_from_before_a_truncate_leaves_no_entry_on_a_relationship_target() {
+    let flavour = RelFlavour::Field;
+    let mut d = start_rel(flavour).await;
+    write(&d, "truncate public.src").await;
+    d.settle().await;
+    stage_pre_truncate_insert(&d, "9", r#"{"id":"9","g":"1","p":"1"}"#).await;
+    assert_rel_oracle(&mut d, flavour).await;
+    assert_eq!(
+        d.rows("select __from_key from public.agg__ledger").await,
+        Vec::<String>::new(),
+        "the refused change left an entry behind"
+    );
+}
+
 /// #784: a parent born and deleted inside one batch, which a child read
 /// while it lived. Child 1 moves to group 3 and onto parent 5, which doesn't
 /// exist yet, and its batch drains after parent 5 is inserted, so its Apply
@@ -3044,9 +3160,10 @@ async fn a_parent_rekeyed_through_a_childs_key_inside_one_batch() {
 /// fold into a tombstone), beside the keys it reads and updates (`$9`): an
 /// existing key moving groups, an existing key deleted, a new key's
 /// Re-derive on its placeholder, and a change from before a truncate that
-/// gets a placeholder at the floor and is refused. The target must equal
-/// the oracle, so each fresh record's move equals the entry its insert
-/// wrote, and the two key lists stay aligned with the records.
+/// gets a placeholder at the floor and is refused, which leaves no entry
+/// (#774). The target must equal the oracle, so each fresh record's move
+/// equals the entry its insert wrote, and the two key lists stay aligned
+/// with the records.
 async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10)]).await;
     write(&d, "truncate public.src").await;
@@ -3069,27 +3186,7 @@ async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle(flavour: Flavour
     )
     .await;
     d.stage_recomputes(SRC, &["8"]).await;
-    let mut client = d.pool().get().await.expect("pool");
-    let txn = client.transaction().await.expect("begin");
-    trellis::staging::append(
-        &txn,
-        &[StagedChange::Cdc {
-            src_table: SRC.to_string(),
-            key: "9".to_string(),
-            op: CdcOp::Insert,
-            lsn: Some(PgLsn::from(1)),
-            old_image: None,
-            new_image: Some(r#"{"id":"9","g":"1","v":"90"}"#.to_string()),
-            origin_lsn: None,
-            src_changed: None,
-            hop_gen: 0,
-            group_key: None,
-        }],
-    )
-    .await
-    .expect("stage the pre-truncate change");
-    txn.commit().await.expect("commit");
-    drop(client);
+    stage_pre_truncate_insert(&d, "9", r#"{"id":"9","g":"1","v":"90"}"#).await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     let entries: Vec<String> = d
@@ -3111,7 +3208,6 @@ async fn a_page_mixing_fresh_and_read_entries_equals_the_oracle(flavour: Flavour
             "(6:true:true:false)",
             "(7:true:false:true)",
             "(8:false:true:false)",
-            "(9:false:false:false)",
         ],
         "each key's entry: applied, member, tombstone"
     );

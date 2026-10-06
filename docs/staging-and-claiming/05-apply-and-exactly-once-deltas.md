@@ -224,7 +224,10 @@ pass:
    if the I2 test above passes; it
    then sets `__applied_lsn`. Either raises `__applied_seg` and marks a
    tombstone when the key has no row after it. The statement returns the keys
-   it changed.
+   it changed. A placeholder step 1 inserted that neither step wrote (an
+   Apply at or below the truncate floor, or a Re-derive that was re-staged)
+   is deleted in the same transaction (#774): it holds no ordering state, so
+   I2 treats it as no entry, and the tombstone GC collects only tombstones.
 4. **The target rows** of exactly those keys are upserted or deleted.
 
 Why that converges: an Apply the test refuses is already reflected by a
@@ -347,6 +350,9 @@ five steps:
    - An Apply writes the entry from the record's new image, or makes a tombstone
      for a delete. It sets `__applied_lsn` to the change's `lsn`, and only if
      the I2 test passes (as on a 1-1 target, [above](#absolute-writes-do-not-commute-the-1-1-ledger)).
+   - An Apply at or below the truncate floor that step 1 gave a placeholder
+     deletes it instead (#774), as on a 1-1 target: nothing else would write
+     it, and the tombstone GC collects only tombstones.
 
    The statement then sums each updated entry's move from its old state to its
    new one into per-group increments: the member count, and per argument its

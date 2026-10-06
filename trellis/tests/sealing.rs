@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, IsolationLevel, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{StagedChange, StagingError, TRUNCATE_SENTINEL_KEY, seal};
@@ -50,8 +51,8 @@ async fn insert_truncate(client: &Client, table: &str) {
     client
         .execute(
             &format!(
-                "insert into {table} (src_table, key, op, hop_gen) \
-                 values ('orders', $1, 'truncate', 0)"
+                "insert into {table} (src_table, key, op, lsn, hop_gen) \
+                 values ('orders', $1, 'truncate', pg_current_wal_insert_lsn(), 0)"
             ),
             &[&TRUNCATE_SENTINEL_KEY],
         )
@@ -1039,7 +1040,7 @@ async fn a_truncate_bearing_batch_seals_single_bucket_with_has_truncate_set() {
 fn truncate_change() -> StagedChange {
     StagedChange::Truncate {
         src_table: "orders".to_string(),
-        lsn: None,
+        lsn: PgLsn::from(1),
         origin_lsn: None,
         src_changed: None,
     }

@@ -907,7 +907,7 @@ async fn a_to_side_change_after_the_refresh_applies_its_image_unchecked() {
 fn customers_truncate(lsn: PgLsn) -> StagedChange {
     StagedChange::Truncate {
         src_table: "public.customers".to_string(),
-        lsn: Some(lsn),
+        lsn,
         origin_lsn: None,
         src_changed: None,
     }

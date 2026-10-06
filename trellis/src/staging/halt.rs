@@ -2,8 +2,9 @@
 //!
 //! A halting failure is structural, not one row's fault: a key the drain
 //! can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a propagation
-//! wave past the hop bound (`HopBoundExceeded`), or an aggregate target off
-//! the ledger (`AggregateOffLedger`). Every key it touches reproduces it, so
+//! wave past the hop bound (`HopBoundExceeded`), an aggregate target off
+//! the ledger (`AggregateOffLedger`), or a truncate with no ring `lsn`
+//! (`TruncateWithoutLsn`). Every key it touches reproduces it, so
 //! retrying the page re-fails it forever, and quarantining a key blames one
 //! for nobody's fault. Instead [`halt_closure`] pauses the definitions the
 //! failure reaches, and the drain retries the page without them:
@@ -11,8 +12,9 @@
 //! - every definition that reads the halting table, as its source or as a
 //!   relationship's to-side (`capture::columns::readers_of`). For a hop
 //!   bound, the halting tables are those the wave ran away through, so their
-//!   readers are the cycle's definitions. For an aggregate off the ledger,
-//!   it's the definition that writes that target;
+//!   readers are the cycle's definitions. For a truncate with no `lsn`, it
+//!   is the truncated table. For an aggregate off the ledger, it's the
+//!   definition that writes that target;
 //! - and everything downstream of them, so no hop target goes quietly stale.
 //!
 //! Each is paused like a capture failure (`capture_failures`, with `kind`
@@ -56,6 +58,7 @@ fn seed(err: &ApplyError) -> Option<Seed> {
             Some(Seed::Tables(vec![source_table.clone()]))
         }
         ApplyError::HopBoundExceeded { tables, .. } => Some(Seed::Tables(tables.clone())),
+        ApplyError::TruncateWithoutLsn { src_table } => Some(Seed::Tables(vec![src_table.clone()])),
         ApplyError::AggregateOffLedger { target } => Some(Seed::Target(target.clone())),
         _ => None,
     }
@@ -204,6 +207,19 @@ mod tests {
 
     fn tables(tables: &[&str]) -> Seed {
         Seed::Tables(tables.iter().map(|t| t.to_string()).collect())
+    }
+
+    /// A truncate with no `lsn` (#774) halts every definition reading the
+    /// truncated table.
+    #[test]
+    fn a_truncate_without_an_lsn_seeds_its_table() {
+        let err = ApplyError::TruncateWithoutLsn {
+            src_table: "public.posts".to_string(),
+        };
+        match seed(&err) {
+            Some(Seed::Tables(tables)) => assert_eq!(tables, ["public.posts"]),
+            _ => panic!("a truncate without an lsn seeds its table"),
+        }
     }
 
     /// A key seed reaches the table's direct reader, the definition reading

@@ -72,7 +72,10 @@
 //!    - either raises `applied_seg` only on an entry it leaves a tombstone
 //!      (`schema::tombstone_seg_sql`, #775);
 //!    - an entry step 1 wrote with its change is left as it is, and moves
-//!      into its group from no entry at all.
+//!      into its group from no entry at all;
+//!    - a placeholder step 1 gave an Apply at or below the truncate floor is
+//!      deleted (#774): nothing writes it, and the tombstone GC collects only
+//!      tombstones.
 //! 4. The recomputed fields of every group the page kept are rewritten from
 //!    its live entries.
 //! 5. Groups whose every accumulator reached 0 are deleted.
@@ -1211,6 +1214,16 @@ fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
 /// `old` and `upd` read the ledger only through `$9`'s keys, and the
 /// statement runs under [`ENTRY_PLAN_SETTINGS`] (#778).
 ///
+/// `gone` deletes the placeholders of the Applies at or below the truncate
+/// floor (#774): [`lock_entries`] inserted them, and `upd` refuses their
+/// change, so nothing would write them, and the tombstone GC collects only
+/// tombstones. A placeholder has no `applied_lsn` and no `basis`, so the
+/// floor is the only part of I2 that can refuse a change to it, which keeps
+/// `gone`'s rows and `upd`'s apart, and I2 treats it as it treats no entry
+/// at all, so deleting it changes no later change's outcome. Its keys come
+/// from `v`, so with no floor, or no change at or below it, it reads no
+/// entry.
+///
 /// The fresh entries are kept out of the ledger reads, not filtered out of
 /// them (#775): a page's every key may be fresh, and a read of the ledger
 /// joined against a list of them is a plan the planner can get wrong while
@@ -1250,6 +1263,15 @@ fn ledger_statement(
         "with {ctes}, \
          {old}, \
          fl as (select floor from ledger_truncate_floor where target_table = $8), \
+         gone as ( \
+             delete from {ledger} l \
+             where l.{key} = any(array( \
+                       select v.__k from v \
+                       where not v.__fresh and not v.__rederive \
+                         and v.__lsn <= (select floor from fl))) \
+               and l.{applied} is null and l.{basis} is null \
+               and not l.{member} and not l.{tombstone} \
+         ), \
          upd as ( \
              update {ledger} l set {set_values}, \
                  {member} = v.__present, {tombstone} = not v.__present, \
@@ -2417,11 +2439,13 @@ pub async fn explain_page(
 
 /// Empties a ledger target for a source `TRUNCATE` (the D split's Q6),
 /// with its group deltas (#625 F1's B4), and raises its truncate floor to
-/// `lsn`, the truncate's ring `lsn`. The caller clears the group rows.
+/// `lsn`, the truncate's ring `lsn`. The caller clears the group rows. `lsn`
+/// is required, as for a 1-1 target
+/// (`super::one_to_one_ledger::truncate`, #774).
 pub(super) async fn truncate_ledger(
     txn: &Transaction<'_>,
     target: &str,
-    lsn: Option<PgLsn>,
+    lsn: PgLsn,
 ) -> Result<(), ApplyError> {
     txn.batch_execute(&format!(
         "truncate {}",
@@ -2433,15 +2457,13 @@ pub(super) async fn truncate_ledger(
         &ddl::qualified_target_table_ident(&schema::deltas_table_name(target)),
     )
     .await?;
-    if let Some(lsn) = lsn {
-        txn.execute(
-            "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
-             on conflict (target_table) do update \
-             set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
-            &[&target, &lsn],
-        )
-        .await?;
-    }
+    txn.execute(
+        "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
+         on conflict (target_table) do update \
+         set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
+        &[&target, &lsn],
+    )
+    .await?;
     Ok(())
 }
 

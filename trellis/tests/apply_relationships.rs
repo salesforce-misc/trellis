@@ -1046,17 +1046,16 @@ async fn reverse_recompute_fan_in_keeps_the_earliest_src_changed() {
     drain_to_quiescence(&db.pool, &mut client).await;
 }
 
-/// A Re-derive of a relationship-enriched 1-1 key reads its row in Phase 3
-/// (#623 D6), but the related rows are only loaded in Phase 2. When the row
-/// read now joins through a parent Phase 2 didn't load, the key can be
-/// neither written from a stale parent nor dropped: it is re-staged as a
-/// recompute instead.
-#[tokio::test]
-async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
+/// `articles` and `categories` (10 'Tech', 20 'Sci'), the to-one
+/// relationship `category`, and the live 1-1 target `article_cat` reading
+/// `category.name`, with its settled parent projection. Then batch 1:
+/// article 1, inserted pointing at 'Tech', and a Re-derive of it, folded and
+/// computed (Phase 2 loads 'Tech') but not applied. Returns batch 1 and its
+/// plan.
+async fn a_computed_rederive_of_an_article(
+    db: &testkit::TestDatabase,
+    client: &mut Client,
+) -> (i64, apply::ApplyPlan) {
     client
         .batch_execute(
             "create table categories (id integer primary key, name text); \
@@ -1096,7 +1095,7 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
     )
     .await
     .expect("create target table");
-    drain_to_quiescence(&db.pool, &mut client).await;
+    drain_to_quiescence(&db.pool, client).await;
     let projection_table = projection_table_name(&db.pool, relationship.id).await;
     client
         .batch_execute(&format!(
@@ -1107,8 +1106,6 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
         .await
         .expect("settle the parent projection");
 
-    // Batch 1: article 1 is inserted pointing at 'Tech', and a Re-derive of
-    // it is computed (Phase 2 loads 'Tech') but not applied.
     client
         .execute(
             "insert into articles (id, category_id, title) values (1, 10, 'a1')",
@@ -1116,8 +1113,8 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
         )
         .await
         .expect("insert article");
-    stage_cdc(&client, "articles", "1", "recompute", None, None).await;
-    let seg1 = seal_active_segment(&mut client).await;
+    stage_cdc(client, "articles", "1", "recompute", None, None).await;
+    let seg1 = seal_active_segment(client).await;
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
     claim::claim(&txn, seg1, "slow_worker", 1)
@@ -1129,7 +1126,38 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
     let filter = share.filter(share.buckets());
     let folded = fold::fold(&txn, seg1, filter).await.expect("fold");
     txn.commit().await.expect("commit phase 1");
-    let stale_plan = apply::compute(&db.pool, &folded).await.expect("compute");
+    let plan = apply::compute(&db.pool, &folded).await.expect("compute");
+    (seg1, plan)
+}
+
+/// Runs batch `seg`'s Phase 3 with `plan`, in a transaction of its own.
+async fn apply_computed(db: &testkit::TestDatabase, seg: i64, plan: &apply::ApplyPlan) {
+    let mut client = db.pool.get().await.expect("connection");
+    let txn = client.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "slow_worker",
+        plan,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply the batch");
+    txn.commit().await.expect("commit phase 3");
+}
+
+/// A Re-derive of a relationship-enriched 1-1 key reads its row in Phase 3
+/// (#623 D6), but the related rows are only loaded in Phase 2. When the row
+/// read now joins through a parent Phase 2 didn't load, the key can be
+/// neither written from a stale parent nor dropped: it is re-staged as a
+/// recompute instead.
+#[tokio::test]
+async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let (seg1, stale_plan) = a_computed_rederive_of_an_article(&db, &mut client).await;
 
     // Batch 2: article 1 moves to 'Sci' and drains completely first.
     client
@@ -1162,19 +1190,7 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
     assert_eq!(target_to_one(&client).await, sci);
 
     // Batch 1's Phase 3 runs last.
-    let mut phase3_client = db.pool.get().await.expect("connection");
-    let txn = phase3_client.transaction().await.expect("begin phase 3");
-    apply::apply_and_mark_drained(
-        &txn,
-        seg1,
-        "slow_worker",
-        &stale_plan,
-        "trellis_apply_test",
-        &StagedWatermark::saturated(),
-    )
-    .await
-    .expect("apply batch 1");
-    txn.commit().await.expect("commit phase 3");
+    apply_computed(&db, seg1, &stale_plan).await;
 
     assert_eq!(
         target_to_one(&client).await,
@@ -1191,6 +1207,43 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
         .expect("free the ring slots batches 1 and 2 used");
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(target_to_one(&client).await, sci);
+    assert_eq!(target_to_one(&client).await, oracle_to_one(&client).await);
+}
+
+/// As above, but the key has no entry when its Re-derive is re-staged: its
+/// move to 'Sci' is in no batch yet. The entry lock gave it a placeholder,
+/// which the re-staged Re-derive leaves unwritten, and the tombstone GC
+/// never collects a placeholder, so the page must not leave it behind
+/// (#774).
+#[tokio::test]
+async fn a_restaged_rederive_of_a_key_with_no_entry_leaves_no_entry() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let (seg1, stale_plan) = a_computed_rederive_of_an_article(&db, &mut client).await;
+    client
+        .execute("update articles set category_id = 20 where id = 1", &[])
+        .await
+        .expect("re-point article");
+
+    apply_computed(&db, seg1, &stale_plan).await;
+
+    assert_eq!(
+        staged_recompute_count(&client, "articles", "1").await,
+        1,
+        "the Re-derive must re-stage its key rather than drop it"
+    );
+    let entries: i64 = client
+        .query_one("select count(*) from public.article_cat__ledger", &[])
+        .await
+        .expect("count the ledger's entries")
+        .get(0);
+    assert_eq!(entries, 0, "the re-staged Re-derive left an entry behind");
+    assert_eq!(target_to_one(&client).await, HashMap::new());
+    retire_drained_segments(&mut client)
+        .await
+        .expect("free batch 1's ring slot");
+    drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(target_to_one(&client).await, oracle_to_one(&client).await);
 }
 

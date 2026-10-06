@@ -816,20 +816,21 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
     );
 }
 
-/// The ordering hazard within a single source transaction: an insert and a
-/// truncate sharing one commit `lsn` are only distinguishable by
-/// `change_id` (capture's append order = execution order). A pre-truncate
-/// insert in the same transaction (lower `change_id`) must be voided; a
-/// post-truncate insert in the same transaction (higher `change_id`) must
-/// survive — `lsn` alone cannot tell these apart.
+/// The fold's tie-break: an insert and a truncate staged by hand at one
+/// `lsn` are only distinguishable by `change_id` (the ring's append order).
+/// A pre-truncate insert (lower `change_id`) must be voided; a post-truncate
+/// insert (higher `change_id`) must survive. Capture never stamps a truncate
+/// and another write with one `lsn`
+/// (`a_truncate_then_an_insert_in_one_transaction_*` in
+/// `ledger_interleavings.rs`), so this pins only the fold's own ordering.
 #[tokio::test]
 async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    // All three rows share lsn 50 — one source transaction. Insertion order
-    // fixes change_id order: "pre" first, then the truncate, then "post".
+    // All three rows share lsn 50. Insertion order fixes change_id order:
+    // "pre" first, then the truncate, then "post".
     insert_row(
         &client,
         "seg_0",

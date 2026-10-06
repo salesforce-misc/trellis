@@ -634,7 +634,10 @@ settled target checks both: `live` from status, then its token.
   I2 then also refuses any change at or below the floor. The floor is
   exact because `TRUNCATE` takes `ACCESS EXCLUSIVE`: every writer that
   touched the table before it committed first, so its trigger's position is
-  below the truncate's, and every writer after it is above. The drain
+  below the truncate's, and every writer after it is above. That includes a
+  later statement in the truncate's own transaction: the truncate's trigger
+  writes its ring row after reading its position, which moves the insert
+  position on before the next statement's trigger reads it. The drain
   barrier already applies the truncate's batch after every earlier batch and
   before every later one, and the fold voids the batch's own earlier rows, so
   the floor is a second line of defence: any change from before the truncate

@@ -137,6 +137,9 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         ApplyError::HopBoundExceeded { .. } | ApplyError::AggregateOffLedger { .. } => {
             FailureClass::Halting
         }
+        // A truncate the drain can't raise a floor for (#774) is no key's
+        // fault: every page holding it reproduces it.
+        ApplyError::TruncateWithoutLsn { .. } => FailureClass::Halting,
         // Both of these mean "this definition can never work against this
         // source's real schema" — a structural, schema-shape diagnosis
         // exactly like the hop bound, not a per-row data problem. By the
@@ -3740,6 +3743,14 @@ mod unit_tests {
     fn classify_maps_an_off_ledger_aggregate_to_halting() {
         let err = ApplyError::AggregateOffLedger {
             target: "t".to_string(),
+        };
+        assert_eq!(classify(&err), FailureClass::Halting);
+    }
+
+    #[test]
+    fn classify_maps_a_truncate_without_an_lsn_to_halting() {
+        let err = ApplyError::TruncateWithoutLsn {
+            src_table: "public.src".to_string(),
         };
         assert_eq!(classify(&err), FailureClass::Halting);
     }

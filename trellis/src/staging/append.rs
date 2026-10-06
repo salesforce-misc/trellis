@@ -188,10 +188,14 @@ pub enum StagedChange {
     /// originates directly from the source, never from a re-propagated
     /// downstream change. The capture trigger writes this row itself
     /// (`capture::sql`); only tests stage one through here.
+    ///
+    /// `lsn` is required, as the trigger always stamps one: the truncate's
+    /// drain raises its targets' truncate floor to it (ADR-0002 I2), and a
+    /// truncate with none would raise no floor (#774).
     #[allow(dead_code)]
     Truncate {
         src_table: String,
-        lsn: Option<PgLsn>,
+        lsn: PgLsn,
         origin_lsn: Option<PgLsn>,
         src_changed: Option<SystemTime>,
     },
@@ -358,7 +362,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 src_table,
                 key: TRUNCATE_SENTINEL_KEY,
                 op: "truncate",
-                lsn: *lsn,
+                lsn: Some(*lsn),
                 old_image: None,
                 new_image: None,
                 origin_lsn: *origin_lsn,

@@ -126,14 +126,16 @@ async fn insert_cdc_row(
         .unwrap_or_else(|e| panic!("insert cdc row {key:?} into {table} failed: {e}"));
 }
 
-/// Stages a truncate sentinel directly into `table`, for `src_table`.
+/// Stages a truncate sentinel directly into `table`, for `src_table`,
+/// stamped with the insert position as the capture trigger stamps one: the
+/// drain raises the truncate floor to it (#774).
 async fn insert_truncate_row(client: &Client, table: &str, src_table: &str) {
     let src_table = qualify_fixture_table(src_table);
     client
         .execute(
             &format!(
-                "insert into {table} (src_table, key, op, hop_gen) \
-                 values ($1, $2, 'truncate', 0)"
+                "insert into {table} (src_table, key, op, lsn, hop_gen) \
+                 values ($1, $2, 'truncate', pg_current_wal_insert_lsn(), 0)"
             ),
             &[&src_table, &TRUNCATE_SENTINEL_KEY],
         )

@@ -249,6 +249,15 @@ pub enum ApplyError {
     /// whole-keyspace full row images must implement and test that arm; until
     /// then this fails one drain visibly instead of aborting the worker.
     ReverseTriggerNotResolvable { from_table: String },
+    /// A folded truncate of `src_table` carries no ring `lsn` (#774). Not
+    /// reachable: the capture trigger is the only writer of a truncate's
+    /// ring row and stamps it with `pg_current_wal_insert_lsn()`, and
+    /// `StagedChange::Truncate` requires one. Without it the truncate could
+    /// raise no truncate floor, and a change from before it that still
+    /// reached a page would apply over the truncate (I2). It halts the
+    /// definitions reading `src_table` rather than clearing their targets
+    /// without the floor.
+    TruncateWithoutLsn { src_table: String },
 }
 
 impl ApplyError {
@@ -276,7 +285,8 @@ impl ApplyError {
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::AggregateOffLedger { .. }
-            | ApplyError::ReverseTriggerNotResolvable { .. } => ErrorCode::Internal,
+            | ApplyError::ReverseTriggerNotResolvable { .. }
+            | ApplyError::TruncateWithoutLsn { .. } => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
             // The definition's persisted status conflicts with what
@@ -375,6 +385,12 @@ impl fmt::Display for ApplyError {
                  combination is unreachable from any current call site and indicates a newly \
                  added caller that must implement the whole-keyspace arm for real"
             ),
+            ApplyError::TruncateWithoutLsn { src_table } => write!(
+                f,
+                "a truncate of '{src_table}' reached the drain with no ring lsn, so it can't \
+                 raise its targets' truncate floor; the capture trigger always stamps one, so \
+                 the ring row was written by something else"
+            ),
         }
     }
 }
@@ -402,7 +418,8 @@ impl std::error::Error for ApplyError {
             | ApplyError::ColumnAwaitingCapture { .. }
             | ApplyError::TransformNotFound { .. }
             | ApplyError::TransformNotPaused { .. }
-            | ApplyError::ReverseTriggerNotResolvable { .. } => None,
+            | ApplyError::ReverseTriggerNotResolvable { .. }
+            | ApplyError::TruncateWithoutLsn { .. } => None,
         }
     }
 }
@@ -3470,7 +3487,7 @@ struct ClearPlan {
     /// #623 D6: the latest truncating commit's ring `lsn` this batch
     /// carries, which the clear raises the target's truncate floor to as it
     /// empties the ledger.
-    truncate_lsn: Option<PgLsn>,
+    truncate_lsn: PgLsn,
 }
 
 /// The aggregate-target counterpart to [`ClearPlan`] — see
@@ -3495,7 +3512,7 @@ struct AggregateClearPlan {
     /// empties the ledger and raises the truncate floor to `truncate_lsn`.
     on_ledger: bool,
     /// The latest truncating commit's ring `lsn` this batch carries.
-    truncate_lsn: Option<PgLsn>,
+    truncate_lsn: PgLsn,
 }
 
 /// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
@@ -6290,6 +6307,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         )
         .await?;
         for def in &defs {
+            // The floor the clear raises (#774, see the error's doc).
+            let truncate_lsn = change.lsn.ok_or_else(|| ApplyError::TruncateWithoutLsn {
+                src_table: change.src_table.clone(),
+            })?;
             match &def.def.key_space {
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {
@@ -6298,7 +6319,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             earliest_src_changed(existing.src_changed, change.src_changed);
                         existing.origin_lsn =
                             earliest_origin(existing.origin_lsn, change.origin_lsn);
-                        existing.truncate_lsn = existing.truncate_lsn.max(change.lsn);
+                        existing.truncate_lsn = existing.truncate_lsn.max(truncate_lsn);
                     } else {
                         // Issue #385: the ungated `identity_key_columns`, not
                         // `source_primary_key`. The clear only renders this
@@ -6331,7 +6352,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 on_ledger: super::ledger::route_definition(pool, def)
                                     .await?
                                     .is_some(),
-                                truncate_lsn: change.lsn,
+                                truncate_lsn,
                             },
                         );
                     }
@@ -6349,7 +6370,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 earliest_src_changed(existing.src_changed, change.src_changed);
                             existing.origin_lsn =
                                 earliest_origin(existing.origin_lsn, change.origin_lsn);
-                            existing.truncate_lsn = existing.truncate_lsn.max(change.lsn);
+                            existing.truncate_lsn = existing.truncate_lsn.max(truncate_lsn);
                         })
                         .or_insert(ClearPlan {
                             pk: target_pk,
@@ -6357,7 +6378,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             qualified_target: def.target_table.clone(),
                             src_changed: change.src_changed,
                             origin_lsn: change.origin_lsn,
-                            truncate_lsn: change.lsn,
+                            truncate_lsn,
                         });
                 }
             }
@@ -7226,6 +7247,14 @@ async fn settle_one_to_one_target(
     )
     .await?;
     changed.extend(inserted.applied);
+    // A placeholder nothing wrote doesn't outlive the page (#774).
+    let unwritten: Vec<&str> = inserted
+        .keys
+        .iter()
+        .filter(|key| !changed.contains(*key))
+        .map(String::as_str)
+        .collect();
+    one_to_one_ledger::drop_placeholders(txn, &plan.qualified_target, &unwritten).await?;
 
     let mut writes = Vec::new();
     let mut deletes = Vec::new();

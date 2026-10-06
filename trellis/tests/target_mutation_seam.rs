@@ -500,7 +500,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
         &txn,
         &[StagedChange::Truncate {
             src_table: "public.src".to_string(),
-            lsn: Some(testkit::wal_insert_lsn(&txn).await),
+            lsn: testkit::wal_insert_lsn(&txn).await,
             origin_lsn: None,
             src_changed: None,
         }],
@@ -565,7 +565,7 @@ async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
         &txn,
         &[StagedChange::Truncate {
             src_table: "public.src".to_string(),
-            lsn: Some(testkit::wal_insert_lsn(&txn).await),
+            lsn: testkit::wal_insert_lsn(&txn).await,
             origin_lsn: None,
             src_changed: None,
         }],

@@ -26,7 +26,10 @@
 //!    latest segment, or to the read's segment when that is newer (#742, see
 //!    [`read_rows`]), so an Apply to a live entry can be HOT
 //!    ([`schema::tombstone_seg_sql`], #775). Returns the keys it changed.
-//!    Step 1's settled Applies skip it.
+//!    Step 1's settled Applies skip it. A placeholder step 1 inserted that
+//!    neither step wrote (an Apply at or below the floor, or a Re-derive the
+//!    page skipped) is deleted ([`drop_placeholders`], #774): the tombstone
+//!    GC collects only tombstones.
 //! 4. The target rows of exactly those keys are upserted or deleted, as
 //!    before (`super::apply::apply_target`).
 //!
@@ -335,6 +338,41 @@ fn update_statement(target: &str, predicate: bool) -> String {
     )
 }
 
+/// Deletes the placeholders among `keys` on `target`'s ledger: the entries
+/// [`lock_entries`] inserted that nothing then wrote (#774). `keys` are the
+/// keys whose entry this transaction inserted and neither its insert nor
+/// [`update_entries`] changed: an Apply at or below the truncate floor, and
+/// a Re-derive the page skipped (re-staged, or a direct writer's row that
+/// failed to evaluate). Such an entry has no `applied_lsn`, no `basis` and
+/// no tombstone, so the tombstone GC would never collect it, and I2 treats
+/// it as it treats no entry at all, so deleting it changes no later
+/// change's outcome. The statement re-checks that state, so it can't delete
+/// an entry something wrote.
+pub(crate) async fn drop_placeholders(
+    txn: &Transaction<'_>,
+    target: &str,
+    keys: &[&str],
+) -> Result<(), ApplyError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let q = |c: &str| quote_ident(c);
+    txn.execute(
+        &format!(
+            "delete from {ledger} where {key} = any($1::text[]) \
+               and {applied} is null and {basis} is null and not {tombstone}",
+            ledger = ledger_ident(target),
+            key = q(schema::KEY_COLUMN),
+            applied = q(schema::APPLIED_LSN_COLUMN),
+            basis = q(schema::BASIS_COLUMN),
+            tombstone = q(schema::TOMBSTONE_COLUMN),
+        ),
+        &[&keys],
+    )
+    .await?;
+    Ok(())
+}
+
 /// The plans of a page's statements that read the 1-1 target `target`'s
 /// ledger by entry key (#778), as `explain`'s text, each labelled, under the
 /// settings a page runs them with: the entry lock
@@ -390,22 +428,21 @@ pub async fn explain_page(
 /// Empties a 1-1 target's ledger for a source `TRUNCATE` and raises its
 /// truncate floor to `lsn`, the truncate's ring `lsn` (the D split's Q6, as
 /// `super::ledger::truncate_ledger` does for an aggregate). The caller
-/// clears the target rows.
+/// clears the target rows. `lsn` is required: a truncate that raised no
+/// floor would let a change from before it apply over it (#774).
 pub(crate) async fn truncate(
     txn: &Transaction<'_>,
     target: &str,
-    lsn: Option<PgLsn>,
+    lsn: PgLsn,
 ) -> Result<(), ApplyError> {
     txn.batch_execute(&format!("truncate {}", ledger_ident(target)))
         .await?;
-    if let Some(lsn) = lsn {
-        txn.execute(
-            "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
-             on conflict (target_table) do update \
-             set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
-            &[&target, &lsn],
-        )
-        .await?;
-    }
+    txn.execute(
+        "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
+         on conflict (target_table) do update \
+         set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
+        &[&target, &lsn],
+    )
+    .await?;
     Ok(())
 }

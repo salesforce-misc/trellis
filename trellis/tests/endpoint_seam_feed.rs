@@ -749,7 +749,7 @@ async fn a_truncate_clear_of_an_endpoint_target_stages_per_key_deletes() {
         &txn,
         &[StagedChange::Truncate {
             src_table: "public.src".to_string(),
-            lsn: Some(testkit::wal_insert_lsn(&txn).await),
+            lsn: testkit::wal_insert_lsn(&txn).await,
             origin_lsn: None,
             src_changed: None,
         }],

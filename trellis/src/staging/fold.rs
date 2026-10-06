@@ -635,10 +635,15 @@ fn fold_sql(
     // truncate for its own `src_table` in this fenced window is stale — the
     // truncate erased whatever it recorded — and must not survive into the
     // group at all, not just lose an arg-extreme. `(t.lsn, t.change_id) >
-    // (f.lsn, f.change_id)` is the "strictly above" test; a truncate and an
-    // insert in the *same* source transaction can share one `lsn`, so
-    // `change_id` (the ring's append order = execution order) is what orders
-    // a same-transaction truncate-then-insert correctly.
+    // (f.lsn, f.change_id)` is the "strictly above" test. A truncate and a
+    // later write in the same source transaction never share an `lsn`: each
+    // statement's trigger reads `pg_current_wal_insert_lsn()`, and the
+    // truncate's trigger then writes its own ring row, which moves the insert
+    // position on before the next statement's trigger reads it. The truncate
+    // floor depends on that, since it refuses every change at or below the
+    // truncate's `lsn` (`a_truncate_then_an_insert_in_one_transaction_*` in
+    // `tests/ledger_interleavings.rs` pins it). `change_id` (the ring's
+    // append order) only breaks a tie capture doesn't produce.
     //
     // Load-bearing subtlety: a recompute row's `lsn` is NULL, and Postgres's
     // row-comparison against a NULL component evaluates to NULL, not TRUE —
