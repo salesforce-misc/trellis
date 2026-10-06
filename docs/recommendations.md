@@ -37,10 +37,10 @@ and needs a reload, not a restart.
 On a 100M-row aggregate build under 8 writers at 2,000 writes per second,
 `wal_compression = lz4` alone cut WAL from 3,370 to 1,918 bytes per built row
 and define-to-`live` from 1,446 to 1,090 seconds, and the writers' rate rose
-from 1,269 to 1,751 per second (#723). That build kept the ledger's `GROUP BY`
-index. A build that skips that index and inserts each chunk's new entries
-first writes less WAL (1,036 bytes per row on the same run) and finishes in
-396 seconds (#723).
+from 1,269 to 1,751 per second (#723). That build kept the ledger's `GROUP BY` index. On a separate 100M run of the
+same benchmark, a build that skips that index and inserts each chunk's new
+entries first wrote 1,036 bytes of WAL per built row, wrote 104 GB in all and
+finished in 396 seconds (#723).
 
 ### `max_wal_size` and `checkpoint_timeout`
 
