@@ -966,6 +966,133 @@ async fn a_drain_as_an_unchecked_role_pauses_the_reader_of_a_hidden_to_side() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
+/// A refused read beside a key failure (#766 with #799). The page holds a
+/// change to a to-side whose policies apply to the drain's role, and a change
+/// to key 1 of `c` that one of `c`'s three readers, `c_cheap`, fails to write
+/// (its target refuses the amount). The refusal halts the definition reading
+/// through the relationship, charging no key, and the page's retries skip the
+/// refused table. So do isolation's probes, both bisection's and the
+/// per-definition attribution's: a probe that read the refused table again
+/// would halt on its `42501` and leave key 1 uncharged on every drain. Key 1
+/// is charged to `c_cheap` alone and, at the death threshold, held for it,
+/// while `c_copy` applies it.
+#[tokio::test]
+async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_definition() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declare a relationship");
+    for ddl in [
+        "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+        "TRANSFORM c_cheap FROM public.c SELECT amount AS amount",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    for target in ["c_named", "c_cheap", "c_copy"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.p enable row level security, force row level security; \
+             create policy hide_two on public.p using (id <> 2); \
+             alter table public.c_cheap add constraint cheap check (amount < 100);",
+        )
+        .await
+        .expect("a member login role the to-side's policies apply to, and a narrow target");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    let worker = trellis::Pool::new(&config).expect("pool");
+
+    it.admin
+        .batch_execute(
+            "update public.p set name = 'renamed' where id = 2; \
+             update public.c set amount = 500 where id = 1;",
+        )
+        .await
+        .expect("write the to-side and the source");
+    let sealed = seal::seal_phase1(&mut it.raw).await.expect("seal phase 1");
+    seal::seal_phase2(&it.raw, sealed.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    let mut failures = 0;
+    loop {
+        match apply::drain_once(
+            &worker,
+            sealed.sealed_seg_seq,
+            "row_security_test",
+            1,
+            "trellis_row_security_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(err) => {
+                failures += 1;
+                assert!(failures <= 20, "the page never committed: {err}");
+            }
+        }
+    }
+    assert_eq!(
+        failures,
+        trellis::staging::DEFAULT_DEATH_THRESHOLD as usize - 1,
+        "each drain below the threshold charges key 1 once, and the one that crosses it \
+         holds the key and commits the page"
+    );
+
+    let halted = status(&it.trellis, "c_named").await;
+    assert_eq!(halted.status, TransformStatus::Paused);
+    let failure = halted.capture_failure.expect("the halt's record");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    assert_eq!(failure.source_table, "public.p");
+    let poisoned: Vec<(String, String)> = it
+        .admin
+        .query(
+            &format!(
+                "select split_part(d.target_table, '.', 2), p.key from {SCHEMA}.poison p \
+                 join {SCHEMA}.transform_definitions d on d.id = p.transform_id order by 1, 2"
+            ),
+            &[],
+        )
+        .await
+        .expect("read poison")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        poisoned,
+        vec![("c_cheap".to_string(), "1".to_string())],
+        "key 1 is held for the definition whose write failed, and the refusal charged nothing"
+    );
+    assert_eq!(
+        status(&it.trellis, "c_cheap").await.status,
+        TransformStatus::Live
+    );
+    assert_eq!(
+        amount_of(&it.admin, "public.c_copy", 1).await,
+        Some("500".to_string()),
+        "c_copy applied the change c_cheap failed on"
+    );
+    assert_eq!(
+        amount_of(&it.admin, "public.c_cheap", 1).await,
+        Some("1".to_string()),
+        "c_cheap holds key 1"
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
 /// defining refuses a target only when DDL around its creation makes the
 /// policies apply to that role: here an event trigger that enables and
 /// forces RLS on each new table (#765). One that only enables it, a common

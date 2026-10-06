@@ -388,10 +388,11 @@ than filtering it. What follows depends on what was refused:
   the readers of each table its role can't read, the writer of each target it
   can't write, and everything downstream of them. `status()`'s
   `capture_failure` names the table, the role, the fix and Postgres's own
-  error. No key is quarantined, and the rest of the page commits. The drain
-  finds those tables from the catalog, as its own role, so it pauses every
-  unfrozen definition whose tables that role can't use, not only those on the
-  refused page. A `42501` the catalog can't pin on a table (a column the role
+  error. The refusal charges no key, and the rest of the page commits; a key
+  that fails beside it is still charged to the definition it fails in. The
+  drain finds those tables from the catalog, as its own role, so it pauses
+  every unfrozen definition whose tables that role can't use, not only those
+  on the refused page. A `42501` the catalog can't pin on a table (a column the role
   isn't granted while it holds a grant on another, a function's `EXECUTE`,
   one of Trellis's own tables) pauses nothing: the drain retries the page and
   surfaces the error on every pass, charges no key, and puts nothing in

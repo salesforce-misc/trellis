@@ -5542,7 +5542,7 @@ pub(super) async fn relationship_readers_of(
 /// that cost). [`apply_target`] (Phase 3) is this tree's next, more
 /// fine-grained span, one per consuming transform. The span is
 /// [`compute_page`]'s, which this calls and [`drain_batch`] calls directly.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(any(test, feature = "internals"))]
 pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, ApplyError> {
     compute_page(pool, folded, None, false).await
 }

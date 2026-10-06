@@ -679,8 +679,9 @@ the page without it:
   own role, since Postgres's message names no key and only a bare table: the
   readers of each table they read that the role can't (`SELECT`, or policies
   that apply to it), and the writer of each target it can't write. The
-  page's retries then skip every table no unfrozen definition reads, as for a
-  table whose key can't be used (#768), because the drain keeps a
+  page's retries, and the isolation probes they run, then skip every table no
+  unfrozen definition reads, as for a table whose key can't be used (#768),
+  because the drain keeps a
   relationship's settled projection current from its to-side whatever its
   readers' status, and that read would be refused again. A resume refreshes
   the projections it reads;
