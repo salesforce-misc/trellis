@@ -3556,10 +3556,13 @@ async fn end_request(
 ///   every page holding the fence, so a page that parked a change for the
 ///   key has committed, and the reads below see its row (ADR-0002 I1). A
 ///   page that read the fence before the release and applies after it
-///   misses the fence and computes again, finding the key no longer held. So
-///   no page can park a change for the key after the release has deleted its
-///   rows, which would leave a held row no release names, blocking every
-///   watermark token (`converge`'s condition 4);
+///   misses the fence and computes again, finding the key no longer held,
+///   and one that read the key as held but the fence after the release parks
+///   nothing ([`park_batch_contribution`] parks only while the key's
+///   `poison` row is there). So no page can park a change for the key after
+///   the release has deleted its rows, which would leave a held row no
+///   release names, blocking every watermark token (`converge`'s condition
+///   4);
 /// - it then takes the definition's row `for no key update`, the lock an
 ///   eviction takes before it poisons a key (`evict_for`, and a build
 ///   chunk's `for update`), and that a resume's `for update` and a drop's

@@ -274,8 +274,11 @@ keys:
   for a fence bump), so it waits for every such page and then reads the key's
   rows, the page's parked change among them. A page computed before the release
   that applies after it misses its fence and computes again, finding the key
-  no longer held. No page parks a change for a key after its release, which
-  would leave a held row no release names (ADR-0002 I1).
+  no longer held. A page reads the poisoned keys before its fence, so one can
+  read the key as held and the fence as the release left it; it parks nothing,
+  since a page parks a change only while the key's `poison` row is there. No
+  page parks a change for a key after its release, which would leave a held
+  row no release names (ADR-0002 I1).
 * **An eviction**, a resume and a drop each take the transform's row first
   (`for no key update`, `for update` and the delete), and so does the release,
   before it reads the key's rows. An eviction that commits first is released

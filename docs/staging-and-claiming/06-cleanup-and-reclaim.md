@@ -149,8 +149,10 @@ parking the same rows is a no-op, not a conflict.
 `Recompute` of the key into the active batch, then delete the transform's held rows,
 its marker, and its death counter for the key. Its first lock is a bump of the key's
 table's version fence, which waits for every page holding the fence: a page that parks
-a change for the key commits first and the release takes its row too, and one that
-computed before the release misses its fence and computes again. The
+a change for the key commits first and the release takes its row too, one that
+computed before the release misses its fence and computes again, and one that read
+the key as held but the fence after the release parks nothing, since a page parks
+only while the key's `poison` row is there. The
 held rows are not replayed: a replayed row would carry the releaser's `row_txid`,
 not its source commit's, so a replay could regress a ledger entry a later
 Re-derive already moved past. The `Recompute` is a Re-derive of the key from its
