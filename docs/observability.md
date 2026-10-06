@@ -380,7 +380,8 @@ without them:
   so the definitions show as halted rather than stuck in
   `waiting_to_backfill` or `catching_up`. A refusal the catalog can't pin on a
   table pauses nothing: the marker backs off and retries like any failed
-  backfill, with the error on `backfill_failure`.* **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
+  backfill, with the error on `backfill_failure`.
+* **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. A resume re-validates the definition as define would, so
   while its source key, or a relationship endpoint's, is still of a type define

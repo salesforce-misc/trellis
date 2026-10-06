@@ -84,7 +84,7 @@ These are the tools the entries refer to:
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
-| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge and catch-up: pause what they reach, or log only; build chunk: `backfill_failure` | #817 |
+| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge and catch-up: pause what they reach; one the catalog can't pin only logs (drain) or shows on `backfill_failure` (discharge); build chunk: `backfill_failure` | #817 |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #528, test ignored |
@@ -352,9 +352,9 @@ Afterwards, `PAUSE`/`RESUME` the affected transforms.
 ## 11. Row-level security on a role Trellis runs as
 
 **Trigger:** a row-level security policy that applies to a role a drain
-worker or a build logs in as, or that comes to apply to the role that owns
-the ring after define. A privilege the drain's or build's role lacks
-(`permission denied for table ...`) is handled the same way.
+worker, the staging worker or a build logs in as, or that comes to apply to
+the role that owns the ring after define. A privilege one of those roles
+lacks (`permission denied for table ...`) is handled the same way.
 
 **Effect:** every connection Trellis opens runs with `row_security = off`, so
 Postgres refuses (`42501`) a read or write the policies would filter, rather
@@ -395,12 +395,14 @@ than filtering it. What follows depends on what was refused:
 **Detected?** A refusal of a drain, a discharge or a catch-up pauses its
 definitions and shows in `status()`, except a `42501` the catalog can't pin:
 a drain's only logs, and a discharge's or catch-up's shows on
-`backfill_failure`. A build chunk's shows on `backfill_failure`. For the ring's owner, the reconcile pass pauses the
-readers and `self_check` reports a `capture` divergence (#745, #765). Define
+`backfill_failure`. A build chunk's shows on `backfill_failure`. For the
+ring's owner, the reconcile pass pauses the readers and `self_check` reports
+a `capture` divergence (#745, #765). Define
 and declare refuse policies that already apply
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
-**Planned work:** #817 decides what a refusal the halt can't pin on a table should do, for the drain and the discharge alike.
+**Planned work:** #817 decides what a refusal the halt can't pin on a table
+should do, for the drain and the discharge alike.
 
 **Repair:** grant `BYPASSRLS` to every role Trellis logs in as and to the
 ring's owner (it isn't inherited), or make the role the table owner without
