@@ -1841,11 +1841,24 @@ async fn backfill_aggregate(
     // build adds them. The ledger always has all of them or none (the load
     // drops them together, and this adds them together), so a key that's
     // already there (42P16) means another build has added them all since this
-    // one's load, over whatever the latest load left.
+    // one's load, over whatever the latest load left. The `GROUP BY` index
+    // is among them only where the ledger's DDL puts it
+    // (`staging::build::ledger_indexes_groups`, #723).
+    let source_is_definition_target = super::catalog::is_definition_target(&**client, source_table)
+        .await
+        .map_err(map_rel_lookup_err)?;
     let rebuild = format!(
         "alter table {ledger} add primary key ({}){}",
         quote_ident(super::ledger::KEY_COLUMN),
-        super::ledger::aggregate_ledger_index_ddl(&ledger, &group_idents),
+        super::ledger::aggregate_ledger_index_ddl(
+            &ledger,
+            &group_idents,
+            crate::staging::build::ledger_indexes_groups(
+                def,
+                source_columns,
+                source_is_definition_target,
+            ),
+        ),
     );
     {
         let txn = client.transaction().await?;

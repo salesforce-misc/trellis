@@ -242,71 +242,81 @@ async fn a_rebuild_replaces_the_ledger() {
 
 /// A build that loaded the ledger but failed before its second transaction
 /// rebuilt the key and indexes leaves a ledger with neither. The next build
-/// loads that ledger and gives it back its key, its `GROUP BY` index and its
-/// tombstone index (#623 D7), so it never has one without the others.
+/// loads that ledger and gives it back its key, its tombstone index (#623
+/// D7) and, where the ledger's DDL has it, its `GROUP BY` index, so it never
+/// has one without the others. A target with a recomputed field has the
+/// `GROUP BY` index. One with only maintained fields, which the Re-derive
+/// build takes, has none (#723), and the rebuild adds none either.
 #[tokio::test]
 async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_the_keys() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create table s (id bigint primary key, g bigint, a numeric); \
-             insert into s select i, i % 3, i from generate_series(1, 30) i",
-        )
-        .await
-        .expect("seed source");
-    let src = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total";
-    let cols = HashMap::from([
-        ("g".to_string(), ValueType::Numeric),
-        ("a".to_string(), ValueType::Numeric),
-    ]);
-    build(&db, src, &cols).await;
-    let indexes = "select string_agg(e, ' | ' order by p desc, e collate \"C\") \
-                   from (select i.indisprimary as p, case when i.indisprimary then 'pkey' \
-                         else pg_get_expr(i.indpred, i.indrelid) end as e \
-                         from pg_index i where i.indrelid = 't__ledger'::regclass) x";
-    let built = rows(&client, indexes).await;
-    assert_eq!(
-        built,
-        vec![vec![Some(
-            "pkey | (__member AND (NOT __tombstone)) | __tombstone".to_string()
-        )]],
-    );
+    for (src, expected) in [
+        (
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total, MAX(a) AS hi",
+            "pkey | (__member AND (NOT __tombstone)) | __tombstone",
+        ),
+        (
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total",
+            "pkey | __tombstone",
+        ),
+    ] {
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute(
+                "create table s (id bigint primary key, g bigint, a numeric); \
+                 insert into s select i, i % 3, i from generate_series(1, 30) i",
+            )
+            .await
+            .expect("seed source");
+        let cols = HashMap::from([
+            ("g".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        build(&db, src, &cols).await;
+        let indexes = "select string_agg(e, ' | ' order by p desc, e collate \"C\") \
+                       from (select i.indisprimary as p, case when i.indisprimary then 'pkey' \
+                             else pg_get_expr(i.indpred, i.indrelid) end as e \
+                             from pg_index i where i.indrelid = 't__ledger'::regclass) x";
+        let built = rows(&client, indexes).await;
+        assert_eq!(built, vec![vec![Some(expected.to_string())]], "{src}");
 
-    // What the load's transaction leaves when the rebuild after it never
-    // commits: every entry, and no key or indexes.
-    let secondary_indexes: String = client
-        .query_one(
-            "select string_agg(indexrelid::regclass::text, ', ') from pg_index \
-             where indrelid = 't__ledger'::regclass and not indisprimary",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    client
-        .batch_execute(&format!(
-            "alter table t__ledger drop constraint t__ledger_pkey; drop index {secondary_indexes}; \
-             update s set a = 0 where id = 1"
-        ))
-        .await
-        .expect("strip the ledger's key and indexes");
-    let def = parse(src).expect("parse");
-    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
-        .await
-        .expect("rebuild");
+        // What the load's transaction leaves when the rebuild after it never
+        // commits: every entry, and no key or indexes.
+        let secondary_indexes: String = client
+            .query_one(
+                "select string_agg(indexrelid::regclass::text, ', ') from pg_index \
+                 where indrelid = 't__ledger'::regclass and not indisprimary",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "alter table t__ledger drop constraint t__ledger_pkey; \
+                 drop index {secondary_indexes}; update s set a = 0 where id = 1"
+            ))
+            .await
+            .expect("strip the ledger's key and indexes");
+        let def = parse(src).expect("parse");
+        backfill_definition(&db.pool, &def, "public", &def.source, &cols)
+            .await
+            .expect("rebuild");
 
-    assert_eq!(rows(&client, indexes).await, built);
-    assert_eq!(
-        rows(
-            &client,
-            "select count(*)::text, (select __arg0::text from t__ledger where __from_key = '1') \
-             from t__ledger"
-        )
-        .await,
-        vec![vec![Some("30".to_string()), Some("0".to_string())]],
-    );
+        assert_eq!(rows(&client, indexes).await, built, "{src}");
+        assert_eq!(
+            rows(
+                &client,
+                "select count(*)::text, \
+                     (select __arg0::text from t__ledger where __from_key = '1') \
+                 from t__ledger"
+            )
+            .await,
+            vec![vec![Some("30".to_string()), Some("0".to_string())]],
+            "{src}"
+        );
+    }
 }
 
 /// A text argument's ledger column carries the collation the argument has

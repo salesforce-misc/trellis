@@ -165,10 +165,12 @@ pub enum BuildStatement {
     ChunkSetup,
     /// A chunk's read of the keys in its range.
     ChunkKeys,
-    /// A chunk's entry lock (placeholders, then the sorted `for update`).
+    /// A chunk's entry lock: the sorted `for update` of the keys that had
+    /// an entry before its insert.
     ChunkLock,
-    /// A chunk's one read-and-write statement: the snapshot, the entries
-    /// and the group-delta insert.
+    /// A chunk's read-and-write statements: the insert of the entries of
+    /// keys with none, and the rewrite of the others' (each the snapshot,
+    /// the entries and the group-delta insert).
     ChunkWrite,
     /// A chunk's commit, and marking it done.
     ChunkCommit,

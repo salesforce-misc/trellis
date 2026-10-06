@@ -290,11 +290,24 @@ entry count, and so on. The group row carries that count as `__trellis_members`.
 A 1-1 target's ledger holds only the key and the ordering state, because the
 target row holds the values.
 
+Every ledger is keyed by `__from_key` and indexes its tombstones by
+`__applied_seg` (the tombstone GC's index, below). An aggregate ledger also
+has a `GROUP BY` index over its live members (`where __member and not
+__tombstone`) unless the Re-derive build takes its target and none of the
+target's fields is recomputed (#723). Only three readers find a group's
+entries through that index: a recomputed field's rewrite, the one-pass
+build's group writes, and the orphan sweep. The last two run only for
+targets the Re-derive build doesn't take. Every other statement reads the
+ledger by key, so a ledger without the index saves every entry write the
+cost of maintaining it, which on a ledger far larger than `shared_buffers`
+was most of a build's WAL.
+
 A target is built one of two ways. The Re-derive build (`staging::build`,
 #625) serves an aggregate target with no relationship path and a 1-1 target
 with none, on a captured source (not another definition's target): it
-applies from its start and re-derives the source in chunks, each locking its
-keys' entries as a page does and stamping them as a Re-derive does (below).
+applies from its start and re-derives the source in chunks, each inserting
+the entries its keys don't have yet and locking the others as a page does,
+and stamping them as a Re-derive does (below).
 Every other target keeps the one-pass build. For an aggregate it empties the
 ledger, reads the source into it in one statement whose snapshot becomes
 every entry's basis, and then writes the group rows as a `GROUP BY` over it.
@@ -384,13 +397,23 @@ A fold record carries the identity of the change that won its post-image
 [04](04-claiming-and-the-fold.md)). That change is the one an Apply judges.
 
 **Build chunks and the merger (#625).** A Re-derive build re-derives the
-source a primary-key range at a time. An aggregate target's chunk takes the
-same entry lock as a page (with a 1 s `lock_timeout`, so it gives way to a
-page), and then one statement reads the range's locked rows with
-`pg_current_snapshot()` and the active segment, rewrites their entries
-(stamping `__applied_seg` with that segment, so the tombstone GC can collect a
-chunk's tombstones), and appends each group's increments to
-`<target>__deltas`, where each row's generated `__part` is its group's merge
+source a primary-key range at a time. An aggregate target's chunk first
+inserts the entries of the keys that have none, in one statement that reads
+their rows with `pg_current_snapshot()` and the active segment, writes each
+entry once from that read (`__basis` the snapshot, a deleted key a tombstone
+stamped with the segment), and appends their groups' increments. A key whose
+entry is there by the time its insert runs is left alone. The insert's
+snapshot is taken before its uniqueness check, which is sound because no
+Apply can have written a key since that snapshot without leaving its entry
+for the check to find: the only thing that removes entries, the tombstone
+GC, skips a ledger while its definition is under a build (below). The chunk
+then takes the same entry lock as a page on the keys that already had an
+entry, and one more statement reads their rows afresh, rewrites their
+entries and appends their increments. Both steps run under a 1 s
+`lock_timeout`, so a chunk gives way to a page. On a fresh build every key
+is new, and the insert is the whole chunk. Every chunk stamps `__applied_seg`
+with the segment its read saw, so the tombstone GC can collect a chunk's
+tombstones. The increments go to `<target>__deltas`, where each row's generated `__part` is its group's merge
 partition: `hash_record_extended` of the group, so equal groups (`1.5` and
 `1.50`, or every `NULL` group) share one. It never writes a group row. A
 merger claims one partition's delta rows oldest first through an index on
@@ -436,6 +459,17 @@ A Re-derive stamps at least the newest segment its snapshot sees (#742), so a
 tombstone it wrote outlives every change its `__basis` would refuse. A later
 change to a collected key finds no entry and gets a fresh one, where I2
 reduces to the truncate floor.
+
+The GC skips the ledger of a definition under a build: one that is
+`backfilling`, or whose Re-derive build a pause or quarantine froze (#723).
+A build chunk inserts a new key's entry from a snapshot taken before the
+insert, so a tombstone written after that snapshot must still be there when
+the insert looks for the key. A GC batch checks the definition and holds its
+row `for key share` until it commits, and a build's start takes that row
+`for update`, so a batch either commits before the start or sees the build
+and skips. The tombstones of deletes applied during a build therefore wait
+for it to finish, which bounds them by the write rate times the build's
+length.
 
 Only a tombstone carries `__applied_seg` (#775). A write that leaves an entry
 a tombstone raises it to `greatest(old, its segment)`; one that leaves the

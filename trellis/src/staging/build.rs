@@ -55,36 +55,50 @@
 //!
 //! 1. read the keys in the range, leaving out the ones quarantined for the
 //!    definition (`poison`, per transform since #799), as the drain does;
-//! 2. lock their ledger entries as a page does
-//!    ([`super::ledger::lock_entries`]: placeholders for keys with no entry,
-//!    then a sorted `for update`), under the short [`CHUNK_LOCK_TIMEOUT`] so
-//!    a drain page holding one of the keys makes the chunk give up rather
-//!    than wait (ADR-0002 I7, #625 Q4);
-//! 3. one statement ([`super::ledger::chunk_statement`]) reads
-//!    `pg_current_snapshot()`, the active segment and the locked keys' source
-//!    rows, rewrites their entries from them (`basis` := the snapshot,
-//!    a tombstone's `applied_seg` raised to the segment, `applied_lsn` left alone, a key
-//!    with no row a tombstone), and appends the moves' per-group increments
-//!    to `<target>__deltas`.
+//! 2. one statement ([`super::ledger::chunk_insert_statement`]) reads
+//!    `pg_current_snapshot()`, the active segment and the keys' source rows,
+//!    inserts the entry of every key that has none from them, in key order
+//!    (`basis` := the snapshot, `applied_lsn` left null, a key with no row a
+//!    tombstone stamped with the segment), and appends the new entries'
+//!    per-group increments to `<target>__deltas`. A key whose entry exists
+//!    by the time its insert runs is left to steps 3 and 4;
+//! 3. lock the other keys' entries as a page does
+//!    ([`super::ledger::lock_entries`]: a sorted `for update`);
+//! 4. if there are any, one statement ([`super::ledger::chunk_statement`])
+//!    reads the snapshot, the segment and their source rows afresh, rewrites
+//!    their entries from them (`basis` := the snapshot, a tombstone's
+//!    `applied_seg` raised to the segment, `applied_lsn` left alone, a key
+//!    with no row a tombstone), and appends the moves' per-group increments.
+//!
+//! Steps 2 and 3 run under the short [`CHUNK_LOCK_TIMEOUT`], so a drain page
+//! holding one of the keys makes the chunk give up rather than wait (ADR-0002
+//! I7, #625 Q4). On a fresh build every key is new, and step 2 is the whole
+//! chunk: each entry is written once, with no placeholder to rewrite (#723).
 //!
 //! The chunk never touches a group row, so two chunks, or a chunk and a
 //! page, never wait on each other's groups (#617's failure mode). A key
-//! inserted after step 1 isn't locked, and its row is ignored: its insert's
+//! inserted after step 1 isn't read, and its row is ignored: its insert's
 //! change applies it. A chunk is idempotent: run again, it finds every entry
 //! equal to the live row and appends nothing.
 //!
 //! Why a chunk and Apply agree: both hold a key's entry lock while they read
-//! and write the entry. A chunk's snapshot is taken after its lock, so it sees
-//! every change an earlier Apply folded in. A change applied after the chunk
-//! is either visible in the chunk's basis (skipped, ADR-0002 I2) or not
-//! (applied over the entry the chunk wrote, which is the snapshot's state). A
-//! key with no entry has contributed nothing anywhere, so an Apply that comes
-//! first counts it from nothing and the chunk then moves it by the
-//! difference. That needs the change's image to be the key's latest state
-//! the definition hasn't seen, which only a change committed after the start
-//! is sure to be: an older one, drained after the start, may have had a
-//! later change drained before it, and a key deleted that way has no row
-//! for a chunk to find. A page re-derives those keys instead (`start`).
+//! and write the entry. For a key that had an entry, the chunk's snapshot is
+//! taken after its lock, so it sees every change an earlier Apply folded in.
+//! A change applied after the chunk is either visible in the chunk's basis
+//! (skipped, ADR-0002 I2) or not (applied over the entry the chunk wrote,
+//! which is the snapshot's state). A key with no entry has contributed
+//! nothing anywhere. The insert writes it from a snapshot taken before its
+//! uniqueness check, which is right because no Apply can have written the
+//! key since: an entry it wrote would be there for the check to find, and
+//! the tombstone GC, the only thing that removes entries, skips a ledger
+//! under a build (`super::retire::collect_tombstones`, #723). An Apply that
+//! wrote the key first counts it from nothing, and the chunk then locks it
+//! and moves it by the difference. That needs the change's image to be the
+//! key's latest state the definition hasn't seen, which only a change
+//! committed after the start is sure to be: an older one, drained after the
+//! start, may have had a later change drained before it, and a key deleted
+//! that way has no row for a chunk to find. A page re-derives those keys
+//! instead (`start`).
 //!
 //! # The merger
 //!
@@ -210,6 +224,7 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::{GenericClient, IsolationLevel, Transaction};
 
+use crate::defs::ast::{TransformDef, ValueType};
 use crate::defs::chunk_queue::{self, ChunkQueueError, ChunkWork, ClaimFence, ClaimedChunk};
 use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::{catalog, ddl};
@@ -278,8 +293,9 @@ impl BuildPlan {
 pub struct ChunkOutcome {
     /// The source keys the chunk found in its range, and re-derived.
     pub keys: usize,
-    /// The group-delta rows it appended: one per group whose increments
-    /// weren't all 0.
+    /// The group-delta rows it appended: per statement that wrote entries
+    /// (the insert, and the rewrite of keys that had one), one per group
+    /// whose increments weren't all 0.
     pub delta_rows: i64,
 }
 
@@ -288,16 +304,18 @@ pub struct ChunkOutcome {
 /// `backfill_chunks` stores a range's bounds; `lo` is `None` for the first
 /// chunk. The caller commits.
 ///
-/// `txn` must be `read committed`, as a page's is: step 3's snapshot has to
-/// be its own statement's, taken after the entry lock (ADR-0002 I1). Under
-/// `repeatable read` it would be the transaction's, from step 1, and the
-/// chunk could rewrite an entry over a change a page applied between.
+/// `txn` must be `read committed`, as a page's is: step 4's snapshot has to
+/// be its own statement's, taken after the entry lock (ADR-0002 I1), and
+/// step 2's has to be taken after step 1's read. Under `repeatable read`
+/// both would be the transaction's, from step 1, and the chunk could rewrite
+/// an entry over a change a page applied between.
 ///
 /// A lock wait past [`CHUNK_LOCK_TIMEOUT`] fails the chunk with `55P03`
 /// (`crate::locks::is_lock_not_available`), and the caller rolls back and
-/// retries it later. So does an entry the tombstone GC collects while the
-/// chunk takes its lock ([`ApplyError::LedgerEntryCollected`], #712). Both
-/// are transient (`crate::staging::quarantine::classify`).
+/// retries it later. So does an entry that is gone by the time the chunk
+/// locks it ([`ApplyError::LedgerEntryCollected`], #712), which the GC's skip
+/// of a building ledger leaves to a chunk run outside a build (a test's).
+/// Both are transient (`crate::staging::quarantine::classify`).
 ///
 /// The range predicate is the 1-1 build's row comparison, which admits a key
 /// with a `NULL` part when an earlier part decides it. Only a source keyed
@@ -350,18 +368,79 @@ pub async fn run_chunk(
         });
     }
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-
-    // 2. The entry lock, under the chunk's own short lock timeout.
-    lock_chunk_entries(txn, ledger, &key_refs).await?;
-
-    // 3. The read, the entries and the deltas, in one statement.
-    let started = Instant::now();
     let keys_param = format!("${}", params.len() + 1);
-    params.push(&key_refs);
-    let sql = ledger::chunk_statement(ledger, &range_where, &keys_param);
-    let row = ledger::query_one_by_entry_key(txn, &sql, &params).await?;
+
+    // 2 and 3, under the chunk's own short lock timeout: the entries of the
+    // keys that have none, inserted from the chunk's read, and then the
+    // entry lock of the others.
+    let previous: String = txn
+        .query_one("select current_setting('lock_timeout')", &[])
+        .await?
+        .get(0);
+    crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+    // Test-only pause points (#723). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::BeforeChunkInsert,
+        &ledger.target,
+    )
+    .await?;
+    let started = Instant::now();
+    #[cfg(any(test, feature = "test-util"))]
+    let pause = super::interleave::pause_in_statement(
+        txn,
+        super::interleave::PausePoint::AfterChunkSnapshot,
+        &ledger.target,
+    )
+    .await?;
+    #[cfg(not(any(test, feature = "test-util")))]
+    let pause = None;
+    let mut insert_params = params.clone();
+    insert_params.push(&key_refs);
+    let row = ledger::query_one_by_entry_key(
+        txn,
+        &ledger::chunk_insert_statement(ledger, &range_where, &keys_param, pause),
+        &insert_params,
+    )
+    .await?;
     metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
-    // Test-only pause point (#623 D1), directly after the chunk's one
+    if pause.is_some() {
+        crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+    }
+    let inserted: std::collections::HashSet<String> =
+        row.get::<_, Vec<String>>(0).into_iter().collect();
+    let mut delta_rows: i64 = row.get(1);
+    let existing: Vec<&str> = key_refs
+        .iter()
+        .copied()
+        .filter(|k| !inserted.contains(*k))
+        .collect();
+    let started = Instant::now();
+    let locked = ledger::lock_entries(
+        txn,
+        ledger,
+        &existing,
+        ledger::NewEntries::None,
+        skip_lock(),
+    )
+    .await;
+    metrics::record_build_statement(BuildStatement::ChunkLock, started.elapsed());
+    locked?;
+    txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
+        .await?;
+
+    // 4. The read, the entries and the deltas of the keys that had an
+    // entry, in one statement.
+    if !existing.is_empty() {
+        let started = Instant::now();
+        params.push(&existing);
+        let sql = ledger::chunk_statement(ledger, &range_where, &keys_param);
+        let row = ledger::query_one_by_entry_key(txn, &sql, &params).await?;
+        metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
+        delta_rows += row.get::<_, i64>(1);
+    }
+    // Test-only pause point (#623 D1), directly after the chunk's last
     // read-and-write statement. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -370,7 +449,6 @@ pub async fn run_chunk(
         &ledger.target,
     )
     .await?;
-    let delta_rows: i64 = row.get(1);
     tracing::debug!(
         target_table = %ledger.target,
         keys = keys.len(),
@@ -411,22 +489,27 @@ fn chunk_range(
     ))
 }
 
-/// A chunk's or a sweep batch's entry lock ([`ledger::lock_entries`]),
-/// under [`CHUNK_LOCK_TIMEOUT`], which it sets for the lock alone. Its time
-/// is recorded whether or not the lock is had: a chunk that gives up spent
-/// it waiting all the same.
-async fn lock_chunk_entries(
+/// Whether a chunk's or a sweep batch's entry lock is skipped: the
+/// `chunk_without_entry_lock` plant (#625 F3), under which the chunk's
+/// read-and-write reads an entry a page is between reading and writing.
+/// See `crate::plant`.
+fn skip_lock() -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    return crate::plant::fires(crate::plant::Plant::ChunkWithoutEntryLock, true);
+    #[cfg(not(any(test, feature = "test-util")))]
+    false
+}
+
+/// A sweep batch's entry lock ([`ledger::lock_entries`], a placeholder for
+/// a key with no entry), under [`CHUNK_LOCK_TIMEOUT`], which it sets for the
+/// lock alone. Its time is recorded whether or not the lock is had: a batch
+/// that gives up spent it waiting all the same.
+async fn lock_sweep_entries(
     txn: &Transaction<'_>,
     ledger: &LedgerTargetPlan,
     keys: &[&str],
 ) -> Result<(), ApplyError> {
-    // Planted bug (#625 F3): the chunk's read-and-write runs with no entry
-    // lock, so it reads an entry a page is between reading and writing.
-    // See `crate::plant`.
-    #[cfg(any(test, feature = "test-util"))]
-    let skip_lock = crate::plant::fires(crate::plant::Plant::ChunkWithoutEntryLock, true);
-    #[cfg(not(any(test, feature = "test-util")))]
-    let skip_lock = false;
+    let skip_lock = skip_lock();
     let started = Instant::now();
     let locked = async {
         let previous: String = txn
@@ -476,8 +559,9 @@ pub struct SweepOutcome {
 /// hasn't re-derived: those whose `basis` is null (written by Apply alone)
 /// or is a snapshot taken before the build's start, `start_xid` (the
 /// snapshot's `xmax` is at or before it). A key quarantined for the
-/// definition (`poison`) is left as it is, as a chunk leaves it (#625 F-A5). Then it locks them as a chunk does
-/// ([`lock_chunk_entries`]) and re-derives them in one statement
+/// definition (`poison`) is left as it is, as a chunk leaves it (#625 F-A5).
+/// Then it locks them ([`lock_sweep_entries`]) and re-derives them in one
+/// statement
 /// ([`ledger::sweep_statement`]), which reads the source by each key: a key
 /// with no row any more (deleted while the definition was frozen) becomes a
 /// tombstone, and its group sheds it through the group deltas. The pick is
@@ -544,7 +628,7 @@ pub async fn sweep_batch(
         });
     }
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    lock_chunk_entries(txn, ledger, &key_refs).await?;
+    lock_sweep_entries(txn, ledger, &key_refs).await?;
     let parts = ledger::sweep_key_params(ledger, &key_refs)?;
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&key_refs];
     for part in &parts {
@@ -937,11 +1021,47 @@ const BUILD_REDERIVE: &str = "rederive";
 /// [`ledger::route`] refuses one, so it keeps the one-pass build until #625
 /// F9.
 fn buildable_shape(definition: &Definition) -> Option<ledger::LedgerShape> {
-    ledger::route(
-        &definition.def,
-        &definition.source_columns,
-        &std::collections::HashMap::new(),
-    )
+    shape_of(&definition.def, &definition.source_columns)
+}
+
+/// [`buildable_shape`] of a definition's parts.
+fn shape_of(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Option<ledger::LedgerShape> {
+    ledger::route(def, source_columns, &HashMap::new())
+}
+
+/// Whether the ledger of aggregate `def` carries its partial `GROUP BY`
+/// index (`defs::ledger::aggregate_ledger_index_ddl`, #723). It does unless
+/// the Re-derive build takes `def` ([`qualifies`], whose test this repeats:
+/// `source_is_definition_target` is its source check) and its target has
+/// no recomputed field. On that path nothing reads the ledger by group:
+/// pages, chunks, the sweep, the merger and the tombstone GC read entries
+/// by key, and only a recomputed field's statement reads a group's entries
+/// (`super::ledger`'s `recompute_statement`). The old build and the resume's
+/// orphan sweep read by group, and they run only for a definition this
+/// path doesn't take. Leaving the index out spares every entry write its
+/// maintenance, which at 100M entries cost most of the build's WAL as
+/// full-page images of its leaves.
+///
+/// Decided once, when the ledger is created (`defs::ddl`), and again by the
+/// old build, which drops and rebuilds the ledger's indexes
+/// (`defs::backfill`).
+///
+/// If `ALTER TRANSFORM` ever edits an aggregate (`defs::catalog` refuses
+/// that today), an edit that adds a recomputed field to a ledger without
+/// this index must build the index as part of its background build, before
+/// any recompute reads it.
+pub(crate) fn ledger_indexes_groups(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+    source_is_definition_target: bool,
+) -> bool {
+    match shape_of(def, source_columns) {
+        Some(shape) if !source_is_definition_target => shape.recomputes(),
+        _ => true,
+    }
 }
 
 /// Whether a Re-derive build may take `definition` (#625 F2, F5, F8a): a
@@ -2602,6 +2722,59 @@ async fn only_capture_waits(pool: &Pool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `text`'s ledger gets its `GROUP BY` index over a source of
+    /// `(id, g, v numeric, x float8)`, `source_is_target` saying whether
+    /// that source is another definition's target.
+    fn indexes_groups(text: &str, source_is_target: bool) -> bool {
+        let def = crate::defs::parse(text).expect("parse");
+        let columns: HashMap<String, ValueType> = [
+            ("id", ValueType::Numeric),
+            ("g", ValueType::Numeric),
+            ("v", ValueType::Numeric),
+            ("x", ValueType::Float(crate::float::FloatWidth::Float8)),
+        ]
+        .into_iter()
+        .map(|(c, t)| (c.to_string(), t))
+        .collect();
+        ledger_indexes_groups(&def, &columns, source_is_target)
+    }
+
+    /// #723: a target the Re-derive build takes, with only maintained
+    /// fields, gets no `GROUP BY` index on its ledger. One with a recomputed
+    /// field gets it, and so does one the Re-derive build doesn't take: a
+    /// source that is another definition's target, or a relationship-fed
+    /// target ([`buildable_shape`] has no relationships to route it with).
+    #[test]
+    fn only_an_invertible_re_derive_built_ledger_goes_without_its_group_index() {
+        let invertible = "TRANSFORM t FROM src GROUP BY g \
+                          SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n";
+        assert!(
+            !indexes_groups(invertible, false),
+            "invertible, Re-derive built"
+        );
+        for recomputed in [
+            "TRANSFORM t FROM src GROUP BY g SELECT MAX(v) AS hi, COUNT(*) AS n",
+            "TRANSFORM t FROM src GROUP BY g SELECT SUM(x) AS total",
+            "TRANSFORM t FROM src GROUP BY g SELECT SUM(v) + COUNT(v) AS both",
+        ] {
+            assert!(
+                indexes_groups(recomputed, false),
+                "recomputed: {recomputed}"
+            );
+        }
+        assert!(
+            indexes_groups(invertible, true),
+            "a seam-fed source: !qualifies"
+        );
+        assert!(
+            indexes_groups(
+                "TRANSFORM t FROM src GROUP BY g SELECT SUM(parent.w) AS total",
+                false
+            ),
+            "a relationship-fed target: !qualifies"
+        );
+    }
 
     /// #625 F-A5 for a Re-derive chunk (#616): a plain aggregate's build over
     /// a source of several chunks, whose `SUM(x + x)` overflows on one row.

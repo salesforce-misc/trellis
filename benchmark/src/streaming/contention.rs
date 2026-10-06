@@ -179,12 +179,13 @@ pub fn statement_class(query: &str, target: &str) -> StatementClass {
 /// shares its text with a drain page's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildClass {
-    /// A chunk's entry lock: the placeholder insert and the sorted
-    /// `for update`.
+    /// A chunk's entry lock: the sorted `for update` of the keys that had
+    /// an entry (and a sweep batch's placeholder insert).
     ChunkLock,
     /// The rest of a chunk's transaction: its claim fence, its key read, its
-    /// read-and-write statement (the entries and the delta insert), its done
-    /// mark and its commit.
+    /// read-and-write statements (the insert of the new keys' entries, the
+    /// rewrite of the others', and their delta inserts), its done mark and
+    /// its commit.
     ChunkWrite,
     /// A merger pass: the claim, sum and group upsert, the all-zero delete
     /// and the seam.

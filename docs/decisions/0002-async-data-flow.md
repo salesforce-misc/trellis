@@ -468,13 +468,20 @@ applying.
   (primary-key ranges over the source, discovered by `max()` over `LIMIT` so
   every row falls in exactly one range) in batches, on a drain worker. Every
   drain worker claims chunks. A chunk
-  is one short transaction: lock its entries in key order (placeholders for
-  keys with no entry), one statement that takes the snapshot and reads the
-  range, replace the entries, record the group deltas (next bullet). "No
-  entry" means "not yet counted": a captured change for a key whose chunk
-  has not run applies as an insert of NEW, a delete of one records a
-  tombstone, and the chunk's later Re-derive replaces the entry under a
+  is one short transaction. One statement takes the snapshot, reads the
+  range and inserts, in key order, the entry of every key that has none,
+  written from that read, and records their group deltas (next bullet).
+  Then the chunk locks the other keys' entries in key order, and one more
+  statement takes a snapshot, reads them, replaces their entries and
+  records their deltas. "No entry" means "not yet counted": a captured
+  change for a key whose chunk has not run applies as an insert of NEW, a
+  delete of one records a tombstone, and the chunk's insert then finds that
+  entry and leaves it to the locked Re-derive, which replaces it under a
   snapshot that includes that commit, so the group ends up counted once.
+  The insert's snapshot is taken before its uniqueness check, so the insert
+  relies on "no entry" meaning "no Apply since the snapshot". The tombstone
+  GC is the one thing that removes entries, and it skips a definition under
+  a build (I4).
   There is no go-live re-read, no orphan sweep and no catch-up: nothing was
   skipped. Batches drain out of order, so a change committed
   before the start can drain after it while a later change to the same key
@@ -596,7 +603,12 @@ applying.
   see, so every change the `basis` does see completed before D and is in D's
   batch or an earlier one, which D's page's stamp covers; a Re-derive that
   deletes it stamps its own read's segment. A revival keeps the old stamp,
-  which can only delay the GC (`defs::ledger::tombstone_seg_sql`).
+  which can only delay the GC (`defs::ledger::tombstone_seg_sql`). The GC
+  skips the ledger of a definition under a build (`backfilling`, or a
+  frozen Re-derive build), holding the definition's row `for key share`
+  while a batch runs, which a build's start waits on: a build chunk's insert
+  of a new key's entry needs every tombstone written after its snapshot to
+  stay until the insert (#723).
 - Every repair (an explicit `request_backfill`, a resume, a quarantine
   release) of a definition on the Re-derive build is a rebuild: Re-derive over
   the key space, which I2 makes safe against any pending change.

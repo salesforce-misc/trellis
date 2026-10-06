@@ -32,9 +32,10 @@
 //! when every accumulator on it (members, each count, each sum) is 0 (I3;
 //! #625 F1's B5, see [`finish_groups`]). The one-pass build writes both.
 //!
-//! A Re-derive build's chunks (`super::build`, #625 F1) rewrite entries with
-//! [`lock_entries`] and [`chunk_statement`] but leave the groups to the
-//! merger ([`merge_statement`]), which upserts their deltas with the same
+//! A Re-derive build's chunks (`super::build`, #625 F1) write entries with
+//! [`chunk_insert_statement`] (the keys with none), and [`lock_entries`] and
+//! [`chunk_statement`] (the others), but leave the groups to the merger
+//! ([`merge_statement`]), which upserts their deltas with the same
 //! [`group_upsert_sql`] a page uses, and then rewrites the recomputed fields
 //! of the groups it wrote, folding a group it only added entries to
 //! ([`recompute_written`], #625 F5).
@@ -741,9 +742,43 @@ fn upd_returning(plan: &LedgerTargetPlan) -> String {
 /// into its group: the entries the page inserted with their change already
 /// applied ([`lock_entries`]), which had no entry to move out of.
 fn moves_and_deltas(plan: &LedgerTargetPlan, build: bool) -> String {
+    let (groups, args) = entry_columns(&plan.shape);
+    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
+    format!(
+        "moves as ( \
+             select {u_cols}, 1 as __sign, u.__k, {rc} as __rc \
+             from upd u join old o on o.__k = u.__k where u.__live \
+             union all \
+             select {o_cols}, -1 as __sign, o.__k, {rc} as __rc \
+             from old o join upd u on u.__k = o.__k where o.__live{fresh} \
+         ), \
+         {d}",
+        rc = format!(
+            "row(o.__live, {})::text is distinct from row(u.__live, {})::text",
+            prefixed(&values, "o"),
+            prefixed(&values, "u")
+        ),
+        u_cols = prefixed(&values, "u"),
+        o_cols = prefixed(&values, "o"),
+        fresh = if build {
+            String::new()
+        } else {
+            format!(
+                " union all select {}, 1 as __sign, f.__k, true as __rc \
+                 from fresh f where f.__live",
+                prefixed(&values, "f")
+            )
+        },
+        d = deltas_cte(plan, build),
+    )
+}
+
+/// [`moves_and_deltas`]' `d` CTE alone, over a preceding `moves` CTE: one
+/// row per move, with the entry's values, `__sign` (1 into the group, -1 out
+/// of it), `__k` (its key) and `__rc` (whether its values changed).
+fn deltas_cte(plan: &LedgerTargetPlan, build: bool) -> String {
     let shape = &plan.shape;
     let (groups, args) = entry_columns(shape);
-    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
 
     // Per-group increments: `dm` members, and per argument `dc<i>` (its
     // non-null count) and, for a summed argument, `ds<i>` (its sum).
@@ -789,34 +824,11 @@ fn moves_and_deltas(plan: &LedgerTargetPlan, build: bool) -> String {
         nonzero.push(format!("{ds} <> 0"));
     }
     format!(
-        "moves as ( \
-             select {u_cols}, 1 as __sign, u.__k, {rc} as __rc \
-             from upd u join old o on o.__k = u.__k where u.__live \
-             union all \
-             select {o_cols}, -1 as __sign, o.__k, {rc} as __rc \
-             from old o join upd u on u.__k = o.__k where o.__live{fresh} \
-         ), \
-         d as ( \
+        "d as ( \
              select {m_groups}, {m_gk} as __gk, {deltas}, array_agg(m.__k) as __ks \
              from moves m group by {m_groups} \
              having {nonzero} \
          )",
-        rc = format!(
-            "row(o.__live, {})::text is distinct from row(u.__live, {})::text",
-            prefixed(&values, "o"),
-            prefixed(&values, "u")
-        ),
-        u_cols = prefixed(&values, "u"),
-        o_cols = prefixed(&values, "o"),
-        fresh = if build {
-            String::new()
-        } else {
-            format!(
-                " union all select {}, 1 as __sign, f.__k, true as __rc \
-                 from fresh f where f.__live",
-                prefixed(&values, "f")
-            )
-        },
         m_groups = prefixed(&groups, "m"),
         m_gk = ddl::pk_key_sql_expr(&plan.identity, Some("m")),
         deltas = deltas.join(", "),
@@ -1330,15 +1342,7 @@ fn ledger_statement(
 /// is older than the fence of the newest one it does see: that fence sees
 /// every change the snapshot sees.
 pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: &str) -> String {
-    let k_expr = ddl::pk_key_sql_expr(&plan.source_pk, Some("s"));
-    rederive_statement(
-        plan,
-        &format!(
-            "join unnest({keys}::text[]) as u(__trellis_k) on u.__trellis_k = {k_expr} \
-             where {range_where}"
-        ),
-        keys,
-    )
+    rederive_statement(plan, &chunk_source_filter(plan, range_where, keys), keys)
 }
 
 /// A rebuild's sweep batch's one statement (#625 F3; called from
@@ -1408,46 +1412,10 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
     let q = |c: &str| quote_ident(c);
     let (groups, args) = entry_columns(shape);
     let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
-    let k_expr = ddl::pk_key_sql_expr(&plan.source_pk, Some("s"));
-    let mut src_cols: Vec<String> = groups
-        .iter()
-        .zip(&shape.group_paths)
-        .map(|(c, path)| match path {
-            None => format!("s.{c} as {c}"),
-            Some(sql) => format!("{sql} as {c}"),
-        })
-        .collect();
-    for contrib in &shape.contribs {
-        src_cols.push(match &contrib.source {
-            ContribSource::Column(source) => format!("s.{} as {}", q(source), q(&contrib.column)),
-            ContribSource::Expr { sql, .. } => format!("{sql} as {}", q(&contrib.column)),
-        });
-    }
     let set_values: Vec<String> = values.iter().map(|c| format!("{c} = v.{c}")).collect();
-    let mut delta_cols = groups.clone();
-    delta_cols.push(schema::DELTA_MEMBERS_COLUMN.to_string());
-    for (i, contrib) in shape.contribs.iter().enumerate() {
-        delta_cols.push(schema::delta_count_column(i));
-        if contrib.summed {
-            delta_cols.push(schema::delta_sum_column(i));
-        }
-    }
-    if shape.recomputes() {
-        delta_cols.push(schema::DELTA_OUT_COLUMN.to_string());
-        delta_cols.push(schema::DELTA_KEYS_COLUMN.to_string());
-    }
+    let delta_cols = delta_columns(shape).join(", ");
     format!(
-        "with snap as ( \
-             select pg_catalog.pg_current_snapshot() as __snap, \
-                    (select max(seg_seq) from segments) as __seg \
-         ), \
-         src as ( \
-             select {k_expr} as __k, {src_cols} from {source} s{joins} {src_from} \
-         ), \
-         v as ( \
-             select u.__k, r.__k is not null as __present, {r_cols} \
-             from unnest({keys}::text[]) as u(__k) left join src r on r.__k = u.__k \
-         ), \
+        "with {reads}, \
          {old}, \
          upd as ( \
              update {ledger} l set {set_values}, \
@@ -1462,10 +1430,7 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
              insert into {deltas} ({delta_cols}) select {delta_cols} from d \
          ) \
          select (select count(*) from upd), (select count(*) from d)",
-        source = ddl::qualified_source_table(&plan.source_table),
-        joins = shape.joins,
-        src_cols = src_cols.join(", "),
-        r_cols = prefixed(&values, "r"),
+        reads = rederive_read_ctes(plan, src_from, keys, None),
         old = old_cte(plan, keys),
         ledger = plan.ledger_ident,
         set_values = set_values.join(", "),
@@ -1482,7 +1447,175 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
         returning = upd_returning(plan),
         moves_and_deltas = moves_and_deltas(plan, true),
         deltas = plan.deltas_ident,
-        delta_cols = delta_cols.join(", "),
+    )
+}
+
+/// A build chunk's insert of the entries its keys don't have yet (#723;
+/// called from [`super::build`]): [`chunk_statement`]'s read, and each key's
+/// entry inserted from it in key order (I5), with `basis` the read's
+/// snapshot, a key with no row a tombstone stamped with the newest segment
+/// the snapshot sees (as [`chunk_statement`] stamps one), and the live
+/// entries' moves into their groups appended to the group deltas. A key
+/// that has an entry by the time its insert runs is left alone (`on
+/// conflict do nothing`): the chunk then locks it and re-derives it with
+/// [`chunk_statement`], as it does every key that already had one. Binds as
+/// [`chunk_statement`] does. Returns the keys it inserted (`text[]`) and the
+/// delta rows it appended.
+///
+/// Each new entry is written once, where a placeholder and its rewrite
+/// would write two versions, the second never HOT since it sets the entry's
+/// group and membership. On a fresh build every key takes this path, and
+/// it is the chunk's only write.
+///
+/// **Why the insert may write from a snapshot taken before it.** The read's
+/// snapshot T is the statement's, and each key's uniqueness check comes
+/// after it. A key with no entry has contributed nothing anywhere, so the
+/// insert is right if no Apply has written the key since T. An Apply that
+/// has writes the key's entry, which the check then finds, or waits for
+/// while the Apply is in flight, and the chunk re-derives that key under
+/// its lock instead. With no entry, every change T doesn't see is still to
+/// apply, and applies over the entry this writes, while every change T sees
+/// is in its `basis`, and is skipped (I2).
+///
+/// That needs every entry an Apply wrote since T to still be there at the
+/// check. Only the tombstone GC removes entries, and it skips the ledger of
+/// a definition under a build (`super::retire::collect_tombstones`).
+/// Otherwise a delete committed after T could be applied as a tombstone and
+/// collected before the check, and the insert would write the key live from
+/// T, with nothing left to retract it.
+///
+/// `pause` is a test's pause lock (`super::interleave`'s
+/// `AfterChunkSnapshot`), taken after the snapshot and before the first
+/// insert; `None` outside those tests.
+pub(super) fn chunk_insert_statement(
+    plan: &LedgerTargetPlan,
+    range_where: &str,
+    keys: &str,
+    pause: Option<i64>,
+) -> String {
+    let shape = &plan.shape;
+    let q = |c: &str| quote_ident(c);
+    let (groups, args) = entry_columns(shape);
+    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
+    let delta_cols = delta_columns(shape).join(", ");
+    format!(
+        "with {reads}, \
+         fresh as ( \
+             insert into {ledger} ({key}, {values}, {member}, {tombstone}, {basis}, {seg}) \
+             select v.__k, {v_values}, v.__present, not v.__present, snap.__snap, {stamp} \
+             from v cross join snap \
+             order by v.__k \
+             on conflict do nothing \
+             returning {key} as __k, {values}, {member} and not {tombstone} as __live \
+         ), \
+         moves as ( \
+             select {f_values}, 1 as __sign, f.__k, true as __rc from fresh f where f.__live \
+         ), \
+         {deltas_cte}, \
+         ins as ( \
+             insert into {deltas} ({delta_cols}) select {delta_cols} from d \
+         ) \
+         select coalesce((select array_agg(__k) from fresh), '{{}}'::text[]), \
+                (select count(*) from d)",
+        reads = rederive_read_ctes(
+            plan,
+            &chunk_source_filter(plan, range_where, keys),
+            keys,
+            pause
+        ),
+        ledger = plan.ledger_ident,
+        key = q(schema::KEY_COLUMN),
+        values = values.join(", "),
+        v_values = prefixed(&values, "v"),
+        f_values = prefixed(&values, "f"),
+        member = q(schema::MEMBER_COLUMN),
+        tombstone = q(schema::TOMBSTONE_COLUMN),
+        basis = q(schema::BASIS_COLUMN),
+        seg = q(schema::APPLIED_SEG_COLUMN),
+        stamp = schema::tombstone_seg_sql(None, "not v.__present", "snap.__seg"),
+        deltas_cte = deltas_cte(plan, true),
+        deltas = plan.deltas_ident,
+    )
+}
+
+/// A chunk's source filter, following `from <source> s`: its `(lo, hi]`
+/// predicate `range_where` and its keys `keys` ([`chunk_statement`]).
+fn chunk_source_filter(plan: &LedgerTargetPlan, range_where: &str, keys: &str) -> String {
+    let k_expr = ddl::pk_key_sql_expr(&plan.source_pk, Some("s"));
+    format!(
+        "join unnest({keys}::text[]) as u(__trellis_k) on u.__trellis_k = {k_expr} \
+         where {range_where}"
+    )
+}
+
+/// The group-delta table's columns a build statement's `d` writes, quoted
+/// where they need it ([`schema::aggregate_deltas_ddl`]).
+fn delta_columns(shape: &LedgerShape) -> Vec<String> {
+    let (mut columns, _) = entry_columns(shape);
+    columns.push(schema::DELTA_MEMBERS_COLUMN.to_string());
+    for (i, contrib) in shape.contribs.iter().enumerate() {
+        columns.push(schema::delta_count_column(i));
+        if contrib.summed {
+            columns.push(schema::delta_sum_column(i));
+        }
+    }
+    if shape.recomputes() {
+        columns.push(schema::DELTA_OUT_COLUMN.to_string());
+        columns.push(schema::DELTA_KEYS_COLUMN.to_string());
+    }
+    columns
+}
+
+/// A build Re-derive's read, as the `snap`, `src` and `v` CTEs:
+/// `pg_current_snapshot()` and the newest segment's `seg_seq` (`snap`), the
+/// keys' source rows (`src`; `src_from` follows `from <source> s`), and per
+/// key of `keys` (a `text[]` parameter) whether it has a row and its
+/// entry's values from it (`v`). `pause` adds a test's pause lock to `snap`
+/// ([`chunk_insert_statement`]).
+fn rederive_read_ctes(
+    plan: &LedgerTargetPlan,
+    src_from: &str,
+    keys: &str,
+    pause: Option<i64>,
+) -> String {
+    let shape = &plan.shape;
+    let q = |c: &str| quote_ident(c);
+    let (groups, args) = entry_columns(shape);
+    let values: Vec<String> = groups.iter().chain(&args).cloned().collect();
+    let k_expr = ddl::pk_key_sql_expr(&plan.source_pk, Some("s"));
+    let mut src_cols: Vec<String> = groups
+        .iter()
+        .zip(&shape.group_paths)
+        .map(|(c, path)| match path {
+            None => format!("s.{c} as {c}"),
+            Some(sql) => format!("{sql} as {c}"),
+        })
+        .collect();
+    for contrib in &shape.contribs {
+        src_cols.push(match &contrib.source {
+            ContribSource::Column(source) => format!("s.{} as {}", q(source), q(&contrib.column)),
+            ContribSource::Expr { sql, .. } => format!("{sql} as {}", q(&contrib.column)),
+        });
+    }
+    let pause = pause.map_or(String::new(), |key| {
+        format!(", pg_catalog.pg_advisory_xact_lock_shared({key}::bigint) as __pause")
+    });
+    format!(
+        "snap as ( \
+             select pg_catalog.pg_current_snapshot() as __snap, \
+                    (select max(seg_seq) from segments) as __seg{pause} \
+         ), \
+         src as ( \
+             select {k_expr} as __k, {src_cols} from {source} s{joins} {src_from} \
+         ), \
+         v as ( \
+             select u.__k, r.__k is not null as __present, {r_cols} \
+             from unnest({keys}::text[]) as u(__k) left join src r on r.__k = u.__k \
+         )",
+        source = ddl::qualified_source_table(&plan.source_table),
+        joins = shape.joins,
+        src_cols = src_cols.join(", "),
+        r_cols = prefixed(&values, "r"),
     )
 }
 
@@ -1996,8 +2129,12 @@ pub(super) fn lock_statement(ledger: &str) -> String {
 
 /// How [`lock_entries`] makes the entries of keys that have none.
 pub(super) enum NewEntries<'a> {
-    /// A non-member placeholder each: a build chunk's, which re-derives
-    /// every key it locks, and a page's on a target that reads a
+    /// None: every key has an entry already. A build chunk's, whose insert
+    /// made the entries of the keys that had none
+    /// ([`chunk_insert_statement`], #723).
+    None,
+    /// A non-member placeholder each: a rebuild's sweep batch's, which
+    /// re-derives every key it locks, and a page's on a target that reads a
     /// relationship.
     Placeholders,
     /// A page's: [`fresh_entries_statement`]'s parameters, in `keys`' order:
@@ -2056,6 +2193,10 @@ pub(super) async fn lock_entries(
     let mut applied: Vec<String> = Vec::new();
     let mut distinct = keys.to_vec();
     match new {
+        NewEntries::None => {
+            distinct.sort_unstable();
+            distinct.dedup();
+        }
         NewEntries::Placeholders => {
             distinct.sort_unstable();
             distinct.dedup();

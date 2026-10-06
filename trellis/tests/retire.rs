@@ -523,3 +523,80 @@ async fn collect_tombstones_skips_a_ledger_without_its_tombstone_index() {
         .expect("collect_tombstones");
     assert_eq!(collected, 1, "k1's tombstone goes once the index is back");
 }
+
+/// The GC skips the ledger of a definition under a build (#723): one that
+/// is `backfilling`, or whose Re-derive build a pause froze (`build` still
+/// set), and one whose row another transaction holds `for update`, as a
+/// build's start does. A build's chunk inserts the entry of a key with no
+/// entry from a snapshot taken before the insert, which a tombstone
+/// collected in between would make wrong
+/// (`staging::ledger::chunk_insert_statement`). Once the build is over, the
+/// GC collects as usual.
+#[tokio::test]
+async fn collect_tombstones_skips_a_ledger_under_a_build() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            r#"
+            create table public.t__ledger (
+                "__from_key" text primary key,
+                "__applied_lsn" pg_lsn,
+                "__applied_seg" bigint,
+                "__basis" pg_snapshot,
+                "__tombstone" boolean not null default false
+            );
+            create index on public.t__ledger ("__applied_seg") where "__tombstone";
+            insert into public.t__ledger ("__from_key", "__applied_seg", "__tombstone")
+            values ('k1', 1, true);
+
+            insert into source_table_versions (source_table, version)
+            values ('public.src', 1);
+            insert into transform_definitions
+                (target_table, source_table, source_version, definition_text, status, build)
+            values ('public.t', 'public.src', 1, 'n/a', 'backfilling', 'rederive');
+            "#,
+        )
+        .await
+        .expect("create a ledger whose definition is building");
+
+    seal_and_fence(&mut client).await; // segment 1
+    mark_drained(&client, 1).await;
+
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 0, "backfilling");
+
+    client
+        .batch_execute("update transform_definitions set status = 'paused'")
+        .await
+        .expect("pause the build");
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 0, "a paused build is still a build");
+
+    client
+        .batch_execute("update transform_definitions set status = 'live', build = null")
+        .await
+        .expect("finish the build");
+    let mut starting = connect_raw(db.dsn()).await;
+    let start = starting.transaction().await.expect("begin");
+    start
+        .batch_execute("select 1 from transform_definitions for update")
+        .await
+        .expect("hold the definition's row as a build's start does");
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 0, "a start in flight");
+    start.rollback().await.expect("roll back");
+
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 1, "k1's tombstone goes once no build runs");
+}

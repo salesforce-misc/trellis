@@ -48,9 +48,13 @@
 //!
 //! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
 //! column's first three points for its target too: `AfterPlaceholders` and
-//! `AfterEntryLock` around the same entry lock, and `AfterRederiveRead`
-//! directly after its one read-and-write statement (the entries rewritten
-//! and the deltas appended, uncommitted). The merger
+//! `AfterEntryLock` around the entry lock of the keys that had an entry
+//! (after its insert of the others', #723), and `AfterRederiveRead`
+//! directly after its last read-and-write statement (the entries written
+//! and the deltas appended, uncommitted). Two points are a chunk's alone:
+//! [`PausePoint::BeforeChunkInsert`], after its read of the keys and
+//! before its insert, and [`PausePoint::AfterChunkSnapshot`], inside the
+//! insert, after its snapshot ([`pause_in_statement`]). The merger
 //! (`super::build::merge_deltas`) fires `AfterGroupUpsert` after its one
 //! statement, holding its claimed delta rows and its groups. A test runs
 //! either inside [`with_scope`] as it would a drain.
@@ -108,6 +112,12 @@ pub enum PausePoint {
     /// After a Re-derive's live read of the source (off the ledger, a
     /// forced group recompute).
     AfterRederiveRead,
+    /// After a build chunk's read of its keys, before its insert of the
+    /// entries of those that have none (#723).
+    BeforeChunkInsert,
+    /// Inside a build chunk's insert of its new keys' entries, after the
+    /// statement's snapshot and before its first insert (#723).
+    AfterChunkSnapshot,
     /// After the page's group increments (aggregate targets only).
     AfterGroupUpsert,
     /// After every write the page makes, just before it commits.
@@ -267,6 +277,40 @@ pub(crate) async fn pause_at<C: GenericClient>(
         )
         .await?;
     Ok(())
+}
+
+/// The in-statement hook, for a point inside one statement
+/// ([`PausePoint::AfterChunkSnapshot`]): unless the running task's
+/// [`PauseScope`] armed `point` for `target`, `None`. When it is armed, it
+/// lifts `client`'s `lock_timeout` for the rest of the transaction, reports
+/// [`Reached`] and returns the lock key, which the caller's statement then
+/// waits on (`pg_advisory_xact_lock_shared`). The caller sets the timeout it
+/// wants back after the statement.
+///
+/// [`Reached`] is sent before the statement starts, so a test that needs the
+/// statement's snapshot taken waits until the backend is queued on the lock
+/// (`pg_blocking_pids`).
+pub(crate) async fn pause_in_statement<C: GenericClient>(
+    client: &C,
+    point: PausePoint,
+    target: &str,
+) -> Result<Option<i64>, tokio_postgres::Error> {
+    let Some(arming) = SCOPE
+        .try_with(|scope| scope.take(point, target))
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let backend_pid: i32 = client
+        .query_one("select pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    client
+        .execute("select set_config('lock_timeout', '0', true)", &[])
+        .await?;
+    let _ = arming.reached.send(Reached { point, backend_pid });
+    Ok(Some(arming.lock_key))
 }
 
 #[cfg(test)]

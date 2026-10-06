@@ -1799,56 +1799,164 @@ async fn a_chunk_queues_on_an_entry_a_page_inserted_with_its_change() {
 
 // ------------------------------------------------------- tombstone GC (D7)
 
-/// A chunk's tombstone (a key it locked whose row was deleted before its
-/// read) carries the segment that was active at its read (#625 finding 11),
-/// so D7's collection keeps it while that segment is undrained, and takes it
-/// once it drains.
+/// A chunk's tombstone (a key whose row was deleted after the chunk read
+/// its keys and before its read of their rows) carries the segment that was
+/// active at its read (#625 finding 11), so D7's collection keeps it while
+/// that segment is undrained, and takes it once it drains. Twice: once for a
+/// key with no entry, which the chunk's insert writes (#723), and once for
+/// a key with one, which the chunk locks and re-derives (a second chunk
+/// over the range).
 #[tokio::test]
 async fn a_chunk_tombstone_is_collected_once_its_segment_drains() {
     let flavour = Flavour::Sum;
-    let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
-    let mut chunk = d
-        .chunk_frozen(&plan, None, "3", &[(PausePoint::AfterPlaceholders, TARGET)])
-        .await;
-    chunk.reached(PausePoint::AfterPlaceholders).await;
-    let user = d.user().await;
-    user.batch_execute("delete from public.src where id = 3")
-        .await
-        .expect("delete key 3 under the chunk");
-    d.release(&mut chunk, PausePoint::AfterPlaceholders).await;
-    chunk.finish().await;
+    for (point, rechunk) in [
+        (PausePoint::BeforeChunkInsert, false),
+        (PausePoint::AfterPlaceholders, true),
+    ] {
+        let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+        if rechunk {
+            d.chunk(&plan, None, "3").await;
+        }
+        let mut chunk = d.chunk_frozen(&plan, None, "3", &[(point, TARGET)]).await;
+        chunk.reached(point).await;
+        let user = d.user().await;
+        user.batch_execute("delete from public.src where id = 3")
+            .await
+            .expect("delete key 3 under the chunk");
+        d.release(&mut chunk, point).await;
+        chunk.finish().await;
 
-    let active: i64 = d
-        .ctl
-        .query_one("select max(seg_seq) from segments", &[])
-        .await
-        .expect("read the active segment")
-        .get(0);
-    assert_eq!(key_3_entry(&d).await, Some((true, Some(active))));
+        let active: i64 = d
+            .ctl
+            .query_one("select max(seg_seq) from segments", &[])
+            .await
+            .expect("read the active segment")
+            .get(0);
+        assert_eq!(
+            key_entry(&d, "3").await,
+            Some((true, Some(active))),
+            "{point:?}"
+        );
 
-    d.collect_tombstones().await;
-    assert!(
-        key_3_entry(&d).await.is_some(),
-        "kept while its segment is undrained"
-    );
-    let batch = d.seal().await;
-    assert_eq!(batch, active, "the delete was captured into that segment");
-    d.drain(batch, "apply").await;
-    d.collect_tombstones().await;
-    assert_eq!(key_3_entry(&d).await, None, "collected once it drained");
-    assert_oracle(&mut d, &plan, flavour).await;
+        d.collect_tombstones().await;
+        assert!(
+            key_entry(&d, "3").await.is_some(),
+            "{point:?}: kept while its segment is undrained"
+        );
+        let batch = d.seal().await;
+        assert_eq!(batch, active, "the delete was captured into that segment");
+        d.drain(batch, "apply").await;
+        d.collect_tombstones().await;
+        assert_eq!(
+            key_entry(&d, "3").await,
+            None,
+            "{point:?}: collected once it drained"
+        );
+        assert_oracle(&mut d, &plan, flavour).await;
+    }
 }
 
-/// Key 3's entry: whether it is a tombstone, and its `applied_seg`.
-async fn key_3_entry(d: &Driver) -> Option<(bool, Option<i64>)> {
+// ------------------------------- the GC under a build's insert (#723)
+
+/// #723: a chunk inserts the entry of a key that has none from its read's
+/// snapshot, which is right only if every entry an Apply wrote since that
+/// snapshot is still there when the insert's uniqueness check runs. So the
+/// tombstone GC skips the ledger of a definition under a build.
+///
+/// The chunk (keys 1 to 3, none with an entry) is frozen inside its insert,
+/// after its snapshot. Key 2 is deleted, and the delete's page writes key
+/// 2's tombstone and drains its batch, so the tombstone is collectable by
+/// segment. The GC pass collects nothing: the definition is building. The
+/// chunk's insert then finds key 2's entry and leaves it to the lock and
+/// the Re-derive, which keep it a tombstone. Collected instead, key 2 would
+/// be inserted live from the snapshot, which still saw its row, and the
+/// target would count it for good.
+#[tokio::test]
+async fn the_gc_keeps_a_tombstone_a_chunk_has_yet_to_insert_over() {
+    for flavour in [Flavour::Sum, Flavour::MinMax] {
+        let (mut d, plan) = start_build(flavour, &[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+        d.ctl
+            .execute(
+                "update transform_definitions set status = 'backfilling', build = 'rederive' \
+                 where target_table = $1",
+                &[&TARGET],
+            )
+            .await
+            .expect("put the definition under a Re-derive build");
+        let mut chunk = d
+            .chunk_frozen(
+                &plan,
+                None,
+                "3",
+                &[(PausePoint::AfterChunkSnapshot, TARGET)],
+            )
+            .await;
+        let frozen = chunk.reached(PausePoint::AfterChunkSnapshot).await;
+        wait_lock_waiting(&d, frozen.backend_pid).await;
+
+        let user = d.user().await;
+        user.batch_execute("delete from public.src where id = 2")
+            .await
+            .expect("delete key 2 after the chunk's snapshot");
+        let batch = d.seal().await;
+        d.drain(batch, "apply").await;
+        assert_eq!(
+            key_entry(&d, "2").await.map(|(tombstone, _)| tombstone),
+            Some(true),
+            "{flavour:?}: the page wrote key 2's tombstone"
+        );
+        assert_eq!(
+            d.collect_tombstones().await,
+            0,
+            "{flavour:?}: the GC skips a ledger under a build"
+        );
+
+        d.release(&mut chunk, PausePoint::AfterChunkSnapshot).await;
+        assert_eq!(chunk.finish().await.keys, 3);
+        assert_eq!(
+            key_entry(&d, "2").await.map(|(tombstone, _)| tombstone),
+            Some(true),
+            "{flavour:?}: key 2 stays a tombstone"
+        );
+        assert_oracle(&mut d, &plan, flavour).await;
+    }
+}
+
+/// Waits until backend `pid` is queued on a lock: a chunk frozen inside a
+/// statement has taken the statement's snapshot once it is.
+async fn wait_lock_waiting(d: &Driver, pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let waiting: bool = d
+            .ctl
+            .query_one(
+                "select exists (select 1 from pg_locks where pid = $1 and not granted)",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_locks")
+            .get(0);
+        if waiting {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backend {pid} queued on no lock within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Key `key`'s entry: whether it is a tombstone, and its `applied_seg`.
+async fn key_entry(d: &Driver, key: &str) -> Option<(bool, Option<i64>)> {
     d.ctl
         .query_opt(
             "select __tombstone, __applied_seg from public.agg__ledger \
-             where __from_key = '3'",
-            &[],
+             where __from_key = $1",
+            &[&key],
         )
         .await
-        .expect("read key 3's entry")
+        .expect("read the entry")
         .map(|r| (r.get(0), r.get(1)))
 }
 

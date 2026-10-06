@@ -423,11 +423,13 @@ fn ordering_state_columns() -> String {
 ///
 /// `group_columns` are the target's `GROUP BY` columns with the target's
 /// types; `contribution_columns` are [`contributions`]' columns, typed by
-/// their arguments. See [`aggregate_ledger_index_ddl`] for the indexes.
+/// their arguments. See [`aggregate_ledger_index_ddl`] for the indexes and
+/// `group_index`.
 pub(crate) fn aggregate_ledger_ddl(
     qualified_ledger: &str,
     group_columns: &[LedgerColumn],
     contribution_columns: &[LedgerColumn],
+    group_index: bool,
 ) -> String {
     let mut columns = vec![format!("{} text primary key", quote_ident(KEY_COLUMN))];
     columns.extend(group_columns.iter().map(LedgerColumn::render));
@@ -441,7 +443,7 @@ pub(crate) fn aggregate_ledger_ddl(
     format!(
         "; create table {qualified_ledger} ({}){}",
         columns.join(", "),
-        aggregate_ledger_index_ddl(qualified_ledger, &group_idents),
+        aggregate_ledger_index_ddl(qualified_ledger, &group_idents, group_index),
     )
 }
 
@@ -451,6 +453,11 @@ pub(crate) fn aggregate_ledger_ddl(
 /// `staging::retire::collect_tombstones` reads, #623 D7), so that a GC batch
 /// seeks the collectable ones however many are not yet collectable.
 /// `group_idents` are the quoted `GROUP BY` columns.
+///
+/// The `GROUP BY` index is there only with `group_index`
+/// (`staging::build::ledger_indexes_groups`, #723): a target the Re-derive
+/// build takes, with no recomputed field, never reads its ledger by group.
+/// The tombstone index is always there.
 ///
 /// Neither reads a column an Apply to a live entry that keeps its group
 /// changes: such an Apply leaves `applied_seg` alone ([`tombstone_seg_sql`]),
@@ -463,13 +470,17 @@ pub(crate) fn aggregate_ledger_ddl(
 pub(crate) fn aggregate_ledger_index_ddl(
     qualified_ledger: &str,
     group_idents: &[String],
+    group_index: bool,
 ) -> String {
-    let mut sql = format!(
-        "; create index on {qualified_ledger} ({}) where {} and not {}",
-        group_idents.join(", "),
-        quote_ident(MEMBER_COLUMN),
-        quote_ident(TOMBSTONE_COLUMN),
-    );
+    let mut sql = String::new();
+    if group_index {
+        sql.push_str(&format!(
+            "; create index on {qualified_ledger} ({}) where {} and not {}",
+            group_idents.join(", "),
+            quote_ident(MEMBER_COLUMN),
+            quote_ident(TOMBSTONE_COLUMN),
+        ));
+    }
     sql.push_str(&format!(
         "; create index on {qualified_ledger} ({}) where {}",
         quote_ident(APPLIED_SEG_COLUMN),
@@ -703,10 +714,39 @@ mod tests {
                     collation: Some(r#""C""#.to_string()),
                 },
             ],
+            true,
         );
         assert_eq!(
             ddl,
             r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__arg1" text collate "C", "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("g") where "__member" and not "__tombstone"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
+        );
+    }
+
+    /// Without its `GROUP BY` index (#723), a ledger keeps its tombstone
+    /// index, and the rebuild after an old build's load adds the same set.
+    #[test]
+    fn a_ledger_without_its_group_index_keeps_its_tombstone_index() {
+        let ddl = aggregate_ledger_ddl(
+            r#""public"."t__ledger""#,
+            &[LedgerColumn {
+                name: "g".to_string(),
+                pg_type: "integer".to_string(),
+                collation: None,
+            }],
+            &[LedgerColumn {
+                name: "__arg0".to_string(),
+                pg_type: "numeric".to_string(),
+                collation: None,
+            }],
+            false,
+        );
+        assert_eq!(
+            ddl,
+            r#"; create table "public"."t__ledger" ("__from_key" text primary key, "g" integer, "__member" boolean not null default true, "__arg0" numeric, "__applied_lsn" pg_lsn, "__applied_seg" bigint, "__basis" pg_snapshot, "__tombstone" boolean not null default false); create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
+        );
+        assert_eq!(
+            aggregate_ledger_index_ddl(r#""public"."t__ledger""#, &[r#""g""#.to_string()], false),
+            r#"; create index on "public"."t__ledger" ("__applied_seg") where "__tombstone""#
         );
     }
 

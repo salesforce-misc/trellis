@@ -313,6 +313,22 @@ async fn aggregate_over_a_to_one_relationship_backfills_to_the_oracle() {
         totals.get("db"),
         Some(&(Some("2".to_string()), Some("100".to_string())))
     );
+    // The old build takes a relationship-fed target, and reads its ledger by
+    // group, so the ledger keeps its `GROUP BY` index (#723).
+    let group_index: bool = client
+        .query_one(
+            "select exists (select 1 from pg_index \
+             where indrelid = 'tag_totals__ledger'::regclass \
+               and pg_get_expr(indpred, indrelid) = '(__member AND (NOT __tombstone))')",
+            &[],
+        )
+        .await
+        .expect("read the ledger's indexes")
+        .get(0);
+    assert!(
+        group_index,
+        "a relationship-fed ledger keeps its GROUP BY index"
+    );
 }
 
 /// Forward propagation: a new `post_tags` row folds its related post's

@@ -164,11 +164,11 @@ const DRAINED_PREFIX_SQL: &str = "\
     from segments";
 
 /// Every ledger table there is, schema-qualified and quoted: a
-/// definition's `<target>__ledger`, where it exists. An aggregate target's
-/// and a 1-1 target's (#623 D6) carry the same ordering-state columns, so
-/// [`collect_tombstones`] collects both alike.
+/// definition's `<target>__ledger`, where it exists, with the definition's
+/// id. An aggregate target's and a 1-1 target's (#623 D6) carry the same
+/// ordering-state columns, so [`collect_tombstones`] collects both alike.
 const LEDGER_TABLES_SQL: &str = "\
-    select format('%I.%I', n.nspname, c.relname) \
+    select format('%I.%I', n.nspname, c.relname), d.id \
     from transform_definitions d \
     join pg_catalog.pg_namespace n on n.nspname = split_part(d.target_table, '.', 1) \
     join pg_catalog.pg_class c on c.relnamespace = n.oid \
@@ -217,6 +217,10 @@ const TOMBSTONE_BATCHES_PER_PASS: usize = 4;
 /// `super::ledger::apply_ledger_target`), a build chunk in its one
 /// statement, and the direct Re-derives stamp the latest segment there is.
 ///
+/// **Against a build.** A ledger whose definition is under a build is
+/// skipped ([`NOT_BUILDING_SQL`], #723): a build chunk's insert needs the
+/// tombstones written since its snapshot.
+///
 /// **Against a page.** Each batch is a short transaction of its own. It
 /// takes the ledger's `ROW EXCLUSIVE` lock `NOWAIT`, so a build or drop of
 /// the ledger (or of its definition) makes this pass skip it rather than
@@ -246,14 +250,14 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
         _ => through,
     };
 
-    let ledgers: Vec<String> = client
+    let ledgers: Vec<(String, i64)> = client
         .query(LEDGER_TABLES_SQL, &[&crate::defs::ledger::LEDGER_SUFFIX])
         .await?
         .into_iter()
-        .map(|row| row.get(0))
+        .map(|row| (row.get(0), row.get(1)))
         .collect();
     let mut collected = 0;
-    for ledger in &ledgers {
+    for (ledger, definition_id) in &ledgers {
         let sql = collect_statement(ledger);
         for _ in 0..TOMBSTONE_BATCHES_PER_PASS {
             let txn = client.transaction().await?;
@@ -267,6 +271,12 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
                     break;
                 }
                 return Err(err.into());
+            }
+            match txn.query_opt(NOT_BUILDING_SQL, &[definition_id]).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(err) if is_lock_not_available(&err) => break,
+                Err(err) => return Err(err.into()),
             }
             let indexed: bool = txn
                 .query_one(
@@ -288,6 +298,39 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
     }
     Ok(collected)
 }
+
+/// Locks definition `$1`'s row `for key share`, without waiting, and
+/// returns it unless the definition is under a build: `backfilling`, or
+/// with a Re-derive build a pause or a quarantine froze (`build` set). A
+/// GC batch collects nothing from a ledger this returns no row for (#723),
+/// and holds the lock until it commits.
+///
+/// **Why.** A Re-derive build's chunk inserts the entries of keys that have
+/// none from a snapshot taken before the insert
+/// (`super::ledger::chunk_insert_statement`), which is right only if no
+/// Apply has written the key since that snapshot. A tombstone a page wrote
+/// since then, and collected before the insert's uniqueness check, would
+/// let the insert write a deleted key live, and nothing would retract it.
+///
+/// **Why the lock makes the skip enough.** A build starts by taking the
+/// definition's row `for update` (`super::build`'s `start`), which waits
+/// for a batch holding this lock, and a chunk's snapshot comes after the
+/// start commits. So a batch that collects either committed before the
+/// start, and every tombstone it collected predates every chunk's
+/// snapshot, or ran its check after the start committed, and skipped. A
+/// build is over only once its last chunk has committed: `try_complete`
+/// needs every chunk done, and a resume waits on every chunk a worker
+/// still holds (`super::quarantine::resume_transform`).
+///
+/// A build's start doesn't wait long: one batch is a few milliseconds. The
+/// tombstones of deletes applied during a build wait for its end, which
+/// bounds them by the write rate times the build's length. `nowait`, so a
+/// batch skips a definition another transaction holds `for update` rather
+/// than queue on it.
+const NOT_BUILDING_SQL: &str = "\
+    select 1 from transform_definitions \
+    where id = $1 and status <> 'backfilling' and build is null \
+    for key share nowait";
 
 /// The plan settings a GC batch's statement runs under (#738, #722): no
 /// sequential scan and no bitmap scan, so the batch walks the ledger's
