@@ -1366,7 +1366,7 @@ async fn widening_a_group_by_key_read_through_a_relationship_pauses_and_resume_w
 /// A second resume tries again and ends the same way.
 #[tokio::test]
 async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_its_target_as_it_was()
- {
+{
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1382,13 +1382,15 @@ async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_it
         .await
         .expect("define tag_labels");
     bring_live(&mut raw, &db.pool, &["tag_labels"]).await;
-    let before = rows(&raw, "select code, label from public.tag_labels order by code").await;
-
-    raw.batch_execute(
-        "alter table public.tags alter column code type uuid using md5(code)::uuid",
+    let before = rows(
+        &raw,
+        "select code, label from public.tag_labels order by code",
     )
-    .await
-    .expect("re-type the key with a USING that isn't a cast");
+    .await;
+
+    raw.batch_execute("alter table public.tags alter column code type uuid using md5(code)::uuid")
+        .await
+        .expect("re-type the key with a USING that isn't a cast");
     capture_pass(&mut raw, &db.pool).await;
     paused_for(&trellis, "tag_labels", "public.tags", &["code"]).await;
 
@@ -1417,8 +1419,86 @@ async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_it
         assert_eq!(requests, 0);
         assert_eq!(column_type(&raw, "public.tag_labels", "code").await, "text");
         assert_eq!(
-            rows(&raw, "select code, label from public.tag_labels order by code").await,
+            rows(
+                &raw,
+                "select code, label from public.tag_labels order by code"
+            )
+            .await,
             before
         );
     }
+}
+
+/// The staging worker re-types each table's copies in a transaction of its
+/// own, so a crash can fall between two tables: here the ledger's copy is
+/// re-typed (by hand) and the target's and the group-delta table's are not.
+/// The definition is still paused with its request, and the next pass
+/// re-types what's left and completes the resume.
+#[tokio::test]
+async fn a_crash_between_two_tables_re_types_leaves_the_rest_to_the_next_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount int); \
+         insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    raw.batch_execute("alter table public.orders alter column shop type bigint")
+        .await
+        .expect("widen the GROUP BY key");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "per_shop", "public.orders", &["shop"]).await;
+    resume(&trellis, "per_shop").await;
+    raw.batch_execute("alter table public.per_shop__ledger alter column shop type bigint")
+        .await
+        .expect("one table's re-type, then a crash");
+    assert_retyping(&trellis, &raw, "per_shop").await;
+    assert_eq!(
+        column_type(&raw, "public.per_shop", "shop").await,
+        "integer"
+    );
+
+    capture_pass(&mut raw, &db.pool).await;
+    for table in [
+        "public.per_shop",
+        "public.per_shop__ledger",
+        "public.per_shop__deltas",
+    ] {
+        assert_eq!(column_type(&raw, table, "shop").await, "bigint", "{table}");
+    }
+    assert_eq!(
+        status(&raw, "per_shop").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    raw.batch_execute("insert into public.orders values (4, 3000000000, 7)")
+        .await
+        .expect("a group above 2^31");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select shop::text, total::text from public.per_shop where total is not null \
+             order by shop"
+        )
+        .await,
+        rows(
+            &raw,
+            "select shop::text, sum(amount)::text from public.orders group by shop order by shop"
+        )
+        .await,
+    );
 }

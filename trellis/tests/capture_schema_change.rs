@@ -1545,7 +1545,9 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
 /// re-validates it as define would and refuses, naming the type, and it
 /// stays paused with its halt record: the halt and the resume's validation
 /// compose, the first record standing. A member that doesn't read the key
-/// (downstream of one that does) passes the validation.
+/// (downstream of one that does) passes the validation. Once the key is
+/// fixed, every member resumes, and the same cause after that halts the
+/// closure again as a new episode, with its own stop.
 #[tokio::test]
 async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
     let cluster = TestCluster::start();
@@ -1587,6 +1589,38 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
         .await
         .expect("named_copy reads no key define would refuse");
     assert_eq!(halting_stops(&db.pool).await, stops + 1);
+
+    // Once the key is fixed the members resume, and the same cause after
+    // that is a new episode, with its own stop.
+    app.batch_execute("alter table public.users alter column handle type varchar(16)")
+        .await
+        .expect("fix the key");
+    for target in ["posts_named", "users_copy"] {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|err| panic!("resume {target}: {err}"));
+    }
+    bring_live(&mut raw, &db.pool, &HALT_CLOSURE).await;
+    app.batch_execute(
+        "alter table public.users alter column handle type character(8); \
+         update public.users set name = 'Ann again' where handle = 'ann';",
+    )
+    .await
+    .expect("retype the key again and write it");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        halting_stops(&db.pool).await,
+        stops + 2,
+        "the second halt is a new episode"
+    );
+    for target in HALT_CLOSURE {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Paused,
+            "{target}"
+        );
+    }
 }
 
 /// Issue #663: two workers draining different buckets of one page both meet
