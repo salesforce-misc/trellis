@@ -2081,3 +2081,137 @@ async fn a_catch_up_refused_for_row_security_pauses_its_definition() {
     );
     it.trellis.shutdown().await.expect("shutdown");
 }
+
+/// A go-live catch-up refused on a relationship's to-side (#813), whose
+/// marker also asks for the projection refresh (#522). `c_named` reads `p`
+/// through `parent`, so re-backfilling `p` parks a catch-up on it that
+/// refreshes `parent`'s projection. The discharge runs as `rls_worker`, which
+/// `p`'s forced policies apply to, so its re-read of `p` is refused and halts
+/// `c_named`. The retry then reads `p` for nothing: `c_named` no longer
+/// counts as its reader, and with every reader of `p` frozen the projection
+/// refresh is skipped too, so the marker discharges instead of being refused
+/// again on the refresh and backing off forever. `c_named`'s resume
+/// refreshes the projection itself (#768), so the write capture missed,
+/// which the re-backfill was for, still reaches it.
+#[tokio::test]
+async fn a_catch_up_refused_on_a_to_side_skips_the_refresh_its_frozen_readers_redo() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declare a relationship");
+    it.trellis
+        .apply("TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name")
+        .await
+        .expect("define");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the registration drains before any policy applies");
+    assert_eq!(
+        status(&it.trellis, "c_named").await.status,
+        TransformStatus::Live
+    );
+    it.admin
+        .batch_execute(
+            "set session_replication_role = replica; \
+             update public.p set name = 'renamed' where id = 2; \
+             reset session_replication_role;",
+        )
+        .await
+        .expect("a write capture missed, which the re-backfill is for");
+    it.trellis
+        .request_backfill("p")
+        .await
+        .expect("re-backfill the to-side");
+    assert_eq!(
+        status(&it.trellis, "c_named").await.status,
+        TransformStatus::CatchingUp
+    );
+    let refresh: bool = it
+        .admin
+        .query_one(
+            &format!(
+                "select refresh_projections from {SCHEMA}.pending_backfill \
+                 where table_name = 'public.p'"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the catch-up's marker")
+        .get(0);
+    assert!(refresh, "the catch-up asks for the projection refresh");
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.p enable row level security, force row level security; \
+             create policy hide_one on public.p using (id <> 1) with check (true);",
+        )
+        .await
+        .expect("a member login role the to-side's policies apply to");
+
+    let mut worker = session_as(&it, "rls_worker").await;
+    markers::run_pending_backfills(
+        &mut worker,
+        "trellis_wake",
+        &StagedWatermark::saturated(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the refused catch-up pauses its reader, then discharges without the refresh");
+
+    let failure = halted(&it.trellis, "c_named").await;
+    assert_eq!(failure.source_table, "public.p");
+    assert!(
+        failure
+            .error
+            .contains("row-level security on public.p applies to role rls_worker"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
+    assert_eq!(pending_markers(&it.admin).await, 0);
+
+    it.admin
+        .batch_execute("alter role rls_worker bypassrls")
+        .await
+        .expect("exempt the role");
+    let worker = pool_as(&it, "rls_worker");
+    it.trellis
+        .apply("RESUME TRANSFORM c_named")
+        .await
+        .expect("resume");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&worker).await;
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain applies the rebuild");
+    let reported = status(&it.trellis, "c_named").await;
+    assert_eq!(reported.status, TransformStatus::Live);
+    assert_eq!(reported.capture_failure, None);
+    let mismatched: i64 = it
+        .admin
+        .query_one(
+            "select count(*) from public.c \
+             left join public.p on p.id = c.pid \
+             full join public.c_named n on n.id = c.id \
+             where c.id is null or n.id is null \
+                or n.amount is distinct from c.amount or n.name is distinct from p.name",
+            &[],
+        )
+        .await
+        .expect("compare the target with its sources")
+        .get(0);
+    assert_eq!(mismatched, 0, "c_named matches its sources");
+    let name: Option<String> = it
+        .admin
+        .query_one("select name from public.c_named where id = 1", &[])
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(name.as_deref(), Some("renamed"), "c 1's parent is p 2");
+    it.trellis.shutdown().await.expect("shutdown");
+}
