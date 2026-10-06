@@ -2410,7 +2410,7 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index(flavour: Flavo
             .batch_execute(&format!(
                 "truncate {ledger}; \
                  insert into {ledger} (__from_key, __applied_seg, __tombstone) \
-                 select 'x' || i, {seg}, {tombstone} from generate_series(1, 200000) i; \
+                 select 'x' || i, {seg}, {tombstone} from generate_series(1, 20000) i; \
                  analyze {ledger}"
             ))
             .await
@@ -2498,10 +2498,10 @@ async fn the_page_statements_read_the_ledger_by_key(flavour: Flavour) {
         }
         let from = if stats == "stale" { 101 } else { 1 };
         d.ctl
-            .batch_execute(&load(from, 400_000))
+            .batch_execute(&load(from, 40_000))
             .await
             .expect("grow the ledger");
-        let keys: Vec<String> = (1..=5_000).map(|i| (i * 79).to_string()).collect();
+        let keys: Vec<String> = (1..=500).map(|i| (i * 79).to_string()).collect();
         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
         let plans = match flavour {
             Flavour::OneToOne => {

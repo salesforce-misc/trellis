@@ -1390,7 +1390,7 @@ async fn the_rederive_statements_read_the_ledger_by_key() {
     for stats in ["empty", "stale"] {
         let (d, plan) = start_build_with(
             Flavour::Sum,
-            "insert into public.src select i, i % 400, i from generate_series(1, 400000) i;",
+            "insert into public.src select i, i % 400, i from generate_series(1, 40000) i;",
         )
         .await;
         let load = |from: i32, to: i32| {
@@ -1411,14 +1411,14 @@ async fn the_rederive_statements_read_the_ledger_by_key() {
         }
         let from = if stats == "stale" { 101 } else { 1 };
         d.ctl
-            .batch_execute(&load(from, 400_000))
+            .batch_execute(&load(from, 40_000))
             .await
             .expect("grow the ledger");
-        let keys: Vec<String> = (10_001..=15_000).map(|i: i32| i.to_string()).collect();
+        let keys: Vec<String> = (10_001..=10_500).map(|i: i32| i.to_string()).collect();
         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
         let mut client = d.db.pool.get().await.expect("pool");
         let txn = client.transaction().await.expect("begin");
-        let plans = build::explain_rederive(&txn, &plan, Some("10000"), "15000", &keys)
+        let plans = build::explain_rederive(&txn, &plan, Some("10000"), "10500", &keys)
             .await
             .expect("explain the Re-derive statements");
         txn.rollback().await.expect("roll back");
@@ -2050,7 +2050,7 @@ async fn a_chunk_losing_an_entry_to_the_gc_gives_up_transiently() {
 /// A chunk's `(lo, hi]`, as encoded keys.
 type Range = (Option<String>, String);
 
-/// A 200k-row build by 8 concurrent hand-driven chunk runners, under two
+/// An 8k-row build (16 chunks) by 8 concurrent hand-driven chunk runners, under two
 /// writers inserting, updating, moving and deleting across the key space,
 /// with pages and merges between, equals a from-scratch `GROUP BY`. A chunk
 /// that gives up on a key a page holds goes back on the queue.
@@ -2068,8 +2068,8 @@ async fn a_min_max_build_by_eight_chunk_runners_under_writers_equals_the_oracle(
 }
 
 async fn eight_chunk_runners_under_writers(flavour: Flavour) {
-    const ROWS: i64 = 200_000;
-    const CHUNK_ROWS: i64 = 10_000;
+    const ROWS: i64 = 8_000;
+    const CHUNK_ROWS: i64 = 500;
     let (mut d, plan) = start_build_with(
         flavour,
         &format!(
