@@ -7403,7 +7403,8 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// under `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), as the
 /// source read, the endpoint feed's re-read, the sweep delete and the
 /// single-column and composite pre-locks ([`lock_single_keys`],
-/// [`lock_composite_keys`]) do.
+/// [`lock_composite_keys`]) and the single-column delete
+/// ([`delete_single_keys`]) do.
 ///
 /// The bound alone isn't enough on PostgreSQL 16, which prices an index scan
 /// for thousands of `= any` values far above 17's estimate: it scanned a
@@ -7471,8 +7472,10 @@ fn single_delete_statement(
     )
 }
 
-/// Runs [`single_delete_statement`] over `keys`, and returns the deleted
-/// keys' rows.
+/// Runs [`single_delete_statement`] over `keys` under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), as
+/// [`lock_single_keys`] runs the pre-lock of the same rows, and returns the
+/// deleted keys' rows.
 async fn delete_single_keys(
     txn: &Transaction<'_>,
     target_ident: &str,
@@ -7481,7 +7484,8 @@ async fn delete_single_keys(
     returning: &str,
     keys: &[&str],
 ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    txn.query(
+    super::ledger::query_by_entry_key(
+        txn,
         &single_delete_statement(target_ident, pk_ident, pk_cast, returning),
         &[&keys],
     )
