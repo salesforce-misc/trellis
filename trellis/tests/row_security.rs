@@ -1453,3 +1453,116 @@ async fn a_to_side_whose_readers_are_paused_for_row_security_drains_past_the_ref
     );
     it.trellis.shutdown().await.expect("shutdown");
 }
+
+/// The relationship's settled projection on `to_table`'s `label` for `id`,
+/// read as the superuser.
+async fn projected_label(admin: &Client, relationship: &str, id: i32) -> Option<String> {
+    let projection: String = admin
+        .query_one(
+            &format!(
+                "select rp.projection_table from {SCHEMA}.relationship_projections rp \
+                 join {SCHEMA}.relationship_definitions rd on rd.id = rp.relationship_id \
+                 where rd.name = $1"
+            ),
+            &[&relationship],
+        )
+        .await
+        .expect("the relationship has a projection")
+        .get(0);
+    admin
+        .query_opt(
+            &format!("select label from {SCHEMA}.{projection} where id = $1"),
+            &[&id],
+        )
+        .await
+        .expect("read the projection")
+        .and_then(|row| row.get(0))
+}
+
+/// The refused page's retry (#766) skips every table no unfrozen definition
+/// reads, not just the refused one: here a healthy to-side, `q`, sharing the
+/// page, whose only reader is paused. Its change never reaches its
+/// relationship's projection, as for a table skipped for its key (#768), so
+/// the next definition to read through the relationship must refresh the
+/// projection from the table, or it would go live on the stale label.
+#[tokio::test]
+async fn a_healthy_to_side_skipped_beside_a_refused_one_is_refreshed_by_the_next_reader() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create table public.q (id int primary key, label text); \
+             create table public.d (id int primary key, qid int); \
+             insert into public.q values (1, 'old'); \
+             insert into public.d values (1, 1); \
+             alter table public.q owner to rls_trellis; \
+             alter table public.d owner to rls_trellis;",
+        )
+        .await
+        .expect("a second relationship's tables");
+    for statement in [
+        "RELATIONSHIP parent FROM c.pid TO p.id",
+        "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+        "RELATIONSHIP tag FROM d.qid TO q.id",
+        "TRANSFORM d_tagged FROM public.d SELECT tag.label AS label",
+    ] {
+        it.trellis.apply(statement).await.expect(statement);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    it.trellis
+        .apply("PAUSE TRANSFORM d_tagged")
+        .await
+        .expect("pause q's only reader");
+    it.admin
+        .batch_execute(
+            "alter table public.p enable row level security, force row level security; \
+             create policy hide_two on public.p using (id <> 2);",
+        )
+        .await
+        .expect("force RLS on the to-side");
+    capture_pass(&mut it.raw, &it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_named").await.status,
+        TransformStatus::Paused
+    );
+
+    it.admin
+        .batch_execute(
+            "update public.p set name = 'renamed' where id = 2; \
+             update public.q set label = 'new' where id = 1;",
+        )
+        .await
+        .expect("write both to-sides into one page");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the retry skips both to-sides and commits the page");
+    assert_eq!(
+        projected_label(&it.admin, "tag", 1).await.as_deref(),
+        Some("old"),
+        "q's change was skipped with the refused table"
+    );
+
+    it.trellis
+        .apply("TRANSFORM d_relabelled FROM public.d SELECT tag.label AS label")
+        .await
+        .expect("a new reader of the relationship");
+    assert_eq!(
+        projected_label(&it.admin, "tag", 1).await.as_deref(),
+        Some("new"),
+        "the define refreshed the projection the skip left stale"
+    );
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("drain after the define");
+    let label: Option<String> = it
+        .admin
+        .query_one("select label from public.d_relabelled where id = 1", &[])
+        .await
+        .expect("read the new reader's target")
+        .get(0);
+    assert_eq!(label.as_deref(), Some("new"));
+    it.trellis.shutdown().await.expect("shutdown");
+}
