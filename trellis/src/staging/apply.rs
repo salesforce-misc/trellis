@@ -5336,12 +5336,16 @@ async fn from_side_key(
 /// it directly, `inbound_rels` the relationships whose to-side it is, and
 /// `poisoned` the batch's poison ([`quarantine::poisoned_keys_among`]).
 ///
-/// A relationship's reverse work leaves a key out only when the relationship
-/// has a reader that isn't frozen and every such reader holds the key: it
-/// keeps the settled projection and the from-side's rows current for all of
-/// them at once. Its readers are read only when one of `changes` is
-/// poisoned. `focus` overrides one key's direct readers for an isolation
-/// probe, and never a relationship's.
+/// A relationship's reverse work leaves a poisoned key out only when every
+/// reader of the relationship that isn't frozen holds the key: it keeps the
+/// settled projection and the from-side's rows current for all of them at
+/// once. A relationship with no such reader serves nobody, so it leaves the
+/// key out too: a define or resume of its first reader refreshes its
+/// projection from the table (#768), and a failure in its work, which
+/// isolation can charge to no reader of it, would otherwise fail the page on
+/// every drain once every direct reader holds the key. Its readers are read
+/// only when one of `changes` is poisoned. `focus` overrides one key's direct
+/// readers for an isolation probe, and never a relationship's.
 async fn key_exclusions(
     pool: &Pool,
     source_key: &str,
@@ -5379,7 +5383,7 @@ async fn key_exclusions(
             if let Some(ids) = poisoned_for {
                 for rel in inbound_rels {
                     let readers = rel_readers.get(&rel.id).unwrap_or(&no_readers);
-                    if !readers.is_empty() && readers.iter().all(|(id, _)| ids.contains(id)) {
+                    if readers.iter().all(|(id, _)| ids.contains(id)) {
                         exclusion.rels.insert(rel.id);
                     }
                     for (id, _) in readers {

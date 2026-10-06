@@ -2895,3 +2895,77 @@ async fn a_halted_definitions_held_key_is_neither_parked_again_nor_left_after_it
         assert_eq!(rows_for(&client, table, "order_prices").await, 0, "{table}");
     }
 }
+
+/// Review of #799: a to-side key whose relationship's every reader is frozen.
+/// `src_w`, the only reader of `parent`, is paused, so `parent`'s reverse
+/// work has no reader that isn't frozen, yet the drain still runs it, and
+/// for key 5 it fails (the image lacks `code`). Isolation can charge only
+/// `par_w`, the one direct reader. Once the key is held for `par_w`, the
+/// change must be left out whole: `parent`'s work serves no reader that
+/// isn't frozen (a resume of `src_w` refreshes its projection, #768), and a
+/// failure in it that no definition can be charged for would otherwise fail
+/// the page on every drain for good.
+#[tokio::test]
+async fn a_held_key_is_left_out_of_a_relationship_whose_every_reader_is_frozen() {
+    const PAR: &str = "public.par";
+    let mut d = drain_driver::Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code text unique, w numeric); \
+         create table public.src (id integer primary key, p text); \
+         insert into public.par values (1, 'a', 10); \
+         insert into public.src values (1, 'a');",
+        &[
+            ("id", ValueType::Numeric),
+            ("w", ValueType::Numeric),
+            ("p", ValueType::Text),
+        ],
+        &["RELATIONSHIP parent FROM src.p TO par.code"],
+        &[
+            "TRANSFORM src_w FROM public.src SELECT parent.w AS pw",
+            "TRANSFORM par_w FROM public.par SELECT w AS w",
+        ],
+        &[PAR, "public.src"],
+    )
+    .await;
+    d.ctl
+        .batch_execute(
+            "update transform_definitions set status = 'paused' \
+             where split_part(target_table, '.', 2) = 'src_w'",
+        )
+        .await
+        .expect("pause src_w");
+
+    d.ctl
+        .batch_execute(
+            "set session_replication_role = replica; \
+             insert into public.par values (5, 'e', 9); \
+             reset session_replication_role",
+        )
+        .await
+        .expect("write par 5 uncaptured");
+    let ring = active_ring_table(&d.ctl).await;
+    insert_cdc_row(
+        &d.ctl,
+        &ring,
+        PAR,
+        "5",
+        "insert",
+        None,
+        Some(r#"{"id":"5","w":"9"}"#),
+    )
+    .await;
+    let seg_seq = d.seal().await;
+    let mut failures = 0;
+    while drain_result(d.pool(), seg_seq).await.is_err() {
+        failures += 1;
+        assert!(failures <= 20, "the page never committed");
+    }
+    assert_eq!(
+        failures,
+        trellis::staging::DEFAULT_DEATH_THRESHOLD as usize - 1
+    );
+    assert_eq!(
+        poisoned_for(&d.ctl).await,
+        vec![("par_w".to_string(), PAR.to_string(), "5".to_string())],
+        "the only definition the drain could charge holds the key"
+    );
+}
