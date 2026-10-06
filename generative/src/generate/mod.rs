@@ -4032,12 +4032,11 @@ mod strategy {
     ///   reconcile pass on the seal cadence rather than the engine's 5s
     ///   default, so they run while the burst that started them writes.
     ///
-    /// A case with a relationship is drawn again: under the load, the
-    /// relationship-fed shapes diverged in about one case in ten, more than a
-    /// sweep's baseline bar. #623 D5 put the relationship-fed aggregates
-    /// (#719) on the ledger, and #726 fixed the 1-1 enrichment's stale value
-    /// (a projection refresh racing pending to-side CDC), but neither has
-    /// been measured under the load since. Drawn apart from
+    /// A case with a relationship is drawn again, until #815 is fixed. With
+    /// relationships allowed, #786's sweep (8 seeds of 12 cases, 4 runs)
+    /// failed once in 384 case runs: seed 8 case 4, a relationship-fed
+    /// `GROUP BY` definition paused and resumed mid-burst, ends with a row
+    /// counted twice (about 1 run in 15 of that case). Drawn apart from
     /// [`mid_burst_case`] so that tier's cases, seed for seed, stay what they
     /// were.
     pub fn steady_load_case() -> impl Strategy<Value = ConcurrentCase> {
@@ -4045,10 +4044,10 @@ mod strategy {
             draws.load = Some(load);
             CaseExtras::MidBurst(draws)
         });
-        hot_key_case_with(extras.boxed()).prop_filter(
-            "a steady-load case has no relationship (#719, #726)",
-            |case| case.program.relationships.is_empty(),
-        )
+        hot_key_case_with(extras.boxed())
+            .prop_filter("a steady-load case has no relationship (#815)", |case| {
+                case.program.relationships.is_empty()
+            })
     }
 
     /// The concurrent tier's cooling-key case (issue #557 part 3b): a

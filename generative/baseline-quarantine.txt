@@ -1,0 +1,16 @@
+# The baseline quarantine list (#786). A planted-bug sweep's unplanted
+# baseline passes only with no failure outside this list; see
+# docs/generative-test-suite.md, "The baseline bar".
+#
+# One entry per line: <tier> <seed>:<case> #<open issue> <what fails>
+#
+# - <seed>:<case> is the sweep's numbering, as GENERATIVE_PLANT_ONLY takes it.
+# - The issue must be open and must pin this case's failure. A sweep fails
+#   before it runs anything if a listed issue is closed: remove the entry
+#   when its fix lands.
+# - A sweep reports a listed case that passed every time it ran. A race can
+#   pass now and then, so that alone doesn't remove an entry; the fix does.
+# - A change to a tier's strategy redraws its cases, so the same numbers name
+#   other programs. Re-sweep the tier and redo its entries.
+#
+# tier        case    issue  what fails

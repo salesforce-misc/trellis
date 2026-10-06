@@ -101,11 +101,10 @@
 //! (`skip_ledger_lock`), and a segment draining past an older one whose page
 //! hasn't taken its entry lock yet, so that a tombstone the older change
 //! needs can be collected (`early_tombstone_gc`). Cases with a relationship
-//! are left out: under the load, the relationship-fed shapes diverged in
-//! about one case in ten, more than a sweep's baseline bar. #623 D5 put the
-//! relationship-fed aggregates (#719) on the ledger, and #726 fixed the 1-1
-//! enrichment's stale value, but neither has been measured under the load
-//! since, so they stay out.
+//! are left out until #815 is fixed: #726 and #784 fixed the divergences
+//! that first kept them out, but with them allowed #786's sweep found a
+//! relationship-fed `GROUP BY` definition, paused and resumed under the
+//! load, counting a row twice.
 //!
 //! The stall is process-wide, so the tier has no property test: it runs
 //! only in [`planted_bugs_are_caught`]'s sweep processes, one case at a time
@@ -235,6 +234,7 @@
 //! two test binaries never share a cluster or a database.
 
 use generative::backend::{Backend, ConcurrentBackend, ManualBackend, SPLIT_THRESHOLD_ROWS};
+use generative::baseline_quarantine;
 use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
@@ -1396,9 +1396,9 @@ async fn hot_key_case_3_11_converges() {
 // Issue #557 part 3: planted ordering bugs.
 // ---------------------------------------------------------------------
 
-/// Names the plants a sweep runs: `all`, or a comma-separated list of
-/// `trellis::dev::plant::Plant` names. Unset, [`planted_bugs_are_caught`]
-/// returns at once.
+/// Names the plants a sweep runs: `all`, `none` (the baseline alone), or a
+/// comma-separated list of `trellis::dev::plant::Plant` names. Unset,
+/// [`planted_bugs_are_caught`] returns at once.
 const PLANTS_ENV: &str = "GENERATIVE_PLANTS";
 /// How many seeds a sweep draws its cases from (default [`PLANT_SEEDS`]).
 const PLANT_SEEDS_ENV: &str = "GENERATIVE_PLANT_SEEDS";
@@ -1441,10 +1441,6 @@ struct SweepTier {
     /// `GENERATIVE_PLANTS=all` leaves them out; named, they run and are
     /// reported, and the sweep never fails on them.
     not_gated: &'static [(&'static str, &'static str)],
-    /// The sweep fails if the baseline fails more than one case in this
-    /// many: the run is then on the wrong storage (a disk cluster fails most
-    /// cases on #494), and no rate means anything.
-    max_baseline_failure_share: usize,
 }
 
 /// Why the hot-key-based tiers miss `stale_one_to_one_write` (#344): the
@@ -1522,49 +1518,55 @@ const MID_BURST_NOT_GATED: &[(&str, &str)] = &[BUILD_UNDER_LOAD, OUT_OF_ORDER_DR
 
 /// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
 ///
-/// The hot-key and mid-burst tiers fail a few cases in 1,000 unplanted on
-/// tmpfs, most of them hot-key seed 3 case 11 (#557 part 3a's PR, pinned as
-/// [`hot_key_case_3_11_converges`]). The cooling-key tier fails a few in 100:
-/// its short seal cadence makes #494's shape (a key passing through a group
-/// inside one folded batch, pinned as [`group_moves_converge_on_disk`]) far
-/// more common, so its bar was set looser while the recompute horizons that
-/// shape needs were still there (#557 part 3b's PR; #623 D5 removed them).
+/// Every tier's baseline is held to the same bar: no failure outside
+/// `generative/baseline-quarantine.txt` (`generative::baseline_quarantine`,
+/// #786).
 fn sweep_tier() -> SweepTier {
-    match std::env::var(PLANT_TIER_ENV).as_deref() {
-        Err(_) | Ok("cooling_key") => SweepTier {
+    let name = std::env::var(PLANT_TIER_ENV);
+    sweep_tier_named(name.as_deref().unwrap_or("cooling_key")).unwrap_or_else(|| {
+        panic!(
+            "{PLANT_TIER_ENV}={name:?}: expected one of {:?}",
+            baseline_quarantine::TIERS
+        )
+    })
+}
+
+/// The tier named `name`, if there is one.
+fn sweep_tier_named(name: &str) -> Option<SweepTier> {
+    Some(match name {
+        "cooling_key" => SweepTier {
             name: "cooling_key",
             strategy: cooling_key_case().boxed(),
             known_misses: COOLING_KEY_MISSES,
             not_gated: COOLING_KEY_NOT_GATED,
-            max_baseline_failure_share: 8,
         },
-        Ok("hot_key") => SweepTier {
+        "hot_key" => SweepTier {
             name: "hot_key",
             strategy: hot_key_case().boxed(),
             known_misses: HOT_KEY_BASED_MISSES,
             not_gated: HOT_KEY_NOT_GATED,
-            max_baseline_failure_share: 20,
         },
-        Ok("mid_burst") => SweepTier {
+        "mid_burst" => SweepTier {
             name: "mid_burst",
             strategy: mid_burst_case().boxed(),
             known_misses: HOT_KEY_BASED_MISSES,
             not_gated: MID_BURST_NOT_GATED,
-            max_baseline_failure_share: 20,
         },
-        Ok("steady_load") => SweepTier {
+        "steady_load" => SweepTier {
             name: "steady_load",
             strategy: steady_load_case().boxed(),
             known_misses: HOT_KEY_BASED_MISSES,
             not_gated: &[],
-            max_baseline_failure_share: 20,
         },
-        Ok(other) => {
-            panic!(
-                "{PLANT_TIER_ENV}={other:?}: expected cooling_key, hot_key, mid_burst or \
-                 steady_load"
-            )
-        }
+        _ => return None,
+    })
+}
+
+#[test]
+fn every_tier_the_quarantine_list_can_name_is_a_sweep_tier() {
+    for name in baseline_quarantine::TIERS {
+        let tier = sweep_tier_named(name).expect("a sweep tier");
+        assert_eq!(tier.name, *name);
     }
 }
 
@@ -1810,15 +1812,21 @@ fn run_plant_sweep_cases() {
 /// plant's catch rate and each seed's cases-to-first-catch, not just
 /// whether it was caught once.
 ///
-/// A plant is only judged on cases the baseline passed, on the same
-/// storage: use the tmpfs cluster, since the disk one fails the baseline on
-/// #494. A failure only counts as a catch if the plant fired in that case
-/// and the failure is in a target the plant writes (`SweepCase::caught`);
-/// the report lists the rest apart, since every tier hits unplanted
-/// divergences on tmpfs too. Fails if the baseline fails more than the
-/// tier's `SweepTier::max_baseline_failure_share`, or if a plant the tier
-/// gates (not in its `SweepTier::known_misses` or `SweepTier::not_gated`) is
-/// never caught. `all` leaves out the plants the tier doesn't gate.
+/// The baseline is held to the bar in `generative::baseline_quarantine`
+/// (#786): it fails on any failed case that isn't on the checked-in
+/// quarantine list, `generative/baseline-quarantine.txt`, each entry naming
+/// the open issue that pins it. Before running anything, the sweep looks up
+/// every listed issue and fails if one is closed; afterwards it reports a
+/// listed case that passed. Run it on the tmpfs cluster, which is what the
+/// tiers are calibrated for.
+///
+/// A plant is only judged on cases the baseline passed that aren't listed,
+/// on the same storage. A failure only counts as a catch if the plant fired
+/// in that case and the failure is in a target the plant writes
+/// (`SweepCase::caught`); the report lists the rest apart. Fails if a plant
+/// the tier gates (not in its `SweepTier::known_misses` or
+/// `SweepTier::not_gated`) is never caught. `all` leaves out the plants the
+/// tier doesn't gate; `none` runs the baseline alone.
 ///
 /// Returns at once without [`PLANTS_ENV`], so the nightly's
 /// `--include-ignored` run of this binary pays nothing for it. Run it with:
@@ -1845,7 +1853,25 @@ fn planted_bugs_are_caught() {
         return;
     };
     let tier = sweep_tier();
-    let plants: Vec<Plant> = if requested.trim() == "all" {
+    let quarantine = baseline_quarantine::checked_in();
+    let closed =
+        baseline_quarantine::closed_entries(&quarantine, baseline_quarantine::github_issue_state)
+            .unwrap_or_else(|e| {
+                panic!("can't confirm generative/baseline-quarantine.txt is current: {e}")
+            });
+    assert!(
+        closed.is_empty(),
+        "generative/baseline-quarantine.txt lists cases whose issue is closed; remove each \
+         entry, or if the case still fails, reopen or file its issue:\n{}",
+        closed
+            .iter()
+            .map(|e| format!("  {e}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let plants: Vec<Plant> = if requested.trim() == "none" {
+        Vec::new()
+    } else if requested.trim() == "all" {
         for (name, why) in tier.not_gated {
             eprintln!(
                 "planted_bugs_are_caught: {name} not run, the {} tier doesn't gate it: {why}",
@@ -1897,30 +1923,61 @@ fn planted_bugs_are_caught() {
         results.extend(lines);
     }
 
-    let report = plant_sweep_report(&tier, &results);
-    eprintln!("{report}");
-    // A case the baseline failed says nothing about any plant, so it is left
-    // out of every plant's count (the report says which). The baseline has
-    // to be mostly green, or the run is on the wrong storage (the disk
-    // cluster fails it on #494) and no rate here means anything.
-    let baseline_failed: Vec<(u64, usize)> = results
+    // The baseline meets the bar only with no failure outside the list. A
+    // case the baseline failed, or that the list names, says nothing about
+    // any plant, so it is left out of every plant's count (the report says
+    // which).
+    let baseline: Vec<baseline_quarantine::BaselineCase> = results
         .iter()
-        .filter(|r| r.plant == "baseline" && r.failed)
-        .map(|r| (r.seed, r.case))
+        .filter(|r| r.plant == "baseline")
+        .map(|r| baseline_quarantine::BaselineCase {
+            seed: r.seed,
+            case: r.case,
+            failed: r.failed,
+        })
         .collect();
-    let baseline_cases = results.iter().filter(|r| r.plant == "baseline").count();
+    let verdict = baseline_quarantine::judge(&quarantine, tier.name, &baseline);
+    let mut excluded: Vec<(u64, usize)> = verdict
+        .unlisted
+        .iter()
+        .chain(&verdict.quarantined)
+        .copied()
+        .chain(
+            quarantine
+                .iter()
+                .filter(|e| e.tier == tier.name)
+                .map(|e| (e.seed, e.case)),
+        )
+        .collect();
+    excluded.sort_unstable();
+    excluded.dedup();
+    let report = plant_sweep_report(&tier, &results, &excluded);
+    eprintln!("{report}");
+    for entry in &verdict.now_passing {
+        eprintln!(
+            "planted_bugs_are_caught: quarantined case {entry} passed every baseline run; once \
+             #{} is fixed, remove its entry",
+            entry.issue
+        );
+    }
     assert!(
-        baseline_failed.len() * tier.max_baseline_failure_share <= baseline_cases,
-        "the unplanted baseline failed {} of {baseline_cases} cases, more than 1 in \
-         {}, so no plant can be judged against it (see the report \
+        verdict.passes(),
+        "the unplanted baseline failed {} case(s) the quarantine list doesn't name: {}. No \
+         unknown failure is accepted: triage each into a filed bug (then list it in \
+         generative/baseline-quarantine.txt) or a fixed harness defect (see the report \
          above; rerun one with {PLANT_ONLY_ENV}=<seed>:<case>)",
-        baseline_failed.len(),
-        tier.max_baseline_failure_share
+        verdict.unlisted.len(),
+        verdict
+            .unlisted
+            .iter()
+            .map(|(seed, case)| format!("{seed}:{case}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let caught = |name: &str| {
         results
             .iter()
-            .any(|r| r.plant == name && r.caught() && !baseline_failed.contains(&(r.seed, r.case)))
+            .any(|r| r.plant == name && r.caught() && !excluded.contains(&(r.seed, r.case)))
     };
     for name in tier.known_misses.iter().filter(|name| caught(name)) {
         eprintln!("planted_bugs_are_caught: known miss {name} was caught; consider gating it");
@@ -1940,7 +1997,13 @@ fn planted_bugs_are_caught() {
 
 /// The sweep's summary: per plant, how many cases it was caught in, how many
 /// cases it fired in, and each seed's cases-to-first-catch.
-fn plant_sweep_report(tier: &SweepTier, results: &[SweepCase]) -> String {
+/// `excluded` are the cases the baseline failed or the quarantine list
+/// names, left out of every plant's row.
+fn plant_sweep_report(
+    tier: &SweepTier,
+    results: &[SweepCase],
+    excluded: &[(u64, usize)],
+) -> String {
     use std::collections::HashMap;
     use std::fmt::Write;
     let mut plants: Vec<&str> = Vec::new();
@@ -1949,15 +2012,9 @@ fn plant_sweep_report(tier: &SweepTier, results: &[SweepCase]) -> String {
             plants.push(&r.plant);
         }
     }
-    // Cases the baseline failed, left out of every plant's row.
-    let excluded: Vec<(u64, usize)> = results
-        .iter()
-        .filter(|r| r.plant == "baseline" && r.failed)
-        .map(|r| (r.seed, r.case))
-        .collect();
     let mut out = format!(
         "planted-bug sweep ({} tier; plant rows leave out the {} case(s) the baseline \
-         failed):\n\
+         failed or the quarantine list names):\n\
          plant | caught | fired in | failed, not attributable | cases to first catch, per seed | \
          mean case secs\n",
         tier.name,

@@ -13,6 +13,9 @@
 //!   reads back derived state.
 //! - [`run`] — drives a program through a backend, asserts the properties.
 //!
+//! [`baseline_quarantine`] sits beside them: the planted-bug sweep's baseline
+//! bar and its checked-in list of known, filed failures (#786).
+//!
 //! `generate`/`oracle`/`run` are skeletons today; [`model`] and [`backend`]
 //! are this issue's substance.
 
@@ -26,6 +29,10 @@
 // feature-unification rule that protects against.
 #[cfg(feature = "engine-access")]
 pub mod backend;
+// Names no engine item, but only the planted-bug sweep reads it, so it is
+// gated with the rest and a plain build still compiles this crate empty.
+#[cfg(feature = "engine-access")]
+pub mod baseline_quarantine;
 #[cfg(feature = "engine-access")]
 pub mod generate;
 #[cfg(feature = "engine-access")]
