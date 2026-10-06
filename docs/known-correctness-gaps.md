@@ -596,9 +596,6 @@ while the column is paused.
 * **Resuming a field that's awaiting capture (#687).** A `RESUME` of a field
   whose status shows `capture_wait` unpauses it before its capture is widened,
   so its rows fail with `MissingColumn`. Let the wait finish first.
-* **The bindings don't show pause reasons yet (#687).** Ruby, Elixir and
-  embedded status show `paused` but not `capture_failure` or `capture_wait`.
-  Read `Trellis::status` from Rust, or the logs, for the reason.
 
 ## What isn't on this list
 
