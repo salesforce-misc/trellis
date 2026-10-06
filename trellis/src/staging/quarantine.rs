@@ -1268,9 +1268,8 @@ async fn isolate_and_evict_probing(
     // (qualified, where resolvable) identity of the ring row's `src_table`,
     // never the raw spelling — resolved once per distinct source table here and
     // threaded through `attribute_column_failure`/`record_key_death`/
-    // `evict_key`/`trip_transform_fuse_if_crossed` alike. The raw spelling is
-    // still what this function *matches ring rows on* (`contribution` below,
-    // and the `retry_folded` filter at the end): those compare against
+    // `evict_key` alike. The raw spelling is still what this function
+    // *matches ring rows on* (`contribution` below): that compares against
     // `folded`'s own strings, which are the ring's, not quarantine's.
     let mut canonical_srcs = CanonicalSrcTables::default();
 

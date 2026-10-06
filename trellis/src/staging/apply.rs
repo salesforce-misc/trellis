@@ -9626,7 +9626,7 @@ async fn drain_batch(
             // it the same way regardless of which phase first tripped over
             // it.
             Err(err) => {
-                if let Some(retry_folded) = classify_and_retry(
+                classify_and_retry(
                     pool,
                     representative_seg_seq,
                     claimed_by,
@@ -9638,10 +9638,7 @@ async fn drain_batch(
                     &mut halt_retried,
                     err,
                 )
-                .await?
-                {
-                    folded = retry_folded;
-                }
+                .await?;
                 continue;
             }
         };
@@ -9678,7 +9675,7 @@ async fn drain_batch(
                 // recomputes the plan and checks out a connection anyway.
                 drop(client);
                 drop(plan);
-                if let Some(retry_folded) = classify_and_retry(
+                classify_and_retry(
                     pool,
                     representative_seg_seq,
                     claimed_by,
@@ -9690,10 +9687,7 @@ async fn drain_batch(
                     &mut halt_retried,
                     err,
                 )
-                .await?
-                {
-                    folded = retry_folded;
-                }
+                .await?;
             }
         }
     }
@@ -9705,11 +9699,11 @@ async fn drain_batch(
 /// regardless of which phase — or which of the two orchestrators —
 /// first surfaced it.
 ///
-/// Returns `Ok(Some(retry_folded))` if isolation evicted at least one key —
-/// the caller must retry with `folded` replaced by `retry_folded`.
-/// `Ok(None)` means "retry with `folded` unchanged" (a version fence
-/// miss or a transient failure, within [`MAX_APPLY_ATTEMPTS`], or a halt,
-/// see [`halt`]).
+/// `Ok(())` means "retry with `folded` unchanged": a version fence miss or a
+/// transient failure, within [`MAX_APPLY_ATTEMPTS`]; a halt, see [`halt`];
+/// or an isolation that poisoned at least one key for the definition it
+/// fails in, which the retry's recompute leaves out of that definition's
+/// apply (#799).
 /// `Err(_)` propagates `err` (or a probe's own halting error, once its halt
 /// paused nothing, see [`halt`]) unmodified, once retries are exhausted or
 /// the failure must never be retried at all —
@@ -9730,7 +9724,7 @@ async fn classify_and_retry(
     transient: &mut TransientRetry,
     halt_retried: &mut bool,
     err: ApplyError,
-) -> Result<Option<Vec<FoldedChange>>, ApplyError> {
+) -> Result<(), ApplyError> {
     let attempt = *attempts;
     // Issue #620 A2a: a lost claim is nobody's key's fault, and nothing in
     // this call can get it back. Isolating it would probe every record under
@@ -9760,7 +9754,7 @@ async fn classify_and_retry(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            Ok(None)
+            Ok(())
         }
         // A lock wait that hit `lock_timeout` (ADR-0002 I7, issue #621):
         // the page's transaction has rolled back, so it holds no snapshot
@@ -9791,7 +9785,7 @@ async fn classify_and_retry(
             // A lock timeout isn't an attempt at the page: it never ran
             // far enough to fail on its own account.
             *attempts -= 1;
-            Ok(None)
+            Ok(())
         }
         // Transient (serialization failure, deadlock, dropped connection,
         // statement timeout): retry, charge nothing, backing off on
@@ -9818,7 +9812,7 @@ async fn classify_and_retry(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            Ok(None)
+            Ok(())
         }
         // Halting schema diagnosis: never quarantine. Pause what it
         // reaches and retry without it (#663).
@@ -9886,7 +9880,7 @@ async fn classify_and_retry(
                              the death threshold)"
                         );
                     }
-                    Ok(None)
+                    Ok(())
                 }
                 // Warn, not debug: the operator should see which key is
                 // heading for eviction, and nothing else logs this surfaced
@@ -9977,7 +9971,7 @@ async fn halt(
     attempts: &mut u32,
     halt_retried: &mut bool,
     err: ApplyError,
-) -> Result<Option<Vec<FoldedChange>>, ApplyError> {
+) -> Result<(), ApplyError> {
     let paused = super::halt::halt_closure(pool, &err).await?;
     if !paused.is_empty() {
         tracing::error!(
@@ -9988,7 +9982,7 @@ async fn halt(
              the page without them"
         );
         *attempts -= 1;
-        return Ok(None);
+        return Ok(());
     }
     if !*halt_retried {
         *halt_retried = true;
@@ -9997,7 +9991,7 @@ async fn halt(
             error = %err,
             "halting failure whose closure is already paused; retrying the page once"
         );
-        return Ok(None);
+        return Ok(());
     }
     Err(err)
 }
