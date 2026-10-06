@@ -86,7 +86,7 @@
 //! The coverage report counts it as `cooling_key`.
 //!
 //! The steady-load tier (#720, #725) draws `generate::steady_load_case`: a
-//! mid-burst case with no relationship, run under a steady load
+//! mid-burst case, relationships included, run under a steady load
 //! (`model::SteadyLoad`). Once an action starts a build, each lane waits a
 //! drawn 0.5 to 2ms after every op for the rest of the burst, so its writes
 //! trickle in while the build runs; and the engine's pages and build chunks
@@ -100,11 +100,7 @@
 //! (`chunk_without_entry_lock`), a page reading an entry another holds
 //! (`skip_ledger_lock`), and a segment draining past an older one whose page
 //! hasn't taken its entry lock yet, so that a tombstone the older change
-//! needs can be collected (`early_tombstone_gc`). Cases with a relationship
-//! are left out until #815 is fixed: #726 and #784 fixed the divergences
-//! that first kept them out, but with them allowed #786's sweep found a
-//! relationship-fed `GROUP BY` definition, paused and resumed under the
-//! load, counting a row twice.
+//! needs can be collected (`early_tombstone_gc`).
 //!
 //! The stall is process-wide, so the tier has no property test: it runs
 //! only in [`planted_bugs_are_caught`]'s sweep processes, one case at a time

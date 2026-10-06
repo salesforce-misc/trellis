@@ -4019,8 +4019,7 @@ mod strategy {
     }
 
     /// The concurrent tier's steady-load case (#720, #725): a
-    /// [`mid_burst_case`] with no relationship, run under a steady load
-    /// ([`SteadyLoad`]).
+    /// [`mid_burst_case`] run under a steady load ([`SteadyLoad`]).
     ///
     /// - Each lane waits a drawn [`LOAD_PACE_MICROS`] after every op, from
     ///   an action that starts a build to the end of its burst, so the rest
@@ -4032,22 +4031,14 @@ mod strategy {
     ///   reconcile pass on the seal cadence rather than the engine's 5s
     ///   default, so they run while the burst that started them writes.
     ///
-    /// A case with a relationship is drawn again, until #815 is fixed. With
-    /// relationships allowed, #786's sweep (8 seeds of 12 cases, 4 runs)
-    /// failed once in 384 case runs: seed 8 case 4, a relationship-fed
-    /// `GROUP BY` definition paused and resumed mid-burst, ends with a row
-    /// counted twice (11 of 84 runs of that case in all). Drawn apart from
-    /// [`mid_burst_case`] so that tier's cases, seed for seed, stay what they
-    /// were.
+    /// Drawn apart from [`mid_burst_case`] so that tier's cases, seed for
+    /// seed, stay what they were.
     pub fn steady_load_case() -> impl Strategy<Value = ConcurrentCase> {
         let extras = (mid_burst_draws(), load_draws()).prop_map(|(mut draws, load)| {
             draws.load = Some(load);
             CaseExtras::MidBurst(draws)
         });
         hot_key_case_with(extras.boxed())
-            .prop_filter("a steady-load case has no relationship (#815)", |case| {
-                case.program.relationships.is_empty()
-            })
     }
 
     /// The concurrent tier's cooling-key case (issue #557 part 3b): a
@@ -5814,23 +5805,24 @@ mod tests {
         }
 
         #[cfg(feature = "proptest")]
-        /// The drawn steady-load cases (#720, #725): none has a
+        /// The drawn steady-load cases (#720, #725, #786): some have a
         /// relationship, each has small build chunks, a reconcile pass at
         /// its seal cadence and a stall of a few seal intervals; and the
         /// mid-burst tier's cases stay flat out, at the engine's defaults.
         #[test]
-        fn steady_load_cases_have_no_relationship_and_mid_burst_cases_no_load() {
+        fn steady_load_cases_draw_relationships_and_mid_burst_cases_no_load() {
             use proptest::strategy::{Strategy, ValueTree};
             use proptest::test_runner::TestRunner;
 
             let mut runner = TestRunner::deterministic();
+            let mut loaded_related = 0usize;
             for _ in 0..16 {
                 let case = steady_load_case()
                     .new_tree(&mut runner)
                     .expect("a case")
                     .current();
                 let load = case.plan.steady_load.expect("a steady load");
-                assert!(case.program.relationships.is_empty());
+                loaded_related += usize::from(!case.program.relationships.is_empty());
                 assert!(LOAD_CHUNK_ROWS.contains(&case.build_chunk_rows.expect("rows")));
                 assert_eq!(case.reconcile_interval_ms, Some(case.seal_interval_ms));
                 let pace = u64::try_from(load.pace.as_micros()).expect("micros");
@@ -5839,6 +5831,10 @@ mod tests {
                     u64::try_from(load.stall.as_millis()).expect("millis") / case.seal_interval_ms;
                 assert!(LOAD_STALL_SEALS.contains(&u32::try_from(seals).expect("seals")));
             }
+            assert!(
+                loaded_related > 0,
+                "the steady-load tier draws relationships"
+            );
             let mut related = 0usize;
             for _ in 0..16 {
                 let case = mid_burst_case()
