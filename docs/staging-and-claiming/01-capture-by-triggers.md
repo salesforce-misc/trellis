@@ -239,7 +239,8 @@ the columns it keys by there (its source key, its `GROUP BY` keys, and each
 relationship it reads through's join columns and to-side key) and the
 columns Trellis keeps a typed copy of (`defs::copies`: a 1-1 target's key and
 passthrough fields, an aggregate's `GROUP BY` columns in its target, ledger
-and group-delta table, and a to-one relationship projection's key). Before
+and group-delta table, and a to-one relationship projection's key and its
+column for a `GROUP BY` key read through the relationship). Before
 it regenerates anything, it pauses the definition, with its
 `capture_failure`, when
 

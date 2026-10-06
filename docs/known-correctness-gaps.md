@@ -178,7 +178,9 @@ Trellis created a column of the field's type from it:
   for `SUM(qty)`, `MIN(qty)` and `MAX(qty)` over an integer column;
 * a 1-1 calculated field over an integer column (`qty + 1`);
 * a to-one relationship projection's column for a to-side field read through
-  it (`author.name`), which copies the to-side column's type exactly.
+  it (`author.name`), which copies the to-side column's type exactly. The same
+  column read as a `GROUP BY` key (`GROUP BY author.country`) is a key copy,
+  not this entry.
 
 A key, passthrough, GROUP BY or projection-key column is not this entry:
 widening one pauses its definitions, and a resume re-types Trellis's copies
@@ -626,9 +628,10 @@ refusing them up front:
   the column or a relationship's join columns no longer match, when the
   change renders the stored keys differently or rounds them (`timestamp` to
   `timestamptz`, `text` to `uuid`, a narrower `numeric` scale or
-  `varchar(n)`), and when a 1-1 target's key or passthrough, a GROUP BY key or
-  a projection's key can no longer hold its source's values (`int` to
-  `bigint`). A resume refuses until define would accept the definition again;
+  `varchar(n)`), and when a 1-1 target's key or passthrough, a GROUP BY key
+  (including a relationship projection's column for one read through the
+  relationship) or a projection's key can no longer hold its source's values
+  (`int` to `bigint`). A resume refuses until define would accept the definition again;
   otherwise it re-types the copies and rebuilds
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and

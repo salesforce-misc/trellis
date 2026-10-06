@@ -80,15 +80,18 @@ can serve as a relationship's join key against a column of that type. A
 `GROUP BY` key's column (in the target, its ledger and its group-delta table)
 takes its value family's type: `integer` or `bigint` by width, `text` for any
 string, unconstrained `numeric`, a temporal type at full precision. A to-one
-relationship's projection keys by the to-side column's exact type.
+relationship's projection keys by the to-side column's exact type, and holds
+each to-side column read through it in that column's exact type.
 
 None of them changes on its own when the source column does. A widening the
 column's copy can't hold (`integer` to `bigint`, `varchar(50)` to `text`, a
 wider `numeric` or temporal precision) pauses the transforms that own the copy,
 and `RESUME` re-types the copies to the source's live type before it rebuilds
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
-A column typed from a calculated field or an aggregate's argument isn't
-re-typed ([known correctness gaps, entry 4](known-correctness-gaps.md#4-widening-a-column-read-only-as-a-field-that-trellis-copies-with-its-type)).
+A projection's column for a `GROUP BY` key read through the relationship
+counts as such a copy. A column typed from a calculated field or an aggregate's
+argument, or a projection's column for a field read through the relationship,
+isn't re-typed ([known correctness gaps, entry 4](known-correctness-gaps.md#4-widening-a-column-read-only-as-a-field-that-trellis-copies-with-its-type)).
 
 ## Text rendering
 

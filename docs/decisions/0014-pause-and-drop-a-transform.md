@@ -112,7 +112,8 @@ definition keys by (`definition_key_types`), which the staging worker's capture 
 compares later changes against. And it brings each of Trellis's typed copies of a
 source column (a 1-1 target's key and passthrough columns, an aggregate's `GROUP BY`
 columns in its target, ledger and group-delta table, a to-one relationship
-projection's key) to the type define would give it now. Re-typing one is an `ALTER
+projection's key and its column for a `GROUP BY` key read through the relationship)
+to the type define would give it now. Re-typing one is an `ALTER
 … TYPE` under `ACCESS EXCLUSIVE`, which waits for every reader of the table and, for
 `integer` to `bigint`, rewrites it, so it never runs inside `RESUME`: a resume with
 copies to re-type records a request (`resume_requests`) and returns at once, the
@@ -120,7 +121,9 @@ definition still paused, and the staging worker's next capture pass re-types the
 table per transaction, then runs the resume itself. A crash between the two leaves the
 request, and the next pass (or the next `RESUME`) finishes the work. A copy whose
 re-type fails (a value its new type can't hold) ends the request with the error on
-the definition's `capture_failure`, and changes nothing.
+the definition's `capture_failure`, and leaves that table's copies as they were;
+another table's, re-typed before it, keep their new types, and the next resume finds
+them current.
 
 Resume also releases every key the definition holds in quarantine: it deletes the
 definition's own `poison`, `poison_held` and `key_deaths` rows in the same transaction.
