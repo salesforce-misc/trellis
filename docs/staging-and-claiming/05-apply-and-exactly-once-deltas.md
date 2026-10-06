@@ -300,7 +300,7 @@ build's group writes, and the orphan sweep. The last two run only for
 targets the Re-derive build doesn't take. Every other statement reads the
 ledger by key, so a ledger without the index saves every entry write the
 cost of maintaining it, which on a ledger far larger than `shared_buffers`
-was most of a build's WAL.
+is most of a build's WAL, as full-page images of the index's leaves.
 
 A target is built one of two ways. The Re-derive build (`staging::build`,
 #625) serves an aggregate target with no relationship path and a 1-1 target
@@ -413,9 +413,10 @@ entries and appends their increments. Both steps run under a 1 s
 `lock_timeout`, so a chunk gives way to a page. On a fresh build every key
 is new, and the insert is the whole chunk. Every chunk stamps `__applied_seg`
 with the segment its read saw, so the tombstone GC can collect a chunk's
-tombstones. The increments go to `<target>__deltas`, where each row's generated `__part` is its group's merge
-partition: `hash_record_extended` of the group, so equal groups (`1.5` and
-`1.50`, or every `NULL` group) share one. It never writes a group row. A
+tombstones. The increments go to `<target>__deltas`, where each row's
+generated `__part` is its group's merge partition: `hash_record_extended`
+of the group, so equal groups (`1.5` and `1.50`, or every `NULL` group)
+share one. It never writes a group row. A
 merger claims one partition's delta rows oldest first through an index on
 `(__part, __seq)` (`for update skip locked`), deletes them, and upserts their
 sums per group with the page's upsert, in group order, then rewrites the
