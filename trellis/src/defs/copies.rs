@@ -10,7 +10,9 @@
 //!   ledger and its group-delta table, typed as the key's value family
 //!   ([`super::ddl::pg_type_name`]: `integer`, `bigint`, `text`, `numeric`);
 //! - a to-one relationship's settled projection's key, typed as the
-//!   to-side's join column.
+//!   to-side's join column, and the projection's column for each `GROUP BY`
+//!   key an aggregate reads through the relationship (`GROUP BY
+//!   author.country`), typed as that to-side column.
 //!
 //! None of them changes type when the source column does. After the source
 //! column widens (`integer` to `bigint`, `varchar(50)` to `text`), the
@@ -48,6 +50,9 @@ pub(crate) enum CopyKind {
     DeltasGroup,
     /// A to-one relationship projection's key.
     ProjectionKey,
+    /// A to-one relationship projection's column for a `GROUP BY` key read
+    /// through the relationship: the aggregate's groups are read from it.
+    ProjectionGroupBy,
 }
 
 impl CopyKind {
@@ -212,14 +217,34 @@ pub(crate) async fn typed_copies(
             continue;
         };
         let projection: String = row.get(0);
+        let table = super::ddl::qualified_relationship_projection_table(schema, &projection);
+        let table_name = format!("{schema}.{projection}");
+        let to_table = rel.qualified_to_table();
         copies.push(copy(
             CopyKind::ProjectionKey,
-            &super::ddl::qualified_relationship_projection_table(schema, &projection),
-            &format!("{schema}.{projection}"),
+            &table,
+            &table_name,
             &rel.def.to_col,
-            &rel.qualified_to_table(),
+            &to_table,
             &rel.def.to_col,
         ));
+        if let KeySpace::Aggregate { group_by } = &def.key_space {
+            for key in group_by {
+                if let GroupByKey::RelationshipPath { rel: name, column } = key
+                    && name == &rel.def.name
+                    && column != &rel.def.to_col
+                {
+                    copies.push(copy(
+                        CopyKind::ProjectionGroupBy,
+                        &table,
+                        &table_name,
+                        column,
+                        &to_table,
+                        column,
+                    ));
+                }
+            }
+        }
     }
     Ok(copies)
 }

@@ -1276,3 +1276,84 @@ async fn a_field_resume_refuses_a_definition_define_would_refuse_now() {
         .get(0);
     assert_eq!(still_paused, 1);
 }
+
+/// An aggregate's `GROUP BY` key read through a to-one relationship
+/// (`GROUP BY author.country`) is read from the relationship's projection,
+/// whose column for it copies the to-side column's type. Widening the
+/// to-side column (`varchar(2)` to `varchar(20)`) outgrows that copy: the
+/// pass pauses the aggregate, naming it, and a resume re-types it and
+/// rebuilds, so a longer value groups.
+#[tokio::test]
+async fn widening_a_group_by_key_read_through_a_relationship_pauses_and_resume_widens_its_projection_column()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.users (id int primary key, country varchar(2)); \
+         create table public.posts (id int primary key, author_id int); \
+         insert into public.users values (1, 'US'), (2, 'FR'); \
+         insert into public.posts values (1, 1), (2, 2), (3, 1);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "RELATIONSHIP author FROM posts.author_id TO users.id",
+        "TRANSFORM per_country FROM public.posts GROUP BY author.country \
+         SELECT author.country AS country, COUNT(*) AS n",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["per_country"]).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    let projection = format!("trellis.{projection}");
+
+    raw.batch_execute("alter table public.users alter column country type varchar(20)")
+        .await
+        .expect("widen the GROUP BY key's to-side column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_country", "public.users", &["country"]).await;
+    assert!(
+        error.contains(&format!("{projection}.country (character varying(2))")),
+        "{error}"
+    );
+
+    resume(&trellis, "per_country").await;
+    let error = assert_retyping(&trellis, &raw, "per_country").await;
+    assert!(
+        error.contains(&format!(
+            "{projection}.country from character varying(2) to character varying(20)"
+        )),
+        "{error}"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, &projection, "country").await,
+        "character varying(20)"
+    );
+    bring_live(&mut raw, &db.pool, &["per_country"]).await;
+    raw.batch_execute("update public.users set country = 'United States' where id = 1")
+        .await
+        .expect("a longer value");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "per_country").await, TransformStatus::Live);
+    assert_eq!(
+        rows(
+            &raw,
+            "select country::text, n::text from public.per_country where n <> 0 order by 1"
+        )
+        .await,
+        rows(
+            &raw,
+            "select u.country::text, count(*)::text from public.posts p \
+             join public.users u on u.id = p.author_id group by 1 order by 1"
+        )
+        .await,
+    );
+}
