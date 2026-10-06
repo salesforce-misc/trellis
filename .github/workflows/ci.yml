@@ -162,6 +162,74 @@ jobs:
             target/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  diag:
+    # TEMPORARY, PR #827 only: why are the data-heavy tests slow on the runner?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        id: toolchain
+        # Local composite action (mirrors peg) so we don't need an allowlisted
+        # third-party toolchain action. Pinned to the version in
+        # rust-toolchain.toml so CI and local dev never drift.
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt, clippy
+
+      - name: Restore Cargo dependency cache
+        # Compiled third-party dependencies (see prune-cargo-target.sh), keyed
+        # on everything that decides them: the compiler, the debug-info
+        # setting above and Cargo.lock. A lockfile change still restores the
+        # nearest older entry, so only the changed dependencies rebuild. PRs
+        # restore the entry main saved.
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-
+
+      - name: Install PostgreSQL server binaries
+        # the shared test harness (see testkit/src/cluster.rs) shells out to
+        # initdb/postgres/pg_isready/createdb/dropdb to spin up throwaway
+        # instances for trellis's (and other crates') integration tests.
+        # Prefer PostgreSQL server binaries already present on the runner (not
+        # necessarily on PATH); fall back to installing the distro package.
+        run: |
+          set -euo pipefail
+          pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$pg_bin" ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql
+            pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin | sort -V | tail -n1)"
+          fi
+          echo "using PostgreSQL server binaries from: $pg_bin"
+          echo "$pg_bin" >> "$GITHUB_PATH"
+
+      - name: Diagnose
+        run: |
+          nproc; free -m; uptime; df -h / /dev/shm; lscpu | head -20
+          export CARGO_TARGET_DIR=target
+          cargo test -p trellis --test build_interleavings --no-run
+          T="cargo test -p trellis --test build_interleavings"
+          H="eight_chunk_runners the_rederive_statements"
+          echo "=== heavy three, serial"; $T -- $H --test-threads 1 2>&1 | grep -E "^test |result"
+          echo "=== whole binary, 1 thread"; $T -- --test-threads 1 2>&1 | grep -E "result"
+          echo "=== whole binary, 2 threads"; $T -- --test-threads 2 2>&1 | grep -E "result"
+          echo "=== whole binary, default"; $T 2>&1 | grep -E "result"
+          echo "=== whole binary, default, tmpfs+fsync off"
+          TMPDIR=/dev/shm TRELLIS_TESTKIT_PG_OPTIONS="fsync=off full_page_writes=off" $T 2>&1 | grep -E "result"
+          uptime
+
   elixir:
     # The Elixir binding (clients/elixir, issue #146). Its NIF crate is a
     # workspace member, so the `ci` job already formats, lints and builds it
