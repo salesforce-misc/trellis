@@ -217,18 +217,18 @@ jobs:
 
       - name: Diagnose
         run: |
-          nproc; free -m; uptime; df -h / /dev/shm; lscpu | head -20
           export CARGO_TARGET_DIR=target
+          postgres --version; pg_config --configure | tr ' ' '\n' | grep -iE "llvm|cassert|enable-debug" || echo "no llvm/cassert/debug in configure"
+          ls "$(pg_config --pkglibdir)" | grep -i llvmjit || echo "no llvmjit.so"
           cargo test -p trellis --test build_interleavings --no-run
           T="cargo test -p trellis --test build_interleavings"
           H="eight_chunk_runners the_rederive_statements"
-          echo "=== heavy three, serial"; $T -- $H --test-threads 1 2>&1 | grep -E "^test |result"
-          echo "=== whole binary, 1 thread"; $T -- --test-threads 1 2>&1 | grep -E "result"
-          echo "=== whole binary, 2 threads"; $T -- --test-threads 2 2>&1 | grep -E "result"
-          echo "=== whole binary, default"; $T 2>&1 | grep -E "result"
-          echo "=== whole binary, default, tmpfs+fsync off"
-          TMPDIR=/dev/shm TRELLIS_TESTKIT_PG_OPTIONS="fsync=off full_page_writes=off" $T 2>&1 | grep -E "result"
-          uptime
+          echo "=== heavy three, serial, jit=off"
+          TRELLIS_TESTKIT_PG_OPTIONS="jit=off" $T -- $H --test-threads 1 2>&1 | grep -E "^test |result"
+          echo "=== heavy three, serial, jit=off, no parallel query"
+          TRELLIS_TESTKIT_PG_OPTIONS="jit=off max_parallel_workers_per_gather=0" $T -- $H --test-threads 1 2>&1 | grep -E "^test |result"
+          echo "=== the eight-runner Avg test alone, jit=off"
+          TRELLIS_TESTKIT_PG_OPTIONS="jit=off" $T -- a_build_by_eight_chunk_runners --test-threads 1 2>&1 | grep -E "^test |result"
 
   elixir:
     # The Elixir binding (clients/elixir, issue #146). Its NIF crate is a
