@@ -127,20 +127,14 @@ jobs:
         # from running, and one run shows every failure, as `verify` does
         # locally (issue #665).
         #
-        # The throwaway clusters run in /dev/shm with `fsync` and
-        # `full_page_writes` off. The data-heavy tests (the build_interleavings,
-        # rederive_build, ledger_interleavings binaries) run ~6x slower
-        # on the runner than on a laptop, and 1.4-1.7x slower again on a busy
-        # runner, which points at its disk. `kill -9` crash recovery, which the crash tests
-        # use, does not depend on fsync; only an OS crash would, and a test
-        # cluster is deleted afterwards anyway. `synchronous_commit` stays at
-        # its default: app_converge sets it per session and asserts on it.
+        # The throwaway clusters run with `jit=off`. The runner's Postgres
+        # (pgdg 16, built --with-llvm) may JIT-compile the large generate_series
+        # and aggregate statements the data-heavy tests run; those ran ~17x
+        # slower here than on a machine whose Postgres has no JIT. JIT is
+        # chosen after planning, so it changes no results or plans.
         env:
-          TMPDIR: /dev/shm
-          TRELLIS_TESTKIT_PG_OPTIONS: fsync=off full_page_writes=off
-        run: |
-          df -h /dev/shm
-          cargo test --workspace --features benchmark/engine-access --no-fail-fast
+          TRELLIS_TESTKIT_PG_OPTIONS: jit=off
+        run: cargo test --workspace --features benchmark/engine-access --no-fail-fast
 
       - name: Prune target/ to third-party dependencies
         # A cold build is ~5.6GB, nearly all of it this workspace's own test
@@ -161,74 +155,6 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-
-  diag:
-    # TEMPORARY, PR #827 only: why are the data-heavy tests slow on the runner?
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        id: toolchain
-        # Local composite action (mirrors peg) so we don't need an allowlisted
-        # third-party toolchain action. Pinned to the version in
-        # rust-toolchain.toml so CI and local dev never drift.
-        uses: ./.github/actions/rust-toolchain
-        with:
-          toolchain: "1.98.0"
-          components: rustfmt, clippy
-
-      - name: Restore Cargo dependency cache
-        # Compiled third-party dependencies (see prune-cargo-target.sh), keyed
-        # on everything that decides them: the compiler, the debug-info
-        # setting above and Cargo.lock. A lockfile change still restores the
-        # nearest older entry, so only the changed dependencies rebuild. PRs
-        # restore the entry main saved.
-        id: cargo-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-
-
-      - name: Install PostgreSQL server binaries
-        # the shared test harness (see testkit/src/cluster.rs) shells out to
-        # initdb/postgres/pg_isready/createdb/dropdb to spin up throwaway
-        # instances for trellis's (and other crates') integration tests.
-        # Prefer PostgreSQL server binaries already present on the runner (not
-        # necessarily on PATH); fall back to installing the distro package.
-        run: |
-          set -euo pipefail
-          pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
-          if [ -z "$pg_bin" ]; then
-            sudo apt-get update
-            sudo apt-get install -y postgresql
-            pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin | sort -V | tail -n1)"
-          fi
-          echo "using PostgreSQL server binaries from: $pg_bin"
-          echo "$pg_bin" >> "$GITHUB_PATH"
-
-      - name: Diagnose
-        run: |
-          export CARGO_TARGET_DIR=target
-          postgres --version; pg_config --configure | tr ' ' '\n' | grep -iE "llvm|cassert|enable-debug" || echo "no llvm/cassert/debug in configure"
-          ls "$(pg_config --pkglibdir)" | grep -i llvmjit || echo "no llvmjit.so"
-          cargo test -p trellis --test build_interleavings --no-run
-          T="cargo test -p trellis --test build_interleavings"
-          H="eight_chunk_runners the_rederive_statements"
-          echo "=== heavy three, serial, jit=off"
-          TRELLIS_TESTKIT_PG_OPTIONS="jit=off" $T -- $H --test-threads 1 2>&1 | grep -E "^test |result"
-          echo "=== heavy three, serial, jit=off, no parallel query"
-          TRELLIS_TESTKIT_PG_OPTIONS="jit=off max_parallel_workers_per_gather=0" $T -- $H --test-threads 1 2>&1 | grep -E "^test |result"
-          echo "=== the eight-runner Avg test alone, jit=off"
-          TRELLIS_TESTKIT_PG_OPTIONS="jit=off" $T -- a_build_by_eight_chunk_runners --test-threads 1 2>&1 | grep -E "^test |result"
 
   elixir:
     # The Elixir binding (clients/elixir, issue #146). Its NIF crate is a
