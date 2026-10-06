@@ -655,6 +655,59 @@ async fn a_change_from_before_a_truncate_does_not_bring_back_a_min_max_entry() {
     a_change_from_before_a_truncate_does_not_come_back(Flavour::AggregateMinMax).await;
 }
 
+/// A page whose placeholder another page is queued behind deletes it
+/// (#774), and the queued page's insert then goes ahead. Page A holds a
+/// change to key 9 from before the truncate, and is frozen once its insert
+/// has given the key a placeholder; page B holds the key's real insert, and
+/// its own insert of the entry queues on A's uncommitted one. A's statement
+/// refuses its change and deletes the placeholder, so once A commits B's
+/// insert finds no entry and goes ahead: B commits, the key's entry holds
+/// B's change, and the key's row is in the target.
+async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry(flavour: Flavour) {
+    let mut d = start(flavour, &[(1, 1, 10)]).await;
+    write(&d, "truncate public.src").await;
+    d.settle().await;
+    stage_pre_truncate_insert(&d, "9", r#"{"id":"9","g":"1","v":"90"}"#).await;
+    let stale = d.seal().await;
+    write(&d, "insert into public.src values (9, 1, 90)").await;
+    let live = d.seal().await;
+
+    let mut page_a = d
+        .drain_frozen(
+            stale,
+            "a",
+            &[(PausePoint::AfterPlaceholders, flavour.target())],
+        )
+        .await;
+    let frozen_a = page_a.reached(PausePoint::AfterPlaceholders).await;
+    let page_b = d.drain_frozen(live, "b", &[]).await;
+    d.wait_blocked_behind(frozen_a.backend_pid).await;
+    d.release(&mut page_a, PausePoint::AfterPlaceholders).await;
+    page_a.finish_result().await.expect("page A");
+    page_b.finish_result().await.expect("page B");
+
+    assert_eq!(
+        d.rows(&format!(
+            "select __from_key from {} where __applied_lsn is not null",
+            flavour.ledger()
+        ))
+        .await,
+        ["(9)"],
+        "page B's insert wrote key 9's entry with its change"
+    );
+    assert_oracle(&mut d, flavour).await;
+}
+
+#[tokio::test]
+async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry_aggregate() {
+    a_dropped_placeholder_lets_a_queued_insert_write_the_entry(Flavour::Aggregate).await;
+}
+
+#[tokio::test]
+async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry_one_to_one() {
+    a_dropped_placeholder_lets_a_queued_insert_write_the_entry(Flavour::OneToOne).await;
+}
+
 /// A truncate and an insert in one source transaction (#774). The truncate
 /// floor refuses every change at or below the truncate's ring `lsn`, so the
 /// insert applies only because its `lsn` is strictly above the truncate's.

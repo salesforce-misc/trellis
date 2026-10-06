@@ -347,7 +347,10 @@ fn update_statement(target: &str, predicate: bool) -> String {
 /// no tombstone, so the tombstone GC would never collect it, and I2 treats
 /// it as it treats no entry at all, so deleting it changes no later
 /// change's outcome. The statement re-checks that state, so it can't delete
-/// an entry something wrote.
+/// an entry something wrote. It reads the ledger by key, so it runs under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` like the page's other entry
+/// statements (#778): left to the planner, a never-analyzed ledger's delete
+/// of a few thousand keys is a sequential scan.
 pub(crate) async fn drop_placeholders(
     txn: &Transaction<'_>,
     target: &str,
@@ -356,30 +359,32 @@ pub(crate) async fn drop_placeholders(
     if keys.is_empty() {
         return Ok(());
     }
-    let q = |c: &str| quote_ident(c);
-    txn.execute(
-        &format!(
-            "delete from {ledger} where {key} = any($1::text[]) \
-               and {applied} is null and {basis} is null and not {tombstone}",
-            ledger = ledger_ident(target),
-            key = q(schema::KEY_COLUMN),
-            applied = q(schema::APPLIED_LSN_COLUMN),
-            basis = q(schema::BASIS_COLUMN),
-            tombstone = q(schema::TOMBSTONE_COLUMN),
-        ),
-        &[&keys],
-    )
-    .await?;
+    super::ledger::query_by_entry_key(txn, &drop_statement(target), &[&keys]).await?;
     Ok(())
+}
+
+/// [`drop_placeholders`]' statement on `target`'s ledger. Binds `$1` the
+/// keys (`text[]`).
+fn drop_statement(target: &str) -> String {
+    let q = |c: &str| quote_ident(c);
+    format!(
+        "delete from {ledger} where {key} = any($1::text[]) \
+           and {applied} is null and {basis} is null and not {tombstone}",
+        ledger = ledger_ident(target),
+        key = q(schema::KEY_COLUMN),
+        applied = q(schema::APPLIED_LSN_COLUMN),
+        basis = q(schema::BASIS_COLUMN),
+        tombstone = q(schema::TOMBSTONE_COLUMN),
+    )
 }
 
 /// The plans of a page's statements that read the 1-1 target `target`'s
 /// ledger by entry key (#778), as `explain`'s text, each labelled, under the
 /// settings a page runs them with: the entry lock
-/// (`super::ledger::lock_statement`) and [`update_entries`]' statement, for
-/// a page of Applies to `keys`, which already have entries. `target` is the
-/// target's qualified identity. For tests of the plans' shape. It locks and
-/// writes nothing.
+/// (`super::ledger::lock_statement`), [`update_entries`]' statement and
+/// [`drop_placeholders`]' delete, for a page of Applies to `keys`, which
+/// already have entries. `target` is the target's qualified identity. For
+/// tests of the plans' shape. It locks and writes nothing.
 #[cfg(any(test, feature = "internals"))]
 pub async fn explain_page(
     pool: &crate::pool::Pool,
@@ -421,8 +426,20 @@ pub async fn explain_page(
         )
         .await?,
     );
+    let drop = explain(
+        super::ledger::query_by_entry_key(
+            &txn,
+            &format!("explain {}", drop_statement(target)),
+            &[&keys],
+        )
+        .await?,
+    );
     txn.rollback().await?;
-    Ok(vec![("entry lock", lock), ("entry update", update)])
+    Ok(vec![
+        ("entry lock", lock),
+        ("entry update", update),
+        ("placeholder drop", drop),
+    ])
 }
 
 /// Empties a 1-1 target's ledger for a source `TRUNCATE` and raises its

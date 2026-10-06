@@ -225,7 +225,8 @@ pass:
    then sets `__applied_lsn`. Either raises `__applied_seg` and marks a
    tombstone when the key has no row after it. The statement returns the keys
    it changed. A placeholder step 1 inserted that neither step wrote (an
-   Apply at or below the truncate floor, or a Re-derive that was re-staged)
+   Apply at or below the truncate floor, or a Re-derive the page re-staged
+   or skipped as failing to evaluate)
    is deleted in the same transaction (#774): it holds no ordering state, so
    I2 treats it as no entry, and the tombstone GC collects only tombstones.
 4. **The target rows** of exactly those keys are upserted or deleted.
