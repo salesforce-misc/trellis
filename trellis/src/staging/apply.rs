@@ -1137,7 +1137,7 @@ async fn accumulate_from_side_recomputes(
     key_hops: &HashMap<String, i32>,
     key_src_changed: &HashMap<String, Provenance>,
     reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
-    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
+    skip_frozen: FromSideFence<'_>,
 ) -> Result<(), ApplyError> {
     // Issue #267: this accumulator's entries become staged `src_table`s
     // verbatim ([`apply_and_mark_drained_many`]'s step 4), so they carry the
@@ -1176,7 +1176,7 @@ async fn accumulate_from_side_recomputes_on(
     key_hops: &HashMap<String, i32>,
     key_src_changed: &HashMap<String, Provenance>,
     reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
-    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
+    skip_frozen: FromSideFence<'_>,
 ) -> Result<(), ApplyError> {
     if key_hops.is_empty() {
         return Ok(());
@@ -1742,7 +1742,7 @@ pub(crate) fn relationship_reverse_deferred_src_table(relationship_id: i64) -> S
 async fn build_reverse_relationship_shape(
     pool: &Pool,
     rel: &RelationshipDefinition,
-    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
+    skip_frozen: FromSideFence<'_>,
 ) -> Result<ReverseRelationshipShape, ApplyError> {
     let projection = catalog::relationship_projection(pool, rel.id).await?;
     let (qualified_projection, projection_schema, projection_table_bare) = match projection {
@@ -3051,8 +3051,13 @@ pub(crate) async fn release_to_one_projections(
         .get(0);
     let pk = ddl::source_primary_key(pool, src_table).await?;
     let pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
+    // A release is no drain page: no fence is committed under, so what the
+    // shape reads of the fence goes unused.
+    let mut versions = HashMap::new();
     for rel in &relationships {
-        let shape = build_reverse_relationship_shape(pool, rel, None).await?;
+        let shape =
+            build_reverse_relationship_shape(pool, rel, FromSideFence::new(&mut versions, false))
+                .await?;
         if shape.qualified_projection.is_empty() {
             continue;
         }
@@ -5340,29 +5345,32 @@ async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyErro
 /// own changes. Without this a write to the to-side halted the drain on the
 /// from-side's key though no reader would apply what it staged. A reader
 /// that isn't frozen halts the page, which pauses it (`super::halt`, #663),
-/// and so does a from-side that is gone. A new reader rebuilds from the
-/// source too, so the skip needs no fence.
+/// and so does a from-side that is gone.
 ///
-/// `skip_frozen` is [`compute_page`]'s (issue #766), with the page's fence:
-/// on the retry after Postgres refused the drain a read, a from-side no
-/// unfrozen definition reads is skipped whatever its key, as `compute_page`
-/// skips that table's own changes. Its readers' halt may be what froze
-/// them, for that very refusal, and the from-side read would be refused
-/// again on every pass. That skip is fenced as `compute_page`'s is
-/// ([`no_unfrozen_reader`]), with the from-side's own fence read first, so a
-/// page can't commit after a resume it didn't see.
+/// Both skips are fenced (#823). A resume's build reads the relationship's
+/// settled projection, so a page that skipped a recompute and commits after
+/// the resume would leave the resumed reader without that change. The
+/// from-side's own fence is read first, then its readers
+/// ([`no_unfrozen_reader`]), and a definition, its resume and its edit each
+/// bump their source's fence, so a page can't commit after a resume it
+/// didn't see.
+///
+/// `fence.skip_frozen` is [`compute_page`]'s (issue #766): on the retry after
+/// Postgres refused the drain a read, a from-side no unfrozen definition
+/// reads is skipped whatever its key, as `compute_page` skips that table's
+/// own changes. Its readers' halt may be what froze them, for that very
+/// refusal, and the from-side read would be refused again on every pass.
 async fn from_side_key(
     pool: &Pool,
     qualified_from_table: &str,
-    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
+    fence: FromSideFence<'_>,
 ) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
-    if let Some(versions) = skip_frozen {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            versions.entry(qualified_from_table.to_string())
-        {
-            let version = catalog::source_table_version(pool, entry.key()).await?;
-            entry.insert(version);
-        }
+    let FromSideFence {
+        versions,
+        skip_frozen,
+    } = fence;
+    if skip_frozen {
+        read_fence(pool, qualified_from_table, versions).await?;
         if no_unfrozen_reader(pool, qualified_from_table, versions).await? {
             tracing::warn!(
                 from_table = %qualified_from_table,
@@ -5376,10 +5384,11 @@ async fn from_side_key(
         Ok(pk) => return Ok(Some(pk)),
         Err(err) => err,
     };
-    if !is_key_gate(&err)
-        || quarantine::source_table_missing(pool, qualified_from_table).await?
-        || has_unfrozen_reader(pool, qualified_from_table).await?
-    {
+    if !is_key_gate(&err) || quarantine::source_table_missing(pool, qualified_from_table).await? {
+        return Err(err.into());
+    }
+    read_fence(pool, qualified_from_table, versions).await?;
+    if !no_unfrozen_reader(pool, qualified_from_table, versions).await? {
         return Err(err.into());
     }
     tracing::warn!(
@@ -5389,6 +5398,38 @@ async fn from_side_key(
          can't be used; staging no recompute of its rows"
     );
     Ok(None)
+}
+
+/// Reads `table`'s version fence into `versions` unless the page already
+/// holds it: the first read is the oldest, so the safest to commit under.
+async fn read_fence(
+    pool: &Pool,
+    table: &str,
+    versions: &mut HashMap<String, Option<i64>>,
+) -> Result<(), ApplyError> {
+    if let std::collections::hash_map::Entry::Vacant(entry) = versions.entry(table.to_string()) {
+        let version = catalog::source_table_version(pool, entry.key()).await?;
+        entry.insert(version);
+    }
+    Ok(())
+}
+
+/// The page's version fence (`versions`, the fence's read set) and whether the
+/// page is on its retry after Postgres refused the drain a read
+/// (`skip_frozen`, [`compute_page`]'s), which [`from_side_key`] judges its
+/// skips under.
+struct FromSideFence<'a> {
+    versions: &'a mut HashMap<String, Option<i64>>,
+    skip_frozen: bool,
+}
+
+impl<'a> FromSideFence<'a> {
+    fn new(versions: &'a mut HashMap<String, Option<i64>>, skip_frozen: bool) -> Self {
+        Self {
+            versions,
+            skip_frozen,
+        }
+    }
 }
 
 /// Each of `changes`' [`KeyExclusion`] (#799), or `None` when every one is
@@ -5933,7 +5974,7 @@ pub(super) async fn compute_page(
                     &key_hops,
                     &key_src_changed,
                     &mut reverse_recomputes,
-                    skip_frozen.then_some(&mut versions),
+                    FromSideFence::new(&mut versions, skip_frozen),
                 )
                 .await?;
             }
@@ -6104,7 +6145,7 @@ pub(super) async fn compute_page(
                     &key_hops,
                     &key_src_changed,
                     &mut reverse_recomputes,
-                    skip_frozen.then_some(&mut versions),
+                    FromSideFence::new(&mut versions, skip_frozen),
                 )
                 .await?;
                 continue;
@@ -6226,7 +6267,7 @@ pub(super) async fn compute_page(
                 &key_hops,
                 &key_src_changed,
                 &mut reverse_recomputes,
-                skip_frozen.then_some(&mut versions),
+                FromSideFence::new(&mut versions, skip_frozen),
             )
             .await?;
 
@@ -6240,7 +6281,7 @@ pub(super) async fn compute_page(
                         build_reverse_relationship_shape(
                             pool,
                             rel,
-                            skip_frozen.then_some(&mut versions),
+                            FromSideFence::new(&mut versions, skip_frozen),
                         )
                         .await?,
                     );
@@ -6551,7 +6592,7 @@ pub(super) async fn compute_page(
                     build_reverse_relationship_shape(
                         pool,
                         &rel,
-                        skip_frozen.then_some(&mut versions),
+                        FromSideFence::new(&mut versions, skip_frozen),
                     )
                     .await?,
                 );
@@ -6587,7 +6628,7 @@ pub(super) async fn compute_page(
                 &key_hops,
                 &key_src_changed,
                 &mut reverse_recomputes,
-                skip_frozen.then_some(&mut versions),
+                FromSideFence::new(&mut versions, skip_frozen),
             )
             .await?;
         }
@@ -6818,7 +6859,7 @@ pub(super) async fn compute_page(
             let Some(from_pk) = from_side_key(
                 pool,
                 &qualified_from_table,
-                skip_frozen.then_some(&mut versions),
+                FromSideFence::new(&mut versions, skip_frozen),
             )
             .await?
             else {

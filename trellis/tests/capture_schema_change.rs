@@ -2201,3 +2201,87 @@ async fn a_reader_beside_an_unfrozen_reader_of_the_relationship_refreshes_nothin
         "posts_named reads author again: no refresh"
     );
 }
+
+/// Issue #823: the from-side's key-gate skip is judged under the fence of the
+/// from-side's source. A page that skipped the reverse recompute of `posts`
+/// while every reader of it was paused and its key was off the allowlist, and
+/// reaches its commit only after the key is usable again and a reader
+/// resumes, misses the fence (the resume bumps `posts`') and computes again.
+/// Committing it would leave the resumed reader's build, which reads the
+/// relationship's settled projection, with a to-side change whose recompute
+/// was never staged.
+#[tokio::test]
+async fn a_page_that_skipped_a_from_side_key_misses_its_fence_after_a_reader_resumes() {
+    use trellis::staging::apply::{self, ApplyError};
+    use trellis::staging::{StagedWatermark, claim, fold, seal};
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    for target in ["posts_named", "posts_plain"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause a reader of posts");
+    }
+    app.batch_execute("alter table public.posts alter column id type numeric")
+        .await
+        .expect("retype the from-side key");
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    app.batch_execute("update public.users set name = 'Annie' where handle = 'ann'")
+        .await
+        .expect("write the to-side");
+    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, outcome.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    let seg_seq = outcome.sealed_seg_seq;
+
+    let mut phase1 = db.pool.get().await.expect("connection");
+    let txn = phase1.transaction().await.expect("begin phase 1");
+    claim::claim(&txn, seg_seq, "worker", 1)
+        .await
+        .expect("claim");
+    let share = claim::held_share(&*txn, seg_seq, "worker")
+        .await
+        .expect("held_share");
+    let folded = fold::fold(&txn, seg_seq, share.filter(share.buckets()))
+        .await
+        .expect("fold");
+    txn.commit().await.expect("commit phase 1");
+    assert!(
+        folded.iter().any(|c| c.src_table == "public.users"),
+        "the page holds the to-side's write"
+    );
+    let plan = apply::compute(&db.pool, &folded)
+        .await
+        .expect("compute skips the from-side's recompute, every reader being paused");
+
+    app.batch_execute("alter table public.posts alter column id type int")
+        .await
+        .expect("make the from-side key usable again");
+    trellis
+        .apply("RESUME TRANSFORM posts_named")
+        .await
+        .expect("resume");
+
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    let err = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "worker",
+        &plan,
+        "capture_schema_change_wake",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect_err("the resume moved the fence the skip was judged under");
+    match &err {
+        ApplyError::VersionFenceMiss { src_table } => assert_eq!(src_table, "public.posts"),
+        other => panic!("expected VersionFenceMiss, got {other:?}"),
+    }
+}
