@@ -48,11 +48,18 @@
 //! pauses nothing: [`super::apply`]'s halt then retries the page once and
 //! surfaces the error, charging no key either way.
 //!
+//! A backfill marker's discharge that Postgres refuses the same way (a
+//! build's planning, or a go-live catch-up's re-read, issue #813) halts
+//! through the same attribution, on the discharge's own connection
+//! ([`halt_refused_discharge`]), and retries the marker without the
+//! definitions it paused. One the catalog pins on no table pauses nothing
+//! there either, and the marker backs off as for any failed discharge.
+//!
 //! [`FailureClass::Halting`]: super::quarantine::FailureClass::Halting
 
 use std::collections::{BTreeSet, HashSet};
 
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Transaction};
 
 use crate::capture::columns::{CaptureCatalog, load_catalog, readers_of};
 use crate::defs::ddl::DdlError;
@@ -108,7 +115,62 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    let catalog = load_catalog(&*txn, pool.schema()).await?;
+    let paused = pause_closure(
+        &txn,
+        pool.schema(),
+        seed,
+        "the drain halted",
+        &err.to_string(),
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(paused)
+}
+
+/// [`halt_closure`] for a backfill marker's discharge (issue #813,
+/// `intake::markers`): a registration's or a resume's planning, or a go-live
+/// catch-up's read, that Postgres refused with `42501`. Runs the same
+/// attribution ([`refusals`]) on the discharge's own connection, `client`,
+/// and so as the role that was refused, and pauses the closure of each
+/// table it names with kind `halt`, recording the halting stop if it paused
+/// any, in one transaction. Returns the bare targets it paused; empty when
+/// the catalog pins the refusal on no table, or every definition it reaches
+/// was already frozen, and then the caller backs the marker off as for any
+/// failed discharge.
+///
+/// `table` is the marker's and `err` the refusal's text, for the record's
+/// sentence. The instance schema
+/// is read from `client`'s `search_path`, which every Trellis session leads
+/// with it.
+pub(crate) async fn halt_refused_discharge(
+    client: &mut tokio_postgres::Client,
+    table: &str,
+    err: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let schema: String = client
+        .query_one("select pg_catalog.current_schema()::text", &[])
+        .await?
+        .get(0);
+    let txn = client.transaction().await?;
+    let halted = format!("the backfill discharge of {table} was refused");
+    let paused = pause_closure(&txn, &schema, None, &halted, err).await?;
+    txn.commit().await?;
+    Ok(paused)
+}
+
+/// Pauses, in `txn`, every unfrozen definition `seed` reaches, or, with no
+/// seed (a refused read or write, `42501`), every one the [`refusals`] read
+/// as `txn`'s role reaches; and records the halting stop if that paused any.
+/// `halted` opens each record's sentence: what halted, and `err`, the
+/// failure's text, follows it.
+async fn pause_closure(
+    txn: &Transaction<'_>,
+    schema: &str,
+    seed: Option<Seed>,
+    halted: &str,
+    err: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let catalog = load_catalog(txn, schema).await?;
     let unfrozen: HashSet<i64> = txn
         .query(
             "select id from transform_definitions where status = any($1)",
@@ -127,18 +189,18 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
                 Seed::Target(target) => target.clone(),
             };
             let error = format!(
-                "the drain halted: {err}; fix the cause, then resume the definition to rebuild \
-                 it, or drop the definition"
+                "{halted}: {err}; fix the cause, then resume the definition to rebuild it, or \
+                 drop the definition"
             );
             vec![(seed, source_table, error)]
         }
-        None => refusals(&*txn, pool.schema(), &catalog, &unfrozen)
+        None => refusals(txn, schema, &catalog, &unfrozen)
             .await?
             .into_iter()
             .map(|refusal| {
                 let error = format!(
-                    "the drain halted: {err}; {}; then resume the definition to rebuild it, or \
-                     drop the definition",
+                    "{halted}: {err}; {}; then resume the definition to rebuild it, or drop the \
+                     definition",
                     refusal.reason
                 );
                 (refusal.seed, refusal.table, error)
@@ -149,16 +211,15 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
     let mut paused = Vec::new();
     for (seed, source_table, error) in &episodes {
         for id in closure(&catalog, seed, &unfrozen) {
-            if crate::defs::lifecycle::pause_for_halt(&txn, id, source_table, error).await? {
+            if crate::defs::lifecycle::pause_for_halt(txn, id, source_table, error).await? {
                 let reader = catalog.definitions.iter().find(|r| r.id == id);
                 paused.push(reader.map_or_else(|| id.to_string(), |r| r.def.target.clone()));
             }
         }
     }
     if !paused.is_empty() {
-        quarantine::record_halting_stop(&txn, &err.to_string()).await?;
+        quarantine::record_halting_stop(txn, err).await?;
     }
-    txn.commit().await?;
     Ok(paused)
 }
 

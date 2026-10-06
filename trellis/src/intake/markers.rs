@@ -951,6 +951,23 @@ pub(super) async fn fetch_read(
 /// recorded error is what `Trellis::status` reports for every definition
 /// reading the table.
 ///
+/// # A refused discharge (issue #813)
+///
+/// Every Trellis session runs with `row_security = off`, so a read that
+/// row-level security would filter, or that the role lacks a privilege for,
+/// fails with `42501`: a build's planning, a go-live catch-up's re-read, an
+/// orphan sweep's anti-join. Such a failure isn't the marker's, and retrying
+/// it would fail forever, so the discharge halts as the drain does
+/// (`staging::halt`): it reads the catalog as its own role, pauses each
+/// definition the refusal reaches with kind `halt` and the reason, and
+/// retries the marker at once without them. A frozen definition doesn't
+/// count as a reader of the table, and a table whose readers are all frozen
+/// gets no projection refresh, so once every reader of a refused table is
+/// paused, the retry neither enumerates it nor refreshes its projections,
+/// and the marker discharges; resuming a definition parks it a fresh one. A
+/// refusal the catalog pins on no table pauses nothing, and the marker backs
+/// off like any other failure.
+///
 /// This form returns the first such failure once the pass has run, for tests
 /// that expect one; [`run_pending_backfills_until`] returns them all without
 /// failing the pass.
@@ -1140,18 +1157,34 @@ pub(crate) async fn run_pending_backfills_for(
             continue;
         }
         settled += 1;
-        match discharge_marker(
-            client,
-            &marker,
-            wake_channel,
-            watermark,
-            intake_timeout,
-            stop,
-            ready,
-            &mut rederive,
-        )
-        .await
-        {
+        // Issue #813: a discharge Postgres refused (`42501`) pauses what the
+        // refusal reaches, as the drain's halt does, and is retried at once
+        // without them. Each retry follows a call that paused something, so
+        // the loop ends: once a refusal pauses nothing new (the catalog pins
+        // it on no table, or its closure is already frozen), it backs off
+        // below like any failed discharge.
+        let outcome = loop {
+            let outcome = discharge_marker(
+                client,
+                &marker,
+                wake_channel,
+                watermark,
+                intake_timeout,
+                stop,
+                ready,
+                &mut rederive,
+            )
+            .await;
+            match outcome {
+                Err(error) if crate::staging::quarantine::is_insufficient_privilege(&error) => {
+                    if !halt_refused(client, &marker.table, &error).await {
+                        break Err(error);
+                    }
+                }
+                outcome => break outcome,
+            }
+        };
+        match outcome {
             Ok(Discharge::Committed) => {}
             Ok(Discharge::Deferred { horizon }) => {
                 tracing::debug!(
@@ -1187,6 +1220,43 @@ pub(crate) async fn run_pending_backfills_for(
     span.record("settled", settled);
     span.record("failed", failures.len());
     Ok(failures)
+}
+
+/// Pauses what the refusal `error` of `table`'s discharge reaches
+/// ([`crate::staging::halt::halt_refused_discharge`], issue #813), on the
+/// discharge's own connection and so as the role Postgres refused. Returns
+/// whether that paused anything, so the caller retries the marker without
+/// them. An attribution that fails is logged and counts as pausing nothing:
+/// the marker then backs off on the refusal, rather than failing the pass and
+/// retrying it on the next one with no backoff.
+async fn halt_refused(
+    client: &mut tokio_postgres::Client,
+    table: &str,
+    error: &IntakeError,
+) -> bool {
+    match crate::staging::halt::halt_refused_discharge(client, table, &error.to_string()).await {
+        Ok(paused) if paused.is_empty() => false,
+        Ok(paused) => {
+            tracing::error!(
+                table = %table,
+                paused = ?paused,
+                error = %error,
+                "backfill discharge refused; paused every definition the refusal reaches until \
+                 resumed, and retrying the marker without them"
+            );
+            true
+        }
+        Err(halt_error) => {
+            tracing::warn!(
+                table = %table,
+                error = %error,
+                halt_error = %halt_error,
+                "backfill discharge refused, and reading what the refusal reaches failed; \
+                 backing the marker off"
+            );
+            false
+        }
+    }
 }
 
 /// Waits until every transaction open at the fences this pass just took (the
@@ -1464,7 +1534,13 @@ async fn discharge_marker(
     // ask for the refresh (`request_projection_refresh`): it diffs the whole
     // table, and every other write reaches the projection through the seam
     // or CDC.
-    if marker.refresh_projections {
+    // Issue #813: not when every reader of the table is frozen, since the
+    // resume of each refreshes the projections it reads (issue #768). So a
+    // to-side Postgres refuses the role doesn't fail the marker again once
+    // the refusal has paused its readers.
+    if marker.refresh_projections
+        && !crate::defs::catalog::table_readers_all_frozen(&txn, &marker.table).await?
+    {
         let refreshed =
             crate::defs::catalog::refresh_relationship_projections_in_txn(&txn, &marker.table)
                 .await?;

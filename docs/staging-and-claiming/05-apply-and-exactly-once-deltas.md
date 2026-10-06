@@ -744,6 +744,16 @@ table, [gap 11](../known-correctness-gaps.md#11-row-level-security-on-a-role-tre
 surfaces the error, and the
 worker re-claims the page at the poll interval under a collapsed warning (#660).
 
+A backfill marker's discharge that Postgres refuses the same way (`42501`),
+while it plans a build or while a go-live catch-up re-reads the source, halts
+through the same attribution (#813), read from the catalog as the discharge's
+own role. It pauses what the refusal reaches with `kind` `halt` and retries
+the marker at once without them. A frozen definition doesn't count as a reader
+of a table, so once every reader of the refused table is paused, the retry
+neither enumerates it nor refreshes its projections, and the marker discharges.
+A refusal the catalog can't pin pauses nothing, and the marker backs off as
+for any failed discharge, with the error on `backfill_failure`.
+
 ## Invariants
 
 1. **The claim is an optimization; the fence plus the atomic apply ∪ mark are the

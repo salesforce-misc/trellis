@@ -438,8 +438,9 @@ async fn defining_refuses_a_table_whose_policies_apply_to_the_trellis_role() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// The capture half of one staging-worker pass.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+/// The capture half of one staging-worker pass. Returns the waiting
+/// definitions it found ready to build.
+async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) -> Vec<i64> {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -452,6 +453,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
     .await
     .expect("capture pass");
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    outcome.ready
 }
 
 async fn status(trellis: &trellis::Trellis, target: &str) -> trellis::DefinitionStatus {
@@ -1784,5 +1786,298 @@ async fn a_to_side_recompute_skips_a_from_side_whose_readers_are_halted_for_row_
         .get(0);
     assert_eq!(name.as_deref(), Some("renamed"), "p_copy applied the page");
     assert_eq!(poison_rows(&it.admin).await, 0);
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A raw session as `role`, set up the way Trellis sets up its own: the
+/// instance schema leads the `search_path`, and row-level security is off
+/// (#766), so a read the policies would filter raises instead.
+async fn session_as(it: &Instance, role: &str) -> Client {
+    let dsn = it
+        ._db
+        .dsn()
+        .replace("user=postgres", &format!("user={role}"));
+    let session = connect(&dsn).await;
+    session
+        .batch_execute(&format!(
+            "set search_path to {SCHEMA}, public; set row_security to off"
+        ))
+        .await
+        .expect("set up the session");
+    session
+}
+
+/// A pool as `role`, for the drains and builds after the fix.
+fn pool_as(it: &Instance, role: &str) -> trellis::Pool {
+    let dsn = it
+        ._db
+        .dsn()
+        .replace("user=postgres", &format!("user={role}"));
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    trellis::Pool::new(&config).expect("pool")
+}
+
+async fn pending_markers(admin: &Client) -> i64 {
+    admin
+        .query_one(
+            &format!("select count(*) from {SCHEMA}.pending_backfill"),
+            &[],
+        )
+        .await
+        .expect("count markers")
+        .get(0)
+}
+
+/// The halt record `target` is paused with, after a refused discharge.
+async fn halted(trellis: &trellis::Trellis, target: &str) -> trellis::CaptureFailure {
+    let reported = status(trellis, target).await;
+    assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+    let failure = reported
+        .capture_failure
+        .unwrap_or_else(|| panic!("{target} carries the halt's record"));
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt, "{target}");
+    failure
+}
+
+/// A backfill discharge refused while planning (#813). `c_copy_2` reads
+/// `c_copy`, another definition's target, so its build is planned by the
+/// discharge of the marker on `c_copy`, which walks `c_copy`'s key. The
+/// discharge runs as `rls_worker`, a member of the ring's owner, which
+/// doesn't inherit its `BYPASSRLS`, so `c_copy`'s forced policies apply to
+/// it and the walk is refused (`42501`). The discharge reads the catalog as
+/// that role, as the drain's halt does, and pauses what the refusal reaches
+/// with kind `halt`: `c_copy_2`, which reads `c_copy`, and `c_copy`, whose
+/// writes to its own target the policies refuse too. Nothing is charged to
+/// the quarantine, and the marker, whose definitions are now all paused,
+/// discharges in the same pass instead of backing off forever. Once the role
+/// is exempted, resuming both rebuilds them to match the oracle.
+#[tokio::test]
+async fn a_discharge_refused_while_planning_pauses_what_the_refusal_reaches() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("define");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Live
+    );
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.c_copy enable row level security, force row level security; \
+             create policy hide_one on public.c_copy using (id <> 1) with check (true);",
+        )
+        .await
+        .expect("a member login role the upstream target's policies apply to");
+    it.trellis
+        .apply("TRANSFORM c_copy_2 FROM public.c_copy SELECT amount AS amount")
+        .await
+        .expect("define on the upstream's target, as the exempt role");
+    let ready = capture_pass(&mut it.raw, &it.pool).await;
+    markers::park_ready_registration_markers(&it.raw, &ready)
+        .await
+        .expect("park the registration's marker");
+    assert!(pending_markers(&it.admin).await > 0);
+
+    let mut worker = session_as(&it, "rls_worker").await;
+    markers::run_pending_backfills(
+        &mut worker,
+        "trellis_wake",
+        &StagedWatermark::saturated(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the refused discharge pauses what it reaches, then discharges the marker");
+
+    let failure = halted(&it.trellis, "c_copy_2").await;
+    assert_eq!(failure.source_table, "public.c_copy");
+    assert!(
+        failure
+            .error
+            .starts_with("the backfill discharge of public.c_copy was refused")
+            && failure
+                .error
+                .contains("row-level security on public.c_copy applies to role rls_worker")
+            && failure
+                .error
+                .contains("query would be affected by row-level security policy"),
+        "{}",
+        failure.error
+    );
+    let failure = halted(&it.trellis, "c_copy").await;
+    assert!(
+        failure
+            .error
+            .contains("row-level security on target public.c_copy applies to role rls_worker"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
+    assert_eq!(
+        pending_markers(&it.admin).await,
+        0,
+        "the marker discharged once its definitions were paused"
+    );
+
+    it.admin
+        .batch_execute(
+            "alter role rls_worker bypassrls; \
+             update public.c set amount = 100 where id = 1;",
+        )
+        .await
+        .expect("exempt the role, and write the source while paused");
+    let worker = pool_as(&it, "rls_worker");
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain passes over the paused definitions");
+    for target in ["c_copy", "c_copy_2"] {
+        it.trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .expect("resume");
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&worker).await;
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain applies the rebuild");
+    for target in ["c_copy", "c_copy_2"] {
+        let reported = status(&it.trellis, target).await;
+        assert_eq!(reported.status, TransformStatus::Live, "{target}");
+        assert_eq!(reported.capture_failure, None, "{target}");
+        assert!(
+            matches!(
+                self_check(&it.trellis, target).await,
+                SelfCheckOutcome::Converged
+            ),
+            "{target} matches the oracle"
+        );
+    }
+    assert_eq!(
+        amount_of(&it.admin, "public.c_copy_2", 1).await,
+        Some("100".to_string())
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A go-live catch-up refused (#813). `c_copy_2` reads `c_copy`, another
+/// definition's target, so it is built by chunks, here as the exempt ring
+/// owner, which leave it `catching_up` with its go-live catch-up parked on
+/// `c_copy`. The catch-up's discharge runs as `rls_worker`, a member of the
+/// ring's owner that `c_copy`'s forced policies apply to, so its re-read of
+/// `c_copy` is refused (`42501`). The discharge pauses what the refusal
+/// reaches with kind `halt`, the reason naming the table and the role:
+/// `c_copy_2`, which reads `c_copy`, and `c_copy`, which writes it. It
+/// charges no key, and discharges the marker once nothing it would serve is
+/// left. Once the role is exempted, resuming both rebuilds them to match the
+/// oracle.
+#[tokio::test]
+async fn a_catch_up_refused_for_row_security_pauses_its_definition() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("TRANSFORM c_copy FROM public.c SELECT amount AS amount")
+        .await
+        .expect("define");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    it.trellis
+        .apply("TRANSFORM c_copy_2 FROM public.c_copy SELECT amount AS amount")
+        .await
+        .expect("define on the upstream's target");
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_builds(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "c_copy_2").await.status,
+        TransformStatus::CatchingUp,
+        "the build finished; its catch-up is parked"
+    );
+    assert_eq!(pending_markers(&it.admin).await, 1);
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.c_copy enable row level security, force row level security; \
+             create policy hide_one on public.c_copy using (id <> 1) with check (true);",
+        )
+        .await
+        .expect("a member login role the upstream target's policies apply to");
+
+    let mut worker = session_as(&it, "rls_worker").await;
+    markers::run_pending_backfills(
+        &mut worker,
+        "trellis_wake",
+        &StagedWatermark::saturated(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the refused catch-up pauses what it reaches, then discharges the marker");
+
+    let failure = halted(&it.trellis, "c_copy_2").await;
+    assert_eq!(failure.source_table, "public.c_copy");
+    assert!(
+        failure
+            .error
+            .starts_with("the backfill discharge of public.c_copy was refused")
+            && failure
+                .error
+                .contains("row-level security on public.c_copy applies to role rls_worker"),
+        "{}",
+        failure.error
+    );
+    let failure = halted(&it.trellis, "c_copy").await;
+    assert!(
+        failure
+            .error
+            .contains("row-level security on target public.c_copy applies to role rls_worker"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
+    assert_eq!(pending_markers(&it.admin).await, 0);
+
+    it.admin
+        .batch_execute(
+            "alter role rls_worker bypassrls; \
+             update public.c set amount = 100 where id = 1;",
+        )
+        .await
+        .expect("exempt the role, and write the source while paused");
+    let worker = pool_as(&it, "rls_worker");
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain passes over the paused definitions");
+    for target in ["c_copy", "c_copy_2"] {
+        it.trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .expect("resume");
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&worker).await;
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain applies the rebuild");
+    for target in ["c_copy", "c_copy_2"] {
+        let reported = status(&it.trellis, target).await;
+        assert_eq!(reported.status, TransformStatus::Live, "{target}");
+        assert_eq!(reported.capture_failure, None, "{target}");
+        assert!(
+            matches!(
+                self_check(&it.trellis, target).await,
+                SelfCheckOutcome::Converged
+            ),
+            "{target} matches the oracle"
+        );
+    }
+    assert_eq!(
+        amount_of(&it.admin, "public.c_copy_2", 1).await,
+        Some("100".to_string())
+    );
     it.trellis.shutdown().await.expect("shutdown");
 }

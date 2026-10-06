@@ -6724,8 +6724,8 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
     )
 }
 
-/// Whether any registered definition other than `excluding` reads
-/// `qualified_table`, in any status: as its anchor source, or through a
+/// Whether any registered definition other than `excluding` that isn't
+/// frozen reads `qualified_table`: as its anchor source, or through a
 /// relationship path ([`all_source_tables`]'s set). The backfill discharge
 /// ([`crate::intake::markers::run_pending_backfills`]) skips enumerating
 /// a table this says `false` for (issue #417), since nothing would consume the
@@ -6734,18 +6734,59 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
 /// `waiting_to_backfill` definition the Re-derive build will start (issue
 /// #732). This leaves out every definition a Re-derive build is running for,
 /// whose chunks read the table too (#625 F2).
+///
+/// A frozen definition doesn't count (issue #813): the drain drops its share
+/// of every page, and its resume rebuilds it from the source. Counting it
+/// would also have a discharge re-read a table Postgres refuses the role,
+/// for nothing, after the refusal paused every reader of it.
 pub(crate) async fn table_has_reader(
     client: &impl GenericClient,
     qualified_table: &str,
     excluding: &[i64],
 ) -> Result<bool, tokio_postgres::Error> {
+    readers_exist(
+        client,
+        qualified_table,
+        excluding,
+        &TransformStatus::dispatchable(),
+    )
+    .await
+}
+
+/// Whether `qualified_table` has readers ([`table_has_reader`]'s sense) and
+/// every one is frozen (issue #813). A backfill discharge then skips its
+/// projection refresh: each frozen reader's resume refreshes the
+/// projections it reads (#768), and the refresh would re-read a to-side
+/// Postgres may refuse the role, after the refusal paused its readers. A
+/// table nothing reads is refreshed as before.
+pub(crate) async fn table_readers_all_frozen(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let frozen: Vec<&str> = TransformStatus::ALL
+        .iter()
+        .filter(|status| status.is_frozen())
+        .map(|status| status.as_str())
+        .collect();
+    Ok(readers_exist(client, qualified_table, &[], &frozen).await?
+        && !table_has_reader(client, qualified_table, &[]).await?)
+}
+
+/// Whether a registered definition other than `excluding`, in one of
+/// `statuses`, with no Re-derive build running, reads `qualified_table`.
+async fn readers_exist(
+    client: &impl GenericClient,
+    qualified_table: &str,
+    excluding: &[i64],
+    statuses: &[&str],
+) -> Result<bool, tokio_postgres::Error> {
     Ok(client
         .query_one(
             &format!(
                 "{} select exists (select 1 from reachable where table_name = $1)",
-                reachable_tables_cte("not (id = any($2)) and build is null")
+                reachable_tables_cte("not (id = any($2)) and build is null and status = any($3)")
             ),
-            &[&qualified_table, &excluding],
+            &[&qualified_table, &excluding, &statuses],
         )
         .await?
         .get(0))

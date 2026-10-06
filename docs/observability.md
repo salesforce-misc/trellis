@@ -226,7 +226,8 @@ pause are arcs of one lifecycle:
     `backfill_failure`;
   * the drain hit a failure that every key reproduces (a source with no usable
     primary key, a propagation cycle past the hop bound, a read or write refused
-    to the drain's role): the definitions it reaches
+    to the drain's role), or a backfill discharge or go-live catch-up was refused
+    a read: the definitions it reaches
     and everything downstream of them are paused, with the cause on `capture_failure`.
 
   `RESUME TRANSFORM` first re-runs define's validation against the live schema. While
@@ -307,6 +308,12 @@ is surfaced:
   every `DefinitionSummary`, and the CLI's `trellis status` prints it on an
   indented line under each affected definition, so one listing shows every
   stuck backfill.
+* **A refusal pauses instead.** When Postgres refuses the staging worker's
+  role a read the backfill needs (row-level security or a missing privilege,
+  `42501`), retrying can't get past it, so the transforms the refusal reaches
+  are paused as a halt ([A halting failure](#a-halting-failure)) and the
+  backfill goes on without them. Only a refusal the catalog can't pin on a
+  table is retried with backoff as above.
 
 A build that has started fails differently. A plain 1-1 transform's build runs as
 chunks of its source's primary-key range on the drain workers, and each failing chunk is
@@ -366,7 +373,14 @@ without them:
   [gap 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as))
   surfaces the error, and the drain worker re-claims the page at its poll
   interval under a collapsed warning (#660).
-* **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
+* **A refused backfill.** A backfill discharge or go-live catch-up that
+  Postgres refuses (`42501`, while it plans a build or re-reads the source)
+  halts the same way, as the staging worker's role (#813): it pauses what the
+  refusal reaches with `kind` `halt`, and the marker discharges without them,
+  so the definitions show as halted rather than stuck in
+  `waiting_to_backfill` or `catching_up`. A refusal the catalog can't pin on a
+  table pauses nothing: the marker backs off and retries like any failed
+  backfill, with the error on `backfill_failure`.* **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. A resume re-validates the definition as define would, so
   while its source key, or a relationship endpoint's, is still of a type define

@@ -84,7 +84,7 @@ These are the tools the entries refer to:
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
-| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain: pauses what it reaches, or logs only; build: `backfill_failure` | #813, #817 |
+| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge and catch-up: pause what they reach, or log only; build chunk: `backfill_failure` | #817 |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #528, test ignored |
@@ -376,9 +376,15 @@ than filtering it. What follows depends on what was refused:
 * **A build chunk** is retried, and its fifth charged attempt pauses its
   definition, with the error on `backfill_failure`. It's never narrowed to a
   key.
-* **A backfill discharge or go-live catch-up** is refused before any chunk
-  exists. It retries forever with backoff, with the error on
-  `backfill_failure`, and never pauses its definitions (#813).
+* **A backfill discharge or go-live catch-up** halts the same way, whether
+  the refusal comes while it plans a build, before any chunk exists, or while
+  a catch-up re-reads the source. It reads the catalog as the discharge's own
+  role, pauses what the refusal reaches with kind `halt` and the same reason,
+  charges no key, and retries the marker at once without them. A frozen
+  definition doesn't count as a reader of a table, so once every reader of
+  the refused table is paused the marker discharges without reading it. A
+  `42501` the catalog can't pin pauses nothing here either: the marker
+  retries with backoff, with the error on `backfill_failure`.
 * **Capture** runs inside the application's own write, under that session's
   `row_security`, so the capture functions don't set it. Setting it there
   would turn a policy on the ring's owner into a failed application write.
@@ -386,20 +392,21 @@ than filtering it. What follows depends on what was refused:
   re-read of the source silently skips the rows they hide, until the next
   reconcile pass pauses the table's readers.
 
-**Detected?** A drain's refusal pauses its definitions and shows in `status()`,
-except a `42501` the catalog can't pin, which only logs. A build's shows on
-`backfill_failure`. For the ring's owner, the reconcile pass pauses the
+**Detected?** A refusal of a drain, a discharge or a catch-up pauses its
+definitions and shows in `status()`, except a `42501` the catalog can't pin:
+a drain's only logs, and a discharge's or catch-up's shows on
+`backfill_failure`. A build chunk's shows on `backfill_failure`. For the ring's owner, the reconcile pass pauses the
 readers and `self_check` reports a `capture` divergence (#745, #765). Define
 and declare refuse policies that already apply
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
-**Planned work:** #813 (pause on a refused discharge or catch-up). #817 decides what a refusal the halt can't pin on a table should do.
+**Planned work:** #817 decides what a refusal the halt can't pin on a table should do, for the drain and the discharge alike.
 
 **Repair:** grant `BYPASSRLS` to every role Trellis logs in as and to the
 ring's owner (it isn't inherited), or make the role the table owner without
 `FORCE ROW LEVEL SECURITY`, and grant any missing privilege. Then resume the
-paused definitions, which rebuilds them. A discharge or catch-up that was
-retrying succeeds on its next attempt.
+paused definitions, which rebuilds them. A discharge or catch-up backing off
+on a refusal the catalog couldn't pin succeeds on its next attempt.
 
 ## 12. A crash empties an unlogged source table
 
