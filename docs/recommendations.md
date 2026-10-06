@@ -52,10 +52,10 @@ interval is minutes, not seconds.
 * `max_wal_size` is the WAL a checkpoint interval may write before a
   checkpoint is forced. Size it to the WAL a build writes in one
   `checkpoint_timeout`: the build's WAL rate times the interval. The rate is
-  the rows built per second times the WAL per row, which was between
-  about 1 and 3.4 KB per row for an aggregate (#723). At 100M rows, 1,036 bytes per row
-  and a build of 396 seconds, the build writes about 104 GB, so a 15-minute
-  interval needs a `max_wal_size` in the hundreds of gigabytes to avoid forced
+  the rows built per second times the WAL per row, which ran from 1,036 to
+  3,370 bytes per row for an aggregate at 100M rows (#723). The build that
+  wrote 104 GB in 396 seconds wrote about 260 MB per second, so a 15-minute
+  interval needs a `max_wal_size` of about 235 GB to avoid forced
   checkpoints. Give it what the disk under `pg_wal` allows and accept a
   forced checkpoint every few minutes for the largest builds, not every few
   seconds.
