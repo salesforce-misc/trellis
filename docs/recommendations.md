@@ -78,18 +78,21 @@ Watching a build's progress is in [observability](observability.md).
 
 ### One Trellis role
 
-Run every Trellis process, the staging worker, the drain workers and the
-processes that define transforms, as one dedicated role, or as login roles
-that are members of it with `INHERIT`. Keep it separate from the roles your
-application connects as.
+Run the staging worker and the drain workers as one dedicated role, or as
+login roles that are members of it with `INHERIT`. Keep it separate from the
+roles your application connects as. A process that only defines transforms
+needs less (see
+[embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
 
 The role owns the instance schema, the staging ring and the capture functions,
 and every target it creates. It needs, and nothing more:
 
 * `LOGIN` for a role that connects. Not `SUPERUSER`, not `REPLICATION`, and
   no `wal_level = logical`: nothing reads the WAL.
-* `CREATE` on the database, so it can create the instance schema. A DBA may
-  create the schema first, owned by a role the Trellis role is a member of.
+* `CREATE` on the database. Attaching runs `create schema if not exists`,
+  which PostgreSQL authorizes before it checks whether the schema exists, so
+  the role needs it even when a DBA created the schema first, owned by a role
+  the Trellis role is a member of.
 * `CREATE` on the schema each target goes in (`public` by default), and
   `USAGE` on the schema of every source.
 * Ownership of each source table and each relationship to-side table, or
