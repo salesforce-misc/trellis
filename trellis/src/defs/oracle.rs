@@ -378,9 +378,25 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 pub(crate) fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
+    // A name inside an aggregate's argument that matches an aggregate field is
+    // the source column of that name (issue #695), so it is read even though
+    // it isn't the enclosing field's own name.
+    let aggregates = super::validate::aggregate_field_names(
+        def.fields.iter().map(|f| (f.name.as_str(), &f.expr)),
+    );
     let mut columns = HashSet::new();
     for field in &def.fields {
         collect_columns(&field.expr, field.name.as_str(), &field_names, &mut columns);
+        let mut ignored = Vec::new();
+        let mut aggregate_args = Vec::new();
+        super::validate::collect_reads(
+            &field.expr,
+            &aggregates,
+            false,
+            &mut ignored,
+            &mut aggregate_args,
+        );
+        columns.extend(aggregate_args);
     }
     columns
 }
@@ -882,6 +898,19 @@ mod tests {
             explicit_source_schema: None,
             explicit_target_schema: None,
         }
+    }
+
+    /// Issue #695: `MIN(b)` reads the source column `b` even though a field
+    /// named `b` exists (an aggregate), so the capture trigger must image it.
+    #[test]
+    fn referenced_source_columns_includes_a_source_column_named_like_an_aggregate_field() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, SUM(a) AS b, MIN(b) AS lo",
+        )
+        .expect("parse");
+        let columns = referenced_source_columns(&def);
+        assert!(columns.contains("b"), "{columns:?}");
+        assert!(columns.contains("a"), "{columns:?}");
     }
 
     #[test]

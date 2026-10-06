@@ -581,6 +581,17 @@ fn collect_refusing_calls(
 ) {
     match expr {
         Expr::FunctionCall { name, args } => {
+            // An aggregate's argument reads source columns, not aggregate
+            // fields (see `aggregate_field_names`).
+            let aggregate_scope;
+            let fields_by_name = if super::registry::lookup_aggregate_function(name).is_some() {
+                let aggregates =
+                    aggregate_field_names(fields_by_name.iter().map(|(n, f)| (*n, &f.expr)));
+                aggregate_scope = without_aggregate_fields(fields_by_name, &aggregates);
+                &aggregate_scope
+            } else {
+                fields_by_name
+            };
             if NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS.contains(&name.as_str()) {
                 let mut columns = Vec::new();
                 let mut visited = HashSet::new();
@@ -4387,6 +4398,20 @@ mod tests {
         );
         let d = parsed("TRANSFORM t FROM s SELECT char_length(title) AS n");
         assert_eq!(collation_refusing_function_reads(&d), vec![]);
+    }
+
+    /// Issue #695: inside an aggregate's argument, an aggregate field's name is
+    /// the source column, so its collation is the one checked.
+    #[test]
+    fn collation_refusing_reads_in_an_aggregate_argument_name_the_source_column() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, SUM(n) AS title, \
+             MAX(strpos(title, 'x')) AS m",
+        );
+        assert_eq!(
+            collation_refusing_function_reads(&d),
+            vec![read("m", "STRPOS", source("title"))]
+        );
     }
 
     /// Issue #695: inside an aggregate's argument, a field's name that matches
