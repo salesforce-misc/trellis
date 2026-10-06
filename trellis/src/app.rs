@@ -1332,62 +1332,12 @@ impl Trellis {
             "resolve_graph_identity/qualify always return a schema.table-shaped string"
         );
 
-        // Issue #108: queries `pg_attribute` directly for each column's raw
-        // `atttypid` OID, classified via `defs::pg_type::value_type_for_oid`
-        // — the same `to_regclass`-bound introspection `defs::catalog` uses
-        // — rather than `information_schema.columns.data_type` text matched
-        // against a small hardcoded list (`pg_value_type`, since removed).
-        // That old mapping silently *dropped* every column whose type it
-        // didn't recognize, `uuid` included, so referencing a `uuid` source
-        // column in a definition failed before validation ever saw it, and
-        // any other Postgres type (`bytea`, `jsonb`, `timestamptz`, ...) was
-        // invisible to the validator entirely rather than being an honestly
-        // typed passthrough column.
+        // The same introspection a resume re-validates against
+        // (`defs::catalog::revalidate`).
         let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                "select a.attname::text, a.atttypid \
-                 from pg_attribute a \
-                 where a.attrelid = pg_catalog.to_regclass($1) \
-                   and a.attnum > 0 \
-                   and not a.attisdropped",
-                &[&defs::ddl::regclass_arg(&qualified)],
-            )
-            .await?;
-
-        if rows.is_empty() {
+        let columns = defs::catalog::live_source_columns(&**client, &qualified).await?;
+        if columns.is_empty() {
             return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
-        }
-
-        let mut columns = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let column_name: String = row.get(0);
-            let type_oid: u32 = row.get(1);
-            // Issue #117: `value_type_for_oid` now also recognizes a
-            // user-defined enum type (a connection is only ever used for an
-            // OID this process hasn't already classified as a fixed
-            // builtin — see that function's own doc comment).
-            match defs::pg_type::value_type_for_oid(&**client, type_oid).await? {
-                // Issue #108 review: a column whose OID the registry still
-                // can't place at all (an array, a range, a composite, a
-                // domain, `citext`, ...) stays *out* of the validator's
-                // view, exactly as the old `pg_value_type` dropped it.
-                // `Other(Unrecognized)` is an honest label but not an
-                // actionable one: everything downstream is keyed on knowing
-                // the column's real Postgres type, and this doesn't.
-                // Admitting it made `GROUP BY <col>` fail at `create table`
-                // with a raw `type "unrecognized" does not exist`, and let a
-                // bare passthrough `define()` succeed only to fail later in
-                // `apply_target`'s `$n::text::<type>` cast — both strictly
-                // worse than the clean `ValidationError::UnknownColumn` this
-                // drop preserves. Promoting the remaining families is
-                // `docs/type-support.md`'s deferred work (#122); enums
-                // themselves left this arm as of #117.
-                ValueType::Other(defs::PgType::Unrecognized) => {}
-                value_type => {
-                    columns.insert(column_name, value_type);
-                }
-            }
         }
         Ok(columns)
     }
@@ -1540,6 +1490,17 @@ pub struct DefinitionStatus {
     ///   worker's install or widen fails for a reason other than a lock (no
     ///   primary key, a statement that fails, #687). Every pass retries it,
     ///   and it clears once one succeeds. Recorded like `capture_wait`;
+    /// - or a column it keys by changed type or collation, or a column it
+    ///   keeps a typed copy of widened (issues #760, #767): define would now
+    ///   refuse the column, a relationship's join columns no longer match,
+    ///   the stored keys render differently, or a copy can't hold the new
+    ///   type. The staging worker's capture pass pauses it, naming the
+    ///   columns, their types and what to do. Resume it once define would
+    ///   accept it (a resume refuses until then), which re-types Trellis's
+    ///   copies and rebuilds it and clears this. While the staging worker
+    ///   re-types the copies for a resume, it stays paused with a record
+    ///   whose `error` starts `resuming:`; if a re-type fails, the record
+    ///   says why;
     /// - or the drain halted on it (issue #663), with
     ///   [`CaptureFailureKind::Halt`]: a failure no retry or quarantine gets
     ///   past (a key the drain can't use, a propagation wave past the hop

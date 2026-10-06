@@ -27,7 +27,14 @@
 //! (its source key, a `GROUP BY` key, a join column or to-side key of a
 //! relationship it reads through) now has a type or collation define would
 //! refuse, or changed type in a way that renders the keys already stored
-//! differently (#760, [`crate::staging::schema_change::pause_readers_of_retyped`]).
+//! differently, whose relationship's join columns no longer match, or that
+//! keeps a typed copy of a column the table widened (#760, #767,
+//! [`crate::staging::schema_change::pause_readers_of_retyped`]). That check
+//! runs on the seam-fed tables too.
+//!
+//! Before any of that, the pass finishes every resume left waiting on it to
+//! re-type Trellis's copies (#767,
+//! [`crate::staging::quarantine::finish_requested_resumes`]).
 //!
 //! # Never waiting on `apply`'s path
 //!
@@ -120,6 +127,9 @@ pub async fn reconcile(
     desired: &[String],
     deadline: Instant,
 ) -> Result<PassOutcome, CaptureError> {
+    // #767: a resume left waiting on re-typed copies is finished first, so
+    // this pass's snapshot sees the ones it completes as waiting.
+    crate::staging::quarantine::finish_requested_resumes(client, schema).await?;
     let snapshot = read_snapshot(client, schema).await?;
     let installed = installed_tables(&*client, schema).await?;
     let database: String = client
@@ -171,12 +181,14 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #760: a key column whose type or collation define would refuse
-        // now, or whose type change renders the stored keys differently,
-        // pauses its readers. After the missing-column check, which owns a
-        // key column that's gone.
+        // #760, #767: a key column whose type or collation define would
+        // refuse now, a join pair that no longer matches, a type change that
+        // renders the stored keys differently, or a widening past a typed
+        // copy pauses the definitions it concerns. After the missing-column
+        // check, which owns a key column that's gone.
         match crate::staging::schema_change::pause_readers_of_retyped(
             client,
+            schema,
             &snapshot.catalog,
             table,
         )
@@ -236,6 +248,28 @@ pub async fn reconcile(
     seam_fed.sort();
     for table in seam_fed {
         match crate::staging::schema_change::pause_readers_of_unsupported(
+            client,
+            schema,
+            &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                seam_held.insert(table.clone());
+                continue;
+            }
+            Err(err) => {
+                seam_held.insert(table.clone());
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
+        // #760, #767: a chained definition's key columns and typed copies
+        // are checked on its source target too, which a resume upstream can
+        // re-type.
+        match crate::staging::schema_change::pause_readers_of_retyped(
             client,
             schema,
             &snapshot.catalog,

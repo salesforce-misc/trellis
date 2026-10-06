@@ -149,6 +149,17 @@ pub enum CatalogError {
     /// dropped, renamed, or never existed under that bare name. Also a table
     /// dropped between resolving it and a later check that reads it.
     SourceTableNotFound(String),
+    /// A 1-1 definition's source was given another row-identity key after
+    /// define (issues #687, #708): its target is keyed by the old one, so a
+    /// resume can't rebuild into it. [`revalidate`] refuses it; the repair
+    /// is to restore the key, or to drop the definition and define it again.
+    SourceKeyChanged {
+        source_table: String,
+        /// The target's key columns: the source key define found.
+        target_key: Vec<String>,
+        /// The source's key columns now.
+        source_key: Vec<String>,
+    },
     /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
     /// shares a bare table-name suffix with a *different* qualified target
     /// some other still-persisted definition already uses — e.g.
@@ -404,6 +415,7 @@ impl CatalogError {
             CatalogError::UnknownValueType { .. } => ErrorCode::Internal,
             CatalogError::Backfill(err) => err.code(),
             CatalogError::SourceTableNotFound(_) => ErrorCode::NotFound,
+            CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             // Collides with existing state (another live definition's
             // persisted target), not a structural/semantic rejection of this
             // definition's own text — the same category
@@ -459,6 +471,17 @@ impl fmt::Display for CatalogError {
             CatalogError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
             }
+            CatalogError::SourceKeyChanged {
+                source_table,
+                target_key,
+                source_key,
+            } => write!(
+                f,
+                "the primary key of {source_table} is now ({}), but this definition's target \
+                 is keyed by ({}). Restore the key, or drop the definition and define it again",
+                source_key.join(", "),
+                target_key.join(", ")
+            ),
             CatalogError::TargetTableSuffixCollision {
                 target,
                 requested,
@@ -600,6 +623,7 @@ impl std::error::Error for CatalogError {
             CatalogError::UnknownValueType { .. } => None,
             CatalogError::Backfill(err) => Some(err),
             CatalogError::SourceTableNotFound(_) => None,
+            CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
@@ -2371,27 +2395,7 @@ async fn create_definition_inner(
     // the table, the role and the fix. It reads only the catalog, so a
     // source that's another definition's not-yet-built target passes here
     // (`to_regclass` finds no table) and is reported by the checks below.
-    let mut to_sides: Vec<(String, super::row_security::Readers)> = relationships
-        .values()
-        .map(|r| {
-            let readers = if r.cardinality == RelationshipCardinality::ToOne {
-                super::row_security::Readers::RingAndSession
-            } else {
-                super::row_security::Readers::Ring
-            };
-            (r.qualified_to_table.clone(), readers)
-        })
-        .collect();
-    to_sides.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut read_tables: Vec<(String, super::row_security::Readers)> =
-        std::iter::once((qualified_source.clone(), super::row_security::Readers::Ring))
-            .chain(to_sides)
-            .collect();
-    for (table, readers) in &mut read_tables {
-        if is_definition_target(&*txn, table).await? {
-            *readers = super::row_security::Readers::Session;
-        }
-    }
+    let read_tables = read_tables_of(&*txn, &qualified_source, &relationships).await?;
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
 
     // Issue #129, epic #127: before this definition is persisted, widen the
@@ -2562,27 +2566,8 @@ async fn create_definition_inner(
     // returns — so an aggregate over a `numeric`-keyed table, or chained off
     // a `numeric`-grouped aggregate (whose identity is its `GROUP BY` key),
     // used to be accepted here and then halt on its first live change.
-    let source_key = ddl::source_primary_key_in_txn(&*txn, &qualified_source)
-        .await
-        .map_err(CatalogError::Ddl)?;
-    // Issue #638: the source's key and any `GROUP BY` key need a
-    // deterministic collation, and so does any column a field's `STRPOS`/
-    // `REGEXP_COUNT` reads. Placed with the key-type check above for the
-    // same reason: it is the first read of the live source relation.
-    assert_deterministic_definition_keys(&txn, &def, &qualified_source, &source_key).await?;
-    assert_collation_safe_text_functions(&txn, &def, &qualified_source, None).await?;
-    // Issue #376: the authoritative copy of `install_definition`'s fail-fast
-    // check, placed with the key check above because it reads the live
-    // source relation (an own-target source is exempt before that query).
-    reject_unkeyed_source(&*txn, &qualified_source).await?;
-    // Issue #751: a table a logical-replication subscription writes is one
-    // whose changes capture never sees, for the same tables the row-level
-    // security check above covered.
-    let read_tables: Vec<&str> = read_tables
-        .iter()
-        .map(|(table, _)| table.as_str())
-        .collect();
-    reject_subscribed(&*txn, &read_tables).await?;
+    // The same checks every resume runs again ([`validate_live_schema`]).
+    validate_live_schema(&txn, pool.schema(), &def, &qualified_source, &relationships).await?;
 
     // Issue #440: registration creates the target here, in the transaction
     // that records the definition, so a failure anywhere after this rolls the
@@ -2679,13 +2664,16 @@ async fn create_definition_inner(
         }
         Err(err) => return Err(err.into()),
     };
-    record_key_types_in_txn(
-        &txn,
+    // Issue #760: the type of each key column now, the one the target,
+    // ledger and projections are built from, for the staging worker's
+    // capture pass to compare against (`super::key_types`).
+    super::key_types::record_definition(
+        &*txn,
         id,
         &def,
         &qualified_source,
-        &source_key,
-        &relationships,
+        &rel_refs(&relationships),
+        false,
     )
     .await?;
 
@@ -3006,24 +2994,20 @@ struct ValidatedRelationship {
 /// A from-side join column with no usable index is a performance warning
 /// ([`RelationshipWarning::MissingFkIndex`]), not a requirement.
 ///
-/// The source schema is the user's to change after this runs (ADR-0005). A
-/// join column or endpoint key re-typed or re-collated into what this would
-/// refuse pauses the definitions that read through the relationship
-/// (#760, `staging::schema_change::pause_readers_of_retyped`). Rule 1's
-/// same-type-and-collation pairing isn't re-checked, since widening both
-/// join columns takes two `ALTER`s.
+/// The source schema is the user's to change after this runs (ADR-0005).
+/// Rule 1 and rule 2's key checks run again for every definition that reads
+/// through the relationship, at its define and at each resume
+/// ([`validate_live_schema`]), and the staging worker's capture pass pauses
+/// those definitions when a join column or endpoint key changes into what
+/// rule 1 would refuse, a mismatched pair included
+/// (`staging::schema_change::pause_readers_of_retyped`, #760).
 async fn validate_relationship(
     txn: &tokio_postgres::Transaction<'_>,
     def: &RelationshipDef,
     qualified_from: &str,
     qualified_to: &str,
 ) -> Result<ValidatedRelationship, CatalogError> {
-    let from = join_column_in_txn(txn, qualified_from, &def.from_table, &def.from_col).await?;
-    let to = join_column_in_txn(txn, qualified_to, &def.to_table, &def.to_col).await?;
-    assert_join_key_type_supported(txn, def, &from.pg_type, &to.pg_type).await?;
-    assert_joinable_as_is(def, &from, &to)?;
-    assert_deterministic_join_collation(def, &from, &to)?;
-    let to_type = to.pg_type;
+    let to_type = validate_join_pair(txn, def, qualified_from, qualified_to, true).await?;
 
     validate_relationship_endpoint(txn, &def.name, RelationshipSide::From, qualified_from).await?;
     validate_relationship_endpoint(txn, &def.name, RelationshipSide::To, qualified_to).await?;
@@ -3123,6 +3107,19 @@ async fn validate_relationship_endpoint(
     side: RelationshipSide,
     qualified_endpoint: &str,
 ) -> Result<(), CatalogError> {
+    validate_relationship_endpoint_keys(txn, name, side, qualified_endpoint).await?;
+    reject_non_live_upstream(txn, qualified_endpoint).await
+}
+
+/// [`validate_relationship_endpoint`]'s checks of the endpoint's key, which
+/// read the live schema: all but the last. [`validate_live_schema`] runs
+/// them again for each relationship a definition reads through.
+async fn validate_relationship_endpoint_keys(
+    txn: &tokio_postgres::Transaction<'_>,
+    name: &str,
+    side: RelationshipSide,
+    qualified_endpoint: &str,
+) -> Result<(), CatalogError> {
     reject_unkeyed_relationship_endpoint(txn, side, qualified_endpoint).await?;
     match ddl::source_primary_key_in_txn(txn, qualified_endpoint).await {
         // Issue #638: the same key, matched by its exact text, so it needs a
@@ -3170,7 +3167,7 @@ async fn validate_relationship_endpoint(
         // `source_primary_key_in_txn` raises nothing else.
         Err(err) => return Err(CatalogError::Ddl(err)),
     }
-    reject_non_live_upstream(txn, qualified_endpoint).await
+    Ok(())
 }
 
 /// The columns every relationship read-back below selects, in the order
@@ -4078,7 +4075,7 @@ impl JoinColumn {
 /// split, same [`ValidationError::UnknownRelationshipColumn`] for a table or
 /// column that doesn't exist).
 async fn join_column_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
+    txn: &impl GenericClient,
     query_table: &str,
     display_table: &str,
     column: &str,
@@ -4099,7 +4096,7 @@ async fn join_column_in_txn(
 /// ([`assert_deterministic_key_collation_in_txn`], issue #638), whose caller
 /// has already resolved the column some other way.
 async fn column_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
+    txn: &impl GenericClient,
     query_table: &str,
     column: &str,
 ) -> Result<Option<JoinColumn>, CatalogError> {
@@ -4183,56 +4180,281 @@ fn assert_deterministic_key_collation(
     )))
 }
 
-/// Issue #760: records the type each of definition `id`'s key columns has
-/// now, the one its target, ledger and projections are built from, so the
-/// staging worker's capture pass can tell when an `ALTER COLUMN ... TYPE`
-/// renders those keys differently (see [`super::key_types`]). The key
-/// columns are [`super::key_types::key_uses`]'s, on the source (keyed by
-/// `source_key`) and on each relationship's to-side.
-async fn record_key_types_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
-    id: i64,
-    def: &TransformDef,
-    qualified_source: &str,
-    source_key: &[ddl::PrimaryKeyColumn],
+/// The relationships in `relationships` as [`super::key_types::key_uses`]
+/// takes them.
+pub(crate) fn rel_refs(
     relationships: &HashMap<String, ResolvedRelationship>,
-) -> Result<(), CatalogError> {
-    let rels: Vec<super::key_types::RelRef<'_>> = relationships
+) -> Vec<super::key_types::RelRef<'_>> {
+    relationships
         .iter()
         .map(|(name, r)| super::key_types::RelRef {
             name,
             from_col: &r.from_col,
             to_col: &r.to_col,
             to_table: &r.qualified_to_table,
-            to_one: r.cardinality == RelationshipCardinality::ToOne,
+        })
+        .collect()
+}
+
+/// Every check of definition `def`, sourced from `qualified_source`, that
+/// reads the live schema, in the order define runs them once its source
+/// resolves. Define runs it before it creates the target; every resume runs
+/// it again ([`revalidate`], #708, #760), so a definition the schema has
+/// drifted from is refused, by the same rule and with the same error, on
+/// either path. `relationships` are the ones `def` reads through. Returns
+/// the source's row-identity key.
+///
+/// - **The source key** ([`ddl::source_primary_key_in_txn`]): every
+///   key-space's, since live apply keys an aggregate's changes by it too
+///   (#371), and a type off the key allowlist would halt its readers. Its
+///   columns, and any `GROUP BY` key, need a deterministic collation, and
+///   so does any column a field's `STRPOS`/`REGEXP_COUNT` reads (#638). A
+///   source that capture can't key is refused (#376).
+/// - **Each relationship read** ([`validate_join_pair`],
+///   [`validate_relationship_endpoint_keys`]): its join columns are still on
+///   the join-key allowlist, still the same type, modifier and collation
+///   (#590), and its to-side's key is still one capture and apply can key.
+///   These ran when the relationship was declared; a definition reading
+///   through it is only as sound as they still are.
+/// - **Row-level security and subscriptions** (#745, #751): row-level
+///   security that applies to a role reading the source or a to-side
+///   ([`read_tables_of`]) would refuse the reads (every Trellis session runs
+///   with `row_security = off`, #766), and a table a logical-replication
+///   subscription writes is one whose changes capture never sees. Define
+///   checks row-level security once already, before its first to-side read;
+///   the second check here is the resume's.
+pub(crate) async fn validate_live_schema(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    def: &TransformDef,
+    qualified_source: &str,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Result<Vec<ddl::PrimaryKeyColumn>, CatalogError> {
+    let source_key = ddl::source_primary_key_in_txn(txn, qualified_source)
+        .await
+        .map_err(CatalogError::Ddl)?;
+    assert_deterministic_definition_keys(txn, def, qualified_source, &source_key).await?;
+    assert_collation_safe_text_functions(txn, def, qualified_source, None).await?;
+    reject_unkeyed_source(txn, qualified_source).await?;
+
+    let mut names: Vec<&String> = relationships.keys().collect();
+    names.sort();
+    if let Some((source_schema, source_table)) = qualified_source.split_once('.') {
+        for name in names {
+            let Some(rel) = relationship_by_name_in(txn, source_schema, source_table, name).await?
+            else {
+                continue;
+            };
+            let qualified_to = rel.qualified_to_table();
+            validate_join_pair(txn, &rel.def, qualified_source, &qualified_to, true).await?;
+            validate_relationship_endpoint_keys(
+                txn,
+                &rel.def.name,
+                RelationshipSide::To,
+                &qualified_to,
+            )
+            .await?;
+        }
+    }
+
+    let read_tables = read_tables_of(txn, qualified_source, relationships).await?;
+    reject_row_security(txn, schema, &read_tables).await?;
+    let read_tables: Vec<&str> = read_tables
+        .iter()
+        .map(|(table, _)| table.as_str())
+        .collect();
+    reject_subscribed(txn, &read_tables).await?;
+    Ok(source_key)
+}
+
+/// The tables definition reads, `qualified_source` and the to-side of each of
+/// `relationships`, each with the roles that read it as row-level security
+/// sees them (#745): the ring's owner for a captured table, the session's
+/// role too for a to-one to-side (registration seeds its projection, and a
+/// build reads the projection), and the session's role alone for a table
+/// another definition targets, which the target-mutation seam feeds and no
+/// capture function reads ([`super::row_security::Readers::Session`]).
+async fn read_tables_of(
+    client: &impl GenericClient,
+    qualified_source: &str,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Result<Vec<(String, super::row_security::Readers)>, CatalogError> {
+    let mut to_sides: Vec<(String, super::row_security::Readers)> = relationships
+        .values()
+        .map(|r| {
+            let readers = if r.cardinality == RelationshipCardinality::ToOne {
+                super::row_security::Readers::RingAndSession
+            } else {
+                super::row_security::Readers::Ring
+            };
+            (r.qualified_to_table.clone(), readers)
         })
         .collect();
-    let mut tables: Vec<(String, Vec<String>)> = vec![(
+    to_sides.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut read_tables: Vec<(String, super::row_security::Readers)> = std::iter::once((
         qualified_source.to_string(),
-        source_key.iter().map(|c| c.name.clone()).collect(),
-    )];
-    for r in relationships.values() {
-        if tables.iter().any(|(t, _)| *t == r.qualified_to_table) {
-            continue;
+        super::row_security::Readers::Ring,
+    ))
+    .chain(to_sides)
+    .collect();
+    for (table, readers) in &mut read_tables {
+        if is_definition_target(client, table).await? {
+            *readers = super::row_security::Readers::Session;
         }
-        let key = ddl::identity_key_columns(txn, &r.qualified_to_table)
+    }
+    Ok(read_tables)
+}
+
+/// What [`revalidate`] read from the live schema, for the resume to build
+/// from.
+#[derive(Debug, Clone)]
+pub(crate) struct Revalidated {
+    /// The source's columns and their value types, as define reads them
+    /// ([`live_source_columns`]).
+    pub source_columns: HashMap<String, ValueType>,
+    /// The relationships the definition reads through.
+    pub relationships: HashMap<String, ResolvedRelationship>,
+}
+
+/// Re-runs define-time validation for `definition` against the live schema
+/// (#708, #760): the definition's own rules ([`validate`]) over the
+/// source's live columns and relationships, [`validate_live_schema`], and
+/// the checks on the target define makes once it exists. A resume calls it
+/// before it changes anything, and refuses while it fails; a definition the
+/// schema has drifted from is then refused for what define would refuse
+/// it for, naming the column and what to change.
+///
+/// One check is a resume's own: a 1-1 target is keyed by the source key
+/// define found, so a source whose key has since been redefined fails with
+/// [`CatalogError::SourceKeyChanged`], whose only repair is to drop and
+/// define again.
+pub(crate) async fn revalidate(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    definition: &Definition,
+) -> Result<Revalidated, CatalogError> {
+    let source = definition.source_table.as_str();
+    let source_columns = live_source_columns(txn, source).await?;
+    if source_columns.is_empty() {
+        return Err(CatalogError::SourceTableNotFound(source.to_string()));
+    }
+    let relationships = resolve_relationships_in(txn, &definition.def, source).await?;
+    validate(&definition.def, &source_columns, &relationships)?;
+    let source_key =
+        validate_live_schema(txn, schema, &definition.def, source, &relationships).await?;
+    if let KeySpace::OneToOne = definition.def.key_space {
+        let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
             .await?
             .into_iter()
             .map(|c| c.name)
             .collect();
-        tables.push((r.qualified_to_table.clone(), key));
+        let source_key: Vec<String> = source_key.into_iter().map(|c| c.name).collect();
+        if !target_key.is_empty() && target_key != source_key {
+            return Err(CatalogError::SourceKeyChanged {
+                source_table: source.to_string(),
+                target_key,
+                source_key,
+            });
+        }
     }
-    let mut columns: Vec<(String, String)> = Vec::new();
-    for (table, key) in &tables {
-        for (column, _) in super::key_types::key_uses(def, qualified_source, &rels, table, key) {
-            let entry = (table.clone(), column);
-            if !columns.contains(&entry) {
-                columns.push(entry);
+    reject_row_security(
+        txn,
+        schema,
+        &[(
+            definition.target_table.clone(),
+            super::row_security::Readers::Target,
+        )],
+    )
+    .await?;
+    Ok(Revalidated {
+        source_columns,
+        relationships,
+    })
+}
+
+/// The relationships declared on `qualified_source` that `def` reads
+/// through, in name order. One no longer declared is left out.
+pub(crate) async fn relationships_read_by(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    qualified_source: &str,
+) -> Result<Vec<RelationshipDefinition>, CatalogError> {
+    let Some((schema, table)) = qualified_source.split_once('.') else {
+        return Ok(Vec::new());
+    };
+    let mut names: Vec<String> = super::eval::relationship_references(def)
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut rels = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some(rel) = relationship_by_name_in(client, schema, table, &name).await? {
+            rels.push(rel);
+        }
+    }
+    Ok(rels)
+}
+
+/// Persists `source_columns` as definition `id`'s source column types, the
+/// ones its builds and applies cast through. A resume records the live ones
+/// ([`revalidate`]), so a source column widened since define is cast to its
+/// new type.
+pub(crate) async fn record_source_columns(
+    client: &impl GenericClient,
+    id: i64,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), CatalogError> {
+    let (keys, vals) = encode_type_map(source_columns);
+    client
+        .execute(
+            "update transform_definitions \
+             set source_columns = jsonb_object($2::text[], $3::text[]) where id = $1",
+            &[&id, &keys, &vals],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The live columns of `qualified` (an unquoted `schema.table`) the
+/// validator can type, with their [`ValueType`]s, as define reads them.
+/// Empty for a table that doesn't exist.
+///
+/// Classified by each column's `atttypid` through
+/// [`super::pg_type::value_type_for_oid`], which also places a user-defined
+/// enum (#108, #117). A column whose type the registry can't place at all
+/// (an array, a range, a composite, a domain, `citext`) is left out, so the
+/// validator reports a reference to it as an unknown column: everything
+/// downstream needs its real Postgres type, and `Unrecognized` isn't one.
+/// Promoting those families is `docs/type-support.md`'s deferred work
+/// (#122).
+pub(crate) async fn live_source_columns(
+    client: &impl GenericClient,
+    qualified: &str,
+) -> Result<HashMap<String, ValueType>, CatalogError> {
+    let rows = client
+        .query(
+            "select a.attname::text, a.atttypid \
+             from pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attnum > 0 \
+               and not a.attisdropped",
+            &[&ddl::regclass_arg(qualified)],
+        )
+        .await?;
+    let mut columns = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let column_name: String = row.get(0);
+        let type_oid: u32 = row.get(1);
+        match super::pg_type::value_type_for_oid(client, type_oid).await? {
+            ValueType::Other(super::PgType::Unrecognized) => {}
+            value_type => {
+                columns.insert(column_name, value_type);
             }
         }
     }
-    super::key_types::record(txn, id, &columns).await?;
-    Ok(())
+    Ok(columns)
 }
 
 /// Issue #638: refuses a definition if any column the engine matches as one
@@ -4732,6 +4954,39 @@ pub(crate) async fn is_enum_type_name(
     Ok(row.get(0))
 }
 
+/// [`validate_relationship`]'s rule 1 for relationship `def` joining
+/// `qualified_from` to `qualified_to`, against the live columns: both join
+/// columns exist, each type is on the join-key allowlist
+/// ([`assert_join_key_type_supported`]), they have the same type, modifier
+/// and collation ([`assert_joinable_as_is`], #590), and that collation is
+/// deterministic ([`assert_deterministic_join_collation`]). Returns the
+/// to-side column's type as `format_type` renders it.
+///
+/// Also the staging worker's capture pass's check of a join pair after
+/// define (#760, `staging::schema_change::pause_readers_of_retyped`): a
+/// one-sided widening (`line_items.product_id` to `bigint` while
+/// `products.id` stays `integer`) fails it with the same
+/// [`ValidationError::RelationshipTypeMismatch`] define would. The pass
+/// passes `compare_collations` false: a change between deterministic
+/// collations leaves byte equality as it was, so it pauses nothing, though
+/// define (and so a resume) refuses the pair until both sides match again.
+pub(crate) async fn validate_join_pair(
+    client: &impl GenericClient,
+    def: &RelationshipDef,
+    qualified_from: &str,
+    qualified_to: &str,
+    compare_collations: bool,
+) -> Result<String, CatalogError> {
+    let from = join_column_in_txn(client, qualified_from, &def.from_table, &def.from_col).await?;
+    let to = join_column_in_txn(client, qualified_to, &def.to_table, &def.to_col).await?;
+    assert_join_key_type_supported(client, def, &from.pg_type, &to.pg_type).await?;
+    if compare_collations || (from.type_oid, from.typmod) != (to.type_oid, to.typmod) {
+        assert_joinable_as_is(def, &from, &to)?;
+    }
+    assert_deterministic_join_collation(def, &from, &to)?;
+    Ok(to.pg_type)
+}
+
 /// Rejects `def` if either endpoint's join key type isn't
 /// [`text-stable`](is_text_stable_join_key_type) (or, issue #117, a live
 /// enum type — [`is_enum_type_name`]) — issue #28 review, hardened
@@ -4743,7 +4998,7 @@ pub(crate) async fn is_enum_type_name(
 /// than as a mismatch that `ALTER`ing the `text` side would only move onto
 /// this check.
 async fn assert_join_key_type_supported(
-    txn: &tokio_postgres::Transaction<'_>,
+    txn: &impl GenericClient,
     def: &RelationshipDef,
     from_type: &str,
     to_type: &str,

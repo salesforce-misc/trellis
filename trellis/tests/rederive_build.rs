@@ -80,7 +80,10 @@ impl Fixture {
         .expect("seed the source");
         let columns = [
             ("id".to_string(), ValueType::Numeric),
-            ("g".to_string(), ValueType::Numeric),
+            (
+                "g".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int4),
+            ),
             ("v".to_string(), ValueType::Numeric),
         ]
         .into_iter()
@@ -1016,7 +1019,10 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
         .expect("create the to-one relationship");
     let columns = [
         ("id".to_string(), ValueType::Numeric),
-        ("g".to_string(), ValueType::Numeric),
+        (
+            "g".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
+        ),
         ("v".to_string(), ValueType::Numeric),
     ]
     .into_iter()
@@ -1175,7 +1181,10 @@ async fn the_start_waits_for_the_widens_capture_gate() {
         .expect("write before the widen");
     let columns = [
         ("id".to_string(), ValueType::Numeric),
-        ("g".to_string(), ValueType::Numeric),
+        (
+            "g".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
+        ),
         ("v".to_string(), ValueType::Numeric),
     ]
     .into_iter()
@@ -1505,7 +1514,10 @@ async fn a_rebuild_sweeps_a_composite_typed_key() {
         .expect("seed the composite source");
     let columns = [
         ("a".to_string(), ValueType::Text),
-        ("g".to_string(), ValueType::Numeric),
+        (
+            "g".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
+        ),
         ("v".to_string(), ValueType::Numeric),
     ]
     .into_iter()
@@ -2003,7 +2015,10 @@ async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted
 
     let columns = [
         ("id".to_string(), ValueType::Numeric),
-        ("g".to_string(), ValueType::Numeric),
+        (
+            "g".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
+        ),
         ("v".to_string(), ValueType::Numeric),
     ]
     .into_iter()
@@ -2063,7 +2078,10 @@ async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_
 
     let columns = [
         ("id".to_string(), ValueType::Numeric),
-        ("g".to_string(), ValueType::Numeric),
+        (
+            "g".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int4),
+        ),
         ("v".to_string(), ValueType::Numeric),
     ]
     .into_iter()

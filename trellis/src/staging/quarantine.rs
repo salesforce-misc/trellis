@@ -2514,6 +2514,9 @@ pub async fn resume_column(
                     transform: transform.to_string(),
                 });
             }
+            // #708: the field rebuilds from the live schema, so it resumes
+            // only while define would accept its definition.
+            refuse_unless_valid(pool, transform, &def).await?;
         }
 
         client
@@ -2554,6 +2557,24 @@ pub async fn resume_column(
         let Some(def) = catalog::definition_by_target(pool, &t).await? else {
             continue;
         };
+        // #708: a dependent the cascade reaches is re-validated as the
+        // resumed field's definition was at the gate above. One define would
+        // refuse now stays paused, as a dependent still mid-build does below.
+        if t != transform {
+            match refuse_unless_valid(pool, &t, &def).await {
+                Ok(()) => {}
+                Err(ApplyError::ResumeRefused { reason, .. }) => {
+                    tracing::info!(
+                        transform = %t,
+                        column = %c,
+                        error = %reason,
+                        "dependent column stays paused: its definition no longer validates"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
         // The unpause and the field build's registration commit together
@@ -2696,6 +2717,29 @@ pub async fn resume_column(
     Ok(resumed)
 }
 
+/// Re-runs define-time validation for `definition` against the live schema
+/// ([`catalog::revalidate`], #708), on a transaction of its own that
+/// changes nothing, as a field resume's gate: [`ApplyError::ResumeRefused`]
+/// for `transform` while define would refuse it.
+async fn refuse_unless_valid(
+    pool: &Pool,
+    transform: &str,
+    definition: &crate::defs::model::Definition,
+) -> Result<(), ApplyError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    match catalog::revalidate(&txn, pool.schema(), definition).await {
+        Ok(_) => Ok(()),
+        Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
+            Err(err.into())
+        }
+        Err(reason) => Err(ApplyError::ResumeRefused {
+            transform: transform.to_string(),
+            reason: Box::new(reason),
+        }),
+    }
+}
+
 /// Whether `column` of `transform` reads another of its fields that is
 /// still paused, by alias, directly or through others (issue #748): Apply
 /// holds it out with that field whatever its own row says
@@ -2814,45 +2858,265 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         .await?
         .ok_or_else(not_found)?
         .get(0);
-    // Issue #768: the drain skips a table whose key can't be used while
-    // every definition reading it is frozen, judged under the fence of each
-    // reader's source (`staging::apply::source_key_for_apply`). The bump
-    // makes a page that judged this definition frozen miss its fence if it
-    // reaches it after this commit, so it can't skip rows the rebuild needs.
-    // It is this transaction's first lock (issue #744): it waits for the
-    // pages holding the fence, and holding the definition row meanwhile
-    // could close a cycle through one queued on a transaction that wants it.
-    super::build::bump_version_fence(&*txn, &fenced_source).await?;
-    let row = txn
-        .query_opt(
-            "select id, source_table, status from transform_definitions \
-             where split_part(target_table, '.', 2) = $1 for update",
-            &[&target],
-        )
-        .await?;
-    let Some(row) = row else {
+    let Some((id, status)) = lock_frozen(
+        &txn,
+        "split_part(target_table, '.', 2)",
+        &target,
+        &fenced_source,
+    )
+    .await?
+    else {
         return Err(not_found());
     };
-    let id: i64 = row.get(0);
-    let source_table: String = row.get(1);
-    if source_table != fenced_source {
-        // Dropped and defined again on another source between the two
-        // reads: not the definition the caller resumed.
-        return Err(not_found());
-    }
-    let status_text: String = row.get(2);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
-    // [`TransformStatus::is_frozen`] rather than a local `matches!`: ADR-0014's
-    // frozen state is defined once, so a status folded into it later reaches
-    // every precondition and dispatch gate that asks (issue #231).
     if !status.is_frozen() {
         return Err(ApplyError::TransformNotPaused {
             transform: target.to_string(),
         });
     }
+    match resume_locked(
+        &txn,
+        pool.schema(),
+        target,
+        id,
+        &fenced_source,
+        status,
+        false,
+    )
+    .await?
+    {
+        ResumeStep::Resumed => {
+            txn.commit().await?;
+            tracing::info!(
+                transform = %target,
+                from = %status.as_str(),
+                to = %TransformStatus::WaitingToBackfill.as_str(),
+                "transform resumed; re-parked for a fresh backfill"
+            );
+        }
+        ResumeStep::Retyping(copies) => {
+            txn.commit().await?;
+            tracing::info!(
+                transform = %target,
+                copies = ?copies,
+                "transform resume accepted; the staging worker re-types its copies, then rebuilds it"
+            );
+        }
+    }
+    Ok(())
+}
 
+/// The first steps of a resume of the definition sourced from
+/// `fenced_source` and found by `column = value`: bumps the source's version
+/// fence, then locks the definition's row and reads its id and status.
+/// `None` if it's gone, or was dropped and defined again on another source.
+///
+/// Issue #768: the drain skips a table whose key can't be used while every
+/// definition reading it is frozen, judged under the fence of each reader's
+/// source (`staging::apply::source_key_for_apply`). The bump makes a page
+/// that judged this definition frozen miss its fence if it reaches it after
+/// the resume commits, so it can't skip rows the rebuild needs. It is the
+/// transaction's first lock (issue #744): it waits for the pages holding the
+/// fence, and holding the definition row meanwhile could close a cycle
+/// through one queued on a transaction that wants it.
+async fn lock_frozen(
+    txn: &Transaction<'_>,
+    column: &str,
+    value: &(dyn tokio_postgres::types::ToSql + Sync),
+    fenced_source: &str,
+) -> Result<Option<(i64, TransformStatus)>, ApplyError> {
+    super::build::bump_version_fence(txn, fenced_source).await?;
+    let row = txn
+        .query_opt(
+            &format!(
+                "select id, source_table, status from transform_definitions \
+                 where {column} = $1 for update"
+            ),
+            &[value],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let source_table: String = row.get(1);
+    if source_table != fenced_source {
+        // Dropped and defined again on another source between the two
+        // reads: not the definition the caller resumed.
+        return Ok(None);
+    }
+    let status_text: String = row.get(2);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    Ok(Some((row.get(0), status)))
+}
+
+/// What [`resume_locked`] did.
+#[derive(Debug)]
+enum ResumeStep {
+    /// The definition is resumed: `waiting_to_backfill`, its rebuild
+    /// scheduled.
+    Resumed,
+    /// Some of its typed copies have to be re-typed first (their labels);
+    /// it stays paused with a resume request.
+    Retyping(Vec<String>),
+}
+
+/// A resume of frozen definition `id` (bare target `target`, qualified
+/// source `source_table`), in `txn`, which [`lock_frozen`] has locked it
+/// in. Every resume goes through here: the operator's
+/// ([`resume_transform`]) and the staging worker's completion of one that
+/// had copies to re-type ([`finish_requested_resumes`]).
+///
+/// 1. **It re-validates the definition against the live schema**
+///    ([`catalog::revalidate`], #708, #760), before it changes anything, and
+///    refuses with [`ApplyError::ResumeRefused`] while define would refuse
+///    it: a key, join or `GROUP BY` column of a type or collation define
+///    refuses, a relationship whose join columns no longer match (#590), a
+///    redefined source key.
+/// 2. **It compares each of Trellis's typed copies with the type define
+///    would give it now** ([`crate::defs::copies`], #767). If any differ, the
+///    copies are re-typed before the rebuild, by the staging worker, under
+///    `ACCESS EXCLUSIVE` (a table rewrite for `integer` to `bigint`). So the
+///    operator's resume, `from_pass` false, only records a resume request
+///    and replaces the definition's `capture_failure` with one saying so,
+///    and returns [`ResumeStep::Retyping`]; the definition stays paused until
+///    the worker has re-typed them and comes back here. The worker's own
+///    call, `from_pass` true, returns that too if a copy drifted again
+///    since, and its caller rolls back.
+/// 3. **Otherwise it completes the resume** ([`complete_resume`]).
+async fn resume_locked(
+    txn: &Transaction<'_>,
+    schema: &str,
+    target: &str,
+    id: i64,
+    source_table: &str,
+    status: TransformStatus,
+    from_pass: bool,
+) -> Result<ResumeStep, ApplyError> {
+    let Some(definition) = catalog::definition_by_id_in(txn, id).await? else {
+        return Err(ApplyError::TransformNotFound {
+            transform: target.to_string(),
+        });
+    };
+    let revalidated = match catalog::revalidate(txn, schema, &definition).await {
+        Ok(revalidated) => revalidated,
+        Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
+            return Err(err.into());
+        }
+        Err(reason) => {
+            return Err(ApplyError::ResumeRefused {
+                transform: target.to_string(),
+                reason: Box::new(reason),
+            });
+        }
+    };
+    let rels = catalog::relationships_read_by(txn, &definition.def, source_table).await?;
+    let rel_refs: Vec<&crate::defs::model::RelationshipDefinition> = rels.iter().collect();
+    let copies = crate::defs::copies::typed_copies(
+        txn,
+        schema,
+        &definition.def,
+        source_table,
+        &definition.target_table,
+        &rel_refs,
+    )
+    .await?;
+    let drifted: Vec<crate::defs::copies::CopyState> = crate::defs::copies::inspect(txn, copies)
+        .await?
+        .into_iter()
+        .filter(|s| s.drifted())
+        .collect();
+    if !drifted.is_empty() {
+        let labels: Vec<String> = drifted.iter().map(|s| s.copy.label()).collect();
+        if !from_pass {
+            request_retype(txn, id, source_table, &drifted).await?;
+        }
+        return Ok(ResumeStep::Retyping(labels));
+    }
+    complete_resume(txn, id, source_table, status, &definition, &revalidated).await?;
+    Ok(ResumeStep::Resumed)
+}
+
+/// Records that definition `id`'s resume waits on the staging worker to
+/// re-type `drifted` (`resume_requests`), and says so in its
+/// `capture_failure`, which [`complete_resume`] deletes. It replaces
+/// whatever reason the definition was paused for: the operator has dealt
+/// with that, and the request is what holds it now.
+async fn request_retype(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    drifted: &[crate::defs::copies::CopyState],
+) -> Result<(), ApplyError> {
+    txn.execute(
+        "insert into resume_requests (transform_id) values ($1) \
+         on conflict (transform_id) do update set requested_at = now()",
+        &[&id],
+    )
+    .await?;
+    let mut columns: Vec<String> = Vec::new();
+    for state in drifted {
+        if state.copy.source_table == source_table && !columns.contains(&state.copy.source_column) {
+            columns.push(state.copy.source_column.clone());
+        }
+    }
+    let changes: Vec<String> = drifted
+        .iter()
+        .map(|s| {
+            format!(
+                "{} from {} to {}",
+                s.copy.label(),
+                s.copy_type.display,
+                s.live_type.display
+            )
+        })
+        .collect();
+    let error = format!(
+        "resuming: the staging worker is re-typing Trellis's copies to their source columns' \
+         types ({}), then it rebuilds the definition. It stays paused until then",
+        changes.join(", ")
+    );
+    set_capture_failure(txn, id, source_table, &columns, &error).await
+}
+
+/// Sets definition `id`'s `capture_failure` (kind `capture`), replacing any
+/// it has: what a resume in progress, or one the staging worker couldn't
+/// finish, reports.
+async fn set_capture_failure(
+    client: &impl GenericClient,
+    id: i64,
+    source_table: &str,
+    columns: &[String],
+    error: &str,
+) -> Result<(), ApplyError> {
+    client
+        .execute(
+            "insert into capture_failures (transform_id, source_table, columns, error, kind) \
+             values ($1, $2, $3, $4, 'capture') \
+             on conflict (transform_id) do update \
+             set source_table = excluded.source_table, columns = excluded.columns, \
+                 error = excluded.error, kind = excluded.kind, detected_at = now()",
+            &[&id, &source_table, &columns, &error],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The resume itself, once [`resume_locked`] has re-validated definition
+/// `id` and found every copy current: see [`resume_transform`]'s doc for
+/// the rebuild it schedules. It also records the live source column types
+/// and key column types the rebuild builds from
+/// ([`catalog::record_source_columns`],
+/// [`crate::defs::key_types::record_definition`]), so the capture pass
+/// compares later changes against them, and deletes any resume request.
+async fn complete_resume(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    status: TransformStatus,
+    definition: &crate::defs::model::Definition,
+    revalidated: &catalog::Revalidated,
+) -> Result<(), ApplyError> {
     // `fuse_rearmed_at = now()` in the same statement, not a separate one:
     // it is this resume's epoch, part of the same atomic "this transform
     // starts over" transition as the status drop (issue #160), and what a
@@ -2869,6 +3133,19 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         "update transform_definitions \
          set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
+    )
+    .await?;
+    // #708, #767: the rebuild casts each source value through its live type,
+    // and the capture pass compares the key columns against what it builds
+    // from.
+    catalog::record_source_columns(txn, id, &revalidated.source_columns).await?;
+    crate::defs::key_types::record_definition(
+        txn,
+        id,
+        &definition.def,
+        source_table,
+        &catalog::rel_refs(&revalidated.relationships),
+        true,
     )
     .await?;
 
@@ -2915,13 +3192,8 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    let definition = catalog::definition_by_id_in(&*txn, id).await?;
-    let rederive_built = match &definition {
-        Some(definition) => super::build::qualifies(&*txn, definition).await?,
-        None => false,
-    };
-    if !rederive_built {
-        crate::intake::markers::park_marker(&*txn, &source_table).await?;
+    if !super::build::qualifies(txn, definition).await? {
+        crate::intake::markers::park_marker(txn, source_table).await?;
     }
     // Issue #768: the drain skips a to-side whose key can't be used while
     // every definition reading it is frozen
@@ -2929,19 +3201,16 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // definition reads may never have reached the relationship's settled
     // projection, which its rebuild's go-live catch-up and every later apply
     // read. Refreshed from the table here, in the resume, so the rebuild
-    // never reads it stale. The bump above holds the fence the skip is
-    // judged under: a page that skipped while this definition was frozen has
-    // committed, its changes no longer pending to be left to it, and a later
-    // one misses the fence and halts. Only the to-one relationships no other
-    // reader that isn't frozen reads ([`catalog::relationships_to_refresh`]),
-    // all their rows locked in one statement, in `relationship_id` order,
-    // the order a page takes them in.
-    if let Some(definition) = &definition {
-        let refresh =
-            catalog::relationships_to_refresh(&*txn, &definition.def, &source_table, Some(id))
-                .await?;
-        catalog::refresh_relationship_projections_by_id_in_txn(&*txn, &refresh).await?;
-    }
+    // never reads it stale. The bump in [`lock_frozen`] holds the fence the
+    // skip is judged under: a page that skipped while this definition was
+    // frozen has committed, its changes no longer pending to be left to it,
+    // and a later one misses the fence and halts. Only the to-one
+    // relationships no other reader that isn't frozen reads
+    // ([`catalog::relationships_to_refresh`]), all their rows locked in one
+    // statement, in `relationship_id` order, the order a page takes them in.
+    let refresh =
+        catalog::relationships_to_refresh(txn, &definition.def, source_table, Some(id)).await?;
+    catalog::refresh_relationship_projections_by_id_in_txn(txn, &refresh).await?;
     // #799: release every key this definition holds. The fresh build below
     // re-derives each from the source, so its parked work is superseded, not
     // replayed, and the key is applied again from the build's go-live on.
@@ -2960,24 +3229,250 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // here, so the next reconcile widens the source's capture to them before
     // the discharge may dispatch the rebuild, or, if a column is still
     // missing, pauses it again with the reason
-    // (`staging::schema_change::pause_readers_of_missing`). Likewise a key
-    // column whose type or collation is still one the pass refuses (#760,
-    // `pause_readers_of_retyped`): its recorded type in
-    // `definition_key_types` stays, since the rebuild writes into the tables
-    // created from it.
+    // (`staging::schema_change::pause_readers_of_missing`). A key column
+    // changed again since the re-validation above is the next pass's to
+    // pause (`pause_readers_of_retyped`), against the types just recorded.
     txn.execute(
         "delete from capture_failures where transform_id = $1",
         &[&id],
     )
     .await?;
+    txn.execute(
+        "delete from resume_requests where transform_id = $1",
+        &[&id],
+    )
+    .await?;
+    tracing::debug!(transform_id = id, from = %status.as_str(), "resume completed");
+    Ok(())
+}
 
-    txn.commit().await?;
-    tracing::info!(
-        transform = %target,
-        from = %status.as_str(),
-        to = %TransformStatus::WaitingToBackfill.as_str(),
-        "transform resumed; re-parked for a fresh backfill"
-    );
+/// How long the staging worker waits for the lock on a table whose copies
+/// it re-types before it leaves the resume for its next pass.
+const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The staging worker's half of every resume [`resume_transform`] left
+/// waiting on re-typed copies (`resume_requests`, #767): run at the start of
+/// each capture pass, before it reads the catalog, so a resume it completes
+/// is `waiting_to_backfill` in that pass's snapshot.
+///
+/// For each request, in id order, it re-validates the definition (a schema
+/// changed since the `RESUME` is caught here too), then runs
+/// [`crate::defs::copies::retype_statements`], one table per transaction,
+/// under a [`RETYPE_LOCK_TIMEOUT`] `lock_timeout`, and then completes the
+/// resume in one transaction through [`resume_locked`], which deletes the
+/// request. Each step is idempotent: a copy already re-typed isn't re-typed
+/// again, so a crash anywhere leaves the request for the next pass.
+///
+/// - A table whose lock it can't get within the timeout is left for the next
+///   pass, the request kept: re-typing takes `ACCESS EXCLUSIVE`, which every
+///   reader of the target waits behind while it is queued.
+/// - A re-validation that now fails, or a re-type that fails (a value the
+///   new type can't hold, a view on the column), ends the request: the
+///   definition stays paused, its `capture_failure` says why, and the next
+///   `RESUME` tries again. A failed re-type changes nothing.
+///
+/// A request's own failure is logged and doesn't stop the others. Errs only
+/// when the requests can't be read.
+pub(crate) async fn finish_requested_resumes(
+    client: &mut tokio_postgres::Client,
+    schema: &str,
+) -> Result<(), tokio_postgres::Error> {
+    let ids: Vec<i64> = client
+        .query(
+            "select transform_id from resume_requests order by transform_id",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    for id in ids {
+        if let Err(err) = finish_requested_resume(client, schema, id).await {
+            tracing::warn!(
+                transform_id = id,
+                error = %err,
+                "a requested resume couldn't be finished; retrying next pass"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`finish_requested_resumes`] for definition `id`.
+async fn finish_requested_resume(
+    client: &mut tokio_postgres::Client,
+    schema: &str,
+    id: i64,
+) -> Result<(), ApplyError> {
+    // What to re-type, read with the re-validation in one snapshot.
+    let (source_table, target, statements) = {
+        let txn = client.transaction().await?;
+        let row = txn
+            .query_opt(
+                "select source_table, split_part(target_table, '.', 2), status \
+                 from transform_definitions where id = $1",
+                &[&id],
+            )
+            .await?;
+        let frozen = row.as_ref().is_some_and(|row| {
+            TransformStatus::from_persisted(row.get(2)).is_some_and(TransformStatus::is_frozen)
+        });
+        let Some(row) = row.filter(|_| frozen) else {
+            // Dropped, or resumed some other way: nothing waits on this.
+            txn.execute(
+                "delete from resume_requests where transform_id = $1",
+                &[&id],
+            )
+            .await?;
+            txn.commit().await?;
+            return Ok(());
+        };
+        let source_table: String = row.get(0);
+        let target: String = row.get(1);
+        let Some(definition) = catalog::definition_by_id_in(&txn, id).await? else {
+            return Ok(());
+        };
+        match catalog::revalidate(&txn, schema, &definition).await {
+            Ok(_) => {}
+            Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
+                return Err(err.into());
+            }
+            Err(reason) => {
+                end_request(
+                    &txn,
+                    id,
+                    &source_table,
+                    &format!(
+                        "the resume was refused: define would refuse the definition as the \
+                         schema stands now: {reason}. Fix that and resume it again, or drop \
+                         the definition and define it again"
+                    ),
+                )
+                .await?;
+                txn.commit().await?;
+                return Ok(());
+            }
+        }
+        let rels = catalog::relationships_read_by(&txn, &definition.def, &source_table).await?;
+        let rel_refs: Vec<&crate::defs::model::RelationshipDefinition> = rels.iter().collect();
+        let copies = crate::defs::copies::typed_copies(
+            &txn,
+            schema,
+            &definition.def,
+            &source_table,
+            &definition.target_table,
+            &rel_refs,
+        )
+        .await?;
+        let states = crate::defs::copies::inspect(&txn, copies).await?;
+        let statements = crate::defs::copies::retype_statements(&states);
+        txn.commit().await?;
+        (source_table, target, statements)
+    };
+
+    for (sql, labels) in statements {
+        let txn = client.transaction().await?;
+        crate::locks::set_local_lock_timeout(&txn, RETYPE_LOCK_TIMEOUT).await?;
+        match txn.batch_execute(&sql).await {
+            Ok(()) => {
+                txn.commit().await?;
+                tracing::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
+            }
+            Err(err) if crate::locks::is_lock_not_available(&err) => {
+                drop(txn);
+                tracing::info!(
+                    transform_id = id,
+                    copies = ?labels,
+                    "re-typing copies for a resume waits for the table's lock; retrying next pass"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                txn.rollback().await?;
+                let txn = client.transaction().await?;
+                end_request(
+                    &txn,
+                    id,
+                    &source_table,
+                    &format!(
+                        "the resume couldn't re-type Trellis's copies {} to their source \
+                         columns' types: {}. Nothing was changed. Fix the cause and resume the \
+                         definition again, or drop the definition and define it again",
+                        labels.join(", "),
+                        err.as_db_error()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| err.to_string()),
+                    ),
+                )
+                .await?;
+                txn.commit().await?;
+                return Ok(());
+            }
+        }
+    }
+
+    let txn = client.transaction().await?;
+    let Some((locked, status)) = lock_frozen(&txn, "id", &id, &source_table).await? else {
+        return Ok(());
+    };
+    let requested: bool = txn
+        .query_one(
+            "select exists (select 1 from resume_requests where transform_id = $1)",
+            &[&locked],
+        )
+        .await?
+        .get(0);
+    if !status.is_frozen() || !requested {
+        return Ok(());
+    }
+    match resume_locked(&txn, schema, &target, id, &source_table, status, true).await {
+        Ok(ResumeStep::Resumed) => {
+            txn.commit().await?;
+            tracing::info!(
+                transform = %target,
+                to = %TransformStatus::WaitingToBackfill.as_str(),
+                "transform resumed once its copies were re-typed; re-parked for a fresh backfill"
+            );
+        }
+        // A copy drifted again since: the next pass re-types it.
+        Ok(ResumeStep::Retyping(_)) => {}
+        Err(ApplyError::ResumeRefused { reason, .. }) => {
+            drop(txn);
+            let txn = client.transaction().await?;
+            end_request(
+                &txn,
+                id,
+                &source_table,
+                &format!(
+                    "the resume was refused: define would refuse the definition as the schema \
+                     stands now: {reason}. Fix that and resume it again, or drop the definition \
+                     and define it again"
+                ),
+            )
+            .await?;
+            txn.commit().await?;
+        }
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+/// Ends definition `id`'s resume request without resuming it: it stays
+/// paused, with `error` as its `capture_failure`.
+async fn end_request(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    error: &str,
+) -> Result<(), ApplyError> {
+    txn.execute(
+        "delete from resume_requests where transform_id = $1",
+        &[&id],
+    )
+    .await?;
+    let columns: Vec<String> = Vec::new();
+    set_capture_failure(txn, id, source_table, &columns, error).await?;
+    tracing::warn!(transform_id = id, "a requested resume ended: {error}");
     Ok(())
 }
 

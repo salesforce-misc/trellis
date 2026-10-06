@@ -4,10 +4,10 @@
 //! by: a type off the key allowlist ([`super::catalog::is_text_stable_join_key_type`],
 //! [`super::ddl::source_primary_key`]), a `GROUP BY` type
 //! [`super::validate::reject_unsupported_group_by_key_type`] refuses, or a
-//! nondeterministic collation (#590, #638). Nothing stopped an
-//! `ALTER COLUMN ... TYPE` or `... COLLATE` after define from giving a key
-//! column such a type, and a key type off the allowlist halts the whole
-//! instance on the next drain that reads it (`quarantine::classify`).
+//! nondeterministic collation (#590, #638). An `ALTER COLUMN ... TYPE` or
+//! `... COLLATE` after define can give a key column such a type, or render
+//! the keys Trellis already stored differently, and a table rewrite fires no
+//! capture trigger.
 //!
 //! A key column is one Trellis matches rows by ([`KeyUse`]): the source's
 //! row-identity key, a `GROUP BY` key, and, for each relationship the
@@ -20,34 +20,31 @@
 //! 1. **define would refuse it now** ([`refusal`]); or
 //! 2. **its new type renders the values already stored differently**
 //!    ([`renders_differently`]), against the type recorded when the
-//!    definition was accepted (`definition_key_types`, [`record`]). A table
-//!    rewrite fires no capture trigger, so the target, ledger and projection
-//!    rows built from the old rendering would never match the new one: a
-//!    `timestamp` key becomes `timestamptz` (`'… 10:00:00'` reads back as
-//!    `'… 15:00:00+00'` after an `ALTER` in a New York session), `date`
-//!    becomes `timestamp`, `text` becomes `uuid` or `integer` (`'007'` reads
-//!    back as `7`), `varchar` becomes `character(n)` (padded).
+//!    definition was accepted or last resumed (`definition_key_types`,
+//!    [`record`]). The target, ledger and projection rows built from the old
+//!    rendering would never match the new one: a `timestamp` key becomes
+//!    `timestamptz` (`'… 10:00:00'` reads back as `'… 15:00:00+00'` after an
+//!    `ALTER` in a New York session), `date` becomes `timestamp`, `text`
+//!    becomes `uuid` or `integer` (`'007'` reads back as `7`), `varchar`
+//!    becomes `character(n)` (padded), a `numeric` scale or a temporal
+//!    precision narrows (the rewrite rounds), or a `varchar(n)` narrows (the
+//!    rewrite strips trailing spaces past the new length).
 //!
-//! Routine changes don't fire: widening an integer key (`integer` to
-//! `bigint`), any `varchar(n)`/`text` change, a `numeric` precision change
-//! or wider scale on a `GROUP BY` key, a change between deterministic
-//! collations. None of them changes an existing value's identity. A
-//! narrower `numeric` scale does fire: it rounds the stored values. The issue's PR body
-//! has the whole matrix and the evidence for each row.
+//! The same pass also pauses on a relationship whose two join columns no
+//! longer have the same type, modifier and collation (#590, through
+//! `catalog::validate_join_pair`), and on a widening of a column Trellis
+//! keeps a typed copy of ([`super::copies`], [`widens`]).
 //!
-//! What isn't checked, and why:
+//! Routine changes that need neither: widening an integer or string key
+//! that no copy holds (an aggregate's source key, a to-many join's to-side),
+//! a `numeric` precision change or wider scale on a `GROUP BY` key (its copy
+//! is unconstrained `numeric`), a wider temporal precision on a `GROUP BY`
+//! key (its copy is the type's full precision), `varchar` to `text`, and a
+//! change between deterministic collations. None of them changes an existing
+//! value's identity, and every copy still holds every value.
 //!
-//! - **That a relationship's two join columns still have the same type,
-//!   modifier and collation** (#590, `catalog::assert_joinable_as_is`).
-//!   Widening both sides of a join takes two `ALTER`s, and between them the
-//!   pair differs. Every key lookup casts the other side's key text to the
-//!   looked-up column's own live type (`staging::apply::key_array_filter`),
-//!   so the lookups keep working while the values fit both types.
-//! - **A narrower column Trellis created keeping its old type.** A 1-1
-//!   target's key, an aggregate's group key and a projection's key keep the
-//!   type they had at define, so after `integer` becomes `bigint` a key
-//!   above 2^31 fails its write (loudly, as a poisoned key) rather than
-//!   being stored wrong. Re-typing those columns is a separate feature.
+//! A resume re-records these types ([`rerecord`]), after it has re-validated
+//! the definition and brought its copies to their live types.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -59,35 +56,21 @@ use super::ast::{GroupByKey, KeySpace, TransformDef};
 /// How a definition uses one of its key columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyUse {
-    /// Part of the definition's source's row-identity key. `mirrored` when
-    /// the definition is 1-1, so its target's key is a copy of the column.
-    SourceKey { mirrored: bool },
+    /// Part of the definition's source's row-identity key.
+    SourceKey,
     /// A `GROUP BY` key: a source column, or a to-side column read through
     /// a relationship.
     GroupBy,
-    /// A join column of relationship `rel`. `mirrored` for a to-one
-    /// relationship's to-side column, which its settled projection's key
-    /// copies.
-    JoinColumn { rel: String, mirrored: bool },
+    /// A join column of relationship `rel`.
+    JoinColumn { rel: String },
     /// Part of relationship `rel`'s to-side's row-identity key.
     EndpointKey { rel: String },
-}
-
-impl KeyUse {
-    /// Whether a column Trellis created holds a typed copy of this one, so a
-    /// change of precision the copy can't hold rounds a key silently.
-    pub(crate) fn mirrored(&self) -> bool {
-        match self {
-            KeyUse::SourceKey { mirrored } | KeyUse::JoinColumn { mirrored, .. } => *mirrored,
-            KeyUse::GroupBy | KeyUse::EndpointKey { .. } => false,
-        }
-    }
 }
 
 impl fmt::Display for KeyUse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            KeyUse::SourceKey { .. } => write!(f, "part of this definition's source key"),
+            KeyUse::SourceKey => write!(f, "part of this definition's source key"),
             KeyUse::GroupBy => write!(f, "one of its GROUP BY keys"),
             KeyUse::JoinColumn { rel, .. } => write!(f, "a join column of relationship '{rel}'"),
             KeyUse::EndpointKey { rel } => {
@@ -105,7 +88,6 @@ pub(crate) struct RelRef<'a> {
     pub to_col: &'a str,
     /// The qualified to-side.
     pub to_table: &'a str,
-    pub to_one: bool,
 }
 
 /// The key columns `def` (sourced from the qualified `source`) uses on
@@ -129,12 +111,7 @@ pub(crate) fn key_uses(
     };
     let mut uses = Vec::new();
     if source == table {
-        let mirrored = group_by.is_empty();
-        uses.extend(
-            table_key
-                .iter()
-                .map(|c| (c.clone(), KeyUse::SourceKey { mirrored })),
-        );
+        uses.extend(table_key.iter().map(|c| (c.clone(), KeyUse::SourceKey)));
         for key in group_by {
             if let GroupByKey::Column(column) = key {
                 uses.push((column.clone(), KeyUse::GroupBy));
@@ -145,7 +122,6 @@ pub(crate) fn key_uses(
                 rel.from_col.to_string(),
                 KeyUse::JoinColumn {
                     rel: rel.name.to_string(),
-                    mirrored: false,
                 },
             ));
         }
@@ -158,7 +134,6 @@ pub(crate) fn key_uses(
             rel.to_col.to_string(),
             KeyUse::JoinColumn {
                 rel: rel.name.to_string(),
-                mirrored: rel.to_one,
             },
         ));
         uses.extend(table_key.iter().map(|c| {
@@ -194,16 +169,61 @@ impl ColumnType {
             .strip_prefix("pg_catalog.")
             .unwrap_or(&self.type_name)
     }
+
+    fn builtin(&self) -> bool {
+        self.type_name.starts_with("pg_catalog.")
+    }
+
+    /// The width of a builtin integer type: 2, 4 or 8 bytes.
+    fn int_width(&self) -> Option<u8> {
+        match self.base() {
+            "int2" if self.builtin() => Some(2),
+            "int4" if self.builtin() => Some(4),
+            "int8" if self.builtin() => Some(8),
+            _ => None,
+        }
+    }
+
+    /// A builtin string type's length bound: `Some(None)` for `text` and an
+    /// unbounded `varchar`, `Some(Some(n))` for `varchar(n)`, `None` for any
+    /// other type.
+    fn string_bound(&self) -> Option<Option<i32>> {
+        match self.base() {
+            "text" if self.builtin() => Some(None),
+            // `varchar(n)`'s `atttypmod` is `n + 4`.
+            "varchar" if self.builtin() => Some((self.typmod >= 4).then(|| self.typmod - 4)),
+            _ => None,
+        }
+    }
+
+    /// A temporal type's fractional-second precision, `-1` meaning the
+    /// default, 6.
+    fn precision(&self) -> i32 {
+        if self.typmod < 0 { 6 } else { self.typmod }
+    }
+}
+
+/// Whether string bound `is` holds fewer characters than `was` (`None` is
+/// unbounded).
+fn narrower_bound(is: Option<i32>, was: Option<i32>) -> bool {
+    match (is, was) {
+        (Some(is), Some(was)) => is < was,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// Whether a key column that had type `old` when Trellis built its state
 /// would render that state's values differently now that it has `new`
-/// (see the module doc). `mirrored` is [`KeyUse::mirrored`].
+/// (see the module doc).
 ///
-/// - **Integers** (`smallint`, `integer`, `bigint`) and **strings**
-///   (`text`, `varchar(n)`) render every value the same within their family.
-///   A narrowing `ALTER` fails on a value that doesn't fit, rather than
-///   changing it (except that `varchar(n)` drops trailing spaces past `n`).
+/// - **Integers** (`smallint`, `integer`, `bigint`) render every value the
+///   same within their family. A narrowing `ALTER` fails on a value that
+///   doesn't fit, rather than changing it.
+/// - **Strings** (`text`, `varchar(n)`) render the same unless the new bound
+///   is narrower: the rewrite drops trailing spaces past it, silently
+///   (`'abc   '` becomes `'abc'` under `varchar(3)`), so the stored key and
+///   the source's no longer match.
 /// - **The same type with another modifier** renders the same for `bit
 ///   varying`, whose stored bits don't change, and for a `numeric` change
 ///   that keeps or widens the scale (only a `GROUP BY` key can be `numeric`;
@@ -214,59 +234,124 @@ impl ColumnType {
 ///   `1.556` both become `1.56`, merging two groups without a capture
 ///   trigger firing ([`numeric_rounds`]).
 /// - **A temporal precision change** rounds the stored values when it
-///   narrows. When it widens, the values stay, but a mirrored copy keeps the
-///   old precision and would round a new key into another's.
+///   narrows. A wider one keeps them; a typed copy that can't hold the new
+///   precision is [`widens`]'s.
 /// - **Anything else** (another type, `character(n)`'s length, `bit(n)`'s)
 ///   renders differently.
-pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType, mirrored: bool) -> bool {
+pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType) -> bool {
     if old == new {
         return false;
     }
-    let family = |t: &ColumnType| match t.base() {
-        "int2" | "int4" | "int8" if t.type_name.starts_with("pg_catalog.") => Some(0),
-        "text" | "varchar" if t.type_name.starts_with("pg_catalog.") => Some(1),
-        _ => None,
-    };
-    if family(old).is_some() && family(old) == family(new) {
+    if old.int_width().is_some() && new.int_width().is_some() {
         return false;
     }
-    if old.type_name != new.type_name {
-        return true;
+    if let (Some(was), Some(is)) = (old.string_bound(), new.string_bound()) {
+        return narrower_bound(is, was);
     }
-    if !old.type_name.starts_with("pg_catalog.") {
+    if old.type_name != new.type_name || !old.builtin() {
         return true;
     }
     match old.base() {
         "numeric" => numeric_rounds(old.typmod, new.typmod),
         "varbit" => false,
-        "time" | "timetz" | "timestamp" | "timestamptz" => {
-            // `-1` is the default precision, 6.
-            let precision = |typmod: i32| if typmod < 0 { 6 } else { typmod };
-            let (was, is) = (precision(old.typmod), precision(new.typmod));
-            is < was || (is != was && mirrored)
-        }
+        "time" | "timetz" | "timestamp" | "timestamptz" => new.precision() < old.precision(),
         _ => true,
     }
+}
+
+/// Whether a typed copy of type `copy` can't hold every value of its source
+/// column's live type `live`, because `live` is a widening of it (#767):
+///
+/// - a wider integer (`smallint` → `integer` → `bigint`);
+/// - a longer string bound (`varchar(n)` → `varchar(m>n)`, `text`, or an
+///   unbounded `varchar`);
+/// - a `numeric` with room for more integer or fractional digits, or none
+///   at all ([`numeric_widens`]);
+/// - a wider temporal, `interval` or `bit varying` precision or length.
+///
+/// Anything else is not a widening: equal types, a narrowing (every value
+/// still fits the copy), or another type altogether (a re-rendering,
+/// [`renders_differently`]'s, for a key).
+pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
+    if copy == live {
+        return false;
+    }
+    if let (Some(was), Some(is)) = (copy.int_width(), live.int_width()) {
+        return is > was;
+    }
+    if let (Some(was), Some(is)) = (copy.string_bound(), live.string_bound()) {
+        return narrower_bound(was, is);
+    }
+    if copy.type_name != live.type_name || !copy.builtin() {
+        return false;
+    }
+    match copy.base() {
+        "numeric" => numeric_widens(copy.typmod, live.typmod),
+        "varbit" => live.typmod < 0 || (copy.typmod >= 0 && live.typmod > copy.typmod),
+        "time" | "timetz" | "timestamp" | "timestamptz" => live.precision() > copy.precision(),
+        "interval" => interval_widens(copy.typmod, live.typmod),
+        _ => false,
+    }
+}
+
+/// A `numeric(p,s)` modifier's precision and scale. A modifier is
+/// `((p << 16) | (s & 0x7ff)) + 4`, with `s` an 11-bit two's complement,
+/// since Postgres 15 allows a negative scale. `None` for an unconstrained
+/// `numeric` (`-1`).
+fn numeric_modifier(typmod: i32) -> Option<(i32, i32)> {
+    (typmod >= 4).then(|| {
+        let precision = ((typmod - 4) >> 16) & 0xffff;
+        let s = (typmod - 4) & 0x7ff;
+        (precision, if s & 0x400 != 0 { s - 0x800 } else { s })
+    })
 }
 
 /// Whether re-typing a `numeric` column from modifier `old` to `new` rounds
 /// a value it holds: when `new` has a scale and `old` had none, or a larger
 /// one. An unconstrained `numeric` (`-1`) keeps every value.
-///
-/// A `numeric(p,s)` modifier is `((p << 16) | (s & 0x7ff)) + 4`, with `s` an
-/// 11-bit two's complement, since Postgres 15 allows a negative scale.
 fn numeric_rounds(old: i32, new: i32) -> bool {
-    let scale = |typmod: i32| {
-        (typmod >= 4).then(|| {
-            let s = (typmod - 4) & 0x7ff;
-            if s & 0x400 != 0 { s - 0x800 } else { s }
-        })
-    };
-    match (scale(old), scale(new)) {
+    match (numeric_modifier(old), numeric_modifier(new)) {
         (_, None) => false,
         (None, Some(_)) => true,
-        (Some(was), Some(is)) => is < was,
+        (Some((_, was)), Some((_, is))) => is < was,
     }
+}
+
+/// Whether a `numeric` of modifier `live` holds a value a copy of modifier
+/// `copy` can't: it is unconstrained and the copy isn't, or it has more
+/// fractional digits, or more integer digits (`p - s`).
+fn numeric_widens(copy: i32, live: i32) -> bool {
+    match (numeric_modifier(copy), numeric_modifier(live)) {
+        (_, None) => copy >= 4,
+        (None, Some(_)) => false,
+        (Some((p, s)), Some((lp, ls))) => ls > s || lp - ls > p - s,
+    }
+}
+
+/// Whether an `interval` of modifier `live` holds a value a copy of
+/// modifier `copy` can't: its field range covers fields the copy's doesn't,
+/// or its fractional-second precision is wider. A modifier is
+/// `(range << 16) | precision`, the precision `0xffff` for the full one;
+/// `-1` is the full range at full precision.
+fn interval_widens(copy: i32, live: i32) -> bool {
+    const FULL_PRECISION: i32 = 0xffff;
+    let split = |typmod: i32| {
+        if typmod < 0 {
+            (0x7fff, 6)
+        } else {
+            let precision = typmod & 0xffff;
+            (
+                (typmod >> 16) & 0x7fff,
+                if precision == FULL_PRECISION {
+                    6
+                } else {
+                    precision
+                },
+            )
+        }
+    };
+    let ((copy_range, copy_precision), (live_range, live_precision)) = (split(copy), split(live));
+    live_range & !copy_range != 0 || live_precision > copy_precision
 }
 
 /// A live column's type, as [`refusal`] and [`renders_differently`] need it.
@@ -420,6 +505,52 @@ pub(crate) async fn record(
     Ok(())
 }
 
+/// Records the live type of every key column definition `id` uses
+/// ([`key_uses`]): on its qualified `source`, keyed by the source's
+/// row-identity key, and on the to-side of each relationship in `rels`,
+/// keyed by that table's. Define calls it with nothing recorded yet; a
+/// resume with `replace`, which deletes what was recorded first, so the
+/// types the capture pass compares against are the ones the rebuild builds
+/// from.
+pub(crate) async fn record_definition(
+    client: &impl GenericClient,
+    id: i64,
+    def: &TransformDef,
+    source: &str,
+    rels: &[RelRef<'_>],
+    replace: bool,
+) -> Result<(), tokio_postgres::Error> {
+    let mut tables: Vec<&str> = vec![source];
+    for rel in rels {
+        if !tables.contains(&rel.to_table) {
+            tables.push(rel.to_table);
+        }
+    }
+    let mut columns: Vec<(String, String)> = Vec::new();
+    for table in tables {
+        let key: Vec<String> = super::ddl::identity_key_columns(client, table)
+            .await?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        for (column, _) in key_uses(def, source, rels, table, &key) {
+            let entry = (table.to_string(), column);
+            if !columns.contains(&entry) {
+                columns.push(entry);
+            }
+        }
+    }
+    if replace {
+        client
+            .execute(
+                "delete from definition_key_types where transform_id = $1",
+                &[&id],
+            )
+            .await?;
+    }
+    record(client, id, &columns).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,10 +576,9 @@ mod tests {
             (ty("int2", -1), ty("int4", -1)),
             (ty("int8", -1), ty("int4", -1)),
             (varchar(50), varchar(100)),
-            (varchar(100), varchar(50)),
             (varchar(50), ty("text", -1)),
-            (ty("text", -1), varchar(255)),
             (ty("varchar", -1), ty("text", -1)),
+            (ty("text", -1), ty("varchar", -1)),
             // numeric(10,2) -> numeric(12,2), -> numeric(10,3), -> numeric.
             (ty("numeric", 655366), ty("numeric", 786438)),
             (ty("numeric", 655366), ty("numeric", 655367)),
@@ -457,13 +587,13 @@ mod tests {
             // numeric(10,-2) -> numeric(10,0).
             (ty("numeric", 657410), ty("numeric", 655364)),
             (ty("varbit", 8), ty("varbit", 16)),
+            // A wider precision keeps the values.
+            (ty("timestamp", 3), ty("timestamp", 6)),
+            (ty("timestamp", 3), ty("timestamp", -1)),
+            (ty("timetz", 0), ty("timetz", 6)),
+            (ty("timestamp", 6), ty("timestamp", -1)),
         ] {
-            for mirrored in [false, true] {
-                assert!(
-                    !renders_differently(&old, &new, mirrored),
-                    "{old:?} -> {new:?} (mirrored: {mirrored})"
-                );
-            }
+            assert!(!renders_differently(&old, &new), "{old:?} -> {new:?}");
         }
     }
 
@@ -498,13 +628,12 @@ mod tests {
             (ty("timestamp", 6), ty("timestamp", 0)),
             (ty("timestamptz", 3), ty("timestamptz", 0)),
             (ty("time", 6), ty("time", 2)),
+            // A narrower string bound strips trailing spaces past it.
+            (varchar(100), varchar(50)),
+            (ty("text", -1), varchar(255)),
+            (ty("varchar", -1), varchar(255)),
         ] {
-            for mirrored in [false, true] {
-                assert!(
-                    renders_differently(&old, &new, mirrored),
-                    "{old:?} -> {new:?} (mirrored: {mirrored})"
-                );
-            }
+            assert!(renders_differently(&old, &new), "{old:?} -> {new:?}");
         }
     }
 
@@ -513,36 +642,72 @@ mod tests {
     fn a_user_type_is_never_in_a_builtin_family() {
         assert!(renders_differently(
             &ty("public.int4", -1),
-            &ty("pg_catalog.int8", -1),
-            false
+            &ty("pg_catalog.int8", -1)
         ));
         assert!(renders_differently(
             &ty("public.text", -1),
-            &ty("pg_catalog.text", -1),
-            false
+            &ty("pg_catalog.text", -1)
         ));
+        assert!(!widens(&ty("public.int4", -1), &ty("pg_catalog.int8", -1)));
     }
 
-    /// A wider precision keeps the values, but a mirrored copy keeps the
-    /// old precision and would round a new key.
+    /// `numeric(p,s)`'s `atttypmod`.
+    fn numeric(precision: i32, scale: i32) -> ColumnType {
+        ty("numeric", ((precision << 16) | (scale & 0x7ff)) + 4)
+    }
+
+    /// `interval`'s `atttypmod` for a field range and a precision.
+    fn interval(range: i32, precision: i32) -> ColumnType {
+        ty("interval", (range << 16) | precision)
+    }
+
     #[test]
-    fn a_wider_precision_is_caught_only_where_a_copy_would_round() {
-        for (old, new) in [
+    fn a_copy_is_widened_only_by_a_wider_type_of_its_family() {
+        for (copy, live) in [
+            (ty("int2", -1), ty("int4", -1)),
+            (ty("int4", -1), ty("int8", -1)),
+            (ty("int2", -1), ty("int8", -1)),
+            (varchar(50), varchar(100)),
+            (varchar(50), ty("text", -1)),
+            (varchar(50), ty("varchar", -1)),
+            (numeric(10, 2), numeric(12, 2)),
+            (numeric(10, 2), numeric(10, 3)),
+            (numeric(10, 2), ty("numeric", -1)),
             (ty("timestamp", 3), ty("timestamp", 6)),
             (ty("timestamp", 3), ty("timestamp", -1)),
+            (ty("timestamptz", 0), ty("timestamptz", 3)),
+            (ty("time", 2), ty("time", -1)),
             (ty("timetz", 0), ty("timetz", 6)),
+            (ty("varbit", 8), ty("varbit", 16)),
+            (ty("varbit", 8), ty("varbit", -1)),
+            // `interval second(3)` -> `interval second(6)`, and `interval
+            // day` -> `interval`.
+            (interval(0x1000, 3), interval(0x1000, 6)),
+            (interval(0x0008, 0xffff), ty("interval", -1)),
         ] {
-            assert!(
-                !renders_differently(&old, &new, false),
-                "{old:?} -> {new:?}"
-            );
-            assert!(renders_differently(&old, &new, true), "{old:?} -> {new:?}");
+            assert!(widens(&copy, &live), "{copy:?} -> {live:?}");
         }
-        assert!(!renders_differently(
-            &ty("timestamp", 6),
-            &ty("timestamp", -1),
-            true
-        ));
+        for (copy, live) in [
+            (ty("int4", -1), ty("int4", -1)),
+            (ty("int8", -1), ty("int4", -1)),
+            (varchar(100), varchar(50)),
+            (ty("text", -1), varchar(50)),
+            (ty("varchar", -1), ty("text", -1)),
+            (ty("text", -1), ty("varchar", -1)),
+            (numeric(12, 2), numeric(10, 2)),
+            (ty("numeric", -1), numeric(10, 2)),
+            (ty("timestamp", 6), ty("timestamp", 3)),
+            (ty("timestamp", 6), ty("timestamp", -1)),
+            (ty("timestamp", -1), ty("timestamptz", -1)),
+            (ty("int4", -1), ty("numeric", -1)),
+            (ty("float4", -1), ty("float8", -1)),
+            (ty("text", -1), ty("uuid", -1)),
+            (ty("bpchar", 9), ty("bpchar", 12)),
+            (ty("varbit", 16), ty("varbit", 8)),
+            (ty("interval", -1), interval(0x0008, 0xffff)),
+        ] {
+            assert!(!widens(&copy, &live), "{copy:?} -> {live:?}");
+        }
     }
 
     fn rel<'a>(name: &'a str, from_col: &'a str, to_col: &'a str, to: &'a str) -> RelRef<'a> {
@@ -551,7 +716,6 @@ mod tests {
             from_col,
             to_col,
             to_table: to,
-            to_one: true,
         }
     }
 
@@ -569,12 +733,11 @@ mod tests {
         assert_eq!(
             key_uses(&def, "public.posts", &rels, "public.posts", &key),
             vec![
-                ("id".to_string(), KeyUse::SourceKey { mirrored: true }),
+                ("id".to_string(), KeyUse::SourceKey),
                 (
                     "author_id".to_string(),
                     KeyUse::JoinColumn {
                         rel: "author".to_string(),
-                        mirrored: false
                     }
                 ),
             ]
@@ -586,7 +749,6 @@ mod tests {
                     "id".to_string(),
                     KeyUse::JoinColumn {
                         rel: "author".to_string(),
-                        mirrored: true
                     }
                 ),
                 (
@@ -609,7 +771,7 @@ mod tests {
         let rels = [rel("author", "author_id", "id", "public.users")];
         let key = vec!["id".to_string()];
         let on_source = key_uses(&def, "public.posts", &rels, "public.posts", &key);
-        assert!(on_source.contains(&("id".to_string(), KeyUse::SourceKey { mirrored: false })));
+        assert!(on_source.contains(&("id".to_string(), KeyUse::SourceKey)));
         assert!(on_source.contains(&("kind".to_string(), KeyUse::GroupBy)));
         let on_to_side = key_uses(&def, "public.posts", &rels, "public.users", &key);
         assert!(on_to_side.contains(&("country".to_string(), KeyUse::GroupBy)));

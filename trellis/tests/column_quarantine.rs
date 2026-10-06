@@ -1318,23 +1318,28 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
 
-    // `tax` is a real Postgres `text` column holding a permanently
-    // non-numeric value — `busted`'s formula (declared `Numeric` via
-    // `source_columns`, same "reach past the mechanism" trick the rest of
-    // this file uses for a malformed CDC image, just baked into real,
-    // persisted source data here since `recompute_column` reads the live
-    // table directly rather than a staged image) throws on every row, for
-    // every recompute attempt, indefinitely.
+    // `tax` is an `integer` column holding `integer`'s largest value, so
+    // `busted`'s formula overflows (`22003`, as Postgres's `tax + tax` would)
+    // on every row, for every recompute attempt, indefinitely. The
+    // definition is one define accepts, so the resume's re-validation
+    // (#708) passes; only the data makes the sibling throw.
     client
         .batch_execute(
-            "create table calc_src (id integer primary key, price numeric, tax text); \
+            "create table calc_src (id integer primary key, price numeric, tax integer); \
              insert into calc_src (id, price, tax) values \
-             (1, 10, 'not-a-number'), (2, 20, 'not-a-number'), (3, 30, 'not-a-number')",
+             (1, 10, 2147483647), (2, 20, 2147483647), (3, 30, 2147483647)",
         )
         .await
         .expect("seed source table");
 
-    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    let source_columns: HashMap<String, ValueType> = [
+        ("id", ValueType::Integer(trellis::integer::IntWidth::Int4)),
+        ("price", ValueType::Numeric),
+        ("tax", ValueType::Integer(trellis::integer::IntWidth::Int4)),
+    ]
+    .into_iter()
+    .map(|(name, ty)| (name.to_string(), ty))
+    .collect();
     create_definition(
         &db.pool,
         "TRANSFORM calc FROM calc_src SELECT price + price AS doubled, tax + tax AS busted",

@@ -551,6 +551,29 @@ pub(crate) fn aggregate_deltas_ddl(
     )
 }
 
+/// Re-types some of a group-delta table's `GROUP BY` columns (#767):
+/// `alter_columns` is the `alter column … type …` clauses, comma-separated,
+/// and `group_columns` the table's `GROUP BY` columns with their new types.
+/// [`DELTA_PART_COLUMN`] is generated from them, which Postgres won't let a
+/// type change pass, so it is dropped first and generated again after, with
+/// its index. The statements are `;`-separated, for one transaction.
+pub(crate) fn deltas_retype_sql(
+    qualified_deltas: &str,
+    group_columns: &[LedgerColumn],
+    alter_columns: &str,
+) -> String {
+    let part = quote_ident(DELTA_PART_COLUMN);
+    format!(
+        "alter table {qualified_deltas} drop column {part}; \
+         alter table {qualified_deltas} {alter_columns}; \
+         alter table {qualified_deltas} add column {part} smallint not null \
+             generated always as ({}) stored; \
+         create index on {qualified_deltas} ({part}, {})",
+        delta_partition_sql(group_columns),
+        quote_ident(DELTA_SEQ_COLUMN),
+    )
+}
+
 /// A 1-1 target's ledger DDL (#623 Q2 (c)): the key and the ordering state,
 /// with no values (the target row holds them), as a statement to append to
 /// the target's own. Created empty: the 1-1 build's writes are absolute, and

@@ -95,6 +95,33 @@ during the pause stay stale until the drain re-derives them, and rows the source
 appear the same way. The deletes, the build's included, go through the target-mutation
 seam like any other target write, so a live definition reading this target drops them too.
 
+Before any of that, resume re-validates the definition against the live schema, with
+the same checks define runs (`defs::catalog::revalidate`): its fields over the source's
+live columns, the source key's type and collations, each relationship it reads
+through (both join columns still on the allowlist and still the same type, modifier
+and collation), row-level security and subscriptions, and, for a 1-1 definition, a
+source key that is still the one its target is keyed by. While define would refuse
+it, the resume refuses with define's error, names the column and what to change, and
+changes nothing: the definition stays paused. A field resume runs the same check on
+its definition, and leaves a dependent its cascade reaches paused while that
+dependent's check fails.
+
+A resume then rebuilds from the schema as it is now. It records the source's live
+column types, which the rebuild casts through, and the type of each column the
+definition keys by (`definition_key_types`), which the staging worker's capture pass
+compares later changes against. And it brings each of Trellis's typed copies of a
+source column (a 1-1 target's key and passthrough columns, an aggregate's `GROUP BY`
+columns in its target, ledger and group-delta table, a to-one relationship
+projection's key) to the type define would give it now. Re-typing one is an `ALTER
+… TYPE` under `ACCESS EXCLUSIVE`, which waits for every reader of the table and, for
+`integer` to `bigint`, rewrites it, so it never runs inside `RESUME`: a resume with
+copies to re-type records a request (`resume_requests`) and returns at once, the
+definition still paused, and the staging worker's next capture pass re-types them, one
+table per transaction, then runs the resume itself. A crash between the two leaves the
+request, and the next pass (or the next `RESUME`) finishes the work. A copy whose
+re-type fails (a value its new type can't hold) ends the request with the error on
+the definition's `capture_failure`, and changes nothing.
+
 Resume also releases every key the definition holds in quarantine: it deletes the
 definition's own `poison`, `poison_held` and `key_deaths` rows in the same transaction.
 The re-derivation covers every key from the source, so the parked work is superseded

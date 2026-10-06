@@ -22,13 +22,15 @@ a key, index or policy itself.
 
 | Condition | Refused at define | If it appears after define | Remedy |
 |---|---|---|---|
-| A source with no primary key (or unique index standing in for one), a partitioned table, or a table in a partition or inheritance hierarchy | Yes. A statement trigger fires only for the table a statement names, so capture would miss writes made through the rest of the hierarchy. | A table that later joins a hierarchy (`ATTACH PARTITION`, `INHERIT`) is not refused. `self_check` reports a `capture` divergence (1-1 targets only; [gap 7](known-correctness-gaps.md#7-a-source-attached-as-a-partition-or-made-to-inherit-after-define)). A dropped key pauses the transforms that read it, with the reason in `status()`; a retyped one: [gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column). | Use a plain table with a primary key. After a later change, undo it, then `PAUSE`/`RESUME`. |
+| A source with no primary key (or unique index standing in for one), a partitioned table, or a table in a partition or inheritance hierarchy | Yes. A statement trigger fires only for the table a statement names, so capture would miss writes made through the rest of the hierarchy. | A table that later joins a hierarchy (`ATTACH PARTITION`, `INHERIT`) is not refused. `self_check` reports a `capture` divergence (1-1 targets only; [gap 7](known-correctness-gaps.md#7-a-source-attached-as-a-partition-or-made-to-inherit-after-define)). A dropped key pauses the transforms that read it, with the reason in `status()`, and so does one retyped (see the key rows below). | Use a plain table with a primary key. After a later change, undo it, then `PAUSE`/`RESUME`. |
 | An aggregate target used as a source (it has no primary key: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint) | Yes, for another Trellis instance. Inside the owning instance it can be chained off, because writes to a target reach its readers in the writing transaction, never through capture triggers. | n/a | Group over a 1-1 transform, or chain within the instance ([instance-identity](instance-identity.md)). |
 | Row-level security that applies to a role Trellis runs as (#745, #765, #766) on a source, on a relationship's to-side, or on a target. Policies apply to a role when RLS is enabled and the role neither owns the table (directly or through membership) nor has `BYPASSRLS`, or owns it and the table is `FORCE ROW LEVEL SECURITY`. A superuser is exempt. Every Trellis connection runs with `row_security = off`, so a read or write the policies would filter fails rather than skipping rows. | Yes, checked for the role that owns the ring, and for the defining role on a to-one to-side and on a table that is another transform's target. Define checks before it widens the relationship's projection, its first read of the to-side, so this refusal comes ahead of the cycle, key, collation and unkeyed-source checks. Declaring a to-one relationship is refused when the to-side's policies apply to the session's role, since declaring fills the relationship's projection from it. | For the ring's owner, the staging worker's reconcile pass pauses every transform that reads the table (or, for a target, the transform that writes it), with the reason in `status()`'s `capture_failure`, and `self_check` reports a `capture` divergence. For a role a drain logs in as, its refused read or write pauses the same transforms, and everything downstream of them, with `capture_failure` of kind `halt`. A refused build chunk pauses its transform after its charged retries, with the error on `backfill_failure`. The window before the pass, and the refusals that only log or retry: [gap 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as). | Give the role `BYPASSRLS` (not inherited), or make it the table's owner without `FORCE ROW LEVEL SECURITY`; then `RESUME`. |
 | A table a logical-replication subscription in the same database replicates into (#751) | Yes, in any sync state, including a disabled subscription. The subscription's apply worker fires only row-level triggers, so its changes never reach capture. Publishing a table to another database is fine. | Paused and reported as for RLS on the ring's owner. | Remove the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then `RESUME`. |
-| A nondeterministic collation (an ICU collation with `deterministic = false`) on a key column: a source primary key, a `GROUP BY` key (including a relationship path's to-side column), a relationship join column or an endpoint's primary key (#638). Also on a column passed to `STRPOS` or `REGEXP_COUNT`, directly or through `COALESCE`, another field or a relationship path. | Yes, for the definition, the relationship, and an `ALTER TRANSFORM` that adds or alters such a field. Trellis matches keys by exact text; such a collation's `=` would fold keys it keeps apart. `CHAR_LENGTH` and `OCTET_LENGTH` accept any column. | Not detected ([gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column)). | Keep the column's collation deterministic ([type-support](type-support.md#collation)). |
-| Relationship join columns that differ in type, type modifier or collation, or whose type is off the join-key allowlist (#590) | Yes. Trellis never casts a join key. `integer` against `bigint`, `text` against `varchar`, and `varchar(50)` against `varchar(255)` are all refused. | Not detected ([gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column)). | Alter one column to match the other. |
-| A relationship endpoint that is not keyable, has a key type off the primary-key allowlist, or (for one of this instance's targets) is not `live` (#429) | Yes. Every requirement is checked at declaration ([relationship-propagation](relationship-propagation.md#endpoint-requirements)). | A key dropped later pauses its readers; one retyped later: [gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column). | Fix the table, then declare the relationship. |
+| A nondeterministic collation (an ICU collation with `deterministic = false`) on a key column: a source primary key, a `GROUP BY` key (including a relationship path's to-side column), a relationship join column or an endpoint's primary key (#638). Also on a column passed to `STRPOS` or `REGEXP_COUNT`, directly or through `COALESCE`, another field or a relationship path. | Yes, for the definition, the relationship, and an `ALTER TRANSFORM` that adds or alters such a field. Trellis matches keys by exact text; such a collation's `=` would fold keys it keeps apart. `CHAR_LENGTH` and `OCTET_LENGTH` accept any column. | On a key column, the staging worker pauses every transform that keys by it, with the reason in `status()`'s `capture_failure`, and `RESUME` refuses until it's deterministic again. On a column only a text function reads: not detected. | Keep the column's collation deterministic ([type-support](type-support.md#collation)). |
+| Relationship join columns that differ in type, type modifier or collation, or whose type is off the join-key allowlist (#590) | Yes. Trellis never casts a join key. `integer` against `bigint`, `text` against `varchar`, and `varchar(50)` against `varchar(255)` are all refused. | A type off the allowlist, or a type or modifier that no longer matches (one side widened, the other not yet), pauses every transform that reads through the relationship, with both columns and both types in `capture_failure`; `RESUME` refuses with the same error until they match. A change between deterministic collations pauses nothing (byte equality is unchanged), but `RESUME` refuses the pair until the collations match too. | Alter one column to match the other, then `RESUME`. |
+| A relationship endpoint that is not keyable, has a key type off the primary-key allowlist, or (for one of this instance's targets) is not `live` (#429) | Yes. Every requirement is checked at declaration ([relationship-propagation](relationship-propagation.md#endpoint-requirements)), and again for each transform that reads through it, at its define and at each `RESUME`. | A key dropped later, or retyped off the allowlist, pauses its readers. | Fix the table, then declare the relationship. |
+| A key column (a source key, a `GROUP BY` key, a relationship's join column or to-side key) retyped so that the values Trellis stored render differently: `timestamp` ↔ `timestamptz`, `date` → `timestamp`, `text` → `uuid` or `integer`, `varchar` → `character(n)`, or a narrower `numeric` scale, temporal precision or `varchar(n)` (the rewrite rounds, or strips trailing spaces) (#760) | n/a: define sees one type. | An `ALTER COLUMN … TYPE` rewrites the table without firing a trigger. The staging worker pauses every transform keyed by the column, with the old and new type in `capture_failure`. | `RESUME`: it re-types Trellis's copies of the column and rebuilds from the source. Or drop and define again. |
+| A column Trellis keeps a typed copy of, widened: a 1-1 target's key or passthrough column, an aggregate's `GROUP BY` key (copied into its target, ledger and group-delta table), a relationship projection's key. Widenings are `integer` → `bigint` (and `smallint` up), `varchar(n)` → longer or `text`, and a wider `numeric`, temporal, `interval` or `bit varying` precision (#767) | n/a: each copy takes the source column's type at define. | The copy keeps its type, so a value it can't hold would fail its write. The staging worker pauses every transform that owns such a copy, naming the column, its new type and each copy. A narrowing pauses nothing (every value still fits), except a `varchar(n)` key's (the row above). | `RESUME`: the staging worker `ALTER`s each copy to the source's live type, under `ACCESS EXCLUSIVE` (a table rewrite for `integer` → `bigint`; reads of the target wait), then rebuilds. Or drop and define again. |
 | Two `GROUP BY` keys that share a target column name (`buyer.name` and `seller.name`, or `name` beside `buyer.name`); keys can't be aliased | Yes. | n/a | Group over a 1-1 transform that selects them under distinct names (`buyer.name AS buyer_name`). |
 | A field named after a 1-1 source key column (`id AS id`), or any field or `GROUP BY` column whose name starts with `__` (#566) | Yes. The target already carries the key columns, and `__` names are Trellis's hidden columns (such as an `AVG`'s running sum). `id AS order_id` is an ordinary column. | n/a | Rename the field. |
 | `JOIN` | Yes (parse error). Cross-join is not supported. | n/a | Use a [relationship](#relationships). |
@@ -37,8 +39,14 @@ a key, index or policy itself.
 
 A refusal after define is a pause, not a loss: `RESUME` rebuilds the target from
 source once the condition is fixed ([Status](#status)). `status()`'s
-`capture_failure` carries the reason. Other ways a source can drift after
-define are in [known correctness gaps](known-correctness-gaps.md).
+`capture_failure` carries the reason. Every `RESUME`, of a transform or of one
+field, first runs define's validation against the live schema, and refuses,
+leaving the transform paused, while define would refuse it; the error names
+the column and what to change. When a resume has copies to re-type it returns
+at once, the transform still `paused` with a `capture_failure` that says so,
+and the staging worker re-types them and starts the rebuild. Other ways a
+source can drift after define are in
+[known correctness gaps](known-correctness-gaps.md).
 
 Other writers are not affected by the subscription rule: a session with
 `session_replication_role = replica` fires the capture triggers, which are
@@ -161,22 +169,11 @@ never casts a join key. The error names both columns and both types. Both
 sides also need deterministic collations
 ([Supported sources and targets](#supported-sources-and-targets)).
 
-The type allowlist and the deterministic-collation rule hold after define
-too (#760). The same-type-modifier-and-collation rule doesn't, because
-widening both join columns takes two `ALTER`s. If an `ALTER COLUMN ... TYPE` or `COLLATE` later gives a key column
-(a source's primary key, a `GROUP BY` column, or a relationship's join column
-or to-side key) a type or collation define would refuse, or changes its type
-so that its existing values render differently (`timestamp` to `timestamptz`,
-`date` to `timestamp`, `text` to `uuid`) or are rounded (a narrower `numeric`
-scale), the staging worker pauses each definition that keys by it, with the
-reason on `status()`'s `capture_failure`. Change the column back and resume
-the definition, or drop it and define it again; resuming with the column
-still changed pauses it again. Widening a key (`integer` to `bigint`,
-`varchar(50)` to `varchar(255)` or `text`) pauses nothing, even while the two
-join columns differ between two `ALTER`s. Trellis doesn't widen the columns
-it created from the old type, though: a 1-1 target's key, a `GROUP BY`
-target's key and a relationship projection's key keep it, so a key that
-doesn't fit the old type fails to apply.
+These rules hold after define too. A join column later altered onto a
+refused type or collation, or a pair whose types or modifiers no longer
+match (one side widened to `bigint`, the other not yet), pauses every
+transform that reads through the relationship, and `RESUME` refuses until
+both sides match again ([Supported sources and targets](#supported-sources-and-targets)).
 
 See [0006-relationships](decisions/0006-relationships.md) for the full design and
 [0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)
@@ -312,9 +309,13 @@ Every defined transform carries an observable **status**:
   fuse. The same frozen state `quarantined` is, reached by the other trigger: the
   target stops being written to and holds its current, now-stale value. Resuming
   likewise re-runs the backfill from `waiting_to_backfill`. Trellis also pauses
-  a transform itself when a source column it reads is renamed or dropped, with
-  the reason on its status (`capture_failure`)
-  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)).
+  a transform itself when a source column it reads is renamed or dropped, or a
+  column it keys by or keeps a typed copy of changes type, with the reason on
+  its status (`capture_failure`)
+  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column),
+  [Supported sources and targets](#supported-sources-and-targets)). Every
+  resume first re-validates the transform as define would, and refuses while
+  define would refuse it.
 
 An application can list defined transforms and read each one's status — enough to
 tell a newly-defined transform is still populating, without a metrics pipeline
@@ -353,8 +354,10 @@ as ambiguous and the address must name the schema.
 
 **Semantics** are covered by
 [0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md).
-In short: `PAUSE` and `DROP` are idempotent; `RESUME` rebuilds by a fresh
-backfill rather than catching up on changes that happened during the pause;
+In short: `PAUSE` and `DROP` are idempotent; `RESUME` re-validates the
+transform against the live schema, refusing while define would, and rebuilds
+by a fresh backfill rather than catching up on changes that happened during
+the pause;
 `DROP` removes the target table's data along with the definition, and is refused
 — naming the blockers — while another registered definition still chains off the
 subject, so a chain is retired from the leaves inward. A relationship with the

@@ -72,6 +72,24 @@ aggregate has no exact inverse, so a group is recomputed by Postgres itself
 (a server-side `min()`, `sum()` and so on) rather than updated by a delta
 (`defs::invertibility`).
 
+### The types of the columns Trellis creates
+
+A passthrough and a 1-1 target's key columns take their source column's exact
+type at define, modifier included (`varchar(50)`, `timestamp(3)`), so either
+can serve as a relationship's join key against a column of that type. A
+`GROUP BY` key's column (in the target, its ledger and its group-delta table)
+takes its value family's type: `integer` or `bigint` by width, `text` for any
+string, unconstrained `numeric`, a temporal type at full precision. A to-one
+relationship's projection keys by the to-side column's exact type.
+
+None of them changes on its own when the source column does. A widening the
+column's copy can't hold (`integer` to `bigint`, `varchar(50)` to `text`, a
+wider `numeric` or temporal precision) pauses the transforms that own the copy,
+and `RESUME` re-types the copies to the source's live type before it rebuilds
+([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+A column typed from a calculated field or an aggregate's argument isn't
+re-typed ([known correctness gaps, entry 4](known-correctness-gaps.md#4-widening-a-column-read-only-as-a-field-that-trellis-copies-with-its-type)).
+
 ## Text rendering
 
 Trellis moves every value as text and matches keys by exact text, so a type is

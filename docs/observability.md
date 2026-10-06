@@ -229,10 +229,22 @@ pause are arcs of one lifecycle:
     to the drain's role): the definitions it reaches
     and everything downstream of them are paused, with the cause on `capture_failure`.
 
-  `RESUME TRANSFORM` returns it to `waiting_to_backfill`. It reconciles the target
-  with current source data rather than replaying what was skipped while paused
-  (the change stream is drained for the transform's siblings meanwhile), so the cost
-  of a resume scales with the data, not with the length of the pause.
+  `RESUME TRANSFORM` first re-runs define's validation against the live schema. While
+  define would refuse the transform (a column it reads is gone or retyped into
+  something it can't use, a relationship's join columns no longer match, its 1-1
+  source key was redefined), the resume fails with `ApplyError::ResumeRefused`,
+  whose message is define's own error naming the column and what to change, and the
+  transform stays paused, untouched. A field resume (`RESUME TRANSFORM t.col`) runs the
+  same check. Otherwise the resume returns it to `waiting_to_backfill`. If Trellis's
+  typed copies of its columns no longer have their sources' types (after `integer` to
+  `bigint`, say), the resume returns at once but the transform stays `paused`, its
+  `capture_failure` reading "resuming: …", until the staging worker has re-typed them
+  (an `ALTER … TYPE` that waits for the table's lock) and moved it to
+  `waiting_to_backfill`. A re-type that fails puts its error on `capture_failure`, and
+  the transform stays paused. The resume reconciles the target with current source
+  data rather than replaying what was skipped while paused (the change stream is
+  drained for the transform's siblings meanwhile), so the cost of a resume scales with
+  the data, not with the length of the pause.
 
 Two further fields on `DefinitionStatus` explain a transform that is waiting on
 capture rather than on a build. `capture_wait` says the staging worker couldn't yet
@@ -356,10 +368,11 @@ without them:
   interval under a collapsed warning (#660).
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
-  clears its halt. Resuming while the cause persists halts it again, as a new
-  episode with its own count and error line. A Re-derive-built definition
-  rebuilt over a source whose key still can't be used may instead be paused by
-  its own build, with the error on `backfill_failure`, as above.
+  clears its halt. A resume re-validates the definition as define would, so
+  while its source key, or a relationship endpoint's, is still of a type define
+  refuses, the resume is refused and the halt stands. A cause define doesn't
+  check (a propagation wave past the hop bound) halts it again after the
+  resume, as a new episode with its own count and error line.
 
 ## Dependencies
 

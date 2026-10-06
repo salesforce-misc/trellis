@@ -31,6 +31,7 @@ pub mod ast;
 pub mod backfill;
 pub mod catalog;
 pub mod chunk_queue;
+pub(crate) mod copies;
 pub mod ddl;
 pub mod error;
 pub mod eval;

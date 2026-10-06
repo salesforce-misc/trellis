@@ -234,6 +234,17 @@ pub enum ApplyError {
     /// [`ApplyError::ColumnNotPaused`]'s same discipline for the
     /// column-level tier.
     TransformNotPaused { transform: String },
+    /// [`super::quarantine::resume_transform`] or
+    /// [`super::quarantine::resume_column`] re-ran define-time validation
+    /// against the live schema and it failed (#708, #760): define would
+    /// refuse the definition as the schema stands now, so a rebuild would
+    /// build from what it no longer matches. `reason` is define's own error,
+    /// naming the column and what to change. Nothing changed: the
+    /// definition (or field) stays paused.
+    ResumeRefused {
+        transform: String,
+        reason: Box<crate::defs::catalog::CatalogError>,
+    },
     /// [`from_side_rows_for_trigger_txn`] was asked to resolve a
     /// [`ReverseTrigger::WholeKeyspace`] against live, transactional full row
     /// images. Not reachable today — both of that function's call sites
@@ -302,6 +313,8 @@ impl ApplyError {
             ApplyError::Intake(err) => err.code(),
             ApplyError::TransformNotFound { .. } => ErrorCode::NotFound,
             ApplyError::TransformNotPaused { .. } => ErrorCode::Conflict,
+            // The schema blocks the request, as define's own refusal does.
+            ApplyError::ResumeRefused { reason, .. } => reason.code(),
         }
     }
 }
@@ -377,6 +390,11 @@ impl fmt::Display for ApplyError {
                 "'{transform}' is not currently paused; resuming it re-runs its full \
                  backfill, which is only valid from `paused` or `quarantined`"
             ),
+            ApplyError::ResumeRefused { transform, reason } => write!(
+                f,
+                "'{transform}' can't resume: define would refuse it as the schema stands now: \
+                 {reason}. It stays paused"
+            ),
             ApplyError::ReverseTriggerNotResolvable { from_table } => write!(
                 f,
                 "cannot resolve a whole-keyspace reverse trigger against live full row images \
@@ -407,6 +425,7 @@ impl std::error::Error for ApplyError {
             ApplyError::Db(err) => Some(err),
             ApplyError::Pool(err) => Some(err),
             ApplyError::Intake(err) => Some(err),
+            ApplyError::ResumeRefused { reason, .. } => Some(reason.as_ref()),
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }

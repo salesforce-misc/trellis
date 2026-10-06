@@ -227,8 +227,13 @@ until one of these releases it:
 
 * **Resume.** `RESUME TRANSFORM` deletes every key the transform holds (above)
   and re-derives every key from the source, so the parked work is superseded
-  rather than replayed. A key whose cause is still
-  there fails again, and is poisoned again.
+  rather than replayed. Before it does, it re-validates the transform against
+  the live schema and brings Trellis's typed copies of its key, passthrough,
+  `GROUP BY` and projection-key columns to their sources' live types
+  ([ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)),
+  so a key quarantined because a widened source value didn't fit a copy
+  (`22003`, `22001`) is rebuilt into the widened copy. A key whose cause is
+  still there fails again, and is poisoned again.
 * **Drop.** Dropping the transform deletes its held keys with its definition
   (`on delete cascade`), so defining it again starts with none.
 * **Per-key release.** `staging::quarantine::release_key(transform, src_table,

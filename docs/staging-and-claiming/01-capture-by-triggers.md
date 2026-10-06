@@ -208,9 +208,11 @@ its marker. The fold leaves markers out.
 record exists, capture doesn't count the definition's columns, so the next
 reconcile pass narrows the functions to what the other readers need and the
 markers stop; a column only an unused relationship or a projection still
-names is left out the same way. `RESUME TRANSFORM` deletes the record and
-rebuilds: once the column is back, the pass widens capture again under the
-join fence before the rebuild is dispatched.
+names is left out the same way. `RESUME TRANSFORM` re-validates the
+definition against the live schema as define would, and refuses while a
+column it reads is still missing; otherwise it deletes the record and
+rebuilds: the pass widens capture again under the join fence before the
+rebuild is dispatched.
 
 The reconcile pass doesn't wait for a marker either. Before it regenerates a
 table's functions, it pauses the same way every definition not yet paused
@@ -220,39 +222,73 @@ reads. That covers two orderings no marker would. A pass that runs between a
 primary-key rename and the table's next write would otherwise regenerate the
 functions keyed by the new name, so no write would ever mark the change and
 every drain would fail on rows keyed by a column the definitions don't know.
-And a definition resumed (or registered) while its column is still missing
-would otherwise wait to backfill forever, with the table's capture failing
-every pass and nothing on its status; instead it pauses again with its
-`capture_failure`. A pass that pauses leaves the table for the next pass.
+And a definition whose column goes missing between its resume (or
+registration) and the next pass would otherwise wait to backfill forever,
+with the table's capture failing every pass and nothing on its status;
+instead it pauses again with its `capture_failure`. A pass that pauses leaves the table for the next pass.
 
-## A re-typed key column
+## A re-typed key column, or an outgrown copy
 
 `ALTER COLUMN ... TYPE` rewrites the table but keeps its triggers, and the
 capture functions name columns in dynamic SQL, so capture goes on working
 over the new type: nothing marks the change. The rows the rewrite changes
 fire no trigger at all.
 
-So the same pass also checks every key column of the table: each
-definition's source key, its `GROUP BY` keys, and each relationship it reads
-through's join columns and to-side key (`defs::key_types`). Before it
-regenerates anything, it pauses a definition, with its `capture_failure`,
-when one of those columns now has a type or collation define would refuse
-for that use (a join column made `character(n)`, a nondeterministic
-`COLLATE` on a `GROUP BY` column), or when its type changed in a way that
-renders the values already stored differently (`timestamp` to `timestamptz`,
-`date` to `timestamp`, `text` to `uuid`). The second check compares against
-the type recorded in `definition_key_types` when the definition was
-accepted. A resume leaves that record alone, because the rebuild writes into
-the tables Trellis created from the old type, so the next pass pauses the
-definition again until the column is changed back. Routine changes don't
-fire: `integer` to `bigint`, any `varchar(n)` and `text` change, a `numeric`
-precision change or wider scale, a change between deterministic collations. A
-narrower `numeric` scale fires, since it rounds the stored values.
+So the same pass also checks, for every definition that reads the table,
+the columns it keys by there (its source key, its `GROUP BY` keys, and each
+relationship it reads through's join columns and to-side key) and the
+columns Trellis keeps a typed copy of (`defs::copies`: a 1-1 target's key and
+passthrough fields, an aggregate's `GROUP BY` columns in its target, ledger
+and group-delta table, and a to-one relationship projection's key). Before
+it regenerates anything, it pauses the definition, with its
+`capture_failure`, when
+
+1. a key column now has a type or collation define would refuse for that use
+   (a join column made `character(n)`, a nondeterministic `COLLATE` on a
+   `GROUP BY` column);
+2. a relationship it reads through no longer joins two columns of the same
+   type and modifier (one join column widened to `bigint`, the other not
+   yet);
+3. a key column's type changed in a way that renders the values already
+   stored differently: `timestamp` to `timestamptz`, `date` to `timestamp`,
+   `text` to `uuid`, a narrower `numeric` scale or temporal precision (the
+   rewrite rounds), or a narrower `varchar(n)` (the rewrite strips trailing
+   spaces past the new length). It compares against the type recorded in
+   `definition_key_types` when the definition was accepted or last resumed;
+   or
+4. a column it keeps a typed copy of widened past the copy: `integer` to
+   `bigint` under a 1-1 target's key, `varchar(50)` to `text` under a
+   passthrough, `integer` to `bigint` under a `GROUP BY` key. The copy's next
+   value that doesn't fit would fail its write.
+
+The reason names each column, its old and new type, and each copy, and says
+what to do. Nothing clears it but a deliberate `RESUME`, or a drop: Trellis
+re-types nothing on its own.
+
+Changes that need neither pause nothing: widening a key no copy holds (an
+aggregate's source key, which its ledger keys by text), a `GROUP BY` key's
+`varchar` widening or move to `text` (its copy is `text`), a `numeric`
+precision change or wider scale, or a wider timestamp precision, on a
+`GROUP BY` key (its copy is unconstrained), a narrowing every copy still
+holds, any change to a column read only as a field, and a change between
+deterministic collations (byte equality is unchanged, even across a join
+pair; define and a resume still require a pair's collations to match).
+
+A resume re-validates the definition as define would and refuses while the
+first two hold, naming the columns and what to change. Otherwise, if any of
+its copies no longer has the type define would give it from the live
+schema, the resume returns at once and leaves it paused with a resume
+request (`resume_requests`): the next pass re-types each such copy (`ALTER
+... TYPE`, one table per transaction, under `ACCESS EXCLUSIVE`, which
+rewrites the table for `integer` to `bigint`) and then completes the resume,
+which records the live key types and rebuilds. A crash between the two
+leaves the request, and the next pass finishes it.
 
 The pause doesn't stop a drain that reads a source key whose type is off the
 key allowlist: `staging::apply::compute` introspects every staged table's key
-before it asks which definitions apply, and halts on that type, as it did
-before #760. Changing the column back lets it continue.
+before it asks which definitions apply, and halts on that type (#663). The
+halt and the capture pass's pause both record a `capture_failure`, and the
+first one stands.
 
 ## Nested writes to the same key
 

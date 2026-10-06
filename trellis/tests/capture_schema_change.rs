@@ -22,7 +22,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::capture::install::{Installed, installed};
 use trellis::capture::reconcile;
 use trellis::defs::TransformStatus;
-use trellis::{CaptureFailureKind, Config, Trellis, TrellisOptions};
+use trellis::staging::apply::ApplyError;
+use trellis::{CaptureFailureKind, Config, Trellis, TrellisError, TrellisOptions};
 
 const SCHEMA: &str = "trellis";
 
@@ -957,11 +958,12 @@ async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
 }
 
 /// Resuming a definition while the column it reads is still missing: the
-/// next capture pass pauses it again, with the reason on its status, rather
-/// than leaving it waiting to backfill and the table's capture failing every
-/// pass. The other readers of the table keep applying.
+/// resume re-validates it as define would and refuses (#708), so it stays
+/// paused with its reason, rather than waiting to backfill with the
+/// table's capture failing every pass. The other readers of the table keep
+/// applying.
 #[tokio::test]
-async fn resuming_while_the_column_is_still_missing_pauses_again() {
+async fn resuming_while_the_column_is_still_missing_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -975,8 +977,12 @@ async fn resuming_while_the_column_is_still_missing_pauses_again() {
     let outcome = capture_pass(&mut raw, &db.pool).await;
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 
-    trellis.apply("RESUME TRANSFORM ta").await.expect("resume");
-    assert_eq!(status(&raw, "ta").await, TransformStatus::WaitingToBackfill);
+    match trellis.apply("RESUME TRANSFORM ta").await {
+        Err(TrellisError::Apply(ApplyError::ResumeRefused { reason, .. })) => {
+            assert!(reason.to_string().contains("'a'"), "{reason}");
+        }
+        other => panic!("expected the resume to be refused, got {other:?}"),
+    }
     let outcome = capture_pass(&mut raw, &db.pool).await;
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
     let reported = trellis.status("ta").await.expect("status").expect("ta");
@@ -1534,11 +1540,14 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
     );
 }
 
-/// Issue #663: resuming a halted closure before its cause is fixed rebuilds
-/// it, meets the same failure, and halts it again: a new episode, with its
-/// own stop. The members resume in any order, here downstream first.
+/// Issue #663 with #708: a member of a halted closure that reads the key
+/// define would refuse can't be resumed before the key is fixed. The resume
+/// re-validates it as define would and refuses, naming the type, and it
+/// stays paused with its halt record: the halt and the resume's validation
+/// compose, the first record standing. A member that doesn't read the key
+/// (downstream of one that does) passes the validation.
 #[tokio::test]
-async fn resuming_a_halted_closure_before_the_key_is_fixed_halts_it_again() {
+async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1555,47 +1564,29 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_halts_it_again() {
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(halting_stops(&db.pool).await, stops + 1);
 
-    for target in HALT_CLOSURE.iter().rev() {
-        trellis
-            .apply(&format!("RESUME TRANSFORM {target}"))
-            .await
-            .unwrap_or_else(|e| panic!("resume {target}: {e}"));
-    }
-    for round in 0..8 {
-        app.batch_execute(&format!(
-            "update public.users set name = 'Ann {round}' where handle = 'ann'"
-        ))
-        .await
-        .expect("write the halted table");
-        full_pass(&mut raw, &db.pool).await;
-        run_backfill_chunks(&db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
-    }
-    // Each member is paused again by whichever meets the key first: the
-    // drain's halt, or a build of its own that keeps failing (`users_copy`'s
-    // Re-derive build reads `users` by that key). At least one must be the
-    // drain's halt, or the second episode never happened.
-    let mut halted = 0;
-    for target in HALT_CLOSURE {
+    for target in ["posts_named", "users_copy"] {
+        match trellis.apply(&format!("RESUME TRANSFORM {target}")).await {
+            Err(TrellisError::Apply(ApplyError::ResumeRefused { reason, .. })) => {
+                assert!(
+                    reason.to_string().contains("character(8)"),
+                    "{target}: {reason}"
+                );
+            }
+            other => panic!("expected the resume of {target} to be refused, got {other:?}"),
+        }
         let reported = trellis.status(target).await.expect("status").expect(target);
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
-        let cause = match (&reported.capture_failure, &reported.backfill_failure) {
-            (Some(failure), _) => {
-                assert_eq!(failure.kind, CaptureFailureKind::Halt, "{target}");
-                halted += 1;
-                &failure.error
-            }
-            (None, Some(failure)) => &failure.last_error,
-            (None, None) => panic!("{target} is paused with no reason: {reported:?}"),
-        };
-        assert!(cause.contains("character(8)"), "{target}: {cause}");
+        assert_eq!(
+            reported.capture_failure.expect("the halt record").kind,
+            CaptureFailureKind::Halt,
+            "{target}"
+        );
     }
-    assert!(halted > 0, "no member was halted again by the drain");
-    assert_eq!(
-        halting_stops(&db.pool).await,
-        stops + 2,
-        "the second halt is a new episode"
-    );
+    trellis
+        .apply("RESUME TRANSFORM named_copy")
+        .await
+        .expect("named_copy reads no key define would refuse");
+    assert_eq!(halting_stops(&db.pool).await, stops + 1);
 }
 
 /// Issue #663: two workers draining different buckets of one page both meet
@@ -1872,13 +1863,15 @@ async fn a_to_side_key_retyped_off_the_allowlist_pauses_a_reader_waiting_for_its
         .apply("PAUSE TRANSFORM posts_named")
         .await
         .expect("pause the reader");
-    app.batch_execute("alter table public.users alter column handle type character(8)")
-        .await
-        .expect("retype the key");
+    // Registered first: define refuses a reader through a join column off
+    // the allowlist.
     trellis
         .apply("TRANSFORM posts_renamed FROM public.posts SELECT author.name AS name")
         .await
         .expect("register a second reader");
+    app.batch_execute("alter table public.users alter column handle type character(8)")
+        .await
+        .expect("retype the key");
     assert_eq!(
         status(&raw, "posts_renamed").await,
         TransformStatus::WaitingToBackfill
@@ -1965,6 +1958,11 @@ async fn a_page_that_skipped_a_to_side_misses_its_fence_after_a_reader_resumes()
         .await
         .expect("compute skips the to-side, every reader being paused");
 
+    // The resume re-validates against the live schema (#708), so the key is
+    // fixed first.
+    app.batch_execute("alter table public.users alter column handle type varchar(16)")
+        .await
+        .expect("fix the key");
     trellis
         .apply("RESUME TRANSFORM posts_named")
         .await

@@ -3584,9 +3584,17 @@ mod catch_up_tests {
             .await
             .expect("seed orders");
         relate_orders(&pool, &client).await;
+        // The live types: a resume re-validates against them and re-types
+        // a `GROUP BY` copy that doesn't match (#767).
         let columns = [
-            ("id", crate::defs::ValueType::Numeric),
-            ("g", crate::defs::ValueType::Numeric),
+            (
+                "id",
+                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
+            ),
+            (
+                "g",
+                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
+            ),
             ("a", crate::defs::ValueType::Numeric),
         ]
         .into_iter()
@@ -3998,9 +4006,17 @@ mod catch_up_tests {
             .await
             .expect("seed orders");
         relate_orders(&pool, &client).await;
+        // The live types: a resume re-validates against them and re-types
+        // a `GROUP BY` copy that doesn't match (#767).
         let columns: std::collections::HashMap<String, crate::defs::ValueType> = [
-            ("id", crate::defs::ValueType::Numeric),
-            ("g", crate::defs::ValueType::Numeric),
+            (
+                "id",
+                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
+            ),
+            (
+                "g",
+                crate::defs::ValueType::Integer(crate::integer::IntWidth::Int8),
+            ),
             ("a", crate::defs::ValueType::Numeric),
         ]
         .into_iter()

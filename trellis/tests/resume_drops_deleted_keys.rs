@@ -167,7 +167,7 @@ async fn status(client: &Client, target: &str) -> String {
 fn orders_columns() -> HashMap<String, ValueType> {
     [
         ("id", ValueType::Numeric),
-        ("g", ValueType::Numeric),
+        ("g", ValueType::Integer(trellis::integer::IntWidth::Int8)),
         ("a", ValueType::Numeric),
     ]
     .into_iter()
