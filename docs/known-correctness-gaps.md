@@ -581,10 +581,15 @@ again.
 **Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
 through a relationship (entry 16).
 
-**Planned work:** #838. The cause is unknown. It isn't the shape of #763's
-to-one projection ordering holes (an orphaned or missing projection key), and
-it needs no resume or build. Milestone E (#624) replaces the
-relationship projection a 1-1 target reads its to-one values from.
+**Planned work:** #838. The suspected cause, not yet confirmed against the
+generated case, is a page that re-derives a child (the recompute an earlier
+parent change staged). It evaluates the child against the projection it read
+before taking the child's entry lock, so if the recompute of a later parent
+change writes the child first, the page writes the older value over it. It
+isn't the shape of #763's to-one projection ordering holes (an orphaned or
+missing projection key), and it needs no resume or build. Milestone E (#624)
+replaces the relationship projection a 1-1 target reads its to-one values
+from.
 
 **Repair:** `PAUSE`/`RESUME` the transform.
 

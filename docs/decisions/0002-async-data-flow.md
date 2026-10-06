@@ -442,9 +442,9 @@ entry lock and in the same statement as the child's own read (I1).
   ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md)),
   under the entry lock like any 1-1 write. A field build's chunk over such a
   target (a column resume) reads the projection after the entry lock (I1):
-  a chunk can sit between its plan and its lock for long, and the page of a
-  parent change's recompute drained in between would otherwise be written
-  over with the chunk's older read.
+  a chunk can sit between its plan and its lock for a long time, and the
+  page of a parent change's recompute drained in between would otherwise be
+  written over with the chunk's older read.
 - **Replica identity is not a requirement on any table.** The ledger holds
   the group a child was last counted under, so a from-side FK re-point needs
   no pre-image, and a to-side change needs only its key. This replaces
