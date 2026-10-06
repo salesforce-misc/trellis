@@ -4675,6 +4675,90 @@ mod tests {
         assert_eq!(locked, keys, "every key is locked, in key order");
     }
 
+    /// Issue #793's sibling: the single-column key's delete
+    /// ([`delete_single_keys`]) reads the same stale target by the same
+    /// keys, so it starts no sequential scan of it either, and still deletes
+    /// every key.
+    #[tokio::test]
+    async fn the_single_column_delete_never_scans_a_stale_target() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table stale (id int primary key, total int) \
+                     with (autovacuum_enabled = false); \
+                 insert into stale select i, i from generate_series(1, 100) i; \
+                 analyze stale; \
+                 insert into stale select i, i from generate_series(101, 400000) i;",
+            )
+            .await
+            .expect("seed the target");
+        let table = "public.stale";
+        let pk = ddl::identity_key_columns(&client, table)
+            .await
+            .expect("identity");
+        let pk_ident = quote_ident(&pk[0].name);
+        let pk_cast = pk[0].data_type.as_str();
+        let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
+        let keys: Vec<String> = client
+            .query(
+                "select id::text from stale where total % 79 = 0 order by stale.id limit 5000",
+                &[],
+            )
+            .await
+            .expect("keys")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(keys.len(), 5000);
+        let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let sql = single_delete_statement(table, &pk_ident, pk_cast, &key_sql);
+        let txn = client.transaction().await.expect("begin");
+        let plan: String =
+            crate::staging::ledger::query_by_entry_key(&txn, &format!("explain {sql}"), &[&bound])
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(
+            !plan.contains("Seq Scan"),
+            "the delete must not scan the target, got:\n{plan}"
+        );
+        let seq_scans = "select seq_scan from pg_stat_xact_user_tables \
+                         where relid = $1::text::regclass";
+        let before: i64 = txn
+            .query_one(seq_scans, &[&table])
+            .await
+            .expect("scans")
+            .get(0);
+        let deleted: std::collections::HashSet<String> =
+            delete_single_keys(&txn, table, &pk_ident, pk_cast, &key_sql, &bound)
+                .await
+                .expect("delete")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+        let after: i64 = txn
+            .query_one(seq_scans, &[&table])
+            .await
+            .expect("scans")
+            .get(0);
+        assert_eq!(
+            after, before,
+            "the delete must not scan the target, as its plan above doesn't"
+        );
+        txn.rollback().await.expect("rollback");
+        assert_eq!(deleted, keys.into_iter().collect(), "every key is deleted");
+    }
+
     /// Issue #531: only a record at or below its relationship's refresh
     /// stamp takes the live-row check. A relationship never refreshed, or a
     /// record above the stamp (every change after the refresh), reads
@@ -7372,6 +7456,38 @@ async fn lock_single_keys(
     .await
 }
 
+/// [`apply_target`]'s delete for a single-column key: the target rows of the
+/// bound `text[]` keys at `$1`, `returning` the key text `returning`.
+fn single_delete_statement(
+    target_ident: &str,
+    pk_ident: &str,
+    pk_cast: &str,
+    returning: &str,
+) -> String {
+    format!(
+        "delete from {target_ident} as t \
+         where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
+         returning {returning} as pk"
+    )
+}
+
+/// Runs [`single_delete_statement`] over `keys`, and returns the deleted
+/// keys' rows.
+async fn delete_single_keys(
+    txn: &Transaction<'_>,
+    target_ident: &str,
+    pk_ident: &str,
+    pk_cast: &str,
+    returning: &str,
+    keys: &[&str],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    txn.query(
+        &single_delete_statement(target_ident, pk_ident, pk_cast, returning),
+        &[&keys],
+    )
+    .await
+}
+
 /// [`apply_target`]'s pre-lock for a composite key (issue #121): the target
 /// rows of a bound keyset relation ([`pk_keyset_unnest`] at `$1`), `select`ing
 /// `columns`, locked `for update of t` in key order. No one column's `=
@@ -8148,13 +8264,13 @@ async fn apply_target(
             let pk_ident = &pk_idents[0];
             let pk_cast = plan.pk[0].data_type.as_str();
             let delete_keys: Vec<&str> = delete_key_parts.iter().map(|p| p[0].as_str()).collect();
-            txn.query(
-                &format!(
-                    "delete from {target_ident} as t \
-                     where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
-                     returning {returning_pk_expr} as pk"
-                ),
-                &[&delete_keys],
+            delete_single_keys(
+                txn,
+                &target_ident,
+                pk_ident,
+                pk_cast,
+                &returning_pk_expr,
+                &delete_keys,
             )
             .await?
         } else {
