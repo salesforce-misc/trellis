@@ -15,7 +15,8 @@
 //! | any error's `code()` + `Display` | `(code, message)` | [`PlainError`] |
 //! | [`trellis::Definition`] | summary fields + column name → type name | [`PlainDefinition`] |
 //! | [`trellis::DefinitionSummary`] | summary fields + backfill failure + halt | [`PlainDefinitionSummary`] |
-//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure | [`PlainDefinitionStatus`] |
+//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys | [`PlainDefinitionStatus`] |
+//! | [`trellis::HeldKeys`] | count + oldest poison time | [`PlainHeldKeys`] |
 //! | [`trellis::CaptureFailureKind`] | its `as_str()` word | [`PlainCaptureFailure::kind`] / [`capture_failure_kind_names`] |
 //! | `SystemTime` | epoch microseconds | [`epoch_micros`] / [`system_time_from_epoch_micros`] |
 //! | [`trellis::TransformStatus`] / [`trellis::QuarantineState`] | their `as_str()` word | [`transform_status`] / [`quarantine_state`] |
@@ -28,7 +29,7 @@
 //! | [`trellis::PoisonEntry`] | fields + poison time | [`PlainPoisonEntry`] |
 //! | a page of [`trellis::PoisonSample`] | the rows + the next page's cursor | [`PlainSamplePage`] |
 //! | `watermark_token`'s `PgLsn` | an opaque string | [`encode_watermark`] / [`decode_watermark`] |
-//! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word | [`PlainSelfCheckReport`] |
+//! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word + held keys | [`PlainSelfCheckReport`] |
 //! | [`trellis::SelfCheckMode`] (an argument) | its word | [`self_check_mode`] |
 //! | [`trellis::Config`] | its fields but the DSN (which can carry a password), the pool timeout in milliseconds | [`PlainConfig`] |
 //!
@@ -73,7 +74,8 @@ pub use log::{
     install_log_bridge, installed_log_bridge,
 };
 pub use quarantine::{
-    PlainPoisonEntry, PlainPoisonSample, PlainQuarantineEntry, PlainSamplePage, quarantine_address,
+    PlainHeldKeys, PlainPoisonEntry, PlainPoisonSample, PlainQuarantineEntry, PlainSamplePage,
+    quarantine_address,
 };
 pub use relationship::{
     PlainRelationship, PlainRelationshipSummary, relationship_cardinality_names,

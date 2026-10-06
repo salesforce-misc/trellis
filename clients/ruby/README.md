@@ -63,6 +63,9 @@ Nothing in the binding uses it.
   `Trellis.sample_quarantined(target, limit:, after:)`,
   `Trellis.poisoned_since(time)`: the quarantine reads. Resuming is a
   statement: `Trellis.apply("RESUME TRANSFORM order_totals.total")`.
+  `Trellis.release_key(transform, source_table, key)` releases one key a
+  transform holds, once its cause is fixed; `status` reports how many it
+  holds (`held_keys`).
 - `Trellis.request_backfill(source_table)`,
   `Trellis.has_live_drain_workers?`, `Trellis.has_live_staging_worker?`,
   `Trellis.watermark_token`, `Trellis.await_converged(token, timeout_ms:)`.

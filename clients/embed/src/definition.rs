@@ -21,7 +21,7 @@ use trellis::{
     DefinitionSummary,
 };
 
-use crate::{epoch_micros, transform_status};
+use crate::{PlainHeldKeys, epoch_micros, transform_status};
 
 /// A [`Definition`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +111,9 @@ pub struct PlainDefinitionStatus {
     /// Set while capture of a table the definition reads is broken; see
     /// [`DefinitionStatus::capture_failure`].
     pub capture_failure: Option<PlainCaptureFailure>,
+    /// Set while the definition holds keys in quarantine; see
+    /// [`DefinitionStatus::held_keys`].
+    pub held_keys: Option<PlainHeldKeys>,
 }
 
 /// A [`CaptureWait`] flattened to plain data.
@@ -172,6 +175,7 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .capture_failure
                 .as_ref()
                 .map(PlainCaptureFailure::from),
+            held_keys: status.held_keys.as_ref().map(PlainHeldKeys::from),
         }
     }
 }
@@ -377,6 +381,7 @@ mod tests {
             backfill_failure: None,
             capture_wait: None,
             capture_failure: None,
+            held_keys: None,
         };
 
         assert_eq!(
@@ -386,7 +391,30 @@ mod tests {
                 backfill_failure: None,
                 capture_wait: None,
                 capture_failure: None,
+                held_keys: None,
             }
+        );
+    }
+
+    #[test]
+    fn held_keys_cross_with_their_oldest_poison_time_in_microseconds() {
+        let status = DefinitionStatus {
+            status: TransformStatus::Live,
+            backfill_failure: None,
+            capture_wait: None,
+            capture_failure: None,
+            held_keys: Some(trellis::HeldKeys {
+                count: 3,
+                oldest_poisoned_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
+            }),
+        };
+
+        assert_eq!(
+            PlainDefinitionStatus::from(&status).held_keys,
+            Some(PlainHeldKeys {
+                count: 3,
+                oldest_poisoned_at_micros: 1_727_222_400_654_321,
+            })
         );
     }
 
@@ -402,6 +430,7 @@ mod tests {
             }),
             capture_wait: None,
             capture_failure: None,
+            held_keys: None,
         };
 
         assert_eq!(
@@ -416,6 +445,7 @@ mod tests {
                 }),
                 capture_wait: None,
                 capture_failure: None,
+                held_keys: None,
             }
         );
     }
@@ -441,6 +471,7 @@ mod tests {
                 error: "capture of public.lines needs column \"qty\"".to_string(),
                 detected_at: at(1_727_222_400_000_003),
             }),
+            held_keys: None,
         };
 
         let plain = PlainDefinitionStatus::from(&status);

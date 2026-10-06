@@ -42,7 +42,7 @@ end
 #   refuses anything but a TRANSFORM statement before applying it.
 # - Reads: status, definitions, relationships.
 # - Quarantine: quarantined, quarantine_status, sample_quarantined,
-#   poisoned_since. Pausing and resuming are statements:
+#   poisoned_since, release_key. Pausing and resuming are statements:
 #   Trellis.apply("RESUME TRANSFORM order_totals.total").
 # - Operations: request_backfill, has_live_drain_workers?,
 #   has_live_staging_worker?, the read-your-writes pair watermark_token and
@@ -229,6 +229,28 @@ module Trellis
     def request_backfill(source_table)
       string!("the source table", source_table)
       handle.request_backfill(source_table)
+      nil
+    end
+
+    # Releases one key `transform` holds in quarantine, once its cause is
+    # fixed. source_table ("public.orders" or "orders") and key are as
+    # sample_quarantined and poisoned_since report them.
+    #
+    # It stages a recompute of the key, which every transform reading the
+    # table applies from the key's current row, and discards the changes held
+    # for `transform` meanwhile. Another transform holding the same key keeps
+    # holding it. If the cause is still there, the key is poisoned again.
+    # Resuming the transform releases every key it holds.
+    #
+    # An unknown transform raises NotFoundError, and so does a key it doesn't
+    # hold, which changes nothing.
+    #
+    #   Trellis.release_key("order_totals", "public.orders", "42")
+    def release_key(transform, source_table, key)
+      string!("the transform", transform)
+      string!("the source table", source_table)
+      string!("the key", key)
+      handle.release_key(transform, source_table, key)
       nil
     end
 

@@ -450,6 +450,34 @@ defmodule Trellis do
     do: bang(sample_quarantined(trellis, target, options))
 
   @doc """
+  Releases one key `transform` holds in quarantine, once its cause is fixed.
+  `source_table` (`"public.orders"` or `"orders"`) and `key` are as
+  `sample_quarantined/3` and `poisoned_since/2` report them.
+
+  It stages a recompute of the key, which every transform reading the table
+  applies from the key's current row, and discards the changes held for
+  `transform` meanwhile. Another transform holding the same key keeps
+  holding it. If the cause is still there, the key is poisoned again.
+  Resuming the transform releases every key it holds.
+
+  An unknown `transform` is a `:not_found` error, and so is a key it doesn't
+  hold, which changes nothing.
+
+      :ok = Trellis.release_key(trellis, "order_totals", "public.orders", "42")
+  """
+  @spec release_key(trellis(), String.t(), String.t(), String.t()) :: :ok | {:error, Error.t()}
+  def release_key(trellis, transform, source_table, key)
+      when is_trellis(trellis) and is_binary(transform) and is_binary(source_table) and
+             is_binary(key) do
+    unit(run(trellis, :release_key, [transform, source_table, key]))
+  end
+
+  @doc "Like `release_key/4`, but raises `Trellis.Error`."
+  @spec release_key!(trellis(), String.t(), String.t(), String.t()) :: :ok
+  def release_key!(trellis, transform, source_table, key),
+    do: bang(release_key(trellis, transform, source_table, key))
+
+  @doc """
   Whether at least one drain worker is alive anywhere in the fleet. With
   none, nothing reaches a target table: poll this from a health check.
   """

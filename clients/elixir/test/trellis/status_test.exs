@@ -20,7 +20,8 @@ defmodule Trellis.StatusTest do
           next_attempt_at_micros: 1_727_222_400_654_321
         },
         capture_wait: nil,
-        capture_failure: nil
+        capture_failure: nil,
+        held_keys: nil
       })
 
     assert %Trellis.Status{
@@ -36,7 +37,7 @@ defmodule Trellis.StatusTest do
     assert next_attempt_at == ~U[2024-09-25 00:00:00.654321Z]
   end
 
-  test "a capture wait and failure become structs with DateTimes" do
+  test "a capture wait, a capture failure and held keys become structs with DateTimes" do
     status =
       Trellis.Status.from_native(%{
         status: :catching_up,
@@ -55,7 +56,8 @@ defmodule Trellis.StatusTest do
           columns: ["qty"],
           error: "column \"qty\" was dropped",
           detected_at_micros: 1_727_222_400_654_321
-        }
+        },
+        held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323}
       })
 
     assert %Trellis.Status{
@@ -75,6 +77,10 @@ defmodule Trellis.StatusTest do
                columns: ["qty"],
                error: "column \"qty\" was dropped",
                detected_at: ~U[2024-09-25 00:00:00.654321Z]
+             },
+             held_keys: %Trellis.HeldKeys{
+               count: 2,
+               oldest_poisoned_at: ~U[2024-09-25 00:00:00.654323Z]
              }
            } = status
   end

@@ -52,6 +52,7 @@ defmodule Trellis.Parity do
       "definitions" => plain,
       "relationships" => plain,
       "request_backfill" => plain,
+      "release_key" => plain,
       "poisoned_since" => plain,
       "quarantined" => plain,
       "quarantine_status" => plain,
@@ -91,7 +92,14 @@ defmodule Trellis.Parity do
 
   # The calls whose success is a bare `:ok` (Ruby's `nil`). Every other
   # call's success is `{:ok, value}`.
-  @unit_ops ["connect", "migrate", "request_backfill", "await_converged", "shutdown"]
+  @unit_ops [
+    "connect",
+    "migrate",
+    "request_backfill",
+    "release_key",
+    "await_converged",
+    "shutdown"
+  ]
 
   @doc """
   What operation `op` returned, in the fixture's canonical form. The envelope

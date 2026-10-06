@@ -61,6 +61,8 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 - `status/2`, `definitions/1`, `relationships/1`: the catalog reads.
 - `quarantined/1`, `quarantine_status/2`, `sample_quarantined/3`,
   `poisoned_since/2`: the quarantine reads. Resuming is a statement.
+  `release_key/4` releases one key a transform holds, once its cause is
+  fixed; `status/2` reports how many it holds (`held_keys`).
 - `request_backfill/2`, `has_live_drain_workers/1`,
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
 - `self_check/3`: audit one page of a target against a fresh recompute from

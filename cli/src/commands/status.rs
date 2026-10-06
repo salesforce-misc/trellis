@@ -148,6 +148,10 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
             entry.transform, entry.src_table, entry.key, entry.last_error
         ));
     }
+    out.push_str(
+        "  Fix the cause, then release a key with \
+         `trellis release <transform> <table> <key>`.\n",
+    );
     out
 }
 

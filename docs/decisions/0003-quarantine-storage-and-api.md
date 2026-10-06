@@ -158,6 +158,14 @@ Three calls, separated by cost:
 A fourth read, `poisoned_since`, lists the poisoned keys recorded since a
 watermark, each with the transform it's held for.
 
+`status` reports, per transform, the keys it holds (`held_keys`: how many, and
+the oldest `poisoned_at`), and `self_check` reports the same with every audit
+(see [Releasing held keys](#releasing-held-keys)). The keys themselves are
+sampled through read 3, not a second sampling call.
+
+One write sits beside the reads: `release_key` releases one held key (see
+[Releasing held keys](#releasing-held-keys)).
+
 ## Fuse: per-column, then transform-wide
 
 Per-row quarantine assumes failures are the exception. When a large fraction of
@@ -236,13 +244,50 @@ until one of these releases it:
   still there fails again, and is poisoned again.
 * **Drop.** Dropping the transform deletes its held keys with its definition
   (`on delete cascade`), so defining it again starts with none.
-* **Per-key release.** `staging::quarantine::release_key(transform, src_table,
-  key)` deletes the transform's rows for the key and stages one image-less
-  `Recompute` of it, which re-derives the key from its current row, including
-  the to-one projection rewrite of #754. The `Recompute` reaches every reader of
+* **Per-key release.** `Trellis::release_key(transform, source_table, key)`
+  (the CLI's `trellis release`, and `release_key` in each binding) releases one
+  key once its cause is fixed. It takes the transform's bare target, as
+  `status` does, and the source table and key as `sample_quarantined` reports
+  them, the table in either spelling (#283). In one transaction it deletes the
+  transform's `poison`, `poison_held` and `key_deaths` rows for the key and
+  stages one image-less `Recompute` of it, which re-derives the key from its
+  current row, including the to-one projection rewrite of #754. The parked
+  changes are discarded, not replayed. The `Recompute` reaches every reader of
   the table: one that doesn't hold the key re-derives it, which is idempotent,
-  and one that does parks it. It is test-only (`internals`); a public release
-  that also reports held keys in `status` is #759.
+  and one that does parks it. If the cause is still there, the `Recompute`
+  fails as the changes before it did, and the key is poisoned again once its
+  fresh death count reaches the threshold. An unknown transform is
+  `TransformNotFound`, and a key the transform doesn't hold (a table it doesn't
+  read, a key it never held or one already released) is `KeyNotHeld`; both are
+  `not_found`, and neither changes anything.
+
+The release is purely operational, like `status`, so it is a call of its own
+rather than a statement of `apply`'s grammar: releasing a key changes nothing
+about the desired transforms.
+
+The release serializes with everything else that writes a transform's held
+keys:
+
+* **A drain page** parks a change for a held key in its apply's transaction,
+  holding the version fence of the key's table `for share` from its first lock
+  to its commit. The release's first lock is a bump of that fence (#744's rule
+  for a fence bump), so it waits for every such page and then reads the key's
+  rows, the page's parked change among them. A page computed before the release
+  that applies after it misses its fence and computes again, finding the key
+  no longer held. No page parks a change for a key after its release, which
+  would leave a held row no release names (ADR-0002 I1).
+* **An eviction**, a resume and a drop each take the transform's row first
+  (`for no key update`, `for update` and the delete), and so does the release,
+  before it reads the key's rows. An eviction that commits first is released
+  with the rest; a resume or drop that commits first leaves nothing held, and
+  the release is refused.
+
+A held key is visible wherever its transform's state is read. `status` reports
+`held_keys` (the count and the oldest `poisoned_at`) whatever the transform's
+status, `live` included, and `self_check` reports the same with every audit,
+whatever its outcome: a held key's target row is one the audit can't vouch
+for, and a key with parked changes holds back convergence, so the audit
+reports `not_caught_up` until it is released.
 
 ## Retry policy
 

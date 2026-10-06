@@ -12,7 +12,7 @@
 
 use trellis::{Divergence, ErrorCode, SelfCheckMode, SelfCheckOutcome, SelfCheckReport};
 
-use crate::{PlainError, encode_watermark};
+use crate::{PlainError, PlainHeldKeys, encode_watermark};
 
 /// Every word [`PlainSelfCheckReport::outcome`] can be.
 pub const SELF_CHECK_OUTCOMES: [&str; 3] = ["converged", "not_caught_up", "diverged"];
@@ -60,6 +60,9 @@ pub struct PlainSelfCheckReport {
     pub outcome: &'static str,
     /// What diverged; empty unless `outcome` is `diverged`.
     pub divergences: Vec<PlainDivergence>,
+    /// The keys the audited definition holds in quarantine, whatever the
+    /// outcome; see [`SelfCheckReport::held_keys`].
+    pub held_keys: Option<PlainHeldKeys>,
 }
 
 /// One [`Divergence`] flattened to plain data. `kind` is one of
@@ -102,6 +105,7 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
             next_after: report.next_after.clone(),
             outcome,
             divergences,
+            held_keys: report.held_keys.as_ref().map(PlainHeldKeys::from),
         }
     }
 }
@@ -166,6 +170,7 @@ mod tests {
             rows_compared: 42,
             next_after: Some("42".to_string()),
             outcome,
+            held_keys: None,
         }
     }
 
@@ -182,12 +187,30 @@ mod tests {
                 next_after: Some("42".to_string()),
                 outcome: "converged",
                 divergences: Vec::new(),
+                held_keys: None,
             }
         );
         // The position is a real watermark token, so a host can wait on it.
         assert_eq!(
             decode_watermark(&plain.checked_through).unwrap(),
             PgLsn::from(0x1_016B_3748)
+        );
+    }
+
+    #[test]
+    fn held_keys_cross_with_any_outcome() {
+        let mut held = report(SelfCheckOutcome::NotCaughtUp);
+        held.held_keys = Some(trellis::HeldKeys {
+            count: 2,
+            oldest_poisoned_at: std::time::UNIX_EPOCH
+                + std::time::Duration::from_micros(1_727_222_400_000_001),
+        });
+        assert_eq!(
+            PlainSelfCheckReport::from(&held).held_keys,
+            Some(PlainHeldKeys {
+                count: 2,
+                oldest_poisoned_at_micros: 1_727_222_400_000_001,
+            })
         );
     }
 

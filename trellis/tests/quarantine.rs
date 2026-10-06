@@ -3023,7 +3023,9 @@ async fn a_held_key_is_left_out_of_a_relationship_whose_every_reader_is_frozen()
 /// (or a resume, rule 5) that lands in between deletes the key's `poison`
 /// and `poison_held` rows, and re-derives the key from its live row. The page
 /// must then park nothing: a held row for a key nothing holds is named by no
-/// release, and blocks every watermark token from then on.
+/// release, and blocks every watermark token from then on. The release bumps
+/// the key's table's version fence (#759), so the page computed before it
+/// misses its fence, and the page computed again finds the key released.
 #[tokio::test]
 async fn a_page_parks_nothing_for_a_key_released_after_it_was_computed() {
     use trellis::staging::{claim, fold};
@@ -3061,6 +3063,25 @@ async fn a_page_parks_nothing_for_a_key_released_after_it_was_computed() {
 
     let mut phase3 = db.pool.get().await.expect("connection");
     let txn = phase3.transaction().await.expect("begin phase 3");
+    let stale = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "worker",
+        &plan,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    assert!(
+        matches!(stale, Err(ApplyError::VersionFenceMiss { .. })),
+        "the release bumped the fence the page was computed under: {stale:?}"
+    );
+    txn.rollback().await.expect("roll back the stale page");
+
+    let plan = apply::compute(&db.pool, &folded)
+        .await
+        .expect("compute again");
+    let txn = phase3.transaction().await.expect("begin phase 3 again");
     apply::apply_and_mark_drained(
         &txn,
         seg_seq,

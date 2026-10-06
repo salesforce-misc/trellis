@@ -10,7 +10,7 @@
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is
 //! just the top-level usage/help and the match that dispatches to one.
-//! Today that's `apply`, `run`, and `status`.
+//! Today that's `apply`, `run`, `status` and `release`.
 
 mod commands;
 mod connection;
@@ -25,6 +25,8 @@ Commands:
                        PAUSE, RESUME or DROP. (`define` is a deprecated alias.)
   run                 Run the live CDC/apply pipeline until interrupted.
   status              Print registered definitions/relationships and exit.
+  release <TRANSFORM> <SOURCE_TABLE> <KEY>
+                      Release one key a transform holds in quarantine.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
@@ -83,6 +85,7 @@ fn run(mut args: Vec<String>) -> ExitCode {
         "apply" | "define" => run_apply(args, database_url),
         "run" => run_run(args, database_url),
         "status" => run_status(args, database_url),
+        "release" => run_release(args, database_url),
         _ if wants_help(std::slice::from_ref(&command)) => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -163,6 +166,43 @@ fn run_run(args: Vec<String>, database_url: Option<String>) -> ExitCode {
     };
 
     match runtime.block_on(commands::run::run(parsed, database_url)) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Dispatches `trellis release`: handles `-h`/`--help` itself (so it works
+/// without a database connection), otherwise parses the three positional
+/// arguments and releases the key on a single-use tokio runtime.
+fn run_release(args: Vec<String>, database_url: Option<String>) -> ExitCode {
+    if wants_help(&args) {
+        print!("{}", commands::release::USAGE);
+        return ExitCode::SUCCESS;
+    }
+
+    let parsed = match commands::release::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: failed to start async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(commands::release::run(parsed, database_url)) {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS

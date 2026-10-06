@@ -71,16 +71,34 @@ module Trellis
   #   or, with kind :halt, a failure no retry gets past reached it, so the
   #   drain paused it and what depends on it (resume it once fixed). A
   #   definition an operator paused has none.
+  # - held_keys: it holds keys in quarantine (a HeldKeys): source keys whose
+  #   changes kept failing in its apply, so it leaves them out and their
+  #   target rows stay as they were, whatever its status, :live included.
+  #   Trellis.sample_quarantined lists them, and Trellis.release_key releases
+  #   one once its cause is fixed.
   # Every process sees them, whichever one runs the staging worker.
-  Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure) do
+  Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
+                       :held_keys) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
       capture_failure = hash[:capture_failure]
+      held_keys = hash[:held_keys]
       new(status: hash[:status],
           backfill_failure: failure && BackfillFailure.from_native(failure),
           capture_wait: wait && CaptureWait.from_native(wait),
-          capture_failure: capture_failure && CaptureFailure.from_native(capture_failure))
+          capture_failure: capture_failure && CaptureFailure.from_native(capture_failure),
+          held_keys: held_keys && HeldKeys.from_native(held_keys))
+    end
+  end
+
+  # The keys a definition holds in quarantine, as Trellis.status and
+  # Trellis.self_check report them: how many (count), and when the one held
+  # longest was last poisoned (oldest_poisoned_at, a Time).
+  HeldKeys = Data.define(:count, :oldest_poisoned_at) do
+    def self.from_native(hash)
+      new(count: hash.fetch(:count),
+          oldest_poisoned_at: EpochMicros.to_time(hash.fetch(:oldest_poisoned_at_micros)))
     end
   end
 
@@ -249,10 +267,16 @@ module Trellis
   #   sweep can end on a page that compares nothing.
   # - checked_through: the watermark the outcome holds through, a token
   #   Trellis.await_converged takes.
+  # - held_keys: whatever the outcome, a HeldKeys while the transform holds
+  #   keys in quarantine, nil otherwise. Their target rows are ones the audit
+  #   can't vouch for, and a key with held changes keeps the target from
+  #   catching up, so the outcome is :not_caught_up until it is released.
   SelfCheckReport = Data.define(:target, :outcome, :divergences, :rows_compared, :next_after,
-                                :checked_through) do
+                                :checked_through, :held_keys) do
     def self.from_native(hash)
-      new(**hash, divergences: hash.fetch(:divergences).map { |d| Divergence.new(**d) })
+      held_keys = hash[:held_keys]
+      new(**hash, divergences: hash.fetch(:divergences).map { |d| Divergence.new(**d) },
+                  held_keys: held_keys && HeldKeys.from_native(held_keys))
     end
   end
 

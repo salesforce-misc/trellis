@@ -17,6 +17,10 @@ defmodule Trellis.SelfCheckReport do
     can end on a page that compares nothing.
   - `checked_through` is the watermark the outcome holds through, a token
     `Trellis.await_converged/3` takes.
+  - `held_keys` is set, whatever the outcome, while the transform holds keys
+    in quarantine (see `Trellis.HeldKeys`): their target rows are ones the
+    audit can't vouch for, and a key with held changes keeps the target from
+    catching up, so the outcome is `:not_caught_up` until it is released.
   """
 
   @typedoc "The verdict of one `Trellis.self_check/3` page."
@@ -31,10 +35,19 @@ defmodule Trellis.SelfCheckReport do
           divergences: [Trellis.Divergence.t()],
           rows_compared: non_neg_integer(),
           next_after: cursor() | nil,
-          checked_through: Trellis.watermark()
+          checked_through: Trellis.watermark(),
+          held_keys: Trellis.HeldKeys.t() | nil
         }
 
-  @enforce_keys [:target, :outcome, :divergences, :rows_compared, :next_after, :checked_through]
+  @enforce_keys [
+    :target,
+    :outcome,
+    :divergences,
+    :rows_compared,
+    :next_after,
+    :checked_through,
+    :held_keys
+  ]
   defstruct @enforce_keys
 
   @doc false
@@ -45,7 +58,8 @@ defmodule Trellis.SelfCheckReport do
       divergences: Enum.map(divergences, &Trellis.Divergence.from_native/1),
       rows_compared: report.rows_compared,
       next_after: report.next_after,
-      checked_through: report.checked_through
+      checked_through: report.checked_through,
+      held_keys: report.held_keys && Trellis.HeldKeys.from_native(report.held_keys)
     }
   end
 end

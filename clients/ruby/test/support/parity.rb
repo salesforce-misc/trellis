@@ -35,6 +35,7 @@ module Parity
     "definitions" => ->(_args, _opts) { Trellis.definitions },
     "relationships" => ->(_args, _opts) { Trellis.relationships },
     "request_backfill" => ->(args, _opts) { Trellis.request_backfill(*args) },
+    "release_key" => ->(args, _opts) { Trellis.release_key(*args) },
     "poisoned_since" => ->(args, _opts) { Trellis.poisoned_since(*args) },
     "quarantined" => ->(_args, _opts) { Trellis.quarantined },
     "quarantine_status" => ->(args, _opts) { Trellis.quarantine_status(*args) },

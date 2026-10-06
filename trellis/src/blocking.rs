@@ -63,6 +63,12 @@ enum Job {
         i64,
         oneshot::Sender<Result<Vec<PoisonSample>, TrellisError>>,
     ),
+    ReleaseKey(
+        String,
+        String,
+        String,
+        oneshot::Sender<Result<(), TrellisError>>,
+    ),
     HasLiveDrainWorkers(oneshot::Sender<Result<bool, TrellisError>>),
     HasLiveStagingWorker(oneshot::Sender<Result<bool, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
@@ -255,6 +261,22 @@ impl BlockingTrellis {
         self.submit(|reply| Job::SampleQuarantined(target, after, limit, reply))
     }
 
+    /// Releases one key `transform` holds in quarantine, re-deriving it from
+    /// its current row. See [`Trellis::release_key`].
+    pub fn release_key(
+        &self,
+        transform: &str,
+        source_table: &str,
+        key: &str,
+    ) -> Result<(), TrellisError> {
+        let (transform, source_table, key) = (
+            transform.to_string(),
+            source_table.to_string(),
+            key.to_string(),
+        );
+        self.submit(|reply| Job::ReleaseKey(transform, source_table, key, reply))
+    }
+
     /// Whether at least one live drain worker is registered anywhere in
     /// this fleet right now — the health-check-shaped read a Phoenix/Rails
     /// host is meant to poll on a timer. See
@@ -438,6 +460,9 @@ async fn run(
             }
             Job::SampleQuarantined(target, after, limit, reply) => {
                 let _ = reply.send(trellis.sample_quarantined(&target, after, limit).await);
+            }
+            Job::ReleaseKey(transform, source_table, key, reply) => {
+                let _ = reply.send(trellis.release_key(&transform, &source_table, &key).await);
             }
             Job::HasLiveDrainWorkers(reply) => {
                 let _ = reply.send(trellis.has_live_drain_workers().await);

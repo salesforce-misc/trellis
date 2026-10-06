@@ -234,6 +234,18 @@ pub enum ApplyError {
     /// [`ApplyError::ColumnNotPaused`]'s same discipline for the
     /// column-level tier.
     TransformNotPaused { transform: String },
+    /// [`super::quarantine::release_key`] was asked to release a key the
+    /// transform doesn't hold: no `poison` or `poison_held` row of the
+    /// transform names that source table and key, in either spelling of the
+    /// table. Releasing a key that isn't held is caller error, not a silent
+    /// no-op, as resuming a column that isn't paused is
+    /// ([`ApplyError::ColumnNotPaused`]). It covers a table the transform
+    /// doesn't read and a key it never held alike.
+    KeyNotHeld {
+        transform: String,
+        src_table: String,
+        key: String,
+    },
     /// [`super::quarantine::resume_transform`] or
     /// [`super::quarantine::resume_column`] re-ran define-time validation
     /// against the live schema and it failed (#708, #760): define would
@@ -313,6 +325,7 @@ impl ApplyError {
             ApplyError::Intake(err) => err.code(),
             ApplyError::TransformNotFound { .. } => ErrorCode::NotFound,
             ApplyError::TransformNotPaused { .. } => ErrorCode::Conflict,
+            ApplyError::KeyNotHeld { .. } => ErrorCode::NotFound,
             // The schema blocks the request, as define's own refusal does.
             ApplyError::ResumeRefused { reason, .. } => reason.code(),
         }
@@ -390,6 +403,14 @@ impl fmt::Display for ApplyError {
                 "'{transform}' is not currently paused; resuming it re-runs its full \
                  backfill, which is only valid from `paused` or `quarantined`"
             ),
+            ApplyError::KeyNotHeld {
+                transform,
+                src_table,
+                key,
+            } => write!(
+                f,
+                "'{transform}' holds no key {key:?} of '{src_table}' in quarantine"
+            ),
             ApplyError::ResumeRefused { transform, reason } => write!(
                 f,
                 "'{transform}' can't resume: define would refuse it as the schema stands now: \
@@ -437,6 +458,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::ColumnAwaitingCapture { .. }
             | ApplyError::TransformNotFound { .. }
             | ApplyError::TransformNotPaused { .. }
+            | ApplyError::KeyNotHeld { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. }
             | ApplyError::TruncateWithoutLsn { .. } => None,
         }
@@ -3044,7 +3066,6 @@ async fn apply_projection_from_live(
 /// refresh stamp is locked `for share` first and the projection rows `for
 /// update` in key order, the order a drain takes them (ADR-0002 I5), and the
 /// rows are stamped with the release's WAL position.
-#[cfg(any(test, feature = "internals"))]
 pub(crate) async fn release_to_one_projections(
     pool: &Pool,
     txn: &Transaction<'_>,

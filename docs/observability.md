@@ -258,6 +258,15 @@ install that failed for a reason other than a lock, which is retried every pass.
 worker records both in the catalog, so every process's `status()` reports them, wherever
 the worker runs.
 
+`held_keys` on `DefinitionStatus` is set while the transform holds source keys in
+quarantine, whatever its status: how many, and when the one held longest was poisoned.
+A held key's target row stays as it was, and a key with changes parked holds back every
+watermark token taken since, so `await_converged` and `self_check` don't converge past it
+until it is released. `self_check` reports the same `held_keys` with every audit, so a
+`live` transform can't hide one. `Trellis::sample_quarantined` lists the keys and their
+errors; fix the cause and release each with `Trellis::release_key`, or resume the
+transform ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
+
 ### Backfill status and the `xmin` caveat
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
@@ -322,7 +331,7 @@ A transient failure (a lost connection, a lock conflict) is retried with backoff
 counts toward nothing. A failure on a row's data (SQLSTATE class `22` or `23`) is split
 down to the row's key, which is quarantined as the drain quarantines a key
 ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)); the build finishes without
-it and `Trellis::sample_quarantined` lists it. The key is held for this transform only:
+it, `held_keys` counts it, and `Trellis::sample_quarantined` lists it. The key is held for this transform only:
 every other transform reading the table keeps applying it, and the whole-transform fuse
 counts it against this transform alone. Any other failure is retried, and its
 fifth charged attempt pauses the transform (an aggregate's or relationship-enriched

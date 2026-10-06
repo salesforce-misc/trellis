@@ -25,7 +25,8 @@ test`, `mix test`), so they run in the `ruby` and `elixir` CI jobs.
   suite also checks that this list is exactly its own value types, field for
   field.
 - `live`: a script of steps, run top to bottom on a private testkit cluster
-  (it runs the staging worker, and it ends by poisoning a key, #588). A step is
+  (it runs the staging worker, and it ends by poisoning a key and releasing it,
+  #588). A step is
   `{"op", "args", "opts", "expect" | "until" + "waiting_for", "save",
   "covers", "about"}`.
   - `op` is one of the binding's calls (`connect`, `apply`, `status`, ...), or
@@ -69,9 +70,9 @@ Some differences between the hosts are deliberate, and the canonical form
 absorbs them:
 
 - Elixir's `{:ok, value}` is `value`, and its `:ok` is `nil`, which is what
-  Ruby returns from `migrate`, `request_backfill`, `await_converged`,
-  `connect` and `shutdown`. Only a result's own envelope is unwrapped, and
-  it must be the call's: `:ok` from those five, `{:ok, value}` from every
+  Ruby returns from `migrate`, `request_backfill`, `release_key`,
+  `await_converged`, `connect` and `shutdown`. Only a result's own envelope
+  is unwrapped, and it must be the call's: `:ok` from those six, `{:ok, value}` from every
   other call (so `status` of an unknown target is `{:ok, nil}`).
 - Elixir's `apply/2` returns a tagged tuple (`{:resumed, columns}`,
   `:paused`, ...). It becomes the `Applied` record Ruby returns, with the

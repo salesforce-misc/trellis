@@ -38,7 +38,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::SystemTime;
 
-#[cfg(any(test, feature = "internals"))]
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
 
@@ -49,9 +48,7 @@ use crate::defs::eval::AliasReaders;
 use crate::defs::model::TransformStatus;
 use crate::pool::Pool;
 
-#[cfg(any(test, feature = "internals"))]
-use super::append::{self, StagedChange};
-use super::append::{RING_SIZE, ring_table_name};
+use super::append::{self, RING_SIZE, StagedChange, ring_table_name};
 use super::apply::{self, ApplyError};
 use super::fold::FoldedChange;
 use super::watermark::StagedWatermark;
@@ -383,8 +380,11 @@ pub(super) async fn poisoned_keys_among(
 /// row `for update` while it deletes, so a page that parks for it either
 /// parks before the resume deletes (and the resume deletes its rows too) or
 /// waits for the resume to commit and then finds the key no longer held. A
-/// release takes no definition lock, so one that commits between the check
-/// and this transaction's commit can still leave a parked row behind.
+/// release ([`release_key`]) bumps the version fence of the key's table
+/// first, which waits for this page to commit, since the page holds that
+/// fence `for share` until then; the release then reads the parked rows and
+/// releases them too. A page that read the fence before the release and
+/// reaches it after misses it and computes again.
 pub(super) async fn park_batch_contribution(
     txn: &Transaction<'_>,
     seg_seq: i64,
@@ -3505,12 +3505,14 @@ async fn end_request(
 // Release
 // ---------------------------------------------------------------------
 
-/// Operator-driven release, one transaction: stages one image-less
-/// `Recompute` of `(src_table, key)` into the active batch, then deletes the
-/// key's `poison_held` rows, its marker, and its death counter for the
-/// definition whose bare target is `transform` (#799: whole-key poison is
-/// per transform, and so is its release). Another definition holding the
-/// same key keeps holding it.
+/// Operator-driven release ([`crate::app::Trellis::release_key`]), one
+/// transaction: stages one image-less `Recompute` of `(src_table, key)` into
+/// the active batch, then deletes the key's `poison_held` rows, its marker,
+/// and its death counter for the definition whose bare target is `transform`
+/// (#799: whole-key poison is per transform, and so is its release). Another
+/// definition holding the same key keeps holding it. If the key's cause is
+/// still there, the `Recompute` fails like the change before it did, and the
+/// key is poisoned again once it reaches [`DEFAULT_DEATH_THRESHOLD`].
 ///
 /// The `Recompute` reaches every reader of the key's table, not only
 /// `transform`: one that doesn't hold the key re-derives it from the live
@@ -3534,6 +3536,9 @@ async fn end_request(
 ///   06), as the replayed rows' own positions used to keep it;
 /// - the union of their `group_key`s.
 ///
+/// A key marked poisoned with nothing parked is re-derived the same way,
+/// with no prior image and an unknown origin.
+///
 /// A `Recompute` builds no reverse record, so it never moves a to-one
 /// relationship's projection of the key's table. The release writes each
 /// projection row the parked changes named, and the live row names, from the
@@ -3541,8 +3546,39 @@ async fn end_request(
 /// (`apply::release_to_one_projections`, issue #754), before the
 /// `Recompute` re-derives the key's from-side rows from it.
 ///
-/// Returns how many held rows were released.
-#[cfg(any(test, feature = "internals"))]
+/// **Concurrency.** Three things write a definition's held keys: a drain
+/// page parks a change for one ([`park_batch_contribution`]), an eviction
+/// poisons one ([`isolate_and_evict`], a build chunk's [`evict_build_key`]),
+/// and a resume or drop deletes them all. The release serializes with each:
+///
+/// - its first lock (#744) is a bump of the version fence of the key's
+///   table, the canonical name the drain fences its pages on. It waits for
+///   every page holding the fence, so a page that parked a change for the
+///   key has committed, and the reads below see its row (ADR-0002 I1). A
+///   page that read the fence before the release and applies after it
+///   misses the fence and computes again, finding the key no longer held. So
+///   no page can park a change for the key after the release has deleted its
+///   rows, which would leave a held row no release names, blocking every
+///   watermark token (`converge`'s condition 4);
+/// - it then takes the definition's row `for no key update`, the lock an
+///   eviction takes before it poisons a key (`evict_for`, and a build
+///   chunk's `for update`), and that a resume's `for update` and a drop's
+///   delete conflict with. The key's rows are read only after it: an
+///   eviction that committed first is released with the rest, and a resume
+///   or drop that committed first leaves nothing held, so the release
+///   refuses ([`ApplyError::KeyNotHeld`]) or finds no definition
+///   ([`ApplyError::TransformNotFound`]).
+///
+/// Neither lock is held while a page waits on one of the release's, since a
+/// page takes its fences before any other lock: the release takes the
+/// fence, then the definition row, then the ring and the projection rows,
+/// the order a page takes them in.
+///
+/// `src_table` may be either spelling of the table (#283), and `key` is the
+/// key text [`crate::app::Trellis::sample_quarantined`] reports. Errors with
+/// [`ApplyError::TransformNotFound`] for an unknown `transform`, and with
+/// [`ApplyError::KeyNotHeld`], changing nothing, when the transform holds no
+/// such key. Returns how many parked changes were discarded.
 pub async fn release_key(
     pool: &Pool,
     transform: &str,
@@ -3550,20 +3586,25 @@ pub async fn release_key(
     key: &str,
 ) -> Result<usize, ApplyError> {
     // Issue #283: quarantine's tables are keyed canonically, but this is an
-    // operator entry point that may be handed either spelling of a source, and
-    // rows written before the V33 fold (or under a spelling V33 could not
-    // resolve) can still be keyed raw. Matching the set of both is what keeps a
-    // release total either way — a partial release would leave orphaned parked
-    // work `converge` gates on forever, which is strictly worse than the extra
-    // array element. The `Recompute` is staged under the first held row's own
-    // stored `src_table`, so a legacy bare held row's key goes back onto the
-    // ring as it left it.
+    // operator entry point that may be handed either spelling of a source.
+    // Matching the set of both is what keeps a release total either way — a
+    // partial release would leave orphaned parked work `converge` gates on
+    // forever, which is strictly worse than the extra array element. The
+    // `Recompute` is staged under the first held row's own stored
+    // `src_table`, so a held row keyed raw goes back onto the ring as it
+    // left it.
     let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    // The first lock (#744): see the doc comment's "Concurrency". `names[0]`
+    // is the canonical name, the one a page's fence read set keys the
+    // table's changes on. A name that resolves to no table bumps a fence no
+    // page reads, and the release then refuses and rolls it back.
+    super::build::bump_version_fence(&*txn, &names[0]).await?;
     let transform_id: i64 = txn
         .query_opt(
-            "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
+            "select id from transform_definitions where split_part(target_table, '.', 2) = $1 \
+             for no key update",
             &[&transform],
         )
         .await?
@@ -3572,59 +3613,78 @@ pub async fn release_key(
         })?
         .get(0);
 
-    let held = txn
+    let marked = txn
         .query(
-            "select old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table, \
-                    new_image::text, lsn \
-             from poison_held \
+            "delete from poison \
              where transform_id = $3 and src_table = any($1::text[]) and key = $2 \
-             order by seg_seq asc, held_seq asc",
+             returning src_table",
             &[&names, &key, &transform_id],
         )
         .await?;
+    let held = txn
+        .query(
+            "delete from poison_held \
+             where transform_id = $3 and src_table = any($1::text[]) and key = $2 \
+             returning old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table, \
+                       new_image::text, lsn, seg_seq, held_seq",
+            &[&names, &key, &transform_id],
+        )
+        .await?;
+    if marked.is_empty() && held.is_empty() {
+        // Dropping `txn` rolls the fence bump back.
+        return Err(ApplyError::KeyNotHeld {
+            transform: transform.to_string(),
+            src_table: src_table.to_string(),
+            key: key.to_string(),
+        });
+    }
+    // `returning` gives no order, so the parked rows are put back in the
+    // order they were parked in: the first one's pre-image is the state
+    // readers last saw.
+    let mut held = held;
+    held.sort_by_key(|row| (row.get::<_, i64>(8), row.get::<_, i64>(9)));
 
-    if let Some(first) = held.first() {
-        let mut origin_lsn: Option<PgLsn> = first.get(1);
-        let mut src_changed: Option<SystemTime> = None;
-        let mut hop_gen = 0;
-        let mut source_change = false;
-        let mut group_key: Vec<String> = Vec::new();
-        for row in &held {
-            origin_lsn = super::fold::earliest_origin(origin_lsn, row.get(1));
-            let changed: Option<SystemTime> = row.get(2);
-            source_change |= changed.is_some();
-            src_changed = super::apply::earliest_src_changed(src_changed, changed);
-            hop_gen = hop_gen.max(row.get::<_, i32>(3));
-            for value in row.get::<_, Option<Vec<String>>>(4).unwrap_or_default() {
-                if !group_key.contains(&value) {
-                    group_key.push(value);
+    let change = match held.first() {
+        Some(first) => {
+            let mut origin_lsn: Option<PgLsn> = first.get(1);
+            let mut src_changed: Option<SystemTime> = None;
+            let mut hop_gen = 0;
+            let mut source_change = false;
+            let mut group_key: Vec<String> = Vec::new();
+            for row in &held {
+                origin_lsn = super::fold::earliest_origin(origin_lsn, row.get(1));
+                let changed: Option<SystemTime> = row.get(2);
+                source_change |= changed.is_some();
+                src_changed = super::apply::earliest_src_changed(src_changed, changed);
+                hop_gen = hop_gen.max(row.get::<_, i32>(3));
+                for value in row.get::<_, Option<Vec<String>>>(4).unwrap_or_default() {
+                    if !group_key.contains(&value) {
+                        group_key.push(value);
+                    }
                 }
             }
+            StagedChange::Recompute {
+                src_table: first.get(5),
+                key: key.to_string(),
+                hop_gen: if source_change { 0 } else { hop_gen },
+                group_key: (!group_key.is_empty()).then_some(group_key),
+                src_changed,
+                prior_image: first.get(0),
+                origin_lsn,
+            }
         }
-        let change = StagedChange::Recompute {
-            src_table: first.get(5),
+        None => StagedChange::Recompute {
+            src_table: marked[0].get(0),
             key: key.to_string(),
-            hop_gen: if source_change { 0 } else { hop_gen },
-            group_key: (!group_key.is_empty()).then_some(group_key),
-            src_changed,
-            prior_image: first.get(0),
-            origin_lsn,
-        };
-        append::append(&txn, &[change]).await?;
-    }
+            hop_gen: 0,
+            group_key: None,
+            src_changed: None,
+            prior_image: None,
+            origin_lsn: None,
+        },
+    };
+    append::append(&txn, &[change]).await?;
 
-    txn.execute(
-        "delete from poison_held \
-         where transform_id = $3 and src_table = any($1::text[]) and key = $2",
-        &[&names, &key, &transform_id],
-    )
-    .await?;
-    txn.execute(
-        "delete from poison \
-         where transform_id = $3 and src_table = any($1::text[]) and key = $2",
-        &[&names, &key, &transform_id],
-    )
-    .await?;
     txn.execute(
         "delete from key_deaths \
          where transform_id = $3 and src_table = any($1::text[]) and key = $2",
@@ -3638,22 +3698,66 @@ pub async fn release_key(
     // the page that skips them commits, so they can still be pending. The
     // release counts only pending changes above the latest parked one: the
     // parked ones are discarded here and will never write the key.
-    if !held.is_empty() {
-        let images: Vec<String> = held
-            .iter()
-            .flat_map(|row| [row.get::<_, Option<String>>(0), row.get(6)])
-            .flatten()
-            .collect();
-        let parked_through: Option<PgLsn> = held
-            .iter()
-            .filter_map(|row| row.get::<_, Option<PgLsn>>(7))
-            .max();
-        apply::release_to_one_projections(pool, &txn, &names[0], key, &images, parked_through)
-            .await?;
-    }
+    let images: Vec<String> = held
+        .iter()
+        .flat_map(|row| [row.get::<_, Option<String>>(0), row.get(6)])
+        .flatten()
+        .collect();
+    let parked_through: Option<PgLsn> = held
+        .iter()
+        .filter_map(|row| row.get::<_, Option<PgLsn>>(7))
+        .max();
+    apply::release_to_one_projections(pool, &txn, &names[0], key, &images, parked_through).await?;
 
     txn.commit().await?;
+    tracing::info!(
+        transform,
+        src_table = %names[0],
+        key,
+        discarded = held.len(),
+        "released a held key; a recompute re-derives it from its current row"
+    );
     Ok(held.len())
+}
+
+/// The keys one definition holds in quarantine (#759): its `poison` rows,
+/// each a source key whose changes the definition's apply leaves out until
+/// a release ([`release_key`]), a resume or a drop. `None` where a
+/// definition holds none. `status` reports it per definition, and
+/// `self_check` with every report, so a definition that reads `live` can't
+/// hide a held key. The keys themselves are paged by `sample_quarantined`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldKeys {
+    /// How many keys the definition holds.
+    pub count: u64,
+    /// The earliest `poisoned_at` among them: when the key held longest was
+    /// last poisoned. A key poisoned again (after a release, or a drain that
+    /// charged it again) counts from then.
+    pub oldest_poisoned_at: SystemTime,
+}
+
+/// The [`HeldKeys`] of definition `transform_id`, in one read of its
+/// `poison` rows (their primary key leads with the definition's id).
+pub(crate) async fn held_keys(
+    client: &impl GenericClient,
+    transform_id: i64,
+) -> Result<Option<HeldKeys>, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            "select count(*), min(poisoned_at) from poison where transform_id = $1",
+            &[&transform_id],
+        )
+        .await?;
+    Ok(held_keys_from(row.get(0), row.get(1)))
+}
+
+/// A [`HeldKeys`] from a `count(*)` and `min(poisoned_at)` over a
+/// definition's `poison` rows; `None` when there are none.
+pub(crate) fn held_keys_from(count: i64, oldest: Option<SystemTime>) -> Option<HeldKeys> {
+    oldest.map(|oldest_poisoned_at| HeldKeys {
+        count: u64::try_from(count).unwrap_or(0),
+        oldest_poisoned_at,
+    })
 }
 
 // ---------------------------------------------------------------------

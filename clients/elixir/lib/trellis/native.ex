@@ -62,6 +62,9 @@ defmodule Trellis.Native do
   def sample_quarantined(_handle, _target, _cursor, _limit),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def release_key(_handle, _transform, _source_table, _key),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def has_live_drain_workers(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def has_live_staging_worker(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def watermark_token(_handle), do: :erlang.nif_error(:nif_not_loaded)

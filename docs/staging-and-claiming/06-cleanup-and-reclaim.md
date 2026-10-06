@@ -145,9 +145,12 @@ It is deliberately **not** bucket-scoped: it parks the whole batch's contributio
 complete and idempotent on the extended key, so a co-worker on another bucket
 parking the same rows is a no-op, not a conflict.
 
-**Release is operator-driven, one transaction:** stage one `Recompute` of the key
-into the active batch, then delete the transform's held rows, its marker, and its
-death counter for the key (`release_key`, #623 D3). The
+**Release is operator-driven, one transaction** (`Trellis::release_key`): stage one
+`Recompute` of the key into the active batch, then delete the transform's held rows,
+its marker, and its death counter for the key. Its first lock is a bump of the key's
+table's version fence, which waits for every page holding the fence: a page that parks
+a change for the key commits first and the release takes its row too, and one that
+computed before the release misses its fence and computes again. The
 held rows are not replayed: a replayed row would carry the releaser's `row_txid`,
 not its source commit's, so a replay could regress a ledger entry a later
 Re-derive already moved past. The `Recompute` is a Re-derive of the key from its

@@ -22,6 +22,11 @@ defmodule Trellis.Status do
       fixed), or, with `kind` `:halt`, a failure no retry gets past reached
       it, so the drain paused it and what depends on it (resume it once
       fixed). A transform an operator paused has none.
+    * `held_keys` is set while it holds keys in quarantine: source keys
+      whose changes kept failing in its apply, so it leaves them out and
+      their target rows stay as they were, whatever its status, `:live`
+      included. `Trellis.sample_quarantined/3` lists them, and
+      `Trellis.release_key/4` releases one once its cause is fixed.
 
   Every process sees them, whichever one runs the staging worker.
   """
@@ -34,10 +39,11 @@ defmodule Trellis.Status do
           status: status(),
           backfill_failure: Trellis.BackfillFailure.t() | nil,
           capture_wait: Trellis.CaptureWait.t() | nil,
-          capture_failure: Trellis.CaptureFailure.t() | nil
+          capture_failure: Trellis.CaptureFailure.t() | nil,
+          held_keys: Trellis.HeldKeys.t() | nil
         }
 
-  @enforce_keys [:status, :backfill_failure, :capture_wait, :capture_failure]
+  @enforce_keys [:status, :backfill_failure, :capture_wait, :capture_failure, :held_keys]
   defstruct @enforce_keys
 
   @doc false
@@ -45,14 +51,37 @@ defmodule Trellis.Status do
         status: status,
         backfill_failure: failure,
         capture_wait: wait,
-        capture_failure: capture_failure
+        capture_failure: capture_failure,
+        held_keys: held_keys
       }) do
     %__MODULE__{
       status: status,
       backfill_failure: failure && Trellis.BackfillFailure.from_native(failure),
       capture_wait: wait && Trellis.CaptureWait.from_native(wait),
-      capture_failure: capture_failure && Trellis.CaptureFailure.from_native(capture_failure)
+      capture_failure: capture_failure && Trellis.CaptureFailure.from_native(capture_failure),
+      held_keys: held_keys && Trellis.HeldKeys.from_native(held_keys)
     }
+  end
+end
+
+defmodule Trellis.HeldKeys do
+  @moduledoc """
+  The keys a transform holds in quarantine, as `Trellis.status/2` and
+  `Trellis.self_check/3` report them: how many (`count`), and when the one
+  held longest was last poisoned (`oldest_poisoned_at`).
+  """
+
+  @type t :: %__MODULE__{
+          count: pos_integer(),
+          oldest_poisoned_at: DateTime.t()
+        }
+
+  @enforce_keys [:count, :oldest_poisoned_at]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{count: count, oldest_poisoned_at_micros: micros}) do
+    %__MODULE__{count: count, oldest_poisoned_at: Trellis.Time.from_micros(micros)}
   end
 end
 

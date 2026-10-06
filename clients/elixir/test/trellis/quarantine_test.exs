@@ -45,8 +45,8 @@ defmodule Trellis.QuarantineTest do
     # pass charges the column once per row. Split across batches, the first
     # row's batch fails alone on each drain cycle, and the row-level fuse
     # (also five) evicts the key before the column fuse can trip: a
-    # poisoned key no public call releases, which wedges convergence for
-    # every test after this one (#588).
+    # poisoned key, which wedges convergence for every test after this one
+    # until it's released (#588).
     ids = Enum.to_list(1..@column_death_threshold)
 
     Postgrex.query!(
@@ -128,12 +128,13 @@ defmodule Trellis.QuarantineTest do
 
   # A failure the column fuse can't pin on one column (here, the target
   # table's own check constraint refusing the write) poisons the whole key,
-  # which `poisoned_since/2` reports and the transform's own address samples.
+  # which `poisoned_since/2` reports, the transform's own address samples, and
+  # `status/2` counts. Fixed, `release_key/4` releases it.
   #
-  # No public call releases a poisoned key, and a held one stops
-  # `await_converged/3` converging past it (#588), so this runs on a cluster
-  # of its own rather than wedging the shared one.
-  test "a poisoned key is reported by poisoned_since and sampled under its transform" do
+  # A held key stops `await_converged/3` converging past it until it's
+  # released (#588), so this runs on a cluster of its own rather than risk
+  # wedging the shared one.
+  test "a poisoned key is reported, sampled, counted and released" do
     cluster = TestCluster.private!()
     dsn = cluster["dsn"]
     pg = TestCluster.postgrex!(cluster)
@@ -191,6 +192,27 @@ defmodule Trellis.QuarantineTest do
     eventually("gizmo_prices to hold the good row", fn ->
       case Postgrex.query!(pg, "select id, price from gizmo_prices", []).rows do
         [[1, 5]] = rows -> {:done, rows}
+        rows -> {:waiting, rows}
+      end
+    end)
+
+    assert %Status{held_keys: %Trellis.HeldKeys{count: 1, oldest_poisoned_at: ^poisoned_at}} =
+             Trellis.status!(trellis, "gizmo_prices")
+
+    # A key the transform doesn't hold is refused, and nothing changes.
+    assert {:error, %Trellis.Error{code: :not_found}} =
+             Trellis.release_key(trellis, "gizmo_prices", "gizmos", "1")
+
+    assert {:error, %Trellis.Error{code: :not_found}} =
+             Trellis.release_key(trellis, "nowhere", "gizmos", "2")
+
+    Postgrex.query!(pg, "alter table gizmo_prices drop constraint cheap", [])
+    assert :ok = Trellis.release_key(trellis, "gizmo_prices", "gizmos", "2")
+    assert %Status{held_keys: nil} = Trellis.status!(trellis, "gizmo_prices")
+
+    eventually("the released key to reach gizmo_prices", fn ->
+      case Postgrex.query!(pg, "select id, price from gizmo_prices order by id", []).rows do
+        [[1, 5], [2, 500]] = rows -> {:done, rows}
         rows -> {:waiting, rows}
       end
     end)

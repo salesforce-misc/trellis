@@ -117,7 +117,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
-use crate::staging::quarantine;
+use crate::staging::quarantine::{self, HeldKeys};
 use crate::staging::self_check::{SelfCheckError, SelfCheckMode, SelfCheckReport, SelfCheckScope};
 use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registry};
 
@@ -634,7 +634,11 @@ impl Trellis {
                             cf.kind as capture_kind, \
                             exists (select 1 from column_status cs \
                                     where cs.transform_table = $1 and cs.awaiting_capture) \
-                              as awaiting_capture \
+                              as awaiting_capture, \
+                            (select count(*) from poison p where p.transform_id = d.id) \
+                              as held_count, \
+                            (select min(p.poisoned_at) from poison p \
+                             where p.transform_id = d.id) as held_since \
                      from transform_definitions d \
                      left join pending_backfill pb \
                        on pb.table_name = d.source_table and pb.last_error is not null \
@@ -672,6 +676,7 @@ impl Trellis {
             backfill_failure: backfill_failure(&row),
             capture_wait,
             capture_failure: capture_failure(&row).or(stalled),
+            held_keys: quarantine::held_keys_from(row.get("held_count"), row.get("held_since")),
         }))
     }
 
@@ -1068,6 +1073,46 @@ impl Trellis {
             .collect())
     }
 
+    /// Releases one key `transform` holds in quarantine
+    /// (`docs/decisions/0003-quarantine-storage-and-api.md`, "Releasing held
+    /// keys"), once its cause is fixed: `source_table` and `key` as
+    /// [`Trellis::sample_quarantined`] and [`Trellis::poisoned_since`] report
+    /// them, the table in either spelling, `schema.table` or bare (#283), and
+    /// `transform` the bare target, as [`Trellis::status`] takes it.
+    ///
+    /// In one transaction, it deletes the key's quarantine rows for
+    /// `transform` and stages a recompute of the key, which the drain
+    /// applies like any other change: every definition reading the table
+    /// re-derives the key from its current row, and the changes held for
+    /// `transform` meanwhile are discarded rather than replayed, since the
+    /// current row supersedes them. Another definition that holds the same
+    /// key keeps holding it. If the cause is still there, the recompute
+    /// fails as the changes before it did, and the key is poisoned again.
+    ///
+    /// Purely operational, like [`Trellis::status`], so not a statement of
+    /// [`Trellis::apply`]: releasing a key changes nothing about the
+    /// definitions. Resuming the definition releases every key it holds.
+    ///
+    /// Errors with [`TrellisError::TransformNotFound`] if no transform is
+    /// registered as `transform`, and with [`ApplyError::KeyNotHeld`]
+    /// (wrapped in [`TrellisError::Apply`], [`ErrorCode::NotFound`]),
+    /// changing nothing, if it holds no such key: a table it doesn't read, a
+    /// key it never held, or one already released.
+    pub async fn release_key(
+        &self,
+        transform: &str,
+        source_table: &str,
+        key: &str,
+    ) -> Result<(), TrellisError> {
+        match quarantine::release_key(&self.pool, transform, source_table, key).await {
+            Ok(_) => Ok(()),
+            Err(ApplyError::TransformNotFound { transform }) => {
+                Err(TrellisError::TransformNotFound(transform))
+            }
+            Err(err) => Err(TrellisError::Apply(err)),
+        }
+    }
+
     /// Stops any background work this connection started (staging worker and
     /// drain workers) and waits for it to exit cleanly. A no-op for a
     /// connection that started none.
@@ -1259,6 +1304,11 @@ impl Trellis {
     /// A currently-paused column (`docs/decisions/0003-quarantine-storage-and-api.md`)
     /// is excluded from the comparison entirely — its persisted value is
     /// deliberately stale, so comparing it would report a false divergence.
+    ///
+    /// Every report carries the keys the definition holds in quarantine
+    /// ([`SelfCheckReport::held_keys`], #759), whatever the outcome, so a
+    /// held key isn't hidden behind a `Converged` page that didn't reach it
+    /// or a `NotCaughtUp` its parked changes cause.
     pub async fn self_check(
         &self,
         target_table: &str,
@@ -1512,6 +1562,15 @@ pub struct DefinitionStatus {
     /// Every case but the halt has [`CaptureFailureKind::Capture`]. A
     /// definition an operator paused has none.
     pub capture_failure: Option<CaptureFailure>,
+    /// Set while the definition holds keys in quarantine (#759): source keys
+    /// whose changes its apply leaves out, each because a change to it kept
+    /// failing in this definition's apply, so their target rows stay as
+    /// they were. Every other definition reading the same keys applies them
+    /// as usual. A definition holds them whatever its status, `live`
+    /// included, until each is released ([`Trellis::release_key`]) or the
+    /// definition is resumed or dropped. [`Trellis::sample_quarantined`]
+    /// pages the keys themselves, with each one's error.
+    pub held_keys: Option<HeldKeys>,
 }
 
 /// Why capture of a table a definition reads is broken (issue #622 C6,

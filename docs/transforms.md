@@ -322,6 +322,19 @@ Every defined transform carries an observable **status**:
   resume first re-validates the transform as define would, and refuses while
   define would refuse it.
 
+A transform can also hold single source keys in quarantine whatever its status,
+`live` included: a key whose change kept failing in this transform's apply (a
+value its target refuses, say) is left out of its apply, and its target row
+stays as it was. Every other transform reading the key keeps applying it. The
+status reports them as `held_keys`: how many keys the transform holds, and when
+the one held longest was poisoned. `self_check` reports the same with every
+audit. `sample_quarantined` lists the keys with their errors, and once a key's
+cause is fixed, `release_key(transform, source_table, key)` releases it (the CLI's
+`trellis release`, and `release_key` in each binding): the key is re-derived from
+its current row, and a key whose cause is still there is quarantined again.
+Resuming the transform releases every key it holds
+([ADR-0003 — Releasing held keys](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
+
 An application can list defined transforms and read each one's status — enough to
 tell a newly-defined transform is still populating, without a metrics pipeline
 ([embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)

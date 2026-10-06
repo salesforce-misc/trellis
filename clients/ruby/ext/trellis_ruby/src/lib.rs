@@ -55,11 +55,12 @@ use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisError, 
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
     PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
-    PlainDivergence, PlainError, PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship,
-    PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
-    self_check_mode, system_time_from_epoch_micros, transform_status_names,
+    PlainDivergence, PlainError, PlainHeldKeys, PlainPoisonEntry, PlainQuarantineEntry,
+    PlainRelationship, PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport,
+    SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -229,6 +230,20 @@ impl Handle {
     /// worker.
     fn request_backfill(ruby: &Ruby, rb_self: &Self, source_table: String) -> Result<(), Error> {
         rb_self.call(ruby, move |trellis| trellis.request_backfill(&source_table))
+    }
+
+    /// Releases one key `transform` holds in quarantine: `source_table`
+    /// (either spelling) and `key` as `sample_quarantined` reports them.
+    fn release_key(
+        ruby: &Ruby,
+        rb_self: &Self,
+        transform: String,
+        source_table: String,
+        key: String,
+    ) -> Result<(), Error> {
+        rb_self.call(ruby, move |trellis| {
+            trellis.release_key(&transform, &source_table, &key)
+        })
     }
 
     /// Every key poisoned after `watermark_micros` (epoch microseconds),
@@ -734,6 +749,10 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .capture_failure
         .map(|failure| capture_failure_hash(ruby, failure))
         .transpose()?;
+    let held_keys = status
+        .held_keys
+        .map(|held| held_keys_hash(ruby, held))
+        .transpose()?;
     record(
         ruby,
         [
@@ -741,6 +760,21 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("backfill_failure", ruby.into_value(failure)),
             ("capture_wait", ruby.into_value(wait)),
             ("capture_failure", ruby.into_value(capture_failure)),
+            ("held_keys", ruby.into_value(held_keys)),
+        ],
+    )
+}
+
+/// How many keys a definition holds in quarantine, and since when.
+fn held_keys_hash(ruby: &Ruby, held: PlainHeldKeys) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("count", ruby.into_value(held.count)),
+            (
+                "oldest_poisoned_at_micros",
+                ruby.into_value(held.oldest_poisoned_at_micros),
+            ),
         ],
     )
 }
@@ -922,6 +956,10 @@ fn poison_entry_hash(ruby: &Ruby, entry: PlainPoisonEntry) -> Result<RHash, Erro
 /// `divergences` is empty unless it is `diverged`.
 fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, Error> {
     let divergences = array(ruby, report.divergences, divergence_hash)?;
+    let held_keys = report
+        .held_keys
+        .map(|held| held_keys_hash(ruby, held))
+        .transpose()?;
     record(
         ruby,
         [
@@ -931,6 +969,7 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
             ("next_after", ruby.into_value(report.next_after)),
             ("outcome", word_symbol(ruby, report.outcome).as_value()),
             ("divergences", divergences.as_value()),
+            ("held_keys", ruby.into_value(held_keys)),
         ],
     )
 }
@@ -1031,6 +1070,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     handle.define_method("definitions", method!(Handle::definitions, 0))?;
     handle.define_method("relationships", method!(Handle::relationships, 0))?;
     handle.define_method("request_backfill", method!(Handle::request_backfill, 1))?;
+    handle.define_method("release_key", method!(Handle::release_key, 3))?;
     handle.define_method("poisoned_since", method!(Handle::poisoned_since, 1))?;
     handle.define_method("quarantined", method!(Handle::quarantined, 0))?;
     handle.define_method("quarantine_status", method!(Handle::quarantine_status, 1))?;

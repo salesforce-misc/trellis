@@ -7,9 +7,10 @@
 //! (from `quarantined` and `quarantine_status`) with its target as an address
 //! and its state as a word, a [`PoisonEntry`] (from `poisoned_since`) and a
 //! page of [`PoisonSample`]s (from `sample_quarantined`) with the opaque
-//! cursor for the next page. Times cross as [`crate::epoch_micros`].
+//! cursor for the next page, and a definition's [`HeldKeys`] (from `status`
+//! and `self_check`). Times cross as [`crate::epoch_micros`].
 
-use trellis::{PoisonEntry, PoisonSample, QuarantineEntry, QuarantineTarget};
+use trellis::{HeldKeys, PoisonEntry, PoisonSample, QuarantineEntry, QuarantineTarget};
 
 use crate::{epoch_micros, next_cursor, quarantine_state};
 
@@ -46,6 +47,26 @@ impl From<&QuarantineEntry> for PlainQuarantineEntry {
             state: quarantine_state(entry.state),
             paused_at_micros: entry.paused_at.map(epoch_micros),
             last_error: entry.last_error.clone(),
+        }
+    }
+}
+
+/// A definition's [`HeldKeys`] flattened to plain data: how many keys it
+/// holds in quarantine, and since when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainHeldKeys {
+    /// How many keys the definition holds.
+    pub count: i64,
+    /// When the key held longest was last poisoned, as
+    /// [`crate::epoch_micros`].
+    pub oldest_poisoned_at_micros: i64,
+}
+
+impl From<&HeldKeys> for PlainHeldKeys {
+    fn from(held: &HeldKeys) -> Self {
+        PlainHeldKeys {
+            count: i64::try_from(held.count).unwrap_or(i64::MAX),
+            oldest_poisoned_at_micros: epoch_micros(held.oldest_poisoned_at),
         }
     }
 }

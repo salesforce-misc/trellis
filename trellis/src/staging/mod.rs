@@ -121,6 +121,7 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // `StagingError`'s own error-type precedent, so this flat re-export would
 // be unused.
 pub use capture_audit::CaptureFault;
+pub use quarantine::HeldKeys;
 pub use self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope,
 };

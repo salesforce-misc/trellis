@@ -92,6 +92,16 @@
 //! the targets an operator is most likely to be inspecting — [`self_check`]
 //! excludes any currently-paused column of the audited transform from the
 //! comparison entirely (see [`paused_columns`]).
+//!
+//! # Held keys
+//!
+//! A key the audited definition holds in quarantine
+//! ([`crate::staging::quarantine`]) has a target row the definition stopped
+//! writing, and a key with changes parked holds back the convergence wait.
+//! Every report names how many keys the definition holds and since when
+//! ([`SelfCheckReport::held_keys`]), read once the audit is done, so a
+//! `Converged` page that never reached one, or a `NotCaughtUp` it causes,
+//! can't hide it.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -110,6 +120,7 @@ use crate::pool::{Pool, quote_ident};
 use super::capture_audit::{self, CaptureFault};
 use super::converge;
 use super::error::StagingError;
+use super::quarantine::{self, HeldKeys};
 
 /// One page's worth of bound for a [`self_check`] call — see the module doc
 /// comment's "Bounded, keyset-scoped, mandatory" section. `after` is a
@@ -201,6 +212,17 @@ pub struct SelfCheckReport {
     /// call would have nothing to do.
     pub next_after: Option<String>,
     pub outcome: SelfCheckOutcome,
+    /// The keys the audited definition holds in quarantine when the audit
+    /// ends, `None` if it holds none (#759). Reported with every outcome,
+    /// because a held key is one the audit can't vouch for: the definition
+    /// leaves its changes out, so its target row stays as it was when the
+    /// key was poisoned. It is a page's [`SelfCheckOutcome::Diverged`] row
+    /// once its source row changes, if the page reaches it, and a key with
+    /// changes parked holds back convergence, so the audit reports
+    /// [`SelfCheckOutcome::NotCaughtUp`] until it is released. Sample the
+    /// keys with `Trellis::sample_quarantined` and release each with
+    /// `Trellis::release_key`, or resume the definition.
+    pub held_keys: Option<HeldKeys>,
 }
 
 /// What [`self_check`] found — see the module doc comment's "Quiescence"
@@ -415,6 +437,24 @@ pub async fn self_check(
         });
     }
 
+    let mut report = audit(pool, &def, target_table, scope, mode, timeout).await?;
+    // Read once the audit is done, so a key poisoned while it waited or
+    // compared is reported too.
+    let client = pool.get().await?;
+    report.held_keys = quarantine::held_keys(&**client, def.id).await?;
+    Ok(report)
+}
+
+/// [`self_check`]'s audit of `def`, the definition registered under
+/// `target_table`, with no [`SelfCheckReport::held_keys`] yet.
+async fn audit(
+    pool: &Pool,
+    def: &Definition,
+    target_table: &str,
+    scope: SelfCheckScope,
+    mode: SelfCheckMode,
+    timeout: Duration,
+) -> Result<SelfCheckReport, SelfCheckError> {
     // #622 C9: a table whose capture is broken may not be feeding the target
     // at all, so that is reported first, and alone. A recompute comparison
     // would only show the symptom, and the convergence wait before it would
@@ -423,7 +463,7 @@ pub async fn self_check(
     // it is one catalog read of installed state.
     let capture = {
         let client = pool.get().await?;
-        let faults = capture_audit::audit(&**client, pool.schema(), &def).await?;
+        let faults = capture_audit::audit(&**client, pool.schema(), def).await?;
         if faults.is_empty() {
             None
         } else {
@@ -439,6 +479,7 @@ pub async fn self_check(
             outcome: SelfCheckOutcome::Diverged(
                 faults.into_iter().map(Divergence::Capture).collect(),
             ),
+            held_keys: None,
         });
     }
 
@@ -447,10 +488,10 @@ pub async fn self_check(
     // (`ddl::pk_key_sql_expr`) rather than a single named column.
     let pk = ddl::source_primary_key(pool, &def.source_table).await?;
 
-    let schema_divergences = check_schema(pool, &def, &pk).await?;
+    let schema_divergences = check_schema(pool, def, &pk).await?;
     let paused = paused_columns(pool, &def.def).await?;
 
-    let pass1 = match await_then_compare(pool, &def, &pk, &scope, &paused, timeout).await? {
+    let pass1 = match await_then_compare(pool, def, &pk, &scope, &paused, timeout).await? {
         AwaitOutcome::NotCaughtUp { attempted } => {
             return Ok(SelfCheckReport {
                 target: target_table.to_string(),
@@ -458,6 +499,7 @@ pub async fn self_check(
                 rows_compared: 0,
                 next_after: scope.after.clone(),
                 outcome: SelfCheckOutcome::NotCaughtUp,
+                held_keys: None,
             });
         }
         AwaitOutcome::CaughtUp(pass) => pass,
@@ -473,6 +515,7 @@ pub async fn self_check(
             rows_compared: pass1.rows_compared,
             next_after: pass1.next_after,
             outcome: SelfCheckOutcome::Converged,
+            held_keys: None,
         });
     }
 
@@ -483,6 +526,7 @@ pub async fn self_check(
             rows_compared: pass1.rows_compared,
             next_after: pass1.next_after,
             outcome: SelfCheckOutcome::Diverged(divergences),
+            held_keys: None,
         });
     }
 
@@ -490,7 +534,7 @@ pub async fn self_check(
     // re-check after a fresh await — a genuine divergence is stable; a
     // convergence race resolves." Re-run the exact same bounded comparison
     // from scratch, behind a brand-new watermark token/await.
-    let pass2 = match await_then_compare(pool, &def, &pk, &scope, &paused, timeout).await? {
+    let pass2 = match await_then_compare(pool, def, &pk, &scope, &paused, timeout).await? {
         AwaitOutcome::NotCaughtUp { attempted } => {
             return Ok(SelfCheckReport {
                 target: target_table.to_string(),
@@ -498,12 +542,13 @@ pub async fn self_check(
                 rows_compared: 0,
                 next_after: scope.after.clone(),
                 outcome: SelfCheckOutcome::NotCaughtUp,
+                held_keys: None,
             });
         }
         AwaitOutcome::CaughtUp(pass) => pass,
     };
 
-    let mut second = check_schema(pool, &def, &pk).await?;
+    let mut second = check_schema(pool, def, &pk).await?;
     second.extend(pass2.divergences);
     let stable = reproduced(&divergences, second);
 
@@ -519,6 +564,7 @@ pub async fn self_check(
         rows_compared: pass2.rows_compared,
         next_after: pass2.next_after,
         outcome,
+        held_keys: None,
     })
 }
 

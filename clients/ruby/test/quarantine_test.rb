@@ -30,8 +30,8 @@ class QuarantineTest < Minitest::Test
     # pass charges the column once per row. Split across batches, the first
     # row's batch fails alone on each drain cycle, and the row-level fuse
     # (also five) evicts the key before the column fuse can trip: a
-    # poisoned key no public call releases, which wedges convergence for
-    # every test after this one (#588).
+    # poisoned key, which wedges convergence for every test after this one
+    # until it's released (#588).
     ids = (1..COLUMN_DEATH_THRESHOLD).to_a
     pg.exec_params("insert into ledger (id, n) select id, 2000000000 from generate_series(1, $1::int) id",
                    [COLUMN_DEATH_THRESHOLD])
@@ -103,12 +103,13 @@ class QuarantineTest < Minitest::Test
 
   # A failure the column fuse can't pin on one column (here, the target
   # table's own check constraint refusing the write) poisons the whole key,
-  # which poisoned_since reports and the transform's own address samples.
+  # which poisoned_since reports, the transform's own address samples, and
+  # status counts. Fixed, release_key releases it.
   #
-  # No public call releases a poisoned key, and a held one stops
-  # await_converged converging past it (#588), so this runs on a cluster of
-  # its own rather than wedging the shared one.
-  def test_a_poisoned_key_is_reported_by_poisoned_since_and_sampled_under_its_transform
+  # A held key stops await_converged converging past it until it's released
+  # (#588), so this runs on a cluster of its own rather than risk wedging the
+  # shared one.
+  def test_a_poisoned_key_is_reported_sampled_counted_and_released
     TestCluster.private_cluster do |cluster|
       dsn = cluster.fetch("dsn")
       pg = TestCluster.pg(cluster)
@@ -156,6 +157,21 @@ class QuarantineTest < Minitest::Test
         eventually_value("gizmo_prices to hold the good row", ->(rows) { rows == [%w[1 5]] }) do
           pg.exec("select id, price from gizmo_prices").values
         end
+
+        held = Trellis.status("gizmo_prices").held_keys
+        assert_equal Trellis::HeldKeys.new(count: 1, oldest_poisoned_at: entry.poisoned_at), held
+
+        # A key the transform doesn't hold is refused, and nothing changes.
+        assert_raises(Trellis::NotFoundError) { Trellis.release_key("gizmo_prices", "gizmos", "1") }
+        assert_raises(Trellis::NotFoundError) { Trellis.release_key("nowhere", "gizmos", "2") }
+
+        pg.exec("alter table gizmo_prices drop constraint cheap")
+        assert_nil Trellis.release_key("gizmo_prices", "gizmos", "2")
+        assert_nil Trellis.status("gizmo_prices").held_keys
+        eventually_value("the released key to reach gizmo_prices",
+                         ->(rows) { rows == [%w[1 5], %w[2 500]] }) do
+          pg.exec("select id, price from gizmo_prices order by id").values
+        end
       ensure
         # Before the private cluster goes away under it.
         Trellis.shutdown
@@ -180,6 +196,8 @@ class QuarantineTest < Minitest::Test
     assert_raises(ArgumentError) { Trellis.sample_quarantined("t.c", page: 2) }
 
     assert_raises(Trellis::ValidationError) { Trellis.poisoned_since("yesterday") }
+    assert_raises(Trellis::ValidationError) { Trellis.release_key("t", :orders, "1") }
+    assert_raises(Trellis::ValidationError) { Trellis.release_key("t", "orders", 1) }
     assert_raises(Trellis::ValidationError) { Trellis.poisoned_since(Time.at(2**62)) }
     assert_raises(Trellis::ValidationError) { Trellis.quarantine_status(:t) }
   end

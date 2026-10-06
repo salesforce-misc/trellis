@@ -47,10 +47,10 @@ use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisOptions
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus,
-    PlainDefinitionSummary, PlainDivergence, PlainError, PlainPoisonEntry, PlainQuarantineEntry,
-    PlainRelationship, PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport,
-    SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor, decode_watermark,
-    encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    PlainDefinitionSummary, PlainDivergence, PlainError, PlainHeldKeys, PlainPoisonEntry,
+    PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
+    PlainSelfCheckReport, SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
     require_transform_statement, self_check_mode, system_time_from_epoch_micros,
     transform_status_names,
 };
@@ -158,6 +158,24 @@ struct StatusTerm {
     backfill_failure: Option<BackfillFailureTerm>,
     capture_wait: Option<CaptureWaitTerm>,
     capture_failure: Option<CaptureFailureTerm>,
+    held_keys: Option<HeldKeysTerm>,
+}
+
+/// How many keys a definition holds in quarantine, and since when, as
+/// `status/2` and `self_check/3` report it.
+#[derive(NifMap)]
+struct HeldKeysTerm {
+    count: i64,
+    oldest_poisoned_at_micros: i64,
+}
+
+impl From<PlainHeldKeys> for HeldKeysTerm {
+    fn from(held: PlainHeldKeys) -> Self {
+        HeldKeysTerm {
+            count: held.count,
+            oldest_poisoned_at_micros: held.oldest_poisoned_at_micros,
+        }
+    }
 }
 
 #[derive(NifMap)]
@@ -369,6 +387,7 @@ struct SelfCheckReportTerm {
     next_after: Option<String>,
     outcome: Atom,
     divergences: Vec<DivergenceTerm>,
+    held_keys: Option<HeldKeysTerm>,
 }
 
 /// One divergence. `kind` is one of [`DIVERGENCE_KINDS`]; see
@@ -397,6 +416,7 @@ impl SelfCheckReportTerm {
                 .into_iter()
                 .map(|divergence| DivergenceTerm::new(env, divergence))
                 .collect::<NifReply<_>>()?,
+            held_keys: report.held_keys.map(HeldKeysTerm::from),
         })
     }
 }
@@ -662,6 +682,19 @@ fn sample_quarantined(
     })
 }
 
+/// Releases one key `transform` holds in quarantine: `source_table` (either
+/// spelling) and `key` as `sample_quarantined/3` reports them.
+#[rustler::nif(schedule = "DirtyIo")]
+fn release_key(
+    handle: ResourceArc<Handle>,
+    transform: String,
+    source_table: String,
+    key: String,
+) -> NifReply<Atom> {
+    handle.with(|trellis| trellis.release_key(&transform, &source_table, &key))?;
+    Ok(rustler::types::atom::ok())
+}
+
 /// Whether any drain worker in the fleet is alive.
 #[rustler::nif(schedule = "DirtyIo")]
 fn has_live_drain_workers(handle: ResourceArc<Handle>) -> NifReply<bool> {
@@ -763,6 +796,7 @@ fn status(
             .capture_failure
             .map(|failure| CaptureFailureTerm::new(env, failure))
             .transpose()?,
+        held_keys: status.held_keys.map(HeldKeysTerm::from),
     }))
 }
 

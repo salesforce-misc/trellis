@@ -573,8 +573,9 @@ Things a poll needs to handle:
   `backfill_failure`; log it, it's usually the whole answer
   ([a backfill that keeps failing](observability.md#a-backfill-that-keeps-failing)).
   A row that fails is quarantined and the transform still goes `live`
-  (`sample_quarantined` lists it); a build that keeps failing for a reason no
-  row explains is paused.
+  (`status` counts it in `held_keys`, `sample_quarantined` lists it, and
+  `release_key` releases it once its cause is fixed); a build that keeps
+  failing for a reason no row explains is paused.
 * **A schema change pauses, it never fails your writes.** Renaming or dropping a
   source column pauses every transform that reads it, with the table and column
   on `capture_failure`; the others on the table keep running.

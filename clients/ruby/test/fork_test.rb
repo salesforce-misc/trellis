@@ -21,6 +21,7 @@ class ForkTest < Minitest::Test
     "definitions" => -> { Trellis.definitions },
     "relationships" => -> { Trellis.relationships },
     "request_backfill" => -> { Trellis.request_backfill("t") },
+    "release_key" => -> { Trellis.release_key("t", "s", "1") },
     "poisoned_since" => -> { Trellis.poisoned_since(Time.now) },
     "quarantined" => -> { Trellis.quarantined },
     "quarantine_status" => -> { Trellis.quarantine_status("t.c") },

@@ -574,16 +574,20 @@ while the column is paused.
   `capture_failure` saying it's resuming, until the staging worker has
   re-typed the copies and started the rebuild. A rebuild follows every
   widening of a copied column.
-* **Quarantined keys stay held until a resume or a drop (#759).** A key
-  that's quarantined after repeated apply failures is held for the definition
-  whose apply failed, with its parked work and its poison row, and that
+* **Quarantined keys stay held until they're released.** A key that's
+  quarantined after repeated apply failures is held for the definition whose
+  apply failed, with its parked work and its poison row, and that
   definition's target row for it stays stale. Every other definition reading
   the same source keeps applying the key, so two definitions can disagree on
   it. Entry 4 can cause such failures, and so can a widening of a copied
   column whose oversized value drains before the capture pass pauses the
-  definition. There's no supported per-key
-  release in production: `release_key` is test-only until #759. What clears a
-  held key:
+  definition. The definition's `status` reports its held keys (`held_keys`:
+  how many, and since when) whatever its status, `live` included, and
+  `self_check` reports them with every audit. What clears a held key:
+  * `Trellis::release_key(transform, source_table, key)` (`trellis release`
+    on the CLI, `release_key` in the bindings) releases one key, once its
+    cause is fixed: every definition reading it re-derives it from its
+    current row. A key whose cause is still there is quarantined again.
   * `RESUME TRANSFORM` deletes every key the resumed definition holds, and
     only its own, and its rebuild re-derives them from the source. A key
     whose cause is still there fails again and is quarantined again.
