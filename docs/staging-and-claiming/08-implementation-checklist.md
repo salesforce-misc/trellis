@@ -17,6 +17,7 @@ A condensed checklist. Each item links to the document that argues for it.
 | Merging happens at read time, under four fixed rules | ordered `array_agg` arg-extremes |
 | Pending work is measured by asking storage, never a boundary aggregate | index + hand-written `ANALYZE` on statistics-free tables |
 | Quarantined work still blocks the read-your-writes predicate | the three-table poison track |
+| A non-commutative write commits only if its basis is current (I2), under a per-key lock | the `<target>__ledger` table, `pg_current_snapshot()` as the basis |
 
 ## Foundations to lock down first
 
@@ -33,6 +34,10 @@ A condensed checklist. Each item links to the document that argues for it.
 - [ ] **Enumerate which measures are invertible.** Everything else goes on a
       recompute path. Never approximate an inverse.
       → [05](05-apply-and-exactly-once-deltas.md)
+- [ ] **Every target keeps a per-key ledger** (last-applied position, basis
+      snapshot, tombstone) and every non-commutative write checks it under the
+      key's entry lock; a group row is a function of its live entries.
+      → [05](05-apply-and-exactly-once-deltas.md#the-ledger)
 - [ ] **No item may stay undrainable** — one would stop the whole instance. A
       schema error pauses the definitions it reaches and drains without them;
       write the halting-stop metric at the same time, so "halted" and "slow"
@@ -56,7 +61,10 @@ A condensed checklist. Each item links to the document that argues for it.
 6. **Retirement and reclaim** — now the system can run indefinitely. → [06](06-cleanup-and-reclaim.md)
 7. **Buckets and multi-worker claims.** → [04](04-claiming-and-the-fold.md)
 8. **Heartbeat, reclaim TTL, release-on-error.** → [04](04-claiming-and-the-fold.md)
-9. **Quarantine.** Last, because it is the only part that can hide work if it is
+9. **The ledger and the Re-derive build.** Entries, the I2 test and tombstone
+   GC, then a build that re-derives the source in chunks and applies from its
+   first chunk. → [05](05-apply-and-exactly-once-deltas.md#the-ledger)
+10. **Quarantine.** Last, because it is the only part that can hide work if it is
    wrong. → [06](06-cleanup-and-reclaim.md)
 
 ## Tests that are not optional
@@ -88,6 +96,23 @@ These fail only if you write them deliberately; ordinary end-to-end tests pass a
       batch, drain a newer one for the same key, then apply the older one; assert
       a 1-1 target ends on the newer value. Cover a live recompute read, an older
       image, a stale write after a delete, and a stale delete after a re-insert.
+
+- [ ] **I2 visibility.** A Re-derive whose snapshot saw a change refuses the
+      older capture of that change and still applies a change it did not see;
+      a Re-derive's tombstone outlives the changes its read saw.
+      (`ledger_interleavings.rs`:
+      `a_rederive_absorbed_update_leaves_an_older_capture_skippable_only_by_visibility`,
+      `a_rederives_tombstone_outlives_the_changes_its_read_saw_*`)
+- [ ] **Ledger GC holds back for out-of-order drains**: a tombstone is collected
+      only at or below the contiguous drained prefix.
+      (`ledger_interleavings.rs`: `an_out_of_order_drain_holds_gc_back_*`)
+- [ ] **A Re-derive build interleaved with live Apply pages** converges to a
+      from-scratch oracle after the last chunk, drain and merge.
+      (`build_interleavings.rs`, `rederive_build.rs`)
+- [ ] **A schema change never fails the application's write**: a renamed or
+      dropped captured column writes a `schema_changed` marker, the drain
+      pauses the definitions that read it, and the others keep applying.
+      (`capture_schema_change.rs`)
 
 ## Anti-patterns to name in review
 

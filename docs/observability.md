@@ -30,7 +30,7 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   [docs/embedding.md](embedding.md#the-silent-stall-hazard-issue-144) for the
   embedded-deployment misconfiguration this exists to catch.
 
-**Non-goals (this pass)**
+**Non-goals**
 
 * Being a metrics *backend*. Trellis exposes an in-process registry for
   scraping; it retains no history and does not replace Prometheus/Grafana.
@@ -101,7 +101,7 @@ The library stays HTTP-agnostic. It exposes a render function over its registry;
 the operator serves the result from their own HTTP stack — no port binding, no
 framework, no bind-address config.
 
-**Implemented (issue #53).** [`Trellis::metrics`](../trellis/src/app.rs) — and
+[`Trellis::metrics`](../trellis/src/app.rs) — and
 [`BlockingTrellis::metrics`](../trellis/src/blocking.rs) for callers without a
 `tokio` runtime — returns a [`Metrics`](../trellis/src/metrics.rs) handle whose
 [`render_prometheus`](../trellis/src/metrics.rs) returns the Prometheus text as a
@@ -137,7 +137,7 @@ A change flowing source → hop → hop → apply *is* a trace. We adopt **spans
 first-class signal, modeling propagation as a `tracing` span tree. This makes the
 pipeline's shape observable and carries per-hop latency for free — the
 per-transform latency histogram is *derived from* span durations captured during
-apply, not instrumented independently. Gates issue #56's design.
+apply, not instrumented independently.
 
 The crate never installs a subscriber; the embedder does. The Elixir binding
 does it on the host's behalf: `Trellis.LogBridge` installs one at application
@@ -152,14 +152,15 @@ events (`clients/elixir/README.md`, issue #149).
 Rather than instrument the backfill with bespoke metrics, every transform carries
 an observable **status**. This is the same lever quarantine uses
 ([ADR-0003](decisions/0003-quarantine-storage-and-api.md) marks a fused transform
-`quarantined` and resumes it by re-running the *same* backfill), so backfill and
-quarantine are two arcs of one lifecycle:
+`quarantined`, and [ADR-0014](decisions/0014-pause-and-drop-a-transform.md) freezes one
+as `paused`; both resume by re-running the *same* backfill), so backfill, quarantine and
+pause are arcs of one lifecycle:
 
 ```
 (new transform)──► waiting_to_backfill ──► backfilling ──► catching_up ◄──► live
-                          ▲                                                    │
-                          │ (resume re-runs backfill)                          │ (fuse trips)
-                          └───────────────────── quarantined ◄─────────────────┘
+                          ▲                                                   │
+                          │ RESUME (re-runs the backfill)                     │ PAUSE, auto-pause,
+                          └───────────── paused / quarantined ◄───────────────┘ or the fuse trips
 ```
 
 * **`waiting_to_backfill`** — defined, but its source's existing rows haven't
@@ -172,57 +173,90 @@ quarantine are two arcs of one lifecycle:
   `Trellis::status` reports its error meanwhile (`backfill_failure`).
 * **`backfilling`** — the backfill discharge has captured the source and
   enqueued the transform's build, which is running: chunks, or one direct
-  set-based build job, on drain threads. The target is partial. A plain
-  aggregate (grouped by plain source columns, on a captured source), and a
-  plain 1-1 transform (no relationship, on a captured source), is built by
-  the Re-derive build instead
-  (#625, [data-flow — Re-derive-built definitions](data-flow.md#re-derive-built-definitions)):
-  the staging worker starts it with no marker, and it is maintained from that
-  start, so it goes from `backfilling` straight to `live` once its last
-  chunk (and, for an aggregate, its last group merge) has committed, with no
-  `catching_up`. Its resume
-  rebuilds it the same way, over the ledger the freeze left. A ring enumeration
-  (the fallback for a shape neither build can render) never shows this: it
-  goes from `waiting_to_backfill` straight to `live` in the discharge's own
-  transaction (or to `catching_up`, when its source is another transform's
-  target).
+  set-based build job, on drain threads. The target is partial.
+  A plain aggregate (grouped by plain source columns, on a captured source) and
+  a plain 1-1 transform (no relationship, on a captured source) are built by the
+  Re-derive build instead
+  ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)).
+  The staging worker starts it with no marker, and it is maintained from the start, so it goes
+  from `backfilling` straight to `live` once its last chunk (and, for an aggregate,
+  its last group merge) has committed, with no `catching_up`. Its resume rebuilds it
+  the same way, over the ledger the freeze left. A ring enumeration (the fallback
+  for a shape neither build can render) never shows this status: it goes from
+  `waiting_to_backfill` straight to `live` in the discharge's own transaction (or
+  to `catching_up`, when its source is another transform's target).
 * **`catching_up`** — the build has finished and apply maintains the
   transform exactly as a `live` one, but a go-live catch-up (a re-read of a
   table it reads, parked as a `pending_backfill` marker) hasn't been
   discharged yet, so the target may be missing changes that drained while it
   was building. The staging worker discharges a fresh marker on its next
-  maintenance tick, and that discharge flips the transform `live`. A `live`
-  transform comes back here for its own catch-up: an `ALTER TRANSFORM` that
-  added columns, a resumed column, a rebuild of a transform whose target it
-  reads, or a re-read of a table it reads (`Trellis::request_backfill`, or
-  the table's capture triggers put back after someone dropped them). A catch-up that keeps failing keeps the transform here, with
-  the error on `Trellis::status` when the failing marker is on its source.
+  maintenance tick, and that discharge flips the transform `live`.
+  A catch-up that keeps failing keeps the transform here, with the error on
+  `Trellis::status` when the failing marker is on its source.
+  A `live` transform comes back here for its own catch-up after:
+  * an `ALTER TRANSFORM` that added columns;
+  * a resumed column;
+  * a rebuild of a transform whose target it reads;
+  * a re-read of a table it reads (`Trellis::request_backfill`, or the table's
+    capture triggers put back after someone dropped them).
+
+  A `live` transform that reads an upstream which isn't `live` reports
+  `catching_up` too.
 * **`live`** — the steady state: a watermark token taken after a commit and
   awaited with `Trellis::await_converged` guarantees the target reflects that
   commit. A ring enumeration's rows may still be draining when it flips, but
   they gate every token, so the await covers them
   ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
-* **`quarantined`** — the fuse tripped
+* **`quarantined`** — the whole-transform fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
   transform back to `waiting_to_backfill`, re-runs the backfill, and **re-arms**
   the fuse: already-evicted keys stay evicted (and releasable one at a time, with
   their parked changes intact) but no longer count against the resumed transform,
   so it gets a fresh eviction budget rather than re-tripping on the next one.
+* **`paused`** — frozen, holding its last value, and not maintained
+  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). Either an operator ran
+  `PAUSE TRANSFORM`, or Trellis paused it because it can't keep it correct:
+  * capture of a table it reads broke (a column it reads was renamed or dropped, a
+    primary key was redefined, row-level security or a logical-replication
+    subscription came to apply to a table it reads) or its target came under
+    row-level security: `DefinitionStatus::capture_failure` names the table, the
+    columns and the cause;
+  * its build kept failing in a way no retry gets past: the error stays on
+    `backfill_failure`;
+  * the drain hit a failure that every key reproduces (a source with no usable
+    primary key, a propagation cycle past the hop bound): the definitions it reaches
+    and everything downstream of them are paused, with the cause on `capture_failure`.
+
+  `RESUME TRANSFORM` returns it to `waiting_to_backfill`. It reconciles the target
+  with current source data rather than replaying what was skipped while paused
+  (the change stream is drained for the transform's siblings meanwhile), so the cost
+  of a resume scales with the data, not with the length of the pause.
+
+Two further fields on `DefinitionStatus` explain a transform that is waiting on
+capture rather than on a build. `capture_wait` says the staging worker couldn't yet
+take the brief lock it needs to install or widen the capture triggers on a table the
+transform reads, and names the table, the operation, the lock mode and the sessions
+holding it (an autovacuum worker, say). The worker retries every reconcile pass, and it
+clears once the lock holder lets go. `capture_failure` is set while capture is broken
+and only fixing the cause gets the transform going again: a pause (above), or an
+install that failed for a reason other than a lock, which is retried every pass. The
+worker records both in the catalog, so every process's `status()` reports them, wherever
+the worker runs.
 
 ### Backfill status and the `xmin` caveat
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
-source only once a conservative transaction fence settles (`now.xmin >
-fence`, `trellis/src/intake/markers.rs`), except the Re-derive build of a
+source only once a conservative transaction fence settles (the backfill discharge
+checks that the snapshot's `xmin` is past the fence), except the Re-derive build of a
 plain aggregate or a plain 1-1 transform: it starts with no fence, and each
 of its chunks reads under its own short snapshot after locking the ledger
 entries it rewrites, so a long transaction elsewhere doesn't hold it, and it holds no
 long snapshot of its own
-([data-flow — Re-derive-built definitions](data-flow.md#re-derive-built-definitions)). Because `xmin` is
+([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)). Because `xmin` is
 **cluster-global**, any unrelated long-running transaction *anywhere in the
 cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
 until that transaction ends. Since every new transform goes through this wait
-([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)), a long
+([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)), a long
 transaction delays every registration from going live, not only the ones on a
 newly captured table.
 
@@ -240,8 +274,7 @@ queries, `pg_dump`, or workload on another database sharing the cluster.
 
 A backfill can also fail outright, for example when a plain 1-1 transform's
 source has lost its primary key. That is a fault, so unlike the fence wait it
-is surfaced (issue #407,
-[ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)):
+is surfaced:
 
 * **It doesn't hold up other tables.** The staging worker logs the failure as a
   warning and moves on to the next table's backfill in the same pass.
@@ -261,40 +294,20 @@ is surfaced (issue #407,
   indented line under each affected definition, so one listing shows every
   stuck backfill.
 
-A build that has started fails differently (#616). A plain 1-1 transform's
-build runs as chunks of its source's primary-key range on the drain workers,
-and each chunk that fails is logged as a warning with the definition, the
-chunk, its range or key, the attempt and what happens next. What happens next
-depends on the failure:
-
-* **A transient failure** (a lost connection, a lock or serialization
-  conflict, a busy server) is retried after a backoff of 1 second, doubling
-  after each further failure up to 5 minutes. It counts toward nothing.
-* **A failure on a row's data** (Postgres rejected a value or a constraint,
-  SQLSTATE class `22` or `23`: an overflow or a division by zero, say) is
-  narrowed to the row. The chunk splits in two by key count and both halves run at once;
-  the half without the row finishes, and the other splits again, until the
-  chunk holds the row's key alone. That key is quarantined as the drain
-  quarantines a key that fails (ADR-0003): it is in `poison`, so
-  `Trellis::sample_quarantined` lists it, and the build finishes without it.
-  Releasing it once the row is fixed re-derives it into the target.
-  Quarantine is per source key, as for the drain: until it is released, the
-  key also stays out of every other transform reading the table, and an
-  `ALTER TRANSFORM` rewrite leaves its row as it was. The whole-transform
-  fuse counts these keys like the drain's, per source table, so a build that
-  quarantines five is quarantined itself, and so is any other transform on
-  the table whose fuse they cross.
-* **Any other failure** (a missing table or column, say) is retried with the
-  same backoff, and its fifth attempt pauses the transform. An aggregate's or
-  relationship-enriched transform's build, which runs as one job rather than
-  chunks, is paused after five failed attempts in a row too, since it can't
-  be narrowed to a key. Fix the cause and resume the transform, which
-  rebuilds it.
-
-Meanwhile `DefinitionStatus::backfill_failure` carries the failing chunk's
-error, attempt count and next attempt time, ahead of any failure of the
-source table's marker. A transform paused this way keeps the error there
-until it is resumed, and its next attempt time is the time it paused.
+A build that has started fails differently. A plain 1-1 transform's build runs as
+chunks of its source's primary-key range on the drain workers, and each failing chunk is
+logged as a warning with the definition, the chunk, the attempt and what happens next.
+A transient failure (a lost connection, a lock conflict) is retried with backoff and
+counts toward nothing. A failure on a row's data (SQLSTATE class `22` or `23`) is split
+down to the row's key, which is quarantined as the drain quarantines a key
+([ADR-0003](decisions/0003-quarantine-storage-and-api.md)); the build finishes without
+it and `Trellis::sample_quarantined` lists it. Any other failure is retried, and its
+fifth charged attempt pauses the transform (an aggregate's or relationship-enriched
+transform's build, which can't be narrowed to a key, is paused the same way). Fix the
+cause and resume the transform, which rebuilds it. Meanwhile
+`DefinitionStatus::backfill_failure` carries the failing chunk's error, attempt count
+and next attempt time, ahead of any failure of the source table's marker; a transform
+paused this way keeps the error there until it is resumed.
 
 ### A halting failure
 
@@ -339,7 +352,7 @@ without them:
 
 ## Dependencies
 
-Approved and pinned in `trellis/Cargo.toml` (issues #51/#56); rationale in
+Pinned in `trellis/Cargo.toml`; rationale in
 [ADR-0009](decisions/0009-observability-decisions.md#1-dependencies-metrics-facade-not-prometheus-directly):
 
 * `metrics` + `metrics-exporter-prometheus` for the registry and text rendering.
@@ -352,8 +365,6 @@ Approved and pinned in `trellis/Cargo.toml` (issues #51/#56); rationale in
 ## Related
 
 * [data-flow](data-flow.md) — the flow these metrics measure.
-* [open-questions](open-questions.md#backfill-status-and-observability) — the
-  backfill-status/lag-telemetry question this doc subsumes.
 * [#14](https://github.com/salesforce-misc/trellis/issues/14) — the motivating stall.
 </content>
 </invoke>

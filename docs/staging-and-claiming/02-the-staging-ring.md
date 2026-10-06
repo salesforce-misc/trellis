@@ -22,7 +22,7 @@ claimed with `SELECT … FOR UPDATE SKIP LOCKED LIMIT n`, deleted on completion.
 does not scale: the claim convoys under drainer count, and every row is inserted,
 updated, locked, and deleted — the worst possible workload for MVCC bloat.
 
-The replacement inverts it. **Producers append blind; merging happens at read
+The ring inverts it. **Producers append blind; merging happens at read
 time.** The hot path never issues an `UPDATE` or `DELETE`. Throughput goes flat in
 worker count instead of convoying, and the vacuum burden moves onto three small
 metadata tables where autovacuum can keep up.
@@ -74,11 +74,11 @@ VALUES (...), (...), ...;
 ```
 
 No `ON CONFLICT`, no merge, one row per raw change. Three columns are supplied by
-the *table definition* rather than the producer — the trick that makes them free:
+the *table definition* rather than the producer, which makes them free that makes them free:
 
 | Column | How it is populated | Why not client-side |
 |---|---|---|
-| `row_txid` | `DEFAULT txid_current()` | it must be the writer's real top-level xid at statement time — this is the fence ([03](03-sealing-and-the-fence.md)) |
+| `row_txid` | `DEFAULT pg_current_xact_id()` | it must be the writer's real top-level xid at statement time — this is the fence ([03](03-sealing-and-the-fence.md)) |
 | `appended_at` | `DEFAULT now()` | the latency origin. Stamping it on the registry row instead would make an in-flight writer hold the row a seal must flip, converting clean backpressure into a hard block |
 | `route` | `GENERATED ALWAYS AS (hash(src_table ‖ 0x1f ‖ key) & 0x7fffffff) STORED` | the partition key ([04](04-claiming-and-the-fold.md)) |
 

@@ -277,8 +277,8 @@ Every candidate action falls in one of three buckets by its effect on the oracle
   define-then-load ≡ load-then-define.
 - **Bucket 3 — source data/shape changes:** source DDL, `TRUNCATE`, restore. The
   source effect is easy; the real work is modeling the engine's *policy* when a
-  definition's dependencies change under it — Trellis's quarantine policy (stage 06,
-  #16), still partly undecided (`docs/open-questions.md`).
+  definition's dependencies change under it — Trellis's quarantine and pause
+  policy (stage 06, #16). The oracle models only the settled cases.
 
 Sequencing, cheapest-first (each its own future story under the epic):
 
@@ -349,23 +349,29 @@ Two structural notes for when faults enter the stream:
   them in: a seed only names the same program while the strategy keeps its shape,
   so a checked-in seed goes stale on the next generator change (#505). A failure
   worth keeping becomes a hand-built pin.
+- **Planted-bug sweeps and their baseline.** The concurrent sweep
+  (`planted_bugs_are_caught` in `generative/tests/concurrent_convergence.rs`)
+  re-runs generated cases with a deliberate bug planted and checks the tier
+  catches it, against an unplanted baseline. Each tier (`SweepTier`) sets
+  `max_baseline_failure_share`: the sweep fails if the baseline fails more than
+  one case in that many (8 for the cooling-key tier, 20 for the others), because
+  the run is then on the wrong storage and no catch rate means anything. A plant
+  in the tier's `known_misses` is run and reported but doesn't fail the sweep
+  when uncaught, and one in `not_gated` (with its reason) is left out of
+  `GENERATIVE_PLANTS=all`. Today the baseline tolerates that failure share.
+  The target ([#786](https://github.com/salesforce-misc/trellis/issues/786)) is
+  to require 0 baseline failures except a checked-in, issue-linked quarantine
+  list.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 
-## 10. Open decisions
+## 10. Settled decisions
 
-- **Property-testing framework.** Shrinking is central and no framework is in the
-  tree (only `rand`). `proptest` (typed strategies + integrated shrinking) is the
-  natural fit; hand-rolling avoids a dependency at the cost of reimplementing
-  shrinking. New dependency — **gated on explicit approval**.
-- **Concurrent-runtime shrink trust.** Until the engine's concurrency is settled,
-  concurrent-mode shrinks are advisory; re-shrink under the manual runtime when a
-  failure reproduces there.
-- **How the Postgres-SQL oracle models the quarantined subset.** A row that makes a
-  formula error (division by zero, overflow, type error) is *quarantined* by Trellis
-  and kept out of the target, whereas one `SELECT` over the whole source aborts on
-  the first such row. So once erroring operations exist, the oracle must model
-  quarantine (compute per-row and exclude erroring rows, or render error-to-`NULL`).
-  **Left open — resolve alongside aggregates.**
-- **Quarantine policy under definition-dependency changes** (bucket 3) is likewise
-  undecided (`docs/open-questions.md`).
+- **Property-testing framework.** `proptest` supplies the typed generator
+  strategies and the shrinking.
+- **Concurrent-runtime shrink trust.** A concurrent-mode shrink is advisory:
+  when a failure reproduces under the manual runtime, re-shrink it there.
+- **The oracle and erroring rows.** The Postgres-SQL oracle must model
+  quarantine once erroring operations exist (a row that makes a formula error is
+  kept out of the target, whereas one `SELECT` over the source aborts on it): it
+  computes per row and excludes the erroring rows, or renders error to `NULL`.

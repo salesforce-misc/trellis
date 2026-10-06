@@ -53,22 +53,11 @@ RETURNING seg_seq, bucket;
 Two workers computing overlapping shares both insert; the loser is returned fewer
 rows. No bucket is ever held twice.
 
-> **Measured cost (issue #277, fixed in #620):** "the loser is returned fewer rows"
-> happens only *after* the winner commits. `ON CONFLICT` against an uncommitted
-> insert waits on the inserter's transaction, and the claim used to share one
-> with the fold. Since #620 the claim commits on its own and the fold runs after
-> it, in its own read transaction (the fenced window is immutable, so nothing
-> needs the claim's snapshot). What follows is the measurement from before. Workers that compute the same free share from the
-> same snapshot all go for the same lowest bucket, so every loser waits out the
-> winner's whole fold, then gets nothing and moves on. Under saturating load
-> with 8 drain workers, ~40% of busy engine backend time went to this wait, and
-> at 16 workers it was ~60%. A prototype that committed each claim before
-> folding removed the wait entirely. Throughput didn't move beyond run-to-run
-> noise, at 400 groups on its own or at 4,000 combined with a batched
-> existence probe, because per-row drain work bound there first: with 400
-> groups, the workers freed from the claim queue went on to queue for the
-> aggregate's group pre-lock. The ledger (#623 D5) has since removed both the
-> probe and the pre-lock.
+**The claim commits on its own, and the fold runs after it** in its own read
+transaction (the fenced window is immutable, so nothing needs the claim's
+snapshot). `ON CONFLICT` against an uncommitted insert waits on the inserter's
+transaction, so a claim sharing a transaction with the fold would make every
+losing worker wait out the winner's whole fold before getting nothing.
 
 **The claim is one statement.** The claim rows and the batch's `sealed → draining`
 flip are the same `WITH … INSERT … UPDATE …` statement, so they commit together.
@@ -77,7 +66,7 @@ on a still-`sealed` batch, the completion guard `state = 'draining'` then matche
 nothing, and that worker can never complete a bucket it legitimately holds until
 the 30 s reclaim TTL.
 
-**The segment row is locked first (#690).** Before that statement, in the same
+**The segment row is locked first.** Before that statement, in the same
 transaction, the claim locks the batch's `segments` row (`for no key update`). A
 statement reads from the snapshot it started with, so without the lock a claim
 racing a peer's could compute its free buckets from before the peer's claim and
@@ -88,11 +77,9 @@ then its `seg_claims` rows.
 
 **Never claim an unfenced batch.** Seal phase 2 publishes the fence only on a batch
 still `sealed`, so a committed `sealed → draining` flip on a batch whose fence isn't
-out yet would leave it unfenced, and undrainable, for good. The fold used to share
-the claim's transaction and fail on the missing fence, rolling the flip back. Since
-the claim commits on its own (#620), the drain checks the fence first and refuses
-the batch without claiming it; a fence only ever goes from absent to present, so a
-batch fenced at the check stays fenced.
+out yet would leave it unfenced, and undrainable, for good. The drain therefore
+checks the fence first and refuses the batch without claiming it; a fence only
+ever goes from absent to present, so a batch fenced at the check stays fenced.
 
 > **Postgres gotcha:** a data-modifying CTE that nothing references can be planned
 > away. The flip CTE must be referenced through a `count(*)` guard in the outer
@@ -124,8 +111,7 @@ Two obstacles are real:
 
 So key-routing buys **disjoint bulk parallelism** and keeps every row of a key in
 one bucket, but it does **not** co-locate an aggregate group: two workers on two
-buckets of one batch still contend on a hot group row. A known limitation, not an
-accident.
+buckets of one batch still contend on a hot group row. This is by design.
 
 Nor does it **order a key's writes across batches.** A key lands in one bucket
 *per batch*, but batches drain out of order and in parallel, so two batches'
@@ -143,10 +129,10 @@ one anyway ([02](02-the-staging-ring.md)).
 
 ## The claim-time fold
 
-The merge the write-time upsert once did now happens at **read** time: group the
+The merge happens at **read** time: group the
 claimed batch's fenced window by `(table, key)` into one record each.
 
-Four rules are load-bearing — the same four the write-time merge established:
+Four rules are load-bearing:
 
 | Field | Rule | Why |
 |---|---|---|
@@ -161,7 +147,7 @@ change.
 
 The `new_image` arg-extreme also carries the winning change's identity,
 `last_change`: its own `lsn` and its `row_txid`, the source transaction's id
-under trigger capture (#623 D3). A target on the ledger applies that change
+under trigger capture. A target on the ledger applies that change
 only if its transaction is not visible in the entry's basis and its `lsn` is
 newer than the entry's
 ([05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-ledger)). A
@@ -185,10 +171,9 @@ own image-bearing test (below) and quarantine, which parks it in
 prior image, the old image is read only by relationship machinery, as the
 one place a key's old join value still exists: a to-side row's reverse path
 (the from-side rows that joined its old key, and its projection record), a
-from-side row's re-point or delete, which bumps the parent it left (#130),
-and the reverse guard's in-flight check, which scans the ring's `old_image`
-directly. Capture still stages OLD images for them;
-dropping OLD from the ring is milestone E (#624).
+from-side row's re-point or delete, which bumps the parent it left, and the
+reverse guard's in-flight check, which scans the ring's `old_image` directly.
+The ring carries both images for them ([ADR-0002](../decisions/0002-async-data-flow.md)).
 
 ### The two kinds of missing image
 
@@ -203,12 +188,13 @@ so both arg-extremes must distinguish **"there is genuinely no image here"** fro
   join value to refresh. It must survive the fold. **Do not reintroduce a
   blanket `COALESCE` here.**
 - An **image-less row** — both images NULL — is not a change at all. Aggregates
-  like `array_agg` don't skip NULLs, so before the discriminator such a row won
-  whichever ordering its `lsn` topped and handed the drain a NULL image, which the
-  old delta path read as "no side to apply". The failure ran both ways: a re-derive
-  restaged at `pg_current_wal_lsn()` killed the `+f(new)` and **under**-counted, up
-  to deleting a live group; reverse propagation and backfill restaged below and
-  killed the `−f(old)`, **over**-counting with a phantom member.
+  like `array_agg` don't skip NULLs, so without the discriminator such a row
+  would win whichever ordering its `lsn` topped and hand the drain a NULL image,
+  which the delta path reads as "no side to apply". It fails both ways: a
+  re-derive restaged at `pg_current_wal_lsn()` would kill the `+f(new)` and
+  **under**-count, up to deleting a live group; reverse propagation and backfill
+  restaged below would kill the `−f(old)`, **over**-counting with a phantom
+  member.
 
 The discriminator is therefore *"does this row carry any image at all"*, **not**
 *"is this image column null"*:
@@ -225,8 +211,7 @@ rows are all image-less folds to both images NULL and no `last_change`, which
 is correct: a ledger target re-derives it from live source.
 
 One image-less row does speak to the post-image: an `op = 'delete'` is the
-key's final state within the window, whatever precedes it (ADR-0002, issue
-#620). The post-image arg-extreme therefore ranks every `delete` alongside the
+key's final state within the window, whatever precedes it (ADR-0002). The post-image arg-extreme therefore ranks every `delete` alongside the
 image-bearing rows, so a latest image-less delete folds `new_image` to NULL
 rather than being skipped for an earlier write's post-image. The pre-image
 arg-extreme is unchanged. The fold also returns `ends_in_delete` for the
@@ -286,7 +271,7 @@ holds, and capping rows would cut a 1000:1 fold into pages of 100 records.
 **Picking the path.** The seal stores the row count of the batch's fenced window,
 both halves, as `segments.row_count` ([03](03-sealing-and-the-fence.md), "The
 batch is sized when its fence is published"). A share estimated at `row_count /
-bucket_count × buckets held` that fits the cap folds whole, as it always did, with
+bucket_count × buckets held` that fits the cap folds whole, with
 a `limit cap + 1` guard (the estimate assumes routes spread evenly across
 buckets).
 A share over the cap, a tripped guard, or a bucket with a cursor from an earlier
@@ -300,11 +285,11 @@ leads with an integer and `key` breaks ties. Three properties follow:
 - **A key never splits inside a segment.** Every row of a key has the same page
   key, so the fold's whole-window rules (first old image, last new image, an
   image-less delete ending the key, born-and-died images) and quarantine's
-  `(src_table, key, seg_seq)` parking hold per page unchanged.
+  `(src_table, key, seg_seq)` parking hold per page.
 - **The truncate sentinel sorts first** (its route is `-1`), so the clear always
   lands on page 1, before any key of the segment applies. A truncate segment has
   one bucket, so one worker runs its pages in order.
-- **Cross-key order is arbitrary**, as it always was.
+- **Cross-key order is arbitrary.**
 
 A resume folds only the keys after its cursor, but still against the **whole**
 fenced window's truncate rows, so a key on page 5 still drops its rows at or below
@@ -396,21 +381,6 @@ could not release. The sweep takes its rows `FOR UPDATE SKIP LOCKED` for the
 mirror-image reason the keepalive does: a registry row locked by its own
 claimant's apply transaction is not a dead claimant, and the sweep must never block
 behind one.
-
-## A gate that was considered and not adopted: the pause lease
-
-Suspending *claiming* fleet-wide — a heartbeated **lease** with an `expires_at`
-gating the claim at the top of a drain call — was scaffolded as one way to give an
-auditor a quiescent read. It is **not** how the shipped auditor works.
-
-The self-check auditor is `Trellis::self_check`
-([ADR-0013](../decisions/0013-self-check-production-recompute-audit.md)), and it gets
-its quiescence a different way: it awaits convergence through a watermark, reads the
-target and its recompute in one statement, under one snapshot, and reports a
-divergence only if it *survives a fresh await*. Its strict mode assumes writes to the
-audited tables are stopped by the caller, not that Trellis pauses its own claim path.
-No caught-up-read guarantee depends on suspending claiming fleet-wide, so the pause
-lease has no consumer and the scaffolding is being removed (see #191).
 
 ## What is load-bearing here
 

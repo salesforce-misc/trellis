@@ -3,6 +3,7 @@
 A declarative API for creating data transformations in PostgreSQL.
 Correctness and performance are the key design goals.
 All state managed in Postgres for simplified architecture and efficient, provably correct transforms.
+The known exceptions to that guarantee are listed in [known correctness gaps](docs/known-correctness-gaps.md).
 
 ## Why incrementally maintained tables?
 

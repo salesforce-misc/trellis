@@ -50,8 +50,8 @@ and that can be a batch the flip never saw it in:
 
 So `has_truncate` and `bucket_count` are computed over both halves of the window,
 in the same statement that publishes `S_k`, and `next_claimable_segment` only
-hands out fenced segments. Deciding them from the slot at the flip let a
-straddling truncate escape the barrier (#598).
+hands out fenced segments. Deciding them from the slot at the flip would let a
+straddling truncate escape the barrier.
 
 Truncates are rare; fully serializing the drain around one is the right
 correctness/throughput trade.

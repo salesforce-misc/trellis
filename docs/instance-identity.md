@@ -115,7 +115,7 @@ One thing remains the operator's responsibility, not the engine's:
 An instance can read another instance's 1-1 target as a source, exactly as it
 would any other table with a primary key. It cannot read another instance's
 aggregate target. Trellis requires a source table to have a primary key
-([transforms — Source tables](transforms.md#source-tables)), and an aggregate
+([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)), and an aggregate
 target has none: its grouping columns may be `NULL`, so its identity is a
 `UNIQUE NULLS NOT DISTINCT` constraint. Inside the owning instance that never
 matters, because an instance hands each write to one of its own targets on to

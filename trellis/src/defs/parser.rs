@@ -1173,7 +1173,7 @@ impl Parser {
             other => Err(ParseError::UnsupportedPredicate {
                 detail: format!(
                     "only a literal TRUE is accepted (general predicates are deferred; \
-                        see docs/open-questions.md); found {}",
+                        see issue #804); found {}",
                     other.describe()
                 ),
             }),

@@ -10,12 +10,29 @@ it works (see [What isn't on this list](#what-isnt-on-this-list)). Each entry
 here needs an operator to act, either because Trellis can't see the problem or
 because it only pauses or fails and waits for you.
 
+## Preconditions
+
+The guarantee holds when all of these do. Each entry below is a way one of
+them gets broken without Trellis noticing.
+
+* Trellis is the only writer to its target tables (entry 8).
+* The capture triggers stay installed, enabled and `ENABLE ALWAYS`, and the
+  capture functions keep their bodies (entries 5 and 6).
+* The source tables stay plain tables, outside any partition or inheritance
+  hierarchy (entry 7).
+* No DDL rewrites, retypes or re-collates a column a definition reads, except
+  the changes Trellis detects and pauses for (entries 1 to 4).
+* No row-level security policy applies to a role Trellis logs in as (entry 11).
+* No application trigger re-keys a relationship's join column within the
+  statement that wrote it (entry 9).
+
 Each entry gives:
 
 * **Trigger**: what causes it.
 * **Effect**: what goes wrong, and whether it's silent.
 * **Detected?**: whether Trellis notices, automatically or through
-  `self_check`.
+  `self_check`. Only 1-1 targets can be audited (entry 16), so "`self_check`"
+  below always means a plain 1-1 target.
 * **Planned work**: issues, branches and decisions that would close the gap.
 * **Repair**: what you can do today.
 
@@ -40,29 +57,31 @@ These are the tools the entries refer to:
   audits the target's capture triggers, then compares the target with a
   recompute of it in Postgres
   ([ADR-0013](decisions/0013-self-check-production-recompute-audit.md)).
-  **It only supports 1-1 targets today.** Aggregate targets return
-  `UnsupportedKeySpace` and relationship-enriched fields return
-  `UnsupportedExpr`, so neither gets the capture audit or the comparison.
+  **It only audits 1-1 targets** (entry 16).
 
 ## Summary
 
 | # | Trigger | Silent? | Detected? | Planned work |
 |---|---|---|---|---|
-| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1) only | #703, study pending |
-| 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1) only | #703, study pending |
+| 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
+| 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 3 | Retype or re-collate of a key, join or GROUP BY column | mostly | no | #760, fix held for sign-off |
 | 4 | Widening a column Trellis keeps a typed copy of (`int` → `bigint`) | no (writes fail) | at failure only | #767, decided, not built |
 | 5 | Capture switched off and back on between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
-| 7 | A source attached as a partition, or made to inherit, after define | yes | `self_check` (1-1) only | #707, study pending |
-| 8 | Hand edits to a target table | yes | `self_check` (1-1) only | none; documented |
+| 7 | A source attached as a partition, or made to inherit, after define | yes | `self_check` (1-1 targets only) | #707, study pending |
+| 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
-| 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1) only | #643, with #575 |
+| 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a Trellis login role that isn't checked | yes | no | #766, decision pending |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
-| 14 | A source's primary key dropped, or retyped to an unsupported type | no (drain loops) | logs only | #663, decided, not built |
-| 15 | A field alias that shadows a source column read by an aggregate | target never builds | logs only | #695 |
+| 14 | A field alias that shadows a source column read by an aggregate | target never builds | logs only | #695 |
+| 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #528, test ignored |
+| 16 | `self_check` audits 1-1 targets only | yes | n/a | none filed |
+| 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
+| 18 | `jsonb_agg` element order differs between recomputes | yes | no | none filed |
+| 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -75,8 +94,7 @@ ALTER TABLE orders ALTER COLUMN amount TYPE integer USING amount * 10;
 ```
 
 **Effect:** the statement rewrites the table without firing any DML
-trigger, so capture never sees the new values. Logical decoding doesn't see
-them either. Every target that reads `amount` keeps its old values until each
+trigger, so capture never sees the new values. Every target that reads `amount` keeps its old values until each
 row is written again. Nothing pauses and status shows nothing.
 
 **Detected?** Not automatically. Capture compares column *names*, not types,
@@ -146,17 +164,25 @@ quarantine (see [Repair caveats](#repair-caveats)).
 scale, and a change between deterministic collations. `int` → `bigint` is
 safe for the values but not for Trellis's copies; see entry 4.
 
-**Planned work:** #760. A fix is built, reviewed and passing on branch
-`fix/issue-760-revalidate-type-collate`, held unmerged until the
-false-positive study in the issue is signed off. The fix pauses the
-definition's readers with a `capture_failure` naming the column, in two
-cases:
+**Planned work:** #760, which now also covers #767 and is blocked by #799.
+A fix is built and passing, held unmerged until the false-positive study in
+the issue is signed off. The fix pauses the definition's readers with a
+`capture_failure` naming the column, in two cases:
 
 * the new type or collation would be refused at define;
 * the change re-renders stored keys, compared against the type recorded at
   define.
 
-It ships with #767 and #759 as one PR.
+It ships with #767 as one PR, and #759 follows #799.
+
+**Audit caveat:** after a source key is re-collated, `self_check` pages the
+source and the target under the source key's collation, so it compares them
+correctly, but it reads each page of the target by a scan instead of the
+target's key index (#782). A `self_check` sweep that straddles the change can
+skip or repeat keys, because its `next_after` cursor continues in the new
+order. Start a new sweep after the change. A build that straddles it is pinned
+to the collation it planned under (#769) and doesn't lose rows, but its
+remaining range reads scan the source table.
 
 **Repair:** revert the column's type or collation, then `PAUSE`/`RESUME`
 the readers. If you're keeping the new type, `DROP TRANSFORM` and define it
@@ -187,8 +213,8 @@ relationships are defined under.
 
 **Detected?** Only when the first oversized value fails.
 
-**Planned work:** #767, decided 2026-10-05 and not yet built. It goes on #760's
-branch. The capture pass will compare each copy's type with the source and
+**Planned work:** #767, decided and not yet built. It is planned
+together with #760. The capture pass will compare each copy's type with the source and
 pause the owning definitions. Resume will then widen the copies
 (`ALTER … TYPE`, under `ACCESS EXCLUSIVE`) and rebuild.
 
@@ -280,7 +306,7 @@ change. An edited row stays wrong until its key is recomputed for another
 reason, and a truncated target stays empty.
 
 **Detected?** `self_check` reports it on 1-1 targets. Nothing reports it on
-aggregate targets.
+aggregate or relationship-enriched targets.
 
 **Planned work:** none. This is a documented rule
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
@@ -293,15 +319,21 @@ were changed, `DROP TRANSFORM` and define it again.
 **Trigger:** an application `AFTER ROW` trigger (or a self-referencing
 cascade) that changes a parent's non-key join column again inside the
 statement that changed it. For example, `parents.code` goes `'a'` → `'x'`, then
-the trigger changes it to `'y'`.
+the trigger changes it to `'y'`. A key join column isn't affected, because the
+ring key names every key a row had.
 
-**Effect:** capture records `'x'` as the old value, which was never committed.
-Nothing names the committed `'a'`, so the children that joined through `'a'`
-are never re-derived. Aggregates and to-one projection fields over those
-children keep stale values.
+**Effect:** the nested statement's capture runs first, so the key's earliest
+ring row is `('x', 'y')` and the outer one is `('a', 'y')` (#680). The fold
+keeps the earliest old image, the uncommitted `'x'`, so nothing names the
+committed `'a'`. The children that joined through `'a'` are never re-derived:
+aggregates over them keep stale values, and a to-one projection of `'a'` isn't
+cleared, so 1-1 fields read through it stay stale too.
 
-**Detected?** No. Ignored tests in `ledger_interleavings` pin the
-behaviour.
+**Detected?** No. Two ignored tests in `ledger_interleavings.rs` pin the
+behaviour:
+`a_nested_rekey_of_a_non_key_to_col_re_derives_the_committed_value`
+(aggregate) and
+`a_nested_rekey_of_a_non_key_to_col_clears_the_committed_projection` (1-1).
 
 **Planned work:** #788 needs a design decision. The options are:
 
@@ -328,7 +360,7 @@ example, `regexp_count('é' COLLATE "C", '\w')` is 0 in Postgres and 1 in
 Trellis. That's a silently different value. Syntax that Rust's regex engine
 rejects fails at define instead.
 
-**Detected?** `self_check` on 1-1 targets.
+**Detected?** `self_check` on 1-1 targets. Not on aggregate targets.
 
 **Planned work:** #643, decided. It closes when #575 moves expression
 evaluation into Postgres.
@@ -354,7 +386,7 @@ Trellis connections so a filtered read raises instead.
 **Repair:** grant `BYPASSRLS` to every role Trellis logs in as (it isn't
 inherited), or make the role the table owner without
 `FORCE ROW LEVEL SECURITY`. Then `PAUSE`/`RESUME` the readers
-([transforms — Source tables](transforms.md#source-tables)).
+([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
 ## 12. A crash empties an unlogged source table
 
@@ -366,7 +398,7 @@ from the table's old contents. This is silent. It's inferred from Postgres's
 behaviour and Trellis not checking `relpersistence`; it isn't tested, and no
 issue is filed.
 
-**Detected?** `self_check` on 1-1 targets.
+**Detected?** `self_check` on 1-1 targets. Not on aggregate targets.
 
 **Planned work:** none.
 
@@ -393,8 +425,8 @@ issue is filed.
   definitions, so nothing maintains them, and defining again fails with a
   `conflict` error because the target exists.
 
-**Detected?** A partial restore isn't detected (`self_check` on 1-1 targets
-only). A schema load is detected when you define again.
+**Detected?** A partial restore isn't detected by Trellis (`self_check` can tell on 1-1
+targets only). A schema load is detected when you define again.
 
 **Planned work:** #644 is decided: dump the definitions with the schema, the
 way Rails dumps `schema_migrations`. It isn't built yet.
@@ -406,30 +438,7 @@ way Rails dumps `schema_migrations`. It isn't built yet.
 * For a schema-loaded database, drop the target tables and run the defining
   migrations ([embedding](embedding.md)).
 
-## 14. A source's primary key dropped or moved to an unsupported type
-
-**Trigger:** `ALTER TABLE orders DROP CONSTRAINT orders_pkey`, or a key
-column retyped off the supported list, while definitions read the table.
-
-**Effect:** it's loud but doesn't stop. The docs promise the instance halts.
-In fact the worker re-claims the failing batch every poll interval
-(200 ms) forever and logs every attempt. Other definitions' changes coalesced
-into that batch are held up with it, and the targets go stale. A redefined
-key (`DROP CONSTRAINT …, ADD PRIMARY KEY (id, region)`) is paused by the
-next reconcile pass (#687). Before that pass, drains can fail with
-`MalformedCompositeKey` and charge keys to quarantine (#703).
-
-**Detected?** In logs only. Status has no halted state.
-
-**Planned work:** #663, decided and not built (it depends on #623). Only the
-dependent definitions will be parked, shown as `halted` with a reason, and
-resume will rebuild them.
-
-**Repair:** restore a supported primary key, then `PAUSE`/`RESUME` the
-table's readers. If the key changed for good, `DROP TRANSFORM` and define the
-transforms again.
-
-## 15. A field alias that shadows a source column
+## 14. A field alias that shadows a source column
 
 **Trigger:** an aggregate whose field alias is the name of a source column
 another field aggregates, e.g.
@@ -447,6 +456,109 @@ is written, but the target never fills.
 **Repair:** `DROP TRANSFORM`, then define it again with an alias that doesn't
 shadow a source column.
 
+## 15. A from-side change pending across a to-side `TRUNCATE`
+
+**Trigger:** an aggregate that groups by a column read through a relationship
+(`GROUP BY region, buyer.name`). The to-side table (`users`) is truncated, and
+a from-side row (`orders`) changes a grouping column while its change is still
+undrained, so the two land in different batches:
+
+```sql
+TRUNCATE users;
+UPDATE orders SET region = 'us' WHERE id = 10;
+```
+
+**Effect:** the truncate re-derives the from-side rows from their live values,
+so its image names the new group `(us, a)`, never the old `(eu, a)`. The later
+change resolves its old image's `buyer` against the cleared projection, which
+names `(eu, NULL)`. Nothing names `(eu, a)`, so that group keeps its old
+value. This is silent.
+
+**Detected?** No. The test that pins it is ignored:
+`a_from_side_change_pending_across_a_to_side_truncate_leaves_no_stale_group`
+(`trellis/tests/apply_relationships.rs`).
+
+**Planned work:** #528.
+
+**Repair:** `PAUSE`/`RESUME` the aggregate.
+
+## 16. `self_check` audits 1-1 targets only
+
+**Trigger:** any divergence of an aggregate target or a relationship-enriched
+1-1 target from what its definition computes, from any cause above.
+
+**Effect:** `self_check` on an aggregate target returns `UnsupportedKeySpace`
+before it audits anything. On a 1-1 target with a field read through a
+relationship it audits capture, and reports a fault there, but the comparison
+returns `UnsupportedExpr`. Neither kind of target is compared with a recompute,
+so a stale value in one is silent.
+
+**Detected?** Not applicable. Each entry's "Detected?" line says `self_check`
+only for plain 1-1 targets.
+
+**Planned work:** none filed. ADR-0013 names aggregates and relationships as
+the next scope.
+
+**Repair:** compare the target with your own query of the source, or
+`PAUSE`/`RESUME` it when you suspect a divergence.
+
+## 17. `DROP TYPE` of an enum a live definition references
+
+**Trigger:** `DROP TYPE` (with the column dropped or retyped) on an enum type
+that a live definition's source column uses.
+
+**Effect:** Trellis looks an enum up by its live `pg_type` row. Once the type
+is gone, the column is no longer recognized, and later introspection of the
+definition fails. Nothing notices the drop itself, and no pause is recorded.
+
+**Detected?** Only when a later read of the column's type fails.
+
+**Planned work:** none filed. Nothing in the crate notices a referenced type or
+table disappearing from under a live definition.
+
+**Repair:** `DROP TRANSFORM` and define it again against the new schema.
+
+## 18. `jsonb_agg` element order
+
+**Trigger:** an aggregate field `JSONB_AGG(...)`.
+
+**Effect:** the call has no `ORDER BY`, so two recomputes of the same group
+aren't guaranteed to agree on element order, though the set of elements is
+always right. A comparison with your own query of the source that is
+order-sensitive can show a difference that isn't staleness. This is how the
+function is defined, more than a bug.
+
+**Detected?** No. `self_check` doesn't audit aggregates (entry 16).
+
+**Planned work:** none filed. An `ORDER BY` inside the call would need a
+grammar extension.
+
+**Repair:** compare the elements as a set, or sort them when you read them.
+
+## 19. A paused column doesn't pause the aggregates that read it
+
+**Trigger:** a column of a 1-1 target is paused (its column fuse tripped, or an
+upstream column it reads was paused), and an aggregate transform reads that
+column.
+
+**Effect:** the pause cascades to downstream 1-1 readers but not to
+aggregates (`column_dependents` filters to 1-1 definitions, and the aggregate
+write path has no per-column pause). The aggregate keeps applying, over the
+paused column's frozen values. It agrees with the upstream target as it stands,
+so it isn't wrong against it, but it's stale against the source and nothing on
+its status says so.
+
+**Detected?** No, on the aggregate. The upstream target's status lists the
+paused column.
+
+**Planned work:** none filed. It's a deliberate scoping of column pauses to
+1-1 targets
+([ADR-0003](decisions/0003-quarantine-storage-and-api.md)).
+
+**Repair:** resume the upstream column. Its rebuild writes through to the
+aggregate. If the aggregate's value matters before then, treat it as stale
+while the column is paused.
+
 ## Repair caveats
 
 * **Resume doesn't re-validate (#708).** `RESUME TRANSFORM` rebuilds with the
@@ -456,7 +568,7 @@ shadow a source column.
   decided (resume will run define's validation first) and not yet built.
 * **Quarantined keys stay held (#759).** A key that's quarantined after
   repeated apply failures keeps its parked work and its poison row. Entries
-  3, 4 and 14 can cause such failures.
+  3 and 4 can cause such failures.
   `RESUME TRANSFORM` doesn't clear them today, so that key's target row stays
   stale. There's no supported release in production: `release_key` is
   test-only. Quarantine is keyed by source table, so dropping and redefining
@@ -468,9 +580,6 @@ shadow a source column.
 * **The bindings don't show pause reasons yet (#687).** Ruby, Elixir and
   embedded status show `paused` but not `capture_failure` or `capture_wait`.
   Read `Trellis::status` from Rust, or the logs, for the reason.
-* **`self_check` covers 1-1 targets only.** For aggregate and
-  relationship-enriched targets, the only check is comparing against your own
-  query of the source.
 
 ## What isn't on this list
 
@@ -487,10 +596,18 @@ refusing them up front:
   pass sees it).** Trellis pauses the readers with a `capture_failure`, and
   you resume once the schema is right
   ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md)).
+* **A source's primary key dropped, or retyped off the supported types.** The
+  drain pauses every definition it reaches, and what is downstream of them,
+  with a `capture_failure` naming the cause, and the rest of the page commits.
+  Resume once the key is right, which rebuilds them.
 * **Row-level security on the ring owner or defining role, and a
   logical-replication subscription into a source.** These are refused at define,
   paused by the pass, and reported by `self_check`
-  ([transforms — Source tables](transforms.md#source-tables)).
+  ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+* **A capture function's privilege revoked, or the function made
+  `SECURITY INVOKER`.** This is loud rather than silent: every write to the
+  captured table fails, naming the capture function, so no change is lost.
+  `self_check` names the cause on 1-1 targets.
 * **Session settings** (`DateStyle`, `TimeZone`, `extra_float_digits`, …).
   Trellis pins them on its connections and in its capture functions.
 * **A whole-database backup and restore, or PITR.** Sources and Trellis state

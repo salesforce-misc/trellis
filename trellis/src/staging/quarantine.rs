@@ -2,9 +2,9 @@
 //! release. See docs/staging-and-claiming/06-cleanup-and-reclaim.md's
 //! "Quarantine" section (the design this module implements) and
 //! docs/decisions/0003-quarantine-storage-and-api.md (storage shape,
-//! settled) plus docs/open-questions.md's "Quarantine policy details" (the
-//! knobs that ADR left open — [`DEFAULT_DEATH_THRESHOLD`] is this module's
-//! answer for the fuse threshold, documented there rather than left silent).
+//! settled, including its "Retry policy" section). [`DEFAULT_DEATH_THRESHOLD`]
+//! is this module's answer for the fuse threshold; issue #803 tracks making it
+//! configurable.
 //!
 //! **Failure classification** ([`classify`]) is the entry point [`super::apply::drain_once`]
 //! consults on every Phase-3 failure — see
@@ -61,8 +61,8 @@ use super::watermark::StagedWatermark;
 /// condition 4: an undrainable batch below the retirement boundary wedges
 /// every candidate), rather than have this module evict silently. Not yet
 /// wired to any per-instance or per-transform config surface — this crate
-/// has none today — so every call site uses this constant directly; see
-/// docs/open-questions.md's "Quarantine policy details" for the follow-up.
+/// has none today — so every call site uses this constant directly; issue #803 tracks a
+/// config surface for it.
 pub const DEFAULT_DEATH_THRESHOLD: i32 = 5;
 
 /// The column-fuse's threshold (`docs/decisions/0003-quarantine-storage-and-api.md`'s

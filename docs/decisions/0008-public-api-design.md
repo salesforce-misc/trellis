@@ -6,20 +6,18 @@ deciders: Michael Ries
 
 # Public API Design
 
-Issue #82 asks for a "deep interface": one connection, one minimal set of
-entrypoints, the same grammar for defining a transform as a relationship —
-mirroring how Postgres exposes only SQL, not a protocol per feature. It's the
-blocker for #87 (embedding Trellis into Rails/Elixir over an FFI boundary via
-Rustler or Magnus/rutie), which can't pick an embedding mechanism until the
-shape of what's being embedded is settled.
+The public API is a "deep interface": one connection, one minimal set of entrypoints,
+the same grammar for defining a transform as a relationship — mirroring how Postgres
+exposes only SQL, not a protocol per feature. It is what lets Trellis be embedded in
+Rails/Elixir over an FFI boundary ([ADR-0010](0010-embeddable-clients.md)).
 
-Most of it already exists. `trellis/src/app.rs`'s `Trellis` facade (commit
-`5e55ee0`) implements the planned interactions: `connect(config, options)`,
-grammar-driven `define(text)`/`define_relationship(text)` (via `defs::parse`),
-typed `definitions()`/`relationships()`/`request_backfill(table)`/`poisoned_since(watermark)`,
-and `shutdown()`. This ADR settles what wasn't: crossing FFI (#87), the
-grammar-vs-typed-method split, and quarantine/status observability (its own
-epic, #49).
+`trellis/src/app.rs`'s `Trellis` facade is that interface: `connect(config, options)`,
+one grammar-driven `apply(text)` for every definition change (see
+[ADR-0012](0012-curate-public-api-demote-engine-modules.md)), typed reads such as
+`definitions()`, `relationships()`, `status()`, `request_backfill(table)` and
+`poisoned_since(watermark)`, and `shutdown()`. This ADR records the choices behind it:
+crossing FFI, the grammar-vs-typed-method split, the error shape, and
+quarantine/status observability.
 
 ## Decisions
 
@@ -33,44 +31,37 @@ async-bridging strategies aren't worth it when neither host needs concurrent
 in-flight calls here.
 
 **Decision:** the FFI surface is synchronous and blocks only on *registration*,
-never backfill. `define()` blocks just long enough to create the target table,
-capture the coverage fence, and persist the definition / enumerate its backfill
-work — then returns before a single target row is built.
+never backfill. `define` creates the target table, its ledger tables and its chunk
+plan, persists the definition, and returns. It captures no fence and reads no source
+row; drain workers build in the background
+([ADR-0002](0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
 
-> [ADR-0002](0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)
-> narrows this further: `define()` creates the target table, its ledger tables
-> and its chunk plan, persists the definition, and nothing else. It captures
-> no fence and reads no source row. Drain workers build in the background.
+The reason is scale: a build takes real wall-clock time on a billion-row table, and
+blocking that long means an interrupted process loses all progress. Backfill is
+therefore always background and resumable: the chunked writes are a durable, claimable
+work queue that running drain threads (`drain_threads`) execute — the same
+claim/heartbeat/reclaim-stale machinery used for sealed ring segments. The staging
+worker (`staging`) is separate: it installs capture and maintains the ring.
 
-The reason is scale: even the chunked direct-build path
-([ADR-0002](0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) takes real wall-clock time on a
-billion-row table, and blocking that long means an interrupted process loses
-all progress. Backfill is therefore always background and resumable: the chunked
-writes are a durable, claimable work queue that running `application_threads`
-execute — the same claim/heartbeat/reclaim-stale machinery used for sealed ring
-segments. (`staging_worker` is unrelated; it only keeps up with the replication
-slot.)
+This is the transform status lifecycle (`waiting_to_backfill` → `backfilling` → `live`,
+plus `catching_up`, `quarantined` and `paused`): a host defines a transform, then polls
+`status(transform)` (see #4) until `live`. Progress requires a staging worker and at
+least one drain thread running *somewhere* in the fleet; a connection that only ever
+defines sees its definition sit in `waiting_to_backfill` indefinitely
+([embedding](../embedding.md#the-silent-stall-hazard-issue-144)).
 
-This is issue #55's transform status lifecycle (`waiting_to_backfill` →
-`backfilling` → `live`, plus `quarantined`): a host defines a transform, then
-polls `status(transform)` (see #4) until `live` — the poll-for-completion
-pattern embedding wants. Progress requires at least one `application_threads > 0`
-worker running *somewhere* in the fleet; a connection that only ever calls
-`define()` will see its definition sit in `waiting_to_backfill` indefinitely —
-document this for embedders.
-
-**Settled:** `BlockingTrellis` (`trellis/src/blocking.rs`) is an additive
-wrapper in the `trellis` crate, not a separate shim. `Trellis` stays
-async-native; `BlockingTrellis` owns a dedicated thread with its own Tokio
-runtime (the pattern `Client::start` already uses) and returns
-`TrellisError::CalledFromAsyncContext` rather than panicking when called from a
-thread that already has a runtime entered.
+`BlockingTrellis` (`trellis/src/blocking.rs`) is an additive wrapper in the `trellis`
+crate, not a separate shim. `Trellis` stays async-native; `BlockingTrellis` owns a
+dedicated thread with its own Tokio runtime (the pattern `Client::start` already uses)
+and returns `TrellisError::CalledFromAsyncContext` rather than panicking when called
+from a thread that already has a runtime entered.
 
 ### 2. Grammar scope: definitional statements only
 
-**Decision:** keep the grammar for declarative, write-shaped statements
-(`TRANSFORM`, `RELATIONSHIP`, plausibly future `PAUSE`/`RESUME`), but keep
-status/listing reads as typed methods.
+**Decision:** the grammar carries declarative, write-shaped statements (`TRANSFORM`,
+`RELATIONSHIP`, `ALTER`, `PAUSE`, `RESUME`, `DROP`; see
+[ADR-0014](0014-pause-and-drop-a-transform.md)), and status/listing reads stay typed
+methods.
 
 A status read isn't a declaration — it's a filtered, paginated query
 ("everything paused," "page 2 of poisoned rows"), and the highest-frequency
@@ -96,11 +87,10 @@ a giant `match` over every internal variant).
 **Settled:** `ErrorCode` (`trellis/src/error_code.rs`) is a small,
 `#[non_exhaustive]` enum of coarse categories an FFI caller would branch on
 (`Parse`, `Validation`, `Connectivity`, `Conflict`, `NotFound`, `Timeout`,
-`Internal`). `Timeout` came later (#586): `await_converged` running out of
-time is an expected, retryable outcome, and reporting it as `Internal` left a
-host unable to tell it from a bug.
+`Internal`). `Timeout` exists because `await_converged` running out of time is an
+expected, retryable outcome that a host must be able to tell from a bug.
 Every caller-facing error type (`TrellisError`, `ClientError`, `CatalogError`,
-`ApplyError`, ...) gained a `code()` method, with SQLSTATE-based
+`ApplyError`, ...) has a `code()` method, with SQLSTATE-based
 `classify_pg_error` for raw Postgres errors. `source()`/chaining stays
 Rust-idiomatic internally (`thiserror`, `#[from]`) and does not cross FFI; a
 caller gets `code()` plus the `Display` message, not a chain to walk.
@@ -108,8 +98,8 @@ caller gets `code()` plus the `Display` message, not a chain to walk.
 ### 4. Resource caps: out of scope
 
 #82 calls for "a fixed resource cap (≤1GB memory, fixed threads)" per client.
-`ClientOptions` already has knobs (`application_threads`, `spill_threshold`,
-`hard_cap`, `heartbeat`, ...) that bound thread count and memory.
+`ClientOptions` has knobs (`application_threads`, the drain batch cap, `heartbeat`, ...)
+that bound thread count and memory.
 
 **Decision:** out of scope. The existing knobs give operators the levers;
 turning "≤1GB" into a single enforced budget the engine translates into
@@ -118,12 +108,11 @@ if operators struggle to hit the target with today's knobs.
 
 ### 5. Quarantine/status: row-and-column granularity
 
-Working through #82's "watching for quarantine events" surfaced that
-whole-transform quarantine is too coarse: one broken formula shouldn't force
+Whole-transform quarantine alone is too coarse: one broken formula shouldn't force
 every healthy column in the same `TRANSFORM` into quarantine.
 
 **Decision:** see [ADR-0003](0003-quarantine-storage-and-api.md) for the full
-storage and fuse design. What it settles (implemented, `V21__column_quarantine.sql`):
+storage and fuse design. What it settles (`V21__column_quarantine.sql`):
 
 * Whole-key fuse exception detail stays one record per poisoned **source row**
   (`poison`, unchanged). Column-grain detail lives in a separate
@@ -135,25 +124,15 @@ storage and fuse design. What it settles (implemented, `V21__column_quarantine.s
   remains as a coarser fallback for failures not attributable to one column.
 * **Addressing:** a target is `transform` (whole keyspace) or `transform.column`
   — reusing the grammar's existing `table.column` shape.
-* **Client API** (typed methods, per #2): `quarantined()`,
-  `quarantine_status()`, `sample_quarantined()`, `resume_column()` on
-  `Trellis`/`BlockingTrellis`.
+* **Client API** (typed reads, per #2): `quarantined()`, `quarantine_status()` and
+  `sample_quarantined()` on `Trellis`/`BlockingTrellis`. Resuming a column is the
+  grammar's `RESUME TRANSFORM <target>.<column>`.
 * Threshold, escalation, paused-value semantics, and propagation to dependents
   are settled in [ADR-0003](0003-quarantine-storage-and-api.md).
 
-## Open questions
+## Related
 
-* **Multi-instance lifetime for FFI:** one long-lived `Trellis` handle per app
-  boot (shared via opaque handle/refcount) or a fresh connection per call?
-  Bears on #87's mechanism choice.
-* How `PAUSE`/`RESUME` would be phrased, and whether they need their own ADR
-  given they mutate ADR-0003's column-status table.
-* Whether the observability epic (#49: metrics registry, Prometheus via #53,
-  structured logs via #56) exposes through this `Trellis` facade or a separate
-  handle — #82's "prometheus instrumentation" pattern isn't reconciled here yet.
-* Redefinition (#12, in-place column edits) isn't addressed here at all.
-
-## Related issues
-
-#82 (this design), #87 (embedding, blocked on #82), #49/#51/#53/#55/#56
-(observability, adjacent), #12 (redefinition, adjacent).
+[ADR-0010](0010-embeddable-clients.md) (the handle model and the FFI boundary),
+[ADR-0012](0012-curate-public-api-demote-engine-modules.md) (the one `apply`
+entrypoint), [ADR-0009](0009-observability-decisions.md) (metrics and status),
+[ADR-0015](0015-transform-redefinition.md) (`ALTER TRANSFORM`).

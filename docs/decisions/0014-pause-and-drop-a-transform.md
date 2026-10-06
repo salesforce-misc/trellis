@@ -8,42 +8,60 @@ deciders: Michael Ries
 
 Defining derived state is only half a lifecycle. A definition — a transform or a
 relationship — can also need to stop: frozen while an operator investigates or stages
-a schema change, or removed entirely. This ADR settles that other half. Pause and drop
-apply to any definition uniformly; the act of defining is one concept, and so is its
-inverse.
+a schema change, or removed entirely. This ADR settles that other half. Drop applies to
+any definition uniformly; pause applies to transforms, the only definitions with a status.
 
 ## The lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Backfilling: define
-    Backfilling --> Live: backfill completes
-    Live --> Paused: pause (intentional)
-    Live --> Paused: auto-pause (poison threshold)
-    Paused --> Live: resume — reconcile with source
-    Paused --> [*]: drop — data removed
+    [*] --> WaitingToBackfill: define
+    WaitingToBackfill --> Backfilling
+    Backfilling --> Live: build completes
+    Live --> Paused: PAUSE (operator)
+    Live --> Paused: auto-pause (see below)
+    Live --> Quarantined: whole-transform fuse trips
+    Paused --> WaitingToBackfill: RESUME
+    Quarantined --> WaitingToBackfill: RESUME
+    Paused --> [*]: DROP — data removed
+    Quarantined --> [*]: DROP — data removed
 ```
 
-A live definition reaches `Paused` two ways that share one state: an operator pauses it
-deliberately, or the engine auto-pauses it when a target accumulates too many poisoned
-rows. Both stop the claim-time fold from writing to the target and hold its current,
-now-stale value. From `Paused`, an operator either resumes — which reconciles the target
-with current source data — or drops it, which removes the definition and its data.
+A definition is frozen in one of two statuses, and both stop the claim-time fold from
+writing to the target and hold its current, now-stale value. `paused` is reached by an
+operator's `PAUSE`, or by the engine when it cannot maintain the definition:
 
-Drop acts only on a paused definition. There is no direct live-to-gone edge: quiescing
-first is a precondition, so the removal never has to reason about a fold still
-dispatching to the target.
+- **Capture failure.** A column the definition reads was renamed or dropped, or its
+  source's primary key was redefined, or row-level security came to apply to the Trellis
+  role on a table it reads or on its target, or a logical-replication subscription began
+  replicating into a table it reads. The reason is on the status's `capture_failure`.
+- **Repeated build failure.** A build chunk kept failing in a way no retry or narrowing
+  gets past (a missing table or column, say). The error stays on `backfill_failure`.
+- **A halting drain failure.** A failure every key reproduces (a source with no usable
+  primary key, a propagation wave past the hop bound, an aggregate target off its ledger)
+  pauses every definition it reaches and everything downstream of them, so the rest of the
+  page commits instead of retrying forever. Recorded on `capture_failure`.
+
+`quarantined` is the whole-transform poison fuse ([ADR-0003](0003-quarantine-storage-and-api.md)):
+too many poisoned source rows. It is a separate status so that poison incidents stay
+distinguishable from an operator's pause. From either, an operator resumes, which
+reconciles the target with current source data, or drops it, which removes the
+definition and its data. Every freeze stays until an operator acts.
+
+Drop acts only on a frozen definition (`paused` or `quarantined`). There is no direct
+live-to-gone edge: quiescing first is a precondition, so the removal never has to reason
+about a fold still dispatching to the target. Only a transform can be paused; a
+relationship has no status to freeze, and is dropped outright once nothing reads it.
 
 ## Decisions
 
-### Pause is one state with two triggers
+### Pause is one freeze with several triggers
 
-Intentional pause and automatic poison-driven pause are the same state, reached by the
-same status gate the fold already honors. There is no second freezing mechanism. An
-operator pause is durable until an explicit resume; a poison auto-pause is durable until
-the operator addresses the poisoned rows and resumes. Column-level quarantine is this
-same idea at column granularity — a paused column holds a deliberately stale value while
-the rest of the target stays live.
+An operator pause, an engine auto-pause and the poison fuse all freeze a definition by
+the same status gate the fold already honors. There is no second freezing mechanism. A
+freeze is durable until an explicit resume. Column-level quarantine is this same idea at
+column granularity: a paused column holds a deliberately stale value while the rest of
+the target stays live.
 
 ### Resume reconciles with source, not by catch-up
 
@@ -60,8 +78,14 @@ together in one transaction (issue #330) and read on one snapshot (issue #436):
 - Every target row that no current source row backs is deleted. That covers a 1-1 row
   whose source row was deleted, and an aggregate group whose rows were all deleted or,
   through a relationship-path `GROUP BY` key, all moved to other groups.
-- Every current source row is enumerated for the drain to re-derive, the same
-  enumeration a new definition's catch-up runs.
+- Every current source row is re-derived, by whichever build the definition
+  qualifies for. A definition the Re-derive build serves restarts it over the
+  existing ledger entries, and its sweep re-derives each live entry no chunk
+  reached (a key deleted while frozen). Any other definition parks a marker,
+  and its one-pass build ends in a go-live catch-up that enumerates the
+  source's current keys as image-less Recomputes, plus the orphan sweep
+  (`intake::resume_orphans`) above. `RESUME` first bumps the source's version
+  fence and discards the definition's unclaimed backfill chunks.
 
 Deletions are visible the moment that transaction commits. Rows whose values changed
 during the pause stay stale until the drain re-derives them, and rows the source gained
@@ -114,20 +138,20 @@ dropped with the target; its forensic value goes with the data. The whole-key po
 is keyed to the source table and shared with sibling definitions, so a drop leaves it
 untouched.
 
-### The publication shrinks by reconciliation
+### Capture shrinks by reconciliation
 
-A drop does not touch the replication publication. It removes the definition's catalog
-rows, and the staging worker's reconcile pass, which derives the publication from the
-catalog every `reconcile_interval`, removes a source table from replication once nothing
-derives from it any longer. A table a sibling definition still reads stays published.
-Correct by construction, with the catalog as the only input.
+A drop does not touch the source table. It removes the definition's catalog rows, and
+the staging worker's reconcile pass, which derives what to capture from the catalog every
+`reconcile_interval`, uninstalls a source table's capture triggers once nothing reads it
+any longer. A table a sibling definition still reads stays captured. Correct by
+construction, with the catalog as the only input.
 
-The shrink is deferred to that pass rather than applied at drop time
-([ADR-0002](0002-async-data-flow.md#capture-by-statement-triggers), #427): the staging worker is the only
-process that changes the publication, so dropping a transform needs no publication
-privileges. The cost is that the table's changes keep being staged for up to one
-`reconcile_interval` with no reader, which is harmless, because apply skips a table
-nothing reads.
+The uninstall is deferred to that pass rather than applied at drop time
+([ADR-0002](0002-async-data-flow.md#capture-by-statement-triggers)): the staging worker
+is the only process that changes a source table's triggers, so dropping a transform
+needs no privileges on the source. The cost is that the table's changes keep being
+staged for up to one `reconcile_interval` with no reader, which is harmless, because
+apply skips a table nothing reads.
 
 ### Pause and drop are idempotent
 

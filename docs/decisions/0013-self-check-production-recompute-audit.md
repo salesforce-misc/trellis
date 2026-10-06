@@ -21,17 +21,16 @@ test suite can perform.
 ### `self_check` is a public method on `Trellis`
 
 It audits one target at a time, is read-only, and returns a `SelfCheckReport`
-describing any divergences (cell, missing row, extra row, missing/extra column, and,
-since #622, a broken capture), the
+describing any divergences (cell, missing row, extra row, missing/extra column, and a
+broken capture), the
 LSN checked through, the rows compared, and whether the scan was bounded. Fleet-wide
 sweeps are a caller-side loop over `definitions()`, not a behaviour of the primitive.
 
 ### The capture audit runs first
 
-*Added by #622 (C9), when capture moved to statement triggers
-([ADR-0002](0002-async-data-flow.md#capture-by-statement-triggers)).*
-
-A target is only as current as the capture feeding it, and a broken capture
+Capture is statement triggers
+([ADR-0002](0002-async-data-flow.md#capture-by-statement-triggers)), so a target is only
+as current as the capture feeding it, and a broken capture
 is invisible to the convergence wait: convergence is a predicate over ring
 rows, and a capture that has stopped writes none. So before it awaits or
 compares anything, `self_check` reads from the catalog (`pg_trigger`,
@@ -65,8 +64,8 @@ reconcile can't land; the others persist until an operator fixes them.
 ### Postgres is the oracle; the comparison is two-way
 
 `self_check` compares the persisted target against an equivalent recompute *query*
-executed by Postgres — for an aggregate target, the corresponding `GROUP BY`. It does
-not run the engine's Rust evaluator as part of the comparison. Re-running the
+executed by Postgres. It does not run the engine's Rust evaluator as part of the
+comparison. Re-running the
 evaluator would check the engine against itself; the authority is Postgres computing
 the answer from source rows independently. This also matches the failure class the
 audit exists to catch: a stale target diverges as persisted-vs-recompute, where an
@@ -89,18 +88,13 @@ and a recompute's text can differ while both are genuinely-correct answers. A
 byte-exact check reports that as a divergence no recomputation can ever settle — a
 false positive in the audit, not a caught bug.
 
-For **aggregate result cells produced by such a fold**, `self_check` therefore
-compares by the type's own `=` (asking Postgres `persisted = recompute`) rather
-than by text. A truly wrong `MAX` still fails — `3 = 5` is false — but a `-0`/`0`
-tie does not. This carve-out is scoped tightly: it applies only to `MIN`/`MAX`
-result cells of these types, never to keys, passthrough, or invertible aggregates
-(`SUM`/`AVG`/`COUNT`), which stay byte-identical. The promise, stated precisely, is
-convergence up to the target type's equality — byte-identical wherever a type has a
-single canonical representation per value, which is almost everywhere.
-
-This is what lets `MIN`/`MAX` ship uniformly across `float` and `interval` (issues
-#112/#113): both families sit on the same side of one consistent rule, rather than
-one being refused for a defect the other tolerates.
+So for **aggregate result cells produced by such a fold**, the promise holds up to the
+type's own `=` (`persisted = recompute`), not the text: a truly wrong `MAX` still fails
+(`3 = 5` is false), but a `-0`/`0` tie does not. The carve-out is tight: it covers only
+`MIN`/`MAX` result cells of these types, never keys, passthrough, or invertible
+aggregates (`SUM`/`AVG`/`COUNT`), which stay byte-identical. `self_check` audits 1-1
+targets only (see [Scope](#scope-1-1-targets)), so every cell it compares is compared
+byte-for-byte.
 
 ### The audit query is rendered independently of the write path
 
@@ -118,9 +112,8 @@ The correctness promise is conditional on being caught up to an LSN, so `self_ch
 must never report a merely-lagging target as diverged. It takes a watermark token,
 awaits convergence through it (bounded by a timeout; on timeout it reports "not caught
 up," never a divergence), and reads the target and runs the recompute under one
-snapshot. *Amended by #782:* that was a `REPEATABLE READ` transaction holding two
-queries; it is now one statement that reads both sides, which gives it one snapshot
-under any isolation level.
+snapshot: one statement reads both sides, which gives it one snapshot under any
+isolation level.
 
 A snapshot alone is not sufficient under live load: a single snapshot pins source and
 target at one instant, but a correctly-working target legitimately lags its source by
@@ -129,13 +122,12 @@ re-check after a fresh await** — a genuine divergence is stable; a convergence
 resolves. A strict mode, sound only when writes to the audited tables are stopped, is
 the documented strong guarantee for callers that can quiesce.
 
-### Scope: 1-1 first, then aggregates and relationships
+### Scope: 1-1 targets
 
-The audit query projects the target's key so a divergence is reported per key.
-Extending to aggregate and relationship-enriched targets is in scope; scoping an
-aggregate audit bounds the *group-key space* and then scans all source rows belonging
-to those groups — a source-row predicate would change the answer, since a group's
-value depends on every row in it.
+`self_check` audits 1-1 targets; asked for an aggregate or a relationship-enriched
+target it returns an error naming the limit
+([known correctness gaps](../known-correctness-gaps.md)). The audit query projects the
+target's key so a divergence is reported per key.
 
 ### Respect column-level quarantine
 

@@ -74,10 +74,9 @@ not the slot. Two writers land outside it:
 Each surfaces as a false `converged`. Condition 3 **asks the slot**, so it replaces
 the whole pile and cannot disagree with the other pending readers.
 
-The band is now write-only. Treat it as vestigial, not an observability surface;
-don't restore a reader assuming one exists. Making it *honest* by finalizing it at
-snapshot capture stays unbuilt: a snapshot-time aggregate still can't see a straddler,
-so it would sit *beside* a straddler term — the shape that leaked.
+Nothing reads the band: it is not an observability surface. Finalizing it at
+snapshot capture wouldn't make it honest either: a snapshot-time aggregate still
+can't see a straddler, so it would sit *beside* a straddler term — the shape that leaked.
 
 **"Narrowing condition 3" is a recurring, unsound temptation** — drained-only,
 straddler-only, band-only all admit a false `converged`. Buy the honest question back
@@ -118,8 +117,8 @@ crosses. The two conditions get there differently, both load-bearing:
 | "how much is pending?" | `count(*)` over every slot plus quarantine | expensive — full scan | observability only, **never polled** |
 
 `pending_count` is linear in the ring and no index helps — there is no predicate to
-index away. It was taken **off the polling path**: every polled consumer wanted the
-sign, not the number, so the sign became its own question. One asymmetry in the
+index away. It stays **off the polling path**: every polled consumer wants the
+sign, not the number, so the sign is its own question. One asymmetry in the
 `EXISTS` form: `true` short-circuits, `false` does not — it is a gate ("has my work
 drained?"), not a work-arrival poll.
 

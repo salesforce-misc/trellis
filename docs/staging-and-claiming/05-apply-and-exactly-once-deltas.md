@@ -176,6 +176,10 @@ table:
 | Relationship projection writes | no | yes | the per-row `prev_lsn` ordering guard |
 | Truncate | no | yes | the drain barrier (full serialization) |
 
+I2 is one test, shared by both ledgers: an Apply changes its entry only if its
+source transaction is not visible in the entry's `__basis`, its `lsn` is above
+`__applied_lsn`, and its `lsn` is above the target's truncate floor.
+
 A 1-1 write is an absolute value: "set this key's row to `f(row)`". Two such writes
 for one key in two batches don't commute. If the batch computed from the older
 source state reaches Phase 3 last, its value overwrites the newer one, and nothing
@@ -201,9 +205,15 @@ pass:
    settled by its insert, since with no entry I2 is only the truncate floor;
    a Re-derive's entry is a placeholder until step 3. Every Phase 3 writer of
    the key's target row holds the entry, so every Phase 3 for a key runs one
-   at a time. (A catch-up's orphan sweep deletes 1-1 rows the source no longer
-   backs without it; that sweep is ordered by its own snapshot argument,
-   `intake::resume_orphans`.) It can't be the target row's `FOR UPDATE`: a stale insert racing a
+   at a time. The one exception is the orphan sweep
+   (`intake::resume_orphans`), which a marker's discharge runs for a resume or a
+   one-pass build's go-live catch-up: it deletes 1-1 target rows, and aggregate
+   groups, the source no longer backs by key, without the entry. It judges
+   them unbacked on the snapshot of its own read, and any later change drains
+   after the sweep commits and re-derives the key, so it is ordered by that
+   snapshot argument instead. It runs only for definitions the Re-derive build
+   doesn't serve (a resumed definition it does serve gets the build's own
+   sweep instead), until milestone F (#625) moves them. It can't be the target row's `FOR UPDATE`: a stale insert racing a
    delete has no row to lock. A key whose tombstone the GC collects between
    the two statements fails the page transiently and it is retried (#712).
 2. **The Re-derive read (I1).** The Re-derived keys' source rows and
@@ -211,8 +221,7 @@ pass:
    row is a delete.
 3. **The entries (I2).** A Re-derive sets the entry's `__basis` to the read's
    snapshot and leaves `__applied_lsn` alone (#623 Q1). An Apply applies only
-   if its transaction is not visible in `__basis`, its `lsn` is above
-   `__applied_lsn`, and it is above the target's truncate floor (#623 Q6); it
+   if the I2 test above passes; it
    then sets `__applied_lsn`. Either raises `__applied_seg` and marks a
    tombstone when the key has no row after it. The statement returns the keys
    it changed.
@@ -336,12 +345,8 @@ five steps:
      pending with its own ring row, and its trigger `lsn` may be below any
      position the read could record.
    - An Apply writes the entry from the record's new image, or makes a tombstone
-     for a delete. It sets `__applied_lsn` to the change's `lsn`. It changes the
-     entry only if all three hold (I2):
-     - the change's source transaction (`row_txid`) is not visible in the
-       entry's `__basis`;
-     - its `lsn` is above `__applied_lsn`;
-     - its `lsn` is above the target's truncate floor.
+     for a delete. It sets `__applied_lsn` to the change's `lsn`, and only if
+     the I2 test passes (as on a 1-1 target, [above](#absolute-writes-do-not-commute-the-1-1-ledger)).
 
    The statement then sums each updated entry's move from its old state to its
    new one into per-group increments: the member count, and per argument its
@@ -437,19 +442,6 @@ its entry's `basis` doesn't see, so every change the `basis` does see
 completed before the delete and is in the delete's batch or an earlier one,
 which the Apply's stamp covers, and a Re-derive that deletes the key stamps
 its own read's segment (`defs::ledger::tombstone_seg_sql`).
-
-## What this replaced
-
-The old, mutable-worklist design needed two extra mechanisms, both now gone:
-
-- An **`lsn` compare-and-delete**: clear a claimed key only if its `lsn` is
-  unchanged since the claim, so concurrent re-stages survive.
-- A **survivor rewrite**: when a re-stage *did* land on a claimed row mid-compute,
-  advance that survivor's `old_image` to the image just applied, or the re-drain
-  double-subtracts.
-
-Both existed *only* because the worklist was mutable; Property 1 removes the race.
-A patch that makes a claimed batch mutable again brings the race back.
 
 ## The delta model
 
@@ -619,9 +611,7 @@ was in. The relationship paths still read the old image a capture trigger
 stages ([01](01-capture-by-triggers.md)), the only place a key's old join
 value still exists: a to-side **delete** or **join-key change** must refresh
 the from-side rows that joined the old key, not only those that join the new
-one ([04](04-claiming-and-the-fold.md#who-reads-the-old-image)). Dropping OLD
-images is milestone E (#624).
-
+one ([04](04-claiming-and-the-fold.md#who-reads-the-old-image)). 
 Two termination mechanisms:
 
 - **Filtered staging.** Dependents are staged only for tables that actually have a
@@ -634,8 +624,7 @@ Two termination mechanisms:
   named error identifying the bound, the generation and the cycling tables.
 
 An absolute round ceiling survives as defence-in-depth, catching runaways the hop
-bound cannot (e.g. an unbounded stream of fresh source changes). It is no longer the
-contract, so its message stays hedged: exceeding it is *not* necessarily a cycle.
+bound cannot (e.g. an unbounded stream of fresh source changes). It is not the contract, so its message stays hedged: exceeding it is *not* necessarily a cycle.
 
 ## Suppressing no-op writes
 

@@ -29,7 +29,7 @@ reference's identity. It never persists or re-resolves the bare spelling.**
    quarantine state, walked and diffed on qualified strings, never re-resolved.
 
 3. **Every generated statement emits qualified names,** schema and table quoted
-   independently — for replication/publication, backfill enumeration, and
+   independently — for capture triggers and functions, backfill enumeration, and
    target-table DDL alike.
 
 4. **The grammar accepts, but does not require, an explicit `schema.table`.** A
@@ -70,11 +70,11 @@ identity — relationship endpoints (see [ADR-0006](0006-relationships.md)).
 
 ### Bind identity to a PostgreSQL OID at definition time
 
-Explored on branch `source_table_resolution` (draft ADR
-`0007-source-object-identity.md`): store the relation's OID as authoritative
+Explored on branch `source_table_resolution` (a draft ADR that never
+landed): store the relation's OID as authoritative
 identity instead of its name. **Rejected.** The bug addressed here is a
-*definition-time name-resolution* bug — the replication path was never confused,
-carrying authoritative schema identity from the WAL. OIDs are also **not** stable
+*definition-time name-resolution* bug — capture was never confused, since the
+trigger is attached to one specific relation. OIDs are also **not** stable
 across restore/`pg_upgrade`/DR-failover, so every transform would break after a
 source-DB restore unless a missing OID were tolerated — which reopens the very
 ambiguity this decision closes. It also imposes permanent dual-path complexity,
@@ -82,7 +82,7 @@ and was only ever partially applied.
 
 ### Resolve names on every operation
 
-Re-applying `search_path` during backfill, publication reconciliation, and apply
+Re-applying `search_path` during backfill, capture-trigger reconciliation, and apply
 makes behavior depend on the executing session and can bind one definition to
 different objects over time — the failure mode PR #39 and PR #69 hit. Persisting
 the qualified name avoids this and the repeated work, extending to identity the

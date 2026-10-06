@@ -24,12 +24,8 @@ segment with one `INSERT … SELECT`:
 - **Keys.** Every ring row is keyed by the table's primary key, in declared
   order, joined with `\x1f` for a composite key. A table without a primary
   key, a partitioned table, or a table in a partition or inheritance
-  hierarchy, is refused when a definition is applied. (A statement trigger
-  fires only for the table a statement names: one on a partitioned parent
-  misses a write aimed at a partition directly, and one on a partition or an
-  inheritance child misses a write made through its parent.) `self_check`
-  reports a source that joins such a hierarchy later
-  (`staging::capture_audit`).
+  hierarchy is refused (see
+  [supported sources and targets](../transforms.md#supported-sources-and-targets)).
 - **Images.** `old_image` and `new_image` hold the primary key plus every
   column some reader of the table needs (`capture::columns`), rendered with
   `format('%s', col)` under the same five pinned output settings as every
@@ -37,37 +33,13 @@ segment with one `INSERT … SELECT`:
   `extra_float_digits`), set as the function's own `SET` clauses. So an image
   doesn't depend on the writing session's settings. `old_image` comes from
   the OLD transition table, which carries the whole row, detoasted.
-- **`new_image` is the live row** (#623 D8a). When another write to the
-  table ran during the statement (see "When capture re-reads" below), each
-  row the statement wrote is
-  re-read from the table by primary key, and `new_image` images that row,
-  the one the transaction holds once the statement and its own `AFTER ROW`
-  triggers are done, not the transition table's version (see "Nested writes
-  to the same key" below). If the key is gone from the table, a nested
-  write deleted or re-keyed it, and the row staged is a delete. A delete's
-  key is re-read too: a nested write that put the key back stages an update
-  to the live row. The re-read never sees another transaction's change: each
-  row it joins was written or deleted by this statement, so this transaction
-  holds its row lock, or for a new key its unique-index entry, until commit,
-  and the key's live version is one this transaction wrote. The probe keeps
-  only such a version (`age(xmin) <= 0`): under `REPEATABLE READ` and
-  `SERIALIZABLE` a version another transaction deleted after the snapshot
-  stays visible beside the one this statement re-created. It also requires
-  the version's key to render as the row's own, because the ring keys by
-  text and a type's `=` can be looser (`numeric` `1.0 = 1.00`). The re-read
-  is a `LATERAL … LIMIT 1` probe per row, and the function runs with
-  `enable_seqscan` off: PL/pgSQL plans once per session, often against a
-  table that was empty then, and a cached sequential scan would read the
-  whole table for every captured row once it grows
-  (`tests/capture_reread.rs`, at every isolation level).
-- **The re-read needs `SELECT` on the table**, which the Trellis role holds
-  as the table's owner; the capture audit reports it missing. On a table
-  whose row-level security policies hide a row from the Trellis role (with
-  `FORCE ROW LEVEL SECURITY`, say, which makes them apply to the owner), the
-  re-read can't find it and stages a delete. That isn't supported (#745):
-  defining refuses such a table, the staging worker pauses its readers if
-  the policies come to apply later, and `self_check` reports it
-  (`defs::row_security`).
+- **`new_image` is the live row.** When another write to the table ran during
+  the statement, capture re-reads each row by primary key (see "When capture
+  re-reads" below); otherwise it images the transition table. The re-read
+  needs `SELECT` on the table, which the Trellis role holds as the table's
+  owner; the capture audit reports it missing. A table whose row-level
+  security hides rows from the Trellis role is refused (see
+  [supported sources and targets](../transforms.md#supported-sources-and-targets)).
 - **Updates** pair the OLD and NEW transition tables by primary key. A row
   whose key changed has no partner, so it becomes a delete of the old key and
   an insert of the new one.
@@ -83,13 +55,13 @@ segment with one `INSERT … SELECT`:
   a `WHEN` clause when it has transition tables, so the filter is in the
   function.
 - **`group_key`** is the union of every outbound relationship's `from_col`
-  across OLD, NEW and the live row (#133).
+  across OLD, NEW and the live row.
 - **`row_txid`** is the ring's default, `pg_current_xact_id()`: the source
   commit's own `xid8` (exact identity, invariant I0).
 - **`lsn` and `origin_lsn`** are `pg_current_wal_insert_lsn()` when the
   trigger runs, below the commit's position.
 - **`src_changed`** is `clock_timestamp()` when the statement's trigger runs:
-  change time, not commit time (#622 plan Q8).
+  change time, not commit time.
 - **The slot.** The function reads the active ring slot from
   `ring_slot_mirror` in the same expression that assigns the writer's xid,
   so the seal's fence ([03](03-sealing-and-the-fence.md)) holds for
@@ -98,16 +70,14 @@ segment with one `INSERT … SELECT`:
 
 The functions are `SECURITY DEFINER`, owned by the role that owns the ring (the
 role that ran the migrations), with `search_path` pinned. That need not be the
-schema's owner: a DBA can pre-create the schema as another role (issue #701).
-The application needs no privilege on Trellis's schema. The triggers are
+schema's owner: a DBA can pre-create the schema as another role. The
+application needs no privilege on Trellis's schema. The triggers are
 `ENABLE ALWAYS`, so a session in `session_replication_role = replica` is
-captured too. A logical-replication subscription's apply worker is not: it
-runs in that role but fires only row-level triggers, so its inserts, updates
-and deletes never reach the ring. That isn't supported (#751): defining
-refuses a table a subscription replicates into, the staging worker pauses its
-readers if a subscription starts to later, and `self_check` reports it
-(`defs::subscription`). Nothing in the capture path issues `NOTIFY`, because `NOTIFY`
-takes a database-wide lock at commit.
+captured too. A logical-replication subscription's apply worker fires only
+row-level triggers, so a table a subscription replicates into is refused (see
+[supported sources and targets](../transforms.md#supported-sources-and-targets)).
+Nothing in the capture path issues `NOTIFY`, because `NOTIFY` takes a
+database-wide lock at commit.
 
 What is installed lives only in Postgres's catalog: the triggers in
 `pg_trigger`, and each function's column set in its `COMMENT ON FUNCTION`.
@@ -130,7 +100,7 @@ Every locking attempt waits at most 50 ms for the table, so an application
 writer never queues behind one for longer (ADR-0002 I6), and is retried. A
 pass spends at most one second on locked tables in all; the first attempt on
 each table always runs, so one blocked table doesn't delay another's join.
-Nothing cancels a lock holder, an autovacuum included (#622 plan Q1): a table
+Nothing cancels a lock holder, an autovacuum included: a table
 whose lock stays held is left for the next pass. While a definition waits on
 such a table, its status carries `capture_wait`, naming the sessions holding
 the lock.
@@ -145,7 +115,7 @@ triggers, so the marker commits exactly when capture starts, and the table
 lock means no writer of the table is in flight at that moment. A write
 committed before the install is in the backfill's enumeration; one after it
 runs the trigger. The discharge fences the marker only after reading it
-committed, as it always has.
+committed.
 
 ## Which definitions a discharge may dispatch
 
@@ -177,13 +147,13 @@ unpauses the field only once the installed capture images the column, and
 only after the widen's gate, so every row the old function staged has drained
 past the paused field. The same discharge's enumeration re-derives every row
 with the field unpaused. A field that reads only columns the definition
-already read unpauses when the backfill ends, as before.
+already read unpauses when the backfill ends.
 
 ## Order
 
 Per-key order is `(lsn, change_id)`. A second writer of a key runs its
 trigger only after the first commits, because it waits on the row lock, so its
-rows sort after the first's (#565 E4). Cross-key order is not promised. In
+rows sort after the first's. Cross-key order is not promised. In
 particular, an `ON DELETE CASCADE` child's capture runs before its parent's
 statement trigger, the reverse of the WAL's order; nothing depends on it.
 
@@ -194,7 +164,7 @@ a watermark token already has its rows in the ring when the token is read.
 The read-your-writes predicate ([07](07-convergence-and-await.md)) only asks
 the ring, and a waiter writes nothing.
 
-## A renamed or dropped column (#622 C6)
+## A renamed or dropped column
 
 A function's inserts name every column it images, so once one of them is
 renamed or dropped they no longer plan, and without a guard every write to
@@ -206,7 +176,7 @@ end`). PL/pgSQL plans a statement only when it first runs it, so on a miss
 the stale inserts are never planned. The check is per statement, and sound,
 because `ALTER TABLE … RENAME` and `DROP COLUMN` take `ACCESS EXCLUSIVE`: no
 captured statement runs across one. It costs about 3.4–5 µs per single-row
-statement and nothing measurable past a few rows per statement (#622 C4's
+statement and nothing measurable past a few rows per statement (
 `trigger+column-check-guard`). There is no `EXCEPTION` block, so no
 subtransaction.
 
@@ -255,23 +225,40 @@ would otherwise wait to backfill forever, with the table's capture failing
 every pass and nothing on its status; instead it pauses again with its
 `capture_failure`. A pass that pauses leaves the table for the next pass.
 
-Regenerating from an event trigger, inside the DDL's own transaction, is not
-built (#622 plan Q2(b)).
+## Nested writes to the same key
 
-## Nested writes to the same key (#680)
+When an application `AFTER ROW` trigger, or a self-referencing cascade,
+rewrites a row its own statement wrote, the nested statement's capture runs
+first, so the outer statement's ring row has the higher `lsn`. The outer
+row's `new_image` is the live row, the final one, so a `GROUP BY` or 1-1
+target keeps the final values (`tests/capture_join.rs`,
+`tests/ledger_interleavings.rs`). Its `old_image` is the statement's OLD row;
+the fold keeps the earliest old image anyway. A nested write that re-keys a
+row is covered by the [known correctness gaps](../known-correctness-gaps.md).
 
-Suppose an application `AFTER ROW` trigger, or a self-referencing cascade,
-rewrites a row its own statement wrote. The nested statement's capture runs
-first, so the outer statement's ring row has the higher `lsn`. Its OLD and
-NEW transition tables still hold the outer statement's own versions, so
-before #623 D8a it staged the older values last, and a `GROUP BY` or 1-1
-target kept them. The outer row's `new_image` is now the live row, the final
-one (`tests/capture_join.rs`, `tests/ledger_interleavings.rs`). Its
-`old_image` is still the outer statement's OLD row: the fold keeps the
-earliest old image anyway, and only the relationship readers read it (until
-#624).
+## When capture re-reads
 
-## When capture re-reads (#623 D8a)
+`new_image` is the live row: the one the transaction holds once the
+statement and its own `AFTER ROW` triggers are done, not the transition
+table's version. When another write to the table ran during the statement
+(below), each row the statement wrote is re-read from the table by primary
+key. If the key is gone, a nested write deleted or re-keyed it, and the row
+staged is a delete. A delete's key is re-read too: a nested write that put
+the key back stages an update to the live row.
+
+The re-read never sees another transaction's change: each row it joins was
+written or deleted by this statement, so this transaction holds its row lock
+(or, for a new key, its unique-index entry) until commit. The probe keeps only
+a version this transaction wrote (`age(xmin) <= 0`), because under
+`REPEATABLE READ` and `SERIALIZABLE` a version another transaction deleted
+after the snapshot stays visible beside the one this statement re-created. It
+also requires the version's key to render as the row's own, because the ring
+keys by text and a type's `=` can be looser (`numeric` `1.0 = 1.00`). The
+probe is a `LATERAL … LIMIT 1` per row, and the function runs with
+`enable_seqscan` off: PL/pgSQL plans once per session, often against a table
+that was empty then, and a cached sequential scan would read the whole table
+for every captured row once it grows (`tests/capture_reread.rs`, at every
+isolation level).
 
 Under `SERIALIZABLE` the re-read's index probe takes a predicate (SIREAD)
 lock on the key's btree leaf page, and concurrent serializable writers on
@@ -305,7 +292,7 @@ update already queued there: one capture call covers both. A row both
 updated (a self-referencing key that cascades, or two cascading keys on one
 row) is in the transition tables twice, and pairing by key can image the
 intermediate version last. So an update capture also re-reads when a key
-occurs twice among its old rows (found in review).
+occurs twice among its old rows.
 `tests/capture_ssi.rs` pins the gate, and `capture::sql`'s `function_body`
 has the argument.
 
@@ -314,8 +301,8 @@ has the argument.
 The capture runs inside the application's transaction, so the writer pays for
 it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
-WAL per row (#622 C4, `local_docs/bench/622-baseline.md`). The begin
-trigger and the span bookkeeping (#623 D8a) add about 4.4 µs per statement,
+WAL per row (`local_docs/bench/622-baseline.md`). The begin
+trigger and the span bookkeeping add about 4.4 µs per statement,
 and nothing per row. An update's repeated-key check adds about 2.7 µs per
 statement and 0.3 µs per row (a rough in-transaction measurement, not
 `write-tax`, which only inserts). When a statement does re-read, the probe

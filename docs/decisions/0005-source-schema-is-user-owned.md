@@ -8,15 +8,16 @@ informed:
 
 # Source Schema Is User-Owned
 
-Trellis reads source tables over logical replication and derives target tables
-from them. As features grow, it's tempting to *improve* the source schema on the
-user's behalf — add an index, add a `UNIQUE` constraint a transform relies on,
-set `REPLICA IDENTITY FULL` so deletes carry an old image. This ADR rejects that.
+Trellis reads source tables (changes are captured by triggers it installs; see
+[capture by triggers](../staging-and-claiming/01-capture-by-triggers.md)) and
+derives target tables from them. As features grow, it's tempting to *improve* the
+source schema on the user's behalf — add an index, add a `UNIQUE` constraint a
+transform relies on. This ADR rejects that.
 
 ## Decision
 
 **Trellis never modifies the source schema.** No indexes, no constraint changes,
-no replica-identity changes, no DDL against a source table. The user owns those
+no DDL against a source table other than the capture triggers themselves. The user owns those
 tables; Trellis is a reader. Instead:
 
 1. **Validate strongly at definition time.** Every definition is checked against
@@ -41,11 +42,8 @@ Correctness vs. performance sets the severity:
 
 * Definitions are only as capable as the schema the user actually built — by
   design. Trellis never leaves a schema in a state the user didn't author.
-* Validation must introspect real constraints (keys, unique indexes, types,
-  replica identity), never assume them. Requirements like `REPLICA IDENTITY FULL`
-  for deletes/re-parents from one-to-many aggregates (see
-  `staging-and-claiming/01-intake-and-lsn-confirmation.md`) are checked and
-  surfaced, never applied.
+* Validation must introspect real constraints (keys, unique indexes, types),
+  never assume them. Requirements are checked and surfaced, never applied.
 * Error and warning messages are first-class product surface: the guidance *is*
   how a user learns to shape a schema Trellis can serve well.
 
@@ -53,5 +51,5 @@ Correctness vs. performance sets the severity:
 
 Project-wide, not feature-specific. Governs how every definition type validates
 against source tables — transforms, relationships (see
-[0006-relationships](0006-relationships.md)), and the transform-redefinition work
-still being designed.
+[0006-relationships](0006-relationships.md)), and transform redefinition (see
+[0015-transform-redefinition](0015-transform-redefinition.md)).

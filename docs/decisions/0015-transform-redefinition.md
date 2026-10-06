@@ -8,9 +8,9 @@ deciders: Michael Ries
 
 A transform's definition is three separable pieces — an immutable key-space, a set
 of calculated fields, and an optional partial-data predicate. Defining, pausing, and
-dropping a whole transform are settled. This ADR settles the missing middle: editing
-the calculated fields of a transform that already exists, without redefining it and
-cutting over.
+dropping a whole transform are covered by their own decisions. This ADR covers the
+middle: editing the calculated fields of a transform that already exists, without
+redefining it and cutting over.
 
 ## What is editable, and what is not
 
@@ -21,8 +21,7 @@ statement has no key-space clause to write, so a granularity change is not expre
 as an edit rather than rejected by a validator branch.
 
 The **calculated fields are the editable surface** — added, dropped, or altered in
-place. The partial-data predicate is out of scope here and stays fixed until a later
-decision.
+place. The partial-data predicate is not editable: it is fixed at creation.
 
 ## Decisions
 
@@ -43,10 +42,9 @@ Each clause names one calculated field and the operation on it. `ADD` introduces
 column, `DROP` removes one, `ALTER` replaces an existing column's formula. The key-space
 is not named and cannot be changed.
 
-A declarative form — restating the full field list and letting the engine diff it — is
-a compatible future addition, not a competing one: it is another production the same
-entrypoint discriminates, and both may be accepted at once. We ship the delta form first
-because it is what the common case (one column on a wide table) wants.
+Only the delta form exists; it is what the common case (one column on a wide table)
+wants. A declarative form (restating the full field list and letting the engine diff
+it) would be another production the same entrypoint discriminates.
 
 ### The edit is grammar through the one entrypoint
 
@@ -63,19 +61,15 @@ single-pass contract a first definition already honors; a growing table pays for
 enumeration, not one per column. Single-column incremental backfill remains only an
 optimization, never a correctness requirement.
 
-While an added column is backfilling it holds no committed value and the rest of the
-target stays live — the column-granularity form of the pause state a target already has.
-A dropped column's data is removed, consistent with drop removing the data it explains.
-
-**Amended by #625 F8b (#666):** the edit returns before the backfill, which is a
-background *field build*. The edit's transaction registers it (the definition moves
-`live -> backfilling`), the changed fields apply to every live change from that commit,
-and background chunks rewrite just those fields across the existing rows, one source
-read for all of them. The definition reads `live` again once the chunks are done. So
-an added column is not held paused while it builds; `backfilling` on the definition is
-what says it isn't built yet. A field that reads a source column capture doesn't image
-yet stays paused until it does, and its build starts then. A column `RESUME` is the same
-kind of build.
+The edit returns before the backfill, which is a background *field build*. The edit's
+transaction registers it (the definition moves `live -> backfilling`), the changed
+fields apply to every live change from that commit, and background chunks rewrite just
+those fields across the existing rows, one source read for all of them. The definition
+reads `live` again once the chunks are done. An added column is not held paused while
+it builds; `backfilling` on the definition says it isn't built yet. A field that reads
+a source column capture doesn't image yet stays paused until it does, and its build
+starts then. A column `RESUME` is the same kind of build. A dropped column's data is
+removed, consistent with drop removing the data it explains.
 
 ### The stored schema versions monotonically; physical changes are additive
 
@@ -87,7 +81,7 @@ table to change one column. A column-add backfill carries the new version as its
 so live change-application and the in-flight backfill do not race on a half-populated
 column.
 
-### `ALTER` refuses a genuine column-type change (v1 scope-down)
+### `ALTER` refuses a genuine column-type change
 
 The "never rewrites the whole target table" guarantee above is not automatic just because
 `ALTER <field> AS <expr>` only touches one column's formula: if the new formula's result
@@ -100,14 +94,12 @@ least likely to expect it (an edit that reads like "just this column").
 `ALTER TRANSFORM` therefore refuses, before any DDL or backfill runs, whenever an `ALTER`
 clause's inferred result type differs from its column's current physical type — naming the
 field and both types, and pointing at `DROP <field>` followed by `ADD <expr> AS <field>` as
-the supported path instead. That pair already pays the same backfill cost today, so nothing
-gets more expensive; the edit only stops pretending a full-table rewrite is a single-column
-one. A same-type `ALTER` (a formula change whose result type is unchanged) is unaffected and
+the supported path instead. That pair pays the same backfill cost, so the refusal makes nothing
+more expensive; it only stops a full-table rewrite posing as a single-column edit. A same-type `ALTER` (a formula change whose result type is unchanged) is unaffected and
 still edits in place as described above.
 
-A real fix that avoids this restriction entirely — a shadow column, a single-pass backfill,
-then an atomic rename-swap, none of which needs the old column's rewrite — is tracked
-separately and deliberately out of scope here.
+A shadow column, single-pass backfill, and atomic rename-swap would avoid the restriction;
+that is not implemented.
 
 ### Column edits validate against the dependency graph like any definition change
 
@@ -141,7 +133,7 @@ to the formula it already has, and dropping a column already absent are no-op su
 - The target table is never rewritten to edit a column — adds are additive, drops remove
   only the dropped column's data, and an `ALTER` that would require a real type change is
   refused rather than honored as a whole-table rewrite; `DROP`+`ADD` remains the supported
-  way to change a column's type in this release.
+  way to change a column's type.
 - Column-granularity dependency tracking is required, so a drop refusal can name the exact
   column a dependent reads.
 - A framework migration that edits a transform is honest under replay and rollback, because

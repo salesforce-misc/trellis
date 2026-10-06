@@ -67,11 +67,10 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 
 `<expr>` is a column reference, a numeric or single-quoted string literal,
 `<expr> + <expr>`, `<expr> > <expr>`, or a function call (`strpos`,
-`octet_length`, `char_length`, `regexp_count`; general `func(args)` syntax landed
-with these four). Values carry one of four types — `Numeric`, `Text`, `Boolean`,
-`Uuid` (the last added in issue #79) — and every operator/function's argument and
+`octet_length`, `char_length`, `regexp_count`; general `func(args)` syntax). Values
+carry one of four types — `Numeric`, `Text`, `Boolean`, `Uuid` — and every operator/function's argument and
 return types are type-checked at definition time. `<predicate>` accepts only the
-literal `TRUE` for now; the partial-data predicate is otherwise deferred.
+literal `TRUE`; any other `WHERE` is refused at definition time.
 
 ### Typed literals (issue #109)
 
@@ -145,15 +144,14 @@ shape:
 
 * `GROUP BY <col1>[, <col2>...]` produces a `KeySpace::Aggregate` whose
   calculated fields may reference a grouping column directly or wrap any other
-  column in exactly one of `SUM`, `MIN`, `MAX`, `AVG` (originally numeric-only;
-  issue #120 generalized `MIN`/`MAX` to any type Postgres itself has a `min`/
-  `max` aggregate for — `text`/`varchar` lands, `uuid` does not, despite having
-  a full btree opclass — see `docs/type-support.md`), resolved against a
-  separate aggregate-function registry. `COUNT(*)` (issue #75) and
-  `COUNT(<expr>)` (issue #120 — counts non-null occurrences of `<expr>`, a
+  column in exactly one of `SUM`, `MIN`, `MAX`, `AVG` (`MIN`/`MAX` accept any type Postgres itself has a
+  `min`/`max` aggregate for — `text`/`varchar` yes, `uuid` no, despite having a
+  full btree opclass; see `docs/type-support.md`), resolved against a
+  separate aggregate-function registry. `COUNT(*)` and
+  `COUNT(<expr>)` (counts non-null occurrences of `<expr>`, a
   different Postgres semantic from `COUNT(*)`) are both supported.
 * `JOIN <other> ON <cond> [INNER|LEFT|RIGHT]` for cross-join is recognized and
-  rejected by name; cross-join remains out of scope. Relationship reference
+  rejected by name; cross-join, and the notation for qualifying columns by join side, remain out of scope. Relationship reference
   syntax is defined with the relationship feature — see
   [0006-relationships](0006-relationships.md).
 
@@ -165,14 +163,6 @@ identical to a stable PostgreSQL 15+ operator/function**; (b) **immutable** per
 [transforms](../transforms.md#calculated-fields); (c) a re-implemented evaluator.
 Anything volatile, session- or collation-dependent stays out.
 
-Undecided:
-
-* Cross-join side-qualification syntax — `JOIN` is recognized and rejected by
-  name, not yet parsed.
-* Whether the grammar and its stored schema are versioned independently of the
-  transform-redefinition scheme (see [open-questions](../open-questions.md)).
-* Operator precedence: the parser is flat left-associative with no precedence
-  table. Safe today only because every Numeric-returning operator (`+`) outranks
-  the sole Boolean-returning one (`>`) in the type lattice, so any regrouping
-  that would change the result also fails type-checking. Re-verify before adding
-  a second Boolean- or Numeric-returning operator at a different precedence tier.
+Binary operators parse by precedence climbing over a per-operator precedence table
+in the operator registry; all are left-associative. A new operator declares its
+tier there.

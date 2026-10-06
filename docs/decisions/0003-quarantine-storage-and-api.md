@@ -20,7 +20,8 @@ Quarantine is tracked at two independent fuse tiers, with no auto-escalation:
 
 * **Whole-key fuse** — a sparse **`poison`** exception table
   (`V13__quarantine.sql`), one row per poisoned *source* row. Tripping it moves
-  the whole transform to `quarantined`; resuming re-runs the full backfill.
+  the whole transform to `quarantined`; resuming rebuilds the target from the
+  source without clearing it (see [ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)).
 * **Per-`(transform, column)` fuse** — `column_failures`, `column_status`, and a
   `column_deaths` counter (`V21__column_quarantine.sql`). A failure in one
   column's formula pauses only that column, leaving healthy columns on the same
@@ -70,17 +71,15 @@ for a fold failure is the `(src_table, key)` that failed to fold.
 
 **`src_table` here is the canonical, fully-qualified identity of the source
 table, not whatever spelling the ring row being diagnosed happened to carry**
-(issue #283, ADR-0007's qualified identity). Every one of these tables —
+(issue #283, [ADR-0011](0011-fully-qualified-names.md)'s qualified identity). Every one of these tables —
 `poison`, `poison_held`, `key_deaths`, `column_failures`, and the transform
 fuse's own `transform_fuse_gate` lock row — is both written and read under it,
 with `staging::quarantine` resolving the ring spelling once per source table per
-batch. Before that, one logical source staged under two spellings (bare `orders`
-and qualified `public.orders` — a real and durable duality) ran two independent
-sets of quarantine state: two half-threshold fuse budgets that never tripped,
-two death counters for one physical row, a fold exclusion blind to a key already
-poisoned under the other spelling, and a per-spelling (therefore
-non-serializing) fuse gate. `V33__quarantine_canonical_src_table.sql` folded the
-pre-existing bare rows into their qualified counterpart.
+batch. A ring row may carry a bare or a qualified spelling of one source
+(`orders`, `public.orders`); keying on the raw spelling would split one source's
+quarantine state in two: half-threshold fuse budgets that never trip, two death
+counters for one row, a fold exclusion blind to a key poisoned under the other
+spelling, and a non-serializing fuse gate.
 
 Column detail is separate from `poison` rather than a `failures` array on it,
 because landing in `poison` means "globally excluded from folding" — correct for
@@ -128,11 +127,12 @@ until resume) and the column is marked `paused`. Resuming re-runs the backfill
 for just that column's formula, without touching other columns or the
 transform's lifecycle status.
 
-The **transform-wide fuse** trips when a failure isn't attributable to one
-column (e.g. a key-shape/DDL failure dooming every column's write for a row),
-moving the whole transform to `quarantined`. `quarantined` is one state of the
-lifecycle (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`);
-resuming re-runs the full backfill (see [data-flow](../data-flow.md)).
+The **transform-wide fuse** trips when the evicted keys of a source table reach the
+threshold, moving every transform reading it to `quarantined`. `quarantined` is one
+state of the lifecycle (`waiting_to_backfill` → `backfilling` → `live`, plus
+`quarantined` and `paused`); resuming rebuilds the target from the source
+without clearing it (see [ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)
+and [data-flow](../data-flow.md)).
 
 Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
 
@@ -145,24 +145,14 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
 * **Propagation** — tripping either fuse cascades the pause to 1-1 downstream
   transforms reading the paused column (`column_pause_cascades`,
   `defs::catalog::column_dependents`), so no downstream reader silently consumes
-  a frozen value. Aggregate transforms are *not* cascaded into — aggregate
-  accumulation has no per-column pause concept (`staging::apply_aggregate`), a
-  deliberate gap.
-* **Sibling readers** (issue #748) — a field of the same 1-1 definition that
-  reads a paused field by alias, directly or through other fields, is paused
-  too: the cascade gives it a `column_status` row and an edge, Apply leaves it
-  out with the paused field (so it freezes rather than evaluating over the
-  paused field's absence and going NULL), and a resume releases it once no
-  field it reads is still paused, rebuilding it in the same field build. Apply's
-  read of the paused set closes over these readers itself
-  (`defs::eval::AliasReaders`), so a reader is held out even before its row
-  exists. An `ALTER TRANSFORM` field build covers the readers of each field it
-  edits, and a capture wait holds them out (and lists them) with it. An edit
-  that makes a field read a paused field pauses it with that field (a row and
-  an edge, as if the pause had come after the edit). A field build's chunks
-  take in the readers of its fields from the definition as it stands when
-  each chunk is planned, so the build that releases a field awaiting its
-  capture also writes a reader an edit added after that build was registered.
+  a frozen value. The column-level fuse only ever freezes a column of a 1-1
+  transform, and the cascade stops at aggregates
+  ([known correctness gaps](../known-correctness-gaps.md)).
+* **Sibling readers** — a field of the same 1-1 definition that reads a paused
+  field by alias, directly or through other fields, is paused with it (a
+  `column_status` row and a cascade edge), so Apply freezes it rather than
+  evaluating it over the paused field's absence. A resume releases it once no
+  field it reads is still paused, rebuilding it in the same field build.
 
 ## Resume re-arms the fuse
 
@@ -172,9 +162,9 @@ source table. A resume **re-arms** the fuse rather than erasing history:
 `transform_definitions.fuse_rearmed_at` (`V29__transform_fuse_rearm.sql`) in the
 same transaction as the status drop, and `trip_transform_fuse_if_crossed` counts
 only `poison` rows evicted after that instant — a full fresh threshold's budget
-of *new* evictions (`null` reads as `-infinity`). Without this, a source that
-ever hit the threshold stayed there forever, and the next single new eviction
-re-quarantined immediately.
+of *new* evictions (`null` reads as `-infinity`). Counting all of a source's
+history instead would leave a source that ever hit the threshold there forever,
+and the next single new eviction would re-quarantine immediately.
 
 The rejected alternative — deleting the source's `poison`/`key_deaths` rows on
 resume — fails because:
@@ -194,8 +184,14 @@ deliberately unaffected by a whole-transform resume: they clear on a clean drain
 of the key and on `resume_column` respectively, and a whole-transform resume
 makes no claim about any individual key's or column's health.
 
-## Open questions
+## Retry policy
 
-* Retry-with-backoff vs. immediate quarantine, and whether older entries move to
-  a dead-letter area, are still open. This ADR fixes storage and the read APIs,
-  not retry policy.
+A transient failure (a lost connection, a lock or serialization conflict) is retried.
+A failure that reproduces is isolated to the source key that causes it, and the key is
+evicted to `poison` once its `key_deaths` count reaches `DEFAULT_DEATH_THRESHOLD`.
+A failure that is structural rather than one key's fault, so that every key reproduces
+it, is not charged to any key: it pauses the definitions it reaches
+([ADR-0014](0014-pause-and-drop-a-transform.md)). `poison` and `poison_held` are where
+evicted work waits until it is released (a public release is #759); nothing moves
+entries elsewhere by age. Whether it should, and whether the threshold should be
+configurable, is [#803](https://github.com/salesforce-misc/trellis/issues/803).

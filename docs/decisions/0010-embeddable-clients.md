@@ -35,11 +35,13 @@ Each binding is a thin Rust crate wrapping `BlockingTrellis`: an Elixir
 [Magnus](https://github.com/matsadler/magnus) extension on
 [`rb-sys`](https://github.com/oxidize-rb/rb-sys).
 
-**Each ships through its own language's registry** — Hex for Elixir,
-RubyGems for Ruby — because that is where its users already look and what lets
+**Each ships through its own language's registry** — Hex for Elixir
+(`trellis_pg`; Hex allows no hyphen, so its OTP app is `:trellis_pg`), RubyGems for Ruby
+(`trellis-pg`) — because that is where its users already look and what lets
 a host declare Trellis in `mix.exs` or a `Gemfile`. Each package carries a
 compiled native extension, so an installing app needs no Rust toolchain.
-Neither binding crate goes to `crates.io`; a Rust program would depend on
+`trellis` is taken on both registries. The module names stay `Trellis` and
+`Trellis::`. Neither binding crate goes to `crates.io`; a Rust program would depend on
 `trellis` directly.
 
 **There is no shared FFI library** — no `trellis-ffi` cdylib exporting a C ABI.
@@ -100,10 +102,10 @@ round trip — far past what either host VM tolerates on a scheduler thread.
 **Rust's threads stay Rust's, and are bounded.** The host VM does not schedule,
 see, or join the Tokio runtime thread, the pool connections, or the drain
 workers; `shutdown` is the only way to stop them. Because they are invisible to
-the host's sizing, the binding must bound them: `BlockingTrellis` currently
-defaults to one worker per core, which inside a BEAM node already sized to core
-count doubles the thread population. The work is IO, not compute, so the
-bindings pass a small explicit worker count — a knob the crate does not have yet.
+the host's sizing, the binding must bound them: `BlockingTrellis` defaults to one
+worker per core, which inside a BEAM node already sized to core count doubles the
+thread population. The work is IO, not compute, so the bindings pass a small explicit
+`worker_threads` (2 by default).
 
 **A handle does not survive `fork`.** Puma, Unicorn, Passenger, and Resque all
 fork; Rust threads do not cross `fork`, so a child inherits the handle and its
@@ -155,17 +157,7 @@ where there is one implementation to get right — decision 2 applied to types.
   gains API surface when a binding needs it rather than the bindings growing SQL.
 * Two binding crates must track the crate's public API; keeping them in this
   repo, built and tested by the same CI run, is the cheapest way to hold that line.
-* Decision 3 needs a runtime worker-thread knob the crate lacks today.
 * Decision 4's flattening is mechanical and testable in Rust, ahead of either host.
-
-## Open questions
-
-* ~~Published package and module names on Hex and RubyGems.~~ Decided
-  2026-09-28 (#150): `trellis` is taken, so the packages are `trellis-pg`, and
-  `trellis_pg` on Hex, which allows no hyphen (its OTP app is `:trellis_pg`).
-  The module names stay `Trellis` and `Trellis::`.
-* A multi-tenant host (one app, several databases) implies several handles, in
-  tension with decision 3's per-process singleton. Deferred until a concrete need.
 
 ## Related issues
 

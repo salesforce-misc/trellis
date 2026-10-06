@@ -45,9 +45,10 @@ in **transaction-visibility space**, not table space.
 
 ## The fence
 
-Every ring row carries `row_txid`, force-assigned by `DEFAULT txid_current()` —
+Every ring row carries `row_txid`, force-assigned by `DEFAULT pg_current_xact_id()` —
 the writer's real top-level transaction id. The seal captures a **transaction
-snapshot** `S_k` onto the registry row. The batch is then:
+snapshot** `S_k` onto the registry row (the `fence_snapshot` column; this page
+calls it `seal_snapshot`). The batch is then:
 
 > **Batch *k*** = the rows of `slot_k` **visible in `S_k`**, **plus** the rows of
 > `slot_{k-1}` visible in `S_k` and **not** visible in `S_{k-1}`.
@@ -88,7 +89,7 @@ version.
 
 **Phase 1** (one transaction):
 1. check the guards (below);
-2. stamp `seal_step1 = txid_current()`;
+2. stamp `seal_step1 = pg_current_xact_id()`;
 3. fill the **predecessor's** `seal_step2` with this flip's xid;
 4. allocate the next `seg_seq` into the next slot as `active`;
 5. flip the pointer — last;
@@ -145,7 +146,7 @@ drag the mirror back to a slot that is already sealed.
 
 ### The `xmax` trap
 
-`txid_snapshot_xmax` is **not** "the next unassigned transaction id". Postgres
+`pg_snapshot_xmax` is **not** "the next unassigned transaction id". Postgres
 sets `xmax = latestCompletedXid + 1`, and the in-progress list holds only running
 xids *below* that. A transaction whose xid was assigned but not committed — with
 nothing above it completed — sits at or above `xmax` and is **absent from the
@@ -162,7 +163,7 @@ segment marks drained, and the slot is reclaimed.
 The fix is one statement, run in autocommit immediately before the snapshot:
 
 ```sql
-SELECT txid_current();   -- assigns an xid AND commits it, raising latestCompletedXid
+SELECT pg_current_xact_id();   -- assigns an xid AND commits it, raising latestCompletedXid
 ```
 
 Now `xmax(S_k)` is strictly above every xid assigned before it — hence above
@@ -193,10 +194,10 @@ and `bucket_count` (the partition, [04](04-claiming-and-the-fold.md)). All three
 describe the batch's **contents**, and those are fixed by `S_k` plus the
 predecessor half of the both-slots read, not by what the slot held at the flip.
 The flip does not stop appends: a straddler that resolved slot *k* before the
-flip commits into it afterwards (#598). If it commits before `S_k` its rows are
+flip commits into it afterwards If it commits before `S_k` its rows are
 batch *k*'s; if it is still open at `S_k` they are batch *k+1*'s, through the
-predecessor half. Sizing at the flip missed both, so a truncate could escape
-`has_truncate` and a truncate-bearing batch could seal multi-bucket.
+predecessor half. Sizing at the flip would miss both, so a truncate could
+escape `has_truncate` and a truncate-bearing batch could seal multi-bucket.
 
 So the statement that publishes `S_k` also sizes the batch, over the fenced
 window, both halves:
@@ -231,8 +232,8 @@ A refused seal is always the correct outcome:
 
 - **`RingFull`** — the next slot still carries a live registry row. Sealing would
   lap it and destroy un-applied work. Cleared by the cleanup pass removing that
-  row ([06](06-cleanup-and-reclaim.md)), so a drainer that hits `RingFull` runs
-  cleanup and retries the seal once. Without the retry, a ring full of
+  row ([06](06-cleanup-and-reclaim.md)), so a seal that hits `RingFull` runs
+  cleanup and retries once. Without the retry, a ring full of
   drained-but-not-retired slots wedges the whole system.
 - **The seal gate** — `xmin(now) < xmax(predecessor's S_k)` means a writer in
   flight at the previous seal has not yet committed or aborted. Advancing the
@@ -249,16 +250,13 @@ already-taken `seg_seq`.
 
 ## Who seals, and when
 
-**There is no timer.** A worker that finds nothing claimable and sees rows in the
-active segment seals it on demand, then retries the claim once. (This describes
-the demand-driven sealing design, issue #272. Until that lands, the client's
-maintenance loop still seals any non-empty active segment on its 300 ms tick,
-through the same `seal_if_active_nonempty` guard.) The busy-loop
-guard is structural: it seals only a *non-empty* active segment — **or** an empty
-one whose predecessor still strands a phase-gap straggler (below) — at most one
-seal per drain call.
+The client's maintenance loop seals the active segment on its tick (300 ms by
+default, `maintenance_interval`) through `seal_if_active_nonempty`. The
+busy-loop guard is structural: it seals only a *non-empty* active segment — **or**
+an empty one whose predecessor still strands a phase-gap straggler (below) — at
+most one seal per tick.
 
-### The phase-gap straggler this guard used to strand
+### The phase-gap straggler
 
 The scoping bug above handles a phase-gap writer that lands in `slot_k` *before*
 `S_k` is captured: batch *k* folds it in. A writer can also land in `slot_k`
@@ -270,7 +268,7 @@ itself gets sealed.
 
 If the ring goes quiet right after the straggler lands, the plain "non-empty"
 guard never fires, `slot_k` reaches `drained` with the straggler still in it, and
-nothing revisits the slot. The fix is the second seal condition above: an empty
+nothing revisits the slot. The second seal condition above covers it: an empty
 active segment still seals when its predecessor holds a row not visible in that
 predecessor's own fence. This is self-limiting — it fires only while the current
 predecessor genuinely has such a row, so once folded in, the next predecessor no
@@ -279,10 +277,9 @@ longer qualifies.
 `'drained'` slot owner does not, on its own, stop gating a row that was never
 visible in its own fence.
 
-Seal-on-demand is deliberate. A fixed cadence makes every small change wait for
-the tick. Instead, **a batch is not a transaction** — it is everything appended
-since the last on-demand seal, so a trickle seals immediately and a bulk workload
-accumulates larger batches. Batch size adapts to load without a knob.
+**A batch is not a transaction** — it is everything appended since the last
+seal, so a trickle seals on the next tick and a bulk workload accumulates
+larger batches. Batch size adapts to load without a knob.
 
 ## Crash recovery: the one window that wedges
 
@@ -306,9 +303,9 @@ instead of a data-loss event.
 ## What is load-bearing here
 
 - **A per-row writer identity the store assigns**, not one the client supplies —
-  `txid_current()` in a column default. The both-slots read depends on it.
+  `pg_current_xact_id()` in a column default. The both-slots read depends on it.
 - **Snapshot isolation with an inspectable snapshot.** Under "read committed" the
-  both-slots read has no meaning; Trellis relies on `txid_snapshot`.
+  both-slots read has no meaning; Trellis relies on `pg_snapshot`.
 - **The two-phase split is not optional.** Capturing the boundary snapshot inside
   the transaction that moves the boundary is the `xmax` trap.
 - **A snapshot-independent pointer read, after the writer's xid exists.** A

@@ -10,157 +10,48 @@ Trellis maintains these tables **incrementally** as source data changes, trading
 spikey read load for a steady write load that keeps the table cheap to read (see
 the README for fuller motivation).
 
-## Source tables
+## Supported sources and targets
 
-**Trellis requires every source table to be a plain table with a primary
-key.** A change a capture trigger stages is identified by its primary key, and
-a 1-1 target inherits that key as its own. A definition over a table with no
-primary key, over a partitioned table, or over a table in a partition or
-inheritance hierarchy (a partition, or an inheritance parent or child), is
-rejected when it is defined, with an error naming the table. A statement
-trigger fires only for the table a statement names, so capture on any of those
-would miss writes made through the rest of the hierarchy. A source that joins
-such a hierarchy after its transform is defined (`ATTACH PARTITION`,
-`INHERIT`, or a table created `INHERITS` it) isn't refused by anything, but
-`self_check` reports it as a `capture` divergence. Trellis never adds the key itself: the source schema
-is the user's
-([0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)).
+Trellis reads tables it does not own ([0005](decisions/0005-source-schema-is-user-owned.md)),
+so it validates them when a definition is applied and refuses what it can't
+maintain correctly, with an error naming the table or column and the fix. These
+refusals are the supported-subset contract, not bugs. Everything in the table
+is checked for a transform's source, for each relationship endpoint and
+to-side it reads through, and (where noted) for its target. Trellis never adds
+a key, index or policy itself.
 
-**Row-level security must not apply to the Trellis role** (#745). Capture
-sees every changed row, because transition tables ignore row-level security,
-but Trellis reads its sources as its own role: a build, a per-key recompute, a
-relationship's parent lookup and `self_check`'s recompute all run as that role,
-and the capture functions re-read the live row as the role that owns
-Trellis's ring. When a table's policies apply to that role, those reads see
-only the rows the policies allow, and the target silently goes wrong: a hidden
-row never reaches it, and a hidden key reads as deleted. So that isn't
-supported. Policies apply to a role when the table has row-level security
-enabled and the role:
+| Condition | Refused at define | If it appears after define | Remedy |
+|---|---|---|---|
+| A source with no primary key (or unique index standing in for one), a partitioned table, or a table in a partition or inheritance hierarchy | Yes. A statement trigger fires only for the table a statement names, so capture would miss writes made through the rest of the hierarchy. | A table that later joins a hierarchy (`ATTACH PARTITION`, `INHERIT`) is not refused. `self_check` reports a `capture` divergence (1-1 targets only; [gap 7](known-correctness-gaps.md#7-a-source-attached-as-a-partition-or-made-to-inherit-after-define)). A dropped key pauses the transforms that read it, with the reason in `status()`; a retyped one: [gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column). | Use a plain table with a primary key. After a later change, undo it, then `PAUSE`/`RESUME`. |
+| An aggregate target used as a source (it has no primary key: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint) | Yes, for another Trellis instance. Inside the owning instance it can be chained off, because writes to a target reach its readers in the writing transaction, never through capture triggers. | n/a | Group over a 1-1 transform, or chain within the instance ([instance-identity](instance-identity.md)). |
+| Row-level security that applies to the Trellis role (#745) on a source, on a relationship's to-side, or (#765) on a target. Policies apply to a role when RLS is enabled and the role neither owns the table (directly or through membership) nor has `BYPASSRLS`, or owns it and the table is `FORCE ROW LEVEL SECURITY`. A superuser is exempt. | Yes, checked for the role that owns the ring, and for the defining role on a to-one to-side (defining reads it) and on a table that is another transform's target. | The staging worker pauses every transform that reads the table (or, for a target, the transform that writes it), with the reason in `status()`'s `capture_failure`. `self_check` reports a `capture` divergence. A login role that is never checked: [gap 11](known-correctness-gaps.md#11-row-level-security-on-a-login-role-trellis-doesnt-check). | Give the role `BYPASSRLS` (not inherited), or make it the table's owner without `FORCE ROW LEVEL SECURITY`; then `RESUME`. |
+| A table a logical-replication subscription in the same database replicates into (#751) | Yes, in any sync state, including a disabled subscription. The subscription's apply worker fires only row-level triggers, so its changes never reach capture. Publishing a table to another database is fine. | Paused and reported exactly as for RLS. | Remove the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then `RESUME`. |
+| A nondeterministic collation (an ICU collation with `deterministic = false`) on a key column: a source primary key, a `GROUP BY` key (including a relationship path's to-side column), a relationship join column or an endpoint's primary key (#638). Also on a column passed to `STRPOS` or `REGEXP_COUNT`, directly or through `COALESCE`, another field or a relationship path. | Yes, for the definition, the relationship, and an `ALTER TRANSFORM` that adds or alters such a field. Trellis matches keys by exact text; such a collation's `=` would fold keys it keeps apart. `CHAR_LENGTH` and `OCTET_LENGTH` accept any column. | Not detected ([gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column)). | Keep the column's collation deterministic ([type-support](type-support.md#collation)). |
+| Relationship join columns that differ in type, type modifier or collation, or whose type is off the join-key allowlist (#590) | Yes. Trellis never casts a join key. `integer` against `bigint`, `text` against `varchar`, and `varchar(50)` against `varchar(255)` are all refused. | Not detected ([gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column)). | Alter one column to match the other. |
+| A relationship endpoint that is not keyable, has a key type off the primary-key allowlist, or (for one of this instance's targets) is not `live` (#429) | Yes. Every requirement is checked at declaration ([relationship-propagation](relationship-propagation.md#endpoint-requirements)). | A key dropped later pauses its readers; one retyped later: [gap 3](known-correctness-gaps.md#3-retyping-or-re-collating-a-key-join-or-group-by-column). | Fix the table, then declare the relationship. |
+| Two `GROUP BY` keys that share a target column name (`buyer.name` and `seller.name`, or `name` beside `buyer.name`); keys can't be aliased | Yes. | n/a | Group over a 1-1 transform that selects them under distinct names (`buyer.name AS buyer_name`). |
+| A field named after a 1-1 source key column (`id AS id`), or any field or `GROUP BY` column whose name starts with `__` (#566) | Yes. The target already carries the key columns, and `__` names are Trellis's hidden columns (such as an `AVG`'s running sum). `id AS order_id` is an ordinary column. | n/a | Rename the field. |
+| `JOIN` | Yes (parse error). Cross-join is not supported. | n/a | Use a [relationship](#relationships). |
+| A `WHERE` other than `TRUE` | Yes (parse error). Partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)). | n/a | None. |
+| Chaining off a transform that is not `live` (`TransformNotLive`) | Yes. | n/a | Wait for the upstream to go `live`, then define. |
 
-- neither owns the table (itself, or through a role it inherits from) nor has
-  `BYPASSRLS`; or
-- owns it, and the table has `FORCE ROW LEVEL SECURITY`.
+A refusal after define is a pause, not a loss: `RESUME` rebuilds the target from
+source once the condition is fixed ([Status](#status)). `status()`'s
+`capture_failure` carries the reason. Other ways a source can drift after
+define are in [known correctness gaps](known-correctness-gaps.md).
 
-A superuser is always exempt. Trellis can't tell whether a policy actually
-hides anything (`USING (true)` hides nothing), so the rule is whether the
-policies apply at all. To exempt the role, either:
-
-- give it `BYPASSRLS` (`ALTER ROLE trellis BYPASSRLS`, which a superuser
-  runs). The attribute isn't inherited, so give it to the role that owns
-  Trellis's ring (the one that ran the migrations), to any login role the
-  workers connect as, and to the role that defines a transform reading a
-  to-one relationship; or
-- make it the table's owner, or a member of the owning role, which capture
-  needs anyway ([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)),
-  and don't set `FORCE ROW LEVEL SECURITY`.
-
-Enabling row-level security for your application's roles on a table the
-Trellis role owns needs neither: the owner is exempt. A definition whose
-source, or a relationship's to-side it reads through, has policies that apply
-to the role that owns Trellis's ring is rejected when it is defined, with an
-error naming the table, the role and the fix. So is one whose policies on a
-to-one relationship's to-side apply to the role that defines it: defining
-reads that table, as that role, to fill the relationship's projection
-([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
-For a table that is another transform's target, only the defining role is
-checked, standing in for the workers: no capture function reads that table,
-so the role that owns the ring never does.
-Row-level security can also be enabled or forced, a table handed to another
-owner, or `BYPASSRLS` taken away, after a transform is defined. The staging
-worker then pauses every transform that reads the table (another transform's
-target included), with the reason on `status()`'s `capture_failure`, and
-`self_check` reports it as a `capture` divergence. Exempt the role, then
-resume the transform, which rebuilds it.
-
-**A logical-replication subscription must not replicate into a table Trellis
-reads** (#751). Capture uses statement-level triggers, and a subscription's
-apply worker fires only row-level triggers for the inserts, updates and
-deletes it applies, so none of them reach Trellis and the target silently
-goes stale. (The subscription's initial copy of the table, and a replicated
-`TRUNCATE`, fire statement triggers and are captured; nothing after them
-is.) So a table that a subscription in the same database replicates into
-isn't supported as a source, or as the to-side of a relationship a
-transform reads through. That holds whatever state its initial sync is in,
-and while the subscription is disabled: enabling it applies every change it
-missed. Trellis running on a logical replica is the case this rules out;
-publishing a source table to another database is fine.
-
-A definition that reads such a table is rejected when it is defined, with an
-error naming the table, the subscription and the fix. A subscription can
-also be created, or refreshed to include the table, after a transform is
-defined. The staging worker then pauses every transform that reads the table
-(another transform's target included), with the reason on `status()`'s
-`capture_failure`, and `self_check` reports it as a `capture` divergence. To
-stop replicating into the table, remove it from the publication on the
-publisher and run `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the
-subscription. Then resume the transform, which rebuilds it.
-
-Other writers aren't affected: a session with `session_replication_role =
-replica` fires the capture triggers, which are `ENABLE ALWAYS`
-([stage 1](staging-and-claiming/01-capture-by-triggers.md)). Only the
-subscription apply worker skips statement triggers.
-
-**Key columns need a deterministic collation** (#638). Trellis matches keys by
-their exact text, but a nondeterministic collation's `=` (an ICU collation
-created with `deterministic = false`, such as a case-insensitive one) treats
-strings that differ as equal, so its `GROUP BY` and unique indexes would fold
-rows Trellis keeps apart. Trellis rejects such a collation when the definition
-or relationship is created, and never reinterprets it. The rule covers every
-column Trellis uses as a key:
-
-- the source's primary key (or the unique index standing in for one), which a
-  1-1 target inherits;
-- each `GROUP BY` key: a source column, or a relationship path's to-side column;
-- a relationship's join columns, and each endpoint's primary key (see
-  [Relationships](#relationships)).
-
-The error names the column and its collation. A deterministic collation other
-than the default, such as `"C"`, is fine. A 1-1 target's key columns take the
-source key's collation, so a relationship that joins a column to a 1-1 target's
-key needs that column to have the source key's collation. An aggregate target's
-key columns take the database default collation, which Postgres always makes
-deterministic.
-
-The same goes for a column that a field passes to `STRPOS` or `REGEXP_COUNT`,
-directly or through `COALESCE`, another field or a relationship path. Postgres
-refuses substring searches and regular expressions under a nondeterministic
-collation, while Trellis would compute them from the exact text, so such a
-definition, or an `ALTER TRANSFORM` that adds or alters such a field, is
-rejected. `CHAR_LENGTH` and `OCTET_LENGTH` don't depend on collation, so they
-accept any column.
-
-Changing a source key's collation to another deterministic one (`alter column …
-type text collate …`) is safe while its definitions are building. A build splits
-the key into ranges and reads them in order, and it keeps comparing keys under
-the collation it planned them with until it finishes (#769). For the rest of
-that build, its range reads can't use the key's rebuilt index, so each one scans
-the source table. On a large source that makes the rest of the build much
-slower. A 1-1 target keeps the key collation it was created with. `self_check`
-pages the source and the target under the source key's collation, so it still
-compares them correctly, but it reads each page of such a target with a scan of
-the target table instead of its key index (#782). A sweep that straddles
-the change can skip or repeat keys, because its `next_after` cursor continues
-in the new order, so start a new sweep after it.
-
-One consequence is worth stating plainly: **an aggregate target does not qualify
-as a source table.** Its grouping columns may be `NULL`, so its identity is a
-`UNIQUE NULLS NOT DISTINCT` constraint rather than a primary key. Chaining off
-it still works inside the instance that owns it, because an instance hands each
-write to one of its own targets on to that target's readers in the writing
-transaction, never through capture triggers (see
-[Chaining and cycle detection](#chaining-and-cycle-detection)). That internal
-path is what makes the chain possible, and it stops at the instance boundary: to
-another Trellis instance, an aggregate target is an ordinary table with no
-primary key, and Trellis rejects
-it as a source like any other. See [instance-identity](instance-identity.md)
-for the cross-instance rules.
+Other writers are not affected by the subscription rule: a session with
+`session_replication_role = replica` fires the capture triggers, which are
+`ENABLE ALWAYS` ([stage 1](staging-and-claiming/01-capture-by-triggers.md)).
+Changing a source key's collation to another deterministic one is safe, though
+the rest of any build then scans the source and `self_check` reads the target
+by scan rather than by index.
 
 ## Granularity
 
 Granularity determines the target's primary-key space — what a single target row
 represents relative to its source row(s). The design has three: 1-1 and
-aggregate are accepted today, and cross-join isn't yet (a `JOIN` clause is a
-parse error).
+aggregate are supported; cross-join is not.
 
 ### 1-1
 
@@ -169,10 +60,8 @@ Insertion/deletion maps 1-1. Always a single source table: deriving a target
 from a key-to-key join of two tables is a cross-join, not 1-1, even when the
 join is one-to-one in practice.
 
-The target always carries the source's primary key columns, so don't select
-them under their own names: a field named after a key column (`id AS id`, or any
-expression `AS id`) is rejected, because the column is already there. A key
-column under a different name (`id AS order_id`) is an ordinary column.
+The target always carries the source's primary key columns, so a field can't
+reuse a key column's name (see [Supported sources and targets](#supported-sources-and-targets)).
 
 ### Aggregate (`GROUP BY`)
 
@@ -184,21 +73,15 @@ removing, or changing a source row can insert, delete, or update a target row.
 Grouping-key columns may be referenced directly; any other source column must be
 wrapped in exactly one aggregate: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`,
 `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR` or `JSONB_AGG`. `COUNT(*)` counts
-rows in the group (#75), and `COUNT(<expr>)` counts the rows where `<expr>`
-isn't null (#120). Which column types each aggregate accepts is in the
+rows in the group, and `COUNT(<expr>)` counts the rows where `<expr>`
+isn't null. Which column types each aggregate accepts is in the
 [type-support matrix](type-support.md).
 
 A grouping key can also be a to-one relationship path (`GROUP BY post.author`).
 Each key becomes a target column named after its bare column, and keys can't be
-aliased yet, so two keys that share a column name (`GROUP BY buyer.name,
-seller.name`, or `name` alongside `buyer.name`) are rejected. To group by both,
-group over a 1-1 transform that selects them under distinct names
-(`buyer.name AS buyer_name`).
-
-An aggregate target also has hidden columns of Trellis's own, such as the
-running sum behind an `AVG`. Their names start with `__`, so that prefix is
-reserved: a field name, or a `GROUP BY` column, that starts with `__` is
-rejected.
+aliased. An aggregate target also has hidden columns of Trellis's own, such as
+the running sum behind an `AVG`. Name limits are in
+[Supported sources and targets](#supported-sources-and-targets).
 
 ```
 TRANSFORM order_totals FROM order_line_items GROUP BY order_id
@@ -228,8 +111,8 @@ it first (`benchmark group-contention --groups <n>`).
 
 ### Cross-join
 
-**Not yet supported:** a `JOIN` clause is refused with a parse error. This
-section describes the design.
+**Not supported:** a `JOIN` clause is refused with a parse error. This
+section describes the intended design.
 
 The primary-key space is the join of two source tables, mirroring the rows a
 `JOIN` returns. Each unique pairing of source primary keys that satisfies the
@@ -253,7 +136,7 @@ join key (`order_line_items.product_id -> products.id`) and declared as its own
 reusable statement. Either endpoint may be a source table or a transform
 target, 1-1 or aggregate. A source-table endpoint needs a primary key, like any
 table Trellis captures. A target endpoint doesn't: Trellis's own writes to it reach
-the relationship directly (issue #375), so it must be `live` when the
+the relationship directly, so it must be `live` when the
 relationship is declared: its initial build writes it outside that path. Both
 endpoints are written as bare table names and resolved once, through the
 declaring connection's `search_path`; the relationship stays pinned to the two
@@ -273,15 +156,10 @@ through paths whose head is the relationship name. How depends on **cardinality*
 
 Each join column's type must be on the join-key allowlist in
 [type-support.md](type-support.md) (a domain never is), and the two join
-columns must have **the same type, type modifier and collation**, because
-Trellis never casts a join key to make two columns meet. An `integer` foreign
-key to a `bigint` primary key is rejected, and so are `text` against
-`varchar`, `varchar(50)` against `varchar(255)`, and two columns with
-different collations. The error names both columns and both types. To fix it,
-alter one column to match the other, for example
-`ALTER TABLE order_line_items ALTER COLUMN product_id TYPE bigint`. A join
-column, and each endpoint's primary key, also needs a deterministic collation
-(see [Source tables](#source-tables)).
+columns must have the same type, type modifier and collation, because Trellis
+never casts a join key. The error names both columns and both types. Both
+sides also need deterministic collations
+([Supported sources and targets](#supported-sources-and-targets)).
 
 See [0006-relationships](decisions/0006-relationships.md) for the full design and
 [0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)
@@ -317,12 +195,11 @@ transforms, and evaluates in dependency order.
 A transform can only chain off a target once that target's own transform is
 `live`. Defining it while the upstream is still building (for example, a plain
 1-1 target whose chunked backfill hasn't finished) is refused with
-`TransformNotLive`: wait for the upstream to go live, then define the chained
-transform. Each write to a target reaches the transforms reading it inside the
+`TransformNotLive`. Each write to a target reaches the transforms reading it inside the
 same transaction as the write; Trellis never installs capture triggers on a
 target, not even one that is a relationship endpoint. That in-transaction hand-off
-is why an aggregate target, which has no primary key, can be chained off at all
-(see [Source tables](#source-tables)). It does not cross into another instance.
+is why an aggregate target, which has no primary key, can be chained off at all.
+It does not cross into another instance.
 
 **Cycles are rejected at definition time across the whole graph.** A definition
 that would introduce a cycle, directly or transitively, is invalid and rejected
@@ -330,8 +207,8 @@ before it runs, keeping evaluation order well-defined.
 
 ## Partial data
 
-**Not yet supported:** the grammar accepts only `WHERE TRUE`, and any other
-predicate is a parse error. This section describes the design.
+**Not supported:** the grammar accepts only `WHERE TRUE`, and any other
+predicate is a parse error. This section describes the intended design.
 
 Any target table, regardless of granularity, may be defined over a *subset* of
 its source rows via a row-level predicate. Like a partial index, materializing
@@ -364,25 +241,19 @@ undefined. Treat a target as read-only, and specifically:
   the table and its definition together, and refuses while another definition
   still chains off it. A hand `TRUNCATE` leaves the table empty until the
   transform is paused and resumed.
-* **Don't let row-level security apply to the role that writes it** (#765).
+* **Don't let row-level security apply to the role that writes it.**
   Trellis writes a target as the role each worker connects as, and policies
   that apply to that role filter those writes: an update or delete skips the
   rows they hide, leaving them stale, and an insert fails their `WITH CHECK`.
-  The rule is the one for [source tables](#source-tables). Trellis creates
-  the target as the role that defines it, so that role owns it and is exempt
-  unless the table has `FORCE ROW LEVEL SECURITY`. Enabling row-level security
-  on a target for your application's readers is fine as long as the workers
-  run as the table's owner (or a member of it) or have `BYPASSRLS`. It isn't
-  supported once the table is forced, handed to an owner the workers don't
-  belong to, or the workers' `BYPASSRLS` is taken away. The staging worker
-  then pauses the transform that writes the target, with the reason on
-  `status()`'s `capture_failure` (whose `source_table` names the target), and
-  `self_check` reports it as a `capture` divergence. Readers of the target are
-  paused too when the policies apply to the role that reads it. Exempt the
-  role, then resume the transform, which rebuilds it. Defining a transform is
-  refused if DDL around its target's creation, such as an event trigger that
-  forces row-level security on every new table, makes the policies apply to
-  the defining role.
+  Trellis creates the target as the role that defines it, so that role owns
+  it and is exempt unless the table is `FORCE ROW LEVEL SECURITY`. Enabling
+  row-level security on a target for your application's readers is fine as
+  long as the workers run as the table's owner (or a member of it) or have
+  `BYPASSRLS`. See [Supported sources and targets](#supported-sources-and-targets)
+  for what happens when that stops holding. A definition is also refused if
+  DDL around its target's creation, such as an event trigger that forces
+  row-level security on every new table, makes the policies apply to the
+  defining role.
 * **Expect a partial table while `backfilling`, and after `RESUME`.** The
   [status](#status) says when the table is complete; a reader that needs
   completeness checks it.
@@ -390,7 +261,7 @@ undefined. Treat a target as read-only, and specifically:
 Indexes, and grants to other roles, are yours to add. They live and die with the
 table, so `DROP TRANSFORM` takes them with it. Another Trellis instance may read
 a 1-1 target as a source, exactly as it would any table with a primary key. An
-aggregate target may not be read that way (see [Source tables](#source-tables)).
+aggregate target may not be read that way (see [Supported sources and targets](#supported-sources-and-targets)).
 
 ## Status
 
@@ -405,7 +276,7 @@ Every defined transform carries an observable **status**:
   plain 1-1 transform (no relationship, over a table rather than another
   transform's target), is built while its live changes are applied, and goes
   from here straight to `live`
-  ([data-flow — Re-derive-built definitions](data-flow.md#re-derive-built-definitions)).
+  ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)).
   A `live` 1-1 transform comes back here while an `ALTER TRANSFORM` that adds
   or changes a field, or a resumed column, is rebuilt in the background
   ([Changing a definition](#changing-a-definition)).
@@ -423,7 +294,7 @@ Every defined transform carries an observable **status**:
   likewise re-runs the backfill from `waiting_to_backfill`. Trellis also pauses
   a transform itself when a source column it reads is renamed or dropped, with
   the reason on its status (`capture_failure`)
-  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column-622-c6)).
+  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)).
 
 An application can list defined transforms and read each one's status — enough to
 tell a newly-defined transform is still populating, without a metrics pipeline
@@ -480,7 +351,7 @@ is a definition — so `DROP RELATIONSHIP` exists.
 calculated field is an `ALTER TRANSFORM` operation, not a drop.
 
 **`apply` only registers.** Every statement returns once the change is
-recorded; none reads the source's rows. A new transform is built in the
+recorded; none reads the transform's source rows. A new transform is built in the
 background from `waiting_to_backfill`. An `ALTER TRANSFORM` that adds or
 changes fields, and a `RESUME TRANSFORM <target>.<column>`, start a
 *field build*: the transform goes `backfilling`, the changed fields are
@@ -492,9 +363,13 @@ poll its status before relying on the new fields
 Until then a row's new field can still be empty (an added field) or hold the
 old formula's value (a changed or resumed one). A field whose formula reads a
 source column the source's capture doesn't record yet waits, paused, until
-capture records it before its build starts. Declaring a to-one relationship,
-or a transform reading through one, is the exception today: it fills the
-relationship's lookup table from the to-side table inside the call.
+capture records it before its build starts.
+
+The one read inside the call is of a to-one relationship's to-side table, not of
+a transform's source: declaring the relationship creates its projection and
+seeds it from the to-side rows, and defining a transform that reads a column
+through it widens that projection, in the same transaction
+([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
 
 ## Scope
 

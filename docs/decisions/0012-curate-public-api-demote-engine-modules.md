@@ -24,22 +24,26 @@ enters through a single grammar-driven entrypoint on them (see below).
 (behind the `otlp` feature). They are public and stable, re-exported at the crate
 root, and documented as deliberate building blocks rather than incidental leaks.
 
-**Tier 3 — the engine.** `defs`, `staging`, and `intake` are `pub(crate)`. No
-external crate names `trellis::defs::*`, `trellis::staging::*`, or
-`trellis::intake::*`. The engine is machinery the facade composes; it is not API.
+**Tier 3 — the engine.** `capture`, `defs`, `staging`, `intake` and `locks` are
+`pub(crate)`. No external crate names `trellis::defs::*`, `trellis::staging::*`,
+`trellis::intake::*` and so on. The engine is machinery the facade composes; it is not
+API.
 
 ## Decisions
 
 ### The engine is `pub(crate)`
 
-`defs`, `staging`, and `intake` — and every module beneath them — are crate-private.
+`capture`, `defs`, `staging`, `intake` and `locks` — and every module beneath them — are
+crate-private. (The `internals` cargo feature opens them for the crate's own integration
+tests; it is not API.)
 The curated re-exports at the crate root are the boundary, not a suggestion layered
 over reachable internals.
 
 ### Public error types are nameable
 
 The error types the public errors wrap — `CatalogError`, `DdlError`, `ParseError`,
-`StagingError`, `IntakeError`, `ApplyError` — are re-exported at the crate root even
+`StagingError`, `IntakeError`, `ApplyError`, `ValidationError`, `SelfCheckError` — are
+re-exported at the crate root even
 though they originate in `pub(crate)` modules. An embedder handed an `Error` must be
 able to name and match its payload (`fn handle(e: &CatalogError)`, `impl From<...>`);
 an unnameable public error type is not an acceptable surface.

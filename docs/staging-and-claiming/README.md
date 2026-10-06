@@ -87,7 +87,8 @@ Four guarantees are correctness (capture durability, one batch per row, claimed
 batches immutable, exactly-once deltas); each is enforced in exactly one stage,
 and duplicating any of them is how the design rots. Everything else — buckets,
 heartbeats, poison quarantine, truncate eligibility — is liveness, throughput,
-or observability.
+or observability. Where the guarantees stop short, see the
+[known correctness gaps](../known-correctness-gaps.md).
 
 ## The state you have to keep
 

@@ -42,23 +42,23 @@ expression language.
 
 * Either endpoint may be a **source table or a transform target** (1-1 or
   aggregate), in any combination.
-  * An endpoint that is one of the instance's own targets is never published
-    (issue #375). Every write to it reaches the relationship through the
+  * An endpoint that is one of the instance's own targets has no capture
+    triggers. Every write to it reaches the relationship through the
     target-mutation seam, which stages it CDC-shaped: prior and new image, and
-    a write token that orders one key's writes the way commit LSNs do. So
-    such an endpoint needs no particular replica identity. It must be `live`
-    when the relationship is declared, the same rule a transform reading it
-    follows: its build (the chunk queue) writes it outside the seam (issue
-    #403).
+    a write token that orders one key's writes the way commit LSNs do. It
+    must be `live` when the relationship is declared, the same rule a
+    transform reading it follows: its build (the chunk queue) writes it
+    outside the seam.
   * An endpoint the instance doesn't own, including another instance's
-    aggregate target, is read over logical replication. It must be keyable by
-    intake, the same rule a transform's source follows, and source-table
-    endpoints are only checked, never altered
-    ([ADR-0005](0005-source-schema-is-user-owned.md)).
+    aggregate target, is captured by triggers like a transform's source
+    ([capture by triggers](../staging-and-claiming/01-capture-by-triggers.md)),
+    so it needs a primary key and is refused on the same conditions
+    (partitioned, inheritance). Source-table endpoints are only checked, never
+    altered ([ADR-0005](0005-source-schema-is-user-owned.md)).
   * Every endpoint, owned or not, must have a key (its primary key, or for an
     aggregate target its `GROUP BY` columns) whose types are all on the
     [primary-key allowlist](../type-support.md): apply keys every change the
-    relationship propagates by it (issue #429).
+    relationship propagates by it .
 * Every requirement on the endpoints and join columns is checked when the
   relationship is declared, so one Trellis accepts can't halt the instance
   later over the tables' shape at that time. The full list is in
@@ -169,7 +169,7 @@ directions:
 * **Reverse (a *related* row changes).** From the dependency graph, Trellis
   finds which relationships target the changed table and updates the
   referencing rows' targets through the parent's applied value, which each
-  target owns ([ADR-0002](0002-async-data-flow.md#relationships-are-factored)):
+  target owns ([ADR-0002](0002-async-data-flow.md#relationships-the-parent-is-read-under-the-childs-entry-lock)):
   a to-side change touches the parent row and its groups, never the children,
   for fields linear in the to-side value; other fields re-derive each child
   through the target's join-key index. No replica identity is required on
@@ -191,5 +191,5 @@ not a new ordering regime.
 
 Relationships are **immutable once declared**, like transforms: to change a join
 key, declare a new relationship and cut over. Editing the calculated columns
-that *consume* a relationship is separate transform-redefinition work (see
-[open-questions](../open-questions.md)).
+that *consume* a relationship is transform redefinition
+([ADR-0015](0015-transform-redefinition.md)).

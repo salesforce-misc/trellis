@@ -50,12 +50,9 @@ Four rules sit behind that table:
 * **`migrate` runs before the worker connects.** The staging worker reads
   Trellis's own tables as it starts, so a `staging: true` connect to a
   schema `migrate` hasn't created yet fails with a `not_found` error.
-* **Nothing errors when a rule is broken.** With no staging worker, every
-  new transform stays `waiting_to_backfill`. With a staging worker but no
-  drain threads, it gets to `backfilling` and stays there. Either way every
-  `define` and `status` call succeeds and the targets stay empty. That's
-  [the silent-stall hazard](#the-silent-stall-hazard-issue-144) below,
-  and the health checks that catch it.
+* **Nothing errors when a rule is broken.** The transforms just never go
+  `live` ([the silent-stall hazard](#the-silent-stall-hazard-issue-144), and
+  the health checks that catch it).
 
 In a Phoenix app, each process's handle is `{Trellis, options}` in its
 supervision tree, with the options read from `config/runtime.exs`, so a
@@ -84,7 +81,7 @@ runtime a `BlockingTrellis` or binding handle owns. The bindings default it to
 
 The staging worker captures each source table's changes with statement
 triggers that write into Trellis's staging ring in the application's own
-transaction (#622; [stage 1](staging-and-claiming/01-capture-by-triggers.md)).
+transaction ([stage 1](staging-and-claiming/01-capture-by-triggers.md)).
 So:
 
 * **No `wal_level = logical` and no `REPLICATION` role attribute.** Nothing
@@ -92,62 +89,40 @@ So:
 * **Ownership of every source table**, or membership in the role that owns
   it. The worker installs the triggers with `ENABLE ALWAYS`, which only the
   owner may run.
-* **The role that ran the migrations** owns the ring and the capture
-  functions, which run `SECURITY DEFINER`, so application roles writing a
-  source table need no privilege on Trellis's schema. The schema itself may
-  belong to another role that pre-created it; a worker whose login role isn't
-  the one that ran the migrations must be a member of it. The owning role must
-  keep `USAGE` on the schema, `INSERT` on the ring segments (`seg_0` to
-  `seg_3`), and `USAGE` on the `staging_change_id_seq` and `ring_slot_mirror`
-  sequences. It has them as their owner, and the schema's `USAGE` through
-  membership in the schema's owner when that is another role, unless someone
-  revokes them.
-* **No row-level security that applies to the Trellis role** (#745). Trellis
-  reads its source tables as its own role, so policies that apply to it
-  would hide rows from every build and recompute. The owner is exempt
-  unless the table has `FORCE ROW LEVEL SECURITY`, and so is a role with
-  `BYPASSRLS`. Defining a transform over such a table is refused, and the
-  worker pauses a transform whose table comes under such policies later,
-  with the reason on `capture_failure`
-  ([transforms — Source tables](transforms.md#source-tables)). The same goes
-  for each target table, which the workers write as their login role (#765):
-  policies that apply to it would skip rows in updates and deletes and fail
-  inserts. A target belongs to the role that defined it, so run the workers
-  as that role or a member of it, and don't force row-level security on the
-  table. The worker pauses a transform whose target comes under such
-  policies, with the reason on `capture_failure`
-  ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
-* **No logical-replication subscription into a table Trellis reads** (#751).
-  A subscription's apply worker fires only row-level triggers, so capture
-  never sees the changes it applies. Running Trellis on a logical replica's
-  replicated tables isn't supported. Defining a transform over such a table
-  is refused, and the worker pauses a transform whose table a subscription
-  starts replicating into later, with the reason on `capture_failure`
-  ([transforms — Source tables](transforms.md#source-tables)).
+* **One role runs the migrations and owns the ring and the capture
+  functions.** The functions are `SECURITY DEFINER`, so application roles
+  writing a source table need no privilege on Trellis's schema. A worker whose
+  login role isn't the one that ran the migrations must be a member of it, and
+  that role must keep the privileges the capture functions use, which it has
+  as owner unless someone revokes them: `USAGE` on the schema, `INSERT` on the
+  ring segments (`seg_0` to `seg_3`), `USAGE` and `UPDATE` on
+  `staging_change_id_seq`, `USAGE` and `SELECT` on `ring_slot_mirror`, and
+  `SELECT` on each captured table (the functions re-read it). Revoking one is
+  loud: writes to the captured table fail, naming the capture function, and
+  `self_check` reports it.
+* **Tables Trellis can read.** Row-level security that applies to the Trellis
+  role, a logical-replication subscription into a source, a source without a
+  primary key, a partition or an inheritance hierarchy: each is refused at
+  define time, or pauses the transform if it comes about later. The full list
+  is [transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
+  The same goes for each target table, which the workers write as their login
+  role: a target belongs to the role that defined it, so run the workers as
+  that role or a member of it, and don't force row-level security on it.
 * **Leave the capture triggers alone.** Each source table carries five
-  triggers named `<schema>_capture_<event>` (`trellis_capture_insert` and so
-  on for the default schema; `trellis_capture_begin` is the `BEFORE`
-  statement trigger that lets capture skip its re-read of the table).
-  Disabling or dropping one, or making the
-  source a partition or part of an inheritance hierarchy, stops some of its
-  changes reaching the target, with no error anywhere. Handing a capture
-  function to another owner or revoking one of the privileges above is loud
-  instead: your writes to the table fail, naming the capture function. The
-  worker's next reconcile pass reinstalls a missing or disabled trigger; it
-  can't undo the rest. `self_check` reports each of these as a `capture`
-  divergence, naming the table and what is wrong, before it compares any
-  rows.
-* **Nothing cancels a lock holder.** Installing or widening a table's triggers
-  needs a brief table lock. The worker tries it for at most 50 ms at a time, so
-  your writers never queue behind it for longer, and retries every reconcile
-  pass while a long transaction or an autovacuum holds the table. Meanwhile the
-  transform stays `waiting_to_backfill` (or, after an `ALTER TRANSFORM` that
-  reads a new source column, `catching_up` with the new field paused), and
-  `status()` reports what it waits on (`capture_wait`). An install that fails
-  for another reason, such as a source that lost its primary key, is on
-  `capture_failure` instead, and is retried every pass until you fix the
-  cause. Every process's `status()` reports both, wherever the staging worker
-  runs.
+  triggers named after the instance schema (`trellis_capture_insert` and so on
+  for the default). Don't disable or drop them. The worker reinstalls a
+  missing or disabled one on its next reconcile pass, and `self_check` reports
+  a broken capture as a `capture` divergence before it compares any rows
+  ([known correctness gaps](known-correctness-gaps.md)).
+* **A long transaction can delay the triggers' install.** Installing or
+  widening a table's triggers needs a brief table lock, which the worker
+  retries every pass while a long transaction or an autovacuum holds the
+  table. Nothing cancels the lock holder. Meanwhile the transform stays
+  `waiting_to_backfill` (or `catching_up`, after an `ALTER TRANSFORM` that reads
+  a new source column), and `status()` reports what it waits on
+  (`capture_wait`), or `capture_failure` when the install fails for another
+  reason, such as a source that lost its primary key. Every process's
+  `status()` reports both, wherever the worker runs.
 
 ```rust
 // A web process: define transforms, never drains anything.
@@ -168,27 +143,23 @@ whatever changed while it was building, and flips the transform to `live`
 So a web process needs no ownership of the source tables; only the worker
 does. It does need to create tables: each target table in the target
 schema, and, for a to-one relationship, the relationship's projection in the
-instance schema, where Trellis keeps its own state. A transform that reads a
-parent column the projection doesn't carry yet adds it there, so the process
+instance schema, where Trellis keeps its own state. A transform that reads
+a parent column the projection doesn't carry yet adds it there, so the process
 that applies it must own the projection too
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
 The role that applies a transform owns the target table it creates, along
 with the tables Trellis keeps beside it, and Trellis grants nothing on them.
 The worker writes them, so it must log in as that role or as a member that
-inherits it. A worker logging in as an unrelated role fails every write to the
+inherits it; a worker logging in as an unrelated role fails every write to the
 target with a permission error.
-It also reads the parent table to fill the projection, so row-level security
-on that table must not apply to the process's role either; `apply` refuses
-the transform if it does (#745,
-[transforms — Source tables](transforms.md#source-tables)).
 Code that needs the target populated polls `status()` until the transform is
 `live` ([Poll to `live`, don't wait](#poll-to-live-dont-wait)).
 
-Dropping a transform is the same: `DROP` removes catalog rows and nothing else,
-and the worker uninstalls the source's capture triggers on its next reconcile
-pass once nothing reads it (#427). The worker also doesn't need any transforms
-registered before it starts; it picks up each one on the pass after `apply`
-registers it.
+Dropping a transform (`PAUSE`, then `DROP`; `DROP` refuses one that isn't
+paused) removes the definition and its target table with its data. The worker
+uninstalls the source's capture triggers on its next reconcile pass once
+nothing reads it. The worker doesn't need any transforms registered before it
+starts; it picks up each one on the pass after `apply` registers it.
 
 ```rust
 // The one dedicated worker process for this fleet.
@@ -232,65 +203,41 @@ so the Elixir binding has nothing to enforce.
 
 This shape has one sharp edge: **if the dedicated worker process is never
 deployed, or gets scaled to zero, nothing errors.** Every `apply()` call
-still succeeds, every transform still gets registered — it just sits in
-`TransformStatus::WaitingToBackfill` forever (or `Backfilling`, when the
-staging worker runs but no drain threads do), because nothing in the fleet
-runs the staging worker that captures its source's rows, or the drain
-workers (`drain_threads > 0`) that build and maintain its target. Read paths against
-the target table quietly return nothing (or stale data, for a transform that
-was already live before the worker process disappeared), with no exception,
-timeout, or log line pointing at the actual cause.
+still succeeds and every transform still gets registered. With no staging
+worker, a new transform sits in `waiting_to_backfill` forever. With a staging
+worker but no drain threads, it stops at `backfilling`. With drain threads but
+no staging worker, a build already dispatched still finishes, but only the
+staging worker runs the catch-up after it, so the transform stops at
+`catching_up`. A `live` transform stops being maintained. Either way the read
+paths quietly return nothing or stale data, with no exception, timeout, or log
+line pointing at the cause.
 
-Drain threads alone don't get a transform to `live` either. A build the
-staging worker dispatched before it went away still finishes on the drain
-threads, but only the staging worker runs the catch-up that follows it, so
-the transform stops at `TransformStatus::CatchingUp` until a staging worker
-is back.
-
-This is the single most likely misconfiguration for an embedded deployment —
-easy to hit (a deploy config typo, an autoscaler with a bad minimum, a worker
-dyno nobody remembered to add), and hard to notice until someone asks why a
-derived table looks empty or frozen.
+This is the most likely misconfiguration for an embedded deployment: a deploy
+config typo, an autoscaler with a bad minimum, a worker dyno nobody remembered
+to add.
 
 ### Detecting it: `has_live_drain_workers` and `has_live_staging_worker`
 
-`Trellis`/`BlockingTrellis` expose two cheap, single-query health checks
-built for exactly this, one per kind of worker:
+`Trellis`/`BlockingTrellis` expose two cheap, single-query health checks, one
+per kind of worker:
 
 ```rust
 if !trellis.has_live_drain_workers().await? || !trellis.has_live_staging_worker().await? {
-    // Every transform in this fleet is at risk of sitting in
-    // `WaitingToBackfill` forever — page someone, don't just log it.
+    // Every transform in this fleet is at risk of stalling — page someone,
+    // don't just log it.
 }
 ```
 
-It answers "is there at least one live drain worker anywhere in this fleet
-right now" — not "is *this* connection running one." Call it from any
-connection, including one that itself runs at `drain_threads: 0` (a web
-process is exactly where you want this check to live, since that's the
-process an uptime monitor or load balancer actually polls).
-
-Under the hood, each `Client` started with `drain_threads > 0` registers
-itself in a worker registry at startup, heartbeats it on every maintenance
-tick, and removes it on clean shutdown; `has_live_drain_workers` is one
-`exists(...)` query with no joins against that table, comparing each
-worker's last heartbeat against the same reclaim-TTL notion of staleness the
-engine already uses to decide a claim is dead (30s by default) — so a worker
-that crashed without a clean shutdown stops counting as live within that
-same window, no separate cleanup pass required. See
-`trellis::staging::worker_registry`'s doc comment for the full mechanism.
-
-`has_live_drain_workers` counts drain workers only, so a fleet whose drain
-workers run but whose staging worker doesn't passes it while nothing is
-sealed and every new transform stays in `WaitingToBackfill`.
-`has_live_staging_worker` (issue #428) is the check for that half: it asks
-whether some connection holds this instance's staging-worker singleton, the
-session-scoped advisory lock the staging worker's maintenance loop holds on
-its own connection for as long as it runs. It needs no heartbeat, since
-Postgres frees the lock the moment a crashed worker's connection closes. It
-also reads `false` for the tick or so the loop takes to reconnect after a
-failed step, so page on it staying `false` across a few checks, not on one
-reading.
+Each answers "is there a live worker of this kind anywhere in this fleet right
+now", not "is *this* connection running one", so call it from any connection,
+including a web process at `drain_threads: 0`, which is where an uptime
+monitor or load balancer polls. A drain worker counts as live until its
+heartbeat is older than the reclaim TTL (30 seconds by default), so a crashed
+one drops out within that window. The staging worker counts as live while
+some connection holds the instance's staging-worker lock, which Postgres frees
+the moment a crashed worker's connection closes. It also reads `false` for the
+tick or so the worker takes to reconnect after a failed step, so page on it
+staying `false` across a few checks, not on one reading.
 
 **These are liveness checks, not backlog checks.** `true` means the worker is
 alive; it says nothing about whether it is keeping up. Use
@@ -299,17 +246,12 @@ about an individual transform's own progress.
 
 ### Wiring it into a host health check
 
-The bindings are in progress (epic #140): the Elixir binding in
-`clients/elixir` and `clients/ruby` each wrap the whole `BlockingTrellis`
-surface (issues #146, #147, #587, #151 and #152). Each is a thin
-Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
-decision 1. In Elixir the two checks are `Trellis.has_live_drain_workers/1`
-and `Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}`
-(or the boolean itself from the bang variant); in Ruby they are the
-predicates `Trellis.has_live_drain_workers?` and
-`Trellis.has_live_staging_worker?`, on the process's one handle, raising a
-`Trellis::Error` if the database can't answer. A plain boolean needs no
-flattening to cross the boundary (ADR-0010 decision 4).
+In Elixir the two checks are `Trellis.has_live_drain_workers/1` and
+`Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}` (or the
+boolean itself from the bang variant). In Ruby they are the predicates
+`Trellis.has_live_drain_workers?` and `Trellis.has_live_staging_worker?`, on
+the process's one handle, raising a `Trellis::Error` if the database can't
+answer.
 
 **Phoenix**, wired as a `Plug` health-check endpoint polled by the
 platform's liveness probe:
@@ -358,10 +300,9 @@ class TrellisWorkerHealthCheck
 end
 ```
 
-Either way, the shape is the same: poll on a timer (not once at boot — a
-worker process can be scaled to zero well after a healthy start), and treat
-`false` as "every transform in this fleet may be silently stuck," not as a
-transient blip to retry past.
+Poll on a timer (not once at boot, since a worker process can be scaled to
+zero well after a healthy start), and treat `false` as "every transform in
+this fleet may be silently stuck," not as a transient blip to retry past.
 
 ### Halted definitions
 
@@ -465,8 +406,10 @@ transform writes. A migration is different: the host's migration tooling
 (Ecto's and Rails's `schema_migrations`) records which migrations have run,
 so a migration that defines a transform runs once per database and needs no
 such guard. Either way, `down` undoes the define with `PAUSE TRANSFORM` and
-then `DROP TRANSFORM`: `DROP` refuses a transform that isn't paused, and
-takes the target table and its data with it.
+then `DROP TRANSFORM` (`DROP` refuses a transform that isn't paused, and takes
+the target table and its data with it). Both are no-ops when repeated, so a
+replayed or rolled-back migration is safe in both directions
+([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)).
 
 In Elixir, `Trellis.Migration` makes those statements read like Ecto's own:
 
@@ -546,14 +489,9 @@ class DefineOrderTotals < ActiveRecord::Migration[8.1]
 end
 ```
 
-A migration's define runs once per database: ActiveRecord's
-`schema_migrations` records which migrations have run, so the helpers add no
-guard. Its `down` undoes the define with `PAUSE TRANSFORM` and then `DROP
-TRANSFORM`: `DROP` refuses a transform that isn't paused, and takes the
-target table and its data with it. A migration that includes
-`Trellis::Migration` has to define `up` and `down`, since ActiveRecord can't
-reverse a Trellis statement on its own: one that defines `change` raises
-before anything runs.
+As in Ecto, a migration that includes `Trellis::Migration` has to define `up`
+and `down`, since ActiveRecord can't reverse a Trellis statement on its own:
+one that defines `change` raises before anything runs.
 
 `rails db:migrate` has no handle of its own (rake tasks skip the boot
 connect), so each helper connects one from `config.trellis.connect`, with
@@ -614,50 +552,38 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 | `catching_up` | Built and maintained, but may still be missing changes made while it was building. A plain aggregate (grouped by plain columns of a table rather than of another transform's target, with no relationship and no `MIN`/`MAX` of text) never reports it: its build goes from `backfilling` straight to `live`. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
-| `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis after a column it reads was renamed or dropped, or its source's primary key was redefined (`capture_failure`). | Stop and report it. |
+| `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis because it can't keep the target correct: capture broke, its build kept failing, or the drain hit a failure every key reproduces ([all the causes](observability.md#transform-status-lifecycle)). | Stop and report it. |
 
 The lifecycle behind these words is in
 [transforms — Status](transforms.md#status) and
 [observability — Transform status lifecycle](observability.md#transform-status-lifecycle).
-Three things a poll needs to handle:
+Things a poll needs to handle:
 
 * **`waiting_to_backfill` has no deadline of its own.** A long-running
   transaction anywhere in the cluster holds most backfills back until it ends
-  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat);
-  a plain aggregate's build doesn't wait on it), and Trellis
-  reports nothing but the status meanwhile. So poll with a
-  deadline of your own, and from somewhere that can wait (a deploy check, a
-  background job), not a web request.
-* **A failing build doesn't fail the poll.** While a build keeps failing,
-  the error is on the status's `backfill_failure` (the source table, attempt
-  count, last error and next attempt time) ([a backfill that keeps
-  failing](observability.md#a-backfill-that-keeps-failing)). Log that
-  error; it's usually the whole answer. When the backfill can't start, it
-  stays `waiting_to_backfill` and is retried forever. A plain 1-1 build is
-  split into chunks, and a chunk that fails on a row (a field that
-  overflows its type, say) quarantines that row's key and finishes without
-  it, so the transform still goes `live`; the key is in
-  `sample_quarantined`. A build that keeps failing for a reason no row
-  explains (a missing column, say) is paused after a few attempts, with
-  the error still on `backfill_failure`: fix the cause and `RESUME
-  TRANSFORM <target>`.
-* **Renaming or dropping a source column never fails your writes.** The
-  capture trigger notices the column is gone, and Trellis pauses every
-  transform that reads it, with the table and column on the status's
-  `capture_failure`. Transforms on the same table that don't read the column
-  keep running. Put the column back (or redefine the transform) and `RESUME
-  TRANSFORM <target>` rebuilds it; renaming a primary-key column, or
-  redefining the primary key, pauses every transform on the table.
-* **`quarantined` can come before `live`.** The fuse can trip while a
-  plain 1-1 transform's build quarantines rows that fail (`backfilling`),
-  and once apply maintains a transform, which starts at `catching_up`, so a
-  transform can reach `quarantined` without ever reporting `live`. Its
-  target holds what the build wrote, and it won't move again on its own:
-  `quarantined` and `sample_quarantined` show which rows failed and why, and
-  `RESUME TRANSFORM <target>` rebuilds it from `waiting_to_backfill` once the
-  data is fixed. A single calculated column can be quarantined too, while
-  the transform stays `live`; `status` doesn't show that, `quarantined`
-  does.
+  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat)),
+  and Trellis reports nothing but the status meanwhile. Poll with a deadline
+  of your own, from somewhere that can wait (a deploy check, a background job),
+  not a web request.
+* **A failing build doesn't fail the poll.** The error is on the status's
+  `backfill_failure`; log it, it's usually the whole answer
+  ([a backfill that keeps failing](observability.md#a-backfill-that-keeps-failing)).
+  A row that fails is quarantined and the transform still goes `live`
+  (`sample_quarantined` lists it); a build that keeps failing for a reason no
+  row explains is paused.
+* **A schema change pauses, it never fails your writes.** Renaming or dropping a
+  source column pauses every transform that reads it, with the table and column
+  on `capture_failure`; the others on the table keep running.
+* **`quarantined` can come before `live`.** The fuse can trip during the
+  build, so a transform can reach `quarantined` without ever reporting `live`.
+  `quarantined` and `sample_quarantined` show which rows failed and why. A
+  single calculated column can be quarantined while the transform stays `live`;
+  `status` doesn't show that, `quarantined` does.
+* **`RESUME TRANSFORM <target>` is the way out of `paused` and `quarantined`.**
+  Fix the cause first. Resume reconciles the target with the current source
+  rather than replaying what was skipped while frozen, so its cost scales with
+  the data, and the transform goes back through `waiting_to_backfill`
+  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)).
 
 ```rust
 use std::time::Duration;
@@ -774,39 +700,15 @@ behind, not broken, so retry or allow longer. A binding handle runs one call
 at a time, so every other call on it waits behind an `await_converged` for up
 to its timeout; keep the timeout short on a handle that also serves requests.
 
-## What the engine maintains today
+## What a transform can do
 
-The grammar's full design is broader than what the engine does today, and
-what it doesn't do is refused when you define it, not accepted and left
-unmaintained. Today a transform:
-
-* Reads one source table, which needs a primary key
-  ([transforms — Source tables](transforms.md#source-tables)), or another
-  transform's target once that transform is `live`.
-* Is either 1-1 (one target row per source row) or a `GROUP BY` aggregate
-  ([transforms — Granularity](transforms.md#granularity)).
-* Computes its fields from the source row, from other fields, and from
-  related tables through a declared `RELATIONSHIP`: a to-one path directly,
-  a to-many path inside an aggregate
-  ([transforms — Relationships](transforms.md#relationships)).
-
-Refused at define time today:
-
-* **`JOIN`.** The cross-join granularity that
-  [transforms](transforms.md#cross-join) describes isn't in the grammar
-  yet; a `JOIN` clause is a `parse` error.
-* **`WHERE` with anything but `TRUE`.** The partial-data predicate
-  [transforms](transforms.md#partial-data) describes isn't in the grammar
-  yet either; any other predicate is a `parse` error.
-* **A type in a role it can't play.** Whether a column's type can be a key,
-  a computed input or an aggregate's argument is in the
-  [type-support matrix](type-support.md). A column of a type Trellis can't
-  place at all (an array, a range, a composite) can't be referenced.
-
-`self_check` audits 1-1 targets only, and the column-level fuse only ever
-freezes a column of a 1-1 transform.
-
-How aggregates and relationship-enriched transforms are built and kept up
-to date is under active redesign (#558), so this guide doesn't describe it.
-Depend on what you can observe: the status lifecycle, and the `live` plus
-`await_converged` contract above.
+A transform reads one source table (which needs a primary key) or another
+transform's target, is 1-1 or a `GROUP BY` aggregate, and computes its fields
+from the source row, from other fields, and from related tables through a
+declared `RELATIONSHIP`. What the grammar accepts, what `define` refuses, and
+which column types play which role are in
+[transforms](transforms.md) and the [type-support matrix](type-support.md).
+Whatever the shape, what you can rely on is the status lifecycle and the `live`
+plus `await_converged` contract above. `self_check` audits a target against a
+recompute from its source ([known correctness gaps](known-correctness-gaps.md)
+lists what it doesn't cover).
