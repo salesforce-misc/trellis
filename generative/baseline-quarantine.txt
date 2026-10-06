@@ -14,7 +14,4 @@
 #   other programs. Re-sweep the tier and redo its entries.
 #
 # tier        case    issue  what fails
-steady_load   1:7     #832   1-1 t4.rel_enrich wrong after PAUSE/RESUME TRANSFORM t4.c5
-steady_load   5:12    #832   1-1 t3.rel_enrich wrong after PAUSE/RESUME TRANSFORM t3.c3
-steady_load   7:1     #832   1-1 t3.rel_enrich wrong after PAUSE/RESUME TRANSFORM t3.total
 steady_load   7:7     #838   1-1 t4.rel_enrich keeps a superseded parent value, no action in the burst (rare)
