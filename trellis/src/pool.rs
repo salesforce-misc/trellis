@@ -357,12 +357,12 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
 /// role the policies apply to.
 ///
 /// Trellis doesn't support policies that apply to the roles it reads or
-/// writes as (`docs/transforms.md`, "Source tables"), and checks the catalog
-/// for them at define, on every capture pass, and in `self_check`
-/// ([`crate::defs::row_security`], #745/#765). Those checks only see the
-/// ring's owner and the role of the session running them, so a drain or
-/// build logged in as any other role used to read past them and write a
-/// silently wrong target. This setting is the defense in depth behind them:
+/// writes as (`docs/transforms.md`, "Supported sources and targets"), and
+/// checks the catalog for them at define, on every capture pass, and in
+/// `self_check` ([`crate::defs::row_security`], #745/#765). Those checks only
+/// see the ring's owner and the role of the session running them, so a drain
+/// or build logged in as any other role would otherwise read past them and
+/// write a silently wrong target. This setting is the defense in depth behind them:
 /// whichever role a Trellis connection logs in as, a filtered read fails
 /// loudly, and the drain pauses the definitions it reaches
 /// ([`crate::staging::halt`]) instead of charging keys for it.

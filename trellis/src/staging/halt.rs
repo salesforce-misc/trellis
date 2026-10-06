@@ -174,7 +174,7 @@ struct Refusal {
 
 /// Where the documentation on row-level security and Trellis's roles lives,
 /// for a refusal's reason.
-const ROW_SECURITY_DOCS: &str = "see \"Source tables\" in docs/transforms.md for the roles row-level security must not apply to";
+const ROW_SECURITY_DOCS: &str = "see \"Supported sources and targets\" in docs/transforms.md for the roles row-level security must not apply to";
 
 /// Every table an unfrozen definition reads or writes that the session's
 /// role (the drain's: `client` is one of its pool's connections) can't use:
