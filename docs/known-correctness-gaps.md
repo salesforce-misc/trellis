@@ -92,6 +92,8 @@ These are the tools the entries refer to:
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
+| 20 | A column paused and resumed on a 1-1 definition that reads a to-one relationship, while both tables take writes | yes | no | #832 (suspected cause #831) |
+| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #838 |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -562,6 +564,59 @@ paused column.
 **Repair:** resume the upstream column. Its rebuild writes through to the
 aggregate. If the aggregate's value matters before then, treat it as stale
 while the column is paused.
+
+## 20. A column paused and resumed on a 1-1 definition that reads a to-one relationship
+
+**Trigger:** a 1-1 definition with a field read through a to-one relationship
+(`author.name AS author_name`) and other fields of its own. One of those other
+columns is paused and resumed (`PAUSE TRANSFORM posts.title`, then
+`RESUME TRANSFORM posts.title`) while the from-side table (`posts`) and the
+to-side table (`authors`) keep taking writes.
+
+**Effect:** the relationship field of some rows ends wrong: `NULL` where the
+parent has a value, a value where the parent is gone, or an older value of
+the parent. The resumed column itself is right. This is silent, and a row
+stays wrong until it's written again. The generative suite's steady-load tier
+reproduces it in between 1 in 20 and 8 in 30 runs of its pinned cases, with
+page and build chunk stalls widening the window, and not once in 30 runs of
+a pinned case with the column pause and resume taken out.
+
+**Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
+through a relationship (entry 16).
+
+**Planned work:** #832. The first lead is #831, a suspected race in which a
+resume commits while a parent change's propagation skips re-deriving the
+resumed definition's rows, leaving them with the old parent value. Neither is
+confirmed.
+
+**Repair:** `PAUSE`/`RESUME` the whole transform, which rebuilds every row,
+ideally while the to-side table is quiet: if #831's race is the cause, any
+resume of the definition can hit it under concurrent writes. Check the
+relationship field against your own query of the source afterwards.
+
+## 21. A to-one relationship field keeps a superseded parent value under concurrent writes
+
+**Trigger:** a 1-1 definition with a field read through a to-one relationship
+(`author.name AS author_name`), and concurrent writes to both tables: child
+rows inserted, deleted and inserted again while their parent's value changes
+several times. No pause, resume, build or other action is involved. It has
+been seen once, in about 135 runs of one generated case under the
+steady-load tier's page and build chunk stalls.
+
+**Effect:** every child of one parent kept a value the parent held only
+briefly, after two later updates replaced it (61, then 17, then `NULL`; the
+children kept 61). This is silent, and a child stays wrong until it's written
+again.
+
+**Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
+through a relationship (entry 16).
+
+**Planned work:** #838. The cause is unknown. It isn't the shape of #763's
+to-one projection ordering holes (an orphaned or missing projection key), and
+it needs no resume, unlike entry 20. Milestone E (#624) replaces the
+relationship projection a 1-1 target reads its to-one values from.
+
+**Repair:** `PAUSE`/`RESUME` the transform.
 
 ## Repair caveats
 
