@@ -1357,3 +1357,68 @@ async fn widening_a_group_by_key_read_through_a_relationship_pauses_and_resume_w
         .await,
     );
 }
+
+/// #760 rule 8: re-typing a copy in place can fail. A 1-1 key re-typed
+/// `text` to `uuid` with a `USING` that isn't a plain cast leaves the
+/// target's copy holding text no `uuid` cast accepts. The resume's re-type
+/// fails: the request ends, the definition stays paused with the Postgres
+/// error on its `capture_failure`, and the target keeps its type and rows.
+/// A second resume tries again and ends the same way.
+#[tokio::test]
+async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_its_target_as_it_was()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.tags (code text primary key, label text); \
+         insert into public.tags values ('red', 'Red'), ('blue', 'Blue');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tag_labels FROM public.tags SELECT label AS label")
+        .await
+        .expect("define tag_labels");
+    bring_live(&mut raw, &db.pool, &["tag_labels"]).await;
+    let before = rows(&raw, "select code, label from public.tag_labels order by code").await;
+
+    raw.batch_execute(
+        "alter table public.tags alter column code type uuid using md5(code)::uuid",
+    )
+    .await
+    .expect("re-type the key with a USING that isn't a cast");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "tag_labels", "public.tags", &["code"]).await;
+
+    for _ in 0..2 {
+        resume(&trellis, "tag_labels").await;
+        assert_retyping(&trellis, &raw, "tag_labels").await;
+        capture_pass(&mut raw, &db.pool).await;
+        let reported = trellis
+            .status("tag_labels")
+            .await
+            .expect("status")
+            .expect("tag_labels");
+        assert_eq!(reported.status, TransformStatus::Paused);
+        let error = reported.capture_failure.expect("reason").error;
+        assert!(
+            error.contains("couldn't re-type Trellis's copies public.tag_labels.code")
+                && error.contains("invalid input syntax for type uuid")
+                && error.contains("drop the definition and define it again"),
+            "{error}"
+        );
+        let requests: i64 = raw
+            .query_one("select count(*) from resume_requests", &[])
+            .await
+            .expect("read requests")
+            .get(0);
+        assert_eq!(requests, 0);
+        assert_eq!(column_type(&raw, "public.tag_labels", "code").await, "text");
+        assert_eq!(
+            rows(&raw, "select code, label from public.tag_labels order by code").await,
+            before
+        );
+    }
+}

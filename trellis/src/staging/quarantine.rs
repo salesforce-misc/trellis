@@ -3269,7 +3269,10 @@ const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// - A re-validation that now fails, or a re-type that fails (a value the
 ///   new type can't hold, a view on the column), ends the request: the
 ///   definition stays paused, its `capture_failure` says why, and the next
-///   `RESUME` tries again. A failed re-type changes nothing.
+///   `RESUME` tries again. The failing table's copies keep their types;
+///   another table's, re-typed before it in its own transaction, keep their
+///   new ones, which the definition, still paused, never reads, and which
+///   the next resume finds current.
 ///
 /// A request's own failure is logged and doesn't stop the others. Errs only
 /// when the requests can't be read.
@@ -3338,8 +3341,9 @@ async fn finish_requested_resume(
                 return Err(err.into());
             }
             Err(reason) => {
+                drop(txn);
                 end_request(
-                    &txn,
+                    client,
                     id,
                     &source_table,
                     &format!(
@@ -3349,7 +3353,6 @@ async fn finish_requested_resume(
                     ),
                 )
                 .await?;
-                txn.commit().await?;
                 return Ok(());
             }
         }
@@ -3370,6 +3373,7 @@ async fn finish_requested_resume(
         (source_table, target, statements)
     };
 
+    let mut retyped: Vec<String> = Vec::new();
     for (sql, labels) in statements {
         let txn = client.transaction().await?;
         crate::locks::set_local_lock_timeout(&txn, RETYPE_LOCK_TIMEOUT).await?;
@@ -3377,6 +3381,7 @@ async fn finish_requested_resume(
             Ok(()) => {
                 txn.commit().await?;
                 tracing::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
+                retyped.extend(labels);
             }
             Err(err) if crate::locks::is_lock_not_available(&err) => {
                 drop(txn);
@@ -3389,15 +3394,23 @@ async fn finish_requested_resume(
             }
             Err(err) => {
                 txn.rollback().await?;
-                let txn = client.transaction().await?;
+                // Each table is re-typed in its own transaction, so the
+                // copies of a table re-typed before this one keep their new
+                // types; the next resume finds them current.
+                let kept = if retyped.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} were re-typed already)", retyped.join(", "))
+                };
                 end_request(
-                    &txn,
+                    client,
                     id,
                     &source_table,
                     &format!(
                         "the resume couldn't re-type Trellis's copies {} to their source \
-                         columns' types: {}. Nothing was changed. Fix the cause and resume the \
-                         definition again, or drop the definition and define it again",
+                         columns' types: {}. They keep their types{kept}, and the definition \
+                         stays paused. Fix the cause and resume the definition again, or drop \
+                         the definition and define it again",
                         labels.join(", "),
                         err.as_db_error()
                             .map(ToString::to_string)
@@ -3405,7 +3418,6 @@ async fn finish_requested_resume(
                     ),
                 )
                 .await?;
-                txn.commit().await?;
                 return Ok(());
             }
         }
@@ -3438,9 +3450,8 @@ async fn finish_requested_resume(
         Ok(ResumeStep::Retyping(_)) => {}
         Err(ApplyError::ResumeRefused { reason, .. }) => {
             drop(txn);
-            let txn = client.transaction().await?;
             end_request(
-                &txn,
+                client,
                 id,
                 &source_table,
                 &format!(
@@ -3450,28 +3461,42 @@ async fn finish_requested_resume(
                 ),
             )
             .await?;
-            txn.commit().await?;
         }
         Err(err) => return Err(err),
     }
     Ok(())
 }
 
-/// Ends definition `id`'s resume request without resuming it: it stays
-/// paused, with `error` as its `capture_failure`.
+/// Ends definition `id`'s resume request without resuming it, in a
+/// transaction of its own: it stays paused, with `error` as its
+/// `capture_failure`. Locked as a resume locks ([`lock_frozen`]: the fence
+/// bump first, then the definition's row), so it serializes with a
+/// `RESUME` or a drop of the same definition. Does nothing if the request
+/// is gone by then: a `RESUME` completed it (the definition is no longer
+/// paused, and must not get a record), or the definition was dropped.
 async fn end_request(
-    txn: &Transaction<'_>,
+    client: &mut tokio_postgres::Client,
     id: i64,
     source_table: &str,
     error: &str,
 ) -> Result<(), ApplyError> {
-    txn.execute(
-        "delete from resume_requests where transform_id = $1",
-        &[&id],
-    )
-    .await?;
+    let txn = client.transaction().await?;
+    if lock_frozen(&txn, "id", &id, source_table).await?.is_none() {
+        return Ok(());
+    }
+    let ended = txn
+        .execute(
+            "delete from resume_requests where transform_id = $1",
+            &[&id],
+        )
+        .await?
+        == 1;
+    if !ended {
+        return Ok(());
+    }
     let columns: Vec<String> = Vec::new();
-    set_capture_failure(txn, id, source_table, &columns, error).await?;
+    set_capture_failure(&txn, id, source_table, &columns, error).await?;
+    txn.commit().await?;
     tracing::warn!(transform_id = id, "a requested resume ended: {error}");
     Ok(())
 }
