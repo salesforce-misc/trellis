@@ -1137,6 +1137,7 @@ async fn accumulate_from_side_recomputes(
     key_hops: &HashMap<String, i32>,
     key_src_changed: &HashMap<String, Provenance>,
     reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
+    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
 ) -> Result<(), ApplyError> {
     // Issue #267: this accumulator's entries become staged `src_table`s
     // verbatim ([`apply_and_mark_drained_many`]'s step 4), so they carry the
@@ -1159,13 +1160,15 @@ async fn accumulate_from_side_recomputes(
         key_hops,
         key_src_changed,
         reverse_recomputes,
+        skip_frozen,
     )
     .await
 }
 
 /// [`accumulate_from_side_recomputes`] for a relationship given by its
 /// qualified from-table and `from_col`, as a deferred reverse's
-/// [`ReverseRelationshipShape`] holds them (#784).
+/// [`ReverseRelationshipShape`] holds them (#784). `skip_frozen` is
+/// [`from_side_key`]'s.
 async fn accumulate_from_side_recomputes_on(
     pool: &Pool,
     qualified_from_table: &str,
@@ -1173,12 +1176,13 @@ async fn accumulate_from_side_recomputes_on(
     key_hops: &HashMap<String, i32>,
     key_src_changed: &HashMap<String, Provenance>,
     reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
+    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
 ) -> Result<(), ApplyError> {
     if key_hops.is_empty() {
         return Ok(());
     }
     let join_keys: Vec<String> = key_hops.keys().cloned().collect();
-    let Some(from_pk) = from_side_key(pool, qualified_from_table).await? else {
+    let Some(from_pk) = from_side_key(pool, qualified_from_table, skip_frozen).await? else {
         return Ok(());
     };
     let matches = from_side_keys(
@@ -1738,6 +1742,7 @@ pub(crate) fn relationship_reverse_deferred_src_table(relationship_id: i64) -> S
 async fn build_reverse_relationship_shape(
     pool: &Pool,
     rel: &RelationshipDefinition,
+    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
 ) -> Result<ReverseRelationshipShape, ApplyError> {
     let projection = catalog::relationship_projection(pool, rel.id).await?;
     let (qualified_projection, projection_schema, projection_table_bare) = match projection {
@@ -1760,7 +1765,7 @@ async fn build_reverse_relationship_shape(
     // relationship's own recorded one (issue #288), never `rel.def.from_table`
     // re-resolved through this session's `search_path`.
     let qualified_from_table = rel.qualified_from_table();
-    let from_pk = from_side_key(pool, &qualified_from_table).await?;
+    let from_pk = from_side_key(pool, &qualified_from_table, skip_frozen).await?;
     let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
 
     let needs_recompute_fallback = defs.iter().any(|def| {
@@ -3047,7 +3052,7 @@ pub(crate) async fn release_to_one_projections(
     let pk = ddl::source_primary_key(pool, src_table).await?;
     let pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
     for rel in &relationships {
-        let shape = build_reverse_relationship_shape(pool, rel).await?;
+        let shape = build_reverse_relationship_shape(pool, rel, None).await?;
         if shape.qualified_projection.is_empty() {
             continue;
         }
@@ -5337,10 +5342,36 @@ async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyErro
 /// that isn't frozen halts the page, which pauses it (`super::halt`, #663),
 /// and so does a from-side that is gone. A new reader rebuilds from the
 /// source too, so the skip needs no fence.
+///
+/// `skip_frozen` is [`compute_page`]'s (issue #766), with the page's fence:
+/// on the retry after Postgres refused the drain a read, a from-side no
+/// unfrozen definition reads is skipped whatever its key, as `compute_page`
+/// skips that table's own changes. Its readers' halt may be what froze
+/// them, for that very refusal, and the from-side read would be refused
+/// again on every pass. That skip is fenced as `compute_page`'s is
+/// ([`no_unfrozen_reader`]), with the from-side's own fence read first, so a
+/// page can't commit after a resume it didn't see.
 async fn from_side_key(
     pool: &Pool,
     qualified_from_table: &str,
+    skip_frozen: Option<&mut HashMap<String, Option<i64>>>,
 ) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
+    if let Some(versions) = skip_frozen {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            versions.entry(qualified_from_table.to_string())
+        {
+            let version = catalog::source_table_version(pool, entry.key()).await?;
+            entry.insert(version);
+        }
+        if no_unfrozen_reader(pool, qualified_from_table, versions).await? {
+            tracing::warn!(
+                from_table = %qualified_from_table,
+                "every definition reading this relationship from-side is frozen, and the drain \
+                 was refused a read or write; staging no recompute of its rows"
+            );
+            return Ok(None);
+        }
+    }
     let err = match ddl::source_primary_key(pool, qualified_from_table).await {
         Ok(pk) => return Ok(Some(pk)),
         Err(err) => err,
@@ -5902,6 +5933,7 @@ pub(super) async fn compute_page(
                     &key_hops,
                     &key_src_changed,
                     &mut reverse_recomputes,
+                    skip_frozen.then_some(&mut versions),
                 )
                 .await?;
             }
@@ -6072,6 +6104,7 @@ pub(super) async fn compute_page(
                     &key_hops,
                     &key_src_changed,
                     &mut reverse_recomputes,
+                    skip_frozen.then_some(&mut versions),
                 )
                 .await?;
                 continue;
@@ -6193,6 +6226,7 @@ pub(super) async fn compute_page(
                 &key_hops,
                 &key_src_changed,
                 &mut reverse_recomputes,
+                skip_frozen.then_some(&mut versions),
             )
             .await?;
 
@@ -6202,7 +6236,14 @@ pub(super) async fn compute_page(
             let shape = match relationship_reverse_shapes.get(&rel.id) {
                 Some(shape) => Arc::clone(shape),
                 None => {
-                    let shape = Arc::new(build_reverse_relationship_shape(pool, rel).await?);
+                    let shape = Arc::new(
+                        build_reverse_relationship_shape(
+                            pool,
+                            rel,
+                            skip_frozen.then_some(&mut versions),
+                        )
+                        .await?,
+                    );
                     relationship_reverse_shapes.insert(rel.id, Arc::clone(&shape));
                     shape
                 }
@@ -6506,7 +6547,14 @@ pub(super) async fn compute_page(
                     );
                     continue;
                 };
-                let shape = Arc::new(build_reverse_relationship_shape(pool, &rel).await?);
+                let shape = Arc::new(
+                    build_reverse_relationship_shape(
+                        pool,
+                        &rel,
+                        skip_frozen.then_some(&mut versions),
+                    )
+                    .await?,
+                );
                 relationship_reverse_shapes.insert(rel_id, Arc::clone(&shape));
                 shape
             }
@@ -6539,6 +6587,7 @@ pub(super) async fn compute_page(
                 &key_hops,
                 &key_src_changed,
                 &mut reverse_recomputes,
+                skip_frozen.then_some(&mut versions),
             )
             .await?;
         }
@@ -6766,7 +6815,13 @@ pub(super) async fn compute_page(
             // that function's accumulator, and its entries are staged as
             // `src_table` verbatim.
             let qualified_from_table = rel.qualified_from_table();
-            let Some(from_pk) = from_side_key(pool, &qualified_from_table).await? else {
+            let Some(from_pk) = from_side_key(
+                pool,
+                &qualified_from_table,
+                skip_frozen.then_some(&mut versions),
+            )
+            .await?
+            else {
                 continue;
             };
             // #623 D5: an aggregate on the from-table keeps each row's group

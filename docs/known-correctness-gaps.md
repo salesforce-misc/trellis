@@ -392,11 +392,11 @@ than filtering it. What follows depends on what was refused:
   that fails beside it is still charged to the definition it fails in. The
   drain finds those tables from the catalog, as its own role, so it pauses
   every unfrozen definition whose tables that role can't use, not only those
-  on the refused page. A `42501` the catalog can't pin on a table (a column the role
-  isn't granted while it holds a grant on another, a function's `EXECUTE`,
-  one of Trellis's own tables) pauses nothing: the drain retries the page and
-  surfaces the error on every pass, charges no key, and puts nothing in
-  `status()`. The logs and a stalled watermark are the only signs.
+  on the refused page. A `42501` the catalog can't pin on a table (a column
+  the role isn't granted while it holds a grant on another, a function's
+  `EXECUTE`, one of Trellis's own tables) pauses nothing: the drain retries
+  the page and surfaces the error on every pass, charges no key, and puts
+  nothing in `status()`. The logs and a stalled watermark are the only signs.
 * **A build chunk** is retried, and its fifth charged attempt pauses its
   definition, with the error on `backfill_failure`. It's never narrowed to a
   key.

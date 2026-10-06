@@ -680,11 +680,13 @@ the page without it:
   readers of each table they read that the role can't (`SELECT`, or policies
   that apply to it), and the writer of each target it can't write. The
   page's retries, and the isolation probes they run, then skip every table no
-  unfrozen definition reads, as for a table whose key can't be used (#768),
-  because the drain keeps a
-  relationship's settled projection current from its to-side whatever its
-  readers' status, and that read would be refused again. A resume refreshes
-  the projections it reads;
+  unfrozen definition reads, as for a table whose key can't be used (#768):
+  its own changes, and the lookup of a relationship's from-side rows a
+  to-side change would recompute. The drain keeps a relationship's settled
+  projection current from its to-side whatever its readers' status, and
+  recomputes the from-side for the to-side's other readers' changes, so
+  either read would be refused again. A resume refreshes the projections it
+  reads;
 - and, in every case, everything downstream of those, so no hop target goes
   quietly stale.
 

@@ -971,11 +971,12 @@ async fn a_drain_as_an_unchecked_role_pauses_the_reader_of_a_hidden_to_side() {
 /// to key 1 of `c` that one of `c`'s three readers, `c_cheap`, fails to write
 /// (its target refuses the amount). The refusal halts the definition reading
 /// through the relationship, charging no key, and the page's retries skip the
-/// refused table. So do isolation's probes, both bisection's and the
-/// per-definition attribution's: a probe that read the refused table again
-/// would halt on its `42501` and leave key 1 uncharged on every drain. Key 1
-/// is charged to `c_cheap` alone and, at the death threshold, held for it,
-/// while `c_copy` applies it.
+/// refused table. So do isolation's probes: a bisection probe holding the
+/// to-side's change would otherwise read the refused table again, halt on its
+/// `42501` and leave key 1 uncharged on every drain. (Attribution's probes
+/// skip the same way, but hold only key 1's record, which reads nothing
+/// refused.) Key 1 is charged to `c_cheap` alone and, at the death threshold,
+/// held for it, while `c_copy` applies it.
 #[tokio::test]
 async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_definition() {
     let cluster = TestCluster::start();
@@ -1691,5 +1692,97 @@ async fn a_healthy_to_side_skipped_beside_a_refused_one_is_refreshed_by_the_next
         .expect("read the new reader's target")
         .get(0);
     assert_eq!(label.as_deref(), Some("new"));
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The from-side half of the skip (#766). A relationship's from-side, `c`,
+/// has policies that apply to the drain's role, and its to-side, `p`, has a
+/// live reader of its own, `p_copy`. An image-less change to `p` (a
+/// `recompute`, as a backfill, a release or a propagation hop stages)
+/// re-derives the `c` rows that read it, so the drain looks those rows up in
+/// `c`, and that read is refused. The refusal halts `c_named`, the only
+/// definition reading `c`, and the retry skips the lookup as it skips `c`'s
+/// own changes, so the page commits and `p_copy` applies its share. Without
+/// the skip the retry is refused again on every pass, and the ring stalls
+/// behind the page.
+#[tokio::test]
+async fn a_to_side_recompute_skips_a_from_side_whose_readers_are_halted_for_row_security() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.trellis
+        .apply("RELATIONSHIP parent FROM c.pid TO p.id")
+        .await
+        .expect("declare a relationship");
+    for ddl in [
+        "TRANSFORM c_named FROM public.c SELECT amount AS amount, parent.name AS name",
+        "TRANSFORM p_copy FROM public.p SELECT name AS name",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    markers::settle_registrations(&it.pool).await;
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the registrations drain before any policy applies");
+    for target in ["c_named", "p_copy"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             create role rls_worker login in role rls_trellis; \
+             alter table public.c enable row level security, force row level security; \
+             create policy hide_two on public.c using (id <> 2); \
+             set session_replication_role = replica; \
+             update public.p set name = 'renamed' where id = 2; \
+             reset session_replication_role;",
+        )
+        .await
+        .expect("a member login role the from-side's policies apply to, and an uncaptured write");
+    let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
+    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
+    let worker = trellis::Pool::new(&config).expect("pool");
+
+    let ring_slot: i16 = it
+        .raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    it.raw
+        .execute(
+            &format!(
+                "insert into seg_{ring_slot} (src_table, key, op, lsn, old_image, new_image, \
+                 hop_gen) values ('public.p', '2', 'recompute', null, null, null, 0)"
+            ),
+            &[],
+        )
+        .await
+        .expect("stage an image-less change to the to-side");
+    seal_and_drain(&mut it.raw, &worker)
+        .await
+        .expect("the drain halts the from-side's reader, skips the lookup and commits");
+
+    let halted = status(&it.trellis, "c_named").await;
+    assert_eq!(halted.status, TransformStatus::Paused);
+    let failure = halted.capture_failure.expect("the halt's record");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    assert_eq!(failure.source_table, "public.c");
+    assert_eq!(
+        status(&it.trellis, "p_copy").await.status,
+        TransformStatus::Live
+    );
+    let name: Option<String> = it
+        .admin
+        .query_one("select name from public.p_copy where id = 2", &[])
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(name.as_deref(), Some("renamed"), "p_copy applied the page");
+    assert_eq!(poison_rows(&it.admin).await, 0);
     it.trellis.shutdown().await.expect("shutdown");
 }
