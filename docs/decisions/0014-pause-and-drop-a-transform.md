@@ -84,13 +84,16 @@ together in one transaction (issue #330) and read on one snapshot (issue #436):
   reached (a key deleted while frozen). Any other definition parks a marker,
   and its one-pass build ends in a go-live catch-up that enumerates the
   source's current keys as image-less Recomputes, plus the orphan sweep
-  (`intake::resume_orphans`) above. `RESUME` first bumps the source's version
-  fence and discards the definition's unclaimed backfill chunks.
+  (`intake::resume_orphans`) above. An aggregate's one-pass build rebuilds
+  its ledger, and before it applies again it deletes every group the rebuilt
+  ledger has no live entry for: a group whose rows left after the sweep's
+  snapshot but before the build's read. `RESUME` first bumps the source's
+  version fence and discards the definition's unclaimed backfill chunks.
 
 Deletions are visible the moment that transaction commits. Rows whose values changed
 during the pause stay stale until the drain re-derives them, and rows the source gained
-appear the same way. The deletes go through the target-mutation seam like any other
-target write, so a live definition reading this target drops them too.
+appear the same way. The deletes, the build's included, go through the target-mutation
+seam like any other target write, so a live definition reading this target drops them too.
 
 A long pause is not free: the cost of resuming scales with the data, not with the length
 of the pause. This is the contract, stated so a caller does not expect a cheap resume.
