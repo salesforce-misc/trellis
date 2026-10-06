@@ -470,6 +470,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         "trellis_span_test",
         &folded,
         1,
+        false,
     )
     .await
     .expect("isolate_and_evict");

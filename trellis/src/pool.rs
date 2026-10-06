@@ -15,7 +15,9 @@
 //!
 //! Beyond `search_path`, the hook also pins the output GUCs that make a
 //! value's text rendering depend on the value alone rather than on the
-//! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]), and turns on
+//! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]), turns
+//! `row_security` off so a read row-level security would filter raises
+//! instead (see [`ROW_SECURITY_OFF`], issue #766), and turns on
 //! TCP keepalives at both ends so a partitioned connection's locks don't
 //! outlive it by hours (see [`tcp_keepalive_gucs`], issue #364). The
 //! dedicated, non-pooled connections get the same through
@@ -342,6 +344,37 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
      set timezone to 'UTC'; set lc_monetary to 'C'; set standard_conforming_strings to 'on'; \
      set xmloption to 'content'";
 
+/// Makes a read or write that row-level security would filter **raise**
+/// instead (issue #766).
+///
+/// Under `row_security = off`, Postgres doesn't apply a table's policies to
+/// the session at all. When they would apply (the table has RLS enabled and
+/// the session's role is neither a superuser, nor has `BYPASSRLS`, nor owns
+/// the table without `FORCE ROW LEVEL SECURITY`), the statement fails with
+/// `42501` ("query would be affected by row-level security policy for
+/// table ...") rather than silently seeing only the rows the policies allow.
+/// A role that is exempt sees no difference: the setting only matters to a
+/// role the policies apply to.
+///
+/// Trellis doesn't support policies that apply to the roles it reads or
+/// writes as (`docs/transforms.md`, "Source tables"), and checks the catalog
+/// for them at define, on every capture pass, and in `self_check`
+/// ([`crate::defs::row_security`], #745/#765). Those checks only see the
+/// ring's owner and the role of the session running them, so a drain or
+/// build logged in as any other role used to read past them and write a
+/// silently wrong target. This setting is the defense in depth behind them:
+/// whichever role a Trellis connection logs in as, a filtered read fails
+/// loudly, and the drain pauses the definitions it reaches
+/// ([`crate::staging::halt`]) instead of charging keys for it.
+///
+/// It is applied by [`session_bootstrap`] and [`dedicated_session_setup`],
+/// so every connection Trellis opens itself carries it. It isn't part of
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], because that list is also pinned on
+/// every capture function, which runs inside the *application's* write:
+/// there it would turn a policy that applies to the ring's owner into a
+/// failed application write. The capture pass pauses those readers instead.
+pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
+
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
 ///
@@ -350,9 +383,10 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
 /// (so unqualified reads/writes against a transform target table resolve
 /// even when it lives outside both `schema` and `public`) and `public`
 /// (Postgres's own default, kept last as a fallback for anything that
-/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], the
-/// server-side TCP keepalives ([`tcp_keepalive_gucs`], without the user
-/// timeout: see [`DeadPeerDetection::KeepalivesOnly`]) and the session's
+/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`],
+/// [`ROW_SECURITY_OFF`], the server-side TCP keepalives
+/// ([`tcp_keepalive_gucs`], without the user timeout: see
+/// [`DeadPeerDetection::KeepalivesOnly`]) and the session's
 /// `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`], ADR-0002
 /// I7).
 async fn session_bootstrap(
@@ -362,7 +396,8 @@ async fn session_bootstrap(
 ) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(&format!(
-            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}; {}",
+            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; \
+             {ROW_SECURITY_OFF}; {}; {}",
             quote_ident(schema),
             quote_ident(target_schema),
             tcp_keepalive_gucs(DeadPeerDetection::KeepalivesOnly),
@@ -583,12 +618,13 @@ pub(crate) async fn connect_dedicated(
 /// The session setup a dedicated connection runs straight after
 /// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
 /// pooled one: `search_path` pinned to `schema` then `public`,
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`tcp_keepalive_gucs`] with the
-/// user timeout, and the `lock_timeout` cap
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`ROW_SECURITY_OFF`],
+/// [`tcp_keepalive_gucs`] with the user timeout, and the `lock_timeout` cap
 /// ([`crate::locks::session_lock_timeout_sql`]).
 pub(crate) fn dedicated_session_setup(schema: &str) -> String {
     format!(
-        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}; {}",
+        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {ROW_SECURITY_OFF}; \
+         {}; {}",
         quote_ident(schema),
         tcp_keepalive_gucs(DeadPeerDetection::KeepalivesAndUserTimeout),
         crate::locks::session_lock_timeout_sql()
@@ -817,6 +853,63 @@ mod tests {
             .await
             .expect("dedicated session setup");
         assert_eq!(render(&dedicated).await, expected, "dedicated");
+    }
+
+    /// Issue #766: every kind of session Trellis opens itself (pooled,
+    /// unpooled, dedicated) runs with `row_security = off`, even when the
+    /// database's default says `on`, so a read that row-level security would
+    /// filter raises instead.
+    #[tokio::test]
+    async fn row_security_is_off_on_every_session_kind() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect unpinned");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "alter database {} set row_security to on",
+            quote_ident(db.name())
+        ))
+        .await
+        .expect("an explicit database default of on");
+
+        async fn setting(client: &tokio_postgres::Client) -> String {
+            client
+                .query_one("select current_setting('row_security')", &[])
+                .await
+                .expect("read row_security")
+                .get(0)
+        }
+
+        // Control: a session that pins nothing has it on.
+        let (unpinned, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect unpinned");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        assert_eq!(setting(&unpinned).await, "on", "unpinned");
+
+        let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let pooled = pool.get().await.expect("pooled connection");
+        assert_eq!(setting(&pooled).await, "off", "pooled");
+
+        let unpooled = pool.connect_unpooled().await.expect("unpooled connection");
+        assert_eq!(setting(&unpooled).await, "off", "unpooled");
+
+        let (dedicated, connection) = connect_dedicated(db.dsn()).await.expect("dedicated");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        dedicated
+            .batch_execute(&dedicated_session_setup(crate::config::DEFAULT_SCHEMA))
+            .await
+            .expect("dedicated session setup");
+        assert_eq!(setting(&dedicated).await, "off", "dedicated");
     }
 
     /// Issue #672 review: the SQL Trellis writes escapes a string literal by

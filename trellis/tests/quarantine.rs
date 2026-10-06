@@ -1606,9 +1606,17 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         to_col_values: Vec::new(),
     }];
 
-    let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 0)
-        .await
-        .expect("isolate_and_evict with threshold 0 must not error");
+    let result = isolate_and_evict(
+        &db.pool,
+        1,
+        "worker",
+        "trellis_quarantine_test",
+        &folded,
+        0,
+        false,
+    )
+    .await
+    .expect("isolate_and_evict with threshold 0 must not error");
     assert!(
         matches!(result, IsolationOutcome::FuseDisabled),
         "threshold 0 must never evict, regardless of how many deaths a key already has, \
@@ -1682,12 +1690,20 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
         to_col_values: Vec::new(),
     }];
 
-    let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
-        .await
-        .expect(
-            "isolate_and_evict must not error on a deferred reverse — it must be skipped \
+    let result = isolate_and_evict(
+        &db.pool,
+        1,
+        "worker",
+        "trellis_quarantine_test",
+        &folded,
+        1,
+        false,
+    )
+    .await
+    .expect(
+        "isolate_and_evict must not error on a deferred reverse — it must be skipped \
              outright, never probed",
-        );
+    );
     assert!(
         matches!(result, IsolationOutcome::NothingReproduced),
         "a batch containing only a deferred reverse must report nothing reproduced, so the \
@@ -1981,9 +1997,17 @@ async fn two_spellings_of_one_source_charge_one_combined_fuse_budget() {
     for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
         let src_table = if i % 2 == 0 { bare } else { qualified.as_str() };
         let folded = vec![unevaluable_change(src_table, &format!("{i}"))];
-        let retry = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
-            .await
-            .expect("isolate_and_evict must not error on an unevaluable change");
+        let retry = isolate_and_evict(
+            &db.pool,
+            1,
+            "worker",
+            "trellis_quarantine_test",
+            &folded,
+            1,
+            false,
+        )
+        .await
+        .expect("isolate_and_evict must not error on an unevaluable change");
         let IsolationOutcome::Evicted { evicted, .. } = retry else {
             panic!(
                 "the key staged under {src_table:?} must have been evicted at threshold 1, \
@@ -2030,9 +2054,17 @@ async fn below_threshold_charge_is_reported_distinctly_from_nothing_reproduced()
     let qualified = qualify_fixture_table("orders");
     let folded = vec![unevaluable_change(&qualified, "7")];
 
-    let first = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 2)
-        .await
-        .expect("first isolate_and_evict");
+    let first = isolate_and_evict(
+        &db.pool,
+        1,
+        "worker",
+        "trellis_quarantine_test",
+        &folded,
+        2,
+        false,
+    )
+    .await
+    .expect("first isolate_and_evict");
     let IsolationOutcome::ChargedBelowThreshold { charged } = first else {
         panic!("a reproducing key at 1 of 2 deaths must be reported as charged, got {first:?}")
     };
@@ -2047,9 +2079,17 @@ async fn below_threshold_charge_is_reported_distinctly_from_nothing_reproduced()
     );
     assert!(!poison_marker_exists(&client, &qualified, "7").await);
 
-    let second = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 2)
-        .await
-        .expect("second isolate_and_evict");
+    let second = isolate_and_evict(
+        &db.pool,
+        1,
+        "worker",
+        "trellis_quarantine_test",
+        &folded,
+        2,
+        false,
+    )
+    .await
+    .expect("second isolate_and_evict");
     let IsolationOutcome::Evicted { evicted, charged } = second else {
         panic!("the second charge reaches the threshold of 2 and must evict, got {second:?}")
     };
@@ -2076,9 +2116,17 @@ async fn two_spellings_of_one_row_charge_one_death_counter() {
     // counter of 2 and a counter of 1, and nothing is ever evicted.
     for src_table in ["orders", qualified.as_str(), "orders"] {
         let folded = vec![unevaluable_change(src_table, "1")];
-        isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 3)
-            .await
-            .expect("isolate_and_evict must not error on an unevaluable change");
+        isolate_and_evict(
+            &db.pool,
+            1,
+            "worker",
+            "trellis_quarantine_test",
+            &folded,
+            3,
+            false,
+        )
+        .await
+        .expect("isolate_and_evict must not error on an unevaluable change");
     }
 
     assert_eq!(

@@ -225,7 +225,8 @@ pause are arcs of one lifecycle:
   * its build kept failing in a way no retry gets past: the error stays on
     `backfill_failure`;
   * the drain hit a failure that every key reproduces (a source with no usable
-    primary key, a propagation cycle past the hop bound): the definitions it reaches
+    primary key, a propagation cycle past the hop bound, a read or write refused
+    to the drain's role): the definitions it reaches
     and everything downstream of them are paused, with the cause on `capture_failure`.
 
   `RESUME TRANSFORM` returns it to `waiting_to_backfill`. It reconciles the target
@@ -317,7 +318,9 @@ paused this way keeps the error there until it is resumed.
 Some failures are no row's fault, so every key of the page reproduces them:
 a source key the drain can't use (the table lost its primary key, or the key
 changed to a type Trellis can't key by), a propagation wave past the hop bound,
-or an aggregate target off the ledger. Retrying the page would fail it forever,
+an aggregate target off the ledger, or Postgres refusing the drain's role a read
+or write (row-level security, which Trellis's `row_security = off` turns into an
+error, or a missing privilege, #766). Retrying the page would fail it forever,
 and quarantining a key would blame one for nobody's fault. Instead the drain
 **halts** the definitions the failure reaches (#663) and drains the page
 without them:
@@ -326,8 +329,11 @@ without them:
   as its source or as a relationship's to-side. For a hop bound outside a
   cycle, the readers of the table the wave ran away through, not the
   definition that wrote it; inside a cycle, every member. For an aggregate off
-  the ledger, the definition that writes that target. In every case, also
-  everything downstream of those, so no hop target goes quietly stale. Every
+  the ledger, the definition that writes that target. For a refused read or
+  write, the readers of each table the drain's role can't read and the writer
+  of each target it can't write, as the catalog shows them for that role. In
+  every case, also everything downstream of those, so no hop target goes
+  quietly stale. Every
   other definition keeps converging, and the staging ring keeps retiring.
 * **How it shows.** A halted definition is `paused`, like an operator pause,
   with no new status word. What tells it apart is
@@ -343,9 +349,11 @@ without them:
   peer worker meeting the same failure, or a retry meeting it again, finds the
   closure already paused and records nothing, so the count is of episodes,
   not attempts. A halt that pauses nothing because a peer already paused the
-  closure retries the page once. One that still pauses nothing (not believed
-  reachable) surfaces the error, and the drain worker re-claims the page at
-  its poll interval under a collapsed warning (#660).
+  closure retries the page once. One that still pauses nothing (a refused
+  read or write the catalog can't pin on a table,
+  [gap 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as))
+  surfaces the error, and the drain worker re-claims the page at its poll
+  interval under a collapsed warning (#660).
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. Resuming while the cause persists halts it again, as a new

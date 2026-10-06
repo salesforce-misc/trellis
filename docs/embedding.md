@@ -108,6 +108,9 @@ So:
   The same goes for each target table, which the workers write as their login
   role: a target belongs to the role that defined it, so run the workers as
   that role or a member of it, and don't force row-level security on it.
+  Every Trellis connection runs with `row_security = off`, so whichever role
+  a worker logs in as, a read or write the policies would filter fails rather
+  than skipping rows.
 * **Leave the capture triggers alone.** Each source table carries five
   triggers named after the instance schema (`trellis_capture_insert` and so on
   for the default). Don't disable or drop them. The worker reinstalls a
@@ -308,8 +311,9 @@ this fleet may be silently stuck," not as a transient blip to retry past.
 
 The worker checks say the fleet is running; they can't say a definition has
 stopped. A halting failure (a source key the drain can't use, a propagation
-wave past the hop bound, or an aggregate off the ledger) pauses the
-definitions it reaches, and every other definition keeps converging (#663,
+wave past the hop bound, an aggregate off the ledger, or Postgres refusing the
+drain's role a read or write) pauses the definitions it reaches, and every
+other definition keeps converging (#663,
 [observability — A halting failure](observability.md#a-halting-failure)). A
 halted definition reports `paused`, the same word as an operator pause, so
 check `DefinitionSummary::halt` rather than the status: it is set only on a

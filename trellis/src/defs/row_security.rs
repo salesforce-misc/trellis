@@ -44,9 +44,10 @@
 //!   from it as that role, and a build reads the projection. Otherwise not
 //!   the session's role: registration reads no source rows, and a process
 //!   that only defines transforms needn't run as a role that could.
-//!   Declaring a relationship isn't checked: it registers no reader, and
-//!   the projection keys it seeds are seeded again (the missing ones
-//!   inserted) by each definition that reads through it, which is.
+//!   Declaring a to-one relationship checks its to-side for the session's
+//!   role alone: it registers no reader, but it seeds the projection from
+//!   the to-side as that role, which `row_security = off` (below) would
+//!   otherwise fail with Postgres's bare error.
 //!   `ALTER TRANSFORM` adds no table to read: its `ADD`/`ALTER` refuse a
 //!   relationship path. A source or to-side that is another definition's
 //!   target is checked for the session's role alone ([`Readers::Session`]).
@@ -68,6 +69,17 @@
 //! Drain threads in another process, running as another login role, aren't
 //! seen from here: a deployment runs every worker as the Trellis role or a
 //! member of it.
+//!
+//! # `row_security = off` (issue #766)
+//!
+//! The checks above are the friendly half. Behind them, every connection
+//! Trellis opens sets `row_security = off` ([`crate::pool::ROW_SECURITY_OFF`]),
+//! so a statement the policies would filter, as whatever role it runs as,
+//! fails with `42501` instead of reading or writing the wrong rows. The drain
+//! classifies that as halting (`staging::quarantine::classify`) and pauses
+//! what it reaches, reading the refused tables off the catalog with
+//! [`applying`] as its own role (`staging::halt`). That is what covers the
+//! drain threads above.
 //!
 //! # A definition's target (issue #765)
 //!

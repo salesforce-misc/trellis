@@ -1124,6 +1124,7 @@ async fn isolation_surfaces_a_lost_claim_without_charging_any_key() {
         WAKE,
         &folded,
         trellis::staging::quarantine::DEFAULT_DEATH_THRESHOLD,
+        false,
     )
     .await;
     assert!(

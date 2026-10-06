@@ -22,7 +22,8 @@ them gets broken without Trellis noticing.
   hierarchy (entry 7).
 * No DDL rewrites, retypes or re-collates a column a definition reads, except
   the changes Trellis detects and pauses for (entries 1 to 4).
-* No row-level security policy applies to a role Trellis logs in as (entry 11).
+* No row-level security policy applies to a role Trellis logs in as, or to
+  the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
   statement that wrote it (entry 9).
 
@@ -74,7 +75,7 @@ These are the tools the entries refer to:
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
-| 11 | Row-level security applying to a Trellis login role that isn't checked | yes | no | #766, decision pending |
+| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain: pauses what it reaches, or logs only; build: `backfill_failure` | #813 |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
 | 14 | A field alias that shadows a source column read by an aggregate | target never builds | logs only | #695 |
@@ -372,25 +373,56 @@ evaluation into Postgres.
 **Repair:** stick to literal patterns or UTF-8 collated data until #575 lands.
 Afterwards, `PAUSE`/`RESUME` the affected transforms.
 
-## 11. Row-level security on a login role Trellis doesn't check
+## 11. Row-level security on a role Trellis runs as
 
-**Trigger:** a row-level security policy that applies to the role a drain
-worker logs in as, when that isn't the ring owner or the defining role.
+**Trigger:** a row-level security policy that applies to a role a drain
+worker or a build logs in as, or that comes to apply to the role that owns
+the ring after define. A privilege the drain's or build's role lacks
+(`permission denied for table ...`) is handled the same way.
 
-**Effect:** reads that build or recompute a target silently skip the rows
-the policy hides.
+**Effect:** every connection Trellis opens runs with `row_security = off`, so
+Postgres refuses (`42501`) a read or write the policies would filter, rather
+than filtering it. What follows depends on what was refused:
 
-**Detected?** No. Define refuses, the capture pass pauses and `self_check`
-reports RLS that applies to the ring owner or the defining role (#745, #765).
-The check doesn't cover other login roles.
+* **A drain** pauses the definitions the refusal reaches, with kind `halt`:
+  the readers of each table its role can't read, the writer of each target it
+  can't write, and everything downstream of them. `status()`'s
+  `capture_failure` names the table, the role, the fix and Postgres's own
+  error. No key is quarantined, and the rest of the page commits. The drain
+  finds those tables from the catalog, as its own role, so it pauses every
+  unfrozen definition whose tables that role can't use, not only those on the
+  refused page. A `42501` the catalog can't pin on a table (a column the role
+  isn't granted while it holds a grant on another, a function's `EXECUTE`,
+  one of Trellis's own tables) pauses nothing: the drain retries the page and
+  surfaces the error on every pass, charges no key, and puts nothing in
+  `status()`. The logs and a stalled watermark are the only signs.
+* **A build chunk** is retried, and its fifth charged attempt pauses its
+  definition, with the error on `backfill_failure`. It's never narrowed to a
+  key.
+* **A backfill discharge or go-live catch-up** is refused before any chunk
+  exists. It retries forever with backoff, with the error on
+  `backfill_failure`, and never pauses its definitions (#813).
+* **Capture** runs inside the application's own write, under that session's
+  `row_security`, so the capture functions don't set it. Setting it there
+  would turn a policy on the ring's owner into a failed application write.
+  So when policies come to apply to the ring's owner, the capture functions'
+  re-read of the source silently skips the rows they hide, until the next
+  reconcile pass pauses the table's readers.
 
-**Planned work:** #766 needs a design decision: set `row_security = off` on
-Trellis connections so a filtered read raises instead.
-
-**Repair:** grant `BYPASSRLS` to every role Trellis logs in as (it isn't
-inherited), or make the role the table owner without
-`FORCE ROW LEVEL SECURITY`. Then `PAUSE`/`RESUME` the readers
+**Detected?** A drain's refusal pauses its definitions and shows in `status()`,
+except a `42501` the catalog can't pin, which only logs. A build's shows on
+`backfill_failure`. For the ring's owner, the reconcile pass pauses the
+readers and `self_check` reports a `capture` divergence (#745, #765). Define
+and declare refuse policies that already apply
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+
+**Planned work:** #813 (pause on a refused discharge or catch-up).
+
+**Repair:** grant `BYPASSRLS` to every role Trellis logs in as and to the
+ring's owner (it isn't inherited), or make the role the table owner without
+`FORCE ROW LEVEL SECURITY`, and grant any missing privilege. Then resume the
+paused definitions, which rebuilds them. A discharge or catch-up that was
+retrying succeeds on its next attempt.
 
 ## 12. A crash empties an unlogged source table
 
@@ -613,11 +645,15 @@ refusing them up front:
   logical-replication subscription into a source.** These are refused at define,
   paused by the pass, and reported by `self_check`
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+  Capture's window before the pass sees row-level security is entry 11.
 * **A capture function's privilege revoked, or the function made
   `SECURITY INVOKER`.** This is loud rather than silent: every write to the
   captured table fails, naming the capture function, so no change is lost.
   `self_check` names the cause on 1-1 targets.
 * **Session settings** (`DateStyle`, `TimeZone`, `extra_float_digits`, …).
-  Trellis pins them on its connections and in its capture functions.
+  Trellis pins them on its connections and in its capture functions. Its
+  connections also run with `row_security = off`, so a read or write that
+  row-level security would filter fails instead of silently missing rows
+  (entry 11).
 * **A whole-database backup and restore, or PITR.** Sources and Trellis state
   roll back together.

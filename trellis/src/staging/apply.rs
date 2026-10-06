@@ -5042,7 +5042,7 @@ mod tests {
             &mut 1,
             &mut FenceMissBackoff::new(),
             &mut TransientRetry::new(),
-            &mut false,
+            &mut HaltRetry::default(),
             wrapped,
         )
         .await;
@@ -5270,21 +5270,7 @@ async fn source_key_for_apply(
     if !is_key_gate(&err) {
         return Err(err.into());
     }
-    // The fence the skip is judged under, read before the readers are: a
-    // reader of `source_key` through a relationship is a definition on the
-    // relationship's from-side, and a definition, its resume or its edit
-    // commits with a bump of its source's fence. `compute`'s caller already
-    // holds `source_key`'s own entry, for a direct reader. So a page that
-    // skips the table can't commit after a reader it didn't see.
-    for rel in catalog::relationships_to_table(pool, source_key).await? {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            versions.entry(rel.qualified_from_table())
-        {
-            let version = catalog::source_table_version(pool, entry.key()).await?;
-            entry.insert(version);
-        }
-    }
-    if has_unfrozen_reader(pool, source_key).await? {
+    if !no_unfrozen_reader(pool, source_key, versions).await? {
         return Err(err.into());
     }
     tracing::warn!(
@@ -5294,6 +5280,33 @@ async fn source_key_for_apply(
          skipping its changes"
     );
     Ok(None)
+}
+
+/// Whether no definition that isn't frozen reads `source_key`, directly or
+/// through a relationship ([`has_unfrozen_reader`]), so a page may skip the
+/// table's changes ([`source_key_for_apply`], [`compute_page`]).
+///
+/// The answer is fenced. The fence the skip is judged under is read before
+/// the readers are: a reader of `source_key` through a relationship is a
+/// definition on the relationship's from-side, and a definition, its resume
+/// or its edit commits with a bump of its source's fence, so each such
+/// from-side's version goes into `versions`. `compute`'s caller already
+/// holds `source_key`'s own entry, for a direct reader. So a page that skips
+/// the table can't commit after a reader it didn't see.
+async fn no_unfrozen_reader(
+    pool: &Pool,
+    source_key: &str,
+    versions: &mut HashMap<String, Option<i64>>,
+) -> Result<bool, ApplyError> {
+    for rel in catalog::relationships_to_table(pool, source_key).await? {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            versions.entry(rel.qualified_from_table())
+        {
+            let version = catalog::source_table_version(pool, entry.key()).await?;
+            entry.insert(version);
+        }
+    }
+    Ok(!has_unfrozen_reader(pool, source_key).await?)
 }
 
 /// Whether `err`, from [`ddl::source_primary_key`], is its key gate: the
@@ -5527,9 +5540,11 @@ pub(super) async fn relationship_readers_of(
 /// across those would make this function's future non-`Send` for no benefit
 /// — an event carries the same `src_table`/`changes` information without
 /// that cost). [`apply_target`] (Phase 3) is this tree's next, more
-/// fine-grained span, one per consuming transform.
+/// fine-grained span, one per consuming transform. The span is
+/// [`compute_page`]'s, which this calls and [`drain_batch`] calls directly.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, ApplyError> {
-    compute_focused(pool, folded, None).await
+    compute_page(pool, folded, None, false).await
 }
 
 /// One key an isolation probe (`quarantine::attribute`, #799) applies with
@@ -5574,7 +5589,16 @@ impl KeyExclusion {
 }
 
 /// [`compute`], with `focus` overriding one key's direct readers for an
-/// isolation probe.
+/// isolation probe, and with `skip_frozen` (issue #766) also skipping every
+/// table no definition that isn't frozen reads, as [`source_key_for_apply`]
+/// skips one whose key can't be used ([`no_unfrozen_reader`], fenced the
+/// same way). [`drain_batch`] asks for it on the retry after Postgres
+/// refused the drain a read or write (`42501`, see [`HaltRetry`]), and so do
+/// that call's isolation probes: the halt has paused the definitions reading
+/// the refused table, but the page still reads it for a relationship's
+/// settled projection, which is kept current whatever its readers' status,
+/// and would fail the same way forever. Asked only then, so a drain that was
+/// refused nothing reads nothing more.
 #[tracing::instrument(
     name = "staging.compute",
     skip(pool, folded, focus),
@@ -5584,10 +5608,11 @@ impl KeyExclusion {
         sources = tracing::field::Empty,
     )
 )]
-pub(super) async fn compute_focused(
+pub(super) async fn compute_page(
     pool: &Pool,
     folded: &[FoldedChange],
     focus: Option<&ProbeFocus<'_>>,
+    skip_frozen: bool,
 ) -> Result<ApplyPlan, ApplyError> {
     // Issue #16: find the already-poisoned keys before anything else touches
     // them. Whole-key poison is per transform (#799): a poisoned key is left
@@ -5759,6 +5784,15 @@ pub(super) async fn compute_focused(
         // by construction (`by_source` grouped on it, issue #380), so any one
         // of them names the right physical table for the reads below.
         let qualified_source = changes[0].src_table.as_str();
+
+        if skip_frozen && no_unfrozen_reader(pool, &source_key, &mut versions).await? {
+            tracing::warn!(
+                src_table = %qualified_source,
+                "every definition reading this table is frozen, and the drain was refused a \
+                 read or write; skipping its changes"
+            );
+            continue;
+        }
 
         // `source_key` alone determines the source table's primary key, not
         // the individual definition (issue #69) — introspected once per
@@ -9620,13 +9654,12 @@ async fn drain_batch(
 
     let mut backoff = FenceMissBackoff::new();
     let mut transient = TransientRetry::new();
-    // Whether this call has retried a halt that paused nothing (#663).
-    let mut halt_retried = false;
+    let mut halt_retry = HaltRetry::default();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         tracing::Span::current().record("attempt", attempt);
-        let plan = match compute(pool, &folded).await {
+        let plan = match compute_page(pool, &folded, None, halt_retry.skip_frozen).await {
             Ok(plan) => plan,
             Err(ApplyError::SourceTableDropped { source_table }) => {
                 // Issue #16's one sanctioned exception to immutability: the
@@ -9664,7 +9697,7 @@ async fn drain_batch(
                     &mut attempt,
                     &mut backoff,
                     &mut transient,
-                    &mut halt_retried,
+                    &mut halt_retry,
                     err,
                 )
                 .await?;
@@ -9713,7 +9746,7 @@ async fn drain_batch(
                     &mut attempt,
                     &mut backoff,
                     &mut transient,
-                    &mut halt_retried,
+                    &mut halt_retry,
                     err,
                 )
                 .await?;
@@ -9751,7 +9784,7 @@ async fn classify_and_retry(
     attempts: &mut u32,
     backoff: &mut FenceMissBackoff,
     transient: &mut TransientRetry,
-    halt_retried: &mut bool,
+    halt_retry: &mut HaltRetry,
     err: ApplyError,
 ) -> Result<(), ApplyError> {
     let attempt = *attempts;
@@ -9845,7 +9878,7 @@ async fn classify_and_retry(
         }
         // Halting schema diagnosis: never quarantine. Pause what it
         // reaches and retry without it (#663).
-        quarantine::FailureClass::Halting => halt(pool, seg_seq, attempts, halt_retried, err).await,
+        quarantine::FailureClass::Halting => halt(pool, seg_seq, attempts, halt_retry, err).await,
         // Everything else: bisect the folded records down to the ones that
         // fail alone to attribute the failure to specific key(s) (issue
         // #655), evicting any past the death
@@ -9870,6 +9903,7 @@ async fn classify_and_retry(
                 wake_channel,
                 folded,
                 quarantine::DEFAULT_DEATH_THRESHOLD,
+                halt_retry.skip_frozen,
             )
             .await
             {
@@ -9879,7 +9913,7 @@ async fn classify_and_retry(
                 Err(probe_err)
                     if quarantine::classify(&probe_err) == quarantine::FailureClass::Halting =>
                 {
-                    return halt(pool, seg_seq, attempts, halt_retried, probe_err).await;
+                    return halt(pool, seg_seq, attempts, halt_retry, probe_err).await;
                 }
                 Err(probe_err) => return Err(probe_err),
             };
@@ -9994,14 +10028,20 @@ async fn classify_and_retry(
 /// A halt that paused nothing (a peer paused the closure first, or the
 /// failure persists without one) retries once per [`drain_batch`] call, for
 /// the peer's case, then surfaces `err` as before, so the page can't spin.
+///
+/// A refused read or write (`42501`, issue #766) also has every retry skip
+/// the tables no unfrozen definition reads ([`HaltRetry::skip_frozen`]).
 async fn halt(
     pool: &Pool,
     seg_seq: i64,
     attempts: &mut u32,
-    halt_retried: &mut bool,
+    halt_retry: &mut HaltRetry,
     err: ApplyError,
 ) -> Result<(), ApplyError> {
     let paused = super::halt::halt_closure(pool, &err).await?;
+    if quarantine::is_insufficient_privilege(&err) {
+        halt_retry.skip_frozen = true;
+    }
     if !paused.is_empty() {
         tracing::error!(
             seg_seq,
@@ -10013,8 +10053,8 @@ async fn halt(
         *attempts -= 1;
         return Ok(());
     }
-    if !*halt_retried {
-        *halt_retried = true;
+    if !halt_retry.retried {
+        halt_retry.retried = true;
         tracing::debug!(
             seg_seq,
             error = %err,
@@ -10023,6 +10063,22 @@ async fn halt(
         return Ok(());
     }
     Err(err)
+}
+
+/// What [`halt`] keeps across one [`drain_batch`] call's retries.
+#[derive(Debug, Default)]
+struct HaltRetry {
+    /// Whether this call has retried a halt that paused nothing (#663).
+    retried: bool,
+    /// Whether Postgres refused the drain a read or write (`42501`, issue
+    /// #766), so every later attempt skips the tables no unfrozen
+    /// definition reads ([`compute_page`]). The halt pauses the readers of
+    /// the refused table, but the page reads it for a relationship's
+    /// settled projection whatever its readers' status, so without the skip
+    /// the retry would be refused again. A resume, or a new definition,
+    /// refreshes the projections it reads, as for a table skipped for its
+    /// key (#768).
+    skip_frozen: bool,
 }
 
 /// The next batch a free worker should pick up: the lowest-`seg_seq`

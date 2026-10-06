@@ -2352,6 +2352,48 @@ async fn create_definition_inner(
         .into());
     }
 
+    // Issue #745: Trellis reads the source, and the to-side of every
+    // relationship the definition reads through, as its own role, so
+    // row-level security that applies to that role would filter the reads.
+    // Registration reads no source rows itself, with one exception: it seeds
+    // and widens each to-one relationship's settled projection from the
+    // to-side as the session's role
+    // ([`widen_relationship_projections_for_definition_in_txn`], below), and
+    // a build reads the projection, so a to-one to-side is checked for the
+    // session's role too. A table another definition targets is checked for
+    // the session's role alone: the target-mutation seam feeds it, no
+    // capture function reads it, so the ring's owner never does (see
+    // [`super::row_security::Readers::Session`]).
+    //
+    // Checked before the widen, the first read of a to-side: every Trellis
+    // session runs with `row_security = off` (issue #766), so that read
+    // fails outright when the policies apply, and this check is what names
+    // the table, the role and the fix. It reads only the catalog, so a
+    // source that's another definition's not-yet-built target passes here
+    // (`to_regclass` finds no table) and is reported by the checks below.
+    let mut to_sides: Vec<(String, super::row_security::Readers)> = relationships
+        .values()
+        .map(|r| {
+            let readers = if r.cardinality == RelationshipCardinality::ToOne {
+                super::row_security::Readers::RingAndSession
+            } else {
+                super::row_security::Readers::Ring
+            };
+            (r.qualified_to_table.clone(), readers)
+        })
+        .collect();
+    to_sides.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut read_tables: Vec<(String, super::row_security::Readers)> =
+        std::iter::once((qualified_source.clone(), super::row_security::Readers::Ring))
+            .chain(to_sides)
+            .collect();
+    for (table, readers) in &mut read_tables {
+        if is_definition_target(&*txn, table).await? {
+            *readers = super::row_security::Readers::Session;
+        }
+    }
+    reject_row_security(&*txn, pool.schema(), &read_tables).await?;
+
     // Issue #129, epic #127: before this definition is persisted, widen the
     // settled parent projection of every to-one relationship its fields read
     // through to cover those reads — see
@@ -2533,42 +2575,9 @@ async fn create_definition_inner(
     // check, placed with the key check above because it reads the live
     // source relation (an own-target source is exempt before that query).
     reject_unkeyed_source(&*txn, &qualified_source).await?;
-    // Issue #745: Trellis reads the source, and the to-side of every
-    // relationship the definition reads through, as its own role, so
-    // row-level security that applies to that role would filter the reads.
-    // Registration reads no source rows itself, with one exception: it seeds
-    // and widens each to-one relationship's settled projection from the
-    // to-side as the session's role
-    // ([`widen_relationship_projections_for_definition_in_txn`], above), and
-    // a build reads the projection, so a to-one to-side is checked for the
-    // session's role too. A table another definition targets is checked for
-    // the session's role alone: the target-mutation seam feeds it, no
-    // capture function reads it, so the ring's owner never does (see
-    // [`super::row_security::Readers::Session`]).
-    let mut to_sides: Vec<(String, super::row_security::Readers)> = relationships
-        .values()
-        .map(|r| {
-            let readers = if r.cardinality == RelationshipCardinality::ToOne {
-                super::row_security::Readers::RingAndSession
-            } else {
-                super::row_security::Readers::Ring
-            };
-            (r.qualified_to_table.clone(), readers)
-        })
-        .collect();
-    to_sides.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut read_tables: Vec<(String, super::row_security::Readers)> =
-        std::iter::once((qualified_source.clone(), super::row_security::Readers::Ring))
-            .chain(to_sides)
-            .collect();
-    for (table, readers) in &mut read_tables {
-        if is_definition_target(&*txn, table).await? {
-            *readers = super::row_security::Readers::Session;
-        }
-    }
-    reject_row_security(&*txn, pool.schema(), &read_tables).await?;
-    // Issue #751: and a table a logical-replication subscription writes is
-    // one whose changes capture never sees, for the same tables.
+    // Issue #751: a table a logical-replication subscription writes is one
+    // whose changes capture never sees, for the same tables the row-level
+    // security check above covered.
     let read_tables: Vec<&str> = read_tables
         .iter()
         .map(|(table, _)| table.as_str())
@@ -2900,7 +2909,19 @@ pub async fn create_relationship(
     // once a consumer's read columns are known). Runs inside this same
     // transaction so a relationship declaration and its projection's
     // creation commit or roll back together.
+    //
+    // The seed reads the to-side as the session's role, and every Trellis
+    // session runs with `row_security = off` (issue #766), so policies that
+    // apply to that role fail the read outright. Refuse first, naming the
+    // table, the role and the fix, rather than surface Postgres's bare
+    // "query would be affected by row-level security policy".
     if cardinality == RelationshipCardinality::ToOne {
+        reject_row_security(
+            &*txn,
+            pool.schema(),
+            &[(qualified_to.clone(), super::row_security::Readers::Session)],
+        )
+        .await?;
         ensure_relationship_projection_in_txn(
             &txn,
             id,

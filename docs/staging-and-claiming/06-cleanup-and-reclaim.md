@@ -170,7 +170,9 @@ replayed with its images, and the new transform holds no key.
 **What must never be quarantined.** The halting errors are deterministic yet
 caused by the *declared schema*, not the data — a source key the drain can't use
 (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a tripped hop bound (a real value
-cycle), and an aggregate target off the ledger (`AggregateOffLedger`). Every key
+cycle), an aggregate target off the ledger (`AggregateOffLedger`), and Postgres
+refusing the drain's role a read or write (`42501`, row-level security or a
+missing privilege, #766). Every key
 reproduces them, so quarantining would blame one key for nobody's fault and turn
 a loud, actionable error into a key that blocks reads forever. Instead the drain
 pauses the closure the failure reaches — left `paused` with a `capture_failures`

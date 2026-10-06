@@ -159,6 +159,15 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // narrowing it to one column.
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
         | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => FailureClass::Halting,
+        // Issue #766: Postgres refused the drain's role a read or write, for
+        // row-level security (every Trellis session runs with `row_security
+        // = off`, so a statement the policies would filter raises instead)
+        // or for a missing privilege. Either says something about the role
+        // and a table, never about a row: every key on that table reproduces
+        // it, so isolating would charge, and eventually evict, each of them
+        // for nothing. Halt the definitions it reaches instead
+        // (`staging::halt`).
+        _ if is_insufficient_privilege(err) => FailureClass::Halting,
         _ if is_transient(err) => FailureClass::Transient,
         _ => FailureClass::Isolate,
     }
@@ -230,6 +239,22 @@ pub(crate) fn is_transient_error(err: &(dyn std::error::Error + 'static)) -> boo
             err.downcast_ref::<deadpool_postgres::PoolError>()
         {
             return true;
+        }
+        link = err.source();
+    }
+    false
+}
+
+/// Whether the first [`tokio_postgres::Error`] on `err`'s
+/// [`std::error::Error::source`] chain is `42501` (`insufficient_privilege`):
+/// row-level security that applies to a session running with `row_security
+/// = off` ("query would be affected by row-level security policy for table
+/// ..."), or a plain "permission denied". See [`classify`].
+pub(crate) fn is_insufficient_privilege(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return pg.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE);
         }
         link = err.source();
     }
@@ -995,16 +1020,15 @@ fn random_dead_end_offset() -> usize {
 /// Computes and applies `records` inside a transaction that always rolls
 /// back (so it never commits the drained mark), and returns the error it
 /// failed with, if any. `Err` only for failing to check out a connection or
-/// open the transaction.
+/// open the transaction. `focus`, and `at`'s `skip_frozen`, are
+/// [`apply::compute_page`]'s.
 async fn probe_records(
     pool: &Pool,
-    seg_seq: i64,
-    claimed_by: &str,
-    wake_channel: &str,
+    at: ProbeSite<'_>,
     records: &[FoldedChange],
     focus: Option<&apply::ProbeFocus<'_>>,
 ) -> Result<Option<ApplyError>, ApplyError> {
-    let plan = match apply::compute_focused(pool, records, focus).await {
+    let plan = match apply::compute_page(pool, records, focus, at.skip_frozen).await {
         Ok(plan) => plan,
         Err(err) => return Ok(Some(err)),
     };
@@ -1020,10 +1044,10 @@ async fn probe_records(
     // `ApplyError` this probe is specifically trying to reproduce.
     let outcome = apply::apply_and_mark_drained(
         &txn,
-        seg_seq,
-        claimed_by,
+        at.seg_seq,
+        at.claimed_by,
         &plan,
-        wake_channel,
+        at.wake_channel,
         &StagedWatermark::saturated(),
     )
     .await;
@@ -1130,6 +1154,13 @@ async fn probe_records(
 /// Either way a key's death count stays what doc 06 means by it: how many
 /// real, observed attempts have failed for it, cleared by any clean drain
 /// that applies it.
+///
+/// **`skip_frozen` (issue #766)** computes every probe as
+/// `apply::compute_page` does with it: a drain that Postgres refused a read
+/// or write probes the page as its own retries compute it, skipping the
+/// tables no unfrozen definition reads. Without that, a probe would read the
+/// refused table again and halt on its `42501`, and a key failing elsewhere
+/// in the page would go uncharged on every drain.
 pub async fn isolate_and_evict(
     pool: &Pool,
     seg_seq: i64,
@@ -1137,6 +1168,7 @@ pub async fn isolate_and_evict(
     wake_channel: &str,
     folded: &[FoldedChange],
     threshold: i32,
+    skip_frozen: bool,
 ) -> Result<IsolationOutcome, ApplyError> {
     if threshold == 0 {
         return Ok(IsolationOutcome::FuseDisabled);
@@ -1148,16 +1180,13 @@ pub async fn isolate_and_evict(
         "isolating a failed batch: probing its records for the keys that fail alone"
     );
     let mut stats = IsolationStats::default();
-    let result = isolate_and_evict_probing(
-        pool,
+    let at = ProbeSite {
         seg_seq,
         claimed_by,
         wake_channel,
-        folded,
-        threshold,
-        &mut stats,
-    )
-    .await;
+        skip_frozen,
+    };
+    let result = isolate_and_evict_probing(pool, at, folded, threshold, &mut stats).await;
     log_isolation_finished(seg_seq, folded.len(), &stats, &result, started.elapsed());
     result
 }
@@ -1260,13 +1289,12 @@ fn log_isolation_finished(
 /// [`isolate_and_evict`] past its fuse check and start-of-call log.
 async fn isolate_and_evict_probing(
     pool: &Pool,
-    seg_seq: i64,
-    claimed_by: &str,
-    wake_channel: &str,
+    at: ProbeSite<'_>,
     folded: &[FoldedChange],
     threshold: i32,
     stats: &mut IsolationStats,
 ) -> Result<IsolationOutcome, ApplyError> {
+    let seg_seq = at.seg_seq;
     // Issue #283: every counter/marker write below lands under the *canonical*
     // (qualified, where resolvable) identity of the ring row's `src_table`,
     // never the raw spelling — resolved once per distinct source table here and
@@ -1313,9 +1341,7 @@ async fn isolate_and_evict_probing(
     while let Some(run) = bisector.next_run() {
         stats.probes += 1;
         let records = &candidates[run.clone()];
-        let Some(err) =
-            probe_records(pool, seg_seq, claimed_by, wake_channel, records, None).await?
-        else {
+        let Some(err) = probe_records(pool, at, records, None).await? else {
             bisector.record(run, ProbeVerdict::Clean);
             continue;
         };
@@ -1380,19 +1406,7 @@ async fn isolate_and_evict_probing(
     for (index, err) in bisection.failing {
         let change = &candidates[index];
         let canonical = canonical_srcs.get(pool, &change.src_table).await?;
-        let culprits = attribute(
-            pool,
-            AttributionProbe {
-                seg_seq,
-                claimed_by,
-                wake_channel,
-            },
-            change,
-            &canonical,
-            &err,
-            stats,
-        )
-        .await?;
+        let culprits = attribute(pool, at, change, &canonical, &err, stats).await?;
         if culprits.is_empty() {
             tracing::warn!(
                 seg_seq,
@@ -1485,12 +1499,15 @@ async fn isolate_and_evict_probing(
     Ok(IsolationOutcome::Evicted { evicted, charged })
 }
 
-/// Where [`attribute`]'s probes run: the page's segment and claim.
+/// Where [`isolate_and_evict`]'s probes run: the page's segment and claim,
+/// and whether they skip the tables no unfrozen definition reads
+/// (`skip_frozen`, issue #766).
 #[derive(Clone, Copy)]
-struct AttributionProbe<'a> {
+struct ProbeSite<'a> {
     seg_seq: i64,
     claimed_by: &'a str,
     wake_channel: &'a str,
+    skip_frozen: bool,
 }
 
 /// The definitions a record that fails alone (`change`, of canonical source
@@ -1518,7 +1535,7 @@ struct AttributionProbe<'a> {
 /// this drain.
 async fn attribute(
     pool: &Pool,
-    at: AttributionProbe<'_>,
+    at: ProbeSite<'_>,
     change: &FoldedChange,
     src_table: &str,
     err: &ApplyError,
@@ -1611,7 +1628,7 @@ async fn attribute(
 /// propagates.
 async fn attribution_probe(
     pool: &Pool,
-    at: AttributionProbe<'_>,
+    at: ProbeSite<'_>,
     records: &[FoldedChange],
     src_table: &str,
     key: &str,
@@ -1628,16 +1645,7 @@ async fn attribution_probe(
         key,
         only,
     };
-    let Some(err) = probe_records(
-        pool,
-        at.seg_seq,
-        at.claimed_by,
-        at.wake_channel,
-        records,
-        Some(&focus),
-    )
-    .await?
-    else {
+    let Some(err) = probe_records(pool, at, records, Some(&focus)).await? else {
         return Ok(Some(None));
     };
     if is_claim_lost(&err) {
@@ -3616,6 +3624,7 @@ mod unit_tests {
             "wake",
             &folded,
             DEFAULT_DEATH_THRESHOLD,
+            false,
         )
         .await
         .expect("a transient storm is an outcome, not an error");
@@ -4276,6 +4285,61 @@ mod unit_tests {
             "{err:?}"
         );
         assert_eq!(classify(&err), FailureClass::Transient);
+    }
+
+    /// Issue #766: a `42501`, row-level security under `row_security = off`
+    /// or a plain missing privilege, is halting however it's wrapped: it is
+    /// about the role and a table, so isolating it would charge every key.
+    #[tokio::test]
+    async fn classify_halts_on_a_refused_read_or_write() {
+        use crate::defs::catalog::CatalogError;
+        use tokio_postgres::error::SqlState;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (admin, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        admin
+            .batch_execute(
+                "create role refused login; \
+                 create table public.policed (id int primary key); \
+                 alter table public.policed enable row level security; \
+                 grant select on public.policed to refused; \
+                 create table public.ungranted (id int primary key);",
+            )
+            .await
+            .expect("a role, a table its policies apply to and one it can't read");
+        let dsn = db.dsn().replace("user=postgres", "user=refused");
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect as the refused role");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(crate::pool::ROW_SECURITY_OFF)
+            .await
+            .expect("row_security off");
+        for sql in [
+            "select * from public.policed",
+            "select * from public.ungranted",
+        ] {
+            let refused = || async {
+                let err = client.simple_query(sql).await.expect_err(sql);
+                assert_eq!(err.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE), "{sql}");
+                err
+            };
+            for err in [
+                ApplyError::Db(refused().await),
+                ApplyError::Catalog(CatalogError::Ddl(DdlError::Db(refused().await))),
+            ] {
+                assert_eq!(classify(&err), FailureClass::Halting, "{sql}: {err}");
+            }
+        }
     }
 
     /// The routing tests above only see uncoded errors, so they can't tell
