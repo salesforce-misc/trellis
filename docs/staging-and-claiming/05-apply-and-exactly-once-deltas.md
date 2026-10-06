@@ -260,7 +260,11 @@ can sit between its plan and its lock for a long time, and a parent change
 whose recompute drained in that window would otherwise have its value
 written over by the chunk's older read (#832). A parent change that commits
 after the chunk's read stages a recompute whose page waits on the entry
-lock and writes after the chunk.
+lock and writes after the chunk. The chunk reads the projection by its
+primary key with sequential scans off, as the entry lock reads the ledger, so
+a projection whose statistics lag its size isn't read in full while the
+entries stay locked. A to-many relationship's to-side is read by its join
+column as Phase 2 reads it, since that column may have no index.
 
 ### The ledger
 

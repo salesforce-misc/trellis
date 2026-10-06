@@ -145,6 +145,13 @@ impl RelationshipContext {
         }
     }
 
+    /// The to-one relationship `name`'s to-side rows, keyed by their
+    /// `to_col` text.
+    #[cfg(test)]
+    pub(crate) fn to_one_rows(&self, name: &str) -> Option<&HashMap<String, Row>> {
+        self.by_name.get(name).map(|rel| &rel.to_rows_by_key)
+    }
+
     /// Every relationship's `from_col`, to-one and to-many: the from-side
     /// columns whose values this context resolved (#623 D6).
     pub(crate) fn join_columns(&self) -> impl Iterator<Item = &str> {

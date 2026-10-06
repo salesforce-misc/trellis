@@ -1291,11 +1291,8 @@ async fn accumulate_from_side_recomputes_on(
 /// cache's refresh-on-miss strategy).
 #[derive(Debug, Clone)]
 pub(crate) struct RelationshipGenBump {
-    /// [`ddl::qualified_relationship_projection_table`]'s output — ready for
-    /// direct interpolation into the Phase 3 `UPDATE`.
-    qualified_projection: String,
-    /// The projection's own primary key column (the relationship's `to_col`).
-    key_col: String,
+    /// [`generation_bump_statement`]'s statement for the projection.
+    sql: String,
     touched_keys: std::collections::HashSet<String>,
 }
 
@@ -1396,8 +1393,7 @@ pub(crate) async fn build_relationship_context(
             gen_bumps
                 .entry(read.id)
                 .or_insert_with(|| RelationshipGenBump {
-                    qualified_projection: projection.qualified_projection.clone(),
-                    key_col: projection.key_col.clone(),
+                    sql: projection.bump_sql.clone(),
                     touched_keys: std::collections::HashSet::new(),
                 })
                 .touched_keys
@@ -1447,12 +1443,10 @@ enum ReadKind {
 
 /// A to-one relationship's projection read ([`ReadKind::ToOne`]).
 struct ProjectionRead {
-    /// [`projection_rows_sql`]'s statement.
+    /// [`projection_rows_statement`]'s statement.
     sql: String,
-    /// The projection, quoted for interpolation (the gen bump's).
-    qualified_projection: String,
-    /// The projection's key column, the relationship's `to_col`.
-    key_col: String,
+    /// [`generation_bump_statement`]'s statement for the projection.
+    bump_sql: String,
 }
 
 impl RelationshipReads {
@@ -1493,11 +1487,25 @@ impl RelationshipReads {
             let kind = match reldef.cardinality {
                 RelationshipCardinality::ToOne => {
                     match catalog::relationship_projection(pool, reldef.id).await? {
-                        Some(projection) => ReadKind::ToOne(Some(ProjectionRead {
-                            sql: projection_rows_sql(pool, &projection, &to_table, to_col).await?,
-                            qualified_projection: projection.qualified_table(),
-                            key_col: to_col.clone(),
-                        })),
+                        Some(projection) => {
+                            // The projection's key column has `to_col`'s
+                            // type (see `projection_rows_sql`).
+                            let key_pg_type = key_column_pg_type(pool, &to_table, to_col).await?;
+                            ReadKind::ToOne(Some(ProjectionRead {
+                                sql: projection_rows_sql(
+                                    pool,
+                                    &projection,
+                                    to_col,
+                                    key_pg_type.as_deref(),
+                                )
+                                .await?,
+                                bump_sql: generation_bump_statement(
+                                    &projection.qualified_table(),
+                                    to_col,
+                                    key_pg_type.as_deref(),
+                                ),
+                            }))
+                        }
                         None => {
                             // Every to-one relationship gets a projection
                             // unconditionally at `create_relationship` time
@@ -1542,6 +1550,34 @@ impl RelationshipReads {
         client: &impl GenericClient,
         rows: &[&Row],
     ) -> Result<RelationshipContext, ApplyError> {
+        self.fetch_with(client, None, rows).await
+    }
+
+    /// [`Self::fetch`] in a direct writer's transaction `txn`, under its
+    /// entry lock (issue #832). A to-one relationship's projection is read
+    /// by its primary key under `super::ledger::ENTRY_PLAN_SETTINGS` (no
+    /// sequential scan, issue #835), so a projection whose statistics lag
+    /// its size isn't read in full while the entries stay locked. A to-many
+    /// relationship's to-side is read as [`Self::fetch`] reads it: its join
+    /// column may be non-unique or unindexed, where a forced index scan can
+    /// cost more than the sequential scan it replaces.
+    pub(crate) async fn fetch_under_lock(
+        &self,
+        txn: &Transaction<'_>,
+        rows: &[&Row],
+    ) -> Result<RelationshipContext, ApplyError> {
+        self.fetch_with(txn, Some(txn), rows).await
+    }
+
+    /// [`Self::fetch`], reading the projections under the entry plan
+    /// settings in `by_entry_key` when given
+    /// ([`fetch_relationship_projection_rows`]).
+    async fn fetch_with(
+        &self,
+        client: &impl GenericClient,
+        by_entry_key: Option<&Transaction<'_>>,
+        rows: &[&Row],
+    ) -> Result<RelationshipContext, ApplyError> {
         let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
         let mut to_many_by_name: HashMap<String, ToManyRelationship> = HashMap::new();
         for read in &self.reads {
@@ -1550,8 +1586,13 @@ impl RelationshipReads {
                 ReadKind::ToOne(projection) => {
                     let to_rows_by_key = match projection {
                         Some(projection) => {
-                            fetch_relationship_projection_rows(client, &projection.sql, &join_keys)
-                                .await?
+                            fetch_relationship_projection_rows(
+                                client,
+                                by_entry_key,
+                                &projection.sql,
+                                &join_keys,
+                            )
+                            .await?
                         }
                         None => HashMap::new(),
                     };
@@ -1699,16 +1740,20 @@ struct ToSide {
     /// #531, [`overtaken_by_refresh`]).
     seam_fed: bool,
     /// `to_col`'s type ([`key_column_pg_type`]), so the lookup by key can
-    /// use the to-side's own unique index on it. Resolved in Phase 3 by the
-    /// first record that takes the live-row check, so a batch where none
-    /// does never reads it.
+    /// use the to-side's own unique index on it, and the projection's key
+    /// (the same type) its primary key index. Resolved in Phase 3 by the
+    /// first statement that needs it, so a batch where none does never reads
+    /// it.
     key_pg_type: std::sync::OnceLock<Option<String>>,
 }
 
 impl ToSide {
-    /// The `where` condition matching the to-side row whose `to_col` is
-    /// `$1` (text), aliased `t`.
-    async fn key_filter(&self, txn: &Transaction<'_>, to_col: &str) -> Result<String, ApplyError> {
+    /// `to_col`'s type, read once and kept.
+    async fn key_pg_type(
+        &self,
+        txn: &Transaction<'_>,
+        to_col: &str,
+    ) -> Result<Option<&str>, ApplyError> {
         let key_pg_type = match self.key_pg_type.get() {
             Some(ty) => ty,
             None => {
@@ -1716,6 +1761,13 @@ impl ToSide {
                 self.key_pg_type.get_or_init(|| ty)
             }
         };
+        Ok(key_pg_type.as_deref())
+    }
+
+    /// The `where` condition matching the to-side row whose `to_col` is
+    /// `$1` (text), aliased `t`.
+    async fn key_filter(&self, txn: &Transaction<'_>, to_col: &str) -> Result<String, ApplyError> {
+        let key_pg_type = self.key_pg_type(txn, to_col).await?;
         let key_ident = quote_ident(to_col);
         Ok(match key_pg_type {
             Some(ty) => format!("t.{key_ident} = $1::text::{ty}"),
@@ -3205,13 +3257,11 @@ pub(crate) async fn release_to_one_projections(
             .into_iter()
             .map(|row| row.get(0))
             .collect();
-        txn.execute(
-            &format!(
-                "select 1 from {proj} where {key_ident}::text = any($1) \
-                 order by {key_ident} for update",
-                proj = shape.qualified_projection,
-            ),
-            &[&keys],
+        let key_pg_type = shape.to_side.key_pg_type(txn, &shape.to_col).await?;
+        lock_projection_rows(
+            txn,
+            &projection_lock_statement(&shape.qualified_projection, &shape.to_col, key_pg_type),
+            &keys,
         )
         .await?;
         for k in keys {
@@ -3306,48 +3356,70 @@ async fn fetch_to_side_rows(
 /// ([`eval::eval_expr`]'s `Row::get`), and a `Row` carrying extra unread keys
 /// is exactly what every other decode in this module already produces.
 ///
-/// Issue #125: the filter compares `key_col` at its own native type via
-/// [`key_column_pg_type`], not an untyped `::text` cast, so a btree index on
-/// the projection's key column (always present — it's the table's own
-/// `primary key`) stays usable. The type is looked up on `to_table` (the
-/// relationship's live to-side table) rather than the projection itself:
+/// Issue #125: the filter compares `key_col` at its own native type,
+/// `key_pg_type` ([`key_column_pg_type`]), not an untyped `::text` cast, so
+/// the projection's key index (always present — it's the table's own
+/// `primary key`) stays usable. The caller looks the type up on the
+/// relationship's live to-side table rather than the projection itself:
 /// `catalog::ensure_relationship_projection_in_txn` creates the projection's
-/// key column with exactly `to_table`'s `to_col` type, so the two always
-/// agree. `to_table` is the to-side's unquoted, qualified identity (issues
-/// #372, #561).
+/// key column with exactly the to-side's `to_col` type, so the two always
+/// agree.
 async fn projection_rows_sql(
     pool: &Pool,
     projection: &catalog::RelationshipProjection,
-    to_table: &str,
     key_col: &str,
+    key_pg_type: Option<&str>,
 ) -> Result<String, ApplyError> {
     let client = pool.get().await?;
-    let key_ident = quote_ident(key_col);
-    let pg_type = key_column_pg_type(pool, to_table, key_col).await?;
-    let filter = key_array_filter(&format!("p.{key_ident}"), pg_type.as_deref());
     // Issue #248: an explicit per-column `jsonb_build_object`, not
     // `to_jsonb(p.*)` — see `row_as_text_jsonb_sql`'s doc comment.
     let row_columns = live_row_columns(&**client, &projection.identity()).await?;
-    let qualified_projection = projection.qualified_table();
-    let doc_expr = row_as_text_jsonb_sql("p", &row_columns);
-    Ok(format!(
+    Ok(projection_rows_statement(
+        &projection.qualified_table(),
+        key_col,
+        key_pg_type,
+        &row_columns,
+    ))
+}
+
+/// [`projection_rows_sql`]'s statement on the projection
+/// `qualified_projection` (quoted, qualified), whose columns are
+/// `row_columns`.
+fn projection_rows_statement(
+    qualified_projection: &str,
+    key_col: &str,
+    key_pg_type: Option<&str>,
+    row_columns: &[String],
+) -> String {
+    let key_ident = quote_ident(key_col);
+    let filter = key_array_filter(&format!("p.{key_ident}"), key_pg_type);
+    let doc_expr = row_as_text_jsonb_sql("p", row_columns);
+    format!(
         "select p.{key_ident}::text as jk, e.key, e.value \
          from {qualified_projection} p \
          cross join lateral jsonb_each_text({doc_expr}) e \
          where {filter}"
-    ))
+    )
 }
 
-/// Runs [`projection_rows_sql`]'s statement for `join_keys` on `client`.
+/// Runs [`projection_rows_sql`]'s statement for `join_keys` on `client`, or,
+/// with `by_entry_key`, on that transaction under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan): a build
+/// chunk's read under its entry lock ([`RelationshipReads::fetch_under_lock`],
+/// issue #835).
 async fn fetch_relationship_projection_rows(
     client: &impl GenericClient,
+    by_entry_key: Option<&Transaction<'_>>,
     sql: &str,
     join_keys: &[String],
 ) -> Result<HashMap<String, Row>, ApplyError> {
     if join_keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let db_rows = client.query(sql, &[&join_keys]).await?;
+    let db_rows = match by_entry_key {
+        Some(txn) => super::ledger::query_by_entry_key(txn, sql, &[&join_keys]).await?,
+        None => client.query(sql, &[&join_keys]).await?,
+    };
     let mut rows: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
         let jk: String = db_row.get(0);
@@ -3356,6 +3428,64 @@ async fn fetch_relationship_projection_rows(
         rows.entry(jk).or_default().insert(field, value);
     }
     Ok(rows)
+}
+
+/// The statement that bumps the generation of the rows of the projection
+/// `qualified_projection` (quoted, qualified) whose key `key_col` is any of
+/// `$1` (`text[]`), compared at the key's own type `key_pg_type`
+/// ([`key_array_filter`]) so the projection's primary key index serves it
+/// (issue #835). [`bump_generations`] runs it.
+fn generation_bump_statement(
+    qualified_projection: &str,
+    key_col: &str,
+    key_pg_type: Option<&str>,
+) -> String {
+    let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+    let filter = key_array_filter(&quote_ident(key_col), key_pg_type);
+    format!("update {qualified_projection} set {gen_ident} = {gen_ident} + 1 where {filter}")
+}
+
+/// Bumps the generation of `bump`'s touched keys' projection rows, under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue #835), as
+/// the page's other statements keyed by entry run. The keys are bound in
+/// sorted order (see the Phase 3 gen-bump step).
+async fn bump_generations(
+    txn: &Transaction<'_>,
+    bump: &RelationshipGenBump,
+) -> Result<(), ApplyError> {
+    let mut keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
+    keys.sort_unstable();
+    super::ledger::query_by_entry_key(txn, &bump.sql, &[&keys]).await?;
+    Ok(())
+}
+
+/// The statement that locks the rows of the projection
+/// `qualified_projection` (quoted, qualified) whose key `key_col` is any of
+/// `$1` (`text[]`), `for update` in key order, compared at the key's own type
+/// `key_pg_type` ([`key_array_filter`]) so the projection's primary key index
+/// serves it (issue #835). One row per locked row.
+/// [`lock_projection_rows`] runs it.
+fn projection_lock_statement(
+    qualified_projection: &str,
+    key_col: &str,
+    key_pg_type: Option<&str>,
+) -> String {
+    let key_ident = quote_ident(key_col);
+    let filter = key_array_filter(&key_ident, key_pg_type);
+    format!("select 1 from {qualified_projection} where {filter} order by {key_ident} for update")
+}
+
+/// Runs [`projection_lock_statement`]'s statement `sql` for `keys` under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue #835), and
+/// returns how many rows it locked.
+async fn lock_projection_rows(
+    txn: &Transaction<'_>,
+    sql: &str,
+    keys: &[String],
+) -> Result<usize, ApplyError> {
+    Ok(super::ledger::query_by_entry_key(txn, sql, &[&keys])
+        .await?
+        .len())
 }
 
 /// The [`ValueType`] of each named column on `table`, introspected live from
@@ -4922,6 +5052,266 @@ mod tests {
         assert!(overtaken_by_refresh(Some(stamp), Some(stamp)));
         assert!(overtaken_by_refresh(Some(PgLsn::from(0x1000)), Some(stamp)));
         assert!(overtaken_by_refresh(None, Some(stamp)));
+    }
+
+    /// Issue #835's tests' relationship projection: `public.stale_projection`,
+    /// keyed by an `integer` primary key, analyzed at 100 rows and grown to
+    /// 400k with autovacuum off, so its statistics lag its size. Returns the
+    /// connection, the projection (quoted, qualified), its key's type as
+    /// [`key_column_pg_type`] reads it, and 5,000 of its keys, in key order.
+    async fn stale_projection(
+        db: &testkit::TestDatabase,
+    ) -> (tokio_postgres::Client, String, Option<String>, Vec<String>) {
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table stale_projection ( \
+                     id int primary key, name text, \
+                     __trellis_gen bigint not null default 0, __trellis_lsn pg_lsn) \
+                     with (autovacuum_enabled = false); \
+                 insert into stale_projection (id, name) \
+                     select i, 'n' || i from generate_series(1, 100) i; \
+                 analyze stale_projection; \
+                 insert into stale_projection (id, name) \
+                     select i, 'n' || i from generate_series(101, 400000) i;",
+            )
+            .await
+            .expect("seed the projection");
+        let key_pg_type = key_column_pg_type_in(&client, "public.stale_projection", "id")
+            .await
+            .expect("key type");
+        assert_eq!(key_pg_type.as_deref(), Some("integer"));
+        let keys: Vec<String> = client
+            .query(
+                "select id::text from stale_projection where id % 79 = 0 \
+                 order by stale_projection.id limit 5000",
+                &[],
+            )
+            .await
+            .expect("keys")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(keys.len(), 5000);
+        (
+            client,
+            "\"public\".\"stale_projection\"".to_string(),
+            key_pg_type,
+            keys,
+        )
+    }
+
+    /// `sql`'s plan for `keys`, explained under the entry plan settings.
+    async fn plan_by_entry_key(txn: &Transaction<'_>, sql: &str, keys: &[&str]) -> String {
+        crate::staging::ledger::query_by_entry_key(txn, &format!("explain {sql}"), &[&keys])
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The sequential scans `txn` has started on `public.stale_projection`.
+    async fn projection_seq_scans(txn: &Transaction<'_>) -> i64 {
+        txn.query_one(
+            "select seq_scan from pg_stat_xact_user_tables \
+             where relid = 'public.stale_projection'::regclass",
+            &[],
+        )
+        .await
+        .expect("scans")
+        .get(0)
+    }
+
+    /// Asserts that `plan` reads the projection only through its primary key
+    /// index, by the keys: no sequential scan, and no filter, which a scan
+    /// of the whole index (the order the release's lock asks for) applies
+    /// when the key column is cast.
+    fn assert_probes_the_key(plan: &str, what: &str) {
+        assert!(
+            !plan.contains("Seq Scan") && !plan.contains("Filter:"),
+            "{what} must probe the projection's key index, got:\n{plan}"
+        );
+    }
+
+    /// Issue #835: the to-one generation bump ([`bump_generations`]) reads
+    /// the projection by its primary key while the projection's statistics
+    /// lag its size. It cast the key column to `text`, which no index serves,
+    /// so it read all 400k rows to bump 5,000; and PostgreSQL 16 still scans
+    /// for thousands of `= any` values compared at the key's type unless the
+    /// statement runs under the entry plan settings.
+    ///
+    /// It must still bump each key's row by exactly one, and no other, and
+    /// put the settings back.
+    #[tokio::test]
+    async fn the_generation_bump_never_scans_a_stale_projection() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
+        let bump = RelationshipGenBump {
+            sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
+            touched_keys: keys.iter().cloned().collect(),
+        };
+        let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let txn = client.transaction().await.expect("begin");
+        let plan = plan_by_entry_key(&txn, &bump.sql, &bound).await;
+        assert_probes_the_key(&plan, "the generation bump");
+        let before = projection_seq_scans(&txn).await;
+        bump_generations(&txn, &bump).await.expect("bump");
+        assert_eq!(
+            projection_seq_scans(&txn).await,
+            before,
+            "the bump must not scan the projection, as its plan above doesn't"
+        );
+        let setting: String = txn
+            .query_one("select current_setting('enable_seqscan')", &[])
+            .await
+            .expect("setting")
+            .get(0);
+        assert_eq!(setting, "on", "the settings are put back afterwards");
+        let bumped: Vec<String> = txn
+            .query(
+                "select id::text from stale_projection where __trellis_gen = 1 \
+                 order by stale_projection.id",
+                &[],
+            )
+            .await
+            .expect("bumped")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let others: i64 = txn
+            .query_one(
+                "select count(*) from stale_projection where __trellis_gen not in (0, 1)",
+                &[],
+            )
+            .await
+            .expect("others")
+            .get(0);
+        txn.rollback().await.expect("rollback");
+        assert_eq!(
+            bumped, keys,
+            "every touched key's row is bumped, and no other"
+        );
+        assert_eq!(others, 0, "each row is bumped at most once");
+    }
+
+    /// Issue #835: the reverse release's projection lock
+    /// ([`lock_projection_rows`]) reads the projection by its primary key
+    /// while the projection's statistics lag its size. It cast the key column
+    /// to `text`, so it walked the whole key index in key order and filtered
+    /// every row.
+    ///
+    /// It must still lock every key's row, and no other.
+    #[tokio::test]
+    async fn the_release_lock_never_scans_a_stale_projection() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
+        let sql = projection_lock_statement(&projection, "id", key_pg_type.as_deref());
+        let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let txn = client.transaction().await.expect("begin");
+        let plan = plan_by_entry_key(&txn, &sql, &bound).await;
+        assert_probes_the_key(&plan, "the release lock");
+        assert!(
+            plan.contains("LockRows"),
+            "the statement locks the rows, got:\n{plan}"
+        );
+        let before = projection_seq_scans(&txn).await;
+        let locked = lock_projection_rows(&txn, &sql, &keys).await.expect("lock");
+        assert_eq!(
+            projection_seq_scans(&txn).await,
+            before,
+            "the lock must not scan the projection, as its plan above doesn't"
+        );
+        assert_eq!(locked, keys.len(), "one row per locked row");
+        let (other, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let free: Vec<String> = other
+            .query(
+                "select id::text from stale_projection where id % 79 = 0 or id = 1 \
+                 order by stale_projection.id for update skip locked",
+                &[],
+            )
+            .await
+            .expect("free rows")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        txn.rollback().await.expect("rollback");
+        let last: i32 = keys.last().expect("keys").parse().expect("key");
+        let expected: Vec<String> = std::iter::once(1)
+            .chain((1..=400000 / 79).map(|i| i * 79).filter(|id| *id > last))
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(free, expected, "every key's row is locked, and no other");
+    }
+
+    /// Issue #835: a build chunk reads a to-one relationship's projection
+    /// under its entry lock ([`RelationshipReads::fetch_under_lock`], issue
+    /// #832), so a sequential scan of a projection whose statistics lag its
+    /// size lengthens the lock hold. PostgreSQL 16 scanned it for thousands
+    /// of `= any` keys; the read runs under the entry plan settings.
+    ///
+    /// It must still read every reached row's columns, keyed by join key.
+    #[tokio::test]
+    async fn the_projection_read_under_the_entry_lock_never_scans_a_stale_projection() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
+        let row_columns = live_row_columns(&client, "public.stale_projection")
+            .await
+            .expect("columns");
+        let sql =
+            projection_rows_statement(&projection, "id", key_pg_type.as_deref(), &row_columns);
+        let reads = RelationshipReads {
+            reads: vec![RelationshipRead {
+                id: 1,
+                name: "parent".to_string(),
+                from_col: "parent_id".to_string(),
+                to_columns: HashMap::new(),
+                kind: ReadKind::ToOne(Some(ProjectionRead {
+                    sql: sql.clone(),
+                    bump_sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
+                })),
+            }],
+        };
+        let from_rows: Vec<Row> = keys
+            .iter()
+            .map(|key| Row::from([("parent_id".to_string(), Some(key.clone()))]))
+            .collect();
+        let from_rows: Vec<&Row> = from_rows.iter().collect();
+        let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let txn = client.transaction().await.expect("begin");
+        let plan = plan_by_entry_key(&txn, &sql, &bound).await;
+        assert_probes_the_key(&plan, "the projection read");
+        let before = projection_seq_scans(&txn).await;
+        let ctx = reads
+            .fetch_under_lock(&txn, &from_rows)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            projection_seq_scans(&txn).await,
+            before,
+            "the read must not scan the projection, as its plan above doesn't"
+        );
+        txn.rollback().await.expect("rollback");
+        let read = ctx.to_one_rows("parent").expect("the relationship is read");
+        assert_eq!(read.len(), keys.len(), "every reached row is read");
+        for key in &keys {
+            let row = read.get(key).expect("the key's row");
+            assert_eq!(row.get("name"), Some(&Some(format!("n{key}"))));
+        }
     }
 
     /// Issue #531: a to-side truncate's projection clear is skipped only
@@ -7561,7 +7951,13 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// for thousands of `= any` values far above 17's estimate: it scanned a
 /// 400k-row table analyzed at 100 and filtered it by the bound, where 17
 /// read the index. So each statement that takes the bound also runs under
-/// those settings.
+/// those settings. So do the statements that read a to-one relationship's
+/// projection by a batch of its primary key's values, which compare the one
+/// key column by `= any` and need no bound: the generation bump
+/// ([`bump_generations`]), the reverse release's lock
+/// ([`lock_projection_rows`]) and a build chunk's read under its entry lock
+/// ([`RelationshipReads::fetch_under_lock`]). PostgreSQL 16 read a 400k-row
+/// projection analyzed at 100 in full for 5,000 of them.
 pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
     key.len() == 1
 }
@@ -8031,7 +8427,7 @@ async fn settle_one_to_one_target(
     let relationships = match &plan.rederive.relationships {
         RederiveRelationships::UnderLock(reads) => {
             let rows: Vec<&Row> = read.values().collect();
-            under_lock = reads.fetch(txn, &rows).await?;
+            under_lock = reads.fetch_under_lock(txn, &rows).await?;
             Some(&under_lock)
         }
         other => other.phase2(),
@@ -8917,20 +9313,18 @@ pub(crate) async fn apply_page(
     // this," not a count of how many things did. A key with no projection
     // row yet (see `ensure_relationship_projection_in_txn`'s own doc comment
     // on the widen-only catch-up gap #131 closes) simply bumps nothing — no
-    // error, same as any `UPDATE ... WHERE` matching zero rows. Plain
-    // `key_col::text = any($1::text[])`, not the native-typed cast
-    // `from_side_keys`'s own doc comment flags as unindexed
-    // (P0.1/plan doc §6) — out of scope here, matches this module's other
-    // untyped relationship lookups. The touched-key array is sorted before
-    // binding (review follow-up to #132) — see the inline comment at that
-    // sort for why.
+    // error, same as any `UPDATE ... WHERE` matching zero rows. The key is
+    // compared at its own type under the entry plan settings, so the
+    // projection's primary key index serves it ([`bump_generations`], issue
+    // #835). The touched-key array is sorted before binding (review
+    // follow-up to #132) — see the comment below for why.
     for bump in plan.relationship_gen_bumps.values() {
         if bump.touched_keys.is_empty() {
             continue;
         }
         // Ascending-key lock order (review follow-up to #132): `touched_keys`
         // is a `HashSet`, whose iteration order is unspecified and can vary
-        // run to run. Without a deterministic sort here, two concurrent
+        // run to run. Without the deterministic sort `bump_generations` takes, two concurrent
         // `apply_and_mark_drained_many` calls whose batches both touch an
         // overlapping set of relationship-projection parent keys (plausible
         // whenever two segments both contain from-side rows re-pointing
@@ -8944,19 +9338,7 @@ pub(crate) async fn apply_page(
         // as its regression pin. Sorting the bound array doesn't change
         // *what* this bare `UPDATE` locks, only lines up every concurrent
         // caller's lock-acquisition order onto the same ascending sequence.
-        let mut keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
-        keys.sort_unstable();
-        let key_ident = quote_ident(&bump.key_col);
-        let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-        txn.execute(
-            &format!(
-                "update {} set {gen_ident} = {gen_ident} + 1 \
-                 where {key_ident}::text = any($1::text[])",
-                bump.qualified_projection,
-            ),
-            &[&keys],
-        )
-        .await?;
+        bump_generations(txn, bump).await?;
     }
 
     // 3d. Issue #131, epic #127: to-one relationship reverse apply — see
