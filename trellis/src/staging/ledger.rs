@@ -1235,6 +1235,8 @@ fn fresh_entries_statement(plan: &LedgerTargetPlan) -> String {
 /// at all, so deleting it changes no later change's outcome. Its keys come
 /// from `v`, so with no floor, or no change at or below it, it reads no
 /// entry.
+/// A build chunk's entry always has a `basis`, so `gone` never deletes one
+/// ([`chunk_insert_statement`] relies on that).
 ///
 /// The fresh entries are kept out of the ledger reads, not filtered out of
 /// them (#775): a page's every key may be fresh, and a read of the ledger
@@ -1478,11 +1480,18 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
 /// is in its `basis`, and is skipped (I2).
 ///
 /// That needs every entry an Apply wrote since T to still be there at the
-/// check. Only the tombstone GC removes entries, and it skips the ledger of
-/// a definition under a build (`super::retire::collect_tombstones`).
-/// Otherwise a delete committed after T could be applied as a tombstone and
-/// collected before the check, and the insert would write the key live from
-/// T, with nothing left to retract it.
+/// check. Only the tombstone GC removes an entry an Apply wrote, and it
+/// skips the ledger of a definition under a build
+/// (`super::retire::collect_tombstones`). Otherwise a delete committed after
+/// T could be applied as a tombstone and collected before the check, and the
+/// insert would write the key live from T, with nothing left to retract it.
+/// A page deletes only the placeholders it wrote no change to
+/// ([`ledger_statement`]'s `gone`): a deleted placeholder holds no applied
+/// change, so its key is as if no Apply had written it, and `gone` never
+/// matches an entry with a `basis`, so never one a chunk wrote. A source
+/// truncate's emptying of the ledger removes no change T doesn't see: the
+/// chunk's first read holds the source's lock, so the truncate committed
+/// before T.
 ///
 /// `pause` is a test's pause lock (`super::interleave`'s
 /// `AfterChunkSnapshot`), taken after the snapshot and before the first

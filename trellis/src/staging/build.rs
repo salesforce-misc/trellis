@@ -90,8 +90,10 @@
 //! nothing anywhere. The insert writes it from a snapshot taken before its
 //! uniqueness check, which is right because no Apply can have written the
 //! key since: an entry it wrote would be there for the check to find, and
-//! the tombstone GC, the only thing that removes entries, skips a ledger
-//! under a build (`super::retire::collect_tombstones`, #723). An Apply that
+//! the tombstone GC, the only thing that removes an entry an Apply wrote,
+//! skips a ledger under a build (`super::retire::collect_tombstones`, #723).
+//! A page deletes only the placeholders it wrote no change to, which hold no
+//! applied change (`super::ledger::chunk_insert_statement`). An Apply that
 //! wrote the key first counts it from nothing, and the chunk then locks it
 //! and moves it by the difference. That needs the change's image to be the
 //! key's latest state the definition hasn't seen, which only a change

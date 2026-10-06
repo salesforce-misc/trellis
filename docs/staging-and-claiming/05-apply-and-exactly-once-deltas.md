@@ -405,8 +405,12 @@ stamped with the segment), and appends their groups' increments. A key whose
 entry is there by the time its insert runs is left alone. The insert's
 snapshot is taken before its uniqueness check, which is sound because no
 Apply can have written a key since that snapshot without leaving its entry
-for the check to find: the only thing that removes entries, the tombstone
-GC, skips a ledger while its definition is under a build (below). The chunk
+for the check to find: the only thing that removes an entry an Apply wrote,
+the tombstone GC, skips a ledger while its definition is under a build
+(below). A page deletes only a placeholder it wrote no change to, which
+holds no applied change, and a source truncate commits before the chunk's
+first read, which holds the source's lock, so it empties no change the
+snapshot doesn't see. The chunk
 then takes the same entry lock as a page on the keys that already had an
 entry, and one more statement reads their rows afresh, rewrites their
 entries and appends their increments. Both steps run under a 1 s
