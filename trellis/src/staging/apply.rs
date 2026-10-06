@@ -4575,6 +4575,106 @@ mod tests {
         }
     }
 
+    /// Issue #793: a single-column-key target's pre-lock
+    /// ([`lock_single_keys`]) starts no sequential scan of the target while
+    /// its statistics lag its size. PostgreSQL 16 priced the index scan for
+    /// thousands of `= any` keys so high that it read a 400k-row target
+    /// analyzed at 100 in full and filtered it by the keys.
+    ///
+    /// The plan is explained under the settings the pre-lock runs with, and
+    /// the pre-lock itself must start no sequential scan of the target. It
+    /// must still lock every key, in key order.
+    #[tokio::test]
+    async fn the_single_column_pre_lock_never_scans_a_stale_target() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table stale (id int primary key, total int) \
+                     with (autovacuum_enabled = false); \
+                 insert into stale select i, i from generate_series(1, 100) i; \
+                 analyze stale; \
+                 insert into stale select i, i from generate_series(101, 400000) i;",
+            )
+            .await
+            .expect("seed the target");
+        let table = "public.stale";
+        let pk = ddl::identity_key_columns(&client, table)
+            .await
+            .expect("identity");
+        assert_eq!(pk.len(), 1);
+        let pk_ident = quote_ident(&pk[0].name);
+        let pk_cast = pk[0].data_type.as_str();
+        let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
+        let keys: Vec<String> = client
+            .query(
+                "select id::text from stale where total % 79 = 0 order by stale.id limit 5000",
+                &[],
+            )
+            .await
+            .expect("keys")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(keys.len(), 5000);
+        let mut bound: Vec<&str> = keys.iter().map(String::as_str).collect();
+        bound.reverse();
+        let sql = single_lock_statement(table, &pk_ident, pk_cast, &key_sql);
+        let txn = client.transaction().await.expect("begin");
+        let plan: String = crate::staging::ledger::query_by_entry_key(
+            &txn,
+            &format!("explain (analyze, timing off) {sql}"),
+            &[&bound],
+        )
+        .await
+        .expect("explain")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(
+            !plan.contains("Seq Scan"),
+            "the pre-lock must not scan the target, got:\n{plan}"
+        );
+        let seq_scans = "select seq_scan from pg_stat_xact_user_tables \
+                         where relid = $1::text::regclass";
+        let before: i64 = txn
+            .query_one(seq_scans, &[&table])
+            .await
+            .expect("scans")
+            .get(0);
+        let locked: Vec<String> =
+            lock_single_keys(&txn, table, &pk_ident, pk_cast, &key_sql, &bound)
+                .await
+                .expect("lock")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+        let after: i64 = txn
+            .query_one(seq_scans, &[&table])
+            .await
+            .expect("scans")
+            .get(0);
+        assert_eq!(
+            after, before,
+            "the pre-lock must not scan the target, as its plan above doesn't"
+        );
+        let setting: String = txn
+            .query_one("select current_setting('enable_seqscan')", &[])
+            .await
+            .expect("setting")
+            .get(0);
+        assert_eq!(setting, "on", "the settings are put back afterwards");
+        txn.rollback().await.expect("rollback");
+        assert_eq!(locked, keys, "every key is locked, in key order");
+    }
+
     /// Issue #531: only a record at or below its relationship's refresh
     /// stamp takes the live-row check. A relationship never refreshed, or a
     /// record above the stamp (every change after the refresh), reads
@@ -7218,7 +7318,8 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// 27 ms bounded, two columns at 1M rows), unless the statement also runs
 /// under `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), as the
 /// source read, the endpoint feed's re-read, the sweep delete and the
-/// composite pre-lock ([`lock_composite_keys`]) do.
+/// single-column and composite pre-locks ([`lock_single_keys`],
+/// [`lock_composite_keys`]) do.
 ///
 /// The bound alone isn't enough on PostgreSQL 16, which prices an index scan
 /// for thousands of `= any` values far above 17's estimate: it scanned a
@@ -7227,6 +7328,47 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// those settings.
 pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
     key.len() == 1
+}
+
+/// [`apply_target`]'s pre-lock for a single-column key: the target rows of
+/// the bound `text[]` keys at `$1` (cast to the key's type, so the column
+/// itself stays uncast and its index usable), `select`ing `columns`, locked
+/// `for update` in key order. `pk_ident` is the quoted key column and
+/// `pk_cast` its type.
+fn single_lock_statement(
+    target_ident: &str,
+    pk_ident: &str,
+    pk_cast: &str,
+    columns: &str,
+) -> String {
+    format!(
+        "select {columns} from {target_ident} as t \
+         where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
+         order by t.{pk_ident} for update"
+    )
+}
+
+/// Runs [`single_lock_statement`] over `keys` under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), and returns
+/// the locked rows in key order. While a target's statistics lag its size,
+/// PostgreSQL 16 prices an index scan for thousands of `= any` values so
+/// high that it read a 400k-row target in full and filtered it by the keys
+/// (#793); with the settings it probes the key's index. With fresh
+/// statistics the planner already probes the index, and the settings leave
+/// that plan alone.
+async fn lock_single_keys(
+    txn: &Transaction<'_>,
+    target_ident: &str,
+    pk_ident: &str,
+    pk_cast: &str,
+    columns: &str,
+    keys: &[&str],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    txn.query(
+        &single_lock_statement(target_ident, pk_ident, pk_cast, columns),
+        &[&keys],
+    )
+    .await
 }
 
 /// [`apply_target`]'s pre-lock for a composite key (issue #121): the target
@@ -7835,13 +7977,13 @@ async fn apply_target(
         let pk_ident = &pk_idents[0];
         let pk_cast = plan.pk[0].data_type.as_str();
         let lock_keys: Vec<&str> = lock_key_parts.iter().map(|p| p[0].as_str()).collect();
-        txn.query(
-            &format!(
-                "select {lock_key_expr}{prior_select} from {target_ident} as t \
-                 where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
-                 order by t.{pk_ident} for update"
-            ),
-            &[&lock_keys],
+        lock_single_keys(
+            txn,
+            &target_ident,
+            pk_ident,
+            pk_cast,
+            &format!("{lock_key_expr}{prior_select}"),
+            &lock_keys,
         )
         .await?
     } else {
