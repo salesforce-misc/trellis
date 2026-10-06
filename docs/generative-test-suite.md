@@ -270,7 +270,7 @@ The concurrent runtime's planted-bug sweep (`planted_bugs_are_caught` in
 `generative/tests/concurrent_convergence.rs`) runs a tier's seeded cases once
 unplanted, as the baseline, then once per planted bug, and judges each plant
 only on cases the baseline passed. **No unknown failure is accepted in a
-generative case** (#786): the baseline passes only with **zero failures outside
+generative case**: the baseline passes only with **zero failures outside
 the quarantine list**, `generative/baseline-quarantine.txt`. The rule is the same
 for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`).
 
@@ -297,11 +297,9 @@ for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`).
   names a different program. The list isn't a regression pin (those are
   hand-built, above), so re-sweep the tier and redo its entries.
 
-The bar replaced a per-tier failure share (one case in 8 for `cooling_key`, one
-in 20 for the others). That share was there to catch a sweep run on the wrong
-storage, but it also let a real bug, #784, fail about one case in 8 through
-routine sweeps. A strict zero with no list was rejected too: a known, filed
-failure would then block every unrelated change's sweep.
+The bar is a zero with a list, not a failure share: a share lets a real bug fail
+a fixed fraction of cases through routine sweeps, while a strict zero with no
+list would let a known, filed failure block every unrelated change's sweep.
 
 To run the baseline alone, against the bar:
 
