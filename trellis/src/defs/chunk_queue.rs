@@ -2189,6 +2189,107 @@ mod tests {
         );
     }
 
+    /// Issue #766: a build worker logged in as a role the source's row-level
+    /// security applies to is refused the read (every Trellis session runs
+    /// with `row_security = off`), rather than building from the rows the
+    /// policies allow. The refusal is no row's fault, so the chunk is never
+    /// narrowed and no key is quarantined: it is retried and charged, and
+    /// its [`MAX_CHARGED_ATTEMPTS`]th charge pauses the definition, with
+    /// Postgres's error left on the chunk for `status`'s `backfill_failure`.
+    #[tokio::test]
+    async fn a_chunk_refused_for_row_security_pauses_its_definition_without_narrowing() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "policed", "policed_doubles", 10).await;
+        // Planned while nothing is refused: a discharge planning as the
+        // refused role is refused too, and retries on its marker instead.
+        assert_eq!(
+            dispatch(&pool, id, &def, "public.policed").await,
+            Some(TransformStatus::Backfilling)
+        );
+        // A member of the owning role inherits its ownership but not its
+        // superuser status, so the forced policies apply to it.
+        raw.batch_execute(
+            "create role build_worker login in role postgres; \
+             alter table public.policed enable row level security, force row level security; \
+             create policy hide_odd on public.policed using (id % 2 = 0);",
+        )
+        .await
+        .expect("a login role the source's policies apply to");
+        let config =
+            crate::config::Config::from_dsn(db.dsn().replace("user=postgres", "user=build_worker"))
+                .expect("valid dsn");
+        let worker = Pool::new(&config).expect("the build worker's pool");
+
+        let mut outcomes = Vec::new();
+        for _ in 0..MAX_CHARGED_ATTEMPTS + 2 {
+            raw.execute(
+                "update backfill_chunks set next_attempt_at = now() where definition_id = $1",
+                &[&id],
+            )
+            .await
+            .expect("run the backoff out");
+            let Some(chunk) = claim_chunks(&raw, WORKER, 1).await.expect("claim").pop() else {
+                break;
+            };
+            let err = run_claimed_chunk(
+                &worker,
+                &chunk,
+                WORKER,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("the build's read is refused");
+            assert!(
+                err.to_string()
+                    .contains("query would be affected by row-level security policy"),
+                "{err}"
+            );
+            outcomes.push(
+                fail_chunk(&worker, &chunk, WORKER, &err)
+                    .await
+                    .expect("fail the chunk"),
+            );
+        }
+
+        let charged = usize::try_from(MAX_CHARGED_ATTEMPTS).expect("small") - 1;
+        assert_eq!(outcomes.len(), charged + 1, "{outcomes:?}");
+        assert!(
+            outcomes[..charged]
+                .iter()
+                .all(|o| matches!(o, ChunkFailure::Retrying { charged: true, .. })),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes.last(), Some(&ChunkFailure::Paused), "{outcomes:?}");
+        assert_eq!(status_of(&raw, id).await, "paused");
+        let poisoned: i64 = raw
+            .query_one("select count(*) from poison", &[])
+            .await
+            .expect("count poison")
+            .get(0);
+        assert_eq!(poisoned, 0, "no key was quarantined");
+        let last_error: Option<String> = raw
+            .query_one(
+                "select last_error from backfill_chunks where definition_id = $1",
+                &[&id],
+            )
+            .await
+            .expect("the chunk stays as the record")
+            .get(0);
+        assert!(
+            last_error.is_some_and(|e| e.contains("row-level security")),
+            "the chunk records Postgres's refusal"
+        );
+        let built: i64 = raw
+            .query_one("select count(*) from public.policed_doubles", &[])
+            .await
+            .expect("read the target")
+            .get(0);
+        assert_eq!(built, 0, "nothing was built from the visible rows");
+    }
+
     /// A source keyed by a nullable `UNIQUE NULLS NOT DISTINCT` index (an
     /// aggregate target's grouping columns, issue #128) can hold a row with a
     /// `NULL` key part that a range's row comparison still admits, because an

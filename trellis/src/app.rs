@@ -203,7 +203,10 @@ impl Trellis {
 
     /// The connection pool backing this instance. Exposed for callers that
     /// need to run their own queries against target tables; not needed for
-    /// anything [`Trellis`]'s own methods already cover.
+    /// anything [`Trellis`]'s own methods already cover. Its connections run
+    /// with `row_security = off` (issue #766), so a query that row-level
+    /// security would filter for the login role fails instead: read through
+    /// your own connection where you rely on policies to filter.
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
