@@ -4036,7 +4036,7 @@ mod strategy {
     /// relationships allowed, #786's sweep (8 seeds of 12 cases, 4 runs)
     /// failed once in 384 case runs: seed 8 case 4, a relationship-fed
     /// `GROUP BY` definition paused and resumed mid-burst, ends with a row
-    /// counted twice (about 1 run in 15 of that case). Drawn apart from
+    /// counted twice (11 of 84 runs of that case in all). Drawn apart from
     /// [`mid_burst_case`] so that tier's cases, seed for seed, stay what they
     /// were.
     pub fn steady_load_case() -> impl Strategy<Value = ConcurrentCase> {

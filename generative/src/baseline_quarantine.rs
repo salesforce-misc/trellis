@@ -191,28 +191,65 @@ pub enum IssueState {
     Closed,
 }
 
+/// How many times [`github_issue_state`] tries a lookup that gets no answer,
+/// and how long it waits between tries.
+const LOOKUP_ATTEMPTS: u32 = 3;
+const LOOKUP_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Looks `issue` up in [`ISSUE_REPO`] with the GitHub CLI (`gh api`), which
 /// reads its token from `GH_TOKEN` or its own login.
+///
+/// A lookup that gets no answer (no network, a server error) is tried again
+/// a couple of times, so one blip doesn't stop a sweep; one that still gets
+/// none is an error, so a sweep that can't confirm its list doesn't run. A
+/// refusal (an HTTP 4xx, such as not found or bad credentials) is an error at
+/// once, and so is a number that names a pull request: an entry names the
+/// issue that pins its failure.
 pub fn github_issue_state(issue: u64) -> Result<IssueState, String> {
+    let mut attempt = 1;
+    loop {
+        match github_issue_state_once(issue) {
+            Ok(answer) => return answer,
+            Err(e) if attempt < LOOKUP_ATTEMPTS => {
+                eprintln!("baseline quarantine: {e}; trying again");
+                std::thread::sleep(LOOKUP_RETRY_WAIT);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// One lookup: `Err` when it got no answer and is worth trying again, else
+/// the answer.
+fn github_issue_state_once(issue: u64) -> Result<Result<IssueState, String>, String> {
     let output = std::process::Command::new("gh")
         .args([
             "api",
             &format!("repos/{ISSUE_REPO}/issues/{issue}"),
             "--jq",
-            ".state",
+            r#"if .pull_request then "pull request" else .state end"#,
         ])
         .output()
         .map_err(|e| format!("couldn't run `gh` to look up #{issue}: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    match (output.status.success(), stdout.trim()) {
-        (true, "open") => Ok(IssueState::Open),
-        (true, "closed") => Ok(IssueState::Closed),
-        _ => Err(format!(
-            "`gh api` couldn't look up #{issue} in {ISSUE_REPO} ({}): {}{}",
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let failed = || {
+        format!(
+            "`gh api` couldn't look up #{issue} in {ISSUE_REPO} ({}): {} {}",
             output.status,
             stdout.trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
+            stderr.trim()
+        )
+    };
+    match (output.status.success(), stdout.trim()) {
+        (true, "open") => Ok(Ok(IssueState::Open)),
+        (true, "closed") => Ok(Ok(IssueState::Closed)),
+        (true, "pull request") => Ok(Err(format!(
+            "#{issue} in {ISSUE_REPO} is a pull request, not the issue that pins a failure"
+        ))),
+        (false, _) if stderr.contains("(HTTP 4") => Ok(Err(failed())),
+        _ => Err(failed()),
     }
 }
 

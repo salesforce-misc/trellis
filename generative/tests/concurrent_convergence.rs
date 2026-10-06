@@ -1405,14 +1405,16 @@ const PLANT_SEEDS_ENV: &str = "GENERATIVE_PLANT_SEEDS";
 /// How many cases a sweep draws from each seed (default [`PLANT_CASES`]).
 const PLANT_CASES_ENV: &str = "GENERATIVE_PLANT_CASES";
 /// Which tier's cases a sweep draws: `cooling_key` (the default),
-/// `hot_key` or `mid_burst`.
+/// `hot_key`, `mid_burst` or `steady_load`.
 const PLANT_TIER_ENV: &str = "GENERATIVE_PLANT_TIER";
 /// Runs one case only, as `<seed>:<case>` (1-based), to look at a failure
 /// the sweep reported. Each failing case's report heads are printed to
 /// stderr.
 const PLANT_ONLY_ENV: &str = "GENERATIVE_PLANT_ONLY";
 /// Set by the sweep on each process it spawns: run the cases and print one
-/// [`SWEEP_LINE`] per case, rather than spawn more processes.
+/// [`SWEEP_LINE`] per case, rather than spawn more processes. Such a process
+/// exits 0 whatever its cases do: only the parent judges them, against the
+/// baseline bar, so a repro loop that runs it directly reads its rows.
 const PLANT_CHILD_ENV: &str = "GENERATIVE_PLANT_CHILD";
 /// Prefixes each case's result on a sweep process's stdout.
 const SWEEP_LINE: &str = "plant-sweep\t";

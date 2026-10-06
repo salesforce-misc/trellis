@@ -276,7 +276,9 @@ for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
   The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
-  it, and the issue is an **open** issue that pins that case's failure.
+  it, and the issue is an **open** issue that pins that case's failure. An
+  entry covers the whole case: while it's listed, any failure in that case is
+  left out, not only the one its issue pins.
 - **A failure that isn't listed fails the baseline.** Triage it before the
   baseline counts: either file it as a bug with its pinned case (check first
   whether it also fails without your change, and whether an issue already
@@ -286,9 +288,11 @@ for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`).
 - **The list can't go stale.** The sweep looks up every listed issue before it
   runs anything, and fails if one is closed: the fix has landed, so the entry
   goes (or the issue was closed early and the case still fails, so it reopens).
-  The lookup goes through `gh api`; a sweep that can't make it doesn't run. After
-  the baseline, the sweep reports a listed case that passed every time it ran.
-  A race can pass now and then, so that is a prompt to look, not a failure.
+  The lookup goes through `gh api` and is tried again after a network blip; a
+  sweep that still can't make it doesn't run, and neither does one whose entry
+  names a pull request or an issue that doesn't exist. After the baseline, the
+  sweep reports a listed case that passed every time it ran. A race can pass
+  now and then, so that is a prompt to look, not a failure.
 - **A tier's strategy change redraws its cases**, so the same `<seed>:<case>`
   names a different program. The list isn't a regression pin (those are
   hand-built, above), so re-sweep the tier and redo its entries.
@@ -308,7 +312,10 @@ GENERATIVE_PLANT_SEEDS=8 cargo test -p generative --test concurrent_convergence 
 ```
 
 `GENERATIVE_PLANTS=all` runs the baseline and then the tier's plant gate. The
-tiers are calibrated for a tmpfs cluster, so run sweeps there.
+tiers are calibrated for a tmpfs cluster, so run sweeps there. A process run
+directly with `GENERATIVE_PLANT_CHILD=1` (as a repro loop does) is one of the
+sweep's workers, not a gate: it prints a `plant-sweep` row per case and exits
+0 even when a case fails, with no list or bar applied, so read its rows.
 
 ## 7. The action space, and how it grows
 
@@ -396,8 +403,9 @@ Two structural notes for when faults enter the stream:
   so a checked-in seed goes stale on the next generator change (#505). A failure
   worth keeping becomes a hand-built pin. (The baseline quarantine list in §6
   does name cases by seed, but only to exclude known, filed failures from a
-  sweep's baseline, and its staleness checks catch an entry that no longer
-  fails.)
+  sweep's baseline. The sweep fails on an entry whose issue is closed and
+  reports one whose case passed, but it can't tell that a generator change
+  has redrawn a listed case, so that change redoes the tier's entries.)
 - **Planted-bug sweeps and their baseline.** The concurrent sweep
   (`planted_bugs_are_caught` in `generative/tests/concurrent_convergence.rs`)
   re-runs generated cases with a deliberate bug planted and checks the tier
