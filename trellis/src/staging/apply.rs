@@ -963,6 +963,37 @@ fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
     }
 }
 
+/// [`key_array_filter`] for one key: `col_ident` equal to the bound `$1`
+/// (`text`), cast to `pg_type` so an index on the column serves it (issue
+/// #835), or, when the type is unknown, the column cast to `text`. A `NULL`
+/// `$1` matches no row either way, and a join key's type is one whose text
+/// form is its identity (`catalog::is_text_stable_join_key_type`), so the
+/// two compare the same rows equal.
+fn single_key_filter(col_ident: &str, pg_type: Option<&str>) -> String {
+    match pg_type {
+        Some(ty) => format!("{col_ident} = $1::text::{ty}"),
+        None => format!("{col_ident}::text = $1"),
+    }
+}
+
+/// The type of `table`'s `column` ([`key_column_pg_type_in`]), read into
+/// `cell` the first time and kept.
+async fn cached_key_pg_type<'a>(
+    cell: &'a std::sync::OnceLock<Option<String>>,
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+) -> Result<Option<&'a str>, ApplyError> {
+    let key_pg_type = match cell.get() {
+        Some(ty) => ty,
+        None => {
+            let ty = key_column_pg_type_in(client, table, column).await?;
+            cell.get_or_init(|| ty)
+        }
+    };
+    Ok(key_pg_type.as_deref())
+}
+
 /// The live, `attnum`-ordered column names of `table` — the same
 /// `to_regclass`-bound `pg_attribute` introspection [`to_column_types`]/
 /// [`key_column_pg_type`] already use, but the whole live column list rather
@@ -1291,6 +1322,9 @@ async fn accumulate_from_side_recomputes_on(
 /// cache's refresh-on-miss strategy).
 #[derive(Debug, Clone)]
 pub(crate) struct RelationshipGenBump {
+    /// [`projection_lock_statement`]'s statement for the projection, which
+    /// locks the rows in key order before the bump writes them.
+    lock_sql: String,
     /// [`generation_bump_statement`]'s statement for the projection.
     sql: String,
     touched_keys: std::collections::HashSet<String>,
@@ -1393,6 +1427,7 @@ pub(crate) async fn build_relationship_context(
             gen_bumps
                 .entry(read.id)
                 .or_insert_with(|| RelationshipGenBump {
+                    lock_sql: projection.lock_sql.clone(),
                     sql: projection.bump_sql.clone(),
                     touched_keys: std::collections::HashSet::new(),
                 })
@@ -1445,6 +1480,8 @@ enum ReadKind {
 struct ProjectionRead {
     /// [`projection_rows_statement`]'s statement.
     sql: String,
+    /// [`projection_lock_statement`]'s statement for the projection.
+    lock_sql: String,
     /// [`generation_bump_statement`]'s statement for the projection.
     bump_sql: String,
 }
@@ -1499,6 +1536,11 @@ impl RelationshipReads {
                                     key_pg_type.as_deref(),
                                 )
                                 .await?,
+                                lock_sql: projection_lock_statement(
+                                    &projection.qualified_table(),
+                                    to_col,
+                                    key_pg_type.as_deref(),
+                                ),
                                 bump_sql: generation_bump_statement(
                                     &projection.qualified_table(),
                                     to_col,
@@ -1708,6 +1750,10 @@ pub(crate) struct ReverseRelationshipShape {
     to_col: String,
     from_table: String,
     from_col: String,
+    /// `from_col`'s type ([`key_column_pg_type`]), so the from-side read by
+    /// key ([`from_side_rows_for_trigger_txn`]) can use an index on it.
+    /// Resolved in Phase 3 by the first read that needs it.
+    from_key_pg_type: std::sync::OnceLock<Option<String>>,
     /// The from-table's primary key, possibly composite (issue #126) — see
     /// [`from_side_rows_for_trigger_txn`]'s doc comment for how a
     /// multi-column key's row identity is encoded/decoded. `None` when it
@@ -1722,6 +1768,19 @@ pub(crate) struct ReverseRelationshipShape {
     /// The relationship's to-side, read by key for the live-row check
     /// ([`superseded_to_side`]).
     to_side: ToSide,
+}
+
+impl ReverseRelationshipShape {
+    /// The `where` condition matching the projection row whose key is `$1`
+    /// (text), the projection unaliased ([`ToSide::projection_key_filter`]).
+    async fn projection_key_filter(
+        &self,
+        client: &impl GenericClient,
+    ) -> Result<String, ApplyError> {
+        self.to_side
+            .projection_key_filter(client, &self.to_col, &quote_ident(&self.to_col))
+            .await
+    }
 }
 
 /// A relationship's to-side as Phase 3 reads its live row by key (issues
@@ -1751,28 +1810,34 @@ impl ToSide {
     /// `to_col`'s type, read once and kept.
     async fn key_pg_type(
         &self,
-        txn: &Transaction<'_>,
+        client: &impl GenericClient,
         to_col: &str,
     ) -> Result<Option<&str>, ApplyError> {
-        let key_pg_type = match self.key_pg_type.get() {
-            Some(ty) => ty,
-            None => {
-                let ty = key_column_pg_type_in(txn, &self.identity, to_col).await?;
-                self.key_pg_type.get_or_init(|| ty)
-            }
-        };
-        Ok(key_pg_type.as_deref())
+        cached_key_pg_type(&self.key_pg_type, client, &self.identity, to_col).await
     }
 
     /// The `where` condition matching the to-side row whose `to_col` is
     /// `$1` (text), aliased `t`.
     async fn key_filter(&self, txn: &Transaction<'_>, to_col: &str) -> Result<String, ApplyError> {
         let key_pg_type = self.key_pg_type(txn, to_col).await?;
-        let key_ident = quote_ident(to_col);
-        Ok(match key_pg_type {
-            Some(ty) => format!("t.{key_ident} = $1::text::{ty}"),
-            None => format!("t.{key_ident}::text = $1"),
-        })
+        Ok(single_key_filter(
+            &format!("t.{}", quote_ident(to_col)),
+            key_pg_type,
+        ))
+    }
+
+    /// The `where` condition matching the projection row whose key is `$1`
+    /// (text), the projection's key column referenced as `col_ref`: compared
+    /// at `to_col`'s type, which the projection's key column has, so the
+    /// projection's primary key index serves it (issue #835).
+    async fn projection_key_filter(
+        &self,
+        client: &impl GenericClient,
+        to_col: &str,
+        col_ref: &str,
+    ) -> Result<String, ApplyError> {
+        let key_pg_type = self.key_pg_type(client, to_col).await?;
+        Ok(single_key_filter(col_ref, key_pg_type))
     }
 }
 
@@ -1974,6 +2039,7 @@ async fn build_reverse_relationship_shape(
         to_col: rel.def.to_col.clone(),
         from_table: qualified_from_table,
         from_col: rel.def.from_col.clone(),
+        from_key_pg_type: std::sync::OnceLock::new(),
         from_pk,
         needs_recompute_fallback,
         to_side,
@@ -2054,20 +2120,20 @@ struct ReverseCapture {
 /// parent insert, not only ones with an existing projection row.
 async fn capture_reverse_guard_state(
     pool: &Pool,
-    qualified_projection: &str,
-    to_col: &str,
+    shape: &ReverseRelationshipShape,
     key: Option<&str>,
 ) -> Result<ReverseCapture, ApplyError> {
     let client = pool.get().await?;
-    if let (Some(key), false) = (key, qualified_projection.is_empty()) {
+    if let (Some(key), false) = (key, shape.qualified_projection.is_empty()) {
         let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
         let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-        let key_ident = quote_ident(to_col);
+        let filter = shape.projection_key_filter(&**client).await?;
         let row = client
             .query_opt(
                 &format!(
                     "select {lsn_ident}, {gen_ident}, pg_current_wal_insert_lsn() \
-                     from {qualified_projection} where {key_ident}::text = $1"
+                     from {} where {filter}",
+                    shape.qualified_projection,
                 ),
                 &[&key],
             )
@@ -2158,6 +2224,7 @@ async fn from_side_rows_for_trigger_txn(
     txn: &Transaction<'_>,
     from_table: &str,
     from_col: &str,
+    from_key_pg_type: Option<&str>,
     from_pk: &[PrimaryKeyColumn],
     trigger: &ReverseTrigger<'_>,
     row_columns: &[String],
@@ -2178,15 +2245,15 @@ async fn from_side_rows_for_trigger_txn(
     // `row_columns` arrives pre-resolved (see this function's own doc
     // comment on why it isn't introspected here).
     let doc_expr = row_as_text_jsonb_sql("t", row_columns);
+    let filter = single_key_filter(&format!("t.{}", quote_ident(from_col)), from_key_pg_type);
     let mut rows: HashMap<String, Row> = HashMap::new();
     for join_key in join_keys {
         let sql = format!(
             "select m.k, e.key, e.value \
              from (select {pk} as k, {doc_expr} as doc from {tbl} t \
-                   where {col}::text = $1) m \
+                   where {filter}) m \
              cross join lateral jsonb_each_text(m.doc) e",
             pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
-            col = quote_ident(from_col),
             tbl = ddl::qualified_source_table(from_table),
         );
         let db_rows = txn.query(&sql, &[join_key]).await?;
@@ -2415,12 +2482,12 @@ async fn check_reverse_guards(
         Some(key) if !shape.qualified_projection.is_empty() => {
             let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
             let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
-            let key_ident = quote_ident(&shape.to_col);
+            let filter = shape.projection_key_filter(txn).await?;
             let row = txn
                 .query_opt(
                     &format!(
                         "select {lsn_ident}, {gen_ident} from {} \
-                         where {key_ident}::text = $1 for update",
+                         where {filter} for update",
                         shape.qualified_projection,
                     ),
                     &[&key],
@@ -2665,11 +2732,11 @@ async fn reverse_ordering_still_holds(
         return Ok(true);
     }
     let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
-    let key_ident = quote_ident(&shape.to_col);
+    let filter = shape.projection_key_filter(txn).await?;
     let row = txn
         .query_opt(
             &format!(
-                "select {lsn_ident} from {} where {key_ident}::text = $1 for update",
+                "select {lsn_ident} from {} where {filter} for update",
                 shape.qualified_projection,
             ),
             &[&key],
@@ -2737,12 +2804,20 @@ async fn stage_reverse_recompute_fallback(
     let Some(from_pk) = &shape.from_pk else {
         return Ok(());
     };
+    let from_key_pg_type = cached_key_pg_type(
+        &shape.from_key_pg_type,
+        txn,
+        &shape.from_table,
+        &shape.from_col,
+    )
+    .await?;
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
         let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
         let from_rows = from_side_rows_for_trigger_txn(
             txn,
             &shape.from_table,
             &shape.from_col,
+            from_key_pg_type,
             from_pk,
             &trigger,
             row_columns,
@@ -2828,11 +2903,9 @@ async fn apply_projection_advance(
     if let Some(old_key) = old_key
         && new_key.as_deref() != Some(old_key.as_str())
     {
+        let filter = shape.projection_key_filter(txn).await?;
         txn.execute(
-            &format!(
-                "delete from {} where {key_ident}::text = $1",
-                shape.qualified_projection
-            ),
+            &format!("delete from {} where {filter}", shape.qualified_projection),
             &[old_key],
         )
         .await?;
@@ -3119,6 +3192,12 @@ async fn apply_projection_from_live(
     let to_side = &shape.to_side;
     let key_ident = quote_ident(&shape.to_col);
     let filter = to_side.key_filter(txn, &shape.to_col).await?;
+    let seen_filter = to_side
+        .projection_key_filter(txn, &shape.to_col, &format!("q.{key_ident}"))
+        .await?;
+    let gone_filter = to_side
+        .projection_key_filter(txn, &shape.to_col, &format!("p.{key_ident}"))
+        .await?;
     let data_columns = projection_data_columns(
         txn,
         &shape.projection_schema,
@@ -3159,9 +3238,9 @@ async fn apply_projection_from_live(
              from ({pending}) c order by c.lsn desc, c.change_id desc limit 1), \
          held as (select 1 from latest l where l.present), \
          seen as materialized ( \
-             select q.{lsn_ident} as row_lsn from {proj} q where q.{key_ident}::text = $1), \
+             select q.{lsn_ident} as row_lsn from {proj} q where {seen_filter}), \
          gone as ( \
-             delete from {proj} p where p.{key_ident}::text = $1 \
+             delete from {proj} p where {gone_filter} \
              and (not exists (select 1 from {to_table} t where {filter}) \
                   or (exists (select 1 from held) \
                       and exists (select 1 from seen v \
@@ -3447,15 +3526,28 @@ fn generation_bump_statement(
 
 /// Bumps the generation of `bump`'s touched keys' projection rows, under
 /// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue #835), as
-/// the page's other statements keyed by entry run. The keys are bound in
-/// sorted order (see the Phase 3 gen-bump step).
+/// the page's other statements keyed by entry run.
+///
+/// The rows are locked in key order first ([`projection_lock_statement`]),
+/// the order the reverse release locks them in and the order of every other
+/// page's bump (ADR-0002 I5). The bump alone locks in whatever order its
+/// plan reads the rows. With the key compared at its type, the planner
+/// reads the key index into a bitmap and the rows in physical order
+/// whenever the keys' rows are scattered through the table, as rewriting a
+/// projection's rows scatters them: on a 100k-row projection it read even
+/// two keys that way, on PostgreSQL 16 and 17. Two pages, or a page and a
+/// release, locking an overlapping set of keys would then take them in
+/// opposite orders and deadlock.
 async fn bump_generations(
     txn: &Transaction<'_>,
     bump: &RelationshipGenBump,
 ) -> Result<(), ApplyError> {
-    let mut keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
-    keys.sort_unstable();
-    super::ledger::query_by_entry_key(txn, &bump.sql, &[&keys]).await?;
+    let keys: Vec<&str> = bump.touched_keys.iter().map(String::as_str).collect();
+    txn.batch_execute(super::ledger::ENTRY_PLAN_SETTINGS)
+        .await?;
+    txn.query(&bump.lock_sql, &[&keys]).await?;
+    txn.execute(&bump.sql, &[&keys]).await?;
+    txn.batch_execute(super::ledger::ENTRY_PLAN_RESET).await?;
     Ok(())
 }
 
@@ -5155,11 +5247,14 @@ mod tests {
         let db = cluster.create_isolated_database().await;
         let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
         let bump = RelationshipGenBump {
+            lock_sql: projection_lock_statement(&projection, "id", key_pg_type.as_deref()),
             sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
             touched_keys: keys.iter().cloned().collect(),
         };
         let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
         let txn = client.transaction().await.expect("begin");
+        let plan = plan_by_entry_key(&txn, &bump.lock_sql, &bound).await;
+        assert_probes_the_key(&plan, "the generation bump's lock");
         let plan = plan_by_entry_key(&txn, &bump.sql, &bound).await;
         assert_probes_the_key(&plan, "the generation bump");
         let before = projection_seq_scans(&txn).await;
@@ -5200,6 +5295,189 @@ mod tests {
             "every touched key's row is bumped, and no other"
         );
         assert_eq!(others, 0, "each row is bumped at most once");
+    }
+
+    /// Issue #835: the generation bump ([`bump_generations`]) locks its rows
+    /// in key order, the order the reverse release's lock and every other
+    /// page's bump take them in (ADR-0002 I5). The bare `update` reads the
+    /// key index into a bitmap and locks the rows in physical order, so on a
+    /// projection whose keys are scattered through the table, with key 2's
+    /// row before key 1's, it locked 2 first.
+    ///
+    /// Another transaction holds key 2's row; the bump of keys 1 and 2 must
+    /// then wait on key 2 holding key 1's lock, not hold nothing.
+    #[tokio::test]
+    async fn the_generation_bump_locks_its_rows_in_key_order() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        };
+        let mut holder = connect().await;
+        holder
+            .batch_execute(
+                "create table reversed_projection ( \
+                     id int primary key, __trellis_gen bigint not null default 0); \
+                 insert into reversed_projection (id) values (2), (1); \
+                 insert into reversed_projection (id) \
+                     select (i * 7919::bigint % 100003)::int \
+                     from generate_series(1, 100002) i \
+                     where i * 7919::bigint % 100003 > 2; \
+                 analyze reversed_projection;",
+            )
+            .await
+            .expect("seed the projection");
+        let projection = "\"public\".\"reversed_projection\"";
+        let bump = RelationshipGenBump {
+            lock_sql: projection_lock_statement(projection, "id", Some("integer")),
+            sql: generation_bump_statement(projection, "id", Some("integer")),
+            touched_keys: ["1", "2"].into_iter().map(String::from).collect(),
+        };
+        let bound = vec!["1", "2"];
+        {
+            let txn = holder.transaction().await.expect("begin");
+            let plan = plan_by_entry_key(&txn, &bump.sql, &bound).await;
+            txn.rollback().await.expect("rollback");
+            assert!(
+                plan.contains("Bitmap Heap Scan"),
+                "the bare bump reads the rows in physical order, which this test \
+                 relies on to tell the orders apart, got:\n{plan}"
+            );
+        }
+
+        let held = holder.transaction().await.expect("begin");
+        held.execute(
+            "select 1 from reversed_projection where id = 2 for update",
+            &[],
+        )
+        .await
+        .expect("hold key 2");
+        let mut bumper = connect().await;
+        let bumper_pid: i32 = bumper
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let bumping = tokio::spawn(async move {
+            let txn = bumper.transaction().await.expect("begin");
+            bump_generations(&txn, &bump).await.expect("bump");
+            txn.commit().await.expect("commit");
+        });
+        // The bump waits on the lock this test holds: a precondition the
+        // test sets up, not a convergence wait.
+        let observer = connect().await;
+        let mut blocked = false;
+        for _ in 0..6000 {
+            blocked = observer
+                .query_one(
+                    "select exists (select 1 from pg_stat_activity \
+                     where pid = $1 and wait_event_type = 'Lock')",
+                    &[&bumper_pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(blocked, "the bump never waited on key 2's held lock");
+        let free: Vec<i32> = observer
+            .query(
+                "select id from reversed_projection where id = 1 for update skip locked",
+                &[],
+            )
+            .await
+            .expect("try key 1")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        held.rollback().await.expect("release key 2");
+        bumping.await.expect("the bump finishes");
+        assert!(
+            free.is_empty(),
+            "the bump holds key 1 while it waits on key 2: it locks in key order"
+        );
+        let gens: Vec<(i32, i64)> = observer
+            .query(
+                "select id, __trellis_gen from reversed_projection \
+                 where id <= 2 or __trellis_gen <> 0 order by id",
+                &[],
+            )
+            .await
+            .expect("gens")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(gens, vec![(1, 1), (2, 1)], "each key's row is bumped once");
+    }
+
+    /// Issue #835: Phase 3's single-key projection statements (the reverse
+    /// guards' locks, the projection advance's delete, the live-row write's
+    /// `seen` and `gone`, Phase 2's guard capture) find the row through
+    /// [`ToSide::projection_key_filter`], which compares the key at its type.
+    /// They cast the key column to `text` and read a 400k-row projection in
+    /// full for each key, whatever its statistics.
+    #[tokio::test]
+    async fn a_single_key_projection_statement_probes_the_key_index() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, projection, _, keys) = stale_projection(&db).await;
+        let to_side = ToSide {
+            table: projection.clone(),
+            identity: "public.stale_projection".to_string(),
+            seam_fed: false,
+            key_pg_type: std::sync::OnceLock::new(),
+        };
+        let txn = client.transaction().await.expect("begin");
+        let filter = to_side
+            .projection_key_filter(&txn, "id", "\"id\"")
+            .await
+            .expect("filter");
+        assert_eq!(filter, r#""id" = $1::text::integer"#);
+        let aliased = to_side
+            .projection_key_filter(&txn, "id", "q.\"id\"")
+            .await
+            .expect("filter");
+        let key = keys[1234].as_str();
+        let before = projection_seq_scans(&txn).await;
+        for sql in [
+            format!("select __trellis_gen from {projection} where {filter} for update"),
+            format!("select q.__trellis_gen from {projection} q where {aliased}"),
+            format!("delete from {projection} where {filter} returning __trellis_gen"),
+        ] {
+            let plan: Vec<String> = txn
+                .query(&format!("explain {sql}"), &[&key])
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_probes_the_key(&plan.join("\n"), &sql);
+            let rows = txn.query(&sql, &[&key]).await.expect("run");
+            assert_eq!(rows.len(), 1, "{sql} finds the key's row");
+        }
+        let missing = txn
+            .query(
+                &format!("select 1 from {projection} where {filter}"),
+                &[&None::<&str>],
+            )
+            .await
+            .expect("a NULL key");
+        assert!(missing.is_empty(), "a NULL key matches no row");
+        assert_eq!(
+            projection_seq_scans(&txn).await,
+            before,
+            "no statement scans the projection"
+        );
+        txn.rollback().await.expect("rollback");
     }
 
     /// Issue #835: the reverse release's projection lock
@@ -5282,6 +5560,7 @@ mod tests {
                 to_columns: HashMap::new(),
                 kind: ReadKind::ToOne(Some(ProjectionRead {
                     sql: sql.clone(),
+                    lock_sql: projection_lock_statement(&projection, "id", key_pg_type.as_deref()),
                     bump_sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
                 })),
             }],
@@ -5352,6 +5631,18 @@ mod tests {
             "the column reference itself must never be cast to ::text — that's exactly the \
              cast that defeats a btree index on it (issue #125): {filter}"
         );
+    }
+
+    /// Issue #835: [`single_key_filter`] casts the bound `$1`, not the
+    /// column, when the column's type is known, and falls back to the
+    /// column cast otherwise, as [`key_array_filter`] does for an array.
+    #[test]
+    fn single_key_filter_casts_the_bound_key_not_the_column_when_type_is_known() {
+        assert_eq!(
+            single_key_filter(r#"q."id""#, Some("integer")),
+            r#"q."id" = $1::text::integer"#
+        );
+        assert_eq!(single_key_filter(r#""id""#, None), r#""id"::text = $1"#);
     }
 
     /// Issue #125 regression pin, part 2: without a known native type (the
@@ -5684,6 +5975,7 @@ mod tests {
             &txn,
             "from_side_fixture",
             "join_key",
+            Some("text"),
             &from_pk,
             &ReverseTrigger::Keys(&join_keys),
             &row_columns,
@@ -5740,6 +6032,7 @@ mod tests {
             &txn,
             "from_side_fixture",
             "join_key",
+            Some("text"),
             &from_pk,
             &ReverseTrigger::WholeKeyspace,
             &[],
@@ -7053,13 +7346,8 @@ pub(super) async fn compute_page(
                 let new_row = rows[i].clone();
                 let read_key =
                     relationship_read_key(&old_row, &new_row, &rel.def.to_col, &rel.def.name)?;
-                let capture = capture_reverse_guard_state(
-                    pool,
-                    &shape.qualified_projection,
-                    &shape.to_col,
-                    read_key.as_deref(),
-                )
-                .await?;
+                let capture =
+                    capture_reverse_guard_state(pool, &shape, read_key.as_deref()).await?;
                 relationship_reverses.push(RelationshipReverseRecord {
                     shape: Arc::clone(&shape),
                     old_row,
@@ -7385,13 +7673,7 @@ pub(super) async fn compute_page(
             continue;
         }
         let read_key = relationship_read_key(&old_row, &new_row, &shape.to_col, &shape.name)?;
-        let capture = capture_reverse_guard_state(
-            pool,
-            &shape.qualified_projection,
-            &shape.to_col,
-            read_key.as_deref(),
-        )
-        .await?;
+        let capture = capture_reverse_guard_state(pool, &shape, read_key.as_deref()).await?;
         relationship_reverses.push(RelationshipReverseRecord {
             shape: Arc::clone(&shape),
             old_row,
@@ -9315,29 +9597,25 @@ pub(crate) async fn apply_page(
     // on the widen-only catch-up gap #131 closes) simply bumps nothing — no
     // error, same as any `UPDATE ... WHERE` matching zero rows. The key is
     // compared at its own type under the entry plan settings, so the
-    // projection's primary key index serves it ([`bump_generations`], issue
-    // #835). The touched-key array is sorted before binding (review
-    // follow-up to #132) — see the comment below for why.
+    // projection's primary key index serves it, after a statement that
+    // locks the same rows in key order ([`bump_generations`], issue #835).
     for bump in plan.relationship_gen_bumps.values() {
         if bump.touched_keys.is_empty() {
             continue;
         }
-        // Ascending-key lock order (review follow-up to #132): `touched_keys`
-        // is a `HashSet`, whose iteration order is unspecified and can vary
-        // run to run. Without the deterministic sort `bump_generations` takes, two concurrent
-        // `apply_and_mark_drained_many` calls whose batches both touch an
-        // overlapping set of relationship-projection parent keys (plausible
-        // whenever two segments both contain from-side rows re-pointing
-        // among the same hot parents) could have their `UPDATE ... WHERE key
-        // = ANY($1)` lock those rows in different orders and deadlock —
+        // Ascending-key lock order (review follow-up to #132, ADR-0002 I5):
+        // two concurrent pages whose batches both touch an overlapping set of
+        // relationship-projection parent keys (plausible whenever two
+        // segments both contain from-side rows re-pointing among the same
+        // hot parents) must lock those rows in one order, or they deadlock.
         // Postgres detects and aborts one side rather than corrupting
-        // anything, but it's a needless liveness hazard, and this codebase
-        // already has the fix for exactly this class of bug: the
-        // target-write lock just above sorts (and dedups) its keys before
-        // taking `FOR UPDATE` locks, with `two_overlapping_group_writers_serialize_via_ascending_lock_order_not_deadlock`
-        // as its regression pin. Sorting the bound array doesn't change
-        // *what* this bare `UPDATE` locks, only lines up every concurrent
-        // caller's lock-acquisition order onto the same ascending sequence.
+        // anything, but it's a needless liveness hazard. The bare `UPDATE`
+        // locks in whatever order its plan reads the rows (physical order
+        // under a bitmap scan), so `bump_generations` locks them `order by`
+        // key first, as the target-write pre-lock above does, with
+        // `two_overlapping_group_writers_serialize_via_ascending_lock_order_not_deadlock`
+        // as that pre-lock's regression pin and
+        // `the_generation_bump_locks_its_rows_in_key_order` as this one's.
         bump_generations(txn, bump).await?;
     }
 
