@@ -3043,3 +3043,31 @@ async fn a_page_parks_nothing_for_a_key_released_after_it_was_computed() {
         .await
         .expect("nothing is left holding the band");
 }
+
+/// #799: a key held in `poison_held` doesn't hold a capture gate
+/// (`converge::table_changes_pending_through`). Its release re-derives the key
+/// from the live row rather than replaying its images, and it is held for the
+/// definitions that hold it, never for the new definition a gate waits for.
+#[tokio::test]
+async fn a_held_key_does_not_hold_its_tables_capture_gate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    hold_key_1_for_order_prices(&db, &mut client).await;
+    let orders = qualify_fixture_table("orders");
+    assert!(
+        rows_for(&client, "poison_held", "order_prices").await > 0,
+        "an imaged change is held"
+    );
+    let gate: PgLsn = client
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the WAL position")
+        .get(0);
+    assert!(
+        !converge::table_changes_pending_through(&client, &orders, gate)
+            .await
+            .expect("read the gate"),
+        "the held change doesn't hold the gate"
+    );
+}
