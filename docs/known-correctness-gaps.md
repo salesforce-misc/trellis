@@ -75,7 +75,7 @@ These are the tools the entries refer to:
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
-| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain: pauses what it reaches, or logs only; build: `backfill_failure` | #813 |
+| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain: pauses what it reaches, or logs only; build: `backfill_failure` | #813, #817 |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
 | 14 | A field alias that shadows a source column read by an aggregate | target never builds | logs only | #695 |
@@ -416,7 +416,7 @@ readers and `self_check` reports a `capture` divergence (#745, #765). Define
 and declare refuse policies that already apply
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
-**Planned work:** #813 (pause on a refused discharge or catch-up).
+**Planned work:** #813 (pause on a refused discharge or catch-up). #817 decides what a refusal the halt can't pin on a table should do.
 
 **Repair:** grant `BYPASSRLS` to every role Trellis logs in as and to the
 ring's owner (it isn't inherited), or make the role the table owner without
