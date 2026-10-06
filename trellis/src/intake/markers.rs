@@ -4157,13 +4157,13 @@ mod catch_up_tests {
     /// rollup is paused at group 1 = 9 (ids 1, 3, 5), and id 3 is deleted
     /// meanwhile. The resume's discharge keeps group 1 (ids 1 and 5 still
     /// back it); they are deleted
-    /// before the rebuild reads, so it writes nothing for group 1 and that
-    /// stale row survives it; id 7 lands after
+    /// before the rebuild reads, so its ledger has nothing in group 1 and it
+    /// deletes that stale row (issue #815); id 7 lands after
     /// the read. Every one of those changes drains while the rollup is
     /// `backfilling`, so none reaches it. The go-live discharge must then
     /// leave group 1 exactly as the source has it. Its last row (7) is
     /// deleted in the discharge's gap and id 10 (100) lands after its read:
-    /// the right answer is 100. Folding those onto the stale row gives more.
+    /// the right answer is 100. Folding those onto a stale row gives more.
     #[tokio::test]
     async fn a_resumed_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows()
      {
@@ -4222,13 +4222,14 @@ mod catch_up_tests {
         .await;
         drain_all(&pool, &mut discharger).await;
         finish_builds(&pool, &chunks).await;
-        // The rollup is on the ledger (#623 D5), so the dispatch's sweep
-        // re-derived the entry of id 3, deleted during the pause, away: the
-        // stale row the rebuild leaves is ids 1 and 5's.
+        // The dispatch's sweep kept group 1 at ids 1 and 5 (6), and the
+        // rebuild's ledger has no entry in it, so the rebuild deleted it
+        // rather than leave that stale row for id 7 to be counted onto
+        // (issue #815).
         assert_eq!(
             rollup_rows(&discharger).await,
-            vec![(0, "12".to_string()), (1, "6".to_string())],
-            "group 1 still holds ids 1 and 5"
+            vec![(0, "12".to_string())],
+            "the rebuild dropped group 1, which its ledger has no entry for"
         );
 
         defer_grps_catch_up(&discharger).await;

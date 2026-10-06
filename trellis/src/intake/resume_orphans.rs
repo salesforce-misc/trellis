@@ -82,6 +82,16 @@
 //! the length of the build. The build's go-live catch-up sweeps again, and
 //! that sweep is exact by the argument above.
 //!
+//! That argument needs a kept ledger target's group row to be the sum of its
+//! live entries, and a direct build breaks it for a group whose rows left
+//! between *S* and the build's read: the build empties the ledger, writes
+//! only the groups the source has, and would leave that group's row at its
+//! old value. A row that joins the group once the definition applies again
+//! is then added on top, and the go-live sweep keeps the group, since it has
+//! a live entry by then (issue #815). So the build itself deletes every
+//! group its ledger has no live entry for, before it finishes
+//! (`defs::backfill`, "Groups the ledger no longer has").
+//!
 //! # Why the delete comes last (issue #503)
 //!
 //! The delete runs as the read is fetched, after the watermark wait, and the

@@ -1555,6 +1555,24 @@ impl SourceScan {
 /// matches an applied one, plus `__trellis_members`,
 /// the group's member count ([`ddl::MEMBERS_COLUMN`]).
 ///
+/// # Groups the ledger no longer has (issue #815)
+///
+/// A rebuild (a resumed definition's, or a build retried after a failure)
+/// starts from a target that already has rows. The group writes overwrite
+/// every group the new ledger has, so before them the build deletes every
+/// target row the new ledger has no live entry for. Apply keeps a group row
+/// the sum of its group's live entries, and moves it by each entry's change.
+/// A row left at its old value with no entries behind it would break that,
+/// and the first source row to join the group once the definition applies
+/// would be added on top of it. The resume's sweep can't remove such a row:
+/// it judges on a snapshot from before the build's read, when a source row
+/// still backed the group. Neither can the go-live catch-up's sweep, once a
+/// row has joined the group (#815's double count). Nothing else writes the
+/// target or the ledger in between: the definition is `backfilling`, which
+/// Apply skips. The delete is outside the target-mutation seam like the
+/// group writes, and a reader catches up the same way
+/// (`intake::markers::park_target_catchup_if_read`).
+///
 /// Non-`NULL` group keys are partitioned into `(prev, hi]` ranges over the
 /// ordered distinct group tuples in the ledger, which cover every non-`NULL`
 /// group exactly once; each range is one `INSERT … SELECT … GROUP BY … ON
@@ -1826,6 +1844,26 @@ async fn backfill_aggregate(
             Err(err) => return Err(err.into()),
         }
     }
+    // Issue #815: the groups the rebuilt ledger has no live entry for go,
+    // before the definition applies again. See "Groups the ledger no longer
+    // has" above.
+    let matches: Vec<String> = group_idents
+        .iter()
+        // Not `is not distinct from`, which no index serves.
+        .map(|c| format!("(l.{c} = t.{c} or (l.{c} is null and t.{c} is null))"))
+        .collect();
+    let stale_sql = format!(
+        "delete from {target} as t where not exists ( \
+             select 1 from {ledger} as l where l.{} and not l.{} and {})",
+        quote_ident(super::ledger::MEMBER_COLUMN),
+        quote_ident(super::ledger::TOMBSTONE_COLUMN),
+        matches.join(" and "),
+    );
+    write_fenced(&mut client, fence, async |client| {
+        client.execute(&stale_sql, &[]).await?;
+        Ok(())
+    })
+    .await?;
     let group_exprs_sql = group_exprs.join(", ");
 
     let insert_for = |condition: &str| {

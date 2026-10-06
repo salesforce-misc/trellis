@@ -635,6 +635,141 @@ async fn resume_drops_groups_a_relationship_key_no_longer_reaches() {
     operator.shutdown().await.expect("shut down");
 }
 
+/// Claims and runs every job in the chunk queue, and nothing else: no
+/// discharge and no drain, so a test can write to the source between a
+/// direct build's dispatch and its run, and between its run and the drain.
+async fn run_queued_jobs(pool: &trellis::Pool) {
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, TEST_NAME, 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                TEST_NAME,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, TEST_NAME)
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
+
+/// Issue #815: a resumed aggregate the direct build rebuilds (here, one that
+/// reads a relationship) must not keep a group the rebuilt ledger has no
+/// entry for. The resume's sweep judges group 0 backed (order 1 is in it),
+/// order 1 leaves before the build reads the source, so the build's ledger
+/// has nothing in group 0, and order 1 comes back afterwards. Its re-derive
+/// (the `Recompute` the discharge enumerated for the live sibling `g_count`,
+/// drained once `by_g` is `catching_up`) finds no entry and counts it into
+/// group 0 from nothing. A stale group 0 row left by the build would count
+/// it twice, and the go-live sweep would keep that row, since group 0 has a
+/// live entry by then.
+#[tokio::test]
+async fn a_resumed_direct_build_drops_the_groups_its_ledger_has_no_entry_for() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table customers (id bigint primary key, region text); \
+             create table orders (id bigint primary key, customer_id bigint, g bigint); \
+             insert into customers values (1, 'eu'), (2, 'us'); \
+             insert into orders values (1, 1, 0), (2, 2, 1), (3, 2, null);",
+        )
+        .await
+        .expect("seed customers and orders");
+    let operator = define_only(db.dsn()).await;
+    apply_all(
+        &operator,
+        &[
+            "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
+            "TRANSFORM by_g FROM orders GROUP BY g \
+             SELECT count(*) AS n, max(customer.region) AS region",
+            "TRANSFORM g_count FROM orders GROUP BY g SELECT count(*) AS n",
+        ],
+    )
+    .await;
+    settle(&db.pool, &mut client).await;
+    let by_g = "select g::text, n::text, region from by_g order by g";
+    assert_eq!(
+        text_rows(&client, by_g).await,
+        text(&[
+            &[Some("0"), Some("1"), Some("eu")],
+            &[Some("1"), Some("1"), Some("us")],
+            &[None, Some("1"), Some("us")],
+        ]),
+        "precondition: both groups built"
+    );
+
+    operator.apply("PAUSE TRANSFORM by_g").await.expect("pause");
+    operator
+        .apply("RESUME TRANSFORM by_g")
+        .await
+        .expect("resume");
+    // The resume's discharge: its sweep keeps group 0 (order 1 backs it),
+    // it dispatches `by_g`'s direct build, and it enumerates `orders` for
+    // `g_count`, which is live.
+    client
+        .batch_execute("select txid_current()")
+        .await
+        .expect("consume an xid");
+    markers::run_pending_backfills(
+        &mut client,
+        "wake",
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the resume's marker");
+    assert_eq!(status(&client, "by_g").await, "backfilling");
+
+    client
+        .batch_execute("delete from orders where id = 1")
+        .await
+        .expect("delete order 1 before the build reads it");
+    run_queued_jobs(&db.pool).await;
+    assert_eq!(status(&client, "by_g").await, "catching_up");
+    assert_eq!(
+        text_rows(&client, by_g).await,
+        text(&[
+            &[Some("1"), Some("1"), Some("us")],
+            &[None, Some("1"), Some("us")],
+        ]),
+        "the build leaves no group its ledger has no live entry for, and keeps the NULL group"
+    );
+
+    client
+        .batch_execute("insert into orders values (1, 1, 0)")
+        .await
+        .expect("order 1 comes back");
+    // `by_g` applies now: the drain re-derives order 1 into group 0, before
+    // the go-live catch-up's sweep reads the target.
+    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
+    assert_eq!(status(&client, "by_g").await, "live");
+    assert_eq!(
+        text_rows(&client, by_g).await,
+        text(&[
+            &[Some("0"), Some("1"), Some("eu")],
+            &[Some("1"), Some("1"), Some("us")],
+            &[None, Some("1"), Some("us")],
+        ]),
+        "order 1 is counted in group 0 once"
+    );
+    operator.shutdown().await.expect("shut down");
+}
+
 /// Two hops: `rollup_echo` aggregates `order_rollup`'s target and stays
 /// `live` while `order_rollup` is paused. When the rebuild deletes
 /// `order_rollup`'s extinct group 0, `rollup_echo` must drop its group 0 too.
