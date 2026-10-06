@@ -28,9 +28,10 @@
 //!
 //! Every target writer (`apply::apply_target`, `ledger::apply_ledger_target`,
 //! the truncate clears (`apply::clear_target`), the Re-derive build's chunks
-//! (`staging::build`), and a rebuild's orphan delete,
-//! `intake::resume_orphans`) takes a `&mut TargetMutations`
-//! and reports each physically-changed key into it. None of them returns the
+//! (`staging::build`), a rebuild's orphan delete,
+//! `intake::resume_orphans`, and the direct aggregate build's delete of the
+//! groups its rebuilt ledger lost, `defs::backfill`, #815) takes a
+//! `&mut TargetMutations` and reports each physically-changed key into it. None of them returns the
 //! changed keys to its caller, so a caller cannot forget to propagate them:
 //! the only way a changed key leaves a writer is through [`TargetMutations::record`],
 //! and the only way a [`TargetMutations`] leaves a transaction is through
@@ -39,8 +40,8 @@
 //! shared helpers, which is the point.
 //!
 //! The only target writes that bypass the seam are a definition's own
-//! initial build (`defs::backfill::backfill_definition` and the chunk queue),
-//! which run while that definition is not yet applying
+//! build's row writes (`defs::backfill::backfill_definition` and the chunk
+//! queue), which run while that definition is not yet applying
 //! (`TransformStatus::is_applying`). Nothing can read a target in that state:
 //! `defs::catalog::create_definition_inner` refuses a definition whose source
 //! is a target still being built (`CatalogError::TransformNotLive`),
@@ -50,7 +51,9 @@
 //! re-derive from its rebuilt state (and report `catching_up` until then):
 //! every reader, including one reading it through a relationship, whose
 //! settled projection that catch-up's discharge also refreshes (#507,
-//! `intake::markers::park_target_catchup_if_read`).
+//! `intake::markers::park_target_catchup_if_read`). That catch-up re-reads
+//! the target's current keys, so it can't tell a reader about a row the
+//! rebuild deleted: such a delete goes through the seam (#815).
 //! A chunk a worker held across a resume can't write once the rebuild has
 //! made the target applying again: its claim fences every write it makes
 //! (`defs::chunk_queue::ClaimFence`, #434).

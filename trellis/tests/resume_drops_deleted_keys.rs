@@ -770,6 +770,176 @@ async fn a_resumed_direct_build_drops_the_groups_its_ledger_has_no_entry_for() {
     operator.shutdown().await.expect("shut down");
 }
 
+/// Issue #815: the direct build's delete matches a composite group key
+/// with `NULL`s in it as the target's `UNIQUE NULLS NOT DISTINCT` key does.
+/// Group `(0, NULL)` loses its only row between the resume's sweep and the
+/// build's read, so the build deletes it, and keeps `(1, NULL)`,
+/// `(NULL, 5)`, `(NULL, NULL)` and `(0, 7)`, which differ from it in one
+/// column or share its `NULL`. A match that is too loose (`(0, 7)`'s entry
+/// taken for `(0, NULL)`'s) leaves the stale group behind. One that is too
+/// strict only deletes a live group the build's group writes then write
+/// again, which this can't see.
+#[tokio::test]
+async fn a_resumed_direct_build_matches_composite_groups_with_nulls() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table customers (id bigint primary key, region text); \
+             create table orders (id bigint primary key, customer_id bigint, g bigint, h bigint); \
+             insert into customers values (1, 'eu'); \
+             insert into orders values (1, 1, 0, null), (2, 1, 1, null), (3, 1, null, 5), \
+                                       (4, 1, null, null), (5, 1, 0, 7);",
+        )
+        .await
+        .expect("seed customers and orders");
+    let operator = define_only(db.dsn()).await;
+    apply_all(
+        &operator,
+        &[
+            "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
+            "TRANSFORM by_gh FROM orders GROUP BY g, h \
+             SELECT count(*) AS n, max(customer.region) AS region",
+        ],
+    )
+    .await;
+    settle(&db.pool, &mut client).await;
+    let by_gh = "select g::text, h::text, n::text from by_gh order by g, h";
+    assert_eq!(
+        text_rows(&client, by_gh).await.len(),
+        5,
+        "precondition: every group built"
+    );
+
+    operator
+        .apply("PAUSE TRANSFORM by_gh")
+        .await
+        .expect("pause");
+    operator
+        .apply("RESUME TRANSFORM by_gh")
+        .await
+        .expect("resume");
+    client
+        .batch_execute("select txid_current()")
+        .await
+        .expect("consume an xid");
+    markers::run_pending_backfills(
+        &mut client,
+        "wake",
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the resume's marker");
+    assert_eq!(status(&client, "by_gh").await, "backfilling");
+    client
+        .batch_execute("delete from orders where id = 1")
+        .await
+        .expect("delete order 1 before the build reads it");
+    run_queued_jobs(&db.pool).await;
+    assert_eq!(status(&client, "by_gh").await, "catching_up");
+    assert_eq!(
+        text_rows(&client, by_gh).await,
+        text(&[
+            &[Some("0"), Some("7"), Some("1")],
+            &[Some("1"), None, Some("1")],
+            &[None, Some("5"), Some("1")],
+            &[None, None, Some("1")],
+        ]),
+        "only (0, NULL) is gone"
+    );
+    operator.shutdown().await.expect("shut down");
+}
+
+/// Issue #815 review: a group the direct build deletes must reach a
+/// consumer that reads the resumed target through a to-one relationship.
+/// `tag_view` reads `by_g.n` for tag 10 through group 0, which the build
+/// deletes because order 1 left between the resume's sweep and the build's
+/// read. The target catch-up enumerates `by_g`'s current keys, which no
+/// longer include 0, so only the delete itself can tell `tag_view`.
+#[tokio::test]
+async fn a_group_a_resumed_direct_build_deletes_reaches_a_to_one_consumer() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table customers (id bigint primary key, region text); \
+             create table orders (id bigint primary key, customer_id bigint, g bigint); \
+             create table tags (id bigint primary key, g bigint); \
+             insert into customers values (1, 'eu'), (2, 'us'); \
+             insert into orders values (1, 1, 0), (2, 2, 1); \
+             insert into tags values (10, 0), (11, 1);",
+        )
+        .await
+        .expect("seed");
+    let operator = define_only(db.dsn()).await;
+    apply_all(
+        &operator,
+        &[
+            "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
+            "TRANSFORM by_g FROM orders GROUP BY g \
+             SELECT count(*) AS n, max(customer.region) AS region",
+        ],
+    )
+    .await;
+    settle(&db.pool, &mut client).await;
+    apply_all(
+        &operator,
+        &[
+            "RELATIONSHIP grp FROM tags.g TO by_g.g",
+            "TRANSFORM tag_view FROM tags SELECT grp.n AS n",
+        ],
+    )
+    .await;
+    settle(&db.pool, &mut client).await;
+    let tag_view = "select id::text, n::text from tag_view order by id";
+    assert_eq!(
+        text_rows(&client, tag_view).await,
+        text(&[&[Some("10"), Some("1")], &[Some("11"), Some("1")]]),
+        "precondition: tag_view reads both groups"
+    );
+
+    operator.apply("PAUSE TRANSFORM by_g").await.expect("pause");
+    operator
+        .apply("RESUME TRANSFORM by_g")
+        .await
+        .expect("resume");
+    client
+        .batch_execute("select txid_current()")
+        .await
+        .expect("consume an xid");
+    markers::run_pending_backfills(
+        &mut client,
+        "wake",
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the resume's marker");
+    assert_eq!(status(&client, "by_g").await, "backfilling");
+    client
+        .batch_execute("delete from orders where id = 1")
+        .await
+        .expect("delete order 1 before the build reads it");
+    run_queued_jobs(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
+    assert_eq!(status(&client, "by_g").await, "live");
+    assert_eq!(
+        text_rows(&client, "select g::text, n::text from by_g order by g").await,
+        text(&[&[Some("1"), Some("1")]]),
+        "group 0 is gone"
+    );
+    assert_eq!(
+        text_rows(&client, tag_view).await,
+        text(&[&[Some("10"), None], &[Some("11"), Some("1")]]),
+        "tag 10's group is gone, so it reads nothing through grp"
+    );
+    operator.shutdown().await.expect("shut down");
+}
+
 /// Two hops: `rollup_echo` aggregates `order_rollup`'s target and stays
 /// `live` while `order_rollup` is paused. When the rebuild deletes
 /// `order_rollup`'s extinct group 0, `rollup_echo` must drop its group 0 too.

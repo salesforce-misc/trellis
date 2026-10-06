@@ -89,8 +89,9 @@
 //! old value. A row that joins the group once the definition applies again
 //! is then added on top, and the go-live sweep keeps the group, since it has
 //! a live entry by then (issue #815). So the build itself deletes every
-//! group its ledger has no live entry for, before it finishes
-//! (`defs::backfill`, "Groups the ledger no longer has").
+//! group its ledger has no live entry for, before it finishes, through the
+//! target-mutation seam like this sweep's deletes (`defs::backfill`, "Groups
+//! the ledger no longer has").
 //!
 //! # Why the delete comes last (issue #503)
 //!

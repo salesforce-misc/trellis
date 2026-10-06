@@ -1569,9 +1569,10 @@ impl SourceScan {
 /// still backed the group. Neither can the go-live catch-up's sweep, once a
 /// row has joined the group (#815's double count). Nothing else writes the
 /// target or the ledger in between: the definition is `backfilling`, which
-/// Apply skips. The delete is outside the target-mutation seam like the
-/// group writes, and a reader catches up the same way
-/// (`intake::markers::park_target_catchup_if_read`).
+/// Apply skips. Unlike the group writes, the delete goes through the
+/// target-mutation seam ([`delete_groups_without_entries`]): a reader's
+/// catch-up (`intake::markers::park_target_catchup_if_read`) re-reads the
+/// target's current keys, which no longer name a deleted group.
 ///
 /// Non-`NULL` group keys are partitioned into `(prev, hi]` ranges over the
 /// ordered distinct group tuples in the ledger, which cover every non-`NULL`
@@ -1845,24 +1846,16 @@ async fn backfill_aggregate(
         }
     }
     // Issue #815: the groups the rebuilt ledger has no live entry for go,
-    // before the definition applies again. See "Groups the ledger no longer
-    // has" above.
-    let matches: Vec<String> = group_idents
-        .iter()
-        // Not `is not distinct from`, which no index serves.
-        .map(|c| format!("(l.{c} = t.{c} or (l.{c} is null and t.{c} is null))"))
-        .collect();
-    let stale_sql = format!(
-        "delete from {target} as t where not exists ( \
-             select 1 from {ledger} as l where l.{} and not l.{} and {})",
-        quote_ident(super::ledger::MEMBER_COLUMN),
-        quote_ident(super::ledger::TOMBSTONE_COLUMN),
-        matches.join(" and "),
-    );
-    write_fenced(&mut client, fence, async |client| {
-        client.execute(&stale_sql, &[]).await?;
-        Ok(())
-    })
+    // before the definition applies again, through the target-mutation seam.
+    // See "Groups the ledger no longer has" above.
+    delete_groups_without_entries(
+        &mut client,
+        fence,
+        &format!("{target_schema}.{}", def.target),
+        &target,
+        &ledger,
+        &group_idents,
+    )
     .await?;
     let group_exprs_sql = group_exprs.join(", ");
 
@@ -1973,6 +1966,99 @@ async fn backfill_aggregate(
     .await?;
 
     Ok(())
+}
+
+/// Plan settings for [`delete_groups_without_entries`]' anti-join, which
+/// must not run as a nested loop (see there), and their reset, so the seam's
+/// own statements after it plan as everywhere else.
+const STALE_GROUPS_PLAN_SETTINGS: &str = "set local enable_nestloop = off";
+const STALE_GROUPS_PLAN_RESET: &str = "set local enable_nestloop to default";
+
+/// Deletes every row of `target` (quoted; `target_table` is its catalog
+/// name) whose `GROUP BY` values (`group_idents`) no live entry of `ledger`
+/// (quoted) has, and records each deleted row through the target-mutation
+/// seam, in one transaction that holds `fence` (issue #815).
+///
+/// The seam is what tells a reader the group is gone. The go-live catch-up
+/// this build parks for the target's readers re-reads its *current* keys, so
+/// it never names a deleted group: a consumer reading the target through a
+/// relationship would keep the group's old values.
+///
+/// The match compares each side's group values as one anonymous record
+/// (`row(...)`), not column by column. Record equality takes two `NULL`
+/// fields as equal, as the target's `UNIQUE NULLS NOT DISTINCT` key does,
+/// and it sorts, so the anti-join is a merge join over one pass of each
+/// table. A per-column `(l.g = t.g or (l.g is null and t.g is null))` can
+/// neither hash nor merge, and leaves a nested loop that probes the ledger's
+/// `GROUP BY` index once per target row on the leading column alone: under a
+/// low-cardinality leading column that is quadratic (a 2-column key with 4
+/// values in the first took 3.5 s at 20k groups, 22 s at 50k, and didn't
+/// finish in 60 s at 200k), and with the ledger's statistics still from
+/// before the build's reload a single-column key planned as a nested loop
+/// over the whole ledger too. With nested loops off, every shape measured
+/// was a merge anti-join, about 2.7 s at 1M groups.
+async fn delete_groups_without_entries(
+    client: &mut crate::pool::Client,
+    fence: Option<ClaimFence<'_>>,
+    target_table: &str,
+    target: &str,
+    ledger: &str,
+    group_idents: &[String],
+) -> Result<(), BackfillError> {
+    let txn = client.transaction().await?;
+    if let Some(fence) = fence
+        && !fence.hold(&*txn).await?
+    {
+        return Err(BackfillError::Superseded);
+    }
+    let mut mutations = crate::staging::target_mutations::TargetMutations::new();
+    let key_cols = ddl::identity_key_columns(&*txn, target_table).await?;
+    let image = mutations.image_sql(&txn, target_table, "t").await?;
+    let mut returning = ddl::pk_key_sql_expr(&key_cols, Some("t"));
+    if let Some(image) = &image {
+        returning.push_str(&format!(", ({image})::text"));
+    }
+    let sql = groups_without_entries_delete_sql(target, ledger, group_idents, &returning);
+    txn.batch_execute(STALE_GROUPS_PLAN_SETTINGS).await?;
+    let rows = txn.query(&sql, &[]).await?;
+    txn.batch_execute(STALE_GROUPS_PLAN_RESET).await?;
+    for row in &rows {
+        let prior = image.is_some().then(|| row.get::<_, String>(1));
+        mutations.record(target_table, row.get(0), prior, 0, None, None);
+    }
+    mutations.flush(&txn).await?;
+    txn.commit().await?;
+    if !rows.is_empty() {
+        tracing::info!(
+            target = %target_table,
+            deleted = rows.len(),
+            "dropped groups the rebuilt ledger has no entry for"
+        );
+    }
+    Ok(())
+}
+
+/// [`delete_groups_without_entries`]' statement, returning `returning` over
+/// the deleted row `t`.
+fn groups_without_entries_delete_sql(
+    target: &str,
+    ledger: &str,
+    group_idents: &[String],
+    returning: &str,
+) -> String {
+    let groups = group_idents.join(", ");
+    format!(
+        "delete from {target} as t where t.ctid in ( \
+             select g.ctid from (select ctid, row({groups}) as k from {target}) as g \
+             where not exists ( \
+                 select 1 from ( \
+                     select row({groups}) as k from {ledger} where {} and not {} \
+                 ) as l \
+                 where l.k = g.k)) \
+         returning {returning}",
+        quote_ident(super::ledger::MEMBER_COLUMN),
+        quote_ident(super::ledger::TOMBSTONE_COLUMN),
+    )
 }
 
 /// Empties the aggregate build's `ledger` (quoted) and runs `load`, the
@@ -2472,6 +2558,82 @@ async fn backfill_relationship_one_to_one(
 mod tests {
     use super::super::ast::{FieldDef, Operator, Predicate};
     use super::*;
+
+    /// Issue #815: the build's delete of the groups its ledger lost plans as
+    /// a set-based anti-join, never a nested loop, for the key that made the
+    /// per-column `OR` match quadratic (a 2-column key whose first column has
+    /// 4 values) and with the ledger's statistics from before its reload,
+    /// when every entry was in one group. It deletes exactly the lost groups,
+    /// `NULL`s included.
+    #[tokio::test]
+    async fn the_delete_of_groups_without_entries_is_a_merge_anti_join() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        client
+            .batch_execute(
+                "create table t (a integer, b integer, n bigint, \
+                     unique nulls not distinct (a, b)) \
+                     with (autovacuum_enabled = false); \
+                 create table l (k text primary key, a integer, b integer, \
+                     __member boolean not null default true, \
+                     __tombstone boolean not null default false) \
+                     with (autovacuum_enabled = false); \
+                 create index on l (a, b) where __member and not __tombstone; \
+                 insert into l (k, a, b) select n::text, 0, 0 from generate_series(1, 1000) n; \
+                 analyze l; \
+                 truncate l; \
+                 insert into t (a, b, n) \
+                     select n % 4, n / 4, 1 from generate_series(1, 20000) n \
+                     union all values (null, 1, 1), (1, null, 1), (null, null, 1), (2, null, 1); \
+                 insert into l (k, a, b) \
+                     select n::text, n % 4, n / 4 from generate_series(1, 20000) n \
+                     where n % 100 <> 0 \
+                     union all values ('x', null, 1), ('y', 1, null), ('z', null, null); \
+                 analyze t;",
+            )
+            .await
+            .expect("seed a target and a reloaded ledger");
+        let idents = vec![quote_ident("a"), quote_ident("b")];
+        let sql = groups_without_entries_delete_sql("t", "l", &idents, "t.a, t.b");
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(STALE_GROUPS_PLAN_SETTINGS)
+            .await
+            .expect("plan settings");
+        let plan: Vec<String> = txn
+            .query(&format!("explain {sql}"), &[])
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("Anti Join") && !plan.contains("Nested Loop"),
+            "the delete must plan as a set-based anti-join:\n{plan}"
+        );
+        let mut deleted: Vec<(Option<i32>, Option<i32>)> = txn
+            .query(&sql, &[])
+            .await
+            .expect("delete")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        deleted.sort();
+        let mut expected: Vec<(Option<i32>, Option<i32>)> = (1..=200)
+            .map(|i| i * 100)
+            .map(|n| (Some(n % 4), Some(n / 4)))
+            .collect();
+        expected.push((Some(2), None));
+        expected.sort();
+        assert_eq!(
+            deleted, expected,
+            "every group the ledger lost, and only those"
+        );
+    }
 
     /// Issue #769: every column of a key range is compared under its
     /// recorded collation, and a column with none bare, so an index of that
