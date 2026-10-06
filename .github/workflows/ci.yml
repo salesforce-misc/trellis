@@ -126,7 +126,21 @@ jobs:
         # `--no-fail-fast` so one failing test binary doesn't stop the rest
         # from running, and one run shows every failure, as `verify` does
         # locally (issue #665).
-        run: cargo test --workspace --features benchmark/engine-access --no-fail-fast
+        #
+        # The throwaway clusters run in /dev/shm with `fsync` and
+        # `full_page_writes` off. The data-heavy tests (the build_interleavings,
+        # rederive_build, ledger_interleavings binaries) run ~6x slower
+        # on the runner than on a laptop, and 1.4-1.7x slower again on a busy
+        # runner, which points at its disk. `kill -9` crash recovery, which the crash tests
+        # use, does not depend on fsync; only an OS crash would, and a test
+        # cluster is deleted afterwards anyway. `synchronous_commit` stays at
+        # its default: app_converge sets it per session and asserts on it.
+        env:
+          TMPDIR: /dev/shm
+          TRELLIS_TESTKIT_PG_OPTIONS: fsync=off full_page_writes=off
+        run: |
+          df -h /dev/shm
+          cargo test --workspace --features benchmark/engine-access --no-fail-fast
 
       - name: Prune target/ to third-party dependencies
         # A cold build is ~5.6GB, nearly all of it this workspace's own test
