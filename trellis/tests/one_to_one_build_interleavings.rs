@@ -1247,3 +1247,122 @@ async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
         d.rows("select id, v + 2 from public.src order by id").await,
     );
 }
+
+// ------------- a relationship-enriched field chunk against a parent change
+
+/// A 1-1 definition that reads a to-one relationship, `p.val` of the parent
+/// `public.par` row a `public.kid` row points at.
+const KID_DDL: &str = "create table public.par (id integer primary key, val numeric); \
+     create table public.kid (id integer primary key, a numeric, par_id integer); \
+     insert into public.par values (1, 10); \
+     insert into public.kid values (1, 5, 1), (2, 6, 2);";
+const KID_TARGET: &str = "public.rk";
+const KID_ACTUAL: &str = "select id, a, pval from public.rk order by id";
+const KID_EXPECTED: &str = "select k.id, k.a, p.val from public.kid k \
+     left join public.par p on p.id = k.par_id order by k.id";
+
+/// The parent change that races the field chunk.
+#[derive(Clone, Copy, Debug)]
+enum ParentChange {
+    /// Kid 1's parent's value moves: the chunk would write the old value.
+    Update,
+    /// Kid 2's parent appears: the chunk would write `NULL` over it.
+    Insert,
+    /// Kid 1's parent goes: the chunk would write the gone parent's value.
+    Delete,
+}
+
+impl ParentChange {
+    fn sql(self) -> &'static str {
+        match self {
+            ParentChange::Update => "update public.par set val = 20 where id = 1",
+            ParentChange::Insert => "insert into public.par values (2, 42)",
+            ParentChange::Delete => "delete from public.par where id = 1",
+        }
+    }
+}
+
+/// A column resume of a 1-1 definition that reads a to-one relationship
+/// starts a field build whose chunks re-derive their keys' whole rows, the
+/// relationship field included (issue #832). The chunk is planned and stops
+/// before its transaction; a parent change then drains, and the page of the
+/// recompute it stages writes the kids' new related value. When the chunk
+/// goes on, it must not put a related value from before that page back over
+/// it: it reads the parent only once it holds the kids' entries, so a parent
+/// change that commits after its read stages a recompute whose page waits
+/// for the chunk and writes after it.
+async fn a_field_chunk_reads_the_parent_after_its_entry_lock(change: ParentChange) {
+    let mut d = Driver::start_with_relationships(
+        KID_DDL,
+        &[
+            ("id", ValueType::Numeric),
+            ("a", ValueType::Numeric),
+            ("par_id", ValueType::Numeric),
+        ],
+        &["RELATIONSHIP p FROM kid.par_id TO par.id"],
+        &["TRANSFORM rk FROM public.kid SELECT a AS a, p.val AS pval"],
+        &["public.kid", "public.par"],
+    )
+    .await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the target before the scenario"
+    );
+    trellis::staging::quarantine::pause_column(d.pool(), "rk", "a")
+        .await
+        .expect("pause rk.a");
+    trellis::staging::quarantine::resume_column(d.pool(), "rk", "a")
+        .await
+        .expect("resume rk.a");
+    // The field build's plan job enqueues its one chunk, which is planned
+    // and stops before its transaction.
+    assert_eq!(
+        build_step(d.pool(), "planner").await,
+        trellis::staging::build::Step::Planned
+    );
+    let mut chunk = d
+        .run_frozen(
+            &[(PausePoint::BeforeChunkTransaction, KID_TARGET)],
+            |pool| async move { Ok(build_step(&pool, "chunk").await) },
+        )
+        .await;
+    chunk.reached(PausePoint::BeforeChunkTransaction).await;
+    let user = d.user().await;
+    user.batch_execute(change.sql())
+        .await
+        .expect("the parent change");
+    // The parent change's page advances the projection and stages the kids'
+    // recompute; the recompute's page writes their new related value.
+    d.settle().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the recompute's page wrote the new related value"
+    );
+    d.release(&mut chunk, PausePoint::BeforeChunkTransaction)
+        .await;
+    assert_eq!(chunk.finish().await, trellis::staging::build::Step::Chunk);
+    trellis::staging::build::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the field chunk put back a related value it read before the parent change ({change:?})"
+    );
+}
+
+#[tokio::test]
+async fn a_field_chunk_does_not_write_a_parent_value_read_before_an_update() {
+    a_field_chunk_reads_the_parent_after_its_entry_lock(ParentChange::Update).await;
+}
+
+#[tokio::test]
+async fn a_field_chunk_does_not_write_null_for_a_parent_inserted_under_it() {
+    a_field_chunk_reads_the_parent_after_its_entry_lock(ParentChange::Insert).await;
+}
+
+#[tokio::test]
+async fn a_field_chunk_does_not_write_a_parent_deleted_under_it() {
+    a_field_chunk_reads_the_parent_after_its_entry_lock(ParentChange::Delete).await;
+}

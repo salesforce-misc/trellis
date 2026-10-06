@@ -1316,200 +1316,287 @@ pub(crate) struct RelationshipGenBump {
 /// double-counts the `δA⋈δB` cross term on the forward path. A to-many
 /// relationship is untouched: Phase 1 of this epic is to-one relationship
 /// *values* only (#94's shape), so `ToManyRelationship` still resolves via
-/// [`fetch_to_side_rows`]'s live read, exactly as before.
+/// [`fetch_to_side_rows`]'s live read, exactly as before. The reads are
+/// [`RelationshipReads`], run here on a pooled connection; a direct writer
+/// runs the same reads in its own transaction instead ([`DirectRederive`]).
 ///
-/// `old_rows`, when supplied, is the same-length, same-index decoded
-/// pre-image of each of `rows`' underlying changes — used only to widen the
-/// gen-bump touched-key set (see [`RelationshipGenBump`]'s doc comment) with
-/// each change's *old* join-key value, not to resolve anything the evaluator
-/// reads. `None` is the shape a direct writer's Re-derive ([`DirectRederive`])
-/// passes, since it isn't part of the staging
-/// ring's claim/fold/compute/apply pipeline this gen bump guards — that
-/// caller discards the returned gen-bump map entirely, so `None` simply
-/// costs it nothing beyond not bothering to compute the old-side half.
+/// `old_rows` is the same-length, same-index decoded pre-image of each of
+/// `rows`' underlying changes — used to widen the gen-bump touched-key set
+/// (see [`RelationshipGenBump`]'s doc comment) with each change's *old*
+/// join-key value.
 ///
-/// `changes`, when supplied, is the same-length, same-index slice of
-/// [`FoldedChange`]s `rows`/`old_rows` were decoded from — issue #133's
-/// signal, read for its `group_key` (the real, pre-fold union of touched
-/// join keys; see that field's doc comment) and unioned into the same
-/// gen-bump touched-key set `old_rows` widens. `None` for the same
-/// [`DirectRederive`] caller as `old_rows`: that path has no
-/// `FoldedChange`s at all (a live full-table scan, not the staging ring's
-/// pipeline) and, as above, discards the gen-bump map regardless.
+/// `changes` is the same-length, same-index slice of [`FoldedChange`]s
+/// `rows`/`old_rows` were decoded from — issue #133's signal, read for its
+/// `group_key` (the real, pre-fold union of touched join keys; see that
+/// field's doc comment) and unioned into the same gen-bump touched-key set
+/// `old_rows` widens.
 pub(crate) async fn build_relationship_context(
     pool: &Pool,
     qualified_source: &str,
     def: &TransformDef,
     rows: &[Option<Row>],
-    old_rows: Option<&[Option<Row>]>,
-    changes: Option<&[&FoldedChange]>,
+    old_rows: &[Option<Row>],
+    changes: &[&FoldedChange],
 ) -> Result<(RelationshipContext, HashMap<i64, RelationshipGenBump>), ApplyError> {
-    // Group the referenced columns by relationship name (a relationship may be
-    // read for more than one column across the definition's fields).
-    let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
-    for (rel, column) in eval::relationship_references(def) {
-        let cols = cols_by_rel.entry(rel).or_default();
-        if !cols.contains(&column) {
-            cols.push(column);
-        }
-    }
+    let reads = RelationshipReads::resolve(pool, qualified_source, def).await?;
+    // The join keys: the distinct non-NULL `from_col` values of the
+    // from-side rows this batch evaluates, so only the related rows those
+    // rows need are fetched.
+    //
+    // Issue #136: also `old_rows`' own `from_col` values, not just `rows`'
+    // (new-side) — a `KeySpace::OneToOne` caller never needed this (it only
+    // ever evaluates the *new* row, so the old parent's value is never
+    // read), but the forward aggregate delta path does: it must resolve a
+    // row's contribution under *both* its old and new relationship value
+    // when the row's own `from_col` itself changes within one folded update
+    // (a re-point), to subtract the old contribution and add the new one
+    // rather than silently treating the old side as "no match". Folding in
+    // an extra key here only ever costs fetching one more (unused)
+    // projection row for a `KeySpace::OneToOne` caller — never a
+    // correctness problem, per this function's own "spurious extra touched
+    // key" rule below.
+    let evaluated: Vec<&Row> = rows.iter().chain(old_rows.iter()).flatten().collect();
+    let ctx = {
+        let client = pool.get().await?;
+        reads.fetch(&**client, &evaluated).await?
+    };
 
-    let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
-    let mut to_many_by_name: HashMap<String, ToManyRelationship> = HashMap::new();
     let mut gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
-
-    for (rel_name, columns) in cols_by_rel {
-        let Some(reldef) =
-            catalog::relationship_on_source(pool, qualified_source, &rel_name).await?
-        else {
-            // Unknown relationship: leave it out and let the evaluator surface
-            // `EvalError::UnknownRelationship`, the same as the pure path.
+    for read in &reads.reads {
+        let ReadKind::ToOne(Some(projection)) = &read.kind else {
             continue;
         };
-        let from_col = reldef.def.from_col.clone();
-        let to_col = reldef.def.to_col.clone();
-        // Issue #372: the to-side the relationship was declared against,
-        // never the bare `to_table` re-resolved through this session's
-        // `search_path`. Unquoted (issue #561): the lookups below quote it
-        // for `to_regclass`, and `fetch_to_side_rows` for interpolation.
-        let to_table = reldef.qualified_to_table();
+        // #130's gen-bump signal, widened by #133 — see
+        // [`RelationshipGenBump`]'s doc comment. Three sources, all unioned
+        // (a spurious extra touched key only ever costs a zero-row `UPDATE`,
+        // never a correctness problem — see the Phase 3 gen-bump step's own
+        // doc comment): the folded endpoints (both folded new-side join keys
+        // just resolved above, and every change's own folded old-image
+        // `from_col` value — a re-point's *previous* parent, which the
+        // new-side scan never sees), plus #133's real pre-fold signal: every
+        // touched change's own `group_key` union, which is what still names
+        // a parent (like the plan doc's "post 3") the fold erased from
+        // *both* folded endpoints within this same batch.
+        let mut touched: std::collections::HashSet<String> =
+            read.join_keys(&evaluated).into_iter().collect();
+        for old_row in old_rows.iter().flatten() {
+            // Issue #677: a to-one's from-side images `from_col` (it is in
+            // its capture set), so an old image missing it is
+            // `MissingColumn`, not a parent silently left un-bumped.
+            if let Some(text) = required_column(old_row, &read.from_col, &read.name)? {
+                touched.insert(text.clone());
+            }
+        }
+        for change in changes {
+            if let Some(group_key) = &change.group_key {
+                touched.extend(group_key.iter().cloned());
+            }
+        }
+        if !touched.is_empty() {
+            gen_bumps
+                .entry(read.id)
+                .or_insert_with(|| RelationshipGenBump {
+                    qualified_projection: projection.qualified_projection.clone(),
+                    key_col: projection.key_col.clone(),
+                    touched_keys: std::collections::HashSet::new(),
+                })
+                .touched_keys
+                .extend(touched);
+        }
+    }
+    Ok((ctx, gen_bumps))
+}
 
-        // The join keys we need on the to-side: the distinct non-NULL
-        // `from_col` values of the from-side rows this batch evaluates.
-        //
-        // Issue #136: also folds in `old_rows`' own `from_col` values, not
-        // just `rows`' (new-side) — a `KeySpace::OneToOne` caller never
-        // needed this (it only ever evaluates the *new* row, so the old
-        // parent's value is never read), but the forward aggregate delta
-        // path does: it must resolve a row's contribution under *both* its
-        // old and new relationship value when the row's own `from_col`
-        // itself changes within one folded update (a re-point), to subtract
-        // the old contribution and add the new one rather than silently
-        // treating the old side as "no match". Folding in an extra key here
-        // only ever costs fetching one more (unused) projection row for a
-        // `KeySpace::OneToOne` caller — never a correctness problem, per
-        // this function's own "spurious extra touched key" rule below.
+/// A relationship-enriched definition's reads of its related rows: each
+/// relationship it reads, resolved from the catalog once, with the
+/// statement that fetches the related rows for a set of join keys.
+/// [`Self::fetch`] runs them on any client. A page's Phase 2 runs them on a
+/// pooled connection ([`build_relationship_context`]); a direct writer
+/// resolves them before its transaction and runs them inside it, after its
+/// entry lock and its read of the rows ([`DirectRederive`], issue #832).
+pub(crate) struct RelationshipReads {
+    reads: Vec<RelationshipRead>,
+}
+
+/// One relationship a definition reads ([`RelationshipReads`]).
+struct RelationshipRead {
+    /// `relationship_definitions.id`, which the gen bump is keyed by.
+    id: i64,
+    /// The relationship's name, which heads a `<rel>.<column>` path.
+    name: String,
+    /// The from-side column whose value is the join key.
+    from_col: String,
+    /// The referenced to-side columns' types.
+    to_columns: HashMap<String, ValueType>,
+    kind: ReadKind,
+}
+
+/// Where a [`RelationshipRead`]'s related rows come from.
+enum ReadKind {
+    /// A to-one relationship's settled parent projection (issue #130,
+    /// epic #127), never a live read of the to-side — see this module's doc
+    /// comment / plan doc §2 for why a live read double-counts the `δA⋈δB`
+    /// cross term on the forward path. `None` when the relationship has no
+    /// projection, which should be unreachable.
+    ToOne(Option<ProjectionRead>),
+    /// A to-many relationship's live to-side ([`to_side_rows_sql`]'s
+    /// statement): Phase 1 of epic #127 is to-one relationship *values*
+    /// only (#94's shape).
+    ToMany(String),
+}
+
+/// A to-one relationship's projection read ([`ReadKind::ToOne`]).
+struct ProjectionRead {
+    /// [`projection_rows_sql`]'s statement.
+    sql: String,
+    /// The projection, quoted for interpolation (the gen bump's).
+    qualified_projection: String,
+    /// The projection's key column, the relationship's `to_col`.
+    key_col: String,
+}
+
+impl RelationshipReads {
+    /// The reads of every relationship `def` references, on its source
+    /// `qualified_source` ([`crate::defs::Definition::source_table`]) — a
+    /// relationship's from-table, and the key its name is unique under
+    /// (issue #288). An unknown relationship is left out, and the evaluator
+    /// surfaces `EvalError::UnknownRelationship`, as the pure path does.
+    async fn resolve(
+        pool: &Pool,
+        qualified_source: &str,
+        def: &TransformDef,
+    ) -> Result<Self, ApplyError> {
+        // Group the referenced columns by relationship name (a relationship
+        // may be read for more than one column across the definition's
+        // fields).
+        let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
+        for (rel, column) in eval::relationship_references(def) {
+            let cols = cols_by_rel.entry(rel).or_default();
+            if !cols.contains(&column) {
+                cols.push(column);
+            }
+        }
+        let mut reads = Vec::with_capacity(cols_by_rel.len());
+        for (rel_name, columns) in cols_by_rel {
+            let Some(reldef) =
+                catalog::relationship_on_source(pool, qualified_source, &rel_name).await?
+            else {
+                continue;
+            };
+            // Issue #372: the to-side the relationship was declared against,
+            // never the bare `to_table` re-resolved through this session's
+            // `search_path`. Unquoted (issue #561): the lookups below quote
+            // it for `to_regclass`, and the statements for interpolation.
+            let to_table = reldef.qualified_to_table();
+            let to_col = &reldef.def.to_col;
+            let to_columns = to_column_types(pool, &to_table, &columns).await?;
+            let kind = match reldef.cardinality {
+                RelationshipCardinality::ToOne => {
+                    match catalog::relationship_projection(pool, reldef.id).await? {
+                        Some(projection) => ReadKind::ToOne(Some(ProjectionRead {
+                            sql: projection_rows_sql(pool, &projection, &to_table, to_col).await?,
+                            qualified_projection: projection.qualified_table(),
+                            key_col: to_col.clone(),
+                        })),
+                        None => {
+                            // Every to-one relationship gets a projection
+                            // unconditionally at `create_relationship` time
+                            // (#129's `ensure_relationship_projection_in_txn`)
+                            // — this should be unreachable. The resolve holds
+                            // no locks and can't assume the catalog is
+                            // self-consistent on that promise alone, so this
+                            // degrades to "nothing resolves" (an empty
+                            // to-side, same as a genuinely dangling join key)
+                            // rather than panicking.
+                            tracing::error!(
+                                relationship = %rel_name,
+                                from_table = %qualified_source,
+                                "to-one relationship has no settled parent projection; \
+                                 resolving as empty (should be unreachable — #129 creates \
+                                 one unconditionally)"
+                            );
+                            ReadKind::ToOne(None)
+                        }
+                    }
+                }
+                RelationshipCardinality::ToMany => {
+                    ReadKind::ToMany(to_side_rows_sql(pool, &to_table, to_col).await?)
+                }
+            };
+            reads.push(RelationshipRead {
+                id: reldef.id,
+                name: rel_name,
+                from_col: reldef.def.from_col.clone(),
+                to_columns,
+                kind,
+            });
+        }
+        Ok(Self { reads })
+    }
+
+    /// The related rows of `rows`, read on `client`, as the evaluator's
+    /// context: for each relationship, the to-side rows keyed by their
+    /// `to_col` text that `rows`' join keys reach.
+    pub(crate) async fn fetch(
+        &self,
+        client: &impl GenericClient,
+        rows: &[&Row],
+    ) -> Result<RelationshipContext, ApplyError> {
+        let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
+        let mut to_many_by_name: HashMap<String, ToManyRelationship> = HashMap::new();
+        for read in &self.reads {
+            let join_keys = read.join_keys(rows);
+            match &read.kind {
+                ReadKind::ToOne(projection) => {
+                    let to_rows_by_key = match projection {
+                        Some(projection) => {
+                            fetch_relationship_projection_rows(client, &projection.sql, &join_keys)
+                                .await?
+                        }
+                        None => HashMap::new(),
+                    };
+                    by_name.insert(
+                        read.name.clone(),
+                        ToOneRelationship {
+                            from_col: read.from_col.clone(),
+                            cardinality: RelationshipCardinality::ToOne,
+                            to_columns: read.to_columns.clone(),
+                            to_rows_by_key,
+                        },
+                    );
+                }
+                ReadKind::ToMany(sql) => {
+                    let to_rows_by_key = fetch_to_side_rows(client, sql, &join_keys).await?;
+                    to_many_by_name.insert(
+                        read.name.clone(),
+                        ToManyRelationship {
+                            from_col: read.from_col.clone(),
+                            to_columns: read.to_columns.clone(),
+                            to_rows_by_key,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(RelationshipContext::new(by_name).with_to_many(to_many_by_name))
+    }
+}
+
+impl RelationshipRead {
+    /// The distinct non-`NULL` `from_col` values of `rows`, in first-seen
+    /// order.
+    fn join_keys(&self, rows: &[&Row]) -> Vec<String> {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut join_keys: Vec<String> = Vec::new();
-        let old_rows_iter = old_rows.unwrap_or(&[]).iter().flatten();
-        for row in rows.iter().flatten().chain(old_rows_iter) {
-            if let Some(Some(text)) = row.get(&from_col)
+        let mut join_keys = Vec::new();
+        for row in rows {
+            if let Some(Some(text)) = row.get(&self.from_col)
                 && seen.insert(text.as_str())
             {
                 join_keys.push(text.clone());
             }
         }
-
-        let to_columns = to_column_types(pool, &to_table, &columns).await?;
-
-        match reldef.cardinality {
-            RelationshipCardinality::ToOne => {
-                let projection = catalog::relationship_projection(pool, reldef.id).await?;
-                let qualified_projection = projection
-                    .as_ref()
-                    .map(catalog::RelationshipProjection::qualified_table);
-
-                let to_rows_by_key = match &projection {
-                    Some(projection) => {
-                        fetch_relationship_projection_rows(
-                            pool, projection, &to_table, &to_col, &join_keys,
-                        )
-                        .await?
-                    }
-                    None => {
-                        // Every to-one relationship gets a projection
-                        // unconditionally at `create_relationship` time
-                        // (#129's `ensure_relationship_projection_in_txn`) —
-                        // this should be unreachable. Phase 2 holds no locks
-                        // and can't assume the catalog is self-consistent on
-                        // that promise alone, so this degrades to "nothing
-                        // resolves" (an empty to-side, same as a genuinely
-                        // dangling join key) rather than panicking.
-                        tracing::error!(
-                            relationship = %rel_name,
-                            from_table = %qualified_source,
-                            "to-one relationship has no settled parent projection; \
-                             resolving as empty (should be unreachable — #129 creates \
-                             one unconditionally)"
-                        );
-                        HashMap::new()
-                    }
-                };
-                by_name.insert(
-                    rel_name.clone(),
-                    ToOneRelationship {
-                        from_col: from_col.clone(),
-                        cardinality: RelationshipCardinality::ToOne,
-                        to_columns,
-                        to_rows_by_key,
-                    },
-                );
-
-                // #130's gen-bump signal, widened by #133 — see
-                // [`RelationshipGenBump`]'s doc comment. Three sources, all
-                // unioned (a spurious extra touched key only ever costs a
-                // zero-row `UPDATE`, never a correctness problem — see the
-                // Phase 3 gen-bump step's own doc comment): the folded
-                // endpoints (both folded new-side join keys just resolved
-                // above, and every change's own folded old-image `from_col`
-                // value — a re-point's *previous* parent, which the
-                // new-side scan never sees), plus #133's real pre-fold
-                // signal: every touched change's own `group_key` union,
-                // which is what still names a parent (like the plan doc's
-                // "post 3") the fold erased from *both* folded endpoints
-                // within this same batch.
-                if let Some(qualified_projection) = qualified_projection {
-                    let mut touched: std::collections::HashSet<String> =
-                        join_keys.iter().cloned().collect();
-                    if let Some(old_rows) = old_rows {
-                        for old_row in old_rows.iter().flatten() {
-                            // Issue #677: a to-one's from-side images
-                            // `from_col` (it is in its capture set), so an
-                            // old image missing it is `MissingColumn`, not a
-                            // parent silently left un-bumped.
-                            if let Some(text) = required_column(old_row, &from_col, &rel_name)? {
-                                touched.insert(text.clone());
-                            }
-                        }
-                    }
-                    if let Some(changes) = changes {
-                        for change in changes {
-                            if let Some(group_key) = &change.group_key {
-                                touched.extend(group_key.iter().cloned());
-                            }
-                        }
-                    }
-                    if !touched.is_empty() {
-                        gen_bumps
-                            .entry(reldef.id)
-                            .or_insert_with(|| RelationshipGenBump {
-                                qualified_projection,
-                                key_col: to_col.clone(),
-                                touched_keys: std::collections::HashSet::new(),
-                            })
-                            .touched_keys
-                            .extend(touched);
-                    }
-                }
-            }
-            RelationshipCardinality::ToMany => {
-                let grouped = fetch_to_side_rows(pool, &to_table, &to_col, &join_keys).await?;
-                to_many_by_name.insert(
-                    rel_name,
-                    ToManyRelationship {
-                        from_col,
-                        to_columns,
-                        to_rows_by_key: grouped,
-                    },
-                );
-            }
-        }
+        join_keys
     }
-
-    Ok((
-        RelationshipContext::new(by_name).with_to_many(to_many_by_name),
-        gen_bumps,
-    ))
 }
 
 // ---------------------------------------------------------------------
@@ -3143,7 +3230,8 @@ pub(crate) async fn release_to_one_projections(
     Ok(())
 }
 
-/// The to-side rows whose `to_col` matches any of `join_keys` (compared at
+/// The statement that reads the to-side rows whose `to_col` matches any of
+/// the join keys it binds as `$1` ([`fetch_to_side_rows`] runs it; compared at
 /// `to_col`'s own native type via [`key_column_pg_type`] — issue #125,
 /// falling back to the old `::text` comparison if the column can't be
 /// introspected), grouped by that key's `::text` (the evaluator's key
@@ -3154,15 +3242,7 @@ pub(crate) async fn release_to_one_projections(
 /// Decodes each row's columns via the same in-SQL `jsonb_each_text` unnest
 /// [`read_live_rows_batch`] uses. `to_table` is the to-side's unquoted,
 /// qualified identity (issues #372, #561), quoted here for interpolation.
-async fn fetch_to_side_rows(
-    pool: &Pool,
-    to_table: &str,
-    to_col: &str,
-    join_keys: &[String],
-) -> Result<HashMap<String, Vec<Row>>, ApplyError> {
-    if join_keys.is_empty() {
-        return Ok(HashMap::new());
-    }
+async fn to_side_rows_sql(pool: &Pool, to_table: &str, to_col: &str) -> Result<String, ApplyError> {
     let client = pool.get().await?;
     let col_ident = quote_ident(to_col);
     let tbl_ident = ddl::qualified_source_table(to_table);
@@ -3172,7 +3252,7 @@ async fn fetch_to_side_rows(
     // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
     let row_columns = live_row_columns(&**client, to_table).await?;
     let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
-    let sql = format!(
+    Ok(format!(
         "select m.jk, m.rn, e.key, e.value \
          from (select {col_ident}::text as jk, \
                       row_number() over () as rn, \
@@ -3180,8 +3260,19 @@ async fn fetch_to_side_rows(
                from {tbl_ident} t \
                where {filter}) m \
          cross join lateral jsonb_each_text(m.doc) e",
-    );
-    let db_rows = client.query(&sql, &[&join_keys]).await?;
+    ))
+}
+
+/// Runs [`to_side_rows_sql`]'s statement for `join_keys` on `client`.
+async fn fetch_to_side_rows(
+    client: &impl GenericClient,
+    sql: &str,
+    join_keys: &[String],
+) -> Result<HashMap<String, Vec<Row>>, ApplyError> {
+    if join_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let db_rows = client.query(sql, &[&join_keys]).await?;
     // Assemble each row by its stable `rn`, carrying its join key, then group.
     let mut assembled: HashMap<i64, (String, Row)> = HashMap::new();
     for db_row in db_rows {
@@ -3199,12 +3290,13 @@ async fn fetch_to_side_rows(
     Ok(grouped)
 }
 
-/// The settled parent projection's rows whose key column matches any of
-/// `join_keys` (issue #130, epic #127) — [`build_relationship_context`]'s
-/// to-one counterpart to [`fetch_to_side_rows`], reading `projection`
+/// The statement that reads the settled parent projection's rows whose key
+/// column matches any of the join keys it binds as `$1` (issue #130, epic
+/// #127; [`fetch_relationship_projection_rows`] runs it) — the to-one
+/// counterpart to [`to_side_rows_sql`], reading `projection`
 /// instead of the live to-side table. The projection's key column is a real
 /// `primary key` (`catalog::ensure_relationship_projection_in_txn`'s DDL), so
-/// unlike `fetch_to_side_rows` there is at most one row per key — no
+/// unlike the to-side read there is at most one row per key — no
 /// `row_number()`/grouping dance needed, just a per-key `Row` assembled the
 /// same `jsonb_each_text` way every other decode in this module uses. This
 /// also happens to return every column the projection carries (bookkeeping
@@ -3223,16 +3315,12 @@ async fn fetch_to_side_rows(
 /// key column with exactly `to_table`'s `to_col` type, so the two always
 /// agree. `to_table` is the to-side's unquoted, qualified identity (issues
 /// #372, #561).
-async fn fetch_relationship_projection_rows(
+async fn projection_rows_sql(
     pool: &Pool,
     projection: &catalog::RelationshipProjection,
     to_table: &str,
     key_col: &str,
-    join_keys: &[String],
-) -> Result<HashMap<String, Row>, ApplyError> {
-    if join_keys.is_empty() {
-        return Ok(HashMap::new());
-    }
+) -> Result<String, ApplyError> {
     let client = pool.get().await?;
     let key_ident = quote_ident(key_col);
     let pg_type = key_column_pg_type(pool, to_table, key_col).await?;
@@ -3242,13 +3330,24 @@ async fn fetch_relationship_projection_rows(
     let row_columns = live_row_columns(&**client, &projection.identity()).await?;
     let qualified_projection = projection.qualified_table();
     let doc_expr = row_as_text_jsonb_sql("p", &row_columns);
-    let sql = format!(
+    Ok(format!(
         "select p.{key_ident}::text as jk, e.key, e.value \
          from {qualified_projection} p \
          cross join lateral jsonb_each_text({doc_expr}) e \
          where {filter}"
-    );
-    let db_rows = client.query(&sql, &[&join_keys]).await?;
+    ))
+}
+
+/// Runs [`projection_rows_sql`]'s statement for `join_keys` on `client`.
+async fn fetch_relationship_projection_rows(
+    client: &impl GenericClient,
+    sql: &str,
+    join_keys: &[String],
+) -> Result<HashMap<String, Row>, ApplyError> {
+    if join_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let db_rows = client.query(sql, &[&join_keys]).await?;
     let mut rows: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
         let jk: String = db_row.get(0);
@@ -3492,10 +3591,7 @@ struct Rederive {
     paused: std::collections::HashSet<String>,
     /// A direct writer's: a row that fails to evaluate is left as it is.
     skip_failing: bool,
-    /// For a definition that reads a relationship. A row read in Phase 3
-    /// whose join key is not among the resolved ones is re-staged, so a
-    /// later page builds a context for it.
-    relationships: Option<JoinCoverage>,
+    relationships: RederiveRelationships,
 }
 
 impl std::fmt::Debug for Rederive {
@@ -3503,8 +3599,38 @@ impl std::fmt::Debug for Rederive {
         f.debug_struct("Rederive")
             .field("def", &self.def.target)
             .field("paused", &self.paused)
-            .field("relationships", &self.relationships.is_some())
+            .field(
+                "relationships",
+                &!matches!(self.relationships, RederiveRelationships::None),
+            )
             .finish()
+    }
+}
+
+/// Where a 1-1 Re-derive reads a relationship's related rows from.
+enum RederiveRelationships {
+    /// The definition reads no relationship.
+    None,
+    /// A page's: the context Phase 2 read, and the join keys it resolved. A
+    /// row read in Phase 3 whose join key is not among them is re-staged, so
+    /// a later page builds a context for it.
+    Phase2(JoinCoverage),
+    /// A direct writer's ([`DirectRederive`], issue #832): the related rows
+    /// are read in its transaction, after the entry lock and its read of the
+    /// rows, for exactly the rows it read. A parent change that commits
+    /// before that read is in it; one that commits after stages a recompute
+    /// of the rows it reaches, whose page waits on the entry lock and writes
+    /// after the writer.
+    UnderLock(RelationshipReads),
+}
+
+impl RederiveRelationships {
+    /// The context Phase 2 read, for a page's evaluation.
+    fn phase2(&self) -> Option<&RelationshipContext> {
+        match self {
+            RederiveRelationships::Phase2((ctx, _)) => Some(ctx),
+            RederiveRelationships::None | RederiveRelationships::UnderLock(_) => None,
+        }
     }
 }
 
@@ -6671,15 +6797,15 @@ pub(super) async fn compute_page(
             // relationship references stays on the plain `eval::evaluate`
             // path.
             let relationships = if eval::relationship_references(&def.def).is_empty() {
-                None
+                RederiveRelationships::None
             } else {
                 let (ctx, gen_bumps) = build_relationship_context(
                     pool,
                     &def.source_table,
                     &def.def,
                     &rows,
-                    Some(&old_rows),
-                    Some(&changes[..]),
+                    &old_rows,
+                    &changes,
                 )
                 .await?;
                 // Issue #130: merge this definition's touched-parent keys
@@ -6697,7 +6823,7 @@ pub(super) async fn compute_page(
                         })
                         .or_insert(bump);
                 }
-                Some(join_coverage(
+                RederiveRelationships::Phase2(join_coverage(
                     ctx,
                     rows.iter().chain(old_rows.iter()).flatten(),
                 ))
@@ -6735,8 +6861,12 @@ pub(super) async fn compute_page(
                     Some(last) if !change.has_recompute => {
                         let values = match (&change.new_image, row) {
                             (Some(_), Some(row)) => {
-                                let mut evaluated =
-                                    evaluate_one_to_one(&rederive, row, &mut regex_cache)?;
+                                let mut evaluated = evaluate_one_to_one(
+                                    &rederive,
+                                    rederive.relationships.phase2(),
+                                    row,
+                                    &mut regex_cache,
+                                )?;
                                 Some(evaluated_values(&field_names, &mut evaluated))
                             }
                             _ => None,
@@ -7598,13 +7728,16 @@ type Restage = DerivedRecompute;
 
 /// Evaluates a 1-1 definition over one source row, without its paused
 /// columns: an Apply's image in Phase 2, or a Re-derive's row in Phase 3.
+/// `relationships` is the context its relationship paths resolve against,
+/// `None` for a definition that reads no relationship.
 fn evaluate_one_to_one(
     rederive: &Rederive,
+    relationships: Option<&RelationshipContext>,
     row: &Row,
     regex_cache: &mut eval::RegexCache,
 ) -> Result<HashMap<String, Option<eval::Value>>, ApplyError> {
-    Ok(match &rederive.relationships {
-        Some((ctx, _)) => eval::evaluate_with_relationships_excluding(
+    Ok(match relationships {
+        Some(ctx) => eval::evaluate_with_relationships_excluding(
             &rederive.def,
             row,
             &rederive.source_columns,
@@ -7671,10 +7804,12 @@ fn join_coverage<'a>(
 /// A direct writer's Re-derive of 1-1 keys, outside a page (#623 D6):
 /// a field build's chunk over a relationship-enriched 1-1 target (a column
 /// resume, #625 F8b, `staging::build`). Settled on the
-/// ledger exactly as a page settles a Re-derive
-/// ([`settle_one_to_one_target`]). Built before the writer's transaction,
-/// since a relationship-enriched definition's context is read through the
-/// pool, as Phase 2 reads it.
+/// ledger as a page settles a Re-derive ([`settle_one_to_one_target`]),
+/// except that it reads the related rows in the writer's transaction, after
+/// the entry lock and its read of the rows
+/// ([`RederiveRelationships::UnderLock`], issue #832). Built before the
+/// writer's transaction, since the catalog it resolves those reads from is
+/// read through the pool.
 pub(crate) struct DirectRederive {
     target: String,
     plan: TargetPlan,
@@ -7709,14 +7844,11 @@ impl DirectRederive {
             live_row_columns(&**client, source_table).await?
         };
         let relationships = if eval::relationship_references(def).is_empty() {
-            None
+            RederiveRelationships::None
         } else {
-            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            let mut live = read_live_rows_batch(pool, source_table, &pk, &key_refs).await?;
-            let rows: Vec<Option<Row>> = keys.iter().map(|key| live.remove(key)).collect();
-            let (ctx, _gen_bumps) =
-                build_relationship_context(pool, source_table, def, &rows, None, None).await?;
-            Some(join_coverage(ctx, rows.iter().flatten()))
+            RederiveRelationships::UnderLock(
+                RelationshipReads::resolve(pool, source_table, def).await?,
+            )
         };
         let records = keys
             .iter()
@@ -7753,9 +7885,7 @@ impl DirectRederive {
     /// Settles the Re-derive in `txn`, reporting every changed key to
     /// `mutations`. A tombstone this writes is stamped with the latest
     /// segment there is, so it is collected once everything staged so far
-    /// has drained. A key whose row now joins through a key the context didn't
-    /// resolve is left as it is: each writer parks a catch-up that
-    /// re-derives every row once it finishes.
+    /// has drained.
     pub(crate) async fn settle(
         &self,
         txn: &Transaction<'_>,
@@ -7895,6 +8025,17 @@ async fn settle_one_to_one_target(
         .await?;
         (read.rows, Some(read.snapshot), seg_seq.max(read.seg))
     };
+    // A direct writer reads the related rows of the rows it just read, under
+    // the same entry lock (issue #832); a page evaluates against Phase 2's.
+    let under_lock;
+    let relationships = match &plan.rederive.relationships {
+        RederiveRelationships::UnderLock(reads) => {
+            let rows: Vec<&Row> = read.values().collect();
+            under_lock = reads.fetch(txn, &rows).await?;
+            Some(&under_lock)
+        }
+        other => other.phase2(),
+    };
     let mut regex_cache = eval::RegexCache::new();
     let mut restage: Vec<Restage> = Vec::new();
     let mut rederived: HashMap<&str, Option<Vec<Option<String>>>> = HashMap::new();
@@ -7902,7 +8043,7 @@ async fn settle_one_to_one_target(
         let values = match read.remove(key) {
             None => None,
             Some(row) => {
-                if let Some((_, covered)) = &plan.rederive.relationships
+                if let RederiveRelationships::Phase2((_, covered)) = &plan.rederive.relationships
                     && covered.iter().any(|(from_col, joined)| {
                         matches!(row.get(from_col), Some(Some(value)) if !joined.contains(value))
                     })
@@ -7917,12 +8058,16 @@ async fn settle_one_to_one_target(
                     ));
                     continue;
                 }
-                let mut evaluated =
-                    match evaluate_one_to_one(&plan.rederive, &row, &mut regex_cache) {
-                        Ok(evaluated) => evaluated,
-                        Err(_) if plan.rederive.skip_failing => continue,
-                        Err(err) => return Err(err),
-                    };
+                let mut evaluated = match evaluate_one_to_one(
+                    &plan.rederive,
+                    relationships,
+                    &row,
+                    &mut regex_cache,
+                ) {
+                    Ok(evaluated) => evaluated,
+                    Err(_) if plan.rederive.skip_failing => continue,
+                    Err(err) => return Err(err),
+                };
                 Some(evaluated_values(&plan.field_names, &mut evaluated))
             }
         };

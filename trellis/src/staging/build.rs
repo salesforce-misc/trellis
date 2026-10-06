@@ -192,7 +192,10 @@
 //!   existing target rows from one snapshot, leaving the entries alone. A
 //!   relationship-enriched 1-1 target, which only a column resume reaches
 //!   (`ALTER` refuses a relationship path), takes a page's whole-row
-//!   Re-derive of the range's keys instead (`apply::DirectRederive`). An
+//!   Re-derive of the range's keys instead (`apply::DirectRederive`), and
+//!   reads their related rows after the entry lock, as it reads the rows
+//!   (#832): a parent change that commits after that read stages a
+//!   recompute whose page waits on the lock and writes after the chunk. An
 //!   aggregate's fields are never held out of Apply, so neither call builds
 //!   one.
 //! - **The capture gate.** A field that reads a source column the source's
@@ -1881,6 +1884,13 @@ async fn run_rederive(
             FieldPlan::for_chunk(pool, &definition, fields, lo, hi, key_collations).await?
         }
     };
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        &**pool.get().await?,
+        super::interleave::PausePoint::BeforeChunkTransaction,
+        &definition.target_table,
+    )
+    .await?;
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
         chunk.id,
@@ -2012,9 +2022,10 @@ enum FieldPlan {
     OneToOne(one_to_one::OneToOnePlan, Vec<String>),
     /// A 1-1 target the Re-derive build's SQL can't render (a
     /// relationship-enriched one): a page's whole-row Re-derive of the
-    /// range's keys, built before the chunk's transaction (it reads the
-    /// relationships' context through the pool, as a page's Phase 2 does),
-    /// and how many keys it re-derives.
+    /// range's keys, built before the chunk's transaction (it resolves its
+    /// relationship reads from the catalog through the pool, and runs them
+    /// in the transaction, after the entry lock), and how many keys it
+    /// re-derives.
     Direct(Box<super::apply::DirectRederive>, usize),
     /// A range with no key to re-derive.
     Empty,

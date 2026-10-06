@@ -253,7 +253,14 @@ recompute instead, which a later page reads.
 entries as a page does and rewrite just the changed columns of their target
 rows from one snapshot, leaving the entries as they are. A relationship-
 enriched 1-1 target's field build re-derives each key's whole row instead,
-settled the same way as a page's Re-derive.
+settled the same way as a page's Re-derive, except that its chunk reads the
+relationship projection in its transaction, after the entry lock and its
+read of the rows, rather than before it as a page's Phase 2 does. A chunk
+can sit between its plan and its lock for a long time, and a parent change
+whose recompute drained in that window would otherwise have its value
+written over by the chunk's older read (#832). A parent change that commits
+after the chunk's read stages a recompute whose page waits on the entry
+lock and writes after the chunk.
 
 ### The ledger
 

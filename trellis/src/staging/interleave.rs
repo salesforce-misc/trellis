@@ -51,10 +51,13 @@
 //! `AfterEntryLock` around the entry lock of the keys that had an entry
 //! (after its insert of the others', #723), and `AfterRederiveRead`
 //! directly after its last read-and-write statement (the entries written
-//! and the deltas appended, uncommitted). Two points are a chunk's alone:
-//! [`PausePoint::BeforeChunkInsert`], after its read of the keys and
-//! before its insert, and [`PausePoint::AfterChunkSnapshot`], inside the
-//! insert, after its snapshot ([`pause_in_statement`]). The merger
+//! and the deltas appended, uncommitted). Three points are a chunk's alone:
+//! [`PausePoint::BeforeChunkTransaction`], after a claimed chunk is planned
+//! and before its transaction begins (any chunk `super::build::run_claimed`
+//! runs, a field build's included), [`PausePoint::BeforeChunkInsert`],
+//! after its read of the keys and before its insert, and
+//! [`PausePoint::AfterChunkSnapshot`], inside the insert, after its snapshot
+//! ([`pause_in_statement`]). The merger
 //! (`super::build::merge_deltas`) fires `AfterGroupUpsert` after its one
 //! statement, holding its claimed delta rows and its groups. A test runs
 //! either inside [`with_scope`] as it would a drain.
@@ -112,6 +115,11 @@ pub enum PausePoint {
     /// After a Re-derive's live read of the source (off the ledger, a
     /// forced group recompute).
     AfterRederiveRead,
+    /// After a claimed build chunk is planned, before its transaction
+    /// begins (`super::build::run_claimed`, #832): the plan read the
+    /// definition, its fields and the range's keys, and holds no lock and
+    /// no transaction id, so the ring seals and drains around it.
+    BeforeChunkTransaction,
     /// After a build chunk's read of its keys, before its insert of the
     /// entries of those that have none (#723).
     BeforeChunkInsert,
