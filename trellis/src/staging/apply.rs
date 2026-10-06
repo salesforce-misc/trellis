@@ -7364,7 +7364,8 @@ async fn lock_single_keys(
     columns: &str,
     keys: &[&str],
 ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    txn.query(
+    super::ledger::query_by_entry_key(
+        txn,
         &single_lock_statement(target_ident, pk_ident, pk_cast, columns),
         &[&keys],
     )
