@@ -720,7 +720,11 @@ pub(crate) async fn pause_readers_of_retyped(
             // A definition already frozen (paused by the operator,
             // quarantined) was paused for another reason first: it gets
             // the record, as before, but not the cause. Read under the lock
-            // the pause takes on its row anyway.
+            // the pause's update takes on an unfrozen row, so the status
+            // can't change before the update. A frozen row the update skips
+            // is locked here too: this transaction bumps no version fence
+            // and locks rows in id order, and a resume holding the row has
+            // finished its fence wait (ADR-0002, #744).
             let frozen = txn
                 .query_opt(
                     "select status from transform_definitions where id = $1 for no key update",
