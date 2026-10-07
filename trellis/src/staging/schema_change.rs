@@ -419,9 +419,12 @@ pub(crate) async fn pause_readers_of_unsupported(
 /// A key column the table no longer has is
 /// [`pause_readers_of_missing`]'s, which the pass runs first. Returns whether
 /// it paused any. Costs no query for a table no unpaused definition reads.
+/// `instance` is the capture pass's key for its database and schema, which
+/// keeps the in-place re-types that failed ([`retype_in_place`]).
 pub(crate) async fn pause_readers_of_retyped(
     client: &mut Client,
     schema: &str,
+    instance: &str,
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<bool, CaptureError> {
@@ -603,7 +606,7 @@ pub(crate) async fn pause_readers_of_retyped(
 
     // #824: each created table whose every drifted column widened by
     // changing only the catalog is re-typed here, and pauses nothing.
-    let in_place = retype_in_place(client, table, &checked).await?;
+    let in_place = retype_in_place(client, instance, table, &checked).await?;
 
     let mut pauses: Vec<(i64, Vec<String>, String)> = Vec::new();
     for Checked {
@@ -734,15 +737,25 @@ struct Checked {
 ///   for a `varchar`, `22003` for a `numeric`. A definition owns the table
 ///   when it has any column there, so every reader of a shared projection
 ///   does, since a projection write that fails is charged to each.
-/// - A table whose lock it can't get within the timeout is left as it is,
-///   and nothing is paused for it: the next pass tries again.
+/// - A table whose re-type fails transiently
+///   (`staging::quarantine::is_transient_error`: its lock not got within the
+///   timeout, a deadlock, a statement timeout's cancel, a lost connection)
+///   is left as it is, and nothing is paused for it: the next pass tries
+///   again.
 /// - A table whose re-type fails otherwise (a view on the column, say) is
-///   left to the pause, as a rewriting widening is.
+///   left to the pause when some column there outgrew its type, as a
+///   rewriting widening is. One whose columns all still hold every value
+///   (an unbounded `varchar` to `text`) pauses nothing, since its writes
+///   still succeed. Either way, the failure is remembered in this process
+///   ([`FAILED_RETYPES`]), and while the table's drift asks for the same
+///   statement, later passes don't try it again: it would only take the
+///   table's lock, fail and log again every pass.
 ///
 /// Returns the tables it re-typed, and those it left waiting for their
 /// lock: no definition pauses for either.
 async fn retype_in_place(
     client: &mut Client,
+    instance: &str,
     checked_table: &str,
     checked: &[Checked],
 ) -> Result<InPlace, CaptureError> {
@@ -761,6 +774,8 @@ async fn retype_in_place(
         }
     }
     let mut in_place = InPlace::default();
+    // Each table's re-type statement this pass, tried or not.
+    let mut attempted: Vec<(String, String)> = Vec::new();
     for (table, states) in widened {
         if !states.iter().all(|s| s.catalog_only()) {
             continue;
@@ -786,6 +801,21 @@ async fn retype_in_place(
         let Some((sql, labels)) = copies::retype_statements(&owned).into_iter().next() else {
             continue;
         };
+        let key = (
+            instance.to_string(),
+            checked_table.to_string(),
+            table.to_string(),
+        );
+        let failed_before = with_failed_retypes(|failed| failed.get(&key) == Some(&sql));
+        attempted.push((key.2.clone(), sql.clone()));
+        if failed_before {
+            tracing::debug!(
+                table = %checked_table,
+                copies = ?labels,
+                "not re-typing Trellis's columns in place: the same re-type failed before"
+            );
+            continue;
+        }
         let txn = client.transaction().await?;
         crate::locks::set_local_lock_timeout(&txn, crate::staging::quarantine::RETYPE_LOCK_TIMEOUT)
             .await?;
@@ -807,32 +837,70 @@ async fn retype_in_place(
                 );
                 in_place.retyped.insert(table.to_string());
             }
-            Err(err) if crate::locks::is_lock_not_available(&err) => {
+            Err(err) if crate::staging::quarantine::is_transient_error(&err) => {
                 drop(txn);
                 tracing::info!(
                     table = %checked_table,
                     copies = ?labels,
-                    "re-typing Trellis's columns in place waits for their table's lock; \
-                     retrying next pass"
+                    error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
+                    "re-typing Trellis's columns in place failed transiently; retrying next pass"
                 );
                 in_place.waiting.insert(table.to_string());
             }
             Err(err) => {
                 txn.rollback().await?;
+                let outcome = if states.iter().any(|s| s.outgrown()) {
+                    "pausing their definitions instead"
+                } else {
+                    "leaving them as they are, since they still hold every value"
+                };
                 tracing::warn!(
                     table = %checked_table,
                     copies = ?labels,
                     error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
-                    "couldn't re-type Trellis's columns in place; pausing their definitions instead"
+                    "couldn't re-type Trellis's columns in place; {outcome}"
                 );
+                with_failed_retypes(|failed| failed.insert(key, sql));
             }
         }
     }
+    // A failure is forgotten once its table's drift no longer asks for the
+    // statement that failed: the drift went, or changed.
+    with_failed_retypes(|failed| {
+        failed.retain(|(i, checked, table), sql| {
+            i != instance
+                || checked != checked_table
+                || attempted.iter().any(|(t, s)| t == table && s == sql)
+        })
+    });
     Ok(in_place)
 }
 
-/// The tables [`retype_in_place`] re-typed, and those it left waiting for
-/// their lock.
+/// The in-place re-types ([`retype_in_place`]) that failed for good, by
+/// capture instance (`capture::reconcile`'s key for a database and schema),
+/// the table checked and the table Trellis created: the statement that
+/// failed. Kept in this process only, so a restarted worker tries each once
+/// more.
+type FailedRetypes = BTreeMap<(String, String, String), String>;
+
+static FAILED_RETYPES: std::sync::Mutex<FailedRetypes> = std::sync::Mutex::new(BTreeMap::new());
+
+fn with_failed_retypes<T>(f: impl FnOnce(&mut FailedRetypes) -> T) -> T {
+    let mut guard = FAILED_RETYPES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut guard)
+}
+
+/// Forgets every in-place re-type that failed for `instance`: its staging
+/// worker in this process stopped, so a worker that takes over tries each
+/// once more.
+pub(crate) fn forget_failed_retypes(instance: &str) {
+    with_failed_retypes(|failed| failed.retain(|(i, _, _), _| i != instance));
+}
+
+/// The tables [`retype_in_place`] re-typed, and those it left to retry next
+/// pass after a transient failure.
 #[derive(Default)]
 struct InPlace {
     retyped: BTreeSet<String>,

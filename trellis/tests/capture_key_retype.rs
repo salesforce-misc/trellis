@@ -2380,6 +2380,154 @@ async fn a_re_type_in_place_that_fails_pauses_its_definition_instead() {
     assert_eq!(requests, 0);
 }
 
+/// Counts each in-place re-type of `public.item_names` the server starts,
+/// in a sequence a rolled-back `ALTER` doesn't undo, and fails it with the
+/// SQLSTATE in `public.retype_injection`, if any. An event trigger at
+/// `ddl_command_start` runs before the `ALTER` takes its lock.
+async fn watch_item_names_retypes(raw: &Client) {
+    raw.batch_execute(
+        "create table public.retype_injection (code text); \
+         create sequence public.retype_attempts; \
+         create function public.watch_retype() returns event_trigger language plpgsql as $$ \
+         declare injected text; \
+         begin \
+           if pg_catalog.current_query() ilike 'alter table %item_names%' then \
+             perform pg_catalog.nextval('public.retype_attempts'); \
+             select code into injected from public.retype_injection limit 1; \
+             if injected is not null then \
+               raise exception 'injected %', injected using errcode = injected; \
+             end if; \
+           end if; \
+         end $$; \
+         create event trigger watch_retype on ddl_command_start when tag in ('ALTER TABLE') \
+           execute function public.watch_retype();",
+    )
+    .await
+    .expect("watch item_names's re-types");
+}
+
+/// How many in-place re-types of `public.item_names` the server started
+/// ([`watch_item_names_retypes`]).
+async fn retype_attempts(raw: &Client) -> i64 {
+    raw.query_one(
+        "select case when is_called then last_value else 0 end from public.retype_attempts",
+        &[],
+    )
+    .await
+    .expect("read retype_attempts")
+    .get(0)
+}
+
+/// #824: an in-place re-type that fails transiently (a deadlock, a
+/// statement or lock timeout's cancel) changes nothing and pauses nothing,
+/// as one that can't get its lock doesn't: the next pass tries again.
+#[tokio::test]
+async fn a_re_type_in_place_that_fails_transiently_pauses_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    items(db.dsn(), &mut raw, &db.pool).await;
+    watch_item_names_retypes(&raw).await;
+
+    raw.batch_execute("alter table public.items alter column name type varchar(40)")
+        .await
+        .expect("widen the passthrough");
+    for (attempt, code) in ["40P01", "57014"].into_iter().enumerate() {
+        raw.execute("insert into public.retype_injection values ($1)", &[&code])
+            .await
+            .expect("inject the error");
+        capture_pass(&mut raw, &db.pool).await;
+        assert_eq!(retype_attempts(&raw).await, attempt as i64 + 1, "{code}");
+        assert_eq!(
+            status(&raw, "item_names").await,
+            TransformStatus::Live,
+            "{code}"
+        );
+        assert_eq!(
+            column_type(&raw, "public.item_names", "name").await,
+            "character varying(10)",
+            "{code}"
+        );
+        raw.batch_execute("delete from public.retype_injection")
+            .await
+            .expect("stop injecting");
+    }
+    let requests: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("read retype_releases")
+        .get(0);
+    assert_eq!(requests, 0);
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(retype_attempts(&raw).await, 3);
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(40)"
+    );
+}
+
+/// #824: an in-place re-type that fails for good on a column that isn't
+/// outgrown (an unbounded `varchar` to `text`, with a view on the target's
+/// column) pauses nothing, since the column still holds every value. The
+/// next pass doesn't try it again, so it doesn't take the target's lock
+/// every pass: only once the source's type changes again, here after the
+/// view is gone.
+#[tokio::test]
+async fn a_re_type_in_place_that_fails_on_a_column_not_outgrown_is_not_retried() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("alter table public.items alter column name type varchar")
+        .await
+        .expect("drop the passthrough's length");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying"
+    );
+    watch_item_names_retypes(&raw).await;
+
+    raw.batch_execute(
+        "create view public.item_name_list as select name from public.item_names; \
+         alter table public.items alter column name type text",
+    )
+    .await
+    .expect("a view on the target's column, then move the passthrough to text");
+    for pass in 0..2 {
+        capture_pass(&mut raw, &db.pool).await;
+        assert_eq!(retype_attempts(&raw).await, 1, "pass {pass}");
+        assert_eq!(
+            status(&raw, "item_names").await,
+            TransformStatus::Live,
+            "pass {pass}"
+        );
+        assert_eq!(
+            column_type(&raw, "public.item_names", "name").await,
+            "character varying",
+            "pass {pass}"
+        );
+    }
+
+    raw.batch_execute(
+        "drop view public.item_name_list; \
+         alter table public.items alter column name type varchar",
+    )
+    .await
+    .expect("drop the view, and move the passthrough back");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(retype_attempts(&raw).await, 1);
+    raw.batch_execute("alter table public.items alter column name type text")
+        .await
+        .expect("move the passthrough to text again");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(retype_attempts(&raw).await, 2);
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(column_type(&raw, "public.item_names", "name").await, "text");
+}
+
 /// #824: a 1-1 key re-typed in place (`varchar(10)` to `varchar(40)`)
 /// keeps the collation it copied from the source key, and its index. It is
 /// recorded at its new type, as a resume records it. Its target stores

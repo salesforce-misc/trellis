@@ -284,11 +284,16 @@ larger precision at the same scale. `character(n)` changes and `text` to
 keeps each index, so no definition pauses or rebuilds. A `varchar` key's
 widening is one of them: the key's copy is re-typed and its new type
 recorded. It runs one table per transaction, under the same lock timeout
-as a resume's re-type. A table whose lock it can't get in time is left as
-it is, nothing pauses, and the next pass tries again. A table where some
-column also needs a rewrite (`integer` to `bigint`) pauses as above. A
-table whose re-type fails for another reason (a view on the column) pauses
-too.
+as a resume's re-type. A table whose re-type fails transiently (its lock
+not got in time, a deadlock, a statement timeout) is left as it is,
+nothing pauses, and the next pass tries again. A table where some column
+also needs a rewrite (`integer` to `bigint`) pauses as above. A table
+whose re-type fails for another reason (a view on the column) pauses too
+when some column there outgrew its type. When none did (`varchar` to
+`text`), its writes still succeed, so it pauses nothing and keeps its old
+types. Either way the worker doesn't try that re-type again, and so
+doesn't take the table's lock for it every pass, until the source's type
+changes again or the worker restarts.
 
 A value written after the source widened and before the pass re-typed the
 column failed its write with `22001` (too long) or `22003` (numeric

@@ -192,6 +192,7 @@ pub async fn reconcile(
         match crate::staging::schema_change::pause_readers_of_retyped(
             client,
             schema,
+            instance,
             &snapshot.catalog,
             table,
         )
@@ -275,6 +276,7 @@ pub async fn reconcile(
         match crate::staging::schema_change::pause_readers_of_retyped(
             client,
             schema,
+            instance,
             &snapshot.catalog,
             table,
         )
@@ -610,11 +612,13 @@ fn report(instance: &str, table: &str, what: &str, log: impl FnOnce()) {
 
 /// Forgets every report of the instance with schema `schema` in database
 /// `database`: its staging worker in this process stopped, so a worker that
-/// takes over logs afresh. Its `capture_holdups` rows stay: they are what
-/// its last pass found, and the next worker's first pass rewrites them.
+/// takes over logs afresh, and tries each in-place re-type that failed once
+/// more. Its `capture_holdups` rows stay: they are what its last pass found,
+/// and the next worker's first pass rewrites them.
 pub fn forget_instance(database: &str, schema: &str) {
     let instance = instance_key(database, schema);
     with_reports(|reports| reports.retain(|(i, _), _| *i != instance));
+    crate::staging::schema_change::forget_failed_retypes(&instance);
 }
 
 fn forget_reports_except(instance: &str, known: &HashSet<&String>) {

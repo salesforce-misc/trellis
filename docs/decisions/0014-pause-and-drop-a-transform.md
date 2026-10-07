@@ -146,9 +146,14 @@ type, as a resume would. Its `ALTER` is the transaction's first statement, so it
 waits for the table's `ACCESS EXCLUSIVE` holding no other lock, and once it has the
 table it takes only the locks of the table's own indexes and TOAST table. So it can't
 close a lock cycle with a drain page, a build or a release: a page queued behind it
-waits at most the timeout. A table whose lock it can't get in time is left as it is,
-nothing pauses, and the next pass tries again. A table where some widened column
-needs a rewrite pauses its definitions as above, and so does one whose re-type fails.
+waits at most the timeout. A table whose re-type fails transiently (its lock not got
+in time, a deadlock, a statement timeout) is left as it is, nothing pauses, and the
+next pass tries again. A table where some widened column needs a rewrite pauses its
+definitions as above, and so does one whose re-type fails otherwise while some column
+there outgrew its type. One whose columns all still hold every value (`varchar` to
+`text`) keeps its old types and pauses nothing, since its writes still succeed. The
+worker doesn't retry a re-type that failed otherwise until the source's type changes
+again or the worker restarts, so it doesn't take the table's lock every pass.
 
 A value written between the source's `ALTER` and that re-type fails its write (`22001`
 or `22003`), and its key may be held. One whose characters past the old `varchar`
