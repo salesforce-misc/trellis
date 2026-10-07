@@ -120,6 +120,7 @@ use crate::pool::{Pool, quote_ident};
 use super::capture_audit::{self, CaptureFault};
 use super::converge;
 use super::error::StagingError;
+use super::holdup::{self, DrainFailure};
 use super::quarantine::{self, HeldKeys};
 
 /// One page's worth of bound for a [`self_check`] call — see the module doc
@@ -223,6 +224,12 @@ pub struct SelfCheckReport {
     /// keys with `Trellis::sample_quarantined` and release each with
     /// `Trellis::release_key`, or resume the definition.
     pub held_keys: Option<HeldKeys>,
+    /// Every page the drain keeps failing on with nothing charged or paused,
+    /// oldest first (#817), whichever definitions read its tables: an
+    /// instance-level finding, reported with every outcome. Each holds back
+    /// the targets of the tables it holds changes to, and with them the
+    /// convergence this audit waits on. Empty when there is none.
+    pub drain_failures: Vec<DrainFailure>,
 }
 
 /// What [`self_check`] found — see the module doc comment's "Quiescence"
@@ -442,6 +449,7 @@ pub async fn self_check(
     // compared is reported too.
     let client = pool.get().await?;
     report.held_keys = quarantine::held_keys(&**client, def.id).await?;
+    report.drain_failures = holdup::open(&**client).await?;
     Ok(report)
 }
 
@@ -480,6 +488,7 @@ async fn audit(
                 faults.into_iter().map(Divergence::Capture).collect(),
             ),
             held_keys: None,
+            drain_failures: Vec::new(),
         });
     }
 
@@ -500,6 +509,7 @@ async fn audit(
                 next_after: scope.after.clone(),
                 outcome: SelfCheckOutcome::NotCaughtUp,
                 held_keys: None,
+                drain_failures: Vec::new(),
             });
         }
         AwaitOutcome::CaughtUp(pass) => pass,
@@ -516,6 +526,7 @@ async fn audit(
             next_after: pass1.next_after,
             outcome: SelfCheckOutcome::Converged,
             held_keys: None,
+            drain_failures: Vec::new(),
         });
     }
 
@@ -527,6 +538,7 @@ async fn audit(
             next_after: pass1.next_after,
             outcome: SelfCheckOutcome::Diverged(divergences),
             held_keys: None,
+            drain_failures: Vec::new(),
         });
     }
 
@@ -543,6 +555,7 @@ async fn audit(
                 next_after: scope.after.clone(),
                 outcome: SelfCheckOutcome::NotCaughtUp,
                 held_keys: None,
+                drain_failures: Vec::new(),
             });
         }
         AwaitOutcome::CaughtUp(pass) => pass,
@@ -565,6 +578,7 @@ async fn audit(
         next_after: pass2.next_after,
         outcome,
         held_keys: None,
+        drain_failures: Vec::new(),
     })
 }
 

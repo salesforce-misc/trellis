@@ -327,14 +327,15 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // started in). V66 is unused. #769 added V69
     // (`backfill_chunks.key_collations`), #663 V70
     // (`capture_failures.kind`), #799 V71 (whole-key poison per
-    // transform), #760 V72 (`definition_key_types`), and #824 V74
-    // (`poison.sqlstate`, `retype_releases`). V73 is reserved for #817.
+    // transform), #760 V72 (`definition_key_types`), #824 V74
+    // (`poison.sqlstate`, `retype_releases`), and #817 V75 (`drain_holdups`).
+    // V73 is unused.
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
-            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74,
+            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75,
         ]
     );
 }

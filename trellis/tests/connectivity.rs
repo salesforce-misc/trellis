@@ -31,7 +31,7 @@ async fn migrate_up_is_idempotent() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
-            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74,
+            50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75,
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -133,9 +133,10 @@ async fn migrate_up_is_idempotent() {
         // started in). V66 is unused. #769 added V69
         // (`backfill_chunks.key_collations`), #663 V70
         // (`capture_failures.kind`), #799 V71 (whole-key poison per
-        // transform), #760 V72 (`definition_key_types`), and #824 V74
-        // (`poison.sqlstate`, `retype_releases`). V73 is reserved for #817.
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 to be applied"
+        // transform), #760 V72 (`definition_key_types`), #824 V74
+        // (`poison.sqlstate`, `retype_releases`), and #817 V75 (`drain_holdups`).
+        // V73 is unused.
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V75 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

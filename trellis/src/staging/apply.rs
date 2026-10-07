@@ -6333,7 +6333,10 @@ mod tests {
 
         let result = classify_and_retry(
             &pool,
-            7,
+            &[SegmentStep {
+                seg_seq: 7,
+                page: None,
+            }],
             "worker-a",
             "wake",
             &[],
@@ -10240,6 +10243,8 @@ pub(crate) async fn apply_page(
     let mut segments_drained = Vec::with_capacity(steps.len());
     for step in steps {
         let batch_drained = end_segment_step(txn, step, claimed_by).await?;
+        // #817: the page commits, so its holdup goes with this transaction.
+        super::holdup::clear(txn, step).await?;
         segments_drained.push((step.seg_seq, batch_drained));
     }
 
@@ -11172,7 +11177,7 @@ async fn drain_batch(
             Err(err) => {
                 classify_and_retry(
                     pool,
-                    representative_seg_seq,
+                    steps,
                     claimed_by,
                     wake_channel,
                     &folded,
@@ -11221,7 +11226,7 @@ async fn drain_batch(
                 drop(plan);
                 classify_and_retry(
                     pool,
-                    representative_seg_seq,
+                    steps,
                     claimed_by,
                     wake_channel,
                     &folded,
@@ -11256,8 +11261,71 @@ async fn drain_batch(
 /// threshold. That ends the drain call; the next drain cycle re-reads the
 /// batch and charges again (see [`quarantine::isolate_and_evict`]'s
 /// "one charge per drain call").
+///
+/// A failure surfaced while charging no key and pausing no definition is
+/// recorded as a drain holdup on `steps`' segments first (#817,
+/// [`super::holdup`]): a halt that paused nothing, isolation that reproduced
+/// nothing or hit its probe limit, and isolate-eligible retries exhausted.
+/// A transient failure, a lost claim, a fence miss and a below-threshold
+/// charge aren't.
 #[allow(clippy::too_many_arguments)]
 async fn classify_and_retry(
+    pool: &Pool,
+    steps: &[SegmentStep],
+    claimed_by: &str,
+    wake_channel: &str,
+    folded: &[FoldedChange],
+    attempts: &mut u32,
+    backoff: &mut FenceMissBackoff,
+    transient: &mut TransientRetry,
+    halt_retry: &mut HaltRetry,
+    err: ApplyError,
+) -> Result<(), ApplyError> {
+    match retry_or_surface(
+        pool,
+        steps[0].seg_seq,
+        claimed_by,
+        wake_channel,
+        folded,
+        attempts,
+        backoff,
+        transient,
+        halt_retry,
+        err,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(Surface::Plain(err)) => Err(err),
+        Err(Surface::Holdup(err)) => {
+            super::holdup::record(pool, steps, claimed_by, folded, &err).await;
+            Err(err)
+        }
+    }
+}
+
+/// How [`retry_or_surface`] surfaces a page's failure: whether it was
+/// charged to no one, and so is recorded as a drain holdup (#817).
+#[derive(Debug)]
+enum Surface {
+    /// Surfaced as is: retries a transient failure or a fence miss ran out
+    /// of, a lost claim, a key charged below the death threshold, or a
+    /// failure of the retry machinery itself.
+    Plain(ApplyError),
+    /// Charged to no one: [`classify_and_retry`] records a holdup first.
+    Holdup(ApplyError),
+}
+
+impl From<ApplyError> for Surface {
+    fn from(err: ApplyError) -> Self {
+        Surface::Plain(err)
+    }
+}
+
+/// [`classify_and_retry`]'s decision, one representative `seg_seq` for its
+/// log lines and isolation's bookkeeping.
+#[allow(clippy::too_many_arguments)]
+async fn retry_or_surface(
     pool: &Pool,
     seg_seq: i64,
     claimed_by: &str,
@@ -11268,7 +11336,7 @@ async fn classify_and_retry(
     transient: &mut TransientRetry,
     halt_retry: &mut HaltRetry,
     err: ApplyError,
-) -> Result<(), ApplyError> {
+) -> Result<(), Surface> {
     let attempt = *attempts;
     // Issue #620 A2a: a lost claim is nobody's key's fault, and nothing in
     // this call can get it back. Isolating it would probe every record under
@@ -11277,7 +11345,7 @@ async fn classify_and_retry(
     // holds the buckets now resumes from the last committed cursor. Bare or
     // wrapped (issue #670), as `classify` decides by the innermost error.
     if quarantine::is_claim_lost(&err) {
-        return Err(err);
+        return Err(Surface::Plain(err));
     }
     match quarantine::classify(&err) {
         // Version fence miss: reload schema and retry, backing off only on
@@ -11291,7 +11359,7 @@ async fn classify_and_retry(
                     error = %err,
                     "version fence miss retries exhausted; surfacing the failure"
                 );
-                return Err(err);
+                return Err(Surface::Plain(err));
             }
             tracing::debug!(seg_seq, attempt, error = %err, "version fence miss; retrying");
             let delay = backoff.next_delay();
@@ -11316,7 +11384,7 @@ async fn classify_and_retry(
                     error = %err,
                     "lock timeout retries exhausted; surfacing the failure"
                 );
-                return Err(err);
+                return Err(Surface::Plain(err));
             }
             let delay = transient.next_delay();
             tracing::warn!(
@@ -11343,7 +11411,7 @@ async fn classify_and_retry(
                     error = %err,
                     "transient failure retries exhausted; surfacing the failure"
                 );
-                return Err(err);
+                return Err(Surface::Plain(err));
             }
             let delay = transient.next_delay();
             tracing::debug!(
@@ -11376,7 +11444,7 @@ async fn classify_and_retry(
                     error = %err,
                     "isolate-eligible failure retries exhausted; surfacing the failure"
                 );
-                return Err(err);
+                return Err(Surface::Holdup(err));
             }
             let outcome = match quarantine::isolate_and_evict(
                 pool,
@@ -11397,7 +11465,7 @@ async fn classify_and_retry(
                 {
                     return halt(pool, seg_seq, attempts, halt_retry, probe_err).await;
                 }
-                Err(probe_err) => return Err(probe_err),
+                Err(probe_err) => return Err(Surface::Plain(probe_err)),
             };
             match outcome {
                 // #799: the key is poisoned for the definition it fails in
@@ -11448,7 +11516,7 @@ async fn classify_and_retry(
                         "isolation pinned the failure on key(s) still below the death threshold; \
                          charged one death each and surfacing the original failure"
                     );
-                    Err(err)
+                    Err(Surface::Plain(err))
                 }
                 quarantine::IsolationOutcome::NothingReproduced => {
                     tracing::debug!(
@@ -11456,7 +11524,7 @@ async fn classify_and_retry(
                         error = %err,
                         "isolation reproduced nothing; surfacing the original failure"
                     );
-                    Err(err)
+                    Err(Surface::Holdup(err))
                 }
                 // Warn: unlike `NothingReproduced`, part of the batch went
                 // unprobed, so a failing key may still be in it (issue #655).
@@ -11468,7 +11536,7 @@ async fn classify_and_retry(
                         "isolation hit its probe limit without pinning the failure on a key; \
                          surfacing the original failure"
                     );
-                    Err(err)
+                    Err(Surface::Holdup(err))
                 }
                 // Warn: a lock or deadlock storm stopped isolation before it
                 // could look at the batch (issue #670). Surfacing ends this
@@ -11486,7 +11554,7 @@ async fn classify_and_retry(
                         "isolation stopped: its latest probes all hit transient errors; charged \
                          nothing, surfacing the original failure so a later drain retries the page"
                     );
-                    Err(err)
+                    Err(Surface::Plain(err))
                 }
                 quarantine::IsolationOutcome::FuseDisabled => {
                     tracing::debug!(
@@ -11494,7 +11562,7 @@ async fn classify_and_retry(
                         error = %err,
                         "row-level death fuse disabled; surfacing the original failure unisolated"
                     );
-                    Err(err)
+                    Err(Surface::Holdup(err))
                 }
             }
         }
@@ -11509,7 +11577,8 @@ async fn classify_and_retry(
 ///
 /// A halt that paused nothing (a peer paused the closure first, or the
 /// failure persists without one) retries once per [`drain_batch`] call, for
-/// the peer's case, then surfaces `err` as before, so the page can't spin.
+/// the peer's case, then surfaces `err`, so the page can't spin. Nothing is
+/// charged, so it surfaces as a drain holdup (#817).
 ///
 /// A refused read or write (`42501`, issue #766) also has every retry skip
 /// the tables no unfrozen definition reads ([`HaltRetry::skip_frozen`]).
@@ -11519,7 +11588,7 @@ async fn halt(
     attempts: &mut u32,
     halt_retry: &mut HaltRetry,
     err: ApplyError,
-) -> Result<(), ApplyError> {
+) -> Result<(), Surface> {
     let paused = super::halt::halt_closure(pool, &err).await?;
     if quarantine::is_insufficient_privilege(&err) {
         halt_retry.skip_frozen = true;
@@ -11544,7 +11613,9 @@ async fn halt(
         );
         return Ok(());
     }
-    Err(err)
+    // Paused nothing twice: a refused read or write the catalog pins on no
+    // table, say. Nothing is charged, so it is a holdup (#817).
+    Err(Surface::Holdup(err))
 }
 
 /// What [`halt`] keeps across one [`drain_batch`] call's retries.

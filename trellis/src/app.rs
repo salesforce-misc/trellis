@@ -117,6 +117,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
+use crate::staging::holdup::DrainFailure;
 use crate::staging::quarantine::{self, HeldKeys};
 use crate::staging::self_check::{SelfCheckError, SelfCheckMode, SelfCheckReport, SelfCheckScope};
 use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registry};
@@ -625,7 +626,7 @@ impl Trellis {
         let row = txn
             .query_opt(
                 &format!(
-                    "select d.status, d.id, d.source_table, \
+                    "select d.status, d.id, d.source_table, d.definition_text, \
                             pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                             pb.last_error as backfill_last_error, \
                             pb.next_attempt_at as backfill_next_attempt_at, \
@@ -652,6 +653,7 @@ impl Trellis {
             .await?;
         let mut status = None;
         let mut holdup = (None, None);
+        let mut drain_failure = None;
         if let Some(row) = &row {
             let status_text: String = row.get(0);
             let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
@@ -669,6 +671,16 @@ impl Trellis {
             {
                 holdup = self.capture_holdup(&*txn, row.get(2)).await?;
             }
+            // #817: a page the drain keeps failing on, charged to no one,
+            // holds back every definition still applying what it reads.
+            if !stored.is_frozen() {
+                drain_failure = crate::staging::holdup::for_definition(
+                    &*txn,
+                    row.get("source_table"),
+                    row.get("definition_text"),
+                )
+                .await?;
+            }
         }
         txn.commit().await?;
         let (capture_wait, stalled) = holdup;
@@ -678,6 +690,7 @@ impl Trellis {
             capture_wait,
             capture_failure: capture_failure(&row).or(stalled),
             held_keys: quarantine::held_keys_from(row.get("held_count"), row.get("held_since")),
+            drain_failure,
         }))
     }
 
@@ -1581,6 +1594,19 @@ pub struct DefinitionStatus {
     /// definition is resumed or dropped. [`Trellis::sample_quarantined`]
     /// pages the keys themselves, with each one's error.
     pub held_keys: Option<HeldKeys>,
+    /// Set while the drain keeps failing on a page holding changes to a
+    /// table the definition reads, as its source or through a relationship,
+    /// with nothing charged or paused (#817): a refused read or write the
+    /// catalog can't pin on a table (a column grant, a function's
+    /// `EXECUTE`, one of Trellis's own tables), records that fail only
+    /// together, isolation stopped at its probe limit, or an
+    /// isolate-eligible failure whose retries ran out. Every drain pass
+    /// retries the page, and the definition's target stops short of it until
+    /// one succeeds: fix the cause the error names. Reported on every
+    /// definition that isn't paused or quarantined, the oldest such page
+    /// first, and cleared when the page commits. Separate from
+    /// `capture_failure`: it pauses nothing.
+    pub drain_failure: Option<DrainFailure>,
 }
 
 /// Why capture of a table a definition reads is broken (issue #622 C6,

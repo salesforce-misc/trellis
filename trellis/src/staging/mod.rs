@@ -66,6 +66,7 @@ pub mod converge;
 pub mod error;
 pub mod fold;
 pub(crate) mod halt;
+pub(crate) mod holdup;
 #[cfg(any(test, feature = "test-util"))]
 pub mod interleave;
 pub(crate) mod ledger;
@@ -121,6 +122,7 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // `StagingError`'s own error-type precedent, so this flat re-export would
 // be unused.
 pub use capture_audit::CaptureFault;
+pub use holdup::DrainFailure;
 pub use quarantine::HeldKeys;
 pub use self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope,

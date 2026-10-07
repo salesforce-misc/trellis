@@ -46,7 +46,8 @@
 //! record carries the reason it found and Postgres's own message. A `42501`
 //! the catalog pins on no table (one about Trellis's own objects, say)
 //! pauses nothing: [`super::apply`]'s halt then retries the page once and
-//! surfaces the error, charging no key either way.
+//! surfaces the error, charging no key either way, as a drain holdup
+//! ([`super::holdup`]).
 //!
 //! A backfill marker's discharge that Postgres refuses the same way (a
 //! build's planning, or a go-live catch-up's re-read, issue #813) halts
