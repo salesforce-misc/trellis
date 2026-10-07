@@ -128,12 +128,12 @@ resume with columns to re-type records a request (`resume_requests`) and returns
 once, the definition still paused, and the staging worker's next capture pass re-types
 them, one table per transaction, then runs the resume itself. A crash between the two
 leaves the request, and the next pass (or the next `RESUME`) finishes the work. So does
-a table whose re-type fails transiently (its lock not got in time, a deadlock, a
-serialization failure, a statement timeout, a lost connection): the request stays, and
-the next pass tries again. A column whose re-type fails otherwise (a value its new type
-can't hold) ends the request with the error on the definition's `capture_failure`, and leaves that table's columns as they
-were; another table's, re-typed before it, keep their new types, and the next resume
-finds them current. The target keeps its rows. When its values can't be converted (a key
+a table whose re-type fails transiently (a lock it can't get in time, a deadlock, a
+serialization failure, a cancelled statement, a lost connection): the request stays,
+and the next pass tries again. A column whose re-type fails otherwise (a value its new
+type can't hold) ends the request with the error on the definition's
+`capture_failure`, and leaves that table's columns as they were; another table's,
+re-typed before it, keep their new types, and the next resume finds them current. The target keeps its rows. When its values can't be converted (a key
 moved from `text` to `uuid` by a `USING` that isn't a cast), the error names the repair:
 `DROP TRANSFORM` and define the definition again, which builds the target from empty.
 Trellis doesn't empty the target itself, because the application reads it: emptying it
