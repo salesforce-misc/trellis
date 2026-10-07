@@ -2076,8 +2076,9 @@ pub(super) async fn finish_groups(
 /// (`super::one_to_one_ledger::update_entries`). They also pin every read
 /// of a source by a batch's keys (`super::apply::live_rows_query`), the
 /// endpoint feed's re-read of a target by its keys
-/// (`super::target_mutations::read_new_images`), the resume sweep's delete
-/// by key (`crate::intake::resume_orphans`) and a composite-key 1-1
+/// (`super::target_mutations::read_new_images`), the resume sweep's locks,
+/// deletes and group reads by key (`crate::intake::resume_orphans`) and a
+/// composite-key 1-1
 /// target's pre-lock (`super::apply::lock_composite_keys`), which a table's
 /// lagging statistics price the same way.
 ///
@@ -2386,58 +2387,125 @@ pub(crate) async fn apply_ledger_target(
         .filter(|r| apply_of(r, rederive_all).is_none())
         .map(|r| r.key.as_str())
         .collect();
-    let mut read_images: HashMap<String, String> = HashMap::new();
-    let mut snapshot: Option<String> = None;
-    // The entries' segment stamp: the page's latest segment, or the newest
-    // one the Re-derive read's snapshot sees when that is newer (#742). The
-    // read is live, so it sees later batches' changes, and every change it
-    // sees is in that segment or an earlier one (see `chunk_statement`).
-    let mut entry_seg = seg_seq;
-    if !rederive.is_empty() {
-        let columns = plan.shape.source_reads();
-        let query = super::apply::live_rows_query(
-            &plan.source_table,
-            &plan.source_pk,
-            &columns,
-            &rederive,
-        )?;
-        let sql = format!(
-            "select null::text, pg_catalog.pg_current_snapshot()::text, \
-                    (select coalesce(max(seg_seq), 0) from segments) \
-             union all select m.k, m.doc::text, null::bigint from ({}) m",
-            query.docs
-        );
-        for row in query_by_entry_key(txn, &sql, &query.params()).await? {
-            let key: Option<String> = row.get(0);
-            let value: String = row.get(1);
-            match key {
-                None => {
-                    snapshot = Some(value);
-                    entry_seg = entry_seg.max(row.get::<_, i64>(2));
-                }
-                Some(key) => {
-                    read_images.insert(key, value);
-                }
-            }
-        }
-        // Test-only pause point (#623 D1), directly after the one
-        // read-and-snapshot statement: the chunked-read test depends on
-        // nothing committing between the two. See `super::interleave`.
-        #[cfg(any(test, feature = "test-util"))]
-        super::interleave::pause_at(
-            txn,
-            super::interleave::PausePoint::AfterRederiveRead,
-            &plan.target,
-        )
-        .await?;
-    }
+    let read = rederive_read(txn, plan, &rederive, seg_seq).await?;
 
-    // 3. The entries and the groups, in one statement.
+    // 3 to 5.
     for (i, record) in records.iter().enumerate() {
         if flags[i] {
-            images[i] = read_images.get(&record.key).map(String::as_str);
+            images[i] = read.images.get(&record.key).map(String::as_str);
         }
     }
+    let page = PageRecords {
+        records,
+        keys,
+        flags,
+        lsns,
+        txids,
+        images,
+    };
+    write_page(txn, plan, &page, &read, fresh, mutations).await
+}
+
+/// What a page's Re-derive read (step 2) found: each key's source row as
+/// its image, keyed by entry key (none for a key with no row), the read's
+/// snapshot (`None` when there was nothing to read) and the entries'
+/// segment stamp.
+struct RederiveRead {
+    images: HashMap<String, String>,
+    snapshot: Option<String>,
+    /// The page's latest segment, or the newest one the read's snapshot
+    /// sees when that is newer (#742). The read is live, so it sees later
+    /// batches' changes, and every change it sees is in that segment or an
+    /// earlier one (see `chunk_statement`).
+    entry_seg: i64,
+}
+
+/// Step 2 of [`apply_ledger_target`]: the source rows of `keys` and the
+/// snapshot they were read on, in one statement, after the entry lock.
+/// `seg_seq` is the page's latest segment.
+async fn rederive_read(
+    txn: &Transaction<'_>,
+    plan: &LedgerTargetPlan,
+    keys: &[&str],
+    seg_seq: i64,
+) -> Result<RederiveRead, ApplyError> {
+    let mut read = RederiveRead {
+        images: HashMap::new(),
+        snapshot: None,
+        entry_seg: seg_seq,
+    };
+    if keys.is_empty() {
+        return Ok(read);
+    }
+    let columns = plan.shape.source_reads();
+    let query = super::apply::live_rows_query(&plan.source_table, &plan.source_pk, &columns, keys)?;
+    let sql = format!(
+        "select null::text, pg_catalog.pg_current_snapshot()::text, \
+                (select coalesce(max(seg_seq), 0) from segments) \
+         union all select m.k, m.doc::text, null::bigint from ({}) m",
+        query.docs
+    );
+    for row in query_by_entry_key(txn, &sql, &query.params()).await? {
+        let key: Option<String> = row.get(0);
+        let value: String = row.get(1);
+        match key {
+            None => {
+                read.snapshot = Some(value);
+                read.entry_seg = read.entry_seg.max(row.get::<_, i64>(2));
+            }
+            Some(key) => {
+                read.images.insert(key, value);
+            }
+        }
+    }
+    // Test-only pause point (#623 D1), directly after the one
+    // read-and-snapshot statement: the chunked-read test depends on
+    // nothing committing between the two. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterRederiveRead,
+        &plan.target,
+    )
+    .await?;
+    Ok(read)
+}
+
+/// A page's records for one ledger target, in key order, with its
+/// statement's per-record parameters in the same order: each record's key,
+/// whether it is a Re-derive, and an Apply's `lsn`, `row_txid` and image (a
+/// Re-derive's image is its read's).
+struct PageRecords<'a> {
+    records: Vec<&'a LedgerRecord>,
+    keys: Vec<&'a str>,
+    flags: Vec<bool>,
+    lsns: Vec<Option<String>>,
+    txids: Vec<Option<&'a str>>,
+    images: Vec<Option<&'a str>>,
+}
+
+/// Steps 3 to 5 of [`apply_ledger_target`], once its entries are locked
+/// and its Re-derives read: the entries and the groups in one statement,
+/// the kept groups' recomputed fields, and the emptied groups' delete.
+/// `fresh` are the keys whose entry [`lock_entries`] inserted with their
+/// change applied. Returns the groups written and deleted.
+async fn write_page(
+    txn: &Transaction<'_>,
+    plan: &LedgerTargetPlan,
+    page: &PageRecords<'_>,
+    read: &RederiveRead,
+    fresh: Vec<String>,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    let PageRecords {
+        records,
+        keys,
+        flags,
+        lsns,
+        txids,
+        images,
+    } = page;
+    // 3. The entries and the groups, in one statement.
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
     #[cfg(any(test, feature = "test-util"))]
     let (visibility, drop_racing) = (
@@ -2458,13 +2526,13 @@ pub(crate) async fn apply_ledger_target(
         txn,
         &sql,
         &[
-            &keys,
-            &flags,
-            &lsns,
-            &txids,
-            &images,
-            &snapshot,
-            &entry_seg,
+            keys,
+            flags,
+            lsns,
+            txids,
+            images,
+            &read.snapshot,
+            &read.entry_seg,
             &plan.target,
             &stale_keys,
             &fresh_flags,
@@ -2511,6 +2579,70 @@ pub(crate) async fn apply_ledger_target(
         (hop_gen, src_changed, origin.flatten())
     })
     .await
+}
+
+/// The discharge orphan sweep's entry lock on a ledger target
+/// (`crate::intake::resume_orphans`, issue #884): [`lock_entries`] on
+/// `keys`, with a non-member placeholder for a key whose entry is gone, and
+/// nothing else. The sweep takes every batch's entry lock, in the ledger's
+/// key order, before it locks a group, then re-derives them with
+/// [`rederive_unbacked`].
+pub(crate) async fn lock_unbacked_entries(
+    txn: &Transaction<'_>,
+    plan: &LedgerTargetPlan,
+    keys: &[&str],
+) -> Result<(), ApplyError> {
+    lock_entries(txn, plan, keys, NewEntries::Placeholders, false).await?;
+    Ok(())
+}
+
+/// The discharge orphan sweep's Re-derive of `keys`, entries of `plan`'s
+/// ledger the sweep's read found live with no source row
+/// (`crate::intake::resume_orphans`, issue #884). The caller holds their
+/// entry locks ([`lock_unbacked_entries`]) and the locks of every group
+/// they are in. `plan` is the target's plan with no records. A tombstone
+/// takes `seg_seq` as its `applied_seg`, or the read's newest segment when
+/// that is newer. Returns the groups written and deleted.
+///
+/// It reads the keys' source rows as a page's Re-derive does, and
+/// re-derives only the keys the read finds no row for: each becomes a
+/// tombstone and leaves its group, one the caller locked, so the statement
+/// waits on no group lock. A key the read finds a row for, re-inserted
+/// since the sweep's read, is left as it is. The insert's own change
+/// drains after the discharge commits and applies to the entry (I2: the
+/// entry's `basis` predates it), moving it to the group the row is in now.
+/// Re-deriving it here would move it into that group under this statement,
+/// a group the caller can't have locked before it read the row.
+pub(crate) async fn rederive_unbacked(
+    txn: &Transaction<'_>,
+    plan: &LedgerTargetPlan,
+    keys: &[&str],
+    seg_seq: i64,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    let read = rederive_read(txn, plan, keys, seg_seq).await?;
+    let mut batch = plan.clone();
+    batch.records.clear();
+    for key in keys {
+        if !read.images.contains_key(*key) {
+            batch.push_rederive((*key).to_string());
+        }
+    }
+    if batch.records.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut records: Vec<&LedgerRecord> = batch.records.iter().collect();
+    records.sort_by(|a, b| a.key.cmp(&b.key));
+    let count = records.len();
+    let page = PageRecords {
+        keys: records.iter().map(|r| r.key.as_str()).collect(),
+        records,
+        flags: vec![true; count],
+        lsns: vec![None; count],
+        txids: vec![None; count],
+        images: vec![None; count],
+    };
+    write_page(txn, plan, &page, &read, Vec::new(), mutations).await
 }
 
 /// The plans of a page's statements that read `target`'s ledger by entry

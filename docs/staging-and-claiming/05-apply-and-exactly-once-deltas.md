@@ -481,6 +481,10 @@ rows. A replayed row would carry the releaser's `row_txid`, not the source
 transaction's. A catch-up discharge's orphan sweep finds live entries the
 source no longer backs and Re-derives them in its own transaction (each comes
 back a tombstone and leaves its group), stamping them with the newest segment.
+It locks every such entry, and then every group they are in, before its first
+Re-derive. A key's new source row could put it in a group it hasn't locked, so
+it re-derives only the keys its own read still finds no row for: a key
+re-inserted since keeps its entry, and the insert's Apply moves it.
 
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
