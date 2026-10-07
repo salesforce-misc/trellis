@@ -1825,3 +1825,86 @@ async fn a_drain_waits_out_a_held_lock_outside_its_transaction() {
     }
     assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
 }
+
+/// `key_deaths` and `drain_holdups` rows: what a page's failure charged or
+/// held up.
+async fn charges_and_holdups(client: &Client) -> (i64, i64) {
+    let row = client
+        .query_one(
+            "select (select count(*) from key_deaths), (select count(*) from drain_holdups)",
+            &[],
+        )
+        .await
+        .expect("count key deaths and holdups");
+    (row.get(0), row.get(1))
+}
+
+/// A connection that drops after page 1's COMMIT landed (#856): the drain
+/// sees only the dropped connection, a transient failure, and retries the
+/// page with the same records and claim ending. A non-final page still holds
+/// its claim, so the retry applies the page again. That moves nothing: each
+/// key's ledger entry already holds its change, so the change is no newer
+/// than the entry's `applied_lsn` (ADR-0002 I2) and moves its group by
+/// nothing. Doubling page 1's SUM/COUNT deltas would show up against the
+/// oracle.
+#[tokio::test]
+async fn a_non_final_page_retried_after_its_commit_landed_applies_nothing_twice() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    let ids: Vec<i32> = (1..=300).collect();
+    insert_items(&client, &ids).await;
+    let seg = seal(&mut client).await;
+
+    let mut hooks = DrainHooks {
+        lose_commit_reply_on_page: Some(1),
+        ..DrainHooks::default()
+    };
+    let outcome = drain(&db.pool, seg, "worker", 40, &mut hooks)
+        .await
+        .expect("the drain retries page 1 past the dropped connection")
+        .expect("the drain claims the segment");
+    assert_eq!(
+        hooks.lose_commit_reply_on_page, None,
+        "page 1's reply was lost"
+    );
+    assert!(outcome.pages > 1, "page 1 isn't the last: {outcome:?}");
+    assert_eq!(outcome.segments_drained, vec![(seg, true)]);
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+    assert_eq!(charges_and_holdups(&client).await, (0, 0));
+}
+
+/// A connection that drops after a final page's COMMIT landed (#856): the
+/// retry's completion finds the claim the commit released already gone, so
+/// it rolls back whole as `ClaimLost`, which is surfaced as it is: no
+/// charge, no holdup. The committed page stands.
+#[tokio::test]
+async fn a_final_page_retried_after_its_commit_landed_rolls_back_as_claim_lost() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    let ids: Vec<i32> = (1..=300).collect();
+    insert_items(&client, &ids).await;
+    let seg = seal(&mut client).await;
+
+    let mut hooks = DrainHooks {
+        lose_commit_reply_on_page: Some(1),
+        ..DrainHooks::default()
+    };
+    let result = drain(&db.pool, seg, "worker", 1000, &mut hooks).await;
+    assert_eq!(
+        hooks.lose_commit_reply_on_page, None,
+        "the page's reply was lost"
+    );
+    assert!(
+        matches!(result, Err(ApplyError::ClaimLost)),
+        "the retry finds the committed page's claim gone: {result:?}"
+    );
+    assert_eq!(segment_state(&client, seg).await.0, "drained");
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+    assert_eq!(charges_and_holdups(&client).await, (0, 0));
+}

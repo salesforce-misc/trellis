@@ -84,8 +84,8 @@ A change that reliably crashes the apply must not wedge its batch forever — bu
 silently skipping it makes a caller waiting on that change wait forever, or worse,
 be told it converged.
 
-**1. Isolate before blaming.** On a non-transient, non-halting apply failure,
-the page's `COMMIT` included (a
+**1. Isolate before blaming.** On a non-transient, non-halting failure of a
+page's apply or its `COMMIT` (a
 halting one pauses its closure instead — see *What must never be quarantined*
 below), the batch is bisected with `BEGIN … ROLLBACK` probes: each half is
 applied on its own, and only a half that fails is split and probed again, down to

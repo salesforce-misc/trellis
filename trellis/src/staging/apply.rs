@@ -10663,6 +10663,11 @@ pub struct DrainHooks {
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    /// Once page `n` (1-based) commits, end its session before the drain
+    /// sees the commit succeed: a connection that drops after its COMMIT
+    /// landed. The drain sees only the dropped connection, so it retries
+    /// the committed page (#856). Taken when it fires.
+    pub lose_commit_reply_on_page: Option<usize>,
 }
 
 /// Runs one full drain of `seg_seq`: see [`drain_many`], which this is the
@@ -10979,6 +10984,7 @@ async fn drain_segments(
                 claimed_by,
                 wake_channel,
                 watermark,
+                lose_commit_reply(hooks, 1),
             )
             .await?;
             return Ok(Some(outcome));
@@ -11060,6 +11066,7 @@ async fn drain_segments(
                 claimed_by,
                 wake_channel,
                 watermark,
+                lose_commit_reply(hooks, total.pages + 1),
             )
             .await?;
             total.absorb(outcome);
@@ -11087,6 +11094,15 @@ async fn drain_segments(
         "paged drain: the share was larger than the drain batch cap"
     );
     Ok(Some(total))
+}
+
+/// Takes [`DrainHooks::lose_commit_reply_on_page`] when `page` is the one it
+/// names.
+fn lose_commit_reply(hooks: &mut DrainHooks, page: usize) -> bool {
+    hooks
+        .lose_commit_reply_on_page
+        .take_if(|n| *n == page)
+        .is_some()
 }
 
 /// Takes [`DrainHooks::pause_before_page`]'s channels when `page` is the one
@@ -11135,6 +11151,7 @@ async fn drain_batch(
     claimed_by: &str,
     wake_channel: &str,
     watermark: &StagedWatermark,
+    mut lose_commit_reply: bool,
 ) -> Result<ManyApplyOutcome, ApplyError> {
     // Every retry-classification helper below (`classify_and_retry`,
     // `isolate_and_evict`) takes one representative `seg_seq` purely as
@@ -11210,11 +11227,22 @@ async fn drain_batch(
                 // is classified like an `apply_page` failure, which isolation can
                 // charge because its probes check deferred constraints too
                 // (`quarantine::probe_records`).
-                Ok(outcome) => txn
-                    .commit()
-                    .await
-                    .map(|()| outcome)
-                    .map_err(ApplyError::from),
+                //
+                // A connection can also drop after the COMMIT landed, so a
+                // transient retry may re-run a page that committed. A final
+                // page's retry finds the claim that commit released gone, and
+                // rolls back whole as `ClaimLost`. A non-final page's retry
+                // still holds its claim and applies again, which writes
+                // nothing new: every key's ledger entry already holds its
+                // change (ADR-0002 I2), a Re-derive reads its source again,
+                // and the cursor moves to where it already is.
+                Ok(outcome) => match txn.commit().await {
+                    Ok(()) if std::mem::take(&mut lose_commit_reply) => {
+                        Err(end_session(&**client).await)
+                    }
+                    Ok(()) => Ok(outcome),
+                    Err(err) => Err(err.into()),
+                },
                 Err(err) => {
                     let _ = txn.rollback().await;
                     Err(err)
@@ -11264,6 +11292,17 @@ async fn drain_batch(
             }
         }
     }
+}
+
+/// [`DrainHooks::lose_commit_reply_on_page`]: terminates `client`'s own
+/// session and returns the error the statement fails with, a dropped
+/// connection.
+async fn end_session(client: &impl GenericClient) -> ApplyError {
+    client
+        .batch_execute("select pg_terminate_backend(pg_backend_pid())")
+        .await
+        .expect_err("a session that terminates itself fails the statement")
+        .into()
 }
 
 /// Classifies `err` (per [`quarantine::classify`]) and either retries or
