@@ -577,23 +577,23 @@ while the column is paused.
 **Trigger:** a 1-1 definition with a field read through a to-one relationship
 (`author.name AS author_name`), and concurrent writes to both tables: child
 rows inserted, deleted and inserted again while their parent's value changes
-several times. No pause, resume, build or other action is involved. It has
-been seen once, in about 135 runs of one generated case under the
-steady-load tier's page and build chunk stalls.
+several times. No pause, resume, build or other action is involved. It is
+rare: one generated case fails in roughly one run in 100 under the
+steady-load tier's page and build chunk stalls, with other processes loading
+the machine.
 
 **Effect:** every child of one parent kept a value the parent held only
 briefly, after two later updates replaced it (61, then 17, then `NULL`; the
-children kept 61). This is silent, and a child stays wrong until it's written
-again.
+children kept 61). This is silent. Writing a child again doesn't correct it,
+since the write reads the same stale projection.
 
 **Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
 through a relationship (entry 16).
 
-**Planned work:** #838. The suspected cause, not yet confirmed against the
-generated case, is a page that re-derives a child (the recompute an earlier
-parent change staged). It evaluates the child against the projection it read
-before taking the child's entry lock, so if the recompute of a later parent
-change writes the child first, the page writes the older value over it. It
+**Planned work:** #838. The relationship projection's own row for the parent
+keeps the superseded value once everything has drained (61, while the parent
+holds `NULL`), so every child read through it gets that value: a parent
+change's advance of the projection is lost. What loses it isn't known yet. It
 isn't the shape of #763's to-one projection ordering holes (an orphaned or
 missing projection key), and it needs no resume or build. Milestone E (#624)
 replaces the relationship projection a 1-1 target reads its to-one values
