@@ -51,11 +51,12 @@
 //! only after this discharge commits, when a swept definition is `live` or
 //! `catching_up` and applies it. For a key of a swept target:
 //!
-//! - **Unbacked at *S***: deleted, whatever the source holds by the time the
-//!   delete runs. A change after *S* that backs the key again drains after
-//!   the commit and re-derives it: a 1-1 upsert, or an aggregate change onto
-//!   its ledger entry, which builds the group again from its entries (see
-//!   "Pending deltas on a deleted group").
+//! - **Unbacked at *S***: an aggregate group is deleted, whatever the source
+//!   holds by the time the delete runs. A change after *S* that refills it
+//!   drains after the commit and applies onto its row's ledger entry, which
+//!   builds the group again from its entries (see "Pending deltas on a
+//!   deleted group"). A 1-1 row is deleted only if the source still has no
+//!   row of its key when the delete runs (see "A 1-1 row backed again").
 //! - **Backed at *S***: kept, and the source row backing it at *S* is
 //!   enumerated, so its `Recompute` re-derives the 1-1 row, or the
 //!   aggregate row's ledger entry, from live state. A change after *S* that
@@ -124,11 +125,46 @@
 //! aborted discharge rolls back with nothing deleted and retries after the
 //! marker's backoff. Neither leaves anything stuck or wrong.
 //!
-//! Each delete also re-checks the definition's status, which by then is
-//! after the watermark wait: a pause that landed since the discharge read it
-//! (#331) leaves the target as the pause found it, and its own resume comes
-//! back here. The dispatch and the flips that move a swept definition out of
-//! the status it was read in come after the fetch.
+//! Each delete also re-checks the definition's status (and a 1-1 delete the
+//! source, below), which by then is after the watermark wait: a pause that
+//! landed since the discharge read it (#331) leaves the target as the pause
+//! found it, and its own resume comes back here. The dispatch and the flips
+//! that move a swept definition out of the status it was read in come after
+//! the fetch.
+//!
+//! # A 1-1 row backed again (issue #883)
+//!
+//! A change after *S* drains after the commit, but a page can still
+//! re-derive a 1-1 row from it before then: a `Recompute` of the key staged
+//! before *S* (an earlier discharge's enumeration, say) drains from a sealed
+//! segment while the discharge runs, and its read sees a source row inserted
+//! after *S*. The page writes the row and stamps its ledger entry with a
+//! basis that holds the insert, so the insert's own Apply, drained after the
+//! commit, is refused (ADR-0002 I2). Deleting that row by key would lose it
+//! for good.
+//!
+//! So a 1-1 delete re-checks the source, and keeps a row the source backs
+//! again. The sweep doesn't hold the row's ledger entry, which every other
+//! writer of a 1-1 row holds (`staging::one_to_one_ledger`); the row lock
+//! stands in for it. A page that re-derives a 1-1 row writes it under the
+//! row's lock, from a read of the source it made before the write (an Apply
+//! that drains before the commit is of a change committed before *S*, which
+//! the read already saw). The sweep locks its rows before it deletes them
+//! (see "Why the delete comes last"), so by the time the delete runs every
+//! page that wrote one of them has committed, and the delete, a statement of
+//! its own in a `READ COMMITTED` transaction, reads a snapshot that holds
+//! every source row such a page read. A row written since the lock, which the
+//! lock didn't find, the delete sees only if its page has committed, and then
+//! it sees that page's source row too.
+//!
+//! Keeping a 1-1 row the source backs again is safe because whatever backed
+//! it writes the whole row: the page that re-derived it, or the change that
+//! re-inserted it, whose Apply drains after the commit and is newer than the
+//! entry's basis. A row the source still doesn't back is deleted, and its
+//! entry stays as it was: live, if the change that emptied the key was
+//! skipped while the definition was paused or building, or is still pending.
+//! Either way the entry's basis predates that change, so the next change to
+//! the key applies (I2), as it would to a tombstone.
 //!
 //! # Pending deltas on a deleted group
 //!
@@ -274,6 +310,11 @@ struct SweptTarget {
     /// group is deleted only if it still has no live entry when the delete
     /// runs, since a Re-derive may have joined one since the read.
     ledger_guard: Option<String>,
+    /// Issue #883: for a 1-1 target, its source (quoted): a row is deleted
+    /// only if the source still has no row of its key when the delete runs,
+    /// since a page may have re-derived it from a row inserted since the
+    /// read ([`delete_statement`]).
+    source_guard: Option<String>,
     /// #623 D3: `Some` for a ledger target's entry sweep. Its branch finds
     /// the ledger's live entries the source no longer backs, and
     /// [`Sweep::finish`] re-derives them through this plan instead of
@@ -374,6 +415,7 @@ impl Sweep {
                         returning: String::new(),
                         has_image: false,
                         ledger_guard: None,
+                        source_guard: None,
                         ledger_rederive: Some(crate::staging::ledger::LedgerTargetPlan::new(
                             &target,
                             &source_table,
@@ -406,6 +448,8 @@ impl Sweep {
             )
             .await?;
             let image_expr = self.mutations.image_sql(txn, &target, "t").await?;
+            let source_guard = matches!(def.key_space, KeySpace::OneToOne)
+                .then(|| ddl::qualified_source_table(&source_table));
             let mut returning = ddl::pk_key_sql_expr(&key_cols, Some("t"));
             if let Some(expr) = &image_expr {
                 returning.push_str(&format!(", ({expr})::text"));
@@ -421,6 +465,7 @@ impl Sweep {
                 returning,
                 has_image: image_expr.is_some(),
                 ledger_guard: ledger,
+                source_guard,
                 ledger_rederive: None,
                 unbacked: Vec::new(),
             });
@@ -465,9 +510,11 @@ impl Sweep {
     /// returns what the sweep deleted.
     ///
     /// The read judged these rows unbacked on its snapshot, so this deletes
-    /// them by key, whatever the source holds by now: a key the source has
-    /// since backed again is re-derived by the change that backed it, which
-    /// drains after this discharge commits (see the module doc).
+    /// an aggregate's by key, whatever the source holds by now: a group the
+    /// source has since backed again is re-derived by the change that backed
+    /// it, which drains after this discharge commits. A 1-1 row is deleted
+    /// only if the source still doesn't back it (issue #883). See the module
+    /// doc.
     ///
     /// It runs once the whole read is fetched, and takes its locks in a
     /// drain page's order (ADR-0002 I5, issue #716): the 1-1 targets, then
@@ -969,36 +1016,59 @@ fn lock_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Strin
 }
 
 /// [`delete_keys`]'s delete: `target`'s rows of the keys in `arrays` (see
-/// [`keyset`]), with no live ledger entry left for a ledger target's group
-/// sweep, returning each deleted row's key (and prior image).
+/// [`keyset`]) that are still unbacked when it runs, returning each deleted
+/// row's key (and prior image). For a ledger target's group sweep, that is a
+/// group with no live ledger entry left; for a 1-1 target, a row whose source
+/// has no row of its key (issue #883). The 1-1 re-check relies on
+/// [`lock_statement`] having run first, in its own statement: see the module
+/// doc's "A 1-1 row backed again".
 fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> String {
     let Keyset {
         relation,
         condition,
     } = keyset(target, arrays);
-    let guard = match &target.ledger_guard {
-        Some(ledger) => {
-            use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
-            let matches: Vec<String> = target
-                .key_cols
-                .iter()
-                // Not `is not distinct from`, which no index serves.
-                .map(|c| {
-                    format!(
-                        "(l.{0} = t.{0} or (l.{0} is null and t.{0} is null))",
-                        quote_ident(&c.name)
-                    )
-                })
-                .collect();
-            format!(
-                " and not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
-                quote_ident(MEMBER_COLUMN),
-                quote_ident(TOMBSTONE_COLUMN),
-                matches.join(" and "),
-            )
-        }
-        None => String::new(),
-    };
+    let mut guard = String::new();
+    if let Some(ledger) = &target.ledger_guard {
+        use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
+        let matches: Vec<String> = target
+            .key_cols
+            .iter()
+            // Not `is not distinct from`, which no index serves.
+            .map(|c| {
+                format!(
+                    "(l.{0} = t.{0} or (l.{0} is null and t.{0} is null))",
+                    quote_ident(&c.name)
+                )
+            })
+            .collect();
+        guard.push_str(&format!(
+            " and not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
+            quote_ident(MEMBER_COLUMN),
+            quote_ident(TOMBSTONE_COLUMN),
+            matches.join(" and "),
+        ));
+    }
+    if let Some(source) = &target.source_guard {
+        // A 1-1 target's key is the source's own key, column for column, all
+        // `NOT NULL` (`one_to_one_match`). The source's side is bounded by
+        // the keys as the target's is ([`keyset_bound`]), so a source whose
+        // statistics lag isn't scanned whole.
+        let source_cols: Vec<String> = target
+            .key_cols
+            .iter()
+            .map(|c| format!("s.{}", quote_ident(&c.name)))
+            .collect();
+        let matches: Vec<String> = source_cols
+            .iter()
+            .zip(target_key_cols(target))
+            .map(|(s, t)| format!("{s} = {t}"))
+            .collect();
+        guard.push_str(&format!(
+            " and not exists (select 1 from {source} as s where {}{})",
+            matches.join(" and "),
+            keyset_bound(&source_cols, &target.key_cols, &null_patterns(arrays)),
+        ));
+    }
     format!(
         "delete from {} as t using {relation} as k where {condition}{guard} returning {}",
         target.target_ident, target.returning,
@@ -1773,6 +1843,267 @@ mod db_tests {
         assert_eq!(swept.expect("swept").deleted, 10001, "every row");
     }
 
+    /// Issue #883's setup: `orders_copy`, a `catching_up` 1-1 copy of
+    /// `public.orders` (ids 1 to 3), whose orders 1 and 3 are deleted with
+    /// no CDC (a delete the definition skipped), so both copies are
+    /// unbacked. A `Recompute` of order 1, staged before the sweep's read
+    /// (an earlier discharge's enumeration, say), waits in a sealed segment.
+    /// Returns a same-crate pool, a raw connection, the copy's definition
+    /// and that segment.
+    async fn copy_with_a_pending_recompute(
+        db: &testkit::TestDatabase,
+    ) -> (Pool, tokio_postgres::Client, Vec<i64>, i64) {
+        let (pool, mut raw) = connect(db).await;
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g text, a numeric); \
+             insert into public.orders values (1, 'a', 1), (2, 'a', 2), (3, 'a', 3)",
+        )
+        .await
+        .expect("seed orders");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.orders")
+            .await
+            .expect("make orders read as another definition's target");
+        crate::defs::catalog::install_definition(
+            &pool,
+            "TRANSFORM orders_copy FROM orders SELECT a AS a",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register");
+        crate::intake::markers::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 1, "the build finished");
+        raw.batch_execute("delete from public.orders where id in (1, 3)")
+            .await
+            .expect("unback orders 1 and 3");
+        let txn = raw.transaction().await.expect("begin");
+        crate::staging::append::append(
+            &txn,
+            &[crate::staging::append::StagedChange::Recompute {
+                src_table: "public.orders".to_string(),
+                key: "1".to_string(),
+                hop_gen: 0,
+                group_key: None,
+                src_changed: None,
+                prior_image: None,
+                origin_lsn: None,
+            }],
+        )
+        .await
+        .expect("stage the Recompute");
+        txn.commit().await.expect("commit the Recompute");
+        let seg = seal(&mut raw).await;
+        (pool, raw, ids, seg)
+    }
+
+    /// Seals the active segment and returns it.
+    async fn seal(client: &mut tokio_postgres::Client) -> i64 {
+        let outcome = crate::staging::seal::seal_phase1(client)
+            .await
+            .expect("seal phase 1");
+        crate::staging::seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        outcome.sealed_seg_seq
+    }
+
+    /// Drains sealed segment `seg` until no page is left: a bounded loop.
+    async fn drain(pool: &Pool, seg: i64) -> Result<(), crate::staging::apply::ApplyError> {
+        let watermark = crate::staging::watermark::StagedWatermark::saturated();
+        while crate::staging::apply::drain_once(pool, seg, "issue_883", 1, "wake", &watermark)
+            .await?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    /// Re-inserts order 1 (`a = 100`) and stages its CDC in the same
+    /// transaction, as a capture trigger does, so the Apply carries the
+    /// insert's own transaction id. It lands in the active segment.
+    async fn reinsert_order_1(writer: &mut tokio_postgres::Client) {
+        let txn = writer.transaction().await.expect("begin");
+        txn.execute("insert into public.orders values (1, 'a', 100)", &[])
+            .await
+            .expect("re-insert order 1");
+        let lsn: tokio_postgres::types::PgLsn = txn
+            .query_one("select pg_current_wal_insert_lsn()", &[])
+            .await
+            .expect("read the WAL position")
+            .get(0);
+        crate::staging::append::append(
+            &txn,
+            &[crate::staging::append::StagedChange::Cdc {
+                src_table: "public.orders".to_string(),
+                key: "1".to_string(),
+                op: crate::staging::CdcOp::Insert,
+                lsn: Some(lsn),
+                old_image: None,
+                new_image: Some(r#"{"id":"1","g":"a","a":"100"}"#.to_string()),
+                origin_lsn: None,
+                src_changed: None,
+                hop_gen: 0,
+                group_key: None,
+            }],
+        )
+        .await
+        .expect("stage the re-insert's Apply");
+        txn.commit().await.expect("commit the re-insert");
+    }
+
+    /// The copy's rows, `(id, a)` as text, by id.
+    async fn copy_rows(client: &tokio_postgres::Client) -> Vec<(String, String)> {
+        client
+            .query(
+                "select id::text, a::text from public.orders_copy order by id",
+                &[],
+            )
+            .await
+            .expect("read orders_copy")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    /// Issue #883: the sweep doesn't delete a 1-1 row the source backs again
+    /// by the time it deletes. The read judges order 1's copy unbacked, and
+    /// order 1 is then re-inserted. A page drains the `Recompute` staged
+    /// before the read, sees the re-insert, writes the row and stamps its
+    /// entry with a basis the insert is visible in, and commits. The sweep
+    /// then deletes.
+    ///
+    /// Deleting by key alone, the sweep removed the row the page wrote, and
+    /// the insert's own Apply, drained after the discharge commits, is
+    /// refused because the entry's basis already holds it (ADR-0002 I2): the
+    /// copy lost order 1 for good. Re-checking the source, the sweep keeps
+    /// it and still deletes order 3's.
+    #[tokio::test]
+    async fn a_sweep_keeps_a_one_to_one_row_a_page_rederived_after_its_read() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw, ids, pending) = copy_with_a_pending_recompute(&db).await;
+
+        let (_, mut sweeper) = connect(&db).await;
+        let txn = sweeper.transaction().await.expect("begin the discharge");
+        let mut sweep = Sweep::default();
+        sweep
+            .add(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect("plan the sweep");
+        assert!(
+            super::super::markers::declare_read(&txn, None, &sweep)
+                .await
+                .expect("declare the read")
+        );
+        super::super::markers::fetch_read(&txn, "", &mut sweep)
+            .await
+            .expect("fetch the read");
+
+        reinsert_order_1(&mut raw).await;
+        drain(&pool, pending).await.expect("drain the Recompute");
+        assert_eq!(
+            copy_rows(&raw).await,
+            vec![
+                ("1".to_string(), "100".to_string()),
+                ("2".to_string(), "2".to_string()),
+                ("3".to_string(), "3".to_string()),
+            ],
+            "the page re-derives order 1 from the re-insert"
+        );
+
+        let swept = sweep.finish(&txn).await.expect("finish the sweep");
+        txn.commit().await.expect("commit the discharge");
+
+        let active = seal(&mut raw).await;
+        drain(&pool, active).await.expect("drain the re-insert");
+        assert_eq!(
+            copy_rows(&raw).await,
+            vec![
+                ("1".to_string(), "100".to_string()),
+                ("2".to_string(), "2".to_string()),
+            ],
+            "the copy matches the source"
+        );
+        assert_eq!(swept.deleted, 1, "order 3's copy only");
+    }
+
+    /// Issue #883, with the page in flight when the sweep deletes: frozen
+    /// before its commit, holding order 1's copy that it re-derived from the
+    /// re-insert. The sweep's row lock queues on it, and once the page
+    /// commits, the delete's snapshot sees the re-insert the page read, so
+    /// the sweep keeps the row.
+    #[tokio::test]
+    async fn a_sweep_keeps_a_one_to_one_row_a_page_in_flight_rederived_after_its_read() {
+        use crate::staging::interleave::{PausePoint, PauseScope};
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw, ids, pending) = copy_with_a_pending_recompute(&db).await;
+
+        let (_, mut sweeper) = connect(&db).await;
+        let txn = sweeper.transaction().await.expect("begin the discharge");
+        let mut sweep = Sweep::default();
+        sweep
+            .add(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect("plan the sweep");
+        assert!(
+            super::super::markers::declare_read(&txn, None, &sweep)
+                .await
+                .expect("declare the read")
+        );
+        super::super::markers::fetch_read(&txn, "", &mut sweep)
+            .await
+            .expect("fetch the read");
+
+        reinsert_order_1(&mut raw).await;
+        let (_, ctl) = connect(&db).await;
+        ctl.execute("select pg_advisory_lock($1)", &[&PAGE_PAUSE])
+            .await
+            .expect("hold the pause lock");
+        let scope = PauseScope::new();
+        let reached = scope.arm(PausePoint::BeforeCommit, "public.orders_copy", PAGE_PAUSE);
+        let page = {
+            let pool = pool.clone();
+            tokio::spawn(crate::staging::interleave::with_scope(scope, async move {
+                drain(&pool, pending).await
+            }))
+        };
+        let frozen = reached.await.expect("the page reaches its commit");
+
+        let (swept, ()) = tokio::join!(sweep.finish(&txn), async {
+            wait_blocked_behind(&ctl, frozen.backend_pid).await;
+            ctl.execute("select pg_advisory_unlock($1)", &[&PAGE_PAUSE])
+                .await
+                .expect("release the page");
+        });
+        page.await
+            .expect("the page task")
+            .expect("drain the Recompute");
+        let swept = swept.expect("finish the sweep");
+        txn.commit().await.expect("commit the discharge");
+
+        let active = seal(&mut raw).await;
+        drain(&pool, active).await.expect("drain the re-insert");
+        assert_eq!(
+            copy_rows(&raw).await,
+            vec![
+                ("1".to_string(), "100".to_string()),
+                ("2".to_string(), "2".to_string()),
+            ],
+            "the copy matches the source"
+        );
+        assert_eq!(swept.deleted, 1, "order 3's copy only");
+    }
+
+    /// The advisory lock key [`a_sweep_keeps_a_one_to_one_row_a_page_in_flight_rederived_after_its_read`]
+    /// holds to freeze its page before the commit.
+    const PAGE_PAUSE: i64 = 883;
+
     /// Issue #518: a definition row whose text doesn't parse is an error the
     /// discharge fails its marker on (and backs off, #407), not a panic that
     /// takes down the maintenance loop.
@@ -1938,7 +2269,10 @@ mod db_tests {
     /// delete is explained the way [`Sweep::finish`] runs it, under
     /// `ENTRY_PLAN_SETTINGS`: with the bound alone, PostgreSQL 16 still
     /// scanned the target and filtered it (CI). [`lock_statement`] reads the
-    /// same keyset the same way, and the scan count below covers it.
+    /// same keyset the same way, and the scan count below covers it. The
+    /// single-column target is a 1-1 one, whose delete re-checks its source
+    /// (issue #883): the source's statistics lag the same way, and it is read
+    /// through the keys too.
     ///
     /// A composite key isn't bounded. With fresh statistics, a four-column
     /// key at 2M rows must not be matched by comparing every target row with
@@ -1963,10 +2297,16 @@ mod db_tests {
              insert into public.wide select i, 'k' || i, i, 'd' || i, i \
                  from generate_series(1, 2000000) i; \
              analyze public.wide; \
+             create table public.single_src (id int primary key) \
+                 with (autovacuum_enabled = false); \
              insert into public.single select i, i from generate_series(1, 100) i; \
+             insert into public.single_src select i from generate_series(1, 100) i \
+                 where i % 79 <> 0; \
              insert into public.composite select i, 'k' || i, i from generate_series(1, 100) i; \
-             analyze public.single; analyze public.composite; \
+             analyze public.single; analyze public.single_src; analyze public.composite; \
              insert into public.single select i, i from generate_series(101, 400000) i; \
+             insert into public.single_src select i from generate_series(101, 400000) i \
+                 where i % 79 <> 0; \
              insert into public.composite select i, 'k' || i, i \
                  from generate_series(101, 400000) i; \
              insert into public.composite values (null, 'k1', 0), (5, null, 0); \
@@ -1975,15 +2315,21 @@ mod db_tests {
         .await
         .expect("seed targets whose statistics lag");
         let cases = [
-            ("public.single", "t.total % 79 = 0", true),
-            ("public.wide", "t.total % 79 = 0", false),
+            (
+                "public.single",
+                "t.total % 79 = 0",
+                true,
+                Some("public.single_src"),
+            ),
+            ("public.wide", "t.total % 79 = 0", false, None),
             (
                 "public.composite",
                 "t.g is null or t.h is null or t.total % 79 = 0",
                 false,
+                None,
             ),
         ];
-        for (table, batch, bounded) in cases {
+        for (table, batch, bounded, source) in cases {
             let id: i64 = raw
                 .query_one(
                     "insert into transform_definitions \
@@ -2010,6 +2356,7 @@ mod db_tests {
                 branches: Vec::new(),
                 has_image: false,
                 ledger_guard: None,
+                source_guard: source.map(ddl::qualified_source_table),
                 ledger_rederive: None,
                 unbacked: Vec::new(),
             };
@@ -2068,26 +2415,27 @@ mod db_tests {
                 .rollback()
                 .await
                 .expect("roll back the explain's delete");
-            let name = &table["public.".len()..];
-            let scans: Vec<&str> = plan
-                .lines()
-                .filter(|line| line.contains(&format!(" on {name} ")))
-                .collect();
-            assert!(
-                !scans.is_empty(),
-                "{table}: no scan of the target in:\n{plan}"
-            );
-            for scan in scans {
-                let estimate: f64 = scan
-                    .split("rows=")
-                    .nth(1)
-                    .and_then(|rest| rest.split(' ').next())
-                    .and_then(|rows| rows.parse().ok())
-                    .expect("a row estimate");
-                assert!(
-                    !scan.contains("Seq Scan") && estimate <= rows.len() as f64,
-                    "{table}: the target must be read through the keys, got:\n{plan}"
-                );
+            // The target, and a 1-1 target's source (issue #883), whose
+            // statistics lag alike.
+            for read in std::iter::once(table).chain(source) {
+                let name = &read["public.".len()..];
+                let scans: Vec<&str> = plan
+                    .lines()
+                    .filter(|line| line.contains(&format!(" on {name} ")))
+                    .collect();
+                assert!(!scans.is_empty(), "{table}: no scan of {read} in:\n{plan}");
+                for scan in scans {
+                    let estimate: f64 = scan
+                        .split("rows=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(' ').next())
+                        .and_then(|rows| rows.parse().ok())
+                        .expect("a row estimate");
+                    assert!(
+                        !scan.contains("Seq Scan") && estimate <= rows.len() as f64,
+                        "{table}: {read} must be read through the keys, got:\n{plan}"
+                    );
+                }
             }
             let filtered: u64 = plan
                 .lines()
@@ -2099,7 +2447,14 @@ mod db_tests {
                 "{table}: the target must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
             );
-            let before = seq_scans_in_txn(&txn, table).await;
+            let scanned = |txn| async move {
+                let mut count = seq_scans_in_txn(txn, table).await;
+                if let Some(source) = source {
+                    count += seq_scans_in_txn(txn, source).await;
+                }
+                count
+            };
+            let before = scanned(&txn).await;
             let deleted: std::collections::HashSet<String> = delete_keys(&txn, &target, &arrays)
                 .await
                 .expect("delete")
@@ -2107,10 +2462,10 @@ mod db_tests {
                 .map(|row| row.get(0))
                 .collect();
             assert_eq!(
-                seq_scans_in_txn(&txn, table).await,
+                scanned(&txn).await,
                 before,
-                "{table}: the sweep's lock and delete must not scan the target, \
-                 as the delete's plan above doesn't"
+                "{table}: the sweep's lock and delete must not scan the target or its \
+                 source, as the delete's plan above doesn't"
             );
             txn.rollback().await.expect("roll back");
             assert_eq!(

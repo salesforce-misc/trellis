@@ -37,7 +37,11 @@
 //! snapshot saw it, or overtaken by a later change: writing it would put an
 //! older state over a newer one (#344, #392). The entry lock is what makes
 //! the check and the write one step: every writer of a key's target row
-//! holds its entry.
+//! holds its entry. The one exception is a marker discharge's orphan sweep
+//! (`crate::intake::resume_orphans`), which only deletes rows the source no
+//! longer backs. It holds the rows' locks instead, and deletes a row only if
+//! the source still has no row of its key on a snapshot taken after them
+//! (#883).
 //!
 //! The Re-derive build's 1-1 chunks (`super::build::one_to_one`) write target
 //! rows outside a page; each locks the entries of the keys it writes the

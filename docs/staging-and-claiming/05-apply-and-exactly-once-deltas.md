@@ -205,17 +205,25 @@ pass:
    settled by its insert, since with no entry I2 is only the truncate floor;
    a Re-derive's entry is a placeholder until step 3. Every Phase 3 writer of
    the key's target row holds the entry, so every Phase 3 for a key runs one
-   at a time. The one exception is the orphan sweep
-   (`intake::resume_orphans`), which a marker's discharge runs for a resume or a
-   one-pass build's go-live catch-up: it deletes 1-1 target rows, and aggregate
-   groups, the source no longer backs by key, without the entry. It judges
-   them unbacked on the snapshot of its own read, and any later change drains
-   after the sweep commits and re-derives the key, so it is ordered by that
-   snapshot argument instead. It runs only for definitions the Re-derive build
-   doesn't serve (a resumed definition it does serve gets the build's own
-   sweep instead), until milestone F (#625) moves them. It can't be the target row's `FOR UPDATE`: a stale insert racing a
-   delete has no row to lock. A key whose tombstone the GC collects between
-   the two statements fails the page transiently and it is retried (#712).
+   at a time. It can't be the target row's `FOR UPDATE`: a stale insert
+   racing a delete has no row to lock. A key whose tombstone the GC collects
+   between the two statements fails the page transiently and it is retried
+   (#712).
+
+   The one writer of a 1-1 target row that doesn't hold the entry is the
+   orphan sweep (`intake::resume_orphans`), which a marker's discharge runs
+   for a resume or a one-pass build's go-live catch-up. It only deletes. It
+   judges a row unbacked on the snapshot of its own read, locks the rows it
+   judged in key order, and then deletes each one only if the source still
+   has no row of its key. A page writes a 1-1 row under the row's lock, from
+   a source read it made before the write, so once the sweep holds the rows
+   its delete's snapshot sees every source row such a page read. It keeps a
+   row a page re-derived from a source row inserted after the sweep's read
+   (#883): that row's entry has a basis that holds the insert, so the
+   insert's own Apply is refused, and deleting the row would lose it. The
+   sweep runs only for definitions the Re-derive build doesn't serve (a
+   resumed definition it does serve gets the build's own sweep instead),
+   until milestone F (#625) moves them.
 2. **The Re-derive read (I1).** The Re-derived keys' source rows and
    `pg_current_snapshot()`, in one statement, after the lock. A key with no
    row is a delete.
