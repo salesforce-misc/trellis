@@ -13,7 +13,9 @@
 mod drain_driver;
 
 use drain_driver::{Driver, Running, WAKE};
+use tokio_postgres::types::PgLsn;
 use trellis::defs::ValueType;
+use trellis::staging::append::{StagedChange, append};
 use trellis::staging::build::one_to_one::{self, OneToOneOutcome, OneToOnePlan};
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine::{FailureClass, classify};
@@ -1534,21 +1536,7 @@ async fn a_page_rederive_joining_a_parent_outside_its_generation_bump_is_harmles
         .await
         .expect("the parent change");
     let parent_batch = d.seal().await;
-    let parent_plan = {
-        let mut client = d.pool().get().await.expect("a connection");
-        let txn = client.transaction().await.expect("begin phase 1");
-        claim::claim(&txn, parent_batch, "parent", 1)
-            .await
-            .expect("claim");
-        let share = claim::held_share(&*txn, parent_batch, "parent")
-            .await
-            .expect("held_share");
-        let folded = fold::fold(&txn, parent_batch, share.filter(share.buckets()))
-            .await
-            .expect("fold");
-        txn.commit().await.expect("commit phase 1");
-        apply::compute(d.pool(), &folded).await.expect("compute")
-    };
+    let parent_plan = compute_page(&d, parent_batch, "parent").await;
     let generation = parent_generation(&d, &projection, 2).await;
 
     d.release(&mut page, PausePoint::AfterPlaceholders).await;
@@ -1564,21 +1552,7 @@ async fn a_page_rederive_joining_a_parent_outside_its_generation_bump_is_harmles
         "the Re-derive bumped nothing for a parent outside its Phase 2 set"
     );
 
-    {
-        let mut client = d.pool().get().await.expect("a connection");
-        let txn = client.transaction().await.expect("begin phase 3");
-        apply::apply_and_mark_drained(
-            &txn,
-            parent_batch,
-            "parent",
-            &parent_plan,
-            WAKE,
-            &StagedWatermark::saturated(),
-        )
-        .await
-        .expect("apply the parent change");
-        txn.commit().await.expect("commit phase 3");
-    }
+    apply_computed_page(&d, parent_batch, "parent", &parent_plan).await;
     d.settle().await;
     assert_eq!(
         d.rows(KID_ACTUAL).await,
@@ -1587,20 +1561,59 @@ async fn a_page_rederive_joining_a_parent_outside_its_generation_bump_is_harmles
     );
 }
 
-/// The quoted, qualified projection of [`KID_DDL`]'s relationship `p`.
-async fn kid_projection(d: &Driver) -> String {
-    let id: i64 = d
-        .ctl
+/// A page's Phase 1 and Phase 2 for `batch` on worker `worker`: the claim
+/// and fold, committed, then `compute` on the pool. The page holds no
+/// transaction until [`apply_computed_page`] runs its Phase 3, so the ring
+/// seals and drains around it.
+async fn compute_page(d: &Driver, batch: i64, worker: &str) -> apply::ApplyPlan {
+    let mut client = d.pool().get().await.expect("a connection");
+    let txn = client.transaction().await.expect("begin phase 1");
+    claim::claim(&txn, batch, worker, 1).await.expect("claim");
+    let share = claim::held_share(&*txn, batch, worker)
+        .await
+        .expect("held_share");
+    let folded = fold::fold(&txn, batch, share.filter(share.buckets()))
+        .await
+        .expect("fold");
+    txn.commit().await.expect("commit phase 1");
+    apply::compute(d.pool(), &folded).await.expect("compute")
+}
+
+/// The Phase 3 of a page [`compute_page`] computed, committed.
+async fn apply_computed_page(d: &Driver, batch: i64, worker: &str, plan: &apply::ApplyPlan) {
+    let mut client = d.pool().get().await.expect("a connection");
+    let txn = client.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        batch,
+        worker,
+        plan,
+        WAKE,
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply the page");
+    txn.commit().await.expect("commit phase 3");
+}
+
+/// The id of relationship `name`.
+async fn relationship_id(d: &Driver, name: &str) -> i64 {
+    d.ctl
         .query_one(
             &format!(
-                "select id from {}.relationship_definitions where name = 'p'",
+                "select id from {}.relationship_definitions where name = $1",
                 trellis::config::DEFAULT_SCHEMA
             ),
-            &[],
+            &[&name],
         )
         .await
-        .expect("relationship p")
-        .get(0);
+        .expect("the relationship")
+        .get(0)
+}
+
+/// The quoted, qualified projection of [`KID_DDL`]'s relationship `p`.
+async fn kid_projection(d: &Driver) -> String {
+    let id = relationship_id(d, "p").await;
     trellis::defs::relationship_projection(d.pool(), id)
         .await
         .expect("read the projection catalog row")
@@ -1624,16 +1637,15 @@ async fn parent_generation(d: &Driver, projection: &str, id: i32) -> i64 {
 
 /// Issue #838's audit: a page's Apply evaluates its change against the
 /// parents its Phase 2 read before the entry lock. That read may feed the
-/// value written, unlike a Re-derive's: a parent change that commits after
-/// it can't advance the projection while the Apply's change is in flight
-/// (guard (c) defers the parent's reverse), so the Apply writes the value
-/// the projection still holds, and the reverse that follows re-derives the
-/// kids. Past guard (c)'s fairness escalation, the reverse's recompute reads
-/// the kids' rows after their changes, and I2 refuses the Apply if it comes
-/// later still (the to-many test below pins that path). Kids 1 and 2 change
-/// and their page stops before its entry lock; the parent change then
-/// drains and leaves the projection as it was until the stopped page
-/// commits.
+/// value written, unlike a Re-derive's: guard (c) defers the reverse of a
+/// parent change that commits after it while the Apply's change is in
+/// flight, so the Apply writes the value the projection still holds, and
+/// the reverse that follows re-derives the kids. Once the reverse escalates
+/// past its deferral budget, its recompute reads the kids' rows after their
+/// changes, and I2 refuses the Apply if it comes later still (the
+/// escalation tests below pin that path). Kids 1 and 2 change and their
+/// page stops before its entry lock; the parent change then drains and
+/// leaves the projection as it was until the stopped page commits.
 async fn a_page_apply_does_not_outlive_a_parent_change_after_its_read(change: ParentChange) {
     let mut d = start_kid().await;
     let user = d.user().await;
@@ -1697,6 +1709,8 @@ const PAR_EXPECTED: &str = "select p.id, p.val, \
 /// The kid change that races a parent's Apply.
 #[derive(Clone, Copy, Debug)]
 enum KidChange {
+    /// Kid 1 changes in place, under parent 1.
+    Update,
     /// A kid joins parent 1: the Apply would write the old count.
     Insert,
     /// Kid 1 leaves parent 1.
@@ -1708,6 +1722,7 @@ enum KidChange {
 impl KidChange {
     fn sql(self) -> &'static str {
         match self {
+            KidChange::Update => "update public.kid set a = a + 1 where id = 1",
             KidChange::Insert => "insert into public.kid values (3, 7, 1)",
             KidChange::Delete => "delete from public.kid where id = 1",
             KidChange::Repoint => "update public.kid set par_id = 1 where id = 2",
@@ -1722,7 +1737,12 @@ impl KidChange {
 /// page would stage (`accumulate_from_side_recomputes`, which no guard
 /// defers) drains and writes the new count. When the stopped page goes on, I2
 /// refuses its Apply: the recompute read parent 1's row after the Apply's
-/// change, so the Apply can't put its older count back.
+/// change, so the Apply can't put its older count back. The kid change is
+/// written past capture and its recompute staged by hand: while the stopped
+/// page's segment is undrained, the four-slot ring takes one more seal, and
+/// the kid change's own page would stage the recompute into the segment
+/// after it. `reverse_recompute_to_many_stages_from_side_recomputes`
+/// (`apply_relationships.rs`) pins that a kid change's page stages it.
 async fn a_page_apply_does_not_outlive_a_kid_change_after_its_read(change: KidChange) {
     let mut d = Driver::start_with_relationships(
         KID_DDL,
@@ -1783,4 +1803,107 @@ async fn a_page_apply_does_not_outlive_a_kid_delete_after_its_read() {
 #[tokio::test]
 async fn a_page_apply_does_not_outlive_a_kid_repoint_after_its_read() {
     a_page_apply_does_not_outlive_a_kid_change_after_its_read(KidChange::Repoint).await;
+}
+
+// ------------- a page Apply against a parent reverse's fairness escalation
+
+/// Issue #838's audit, the to-one case past guard (c): a parent's reverse
+/// that guard (c) has deferred `RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD - 1`
+/// times escalates on its next rejection, advancing the projection while a
+/// kid's change is still in flight. The kid change's page runs its Phase 2,
+/// reading parent 1's old value, and stops before its Phase 3. Parent 1 then
+/// changes, and the reverse's page escalates: it advances the projection and
+/// stages a recompute of every kid under parent 1, whose page writes the new
+/// value. When the stopped page goes on, I2 refuses its Apply: the
+/// recompute read the kid's row after the Apply's change.
+///
+/// The reverse is staged by hand, already deferred that often, in a segment
+/// sealed before the kid's: while the kid's segment is undrained, the
+/// four-slot ring takes one more seal, which the escalation's recompute
+/// needs. Its image of parent 1 is the change written past capture after
+/// the kid's Phase 2.
+async fn a_page_apply_does_not_outlive_an_escalated_parent_reverse(change: KidChange) {
+    let mut d = start_kid().await;
+    let relationship_id = relationship_id(&d, "p").await;
+    let lsn: PgLsn = d
+        .ctl
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("a WAL position")
+        .get(0);
+    {
+        let mut client = d.pool().get().await.expect("a connection");
+        let txn = client.transaction().await.expect("begin");
+        append(
+            &txn,
+            &[StagedChange::RelationshipReverseDeferred {
+                src_table: format!("\u{1f}trellis-rel-reverse-deferred:{relationship_id}"),
+                key: "1".to_string(),
+                old_image: Some(r#"{"id": "1", "val": "10"}"#.to_string()),
+                new_image: Some(r#"{"id": "1", "val": "20"}"#.to_string()),
+                lsn: Some(lsn),
+                src_changed: None,
+                origin_lsn: None,
+                relationship_id,
+                retry_count: apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD - 1,
+                group_key: Some(vec!["1".to_string()]),
+            }],
+        )
+        .await
+        .expect("stage the deferred reverse");
+        txn.commit().await.expect("commit the deferred reverse");
+    }
+    let reverse_batch = d.seal().await;
+
+    let user = d.user().await;
+    user.batch_execute(change.sql())
+        .await
+        .expect("the kid change");
+    let kid_batch = d.seal().await;
+    let kid_plan = compute_page(&d, kid_batch, "kid").await;
+    write_uncaptured_on(&d, "public.par", ParentChange::Update.sql()).await;
+
+    let outcome = d
+        .drain(reverse_batch, "reverse")
+        .await
+        .expect("the reverse's page");
+    assert_eq!(
+        outcome.fairness_escalations, 1,
+        "guard (c) rejected the reverse while the kid change is in flight, and it escalated"
+    );
+    let projection = kid_projection(&d).await;
+    assert_eq!(
+        d.rows(&format!("select id, val from {projection} order by id"))
+            .await,
+        ["(1,20)"],
+        "the escalation advanced the projection"
+    );
+    let recompute_batch = d.seal().await;
+    d.drain(recompute_batch, "recompute").await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the escalation's recompute wrote the new value"
+    );
+    apply_computed_page(&d, kid_batch, "kid", &kid_plan).await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the Apply put back a parent value its Phase 2 read before the escalation ({change:?})"
+    );
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_an_escalated_reverse_for_a_kid_update() {
+    a_page_apply_does_not_outlive_an_escalated_parent_reverse(KidChange::Update).await;
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_an_escalated_reverse_for_a_kid_insert() {
+    a_page_apply_does_not_outlive_an_escalated_parent_reverse(KidChange::Insert).await;
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_an_escalated_reverse_for_a_kid_repoint() {
+    a_page_apply_does_not_outlive_an_escalated_parent_reverse(KidChange::Repoint).await;
 }
