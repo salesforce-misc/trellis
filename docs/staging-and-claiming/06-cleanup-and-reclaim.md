@@ -102,9 +102,10 @@ each one that fails alone are charged, or every relationship's readers when none
 does. One that fails with no direct reader alone fails only when several apply it
 together: with two, both are charged; with more, each is left out in turn, and
 every one whose absence lets it apply is charged. When no one is (two separate
-failing pairs), nobody is, and the page is a drain holdup. A failure in the source
-itself (an image that won't decode) fails for every reader, and is charged once per
-transform that hits it.
+failing pairs), nobody is, and the page is a drain holdup
+([known gap 24](../known-correctness-gaps.md#24-a-change-only-two-separate-pairs-of-definitions-fail-on-together)).
+A failure in the source itself (an image that won't decode) fails for every reader,
+and is charged once per transform that hits it.
 
 **2. Count deaths per key, off the immutable rows.** Batch rows are immutable and
 carry no counter, so the counter lives in its own table keyed by `(transform,

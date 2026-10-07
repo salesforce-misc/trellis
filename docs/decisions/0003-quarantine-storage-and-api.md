@@ -118,7 +118,8 @@ needs pausing, as the per-column tier does.
     is left out in turn, and every one whose absence lets the record apply is
     charged: it is in every failing combination. When no one is (two separate
     failing pairs, say), the record is charged to nobody, as a failure only two
-    records reproduce together is, and the page is a drain holdup.
+    records reproduce together is, and the page is a drain holdup
+    ([known gap 24](../known-correctness-gaps.md#24-a-change-only-two-separate-pairs-of-definitions-fail-on-together)).
   * Each probe counts toward the isolation's probe limit. At the limit, a
     record is charged to the transforms its probes had pinned, and to every
     relationship's readers it hadn't probed yet; a probe that hits a transient
@@ -328,11 +329,12 @@ it, is not charged to any key: it pauses the definitions it reaches
 A failure that is charged to no key and pauses nothing is a *drain holdup*: a refused
 read or write the catalog can't pin on a table (so the halt pauses nothing), isolation
 that charges nobody (records that fail only together, or a record that fails only in two
-separate combinations of transforms) or stops at its probe limit without pinning a key, or a reproducing failure whose page runs out of retries. The
-drain surfaces it and records the page in `drain_holdups`, one row per segment, in a
-short transaction of its own after the page's transaction rolls back: the latest error
-and SQLSTATE, the source tables on the page, the buckets the failing pages covered, when
-it first and last failed, and how many passes have. It charges and pauses nothing; every
+separate combinations of transforms) or stops at its probe limit without pinning a key,
+or a reproducing failure whose page runs out of retries. The drain surfaces it and
+records the page in `drain_holdups`, one row per segment, in a short transaction of its
+own after the page's transaction rolls back: the latest error and SQLSTATE, the source
+tables on the page, the buckets the failing pages covered, when it first and last failed,
+and how many passes have. It charges and pauses nothing; every
 drain pass retries the page as before. `Trellis::status` reports the holdup as
 `drain_failure` on every unfrozen definition that reads a table on the page, directly or
 through a relationship, and `self_check` reports every open one as an instance-level

@@ -31,8 +31,9 @@ them gets broken without Trellis noticing.
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
   statement that wrote it (entry 9).
-* No trigger or constraint refuses a change only when two separate pairs of
-  the definitions reading it apply it together (entry 24).
+* No trigger or constraint refuses a change only when several of the
+  definitions reading it apply it together, in combinations no one of them is
+  in every one of, such as two separate pairs (entry 24).
 
 Each entry gives:
 
@@ -634,18 +635,19 @@ full key, and nothing deletes the truncated row.
 **Planned work:** none filed.
 
 **Repair:** `PAUSE`/`RESUME` every transform that copies the column, after
-
 the capture pass has re-typed it.
+
 ## 24. A change only two separate pairs of definitions fail on together
 
-**Trigger:** a user trigger or constraint that refuses a write only when two
-definitions' targets are written in one transaction, spanning two separate
-pairs of the definitions that read one table: `a` and `b` refused together,
-and `c` and `d` too.
+**Trigger:** a user trigger or constraint that refuses a write only when
+several definitions' targets are written in one transaction, in combinations
+of the definitions that read one table directly that no one definition is in
+every one of: two separate pairs (`a` and `b` refused together, and `c` and
+`d` too), or any two of three.
 
 **Effect:** isolation can't charge the change's key to anyone. Each
-definition applies it alone, and leaving any one of them out still leaves the
-other pair failing. The drain fails on the page on every pass, and every
+definition applies it alone, and leaving any one of them out still leaves
+another combination failing. The drain fails on the page on every pass, and every
 target reading the page's tables stops short of it, along with every
 watermark token taken since. It isn't silent: each pass surfaces the error.
 A single failing pair is charged to both of its definitions, which hold the
@@ -653,13 +655,15 @@ key (see [Repair caveats](#repair-caveats)).
 
 **Detected?** Yes. The page is a drain holdup: `status()` reports it as
 `drain_failure` on every definition that isn't paused or quarantined and
-reads a table on the page, and `self_check` reports it as `drain_failures`.
+reads a table on the page, directly or through a relationship, and
+`self_check` reports it as `drain_failures`.
 
 **Planned work:** none.
 
 **Repair:** fix the trigger or constraint, and the next pass commits the page.
-Or pause one definition of either pair: isolation then charges the other
-pair, whose definitions hold the key until it's released or they're resumed.
+Or pause a definition in a failing combination (one of either pair): once
+some definition is in every combination left, isolation charges the ones it
+pins, which hold the key until it's released or they're resumed.
 
 ## Repair caveats
 
