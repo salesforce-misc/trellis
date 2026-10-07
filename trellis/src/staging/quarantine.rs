@@ -1710,6 +1710,31 @@ async fn attribute_relationships(
     shared_err: &ApplyError,
     stats: &mut IsolationStats,
 ) -> Result<BTreeMap<i64, (String, String)>, ApplyError> {
+    if let [(_, readers)] = inbound {
+        return Ok(readers
+            .iter()
+            .map(|(id, target)| (*id, (target.clone(), shared_err.to_string())))
+            .collect());
+    }
+    let mut probed = Vec::with_capacity(inbound.len());
+    for (rel, _) in inbound {
+        // Past the limit, each one is `OutOfProbes` without probing.
+        probed.push(
+            probe
+                .run(pool, DirectFocus::None, Some(*rel), stats)
+                .await?,
+        );
+    }
+    Ok(relationship_charges(inbound, probed, shared_err))
+}
+
+/// [`attribute_relationships`]' charges from what each of `inbound`'s
+/// relationships' probes settled (`probed`, in the same order).
+fn relationship_charges(
+    inbound: &[(i64, Vec<(i64, String)>)],
+    probed: Vec<Probed>,
+    shared_err: &ApplyError,
+) -> BTreeMap<i64, (String, String)> {
     let mut charged: BTreeMap<i64, (String, String)> = BTreeMap::new();
     let charge = |charged: &mut BTreeMap<i64, (String, String)>,
                   readers: &[(i64, String)],
@@ -1720,28 +1745,13 @@ async fn attribute_relationships(
                 .or_insert_with(|| (target.clone(), last_error.to_string()));
         }
     };
-    if let [(_, readers)] = inbound {
-        charge(&mut charged, readers, shared_err);
-        return Ok(charged);
-    }
     let mut unsettled = false;
-    let mut out_of_probes = false;
-    for (rel, readers) in inbound {
-        if out_of_probes {
-            charge(&mut charged, readers, shared_err);
-            continue;
-        }
-        match probe
-            .run(pool, DirectFocus::None, Some(*rel), stats)
-            .await?
-        {
+    for ((_, readers), probed) in inbound.iter().zip(probed) {
+        match probed {
             Probed::Failed(rel_err) => charge(&mut charged, readers, &rel_err),
             Probed::Clean => {}
             Probed::Unsettled => unsettled = true,
-            Probed::OutOfProbes => {
-                out_of_probes = true;
-                charge(&mut charged, readers, shared_err);
-            }
+            Probed::OutOfProbes => charge(&mut charged, readers, shared_err),
         }
     }
     if charged.is_empty() && !unsettled {
@@ -1749,7 +1759,7 @@ async fn attribute_relationships(
             charge(&mut charged, readers, shared_err);
         }
     }
-    Ok(charged)
+    charged
 }
 
 /// The record one of [`attribute`]'s probes applies, and where.
@@ -4211,6 +4221,123 @@ mod unit_tests {
             },
             sqlstate: None,
         }
+    }
+
+    fn rel_err(message: &str) -> ApplyError {
+        ApplyError::Pool(crate::error::Error::Config(message.to_string()))
+    }
+
+    /// Three relationships, `r1` read by 1 and 2, `r2` by 2 and 3, `r3` by 4.
+    fn three_relationships() -> Vec<(i64, Vec<(i64, String)>)> {
+        let readers = |ids: &[i64]| ids.iter().map(|id| (*id, format!("t{id}"))).collect();
+        vec![
+            (1, readers(&[1, 2])),
+            (2, readers(&[2, 3])),
+            (3, readers(&[4])),
+        ]
+    }
+
+    /// Each charged reader, with the error it's charged with.
+    fn charges(charged: BTreeMap<i64, (String, String)>) -> Vec<(i64, String)> {
+        charged
+            .into_iter()
+            .map(|(id, (target, error))| {
+                assert_eq!(target, format!("t{id}"));
+                (id, error)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn relationship_charges_charge_the_readers_of_each_relationship_that_fails_alone() {
+        let shared = rel_err("shared");
+        let charged = relationship_charges(
+            &three_relationships(),
+            vec![
+                Probed::Failed(rel_err("r1")),
+                Probed::Clean,
+                Probed::Failed(rel_err("r3")),
+            ],
+            &shared,
+        );
+        let r1 = rel_err("r1").to_string();
+        let r3 = rel_err("r3").to_string();
+        // 2 reads through `r2` too, which applied, and is charged once.
+        assert_eq!(charges(charged), vec![(1, r1.clone()), (2, r1), (4, r3)]);
+    }
+
+    #[test]
+    fn relationship_charges_charge_every_reader_when_none_fails_alone() {
+        let shared = rel_err("shared");
+        let charged = relationship_charges(
+            &three_relationships(),
+            vec![Probed::Clean, Probed::Clean, Probed::Clean],
+            &shared,
+        );
+        let s = shared.to_string();
+        assert_eq!(
+            charges(charged),
+            vec![(1, s.clone()), (2, s.clone()), (3, s.clone()), (4, s)]
+        );
+    }
+
+    /// The probe limit, reached after `r1`'s probe: `r2` and `r3` weren't
+    /// probed, so their readers are charged with the combined probe's error,
+    /// beside `r1`'s, which failed alone.
+    #[test]
+    fn relationship_charges_charge_every_relationship_left_unprobed_at_the_limit() {
+        let shared = rel_err("shared");
+        let charged = relationship_charges(
+            &three_relationships(),
+            vec![
+                Probed::Failed(rel_err("r1")),
+                Probed::OutOfProbes,
+                Probed::OutOfProbes,
+            ],
+            &shared,
+        );
+        let (r1, s) = (rel_err("r1").to_string(), shared.to_string());
+        assert_eq!(
+            charges(charged),
+            vec![(1, r1.clone()), (2, r1), (3, s.clone()), (4, s)]
+        );
+
+        // `r1` applied before the limit: only the unprobed ones are charged.
+        let charged = relationship_charges(
+            &three_relationships(),
+            vec![Probed::Clean, Probed::OutOfProbes, Probed::OutOfProbes],
+            &shared,
+        );
+        let s = shared.to_string();
+        assert_eq!(
+            charges(charged),
+            vec![(2, s.clone()), (3, s.clone()), (4, s)]
+        );
+    }
+
+    /// A probe that settles nothing can't rule its relationship out, so with
+    /// no other failing alone, nobody is charged on this drain; one that did
+    /// fail alone is still charged.
+    #[test]
+    fn relationship_charges_charge_nobody_for_an_unsettled_relationship() {
+        let shared = rel_err("shared");
+        let charged = relationship_charges(
+            &three_relationships(),
+            vec![Probed::Clean, Probed::Unsettled, Probed::Clean],
+            &shared,
+        );
+        assert!(charged.is_empty(), "{charged:?}");
+
+        let charged = relationship_charges(
+            &three_relationships(),
+            vec![
+                Probed::Clean,
+                Probed::Unsettled,
+                Probed::Failed(rel_err("r3")),
+            ],
+            &shared,
+        );
+        assert_eq!(charges(charged), vec![(4, rel_err("r3").to_string())]);
     }
 
     /// `ceil(log2(n))`: how many halvings take `n` records down to one.
