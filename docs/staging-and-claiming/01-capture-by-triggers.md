@@ -264,9 +264,10 @@ it regenerates anything, it pauses the definition, with its
 4. a column Trellis created can't hold every value of the type define would
    give it now: `integer` to `bigint` under a 1-1 target's key, a `GROUP BY`
    key, a calculated field (`qty + 1`) or a `SUM` or `MIN` (whose ledger
-   contribution is typed as the argument), `varchar(50)` to `text` under a
-   passthrough or a projection's column for `author.name`. The column's next
-   value that doesn't fit would fail its write.
+   contribution is typed as the argument), `integer` or `bigint` to
+   `numeric` under the same, `varchar(50)` to `text` under a passthrough or
+   a projection's column for `author.name`. The column's next value that
+   doesn't fit would fail its write.
 
 The reason names each column, its old and new type, and each copy, and says
 what to do. Nothing clears it but a deliberate `RESUME`, or a drop: Trellis

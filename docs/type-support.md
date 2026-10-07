@@ -90,9 +90,10 @@ define's inference gives their expression: `SUM` over an `integer` is
 
 None of them changes on its own when the source column does. A widening a
 column can't hold (`integer` to `bigint`, `varchar(50)` to `text`, a wider
-`numeric` or temporal precision, `real` to `double precision`) pauses the
-transforms that own the column, and `RESUME` re-types every column to the
-type define would give it from the live schema before it rebuilds
+`numeric` or temporal precision, `bigint` to `numeric`, `real` to `double
+precision`) pauses the transforms that own the column, and `RESUME` re-types
+every column to the type define would give it from the live schema before it
+rebuilds
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 A widening that changes only the catalog pauses and rebuilds too
 ([known correctness gaps, entry 4](known-correctness-gaps.md#4-a-catalog-only-widening-of-a-column-trellis-copies-with-its-type)).

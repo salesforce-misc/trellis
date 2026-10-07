@@ -1672,6 +1672,107 @@ async fn widening_a_column_a_calculated_field_reads_pauses_and_resume_re_types_t
     assert_item_names_match(&raw).await;
 }
 
+/// #824: an integer column moved to `numeric` outgrows every integer
+/// column Trellis created from it. Here it happens to a chained definition:
+/// the resume that re-types an upstream aggregate's `SUM` column from
+/// `bigint` to `numeric` (`sum(bigint)`'s type) moves the column the
+/// downstream aggregate reads, and the pass pauses the downstream, whose
+/// `MIN` column and ledger contribution are `bigint`. Its resume re-types
+/// them, and a minimum above 2^63 lands.
+#[tokio::test]
+async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_downstream_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.sales (id int primary key, shop int, amount int); \
+         insert into public.sales values (1, 1, 10), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM shop_totals FROM public.sales GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total",
+        )
+        .await
+        .expect("define shop_totals");
+    bring_live(&mut raw, &db.pool, &["shop_totals"]).await;
+    trellis
+        .apply(
+            "TRANSFORM smallest FROM public.shop_totals GROUP BY shop \
+             SELECT shop AS shop, MIN(total) AS least",
+        )
+        .await
+        .expect("define smallest");
+    bring_live(&mut raw, &db.pool, &["shop_totals", "smallest"]).await;
+    assert_eq!(
+        column_type(&raw, "public.smallest", "least").await,
+        "bigint"
+    );
+
+    raw.batch_execute("alter table public.sales alter column amount type bigint")
+        .await
+        .expect("widen the summed column");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "shop_totals", "public.sales", &["amount"]).await;
+    resume(&trellis, "shop_totals").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.shop_totals", "total").await,
+        "numeric"
+    );
+    let error = paused_for(&trellis, "smallest", "public.shop_totals", &["total"]).await;
+    for column in [
+        "public.smallest.least (bigint, now numeric)",
+        "public.smallest__ledger.__arg0 (bigint, now numeric)",
+    ] {
+        assert!(error.contains(column), "{column}: {error}");
+    }
+
+    resume(&trellis, "smallest").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.smallest", "least").await,
+        "numeric"
+    );
+    assert_eq!(
+        column_type(&raw, "public.smallest__ledger", "__arg0").await,
+        "numeric"
+    );
+    bring_live(&mut raw, &db.pool, &["shop_totals", "smallest"]).await;
+    raw.batch_execute(
+        "insert into public.sales values (4, 3, 9000000000000000000), \
+                                         (5, 3, 9000000000000000000)",
+    )
+    .await
+    .expect("a sum above 2^63");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for target in ["shop_totals", "smallest"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &raw,
+            "select shop::text, least::text from public.smallest order by shop"
+        )
+        .await,
+        rows(
+            &raw,
+            "select shop::text, sum(amount)::text from public.sales group by shop order by shop"
+        )
+        .await,
+    );
+}
+
 /// #824: widening a to-side column a 1-1 definition reads through a to-one
 /// relationship (`author.name`, `varchar(10)` to `varchar(40)`) outgrows the
 /// relationship projection's column for it. The target's column is `text`,
