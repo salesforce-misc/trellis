@@ -292,14 +292,17 @@ too.
 
 A value written after the source widened and before the pass re-typed the
 column failed its write with `22001` (too long) or `22003` (numeric
-overflow), and its key may be held. The re-type's transaction records a
-release request (`retype_releases`) for each definition with a column on
-the table. After the pass, the staging worker releases every key such a
-definition holds whose failure had that SQLSTATE (`poison.sqlstate`),
-through the same per-key release as `Trellis::release_key`, so the key's
-parked work is applied again, and does so after each pass for a minute
-more, for a key whose eviction was still committing. A key held for any
-other failure stays held.
+overflow), and its key may be held. One whose excess characters are all
+spaces was stored truncated instead, which nothing repairs ([known
+correctness gaps, entry
+23](../known-correctness-gaps.md#23-a-value-padded-with-spaces-past-a-widened-varchars-old-length-drained-before-trellis-re-types-its-copy)).
+The re-type's transaction records a release request (`retype_releases`) for
+each definition with a column on the table. After the pass, the staging
+worker releases every key such a definition holds whose failure had that
+SQLSTATE (`poison.sqlstate`), through the same per-key release as
+`Trellis::release_key`, so the key's parked work is applied again, and does
+so after each pass for a minute more, for a key whose eviction was still
+committing. A key held for any other failure stays held.
 
 Changes that need neither pause nothing: widening a key no copy holds (an
 aggregate's source key, which its ledger keys by text), a `GROUP BY` key's

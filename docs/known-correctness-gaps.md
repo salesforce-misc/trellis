@@ -26,7 +26,7 @@ them gets broken without Trellis noticing.
   BY column, and widening any column Trellis creates a column from with its
   type, pause the definitions concerned, except a widening that changes only
   the catalog, which Trellis applies to its own columns in place (see
-  [What isn't on this list](#what-isnt-on-this-list)).
+  [What isn't on this list](#what-isnt-on-this-list), and entry 23).
 * No row-level security policy applies to a role Trellis logs in as, or to
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
@@ -96,6 +96,7 @@ These are the tools the entries refer to:
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
 | 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #838 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
+| 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -595,6 +596,34 @@ argument moved between `numeric` and floating point is the exception: its
 group-delta table keeps the running-sum column define gave the old `SUM`,
 and the rebuild fails the keys it writes. Drop it and define it again.
 
+## 23. A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy
+
+**Trigger:** a source `varchar(n)` column widened by changing only the
+catalog (to a longer `varchar`, to `text` or to `varchar`), and a value
+whose characters past `n` are all spaces (`'abcdefghij   '` after
+`varchar(10)` became `varchar(40)`) written to it and drained before the
+staging worker's next capture pass re-types the column Trellis copied it
+into, up to one `reconcile_interval` later. The copies are a 1-1 target's
+key and passthrough columns, and a to-one relationship projection's key and
+its column for each to-side column read through it.
+
+**Effect:** silent. Postgres stores a value whose excess characters are all
+spaces in a `varchar(n)` column truncated to `n`, rather than failing it, so
+the copy holds `'abcdefghij'`. Every other value too long for the copy fails
+its write, and its key is held and then released after the re-type (see
+[What isn't on this list](#what-isnt-on-this-list)). The re-type changes no
+value and rebuilds nothing, so the copy keeps the truncated value until its
+row is written again. A 1-1 key truncated this way leaves its target row
+under the truncated key: the source's later changes to the row write the
+full key, and nothing deletes the truncated row.
+
+**Detected?** Only by `self_check`, on a 1-1 target.
+
+**Planned work:** none filed.
+
+**Repair:** `PAUSE`/`RESUME` every transform that copies the column, after
+the capture pass has re-typed it.
+
 ## Repair caveats
 
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
@@ -684,7 +713,9 @@ refusing them up front:
   place, with no pause and no rebuild, and then releases the keys held for
   a value the old type couldn't hold (`22001`, `22003`) in between
   ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md)).
-  A table where another column needs a rewrite pauses as above.
+  A table where another column needs a rewrite pauses as above. A value
+  padded with spaces past the old length doesn't fail, and is stored
+  truncated (entry 23).
 * **A source's primary key dropped, or retyped off the supported types.** The
   drain pauses every definition it reaches, and what is downstream of them,
   with a `capture_failure` naming the cause, and the rest of the page commits.

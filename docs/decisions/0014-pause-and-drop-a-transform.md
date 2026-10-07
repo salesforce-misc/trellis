@@ -150,15 +150,18 @@ waits at most the timeout. A table whose lock it can't get in time is left as it
 nothing pauses, and the next pass tries again. A table where some widened column
 needs a rewrite pauses its definitions as above, and so does one whose re-type fails.
 
-A value written between the source's `ALTER` and that re-type fails its write
-(`22001` or `22003`), and its key may be held. The re-type's transaction records a
-release request for each definition with a column on the table (`retype_releases`).
+A value written between the source's `ALTER` and that re-type fails its write (`22001`
+or `22003`), and its key may be held. One whose characters past the old `varchar`
+length are all spaces is stored truncated instead, and stays so ([known correctness
+gaps, entry 23](../known-correctness-gaps.md#23-a-value-padded-with-spaces-past-a-widened-varchars-old-length-drained-before-trellis-re-types-its-copy)).
+The re-type's transaction records a release request for each definition with a column
+on the table (`retype_releases`).
 After the pass, the staging worker releases each key such a definition holds whose
 failure had that SQLSTATE, recorded on its `poison` row, one key at a time through the
 same release as `Trellis::release_key`, and the key's parked work is applied again. It
 does so again after each pass for twice the session lock timeout, so a key whose
-eviction reproduced its failure before the re-type but committed after the release
-read the held keys is released too. A key held for any other failure stays held.
+eviction reproduced its failure before the re-type but committed after the release read
+the held keys is released too. A key held for any other failure stays held.
 
 Resume also releases every key the definition holds in quarantine: it deletes the
 definition's own `poison`, `poison_held` and `key_deaths` rows in the same transaction.
