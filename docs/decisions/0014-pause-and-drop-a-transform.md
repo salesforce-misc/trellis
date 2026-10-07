@@ -109,7 +109,8 @@ dependent's check fails.
 A resume then rebuilds from the schema as it is now. It records the source's live
 column types, which the rebuild casts through, and the type of each column the
 definition keys by (`definition_key_types`), which the staging worker's capture pass
-compares later changes against. And it brings every column Trellis created for the
+compares later changes against. The pass records a key column's new type itself when
+it accepts a change to it without a pause. And it brings every column Trellis created for the
 definition with a type that comes from the source to the type define would give it
 now. Some are copies of one source column: a 1-1 target's key and passthrough columns,
 an aggregate's `GROUP BY` columns in its target, ledger and group-delta table, and a

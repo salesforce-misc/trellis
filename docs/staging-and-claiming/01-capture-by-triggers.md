@@ -259,8 +259,8 @@ it regenerates anything, it pauses the definition, with its
    `text` to `uuid`, a narrower `numeric` scale or temporal precision (the
    rewrite rounds), or a narrower `varchar(n)` (the rewrite strips trailing
    spaces past the new length). It compares against the type recorded in
-   `definition_key_types` when the definition was accepted or last resumed;
-   or
+   `definition_key_types` when the definition was accepted or last resumed,
+   or when a pass last accepted a change to the column without a pause; or
 4. a column Trellis created can't hold every value of the type define would
    give it now: `integer` to `bigint` under a 1-1 target's key, a `GROUP BY`
    key, a calculated field (`qty + 1`) or a `SUM` or `MIN` (whose ledger

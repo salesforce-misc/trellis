@@ -412,8 +412,9 @@ pub(crate) async fn pause_readers_of_unsupported(
 /// definition as define would, and refuses while the first two hold;
 /// otherwise it re-records the key types, brings every column it created to
 /// the type define would give it now, and rebuilds
-/// (`staging::quarantine::resume_transform`). A key column whose copy is
-/// re-typed in place is re-recorded here, as a resume would.
+/// (`staging::quarantine::resume_transform`). A key column whose type
+/// changed without a pause (a widening, a wider `numeric` scale) is
+/// re-recorded here, as a resume would.
 ///
 /// A key column the table no longer has is
 /// [`pause_readers_of_missing`]'s, which the pass runs first. Returns whether
@@ -460,9 +461,9 @@ pub(crate) async fn pause_readers_of_retyped(
 
     let mut checked: Vec<Checked> = Vec::new();
     let mut unrecorded: Vec<(i64, String)> = Vec::new();
-    // Key columns whose recorded type the live one widens without
-    // re-rendering: re-recorded below where this pass re-types a copy of
-    // one in place.
+    // Key columns whose live type differs from the recorded one without
+    // re-rendering the keys stored: re-recorded below for each definition
+    // this pass doesn't pause.
     let mut widened_keys: Vec<(i64, String)> = Vec::new();
     for reader in catalog
         .definitions
@@ -605,8 +606,6 @@ pub(crate) async fn pause_readers_of_retyped(
     let in_place = retype_in_place(client, table, &checked).await?;
 
     let mut pauses: Vec<(i64, Vec<String>, String)> = Vec::new();
-    // The columns of this table a copy re-typed in place copies, by reader.
-    let mut copied_retyped: Vec<(i64, String)> = Vec::new();
     for Checked {
         id,
         mut columns,
@@ -620,14 +619,6 @@ pub(crate) async fn pause_readers_of_retyped(
         // typed from.
         let mut outgrown: BTreeMap<Vec<String>, Vec<copies::CopyState>> = BTreeMap::new();
         for state in states {
-            if state.drifted()
-                && state.copy.inferred.is_none()
-                && in_place.retyped.contains(&state.copy.table)
-            {
-                for column in state.copy.columns_of(table) {
-                    copied_retyped.push((id, column.to_string()));
-                }
-            }
             if !state.outgrown() || in_place.handles(&state.copy.table) {
                 continue;
             }
@@ -663,10 +654,12 @@ pub(crate) async fn pause_readers_of_retyped(
     }
 
     // Recorded on its own: the next pass compares against it whether or not
-    // this one pauses anything. A key column whose copy this pass re-typed
-    // in place is recorded at its new type for each definition left live,
-    // as a resume records it: the definition stores keys of that type from
-    // now on, so a later narrowing is measured from it.
+    // this one pauses anything. A key column whose change this pass accepted
+    // without a pause is recorded at its new type for each definition left
+    // unpaused, as a resume records it: the definition stores keys of that
+    // type from now on, so a later change is measured from it. Measured from
+    // the type define saw instead, `numeric(10,2)` widened to `(10,3)` and
+    // narrowed back would round the keys stored in between unseen.
     let mut by_reader: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
     for (id, column) in unrecorded {
         by_reader
@@ -679,9 +672,7 @@ pub(crate) async fn pause_readers_of_retyped(
     }
     let mut widened: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
     for (id, column) in widened_keys {
-        if copied_retyped.contains(&(id, column.clone()))
-            && !pauses.iter().any(|(paused, _, _)| *paused == id)
-        {
+        if !pauses.iter().any(|(paused, _, _)| *paused == id) {
             widened
                 .entry(id)
                 .or_default()

@@ -1102,10 +1102,11 @@ async fn a_nondeterministic_collation_on_a_group_by_column_pauses_its_reader() {
 /// value (`1.50` reads back as `1.500`) and fires no capture trigger, yet
 /// pauses nothing: numeric groups are matched as numbers, so a delete or
 /// update of a row the rewrite re-rendered still retracts from the group it
-/// was counted in, and a new row joins it. A scale narrower than the one
-/// recorded at define does pause: it rounds the stored values, so two
-/// groups (`1.555`, `1.556`) can become one (`1.56`) with no trigger firing.
-/// A resume rebuilds the groups from the rounded values.
+/// was counted in, and a new row joins it. The pass records the wider
+/// scale, so narrowing back to the scale define saw pauses: it rounds the
+/// values stored under the wider one, so two groups (`1.555`, `1.556`)
+/// become one (`1.56`) with no trigger firing. A resume rebuilds the groups
+/// from the rounded values.
 #[tokio::test]
 async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower_one_pauses() {
     let cluster = TestCluster::start();
@@ -1120,6 +1121,24 @@ async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower
         .await
         .expect("define per_price");
     bring_live(&mut raw, &db.pool, &["per_price"]).await;
+    let groups_match = async |raw: &Client| {
+        // Compared as numbers: the target's rendering of a group is the one
+        // it was first written with.
+        assert_eq!(
+            rows(
+                raw,
+                "select (price * 1000)::bigint::text, n::text, kinds::text from public.per_price \
+                 where n <> 0 order by price"
+            )
+            .await,
+            rows(
+                raw,
+                "select (price * 1000)::bigint::text, count(*)::text, sum(kind)::text \
+                 from public.posts group by price order by price"
+            )
+            .await,
+        );
+    };
 
     raw.batch_execute("alter table public.posts alter column price type numeric(10,3)")
         .await
@@ -1136,44 +1155,25 @@ async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower
     raw.batch_execute(
         "delete from public.posts where id = 1; \
          update public.posts set price = 1.5 where id = 2; \
-         insert into public.posts values (4, 'ann', 'd', 5, 2.5), (5, 'bob', 'e', 7, 1.5);",
+         insert into public.posts values (4, 'ann', 'd', 5, 2.5), (5, 'bob', 'e', 7, 1.5), \
+                                         (6, 'ann', 'f', 1, 1.555), (7, 'bob', 'g', 2, 1.556);",
     )
     .await
-    .expect("writes to rows the rewrite re-rendered");
+    .expect("writes to rows the rewrite re-rendered, and at the wider scale");
     full_pass(&mut raw, &db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "per_price").await, TransformStatus::Live);
-    // Compared as numbers: the target's rendering of a group is the one it
-    // was first written with.
-    assert_eq!(
-        rows(
-            &raw,
-            "select (price * 1000)::bigint::text, n::text, kinds::text from public.per_price \
-             where n <> 0 order by price"
-        )
-        .await,
-        rows(
-            &raw,
-            "select (price * 1000)::bigint::text, count(*)::text, sum(kind)::text \
-             from public.posts group by price order by price"
-        )
-        .await,
-    );
+    groups_match(&raw).await;
 
-    // Back to the recorded scale: nothing the target holds changes.
+    // Back to the scale define saw: it rounds the keys stored at the wider
+    // one, merging 1.555 and 1.556.
     raw.batch_execute("alter table public.posts alter column price type numeric(10,2)")
         .await
-        .expect("narrow back to the recorded scale");
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(status(&raw, "per_price").await, TransformStatus::Live);
-
-    raw.batch_execute("alter table public.posts alter column price type numeric(10,1)")
-        .await
-        .expect("narrow below the recorded scale");
+        .expect("narrow back to the scale define saw");
     capture_pass(&mut raw, &db.pool).await;
     let error = paused_for(&trellis, "per_price", "public.posts", &["price"]).await;
     assert!(
-        error.contains("from numeric(10,2) to numeric(10,1)") && error.contains("GROUP BY"),
+        error.contains("from numeric(10,3) to numeric(10,2)") && error.contains("GROUP BY"),
         "{error}"
     );
     for target in ["post_authors", "post_titles", "per_kind"] {
@@ -1187,20 +1187,7 @@ async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower
     // The resume rebuilds the groups from the rounded values.
     resume(&trellis, "per_price").await;
     bring_live(&mut raw, &db.pool, &["per_price"]).await;
-    assert_eq!(
-        rows(
-            &raw,
-            "select (price * 1000)::bigint::text, n::text, kinds::text from public.per_price \
-             where n <> 0 order by price"
-        )
-        .await,
-        rows(
-            &raw,
-            "select (price * 1000)::bigint::text, count(*)::text, sum(kind)::text \
-             from public.posts group by price order by price"
-        )
-        .await,
-    );
+    groups_match(&raw).await;
 }
 
 /// #708: a resume re-runs define-time validation against the live schema,

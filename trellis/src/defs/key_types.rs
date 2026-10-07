@@ -20,8 +20,9 @@
 //! 1. **define would refuse it now** ([`refusal`]); or
 //! 2. **its new type renders the values already stored differently**
 //!    ([`renders_differently`]), against the type recorded when the
-//!    definition was accepted or last resumed (`definition_key_types`,
-//!    [`record`]). The target, ledger and projection rows built from the old
+//!    definition was accepted or last resumed, or when a pass last accepted
+//!    a change to the column without a pause (`definition_key_types`,
+//!    [`record`], [`rerecord`]). The target, ledger and projection rows built from the old
 //!    rendering would never match the new one: a `timestamp` key becomes
 //!    `timestamptz` (`'… 10:00:00'` reads back as `'… 15:00:00+00'` after an
 //!    `ALTER` in a New York session), `date` becomes `timestamp`, `text`
@@ -47,9 +48,13 @@
 //!
 //! A resume re-records these types ([`record_definition`]), after it has
 //! re-validated the definition and brought its copies to their live types.
-//! So does the capture pass for a key column whose copy it re-typed in place
-//! ([`rerecord`]): the definition stores keys of the new type from then
-//! on.
+//! So does the capture pass, for each key column whose type changed in one
+//! of these routine ways or by a widening it re-typed in place, unless it
+//! pauses the definition ([`rerecord`]). The definition stores keys of the
+//! new type from then on, so the next change is measured from it: a
+//! `GROUP BY` key widened from `numeric(10,2)` to `numeric(10,3)` and then
+//! narrowed back to `numeric(10,2)` rounds the keys stored in between, and
+//! pauses.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -549,7 +554,7 @@ pub(crate) async fn record(
 }
 
 /// [`record`], replacing the type recorded for each column: for a key
-/// column that widened without re-rendering the keys stored (#824), so the
+/// column whose type changed without re-rendering the keys stored, so the
 /// next change is measured from the type keys are stored under now.
 pub(crate) async fn rerecord(
     client: &impl GenericClient,
