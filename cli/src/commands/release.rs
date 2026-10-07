@@ -24,8 +24,13 @@ poisoned it is fixed. `trellis status` lists the held keys under
 <TRANSFORM> is the transform's bare target-table name. <SOURCE_TABLE> may be
 `schema.table` or a bare table name. <KEY> is the key as status prints it (a
 composite key's columns joined as status shows them). Status quotes each of
-the three for a POSIX shell where it needs it ('...', with a ' inside written
-'\\''), so paste them as printed.
+the three for the shell where it needs it ('...', with a ' inside written
+'\\'', and a control character, such as the separator between a composite
+key's columns, written $'\\ooo' in octal, which bash and zsh read), so paste
+them as printed. Put -- before the three if one of them is -h, --help, -d or
+--database-url:
+
+  trellis release -- order_totals public.orders -h
 
 The release stages a recompute of the key, which every transform reading the
 table applies from the key's current row, and discards the changes held for
@@ -47,18 +52,56 @@ Options:
   -h, --help                 Print this help and exit.
 ";
 
-/// `text` as one word of a POSIX shell command line: bare when every
-/// character is one no shell treats specially, otherwise inside single
-/// quotes, where nothing is special but the quote itself, written `'\''`
-/// (close the quotes, an escaped quote, reopen them). `status` prints held
-/// keys, their tables and transforms this way, so a line pasted from it
-/// passes `release` each one exactly as the engine reports it (#842).
+/// `text` as one word of a shell command line (#842). It's bare when every
+/// character is one no POSIX shell, bash or zsh treats specially anywhere in
+/// a word (letters, digits and `_-.,:/@+`; not `=`, which zsh expands at a
+/// word's start, nor `%` or `~`). Otherwise it's inside single quotes, where
+/// nothing is special but the quote itself, written `'\''` (close the quotes,
+/// an escaped quote, reopen them). A control character, such as the
+/// separator between a composite key's columns or an escape a source row
+/// smuggled into its key, is never written raw: a terminal drops it from a
+/// copy, or obeys it. It's a `$'\ooo'` word of its UTF-8 bytes in octal,
+/// joined onto the quoted text, which bash and zsh read back as those bytes.
+/// `status` prints held keys, their tables and transforms this way, so a
+/// line pasted from it passes `release` each one exactly as the engine
+/// reports it.
 pub fn shell_quote(text: &str) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || "_-.,:/@%+=".contains(c);
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-.,:/@+".contains(c);
     if !text.is_empty() && text.chars().all(plain) {
         return text.to_string();
     }
-    format!("'{}'", text.replace('\'', "'\\''"))
+    if text.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::new();
+    let mut in_quotes = false;
+    for c in text.chars() {
+        if c.is_control() {
+            if in_quotes {
+                out.push('\'');
+                in_quotes = false;
+            }
+            out.push_str("$'");
+            for byte in c.to_string().bytes() {
+                out.push_str(&format!("\\{byte:03o}"));
+            }
+            out.push('\'');
+        } else {
+            if !in_quotes {
+                out.push('\'');
+                in_quotes = true;
+            }
+            if c == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(c);
+            }
+        }
+    }
+    if in_quotes {
+        out.push('\'');
+    }
+    out
 }
 
 /// A parsed `release` invocation.
@@ -71,8 +114,13 @@ pub struct Args {
 
 /// Parses the remaining args after `--database-url`/`-d` (and the
 /// subcommand name itself) have been stripped: exactly three positional
-/// arguments.
+/// arguments, after an optional `--` that lets one of them be `-h`,
+/// `--help`, `-d` or `--database-url`.
 pub fn parse(args: &[String]) -> Result<Args, String> {
+    let args = match args {
+        [first, rest @ ..] if first == "--" => rest,
+        _ => args,
+    };
     match args {
         [transform, source_table, key] => Ok(Args {
             transform: transform.clone(),
@@ -136,7 +184,7 @@ mod tests {
 
     #[test]
     fn a_plain_word_is_left_bare() {
-        for word in ["42", "public.orders", "order_totals", "a-b,c:d/e@f%g+h=i"] {
+        for word in ["42", "-7", "public.orders", "order_totals", "a-b,c:d/e@f+g"] {
             assert_eq!(shell_quote(word), word);
         }
     }
@@ -148,6 +196,40 @@ mod tests {
         assert_eq!(shell_quote("$HOME"), "'$HOME'");
         assert_eq!(shell_quote(r#"a"b\c"#), r#"'a"b\c'"#);
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+        // zsh expands a word starting `=` to a command's path, and `%`/`~`
+        // start job and home-directory names in some shells.
+        assert_eq!(shell_quote("=ls"), "'=ls'");
+        assert_eq!(shell_quote("%1"), "'%1'");
+        assert_eq!(shell_quote("~root"), "'~root'");
+        assert_eq!(shell_quote("é"), "'é'");
+    }
+
+    #[test]
+    fn a_control_character_is_written_in_octal_never_raw() {
+        // A composite key's separator (U+001F), a NULL column's sentinel
+        // (U+0001), an escape (U+001B), a newline and a C1 control (U+0085,
+        // two bytes of UTF-8).
+        assert_eq!(shell_quote("1\u{1f}2"), r"'1'$'\037''2'");
+        assert_eq!(shell_quote("\u{1}"), r"$'\001'");
+        assert_eq!(shell_quote("\u{1b}[2J"), r"$'\033''[2J'");
+        assert_eq!(shell_quote("a\nb'c"), r"'a'$'\012''b'\''c'");
+        assert_eq!(shell_quote("\u{85}"), r"$'\302\205'");
+        for word in ["1\u{1f}2", "\u{1b}[2J", "a\nb'c", "\u{85}"] {
+            assert!(!shell_quote(word).chars().any(char::is_control), "{word:?}");
+        }
+    }
+
+    #[test]
+    fn a_leading_double_dash_ends_the_options() {
+        assert_eq!(
+            parse(&strings(&["--", "order_totals", "public.orders", "-h"])).unwrap(),
+            Args {
+                transform: "order_totals".to_string(),
+                source_table: "public.orders".to_string(),
+                key: "-h".to_string(),
+            }
+        );
+        assert!(parse(&strings(&["--", "order_totals", "public.orders"])).is_err());
     }
 
     #[test]

@@ -181,7 +181,9 @@ fn run_run(args: Vec<String>, database_url: Option<String>) -> ExitCode {
 /// without a database connection), otherwise parses the three positional
 /// arguments and releases the key on a single-use tokio runtime.
 fn run_release(args: Vec<String>, database_url: Option<String>) -> ExitCode {
-    if wants_help(&args) {
+    // A `--` ends the options: a key spelled `-h` after it is a key.
+    let options = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    if wants_help(&args[..options]) {
         print!("{}", commands::release::USAGE);
         return ExitCode::SUCCESS;
     }

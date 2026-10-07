@@ -27,11 +27,17 @@ const SHORT_FLAG: &str = "-d";
 /// Returns `Ok(None)` if the flag isn't present at all (callers then fall
 /// back to `trellis::Config::resolve`'s own env-var chain). Errors if the flag
 /// is given with no following value, or given more than once.
+///
+/// Nothing after a `--` is a flag: it ends the options, so a positional
+/// argument spelled like the flag (a key `trellis release` is handed, say)
+/// stays where it is.
 pub fn extract_database_url(args: &mut Vec<String>) -> Result<Option<String>, String> {
-    let Some(idx) = args.iter().position(|a| a == LONG_FLAG || a == SHORT_FLAG) else {
+    let is_flag = |a: &String| a == LONG_FLAG || a == SHORT_FLAG;
+    let options = |args: &[String]| args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let Some(idx) = args[..options(args)].iter().position(is_flag) else {
         return Ok(None);
     };
-    if idx + 1 >= args.len() {
+    if idx + 1 >= options(args) {
         return Err(format!(
             "{} requires a value, e.g. {LONG_FLAG} <URL>",
             args[idx]
@@ -40,7 +46,7 @@ pub fn extract_database_url(args: &mut Vec<String>) -> Result<Option<String>, St
     let flag = args.remove(idx);
     let value = args.remove(idx);
 
-    if let Some(second_idx) = args.iter().position(|a| a == LONG_FLAG || a == SHORT_FLAG) {
+    if let Some(second_idx) = args[..options(args)].iter().position(is_flag) {
         let second_flag = &args[second_idx];
         return Err(format!(
             "{LONG_FLAG}/{SHORT_FLAG} may only be specified once, got both {flag} and {second_flag}"
@@ -86,6 +92,40 @@ mod tests {
         let url = extract_database_url(&mut args).unwrap();
         assert_eq!(url.as_deref(), Some("postgresql://x/y"));
         assert_eq!(args, vec!["define", "TRANSFORM x FROM y"]);
+    }
+
+    #[test]
+    fn nothing_after_a_double_dash_is_a_flag() {
+        let mut args: Vec<String> = [
+            "release",
+            "-d",
+            "postgres://x",
+            "--",
+            "t",
+            "-d",
+            "--database-url",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        assert_eq!(
+            extract_database_url(&mut args).unwrap().as_deref(),
+            Some("postgres://x")
+        );
+        assert_eq!(args, ["release", "--", "t", "-d", "--database-url"]);
+
+        let mut args: Vec<String> = ["release", "--", "t", "s", "-d"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(extract_database_url(&mut args).unwrap(), None);
+
+        // The flag's value can't be the `--` itself.
+        let mut args: Vec<String> = ["release", "-d", "--", "t"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert!(extract_database_url(&mut args).is_err());
     }
 
     #[test]

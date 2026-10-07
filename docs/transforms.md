@@ -334,9 +334,12 @@ cause is fixed, `release_key(transform, source_table, key)` releases it (the CLI
 its current row, and a key whose cause is still there is quarantined again.
 Resuming the transform releases every key it holds
 ([ADR-0003 — Releasing held keys](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
-`trellis status` prints each held key, its table and its transform quoted for a
-POSIX shell where they need it (`'...'`, a quote inside written `'\''`), so they
-paste into `trellis release` as printed.
+`trellis status` prints each held key, its table and its transform quoted for the
+shell where they need it, so they paste into `trellis release` as printed: text
+goes inside `'...'`, with a quote written `'\''`, and a control character, such as
+the separator between a composite key's columns, is written `$'\ooo'` in octal,
+which bash and zsh read. A value that is exactly `-h`, `--help`, `-d` or
+`--database-url` goes after a `--`: `trellis release -- <transform> <table> <key>`.
 
 A release first waits for the drain pages in flight on the key's table to commit,
 so it can't miss a change one of them is parking for the key. If that wait runs

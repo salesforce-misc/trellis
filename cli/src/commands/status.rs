@@ -509,37 +509,27 @@ mod tests {
         assert!(formatted.contains("error=\"division by zero\""));
     }
 
-    /// A held key that needs quoting round-trips from `status`'s listing to
-    /// `release`'s arguments through a real shell (#842): the line's
-    /// `transform=`, `table=` and `key=` words, pasted after `trellis
-    /// release` and split by `sh`, parse to exactly the entry's values.
-    #[test]
-    fn a_held_key_pastes_from_status_into_release_unchanged() {
-        use trellis::PoisonEntry;
-
-        use super::super::release;
-
-        let entry = PoisonEntry {
-            transform: "order_totals".to_string(),
-            src_table: "public.orders".to_string(),
-            key: r#"it's a "key" \ with $HOME `and` \"#.to_string(),
-            last_error: "division by zero".to_string(),
-            poisoned_at: UNIX_EPOCH,
-        };
-        let formatted = format_poisoned(std::slice::from_ref(&entry));
+    /// The `transform=`, `table=` and `key=` words of `entry`'s `status`
+    /// line, pasted after `trellis release` and split by `shell` as an
+    /// operator's shell would, and parsed by `release`.
+    fn paste_into_release(
+        shell: &str,
+        entry: &trellis::PoisonEntry,
+    ) -> super::super::release::Args {
+        let formatted = format_poisoned(std::slice::from_ref(entry));
         let line = formatted
             .lines()
             .find(|line| line.starts_with("  transform="))
             .expect("the entry's line");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
         let words = &line.trim_start()[..line.trim_start().rfind(" error=").expect("error=")];
 
-        // `sh` splits the pasted words as an operator's shell would, and
-        // prints each argument NUL-terminated.
-        let output = std::process::Command::new("sh")
+        // The shell prints each argument NUL-terminated.
+        let output = std::process::Command::new(shell)
             .arg("-c")
             .arg(format!("printf '%s\\0' {words}"))
             .output()
-            .expect("run sh");
+            .unwrap_or_else(|err| panic!("run {shell}: {err}"));
         assert!(output.status.success(), "{output:?}");
         let argv: Vec<String> = String::from_utf8(output.stdout)
             .expect("utf-8")
@@ -551,13 +541,64 @@ mod tests {
                     .to_string()
             })
             .collect();
-        assert_eq!(
-            release::parse(&argv).expect("release takes the pasted words"),
-            release::Args {
-                transform: entry.transform,
-                source_table: entry.src_table,
-                key: entry.key,
-            }
-        );
+        super::super::release::parse(&argv).expect("release takes the pasted words")
+    }
+
+    fn held(transform: &str, src_table: &str, key: &str) -> trellis::PoisonEntry {
+        trellis::PoisonEntry {
+            transform: transform.to_string(),
+            src_table: src_table.to_string(),
+            key: key.to_string(),
+            last_error: "division by zero".to_string(),
+            poisoned_at: UNIX_EPOCH,
+        }
+    }
+
+    /// A held key that needs quoting round-trips from `status`'s listing to
+    /// `release`'s arguments through a real POSIX shell (#842).
+    #[test]
+    fn a_held_key_pastes_from_status_into_release_unchanged() {
+        for entry in [
+            held(
+                "order_totals",
+                "public.orders",
+                r#"it's a "key" \ with $HOME `and` \"#,
+            ),
+            held("order_totals", "public.orders", "=ls"),
+            held("order totals", "public.my orders", "-7"),
+        ] {
+            assert_eq!(
+                paste_into_release("sh", &entry),
+                super::super::release::Args {
+                    transform: entry.transform,
+                    source_table: entry.src_table,
+                    key: entry.key,
+                }
+            );
+        }
+    }
+
+    /// A key with control characters in it, as every composite key has
+    /// (its columns' separator, U+001F) and a NULL column's sentinel
+    /// (U+0001) adds, is printed without them raw, and still round-trips:
+    /// through bash, which reads the `$'...'` words they're written as
+    /// (#842).
+    #[test]
+    fn a_composite_or_control_character_key_pastes_from_status_into_release_unchanged() {
+        for key in [
+            "1\u{1f}east",
+            "\u{1}\u{1f}it's",
+            "line\none\u{1b}[2J\u{85}é",
+        ] {
+            let entry = held("order_totals", "public.orders", key);
+            assert_eq!(
+                paste_into_release("bash", &entry),
+                super::super::release::Args {
+                    transform: entry.transform,
+                    source_table: entry.src_table,
+                    key: entry.key,
+                }
+            );
+        }
     }
 }
