@@ -3726,6 +3726,13 @@ pub async fn release_key(
         .max();
     apply::release_to_one_projections(pool, &txn, &names[0], key, &images, parked_through).await?;
 
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        &*txn,
+        super::interleave::PausePoint::BeforeReleaseCommit,
+        &names[0],
+    )
+    .await?;
     txn.commit().await?;
     tracing::info!(
         transform,

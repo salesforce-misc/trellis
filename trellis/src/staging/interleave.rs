@@ -63,6 +63,10 @@
 //! statement, holding its claimed delta rows and its groups. A test runs
 //! either inside [`with_scope`] as it would a drain.
 //!
+//! A key release (`super::quarantine::release_key`) fires
+//! [`PausePoint::BeforeReleaseCommit`] for the key's table after its last
+//! write. A test runs it inside [`with_scope`] as it would a drain.
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -135,6 +139,11 @@ pub enum PausePoint {
     AfterReverseGuards,
     /// After every write the page makes, just before it commits.
     BeforeCommit,
+    /// After every write a key release makes (`super::quarantine::release_key`),
+    /// just before it commits, for the key's table (its canonical name): the
+    /// release holds the table's fence, the definition's row, and each to-one
+    /// relationship's refresh stamp and projection rows it wrote (#831).
+    BeforeReleaseCommit,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

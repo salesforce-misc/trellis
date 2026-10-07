@@ -2317,3 +2317,174 @@ async fn a_page_that_skipped_a_from_side_key_misses_its_fence_after_a_reader_res
         other => panic!("expected VersionFenceMiss, got {other:?}"),
     }
 }
+
+/// Issue #831: a key release reaches the from-side's key-gate skip too
+/// (`release_to_one_projections` builds each to-one relationship's shape),
+/// but commits under no fence of the from-side's. That is safe for two
+/// reasons, and this pins both:
+///
+/// - the release stages no recompute of the from-side's rows, whatever its
+///   key: it writes the relationship's projection rows, and the
+///   `Recompute` it stages re-derives the from-side's rows on a later page,
+///   whose own skip is fenced (#823);
+/// - a resume of the relationship's first reader to go unfrozen refreshes
+///   its projection, locking the refresh stamp `for update`, which the
+///   release holds `for share` from before its skip to its commit. So the
+///   resume waits for the release, and reads what it wrote.
+///
+/// `users` key `ann` is held for `users_copy` while every reader of `posts`
+/// is paused and its key is off the allowlist. The release is frozen after
+/// its last write, the key is made usable again and `posts_named` resumed:
+/// the resume queues behind the release, on the refresh stamp, and the
+/// rebuilt `posts_named` holds the change the release carried.
+#[tokio::test]
+async fn a_resume_of_a_from_side_reader_waits_for_a_release_that_skipped_its_key() {
+    use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+    use trellis::staging::{StagedWatermark, apply, seal};
+    const PAUSE_LOCK: i64 = 831;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = retyped_to_side_setup(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply("TRANSFORM users_copy FROM public.users SELECT name AS name")
+        .await
+        .expect("define users_copy");
+    bring_live(&mut raw, &db.pool, &["users_copy"]).await;
+    let app = connect(db.dsn()).await;
+
+    for target in ["posts_named", "posts_plain"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause a reader of posts");
+    }
+    app.batch_execute("alter table public.posts alter column id type numeric")
+        .await
+        .expect("retype the from-side key");
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    raw.batch_execute(
+        "insert into poison (transform_id, src_table, key, last_error) \
+         select id, 'public.users', 'ann', 'planted by the test' from transform_definitions \
+         where target_table = 'public.users_copy'",
+    )
+    .await
+    .expect("hold users key ann for users_copy");
+    app.batch_execute("update public.users set name = 'Annie' where handle = 'ann'")
+        .await
+        .expect("write the to-side");
+    // One batch, not `drain_to_quiescence`: the parked write keeps the ring
+    // pending until the release.
+    let sealed = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, sealed.sealed_seg_seq, "capture_schema_change_wake")
+        .await
+        .expect("seal phase 2");
+    while apply::drain_once(
+        &db.pool,
+        sealed.sealed_seg_seq,
+        "worker",
+        1,
+        "capture_schema_change_wake",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain the to-side's write")
+    .is_some()
+    {}
+    assert_eq!(
+        rows(&raw, "select count(*)::text from poison_held").await,
+        vec![vec![Some("1".to_string())]],
+        "the page parked the write for users_copy"
+    );
+    assert_eq!(
+        rows(&raw, "select name from public.posts_named where id = 1").await,
+        vec![vec![Some("Ann".to_string())]],
+        "posts_named is paused"
+    );
+
+    let gate = connect(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeReleaseCommit, "public.users", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut release = tokio::spawn(with_scope(scope, async move {
+        trellis::staging::release_key(&pool, "users_copy", "public.users", "ann").await
+    }));
+    // Reaching its last write means the release built `author`'s shape with
+    // `posts`' key off the allowlist and no reader of it unfrozen: the key
+    // gate's skip, or it would have failed.
+    let releaser = tokio::select! {
+        reached = reached => reached.expect("pause scope dropped").backend_pid,
+        finished = &mut release => panic!("the release finished without pausing: {finished:?}"),
+    };
+
+    app.batch_execute("alter table public.posts alter column id type int")
+        .await
+        .expect("make the from-side key usable again");
+    let resume = tokio::spawn({
+        let dsn = db.dsn().to_string();
+        async move {
+            definer(&dsn)
+                .await
+                .apply("RESUME TRANSFORM posts_named")
+                .await
+        }
+    });
+    let blocked = blocked_behind(&raw, releaser).await;
+    assert!(
+        blocked.contains("relationship_projections"),
+        "the resume waits on author's refresh stamp: {blocked}"
+    );
+    assert!(!resume.is_finished(), "the resume waits for the release");
+
+    gate.execute("select pg_advisory_unlock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+    let discarded = release
+        .await
+        .expect("release task")
+        .expect("release users key ann");
+    assert_eq!(discarded, 1, "the parked write is discarded");
+    resume
+        .await
+        .expect("resume task")
+        .expect("resume posts_named");
+
+    bring_live(&mut raw, &db.pool, &["posts_named", "users_copy"]).await;
+    assert_eq!(
+        rows(&raw, "select name from public.posts_named where id = 1").await,
+        vec![vec![Some("Annie".to_string())]],
+        "the resumed reader holds the change the release carried"
+    );
+    assert_eq!(
+        rows(&raw, "select name from public.users_copy order by name").await,
+        rows(&raw, "select name from public.users order by name").await,
+        "the release re-derived users_copy's key"
+    );
+}
+
+/// The query of a backend queued on a lock `pid` holds, once one is: the
+/// wait is one the test forced, so this is no wait for convergence.
+async fn blocked_behind(raw: &Client, pid: i32) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(row) = raw
+            .query_opt(
+                "select query from pg_stat_activity where $1 = any(pg_blocking_pids(pid))",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+        {
+            return row.get(0);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no backend queued behind the release (pid {pid}) within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

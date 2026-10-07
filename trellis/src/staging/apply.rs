@@ -3352,8 +3352,20 @@ pub(crate) async fn release_to_one_projections(
         .get(0);
     let pk = ddl::source_primary_key(pool, src_table).await?;
     let pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
-    // A release is no drain page: no fence is committed under, so what the
-    // shape reads of the fence goes unused.
+    // A release is no drain page and commits under no fence, so what the
+    // shape reads of a from-side's fence goes unused. The from-side's
+    // key-gate skip (`from_side_key`) needs no fence here (#831). The skip
+    // only leaves the shape's `from_pk` unset, and the release stages no
+    // recompute of a from-side's rows whatever its key: the release's
+    // `Recompute` re-derives them on a later page, whose own skip is fenced.
+    // What a resumed reader reads of the release is the projection rows
+    // written below. While the skip holds, a resume of a reader of the
+    // relationship is its first reader to go unfrozen, so it refreshes the
+    // projection under the refresh stamp locked `for update`
+    // (`catalog::relationships_to_refresh`), which conflicts with the `for
+    // share` taken above, before any shape, and held to the release's
+    // commit. So the resume's refresh reads what the release wrote, or the
+    // release, queued behind the resume, reads the resumed reader.
     let mut versions = HashMap::new();
     for rel in &relationships {
         let shape =
@@ -6629,7 +6641,9 @@ async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyErro
 /// from-side's own fence is read first, then its readers
 /// ([`no_unfrozen_reader`]), and a definition, its resume and its edit each
 /// bump their source's fence, so a page can't commit after a resume it
-/// didn't see.
+/// didn't see. A key release ([`release_to_one_projections`]) reaches the
+/// skips too and commits under no fence; its relationship refresh stamp
+/// locks are why it needs none (#831).
 ///
 /// `fence.skip_frozen` is [`compute_page`]'s (issue #766): on the retry after
 /// Postgres refused the drain a read, a from-side no unfrozen definition
