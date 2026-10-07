@@ -242,7 +242,11 @@ pause are arcs of one lifecycle:
   `capture_failure` reading "resuming: …", until the staging worker has re-typed them
   (an `ALTER … TYPE` that waits for the table's lock) and moved it to
   `waiting_to_backfill`. A re-type that fails puts its error on `capture_failure`, and
-  the transform stays paused. The resume reconciles the target with current source
+  the transform stays paused with its target's rows kept. When the values can't be
+  converted, the repair is `DROP TRANSFORM` and define it again, which builds the
+  target from empty. A re-type of a target pauses the transforms chained off it whose
+  own columns were typed from the old type: their `capture_failure` names the upstream
+  resume, and they're resumed once the upstream is `live` again. The resume reconciles the target with current source
   data rather than replaying what was skipped while paused (the change stream is
   drained for the transform's siblings meanwhile), so the cost of a resume scales with
   the data, not with the length of the pause.
