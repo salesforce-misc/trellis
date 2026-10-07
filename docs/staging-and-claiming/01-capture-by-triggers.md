@@ -280,9 +280,12 @@ precision change or wider scale, or a wider timestamp precision, on a
 `GROUP BY` key (its copy is unconstrained), a narrowing every copy still
 holds, a change to a column read only as a field that every column typed
 from it still holds (a `varchar` widening under a calculated field, whose
-column is `text`), and a change between
-deterministic collations (byte equality is unchanged, even across a join
-pair; define and a resume still require a pair's collations to match).
+column is `text`), and a change between deterministic collations (byte
+equality is unchanged, even across a join pair; define and a resume still
+require a pair's collations to match). A field's move to another type
+family (`integer` to `double precision`) pauses nothing either, though its
+columns may not hold the new values
+([known correctness gaps, entry 22](../known-correctness-gaps.md#22-a-column-read-only-as-a-field-moved-to-another-type-family)).
 
 A resume re-validates the definition as define would and refuses while the
 first two hold, naming the columns and what to change. Otherwise, if any

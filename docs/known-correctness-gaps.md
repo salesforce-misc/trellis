@@ -22,7 +22,7 @@ them gets broken without Trellis noticing.
   hierarchy (entry 7).
 * No DDL rewrites a column a definition reads, or moves one it reads only as
   a field to another type family, beyond the changes Trellis detects and
-  pauses for (entries 1 and 2). Retyping or re-collating a key, join or GROUP
+  pauses for (entries 1, 2 and 22). Retyping or re-collating a key, join or GROUP
   BY column, and widening any column Trellis creates a column from with its
   type, pause the definitions concerned (see
   [What isn't on this list](#what-isnt-on-this-list), and entry 4 for what a
@@ -96,6 +96,7 @@ These are the tools the entries refer to:
 | 18 | `jsonb_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
 | 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #838 |
+| 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -600,6 +601,41 @@ from.
 
 **Repair:** `PAUSE`/`RESUME` the transform.
 
+## 22. A column read only as a field moved to another type family
+
+**Trigger:** an `ALTER COLUMN … TYPE` that moves a column a definition reads
+only as a field (a passthrough, a calculated field's input, an aggregate's
+argument, a to-side column read through a relationship) to another type
+family: `integer` to `double precision`, or `numeric` to `double precision`
+and back. An integer moved to `numeric` isn't this entry: every integer
+column Trellis created from it can no longer hold its values, so its readers
+pause (entry 4).
+
+**Effect:** the columns Trellis created from it keep the types define gave
+them, and nothing pauses.
+
+* A value the old type can't parse fails its write, and the key is held for
+  that definition (see [Repair caveats](#repair-caveats)). Trellis evaluates
+  a field with the source types it recorded at define or the last resume,
+  so `3.5` fails a field read from what was an `integer`.
+* A value the old type parses but can't hold exactly is rounded into it,
+  silently. A passthrough's `numeric(10,2)` column keeps `1.23` for a
+  `double precision` `1.234`, and an aggregate's `MIN(d)` column keeps
+  `0.12345678901234568` where `d` now holds `0.12345678901234567890123`.
+
+**Detected?** A failed write shows as a held key on the definition's
+`status`. A rounded value shows only in `self_check`, on a 1-1 target.
+
+**Planned work:** none filed. #824 pauses for a widening, and leaves a move
+to another type family as it was.
+
+**Repair:** `PAUSE TRANSFORM` then `RESUME TRANSFORM`. The resume brings
+every column the definition created to the type define would give it now,
+releases its held keys and rebuilds the target. An aggregate whose `SUM`
+argument moved between `numeric` and floating point is the exception: its
+group-delta table keeps the running-sum column define gave the old `SUM`,
+and the rebuild fails the keys it writes. Drop it and define it again.
+
 ## Repair caveats
 
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
@@ -618,9 +654,11 @@ from.
   the same source keeps applying the key, so two definitions can disagree on
   it. A widening of a column Trellis copies with its type causes such
   failures when an oversized value drains before the capture pass pauses
-  the definition (entry 4). The definition's `status` reports its held keys (`held_keys`:
-  how many, and since when) whatever its status, `live` included, and
-  `self_check` reports them with every audit. What clears a held key:
+  the definition (entry 4), and so does a field's move to another type
+  family (entry 22). The definition's `status` reports its held keys
+  (`held_keys`: how many, and since when) whatever its status, `live`
+  included, and `self_check` reports them with every audit. What clears a
+  held key:
   * `Trellis::release_key(transform, source_table, key)` (`trellis release`
     on the CLI, `release_key` in the bindings) releases one key, once its
     cause is fixed: every definition reading it re-derives it from its
@@ -650,23 +688,25 @@ refusing them up front:
   you resume once the schema is right
   ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md)).
 * **A key, join or GROUP BY column retyped or re-collated, or a column
-  Trellis creates a column from with its type widened.** The staging worker's capture pass
-  pauses the definitions concerned, with a `capture_failure` naming each
-  column, its old and new type, and what to do, when define would now refuse
-  the column or a relationship's join columns no longer match, when the
-  change renders the stored keys differently or rounds them (`timestamp` to
-  `timestamptz`, `text` to `uuid`, a narrower `numeric` scale or
-  `varchar(n)`), and when a column Trellis created from the source can no
-  longer hold every value of the type define would give it now (`int` to
-  `bigint` under a 1-1 target's key, passthrough or calculated field, a
-  GROUP BY key, a `SUM` or `MIN` and its ledger contribution, or a
-  relationship projection's key or column). A resume refuses until define
-  would accept the definition again; otherwise it re-types those columns
-  and rebuilds (entry 4 for what that costs)
+  Trellis creates a column from with its type widened.** The staging
+  worker's capture pass pauses the definitions concerned, with a
+  `capture_failure` naming each column, its old and new type, and what to
+  do, when define would now refuse the column or a relationship's join
+  columns no longer match, when the change renders the stored keys
+  differently or rounds them (`timestamp` to `timestamptz`, `text` to
+  `uuid`, a narrower `numeric` scale or `varchar(n)`), and when a column
+  Trellis created from the source can no longer hold every value of the type
+  define would give it now (`int` to `bigint` under a 1-1 target's key,
+  passthrough or calculated field, a GROUP BY key, a `SUM` or `MIN` and its
+  ledger contribution, or a relationship projection's key or column;
+  `bigint` to `numeric` under a `MIN`). A resume refuses until define would
+  accept the definition again; otherwise it re-types those columns and
+  rebuilds (entry 4 for what that costs)
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and
   the resume releases it. A change between deterministic collations needs
-  nothing (but see entry 3).
+  nothing (but see entry 3). A field's move to another type family pauses
+  nothing (entry 22).
 * **A source's primary key dropped, or retyped off the supported types.** The
   drain pauses every definition it reaches, and what is downstream of them,
   with a `capture_failure` naming the cause, and the rest of the page commits.
