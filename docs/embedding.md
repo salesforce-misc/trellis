@@ -111,6 +111,11 @@ So:
   Every Trellis connection runs with `row_security = off`, so whichever role
   a worker logs in as, a read or write the policies would filter fails rather
   than skipping rows.
+* **Any default isolation level.** Trellis's connections start every
+  transaction at `read committed`, whatever the server's, database's or
+  role's `default_transaction_isolation`. Only the connections Trellis opens
+  itself are set: your application's sessions keep their own level, and
+  capture works at `read committed`, `repeatable read` and `serializable`.
 * **Leave the capture triggers alone.** Each source table carries five
   triggers named after the instance schema (`trellis_capture_insert` and so on
   for the default). Don't disable or drop them. The worker reinstalls a

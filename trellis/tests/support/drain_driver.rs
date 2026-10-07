@@ -83,10 +83,51 @@ impl Driver {
         definitions: &[&str],
         captured: &[&str],
     ) -> Self {
+        Self::start_with_database_defaults(
+            &[],
+            source_ddl,
+            columns,
+            relationships,
+            definitions,
+            captured,
+        )
+        .await
+    }
+
+    /// [`Self::start_with_relationships`] on a database whose defaults
+    /// (`alter database ... set name to value`) include `defaults`. The
+    /// engine's pool only opens connections once they are set, so every
+    /// session Trellis opens starts from them. `ctl` and `gate` connect
+    /// before them and keep the server's defaults: they stand in for the
+    /// test, not for the engine. A [`Self::user`] connection starts from
+    /// them too, as an application's would.
+    pub async fn start_with_database_defaults(
+        defaults: &[(&str, &str)],
+        source_ddl: &str,
+        columns: &[(&str, ValueType)],
+        relationships: &[&str],
+        definitions: &[&str],
+        captured: &[&str],
+    ) -> Self {
         let cluster = TestCluster::start();
-        let db = cluster.create_isolated_database().await;
+        let mut db = cluster.create_isolated_database().await;
         let mut ctl = connect(db.dsn()).await;
         let gate = connect(db.dsn()).await;
+        if !defaults.is_empty() {
+            for (name, value) in defaults {
+                ctl.batch_execute(&format!(
+                    "alter database \"{}\" set {name} to '{value}'",
+                    db.name().replace('"', "\"\"")
+                ))
+                .await
+                .expect("set a database default");
+            }
+            // Migrating the database opened the pool's connections before
+            // the defaults existed; a fresh pool opens its own after them.
+            let config =
+                trellis::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+            db.pool = trellis::Pool::new(&config).expect("a fresh pool");
+        }
         ctl.batch_execute(source_ddl).await.expect("source DDL");
         for relationship in relationships {
             create_relationship(&db.pool, relationship)

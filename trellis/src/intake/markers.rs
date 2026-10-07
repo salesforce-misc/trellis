@@ -1483,9 +1483,12 @@ async fn discharge_marker(
         .map(|(id, _)| *id)
         .collect();
 
-    // `read committed`, whatever the server's default: the orphan sweep's
-    // 1-1 delete re-checks the source on a snapshot of its own, taken after
-    // its lock statement (`resume_orphans`, "A 1-1 row backed again", #883).
+    // `read committed`: the orphan sweep's 1-1 delete re-checks the source
+    // on a snapshot of its own, taken after its lock statement
+    // (`resume_orphans`, "A 1-1 row backed again", #883). Every Trellis
+    // session already starts its transactions there
+    // (`crate::pool::READ_COMMITTED`, #887); the level is spelled out here
+    // too because this transaction depends on it.
     let txn = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)

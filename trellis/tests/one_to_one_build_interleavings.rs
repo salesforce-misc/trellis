@@ -1332,7 +1332,14 @@ async fn a_field_chunk_reads_the_parent_after_its_entry_lock(change: ParentChang
 
 /// [`KID_DDL`] with `rk` live over it, both tables captured, drained.
 async fn start_kid() -> Driver {
-    let d = Driver::start_with_relationships(
+    start_kid_with_database_defaults(&[]).await
+}
+
+/// [`start_kid`] on a database whose defaults include `defaults`
+/// ([`Driver::start_with_database_defaults`]).
+async fn start_kid_with_database_defaults(defaults: &[(&str, &str)]) -> Driver {
+    let d = Driver::start_with_database_defaults(
+        defaults,
         KID_DDL,
         &[
             ("id", ValueType::Numeric),
@@ -1489,6 +1496,51 @@ async fn a_page_rederive_does_not_write_null_for_a_parent_inserted_under_it() {
 #[tokio::test]
 async fn a_page_rederive_does_not_write_a_parent_deleted_under_it() {
     a_page_rederive_reads_the_parent_after_its_entry_lock(ParentChange::Delete).await;
+}
+
+/// Issue #887: a read after the entry lock sees what committed before it
+/// only at `read committed`. A page re-deriving kid 1 takes its first
+/// statement's snapshot and stops before its entry lock; kid 1's own row
+/// then changes. When the page goes on, its Re-derive reads the row after
+/// its entry lock and writes the new value. Under a database default of
+/// `repeatable read` it would read the row as of its first statement and
+/// write the superseded value, with nothing raising: the change touched
+/// none of the rows the page locks or writes. Here the change's own Apply
+/// puts the row right later; the test pins the read, which I1 needs
+/// wherever nothing later would. Every session Trellis opens pins
+/// `read committed`, so the default doesn't reach the page.
+#[tokio::test]
+async fn a_page_rederive_reads_its_row_after_its_entry_lock_under_a_repeatable_read_default() {
+    let mut d =
+        start_kid_with_database_defaults(&[("default_transaction_isolation", "repeatable read")])
+            .await;
+    d.stage_recomputes("public.kid", &["1"]).await;
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(
+            batch,
+            "page",
+            &[(PausePoint::AfterPlaceholders, KID_TARGET)],
+        )
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    let user = d.user().await;
+    user.batch_execute("update public.kid set a = 7 where id = 1")
+        .await
+        .expect("the kid's change");
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    page.finish().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the page wrote kid 1 as it was before a change that committed before its entry lock"
+    );
+    d.settle().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the target once the change drains"
+    );
 }
 
 /// Issue #838, rule 4: a page's Re-derive that joins a parent outside the

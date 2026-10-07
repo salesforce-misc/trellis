@@ -18,7 +18,8 @@
 //! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]), turns
 //! `row_security` off so a read row-level security would filter raises
 //! instead (see [`ROW_SECURITY_OFF`], issue #766), turns JIT compilation
-//! off (see [`JIT_OFF`], issue #794), and turns on
+//! off (see [`JIT_OFF`], issue #794), starts every transaction at
+//! `READ COMMITTED` (see [`READ_COMMITTED`], issue #887), and turns on
 //! TCP keepalives at both ends so a partitioned connection's locks don't
 //! outlive it by hours (see [`tcp_keepalive_gucs`], issue #364). The
 //! dedicated, non-pooled connections get the same through
@@ -411,6 +412,25 @@ pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 /// server's, database's or role's default.
 pub(crate) const JIT_OFF: &str = "set jit to off";
 
+/// Starts every transaction at `READ COMMITTED` (issue #887).
+///
+/// ADR-0002's I1 (read after lock) depends on it: a statement that reads
+/// after the entry lock has to see what committed before it, including the
+/// writer the lock waited on. At `READ COMMITTED` each statement takes a
+/// fresh snapshot, so it does. At `REPEATABLE READ` or `SERIALIZABLE` the
+/// whole transaction reads from the snapshot its first statement took,
+/// before the lock, and a page could write a value derived from a row
+/// another transaction had already replaced. Where that writer also
+/// touched a row the page locks or writes, the page fails with `40001`
+/// instead and is retried; where it didn't, nothing would notice.
+///
+/// It is applied by [`session_bootstrap`] and [`dedicated_session_setup`],
+/// so every connection Trellis opens itself carries it, whatever the
+/// server's, database's or role's default. A transaction that asks for a
+/// level of its own still gets it: the capture pass reads its catalog in
+/// one `REPEATABLE READ` snapshot.
+pub(crate) const READ_COMMITTED: &str = "set default_transaction_isolation to 'read committed'";
+
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
 ///
@@ -420,8 +440,8 @@ pub(crate) const JIT_OFF: &str = "set jit to off";
 /// even when it lives outside both `schema` and `public`) and `public`
 /// (Postgres's own default, kept last as a fallback for anything that
 /// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`],
-/// [`ROW_SECURITY_OFF`], [`JIT_OFF`], the server-side TCP keepalives
-/// ([`tcp_keepalive_gucs`], without the user timeout: see
+/// [`ROW_SECURITY_OFF`], [`JIT_OFF`], [`READ_COMMITTED`], the server-side
+/// TCP keepalives ([`tcp_keepalive_gucs`], without the user timeout: see
 /// [`DeadPeerDetection::KeepalivesOnly`]) and the session's
 /// `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`], ADR-0002
 /// I7).
@@ -433,7 +453,7 @@ async fn session_bootstrap(
     client
         .batch_execute(&format!(
             "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; \
-             {ROW_SECURITY_OFF}; {JIT_OFF}; {}; {}",
+             {ROW_SECURITY_OFF}; {JIT_OFF}; {READ_COMMITTED}; {}; {}",
             quote_ident(schema),
             quote_ident(target_schema),
             tcp_keepalive_gucs(DeadPeerDetection::KeepalivesOnly),
@@ -655,12 +675,12 @@ pub(crate) async fn connect_dedicated(
 /// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
 /// pooled one: `search_path` pinned to `schema` then `public`,
 /// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`ROW_SECURITY_OFF`], [`JIT_OFF`],
-/// [`tcp_keepalive_gucs`] with the user timeout, and the `lock_timeout` cap
-/// ([`crate::locks::session_lock_timeout_sql`]).
+/// [`READ_COMMITTED`], [`tcp_keepalive_gucs`] with the user timeout, and
+/// the `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`]).
 pub(crate) fn dedicated_session_setup(schema: &str) -> String {
     format!(
         "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {ROW_SECURITY_OFF}; \
-         {JIT_OFF}; {}; {}",
+         {JIT_OFF}; {READ_COMMITTED}; {}; {}",
         quote_ident(schema),
         tcp_keepalive_gucs(DeadPeerDetection::KeepalivesAndUserTimeout),
         crate::locks::session_lock_timeout_sql()
@@ -893,12 +913,23 @@ mod tests {
 
     /// Every kind of session Trellis opens itself (pooled, unpooled,
     /// dedicated) runs with `row_security` (issue #766) and `jit` (issue
-    /// #794) off, even when the database's default says `on`: a read that
-    /// row-level security would filter raises instead, and no statement is
-    /// JIT-compiled.
+    /// #794) off and starts its transactions at `read committed` (issue
+    /// #887), even when the database's defaults say otherwise: a read that
+    /// row-level security would filter raises instead, no statement is
+    /// JIT-compiled, and a read after a lock sees what committed before it.
     #[tokio::test]
-    async fn row_security_and_jit_are_off_on_every_session_kind() {
-        const SETTINGS: [&str; 2] = ["row_security", "jit"];
+    async fn session_settings_are_pinned_on_every_session_kind() {
+        /// Each setting, the database default this test sets, and the value
+        /// every Trellis session pins.
+        const SETTINGS: [(&str, &str, &str); 3] = [
+            ("row_security", "on", "off"),
+            ("jit", "on", "off"),
+            (
+                "default_transaction_isolation",
+                "repeatable read",
+                "read committed",
+            ),
+        ];
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
@@ -907,18 +938,21 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        for name in SETTINGS {
+        for (name, default, _) in SETTINGS {
             raw.batch_execute(&format!(
-                "alter database {} set {name} to on",
-                quote_ident(db.name())
+                "alter database {} set {name} to {}",
+                quote_ident(db.name()),
+                quote_literal(default)
             ))
             .await
-            .expect("an explicit database default of on");
+            .expect("an explicit database default");
         }
 
-        async fn settings(client: &tokio_postgres::Client) -> Vec<String> {
+        /// Each setting's value, then the isolation level of a transaction
+        /// opened with no level of its own.
+        async fn settings(client: &mut tokio_postgres::Client) -> Vec<String> {
             let mut values = Vec::new();
-            for name in SETTINGS {
+            for (name, _, _) in SETTINGS {
                 values.push(
                     client
                         .query_one("select current_setting($1)", &[&name])
@@ -927,29 +961,63 @@ mod tests {
                         .get(0),
                 );
             }
+            let txn = client.transaction().await.expect("begin");
+            values.push(
+                txn.query_one("select current_setting('transaction_isolation')", &[])
+                    .await
+                    .expect("read the transaction's level")
+                    .get(0),
+            );
+            txn.rollback().await.expect("rollback");
             values
         }
-        let on = vec!["on".to_string(); SETTINGS.len()];
-        let off = vec!["off".to_string(); SETTINGS.len()];
+        let defaults: Vec<String> = SETTINGS
+            .iter()
+            .map(|(_, default, _)| default)
+            .chain([&"repeatable read"])
+            .map(|value| value.to_string())
+            .collect();
+        let pinned: Vec<String> = SETTINGS
+            .iter()
+            .map(|(_, _, pinned)| pinned)
+            .chain([&"read committed"])
+            .map(|value| value.to_string())
+            .collect();
 
-        // Control: a session that pins nothing has them on.
-        let (unpinned, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+        // Control: a session that pins nothing has the database's defaults.
+        let (mut unpinned, connection) = tokio_postgres::connect(db.dsn(), NoTls)
             .await
             .expect("connect unpinned");
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        assert_eq!(settings(&unpinned).await, on, "unpinned");
+        assert_eq!(settings(&mut unpinned).await, defaults, "unpinned");
 
         let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
         let pool = Pool::new(&config).expect("pool");
-        let pooled = pool.get().await.expect("pooled connection");
-        assert_eq!(settings(&pooled).await, off, "pooled");
+        let mut pooled = pool.get().await.expect("pooled connection");
+        assert_eq!(settings(&mut pooled).await, pinned, "pooled");
 
-        let unpooled = pool.connect_unpooled().await.expect("unpooled connection");
-        assert_eq!(settings(&unpooled).await, off, "unpooled");
+        // A transaction that asks for a level of its own still gets it, as
+        // the capture pass's catalog read does.
+        let txn = pooled
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .start()
+            .await
+            .expect("begin repeatable read");
+        let level: String = txn
+            .query_one("select current_setting('transaction_isolation')", &[])
+            .await
+            .expect("read the transaction's level")
+            .get(0);
+        assert_eq!(level, "repeatable read", "an explicit level");
+        txn.rollback().await.expect("rollback");
 
-        let (dedicated, connection) = connect_dedicated(db.dsn()).await.expect("dedicated");
+        let mut unpooled = pool.connect_unpooled().await.expect("unpooled connection");
+        assert_eq!(settings(&mut unpooled).await, pinned, "unpooled");
+
+        let (mut dedicated, connection) = connect_dedicated(db.dsn()).await.expect("dedicated");
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -957,7 +1025,7 @@ mod tests {
             .batch_execute(&dedicated_session_setup(crate::config::DEFAULT_SCHEMA))
             .await
             .expect("dedicated session setup");
-        assert_eq!(settings(&dedicated).await, off, "dedicated");
+        assert_eq!(settings(&mut dedicated).await, pinned, "dedicated");
     }
 
     /// Issue #672 review: the SQL Trellis writes escapes a string literal by
