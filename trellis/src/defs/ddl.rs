@@ -125,18 +125,9 @@ fn passthrough_source_column<'a>(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Option<&'a str> {
-    let Expr::Column(name) = &field.expr else {
-        return None;
-    };
-    if !source_columns.contains_key(name) {
-        return None;
-    }
-    let resolves_to_other_calc_field =
-        name != &field.name && def.fields.iter().any(|f| &f.name == name);
-    if resolves_to_other_calc_field {
-        return None;
-    }
-    Some(name.as_str())
+    field
+        .passthrough_column(&def.fields)
+        .filter(|name| source_columns.contains_key(*name))
 }
 
 /// The source table's primary key, as introspected from `pg_catalog`.

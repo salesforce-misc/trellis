@@ -937,6 +937,137 @@ mod tests {
             }]
         );
     }
+
+    fn source_column(schema: Option<&str>, table: &str, column: &str) -> Expr {
+        Expr::SourceColumn {
+            schema: schema.map(str::to_string),
+            table: table.to_string(),
+            column: column.to_string(),
+        }
+    }
+
+    /// Issue #830: `<FROM table>.<column>` is a qualified source column; any
+    /// other two-part head is a relationship.
+    #[test]
+    fn a_two_part_name_headed_by_the_from_table_is_a_source_column() {
+        let def =
+            parse("TRANSFORM t FROM orders SELECT orders.price + product.cost AS margin").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(source_column(None, "orders", "price")),
+                rhs: Box::new(Expr::RelationshipPath {
+                    rel: "product".to_string(),
+                    column: "cost".to_string(),
+                }),
+            }
+        );
+        // The FROM table's bare name heads it even when FROM names a schema.
+        let def = parse("TRANSFORM t FROM app.orders SELECT orders.price AS p").unwrap();
+        assert_eq!(def.fields[0].expr, source_column(None, "orders", "price"));
+    }
+
+    /// A three-part name is always a qualified source column, inside an
+    /// aggregate's argument too; the validator checks which table it names.
+    #[test]
+    fn a_three_part_name_is_a_source_column() {
+        let def = parse(
+            "TRANSFORM t FROM app.orders GROUP BY region SELECT region AS region, \
+             SUM(app.orders.price) AS total, SUM(x.y.z) AS other",
+        )
+        .unwrap();
+        assert_eq!(
+            def.fields[1].expr,
+            Expr::FunctionCall {
+                name: "SUM".to_string(),
+                args: vec![source_column(Some("app"), "orders", "price")],
+            }
+        );
+        assert_eq!(
+            def.fields[2].expr,
+            Expr::FunctionCall {
+                name: "SUM".to_string(),
+                args: vec![source_column(Some("x"), "y", "z")],
+            }
+        );
+    }
+
+    #[test]
+    fn a_four_part_name_is_rejected() {
+        assert_eq!(
+            parse("TRANSFORM t FROM orders SELECT a.b.c.d AS x"),
+            Err(ParseError::TooManyColumnNameParts {
+                reference: "a.b.c.d".to_string(),
+            })
+        );
+    }
+
+    /// A `GROUP BY` key qualified by the FROM table is the plain column.
+    #[test]
+    fn a_group_by_key_qualified_by_the_from_table_is_the_column() {
+        let def = parse(
+            "TRANSFORM t FROM orders GROUP BY orders.region, product.kind \
+             SELECT region AS region, COUNT(*) AS n",
+        )
+        .unwrap();
+        assert_eq!(
+            def.key_space,
+            KeySpace::Aggregate {
+                group_by: vec![
+                    GroupByKey::Column("region".to_string()),
+                    GroupByKey::RelationshipPath {
+                        rel: "product".to_string(),
+                        column: "kind".to_string(),
+                    },
+                ],
+            }
+        );
+    }
+
+    /// A rendered definition (what `ALTER TRANSFORM` persists) keeps a
+    /// qualified name qualified, as written.
+    #[test]
+    fn a_qualified_name_round_trips_through_render() {
+        for text in [
+            "TRANSFORM t FROM orders GROUP BY region SELECT region AS region, \
+             (region + 1) AS price, SUM(orders.price) AS total",
+            "TRANSFORM t FROM app.orders SELECT app.orders.price AS p",
+        ] {
+            let def = parse(text).unwrap();
+            assert_eq!(
+                parse(&ast::render_definition_text(&def)).unwrap(),
+                def,
+                "{text}"
+            );
+        }
+    }
+
+    /// An `ALTER TRANSFORM` clause is parsed without its source; the catalog
+    /// reads its two-part names against the stored definition's.
+    #[test]
+    fn qualify_source_columns_reads_a_from_table_head_as_the_source() {
+        let Statement::AlterTransform(alter) =
+            parse_statement("ALTER TRANSFORM t ADD orders.price + product.cost AS margin").unwrap()
+        else {
+            panic!("not an ALTER");
+        };
+        let ast::AlterClause::Add(mut field) = alter.clauses[0].clone() else {
+            panic!("not an ADD");
+        };
+        field.expr.qualify_source_columns("orders");
+        assert_eq!(
+            field.expr,
+            Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(source_column(None, "orders", "price")),
+                rhs: Box::new(Expr::RelationshipPath {
+                    rel: "product".to_string(),
+                    column: "cost".to_string(),
+                }),
+            }
+        );
+    }
 }
 
 /// Grammar coverage for [`parse_statement`], the unified statement entry point

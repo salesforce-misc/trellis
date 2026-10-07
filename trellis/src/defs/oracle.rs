@@ -414,6 +414,9 @@ fn collect_columns(
                 out.insert(name.clone());
             }
         }
+        Expr::SourceColumn { column, .. } => {
+            out.insert(column.clone());
+        }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
         // Not a source-column reference by name — a path's columns live on
         // the *to-side* table, which [`recompute`]/[`recompute_aggregate`]'s
@@ -446,7 +449,7 @@ fn collect_columns(
 /// cast so the rendered text is unambiguous regardless of context.
 pub fn render_expr_sql(expr: &Expr) -> String {
     match expr {
-        Expr::Column(name) => quote_ident(name),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
@@ -500,7 +503,9 @@ pub fn render_expr_sql(expr: &Expr) -> String {
 /// joined to-side column of the same name.
 pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> String {
     match expr {
-        Expr::Column(name) => format!("{source_sql}.{}", quote_ident(name)),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+            format!("{source_sql}.{}", quote_ident(name))
+        }
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
@@ -654,6 +659,7 @@ fn collect_rel_names<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
             out.insert(rel.as_str());
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
@@ -787,6 +793,7 @@ fn collect_to_one_rels<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
             collect_to_one_rels(rhs, out);
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
@@ -805,7 +812,9 @@ pub(crate) fn render_rel_expr_sql(
     relationships: &HashMap<String, RelationshipDef>,
 ) -> String {
     match expr {
-        Expr::Column(name) => format!("{}.{}", quote_ident(source), quote_ident(name)),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+            format!("{}.{}", quote_ident(source), quote_ident(name))
+        }
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
@@ -911,6 +920,23 @@ mod tests {
         let columns = referenced_source_columns(&def);
         assert!(columns.contains("b"), "{columns:?}");
         assert!(columns.contains("a"), "{columns:?}");
+    }
+
+    /// Issue #830: `SUM(s.val)` reads the source column `val` though a field
+    /// named `val` exists, so the capture trigger images it and the SQL
+    /// oracle sums it.
+    #[test]
+    fn a_qualified_name_in_an_aggregate_reads_the_source_column() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
+             SUM(s.val) AS total",
+        )
+        .expect("parse");
+        let columns = referenced_source_columns(&def);
+        assert!(columns.contains("val"), "{columns:?}");
+        let sql = render_aggregate_select_sql(&def);
+        assert!(sql.contains(r#"sum("val")"#), "{sql}");
+        assert!(!sql.contains(r#"sum(("grp""#), "{sql}");
     }
 
     #[test]

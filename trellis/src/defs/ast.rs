@@ -494,6 +494,24 @@ pub enum Expr {
     /// cardinality, is deferred to later validation/eval issues; this
     /// variant is grammar + AST only.
     RelationshipPath { rel: String, column: String },
+    /// A source column named through the `FROM` table (issue #830):
+    /// `<table>.<column>` or `<schema>.<table>.<column>`. It always reads the
+    /// source column, never a calculated field of the same name, which is how
+    /// a definition reads a column that a field's name shadows (a bare name
+    /// that could mean either is refused at define, see
+    /// [`super::validate::ValidationError::AmbiguousColumnReference`]).
+    ///
+    /// `table` and `schema` are kept as written. The parser builds this node
+    /// for any three-part name, and for a two-part one whose head is the
+    /// `FROM` table's bare name (any other head is a relationship). The
+    /// validator checks that `table` is the `FROM` table and, when the `FROM`
+    /// clause names its schema, that `schema` matches; the catalog checks
+    /// `schema` against the schema a bare `FROM` resolved to.
+    SourceColumn {
+        schema: Option<String>,
+        table: String,
+        column: String,
+    },
     BinaryOp {
         op: Operator,
         lhs: Box<Expr>,
@@ -696,7 +714,7 @@ fn render_table_ref(out: &mut String, table: &str, explicit_schema: Option<&str>
     out.push_str(table);
 }
 
-fn render_field_expr(expr: &Expr) -> String {
+pub(crate) fn render_field_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
         Expr::NumberLiteral(text) => text.clone(),
@@ -707,6 +725,11 @@ fn render_field_expr(expr: &Expr) -> String {
             typed_literal_keyword(*value_type)
         ),
         Expr::RelationshipPath { rel, column } => format!("{rel}.{column}"),
+        Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } => qualified_column_text(schema.as_deref(), table, column),
         Expr::BinaryOp { op, lhs, rhs } => format!(
             "({} {} {})",
             render_field_expr(lhs),
@@ -725,6 +748,68 @@ fn render_field_expr(expr: &Expr) -> String {
             let rendered_args: Vec<String> = args.iter().map(render_field_expr).collect();
             format!("{name}({})", rendered_args.join(", "))
         }
+    }
+}
+
+impl Expr {
+    /// Reads every two-part `<source>.<column>` in this expression as the
+    /// qualified source column it is when `source` is the `FROM` table's bare
+    /// name (issue #830), as [`super::parser::parse`] does for a whole
+    /// `TRANSFORM` statement. An `ALTER TRANSFORM` clause is parsed without
+    /// knowing its source, so its two-part names come out as relationship
+    /// paths; the catalog runs this over them against the stored
+    /// definition's source.
+    pub(crate) fn qualify_source_columns(&mut self, source: &str) {
+        match self {
+            Expr::RelationshipPath { rel, column } if rel == source => {
+                *self = Expr::SourceColumn {
+                    schema: None,
+                    table: std::mem::take(rel),
+                    column: std::mem::take(column),
+                };
+            }
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                lhs.qualify_source_columns(source);
+                rhs.qualify_source_columns(source);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    arg.qualify_source_columns(source);
+                }
+            }
+            Expr::Column(_)
+            | Expr::SourceColumn { .. }
+            | Expr::RelationshipPath { .. }
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. } => {}
+        }
+    }
+}
+
+impl FieldDef {
+    /// The column this field passes through, if its expression is exactly one
+    /// column reference that reads a column rather than another field: a
+    /// qualified [`Expr::SourceColumn`], its own name (`val AS val`), or a
+    /// bare name no other field of `fields` takes. Whether that column exists
+    /// on the source is the caller's to check.
+    pub(crate) fn passthrough_column<'a>(&'a self, fields: &[FieldDef]) -> Option<&'a str> {
+        match &self.expr {
+            Expr::SourceColumn { column, .. } => Some(column),
+            Expr::Column(name) if name == &self.name || !fields.iter().any(|f| &f.name == name) => {
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// How an [`Expr::SourceColumn`] is written: `<table>.<column>`, or
+/// `<schema>.<table>.<column>` when a schema is given.
+pub(crate) fn qualified_column_text(schema: Option<&str>, table: &str, column: &str) -> String {
+    match schema {
+        Some(schema) => format!("{schema}.{table}.{column}"),
+        None => format!("{table}.{column}"),
     }
 }
 

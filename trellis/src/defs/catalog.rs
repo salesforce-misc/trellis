@@ -119,7 +119,7 @@ use super::pg_type::PgType;
 use super::validate::{
     KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
     RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError,
-    infer_field_types, reject_primary_key_named_fields, validate,
+    infer_field_types, reject_primary_key_named_fields, validate, validate_qualified_columns,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -861,7 +861,7 @@ pub async fn install_definition(
             .await?;
     }
     let relationships = resolve_relationships_for_new_definition(pool, &def).await?;
-    validate(&def, source_columns, &relationships)?;
+    validate_for_define(pool, &def, source_columns, &relationships).await?;
 
     // An explicit `TRANSFORM <schema>.<target>` spelling overrides
     // `target_schema` (`Config::target_schema`, or this function's own
@@ -1585,7 +1585,16 @@ pub async fn alter_transform(
     let mut real_alters: Vec<FieldDef> = Vec::new();
     let mut real_drops: Vec<String> = Vec::new();
 
-    for clause in &alter.clauses {
+    // Issue #830: the clauses were parsed without the source, so a
+    // `<source>.<column>` in them came out as a relationship path.
+    let mut clauses = alter.clauses.clone();
+    for clause in &mut clauses {
+        if let AlterClause::Add(field) | AlterClause::Alter(field) = clause {
+            field.expr.qualify_source_columns(&current.def.source);
+        }
+    }
+
+    for clause in &clauses {
         match clause {
             AlterClause::Add(new_field) => {
                 match fields.iter().find(|f| f.name == new_field.name) {
@@ -1700,7 +1709,12 @@ pub async fn alter_transform(
     // detector) a first `define` runs — see this function's own doc comment
     // on why the table-level whole-graph check is deliberately not re-run.
     let relationships = resolve_relationships(pool, &merged, &current.source_table).await?;
-    validate(&merged, &current.source_columns, &relationships)?;
+    validate_with_source(
+        &merged,
+        &current.source_columns,
+        &relationships,
+        &current.source_table,
+    )?;
     let field_types = infer_field_types(&merged, &current.source_columns, &relationships)?;
 
     // Pre-transaction dependency check for every real `DROP` — issue #241's
@@ -2252,7 +2266,7 @@ async fn create_definition_inner(
     // the sync, DB-less validator can't fetch itself, so resolve it here (same
     // caller-supplies-context split as `source_columns`).
     let relationships = resolve_relationships_for_new_definition(pool, &def).await?;
-    validate(&def, source_columns, &relationships)?;
+    validate_for_define(pool, &def, source_columns, &relationships).await?;
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
@@ -2307,6 +2321,9 @@ async fn create_definition_inner(
     // Issue #315: the authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source).await?;
+    // Issue #830: a three-part qualified column names the source's schema,
+    // which a bare `FROM` only now resolved.
+    validate_qualified_columns(&def, source_columns, schema_of(&qualified_source))?;
 
     // The source's version fence, bumped as this transaction's first lock
     // (issues #744 and #770). The bump waits for every page holding the
@@ -2784,6 +2801,20 @@ fn is_target_suffix_index_violation(err: &tokio_postgres::Error) -> bool {
         && db_err.constraint() == Some("transform_definitions_target_suffix_idx")
 }
 
+/// Refuses a relationship named after its own from-table (issue #830): a
+/// transform over that table reads `<table>.<column>` as its own source
+/// column, so the relationship's paths would mean two things.
+fn reject_relationship_named_after_from_table(
+    def: &RelationshipDef,
+) -> Result<(), ValidationError> {
+    if def.name == def.from_table {
+        return Err(ValidationError::RelationshipNamedAfterFromTable {
+            name: def.name.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Parses, validates, and stores a new relationship declaration (issue #26
 /// storage, issue #27 validation, ADR-0006): resolves/creates `schema_nodes`
 /// for both endpoints, persists a `schema_edges` row from `from_table` to
@@ -2812,6 +2843,7 @@ pub async fn create_relationship(
     source_text: &str,
 ) -> Result<RelationshipDefinition, CatalogError> {
     let def: RelationshipDef = parse_relationship(source_text)?;
+    reject_relationship_named_after_from_table(&def)?;
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
@@ -3841,6 +3873,53 @@ async fn reject_fields_named_after_primary_key(
     Ok(())
 }
 
+/// The schema half of a qualified `schema.table` name.
+fn schema_of(qualified: &str) -> Option<&str> {
+    qualified.split_once('.').map(|(schema, _)| schema)
+}
+
+/// [`validate`] for a definition whose source resolved to `qualified_source`
+/// (issue #830): a three-part qualified column must name that schema, and an
+/// ambiguous-name refusal spells it in the qualified names it suggests.
+fn validate_with_source(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
+    qualified_source: &str,
+) -> Result<(), ValidationError> {
+    let schema = schema_of(qualified_source);
+    validate(def, source_columns, relationships).map_err(|err| match schema {
+        Some(schema) => err.with_source_schema(schema),
+        None => err,
+    })?;
+    validate_qualified_columns(def, source_columns, schema)
+}
+
+/// [`validate`] for a definition being defined, before its source is
+/// resolved. Resolves the source only to spell its schema in an
+/// ambiguous-name refusal (issue #830); a definition that fails some other
+/// way, or passes, never resolves it here.
+async fn validate_for_define(
+    pool: &Pool,
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Result<(), CatalogError> {
+    match validate(def, source_columns, relationships) {
+        Err(err @ ValidationError::AmbiguousColumnReference(_)) => {
+            let err = match resolve_source_for_install(pool, def).await {
+                Ok(qualified) => match schema_of(&qualified) {
+                    Some(schema) => err.with_source_schema(schema),
+                    None => err,
+                },
+                Err(_) => err,
+            };
+            Err(err.into())
+        }
+        result => Ok(result?),
+    }
+}
+
 /// The fully-qualified source [`install_definition`]'s own DDL steps read
 /// from (issue #76, ADR-0007 grammar clause 4) — computed once, early in
 /// that function, exactly like `target_schema`/[`effective_target_schema`]
@@ -4339,7 +4418,7 @@ pub(crate) async fn revalidate(
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
     }
     let relationships = resolve_relationships_in(txn, &definition.def, source).await?;
-    validate(&definition.def, &source_columns, &relationships)?;
+    validate_with_source(&definition.def, &source_columns, &relationships, source)?;
     let source_key =
         validate_live_schema(txn, schema, &definition.def, source, &relationships).await?;
     if let KeySpace::OneToOne = definition.def.key_space {
@@ -7287,7 +7366,9 @@ fn expr_references_column(
     rel_to_table: &HashMap<(String, String), String>,
 ) -> bool {
     match expr {
-        Expr::Column(name) => def_source == upstream_table && name == upstream_column,
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+            def_source == upstream_table && name == upstream_column
+        }
         Expr::RelationshipPath { rel, column } => {
             column == upstream_column
                 && rel_to_table
@@ -7964,6 +8045,44 @@ mod join_column_tests {
                     &resolved
                 )
                 .is_ok()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod relationship_name_tests {
+    use super::*;
+
+    /// Issue #830: a transform over `posts` reads `posts.<column>` as its
+    /// own source column, so a relationship on `posts` can't be named
+    /// `posts`. Any other name, or `posts` on another from-table, is fine.
+    #[test]
+    fn a_relationship_named_after_its_from_table_is_refused() {
+        let def = parse_relationship("RELATIONSHIP posts FROM posts.author_id TO users.id")
+            .expect("parse");
+        let err = reject_relationship_named_after_from_table(&def).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::RelationshipNamedAfterFromTable {
+                name: "posts".to_string(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "relationship 'posts' has the same name as its from-table; a transform over \
+             'posts' reads `posts.<column>` as its own source column, so give the \
+             relationship a different name"
+        );
+        for text in [
+            "RELATIONSHIP author FROM posts.author_id TO users.id",
+            "RELATIONSHIP posts FROM comments.post_id TO posts.id",
+        ] {
+            let def = parse_relationship(text).expect("parse");
+            assert_eq!(
+                reject_relationship_named_after_from_table(&def),
+                Ok(()),
+                "{text}"
             );
         }
     }

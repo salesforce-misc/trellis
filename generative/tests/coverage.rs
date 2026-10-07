@@ -107,7 +107,7 @@ fn value_column_types(table: &Table) -> impl Iterator<Item = ValueType> + '_ {
 
 fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
     match expr {
-        Expr::Column(name) => {
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
             let column = source
                 .columns
                 .iter()

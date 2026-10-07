@@ -892,9 +892,33 @@ fn collect_relationship_refs(expr: &Expr, out: &mut Vec<(String, String)>) {
             }
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
+    }
+}
+
+/// Reads source column `name` from `row`, parsed as the column's type.
+fn read_source_column(
+    field_name: &str,
+    name: &str,
+    row: &Row,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<Option<Value>, EvalError> {
+    match row.get(name) {
+        Some(Some(text)) => {
+            let value_type = source_columns
+                .get(name)
+                .copied()
+                .unwrap_or(ValueType::Numeric);
+            parse_value(field_name, value_type, text).map(Some)
+        }
+        Some(None) => Ok(None),
+        None => Err(EvalError::MissingColumn {
+            field: field_name.to_string(),
+            column: name.to_string(),
+        }),
     }
 }
 
@@ -977,20 +1001,12 @@ fn eval_expr(
                     regex_cache,
                 );
             }
-            match row.get(name) {
-                Some(Some(text)) => {
-                    let value_type = source_columns
-                        .get(name)
-                        .copied()
-                        .unwrap_or(ValueType::Numeric);
-                    parse_value(field_name, value_type, text).map(Some)
-                }
-                Some(None) => Ok(None),
-                None => Err(EvalError::MissingColumn {
-                    field: field_name.to_string(),
-                    column: name.clone(),
-                }),
-            }
+            read_source_column(field_name, name, row, source_columns)
+        }
+        // Issue #830: a qualified name reads the source column even when a
+        // field has the same name.
+        Expr::SourceColumn { column, .. } => {
+            read_source_column(field_name, column, row, source_columns)
         }
         Expr::NumberLiteral(text) => number_literal(field_name, text).map(Some),
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
@@ -1380,6 +1396,11 @@ fn eval_aggregate_expr(
             // Every row in the group shares this value, so any row's is
             // representative.
             eval_row_scalar(name, field_name, &rows[0], source_columns)
+        }
+        // Issue #830: outside an aggregate's argument, the validator only
+        // lets a qualified name read a grouping key.
+        Expr::SourceColumn { column, .. } => {
+            eval_row_scalar(column, field_name, &rows[0], source_columns)
         }
         Expr::Column(name) => {
             // The validator guarantees a bare column reference reaching here
@@ -3483,6 +3504,36 @@ mod tests {
             evaluate_aggregate(&d, &rows, &numeric_types(&["id"]), &mut RegexCache::new()).unwrap();
         match result["t"].as_ref().unwrap() {
             Value::Numeric(n) => assert_eq!(n.to_string(), "6"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    /// Issue #830: `SUM(s.val)` folds the source column `val`, not the field
+    /// `val` that shadows it.
+    #[test]
+    fn a_qualified_name_in_an_aggregate_argument_folds_the_source_column() {
+        let d = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
+             SUM(s.val) AS total",
+        )
+        .expect("parse");
+        let rows = vec![
+            row(&[("grp", Some("1")), ("val", Some("10"))]),
+            row(&[("grp", Some("1")), ("val", Some("20"))]),
+        ];
+        let result = evaluate_aggregate(
+            &d,
+            &rows,
+            &numeric_types(&["grp", "val"]),
+            &mut RegexCache::new(),
+        )
+        .unwrap();
+        match result["total"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "30"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+        match result["val"].as_ref().unwrap() {
+            Value::Numeric(n) => assert_eq!(n.to_string(), "2"),
             other => panic!("expected Numeric, got {other:?}"),
         }
     }

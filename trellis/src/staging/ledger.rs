@@ -398,7 +398,9 @@ pub(crate) fn route(
             }
         }
         let source = match &contribution.arg {
-            Expr::Column(column) => ContribSource::Column(column.clone()),
+            Expr::Column(column) | Expr::SourceColumn { column, .. } => {
+                ContribSource::Column(column.clone())
+            }
             arg => ContribSource::Expr {
                 sql: render_over_source(arg),
                 reads,
@@ -527,7 +529,7 @@ fn fold_of(expr: &Expr) -> Option<&'static str> {
 /// The source columns `expr` reads, appended to `out` once each.
 fn source_reads(expr: &Expr, out: &mut Vec<String>) {
     match expr {
-        Expr::Column(column) => {
+        Expr::Column(column) | Expr::SourceColumn { column, .. } => {
             if !out.contains(column) {
                 out.push(column.clone());
             }

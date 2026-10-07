@@ -101,6 +101,14 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
 pub(super) fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
+        Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } => match schema {
+            Some(schema) => format!("{schema}.{table}.{column}"),
+            None => format!("{table}.{column}"),
+        },
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
         // Issue #109's typed literal, rendered in the `<type> '<text>'`
@@ -716,6 +724,28 @@ mod tests {
             def.fields[0].expr, expr,
             "round-tripping through render_expr -> parse must reproduce the exact original tree"
         );
+    }
+
+    /// Issue #830: a qualified source column inside an aggregate renders
+    /// back to the same qualified spelling, so a generated definition that
+    /// carries one re-parses to the same tree.
+    #[test]
+    fn render_expr_round_trips_a_qualified_source_column_in_an_aggregate() {
+        for (schema, prefix) in [(None, "s"), (Some("app"), "app.s")] {
+            let expr = Expr::FunctionCall {
+                name: "SUM".to_string(),
+                args: vec![Expr::SourceColumn {
+                    schema: schema.map(str::to_string),
+                    table: "s".to_string(),
+                    column: "v".to_string(),
+                }],
+            };
+            let rendered = render_expr(&expr);
+            assert_eq!(rendered, format!("SUM({prefix}.v)"));
+            let text = format!("TRANSFORM t FROM s GROUP BY g SELECT g AS g, {rendered} AS total");
+            let def = parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert_eq!(def.fields[1].expr, expr);
+        }
     }
 
     /// The mirror shape, pinned so a future change to `render_expr` can't

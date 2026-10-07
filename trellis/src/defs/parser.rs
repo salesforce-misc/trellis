@@ -27,7 +27,10 @@
 //! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
 //! `<rel>.<column>` relationship-path references (issue #25, ADR-0006) —
 //! whose head is a relationship name, resolved and cardinality-checked by
-//! later issues, not this parser. Issue #109 adds **typed literals**, spelled
+//! later issues, not this parser — and qualified source columns,
+//! `<table>.<column>` with the `FROM` table's bare name as the head, or any
+//! `<schema>.<table>.<column>` (issue #830, see
+//! [`Parser::parse_dotted_reference`]). Issue #109 adds **typed literals**, spelled
 //! either `<type> '<text>'` or `CAST('<text>' AS <type>)` — see
 //! [`super::typed_literal`] for the allowlisted types, why both spellings
 //! build one AST node, and why `<expr>::<type>` and general casts are
@@ -84,6 +87,7 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
         tokens,
         pos: 0,
         is_aggregate: false,
+        source: None,
     }
     .parse_transform_def()
 }
@@ -100,6 +104,7 @@ pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
         tokens,
         pos: 0,
         is_aggregate: false,
+        source: None,
     }
     .parse_relationship_def()
 }
@@ -160,6 +165,7 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
         tokens,
         pos: 0,
         is_aggregate: false,
+        source: None,
     }
     .parse_statement()
 }
@@ -210,6 +216,14 @@ struct Parser {
     /// key-space through every expression-parsing method, since it's fixed
     /// for the whole statement by the time fields are parsed.
     is_aggregate: bool,
+    /// The `FROM` table's bare name, once [`Self::parse_transform_def`] has
+    /// parsed it: a two-part `<head>.<column>` whose head is this table is a
+    /// qualified source column, any other head a relationship (issue #830).
+    /// `None` for an `ALTER TRANSFORM` clause, whose statement doesn't name
+    /// the source; [`super::catalog::alter_transform`] resolves its
+    /// two-part names against the stored definition's instead
+    /// ([`super::ast::Expr::qualify_source_columns`]).
+    source: Option<String>,
 }
 
 impl Parser {
@@ -586,6 +600,7 @@ impl Parser {
 
         self.expect_keyword("FROM")?;
         let (source, explicit_source_schema) = self.parse_table_ref()?;
+        self.source = Some(source.clone());
 
         let key_space = self.parse_key_space_clause()?;
 
@@ -753,6 +768,13 @@ impl Parser {
         if self.peek_is_symbol('.') {
             self.advance();
             let column = self.expect_ident()?;
+            // Issue #830: `<source>.<column>` is the source column, as in a
+            // field's expression. A key is always a source column or a
+            // relationship path, never a field, so the qualifier changes
+            // nothing and isn't kept.
+            if self.source.as_deref() == Some(first.as_str()) {
+                return Ok(GroupByKey::Column(column));
+            }
             return Ok(GroupByKey::RelationshipPath { rel: first, column });
         }
         Ok(GroupByKey::Column(first))
@@ -922,9 +944,7 @@ impl Parser {
                 }
 
                 if self.peek_is_symbol('.') {
-                    self.advance();
-                    let column = self.expect_ident()?;
-                    return Ok(Expr::RelationshipPath { rel: name, column });
+                    return self.parse_dotted_reference(name);
                 }
 
                 if self.peek_is_symbol('(') {
@@ -1068,6 +1088,53 @@ impl Parser {
                 found: other.describe(),
             }),
         }
+    }
+
+    /// Parses the rest of a dotted name whose head `first` (and its `.`) is
+    /// at the cursor (issue #830):
+    /// * `<schema>.<table>.<column>` is a qualified source column, always;
+    /// * `<table>.<column>`, where `table` is the `FROM` table's bare name, is
+    ///   a qualified source column;
+    /// * any other `<rel>.<column>` is a relationship path (ADR-0006), whose
+    ///   head is a relationship name, resolved by the validator.
+    ///
+    /// A relationship can't be named after its from-table
+    /// ([`super::validate::ValidationError::RelationshipNamedAfterFromTable`]),
+    /// so the two-part reading never hides a relationship. Whether a
+    /// qualified column names the right table and a real column is the
+    /// validator's to check.
+    fn parse_dotted_reference(&mut self, first: String) -> Result<Expr, ParseError> {
+        self.expect_symbol('.')?;
+        let second = self.expect_ident()?;
+        if !self.peek_is_symbol('.') {
+            if self.source.as_deref() == Some(first.as_str()) {
+                return Ok(Expr::SourceColumn {
+                    schema: None,
+                    table: first,
+                    column: second,
+                });
+            }
+            return Ok(Expr::RelationshipPath {
+                rel: first,
+                column: second,
+            });
+        }
+        self.advance();
+        let third = self.expect_ident()?;
+        if self.peek_is_symbol('.') {
+            let mut reference = format!("{first}.{second}.{third}");
+            while self.peek_is_symbol('.') {
+                self.advance();
+                reference.push('.');
+                reference.push_str(&self.expect_ident()?);
+            }
+            return Err(ParseError::TooManyColumnNameParts { reference });
+        }
+        Ok(Expr::SourceColumn {
+            schema: Some(first),
+            table: second,
+            column: third,
+        })
     }
 
     /// Parses the remainder of a `CAST(...)` — `'<literal>' AS <type>)`,

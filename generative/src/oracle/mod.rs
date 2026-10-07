@@ -363,7 +363,7 @@ fn quote_ident(ident: &str) -> String {
 /// grammar for the two to disagree about.
 fn render_expr(expr: &Expr) -> String {
     match expr {
-        Expr::Column(name) => quote_ident(name),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
@@ -464,6 +464,7 @@ fn expr_reads_relationship(expr: &Expr) -> bool {
     match expr {
         Expr::RelationshipPath { .. } => true,
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => false,
@@ -491,6 +492,7 @@ fn collect_join_rels<'a>(expr: &'a Expr, rels: &RelIndex<'_>, out: &mut BTreeSet
             }
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
@@ -535,7 +537,9 @@ fn collect_join_rels<'a>(expr: &'a Expr, rels: &RelIndex<'_>, out: &mut BTreeSet
 /// widening a loud failure rather than a silent false differential.
 fn render_rel_expr(expr: &Expr, source: &str, rels: &RelIndex<'_>) -> String {
     match expr {
-        Expr::Column(name) => format!("{}.{}", quote_ident(source), quote_ident(name)),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+            format!("{}.{}", quote_ident(source), quote_ident(name))
+        }
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
@@ -1053,13 +1057,15 @@ fn field_value_type(
     rels: &RelIndex<'_>,
 ) -> ValueType {
     match expr {
-        Expr::Column(name) => *source_columns.get(name).unwrap_or_else(|| {
-            panic!(
-                "oracle: field expression references source column {name:?} that isn't in \
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+            *source_columns.get(name).unwrap_or_else(|| {
+                panic!(
+                    "oracle: field expression references source column {name:?} that isn't in \
                  source_columns — a generator/caller bug (source_columns must list every column \
                  on the def's actual source table)"
-            )
-        }),
+                )
+            })
+        }
         // Issue #111: Postgres's own literal-typing rule — a bare integral
         // literal is `integer` if it fits, else `bigint`; anything else is
         // `numeric`.
@@ -1191,6 +1197,21 @@ pub async fn check(
 mod tests {
     use super::*;
     use crate::model::Column;
+
+    /// Issue #830: the SQL oracle reads a qualified name inside an aggregate
+    /// as the source column it names.
+    #[test]
+    fn render_expr_reads_a_qualified_source_column_as_the_column() {
+        let expr = Expr::FunctionCall {
+            name: "SUM".to_string(),
+            args: vec![Expr::SourceColumn {
+                schema: Some("app".to_string()),
+                table: "t0".to_string(),
+                column: "c1".to_string(),
+            }],
+        };
+        assert_eq!(render_expr(&expr), r#"sum("c1")"#);
+    }
 
     // A nested slice of literals is the most legible way to spell a fixture
     // inline; the complexity lint isn't worth a wrapper type for a test.

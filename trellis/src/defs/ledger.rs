@@ -301,6 +301,7 @@ pub(crate) fn contributions(
                 walk(rhs, out);
             }
             Expr::Column(_)
+            | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
             | Expr::TypedLiteral { .. }

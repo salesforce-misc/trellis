@@ -313,6 +313,7 @@ pub(crate) fn uses_relationships(def: &TransformDef) -> bool {
             Expr::BinaryOp { lhs, rhs, .. } => walk(lhs) || walk(rhs),
             Expr::FunctionCall { args, .. } => args.iter().any(walk),
             Expr::Column(_)
+            | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
             | Expr::TypedLiteral { .. } => false,
@@ -338,6 +339,9 @@ pub(crate) fn uses_relationships(def: &TransformDef) -> bool {
 /// After this pass the existing renderers (`render_expr_sql` and the
 /// relationship renderer below) need no awareness of field aliases: every
 /// `Column` leaf is a real source column, which is exactly what they render.
+/// A qualified [`Expr::SourceColumn`] (issue #830) names a source column by
+/// construction, so it is lowered to a plain `Column` here and never reaches
+/// them.
 ///
 /// `fields_by_name` maps every field name to its expression. `visiting` is the
 /// set of field names currently being expanded on this recursion path; a field
@@ -405,6 +409,10 @@ fn substitute_field_aliases(
                 charge_budget(budget, 1)?;
                 Ok(Expr::Column(name.clone()))
             }
+        }
+        Expr::SourceColumn { column, .. } => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::Column(column.clone()))
         }
         Expr::NumberLiteral(text) => {
             charge_budget(budget, 1)?;
@@ -508,6 +516,7 @@ fn charge_budget(budget: &mut usize, cost: usize) -> Result<(), BackfillError> {
 fn node_count(expr: &Expr) -> usize {
     match expr {
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => 1,
@@ -2193,6 +2202,7 @@ fn agg_leaf_parts(name: &str, args: &[Expr]) -> Option<(String, String)> {
 fn collect_agg_leaves(expr: &Expr, leaves: &mut BTreeSet<AggLeaf>) -> Result<(), BackfillError> {
     match expr {
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => Ok(()),
@@ -2240,7 +2250,9 @@ fn render_rel_field_direct(
     leaf_cols: &HashMap<AggLeaf, String>,
 ) -> Option<String> {
     match expr {
-        Expr::Column(name) => Some(format!("{}.{}", quote_ident(source), quote_ident(name))),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+            Some(format!("{}.{}", quote_ident(source), quote_ident(name)))
+        }
         Expr::NumberLiteral(text) => Some(format!("{text}::numeric")),
         Expr::StringLiteral(text) => Some(format!("'{}'::text", text.replace('\'', "''"))),
         Expr::TypedLiteral { value_type, text } => {
@@ -2791,6 +2803,31 @@ mod tests {
             sql[4], r#"(sum("val") + count(*))"#,
             "a name outside an aggregate's argument still inlines the field"
         );
+    }
+
+    /// Issue #830: a qualified name is the source column even where a field
+    /// of that name exists, and comes out of substitution as a plain column.
+    #[test]
+    fn substitute_reads_the_source_column_for_a_qualified_name() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
+             SUM(s.val) AS total, s.grp + val AS mixed",
+        )
+        .expect("parse");
+        let out = substitute_all_fields(&def).expect("no cycle");
+        assert_eq!(out[2], call_sum(Expr::Column("val".to_string())));
+        assert_eq!(
+            render_expr_sql(&out[3]),
+            r#"("grp" + ("grp" + 1::numeric))"#,
+            "the bare name still inlines the field"
+        );
+
+        fn call_sum(arg: Expr) -> Expr {
+            Expr::FunctionCall {
+                name: "SUM".to_string(),
+                args: vec![arg],
+            }
+        }
     }
 
     /// An aggregate argument still reads a field that isn't an aggregate:

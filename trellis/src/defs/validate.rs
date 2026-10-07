@@ -17,7 +17,9 @@ use std::fmt;
 
 use regex::Regex;
 
-use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Predicate, TransformDef, ValueType};
+use super::ast::{
+    Expr, FieldDef, GroupByKey, KeySpace, Predicate, TransformDef, ValueType, render_field_expr,
+};
 use super::model::{RelationshipCardinality, RelationshipSide};
 use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
@@ -270,6 +272,22 @@ pub enum ValidationError {
     /// nothing for it to read; reading the field would nest one aggregate in
     /// another.
     AggregateOfAggregateField { field: String, reference: String },
+    /// A field reads a bare name that is both a source column and another
+    /// field whose expression is not just that column (issue #830), outside
+    /// the one place #695 settled: an aggregate field's name inside another
+    /// aggregate's argument, which reads the source column. A qualified
+    /// `<table>.<column>` reads the source column; renaming the field is how
+    /// to read the field.
+    AmbiguousColumnReference(Box<AmbiguousColumnReference>),
+    /// A qualified `<table>.<column>` or `<schema>.<table>.<column>`
+    /// reference names a table other than this definition's `FROM` table
+    /// (issue #830). `source` is the `FROM` table as the reference would
+    /// have to spell it.
+    QualifiedColumnNotFromSource {
+        field: String,
+        reference: String,
+        source: String,
+    },
     /// An [`super::ast::KeySpace::Aggregate`] definition has a calculated
     /// field whose name matches one of its grouping columns, but whose
     /// expression isn't a bare passthrough of that same column (e.g.
@@ -367,6 +385,11 @@ pub enum ValidationError {
     /// name is unique per qualified from-table (issue #288), so a same-named
     /// table in another schema is no collision.
     DuplicateRelationshipName { from_table: String, name: String },
+    /// A relationship is declared with the same name as its from-table
+    /// (issue #830). A transform over that table reads `<table>.<column>` as
+    /// its own source column, so a relationship of that name could never be
+    /// read, and the two-part name would mean two things.
+    RelationshipNamedAfterFromTable { name: String },
     /// A relationship's join key resolved to a Postgres type that isn't
     /// text-stable — one where `a::text = b::text` disagrees with the type's
     /// native typed `=` (see
@@ -613,6 +636,7 @@ fn collect_refusing_calls(
             collect_refusing_calls(rhs, field, fields_by_name, out);
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::RelationshipPath { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
@@ -639,6 +663,7 @@ fn collect_text_columns<'a>(
             }
             _ => out.push(TextColumnRef::Source(name.clone())),
         },
+        Expr::SourceColumn { column, .. } => out.push(TextColumnRef::Source(column.clone())),
         Expr::RelationshipPath { rel, column } => out.push(TextColumnRef::Relationship {
             rel: rel.clone(),
             column: column.clone(),
@@ -654,6 +679,24 @@ fn collect_text_columns<'a>(
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
     }
+}
+
+/// Payload of [`ValidationError::AmbiguousColumnReference`], boxed out of
+/// the enum like [`RelationshipTypeMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousColumnReference {
+    /// The field whose expression reads the name.
+    pub field: String,
+    /// The bare name, which is both a source column and `shadowing_field`.
+    pub name: String,
+    /// The other field's expression, as the grammar writes it.
+    pub shadowing_expr: String,
+    /// The `FROM` table's bare name.
+    pub source_table: String,
+    /// The `FROM` table's schema, when known: written in the `FROM` clause,
+    /// or filled in by the catalog once it has resolved a bare one
+    /// ([`ValidationError::with_source_schema`]).
+    pub source_schema: Option<String>,
 }
 
 /// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
@@ -682,6 +725,23 @@ impl ValidationError {
         match self {
             ValidationError::DuplicateRelationshipName { .. } => ErrorCode::Conflict,
             _ => ErrorCode::Validation,
+        }
+    }
+
+    /// Fills in the `FROM` table's schema for an
+    /// [`ValidationError::AmbiguousColumnReference`] that doesn't have it yet,
+    /// so its message spells the three-part qualified name. `schema` comes
+    /// from the catalog's resolution of a bare `FROM`. Any other error is
+    /// returned as it is.
+    pub(crate) fn with_source_schema(self, schema: &str) -> Self {
+        match self {
+            ValidationError::AmbiguousColumnReference(mut ambiguous)
+                if ambiguous.source_schema.is_none() =>
+            {
+                ambiguous.source_schema = Some(schema.to_string());
+                ValidationError::AmbiguousColumnReference(ambiguous)
+            }
+            other => other,
         }
     }
 }
@@ -846,6 +906,38 @@ impl fmt::Display for ValidationError {
                  aggregate field, not a source column; an aggregate's argument can't be \
                  another aggregate (use the source column the aggregate reads instead)"
             ),
+            ValidationError::AmbiguousColumnReference(ambiguous) => {
+                let AmbiguousColumnReference {
+                    field,
+                    name,
+                    shadowing_expr,
+                    source_table,
+                    source_schema,
+                } = ambiguous.as_ref();
+                let two_part = format!("{source_table}.{name}");
+                let three_part = match source_schema {
+                    Some(schema) => format!("{schema}.{source_table}.{name}"),
+                    None => format!("<schema>.{source_table}.{name}"),
+                };
+                write!(
+                    f,
+                    "calculated field '{field}' reads '{name}', which is ambiguous: it names \
+                     both the source column '{name}' of '{source_table}' and the calculated \
+                     field '{name}' (`{shadowing_expr}`). Write `{two_part}` or \
+                     `{three_part}` to read the source column, or rename the field '{name}' \
+                     and read it by its new name"
+                )
+            }
+            ValidationError::QualifiedColumnNotFromSource {
+                field,
+                reference,
+                source,
+            } => write!(
+                f,
+                "calculated field '{field}' reads '{reference}', but a qualified column must \
+                 name this transform's FROM table ('{source}'); a column of another table is \
+                 read through a relationship"
+            ),
             ValidationError::GroupingColumnFieldMustBePassthrough { field } => write!(
                 f,
                 "calculated field '{field}' shares its name with a GROUP BY column, so it must \
@@ -912,6 +1004,12 @@ impl fmt::Display for ValidationError {
                      casts a join key. Alter one column to match the other"
                 )
             }
+            ValidationError::RelationshipNamedAfterFromTable { name } => write!(
+                f,
+                "relationship '{name}' has the same name as its from-table; a transform over \
+                 '{name}' reads `{name}.<column>` as its own source column, so give the \
+                 relationship a different name"
+            ),
             ValidationError::DuplicateRelationshipName { from_table, name } => write!(
                 f,
                 "relationship '{name}' is already declared on '{from_table}'; relationship \
@@ -1100,6 +1198,8 @@ pub fn validate(
         });
     }
 
+    validate_qualified_columns(def, source_columns, def.explicit_source_schema.as_deref())?;
+
     // Exhaustive matches: these are the "re-verify at this layer" guard for
     // #22's already-enforced 1-1/TRUE-only constructs (see module docs).
     // `Aggregate` has real runtime checks (below), since — unlike the other
@@ -1124,6 +1224,9 @@ pub fn validate(
                     });
                 }
             }
+            // With every shadowing field refused above there is nothing
+            // ambiguous left to find; kept so the rule holds in both arms.
+            reject_ambiguous_names(def, source_columns)?;
         }
         KeySpace::Aggregate { group_by } => {
             // Issue #137: a `GROUP BY` key is either a plain source column
@@ -1207,6 +1310,12 @@ pub fn validate(
                         field: field.name.clone(),
                     });
                 }
+            }
+            // Issue #830: ahead of the ungrouped-column check, which would
+            // otherwise report a bare read of a shadowing field as an
+            // ungrouped source column.
+            reject_ambiguous_names(def, source_columns)?;
+            for field in &def.fields {
                 validate_aggregate_field_expr(
                     &field.expr,
                     &field.name,
@@ -1306,6 +1415,150 @@ pub fn validate(
     Ok(())
 }
 
+/// Checks every qualified [`Expr::SourceColumn`] in `def` (issue #830): it
+/// names the `FROM` table, a schema that matches `source_schema` when one is
+/// known (written in the `FROM` clause, or resolved by the catalog), and a
+/// column the source has.
+pub(crate) fn validate_qualified_columns(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+    source_schema: Option<&str>,
+) -> Result<(), ValidationError> {
+    fn walk(
+        expr: &Expr,
+        field: &str,
+        def: &TransformDef,
+        source_columns: &HashMap<String, ValueType>,
+        source_schema: Option<&str>,
+    ) -> Result<(), ValidationError> {
+        match expr {
+            Expr::SourceColumn {
+                schema,
+                table,
+                column,
+            } => {
+                let wrong_schema = matches!(
+                    (schema.as_deref(), source_schema),
+                    (Some(written), Some(actual)) if written != actual
+                );
+                if table != &def.source || wrong_schema {
+                    return Err(ValidationError::QualifiedColumnNotFromSource {
+                        field: field.to_string(),
+                        reference: render_field_expr(expr),
+                        source: match source_schema {
+                            Some(actual) => format!("{actual}.{}", def.source),
+                            None => def.source.clone(),
+                        },
+                    });
+                }
+                if !source_columns.contains_key(column) {
+                    return Err(ValidationError::UnresolvedColumn {
+                        field: field.to_string(),
+                        column: render_field_expr(expr),
+                    });
+                }
+                Ok(())
+            }
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                walk(lhs, field, def, source_columns, source_schema)?;
+                walk(rhs, field, def, source_columns, source_schema)
+            }
+            Expr::FunctionCall { args, .. } => args
+                .iter()
+                .try_for_each(|arg| walk(arg, field, def, source_columns, source_schema)),
+            Expr::Column(_)
+            | Expr::RelationshipPath { .. }
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. } => Ok(()),
+        }
+    }
+    def.fields
+        .iter()
+        .try_for_each(|f| walk(&f.expr, &f.name, def, source_columns, source_schema))
+}
+
+/// Refuses a bare name that could mean either a source column or a field
+/// (issue #830): a name that is a source column and also a field whose
+/// expression is not just that column (`(grp * 2) AS val` over a source with
+/// a `val` column), read by any other field.
+///
+/// Two reads of such a name are not ambiguous, and keep their meaning:
+/// * a field reading its own name reads the source column (`SUM(val) AS
+///   val`), as it always has, since a field can't read itself;
+/// * an aggregate field's name inside another aggregate's argument is the
+///   source column (#695, [`aggregate_field_names`]).
+///
+/// A field named after the column it passes through (`val AS val`) shadows
+/// nothing, so it is never the other meaning.
+fn reject_ambiguous_names(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), ValidationError> {
+    let shadowing: HashMap<&str, &FieldDef> = def
+        .fields
+        .iter()
+        .filter(|f| {
+            source_columns.contains_key(&f.name)
+                && !matches!(&f.expr, Expr::Column(name) if name == &f.name)
+        })
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    if shadowing.is_empty() {
+        return Ok(());
+    }
+    let aggregates = aggregate_field_names(def.fields.iter().map(|f| (f.name.as_str(), &f.expr)));
+
+    fn first_ambiguous<'a>(
+        expr: &'a Expr,
+        reader: &str,
+        in_aggregate_arg: bool,
+        shadowing: &HashMap<&str, &FieldDef>,
+        aggregates: &HashSet<&str>,
+    ) -> Option<&'a str> {
+        match expr {
+            Expr::Column(name) => {
+                let is_shadowed = name != reader && shadowing.contains_key(name.as_str());
+                let reads_source_by_695 = in_aggregate_arg && aggregates.contains(name.as_str());
+                (is_shadowed && !reads_source_by_695).then_some(name.as_str())
+            }
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                first_ambiguous(lhs, reader, in_aggregate_arg, shadowing, aggregates).or_else(
+                    || first_ambiguous(rhs, reader, in_aggregate_arg, shadowing, aggregates),
+                )
+            }
+            Expr::FunctionCall { name, args } => {
+                let in_arg =
+                    in_aggregate_arg || super::registry::lookup_aggregate_function(name).is_some();
+                args.iter()
+                    .find_map(|arg| first_ambiguous(arg, reader, in_arg, shadowing, aggregates))
+            }
+            Expr::SourceColumn { .. }
+            | Expr::RelationshipPath { .. }
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. } => None,
+        }
+    }
+
+    for reader in &def.fields {
+        if let Some(name) =
+            first_ambiguous(&reader.expr, &reader.name, false, &shadowing, &aggregates)
+        {
+            return Err(ValidationError::AmbiguousColumnReference(Box::new(
+                AmbiguousColumnReference {
+                    field: reader.name.clone(),
+                    name: name.to_string(),
+                    shadowing_expr: render_field_expr(&shadowing[name].expr),
+                    source_table: def.source.clone(),
+                    source_schema: def.explicit_source_schema.clone(),
+                },
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The name prefix reserved for the hidden columns Trellis keeps on a target
 /// table (issue #566). A user field or `GROUP BY` column may not start with it.
 pub const RESERVED_COLUMN_PREFIX: &str = "__";
@@ -1381,6 +1634,7 @@ fn validate_relationship_refs(
 ) -> Result<(), ValidationError> {
     match expr {
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => Ok(()),
@@ -1477,6 +1731,20 @@ fn validate_aggregate_field_expr(
             }
             Ok(())
         }
+        // Issue #830: a qualified name is a source column even when a field
+        // has its name, so the same rule applies without the field lookup.
+        Expr::SourceColumn { column, .. } => {
+            let is_group_key = group_by
+                .iter()
+                .any(|k| matches!(k, GroupByKey::Column(c) if c == column));
+            if !is_group_key && !in_aggregate_call {
+                return Err(ValidationError::UngroupedColumnReference {
+                    field: field_name.to_string(),
+                    column: render_field_expr(expr),
+                });
+            }
+            Ok(())
+        }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => Ok(()),
         Expr::RelationshipPath { rel, column } => {
             let Some(resolved) = relationships.get(rel) else {
@@ -1559,6 +1827,8 @@ fn expr_is_group_by_key_passthrough(expr: &Expr, key: &GroupByKey) -> bool {
 pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.clone()),
+        // Always a source column, never a read of a field (issue #830).
+        Expr::SourceColumn { .. } => {}
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
         // Not a source-column reference by name — its type is resolved from
         // relationship metadata by `infer_expr`, and its cardinality rules by
@@ -1585,6 +1855,7 @@ fn has_aggregate_call(expr: &Expr) -> bool {
         }
         Expr::BinaryOp { lhs, rhs, .. } => has_aggregate_call(lhs) || has_aggregate_call(rhs),
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. }
@@ -1663,7 +1934,10 @@ pub(crate) fn collect_reads(
             aggregate_args.push(name.clone());
         }
         Expr::Column(name) => fields.push(name.clone()),
-        Expr::NumberLiteral(_)
+        // Always a source column, never a field (issue #830); `validate`
+        // checks it names one through `validate_qualified_columns`.
+        Expr::SourceColumn { .. }
+        | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. }
         | Expr::RelationshipPath { .. } => {}
@@ -2085,6 +2359,11 @@ fn infer_expr(
                 .copied()
                 .unwrap_or(ValueType::Numeric))
         }
+        // Issue #830: a qualified name is always the source column.
+        Expr::SourceColumn { column, .. } => Ok(source_columns
+            .get(column)
+            .copied()
+            .unwrap_or(ValueType::Numeric)),
         // Issue #111: an unadorned literal is typed exactly as Postgres's
         // own lexer types it — `integer` if it fits, else `bigint`, else
         // (or if fractional) `numeric`. `eval::number_literal` is the
@@ -4486,6 +4765,246 @@ mod tests {
             },
         ]);
         let source_columns = numeric_columns(&["id"]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    // Issue #830: a bare name that is both a source column and a field whose
+    // expression is something else is refused at define; a qualified
+    // `<table>.<column>` reads the source column.
+
+    fn ambiguity(field: &str, name: &str, shadowing_expr: &str) -> ValidationError {
+        ValidationError::AmbiguousColumnReference(Box::new(AmbiguousColumnReference {
+            field: field.to_string(),
+            name: name.to_string(),
+            shadowing_expr: shadowing_expr.to_string(),
+            source_table: "s".to_string(),
+            source_schema: None,
+        }))
+    }
+
+    /// The decision's example: a non-aggregate field shadowing a source
+    /// column, read in an aggregate's argument. It used to be accepted as
+    /// `SUM(grp + 1)`.
+    #[test]
+    fn a_shadowed_name_in_an_aggregate_argument_is_refused() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
+             SUM(val) AS total",
+        );
+        let source_columns = numeric_columns(&["grp", "val"]);
+        assert_eq!(
+            validate(&d, &source_columns, &HashMap::new()),
+            Err(ambiguity("total", "val", "(grp + 1)"))
+        );
+    }
+
+    /// The message names both meanings and both qualified spellings, and the
+    /// way to read the field.
+    #[test]
+    fn the_ambiguity_message_names_both_meanings_and_both_spellings() {
+        let message = ambiguity("total", "val", "(grp + 1)").to_string();
+        assert_eq!(
+            message,
+            "calculated field 'total' reads 'val', which is ambiguous: it names both the \
+             source column 'val' of 's' and the calculated field 'val' (`(grp + 1)`). Write \
+             `s.val` or `<schema>.s.val` to read the source column, or rename the field 'val' \
+             and read it by its new name"
+        );
+        // Once the catalog has resolved the source's schema, it is spelled.
+        let message = ambiguity("total", "val", "(grp + 1)")
+            .with_source_schema("public")
+            .to_string();
+        assert!(message.contains("`s.val` or `public.s.val`"), "{message}");
+
+        // A FROM clause that names its schema spells it directly.
+        let d = parsed(
+            "TRANSFORM t FROM app.s GROUP BY grp SELECT grp AS grp, (grp + 1) AS val, \
+             SUM(val) AS total",
+        );
+        let err = validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("`s.val` or `app.s.val`"), "{err}");
+        // ... and the catalog's resolved schema doesn't override it.
+        assert_eq!(err.clone().with_source_schema("public"), err);
+    }
+
+    /// Outside an aggregate's argument, an aggregate field shadowing a source
+    /// column is ambiguous too (it used to be refused as an ungrouped column).
+    #[test]
+    fn a_shadowed_name_outside_an_aggregate_argument_is_refused() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
+             val + 1 AS bumped",
+        );
+        assert_eq!(
+            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
+            Err(ambiguity("bumped", "val", "SUM(val)"))
+        );
+    }
+
+    /// `grp AS grp` and `val AS val` pass their column through, so reading
+    /// the name elsewhere means the one thing it can.
+    #[test]
+    fn a_self_named_passthrough_is_not_ambiguous() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, grp + 1 AS next_grp, \
+             SUM(grp) AS grp_sum",
+        );
+        assert_eq!(
+            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
+            Ok(())
+        );
+        let d = parsed("TRANSFORM t FROM s SELECT val AS val, val + 1 AS bumped");
+        assert_eq!(
+            validate(&d, &numeric_columns(&["id", "val"]), &HashMap::new()),
+            Ok(())
+        );
+    }
+
+    /// #695: an aggregate field's name inside another aggregate's argument is
+    /// the source column, so it isn't ambiguous; nor is a field reading its
+    /// own name (`SUM(val) AS val`).
+    #[test]
+    fn an_aggregate_field_inside_another_aggregate_is_not_ambiguous() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(val) AS val, \
+             MIN(val) AS lo, MAX(val) AS hi",
+        );
+        assert_eq!(
+            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
+            Ok(())
+        );
+    }
+
+    /// A bare name still reads the field when no source column has that name.
+    #[test]
+    fn a_bare_name_no_source_column_has_reads_the_field() {
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, (grp + 1) AS adj, \
+             SUM(adj) AS total",
+        );
+        assert_eq!(
+            validate(&d, &numeric_columns(&["grp", "val"]), &HashMap::new()),
+            Ok(())
+        );
+    }
+
+    /// `s.val` and `app.s.val` read the source column the field `val`
+    /// shadows: the argument is typed as the source column, not the field.
+    #[test]
+    fn a_qualified_name_reads_the_shadowed_source_column() {
+        let int4 = ValueType::Integer(crate::integer::IntWidth::Int4);
+        let source_columns = HashMap::from([
+            ("grp".to_string(), ValueType::Text),
+            ("val".to_string(), int4),
+        ]);
+        for text in [
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, grp AS val, \
+             MIN(s.val) AS lo",
+            "TRANSFORM t FROM app.s GROUP BY grp SELECT grp AS grp, grp AS val, \
+             MIN(app.s.val) AS lo",
+        ] {
+            let d = parsed(text);
+            assert_eq!(
+                validate(&d, &source_columns, &HashMap::new()),
+                Ok(()),
+                "{text}"
+            );
+            let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+            assert_eq!(types["val"], ValueType::Text, "{text}");
+            assert_eq!(types["lo"], int4, "MIN of the int4 source column: {text}");
+        }
+    }
+
+    /// A qualified name must name the FROM table and, when known, its schema.
+    #[test]
+    fn a_qualified_name_of_another_table_is_refused() {
+        let source_columns = numeric_columns(&["grp", "val"]);
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(app.other.val) AS total",
+        );
+        assert_eq!(
+            validate(&d, &source_columns, &HashMap::new()),
+            Err(ValidationError::QualifiedColumnNotFromSource {
+                field: "total".to_string(),
+                reference: "app.other.val".to_string(),
+                source: "s".to_string(),
+            })
+        );
+        // The FROM clause names schema `app`; `other.s.val` names another.
+        let d = parsed(
+            "TRANSFORM t FROM app.s GROUP BY grp SELECT grp AS grp, SUM(other.s.val) AS total",
+        );
+        assert_eq!(
+            validate(&d, &source_columns, &HashMap::new()),
+            Err(ValidationError::QualifiedColumnNotFromSource {
+                field: "total".to_string(),
+                reference: "other.s.val".to_string(),
+                source: "app.s".to_string(),
+            })
+        );
+        // A bare FROM: the catalog checks the schema once it has resolved it.
+        let d =
+            parsed("TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, SUM(other.s.val) AS total");
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        assert_eq!(
+            validate_qualified_columns(&d, &source_columns, Some("public")),
+            Err(ValidationError::QualifiedColumnNotFromSource {
+                field: "total".to_string(),
+                reference: "other.s.val".to_string(),
+                source: "public.s".to_string(),
+            })
+        );
+        assert_eq!(
+            validate_qualified_columns(&d, &source_columns, Some("other")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_qualified_name_of_a_missing_column_is_unresolved() {
+        let d = parsed("TRANSFORM t FROM s SELECT s.nope + 1 AS x");
+        assert_eq!(
+            validate(&d, &numeric_columns(&["id", "val"]), &HashMap::new()),
+            Err(ValidationError::UnresolvedColumn {
+                field: "x".to_string(),
+                column: "s.nope".to_string(),
+            })
+        );
+    }
+
+    /// A qualified name is still a source column for the grouping rules.
+    #[test]
+    fn a_qualified_ungrouped_column_outside_an_aggregate_is_refused() {
+        let source_columns = numeric_columns(&["grp", "val"]);
+        let d = parsed("TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, s.val AS v");
+        assert_eq!(
+            validate(&d, &source_columns, &HashMap::new()),
+            Err(ValidationError::UngroupedColumnReference {
+                field: "v".to_string(),
+                column: "s.val".to_string(),
+            })
+        );
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY s.grp SELECT grp AS grp, s.grp + 1 AS next_grp, \
+             COUNT(*) AS n",
+        );
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    /// A 1-1 field can't shadow a source column at all (issue #80), so a 1-1
+    /// field reading a shadowing alias is refused at the alias; the qualified
+    /// name reads the column in a 1-1 definition too.
+    #[test]
+    fn a_one_to_one_field_reading_a_shadowing_alias_is_refused_at_the_alias() {
+        let source_columns = numeric_columns(&["id", "val"]);
+        let d = parsed("TRANSFORM t FROM s SELECT (val + 1) AS val, val + 2 AS other");
+        assert_eq!(
+            validate(&d, &source_columns, &HashMap::new()),
+            Err(ValidationError::CalculatedFieldShadowsSourceColumn {
+                field: "val".to_string(),
+            })
+        );
+        let d = parsed("TRANSFORM t FROM s SELECT s.val + 2 AS other");
         assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 }

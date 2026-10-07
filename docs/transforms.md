@@ -34,6 +34,8 @@ a key, index or policy itself.
 | Two `GROUP BY` keys that share a target column name (`buyer.name` and `seller.name`, or `name` beside `buyer.name`); keys can't be aliased | Yes. | n/a | Group over a 1-1 transform that selects them under distinct names (`buyer.name AS buyer_name`). |
 | A field named after a 1-1 source key column (`id AS id`), or any field or `GROUP BY` column whose name starts with `__` (#566) | Yes. The target already carries the key columns, and `__` names are Trellis's hidden columns (such as an `AVG`'s running sum). `id AS order_id` is an ordinary column. | n/a | Rename the field. |
 | An aggregate whose argument names another aggregate field when no source column has that name (`SUM(val) AS total, MAX(total)`), directly or through a field that reads one | Yes (`AggregateOfAggregateField`). The argument would nest one aggregate in another, which no build can run. | n/a | Aggregate the source column instead (`MAX(val)`). |
+| A bare name that could mean a source column or a field: the name of a source column and of a field whose expression is not just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`). An aggregate field's name inside another aggregate's argument is not ambiguous: it is the source column ([Calculated Fields](#calculated-fields)). | Yes (`AmbiguousColumnReference`), naming both meanings. `val AS val` passes the column through, so reading `val` elsewhere is not ambiguous. | A source column added later under the name of a field another field reads: the transform keeps reading the field, and `RESUME` refuses until the name means one thing. | Write `src.val` or `public.src.val` to read the source column. To read the field, rename it and read it by its new name. |
+| A relationship named after its from-table (`RELATIONSHIP posts FROM posts.author_id TO users.id`) | Yes, when it's declared. A transform over `posts` reads `posts.<column>` as its own source column, so the relationship's paths could never be read. | n/a | Give the relationship another name. |
 | `JOIN` | Yes (parse error). Cross-join is not supported. | n/a | Use a [relationship](#relationships). |
 | A `WHERE` other than `TRUE` | Yes (parse error). Partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)). | n/a | None. |
 | Chaining off a transform that is not `live` (`TransformNotLive`) | Yes. | n/a | Wait for the upstream to go `live`, then define. |
@@ -190,11 +192,30 @@ by a formula rather than copied from a source column. A formula may reference:
   requires (see [Granularity](#granularity)).
 * Related-table columns through a declared relationship — a bare path for to-one,
   wrapped in an aggregate for to-many (see [Relationships](#relationships)).
-* Other calculated columns on the same target table. In an aggregate target, an
-  aggregate's argument never reads a column that is itself an aggregate: a name
-  there means the source column, as in SQL. `SUM(val) AS val, MIN(val) AS lo`
-  takes the minimum of the source column `val`, not of the sum. A column that
-  isn't an aggregate (`(id + 1) AS adj, SUM(adj)`) is still read by name.
+* Other calculated columns on the same target table, by name.
+
+A bare name means a field when no source column has that name, and the source
+column when no field does. A name that is both a source column and a field whose
+expression is something else is refused at define as ambiguous, with both
+meanings in the error ([Supported sources and targets](#supported-sources-and-targets)).
+A 1-1 target refuses such a field outright, whether or not anything reads it.
+Two reads of such a name are not ambiguous:
+
+* A field reading its own name reads the source column (`SUM(val) AS val`), and
+  a field that passes its column through (`val AS val`) is that column.
+* In an aggregate target, an aggregate's argument never reads a column that is
+  itself an aggregate: a name there means the source column, as in SQL.
+  `SUM(val) AS val, MIN(val) AS lo` takes the minimum of the source column
+  `val`, not of the sum. A column that isn't an aggregate (`(id + 1) AS adj,
+  SUM(adj)`) is still read by name, as long as no source column is named `adj`.
+
+A **qualified name** always reads the source column: `src.val`, or
+`public.src.val`, where `src` is the `FROM` table. So `(grp + 1) AS val,
+SUM(src.val) AS total` sums the source column beside the field that shadows it.
+A two-part name whose head is not the `FROM` table is a relationship path, which
+is why a relationship can't be named after its from-table. A three-part name
+must name the `FROM` table and its schema. A field has no qualified form: to
+read a field a source column shadows, rename the field.
 
 Formulas may only use **immutable** functions and operators — those whose output
 depends solely on their inputs. Anything depending on database state outside the

@@ -1080,7 +1080,7 @@ async fn check_schema(
 /// ([`SelfCheckError::UnsupportedExpr`]).
 fn render_leaf(expr: &Expr) -> Result<String, String> {
     Ok(match expr {
-        Expr::Column(name) => quote_ident(name),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),

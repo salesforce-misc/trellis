@@ -290,6 +290,10 @@ impl Coverage {
                 self.expr_shapes.insert("Column");
                 1
             }
+            Expr::SourceColumn { .. } => {
+                self.expr_shapes.insert("SourceColumn");
+                1
+            }
             Expr::NumberLiteral(_) => {
                 self.expr_shapes.insert("NumberLiteral");
                 1
@@ -342,6 +346,7 @@ fn collect_aggregate_calls(
                 let argument = match args.as_slice() {
                     [] => "*",
                     [Expr::Column(_)] => "column",
+                    [Expr::SourceColumn { .. }] => "qualified_column",
                     [Expr::RelationshipPath { .. }] => "rel",
                     _ => "expr",
                 };
@@ -356,6 +361,7 @@ fn collect_aggregate_calls(
             collect_aggregate_calls(rhs, key_space, out);
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. }
@@ -398,6 +404,7 @@ fn collect_relationship_reads<'a>(
             out.push(RelationshipRead { rel, column, shape });
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}

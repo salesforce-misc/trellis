@@ -45,6 +45,10 @@ pub enum ParseError {
     /// clause 4) had more than the two `<schema>.<table>` components this
     /// grammar accepts — e.g. `a.b.c`.
     TooManyQualifiedNameParts { reference: String },
+    /// A column reference in an expression had more than the three
+    /// `<schema>.<table>.<column>` components a qualified source column takes
+    /// (issue #830) — e.g. `a.b.c.d`.
+    TooManyColumnNameParts { reference: String },
     /// A `CAST(<expr> AS <type>)` whose operand is not a single-quoted
     /// string literal (issue #109) — i.e. a request for a **general** cast
     /// rather than a typed literal. See [`super::typed_literal`] for why the
@@ -132,6 +136,12 @@ impl fmt::Display for ParseError {
             ParseError::AtLeastOneArgumentRequired { name } => {
                 write!(f, "function '{name}' requires at least 1 argument")
             }
+            ParseError::TooManyColumnNameParts { reference } => write!(
+                f,
+                "'{reference}' is not a valid column reference: a column is written \
+                 <column>, <table>.<column> or <schema>.<table>.<column> (the FROM table's), \
+                 or <relationship>.<column>"
+            ),
             ParseError::TooManyQualifiedNameParts { reference } => write!(
                 f,
                 "'{reference}' is not a valid table reference: only a bare <table> or a \

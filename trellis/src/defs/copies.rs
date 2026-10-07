@@ -192,12 +192,10 @@ pub(crate) async fn typed_copies(
             for field in &def.fields {
                 // A bare source-column reference, as `ddl::target_table_ddl`
                 // finds one: not a reference to another field by its name.
-                let Expr::Column(name) = &field.expr else {
+                let Some(name) = field.passthrough_column(&def.fields) else {
                     continue;
                 };
-                if !source_columns.contains(name)
-                    || (name != &field.name && def.fields.iter().any(|f| &f.name == name))
-                {
+                if !source_columns.contains(name) {
                     continue;
                 }
                 copies.push(copy(
@@ -381,9 +379,9 @@ async fn inferred_copies(
             for field in &def.fields {
                 // A bare passthrough is a copy of its column, as
                 // `ddl::target_table_ddl` decides one is.
-                let passthrough = matches!(&field.expr, Expr::Column(name)
-                    if source_columns.contains_key(name)
-                        && (name == &field.name || !def.fields.iter().any(|f| &f.name == name)));
+                let passthrough = field
+                    .passthrough_column(&def.fields)
+                    .is_some_and(|name| source_columns.contains_key(name));
                 if passthrough {
                     continue;
                 }
@@ -455,7 +453,9 @@ fn expr_reads(
     out: &mut Vec<(String, String)>,
 ) {
     let read = match expr {
-        Expr::Column(name) if source_columns.contains_key(name) => {
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. }
+            if source_columns.contains_key(name) =>
+        {
             Some((source.to_string(), name.clone()))
         }
         Expr::RelationshipPath { rel, column } => rels
@@ -474,6 +474,7 @@ fn expr_reads(
             None
         }
         Expr::Column(_)
+        | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => None,
