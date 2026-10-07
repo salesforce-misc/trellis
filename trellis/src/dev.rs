@@ -86,6 +86,10 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
+    /// The staging-worker singleton's advisory-lock key, for a crash test
+    /// that holds the singleton itself to stand in for a killed engine's
+    /// backend that hasn't freed it yet.
+    pub use crate::staging::session::producer_singleton_lock_key;
     pub use crate::staging::{
         StagingError, await_converged, has_pending, retire_drained_segments, seal_phase1,
         seal_phase2, watermark_token,

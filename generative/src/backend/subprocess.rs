@@ -66,10 +66,19 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// time out loudly, not hang the suite.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long [`SubprocessBackend::restart`] waits, once the killed primary
+/// has exited, for Postgres to free the staging-worker singleton that
+/// primary held. A dead process's sockets are already closed, so this is
+/// normally a few milliseconds of backend scheduling; the bound only turns
+/// a lock that never frees into an error instead of a hang.
+const PRODUCER_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Failure modes across the subprocess backend's lifecycle. Mirrors
 /// `ManualBackendError`'s shape (same variant names wherever the condition
-/// is the same), plus a couple of subprocess-specific ones
-/// ([`SubprocessBackendError::Spawn`]/[`SubprocessBackendError::EngineNotReady`]).
+/// is the same), plus a few subprocess-specific ones
+/// ([`SubprocessBackendError::Spawn`], [`SubprocessBackendError::EngineNotReady`],
+/// [`SubprocessBackendError::EngineExited`],
+/// [`SubprocessBackendError::ProducerNotReleased`]).
 #[derive(Debug)]
 pub enum SubprocessBackendError {
     /// An op named a table [`SubprocessBackend::install`] was never given.
@@ -87,13 +96,23 @@ pub enum SubprocessBackendError {
     /// Spawning `engine_subprocess` itself failed (e.g. the binary path
     /// [`SubprocessBackend::connect`] was given doesn't exist).
     Spawn(std::io::Error),
-    /// A freshly spawned `engine_subprocess` never wrote its readiness
-    /// marker within [`READY_TIMEOUT`] — either it's stuck in
-    /// `trellis::Client::start`'s setup, or it exited before ever reaching
-    /// it (check its inherited stderr, which
-    /// [`SubprocessBackend::spawn_engine`] leaves attached to this test
-    /// process's own for exactly this kind of diagnosis).
+    /// A freshly spawned `engine_subprocess` is still running but never
+    /// wrote its readiness marker within [`READY_TIMEOUT`]: it's stuck in
+    /// `trellis::Client::start`'s setup.
     EngineNotReady {
+        waited: Duration,
+    },
+    /// A freshly spawned `engine_subprocess` exited before writing its
+    /// readiness marker. Its inherited stderr, which
+    /// [`SubprocessBackend::spawn_engine`] leaves attached to this test
+    /// process's own, says why.
+    EngineExited {
+        status: ExitStatus,
+    },
+    /// [`SubprocessBackend::restart`] killed the primary, but the
+    /// staging-worker singleton it held was still taken
+    /// [`PRODUCER_RELEASE_TIMEOUT`] later.
+    ProducerNotReleased {
         waited: Duration,
     },
     /// [`SubprocessBackend::quiesce`] waited [`QUIESCE_TIMEOUT`] for every
@@ -105,6 +124,7 @@ pub enum SubprocessBackendError {
         waited: Duration,
     },
     Config(trellis::Error),
+    Trellis(trellis::TrellisError),
     Catalog(CatalogError),
     Ddl(DdlError),
     Staging(StagingError),
@@ -126,6 +146,12 @@ impl From<sql::QuiesceError> for SubprocessBackendError {
 impl From<trellis::Error> for SubprocessBackendError {
     fn from(err: trellis::Error) -> Self {
         SubprocessBackendError::Config(err)
+    }
+}
+
+impl From<trellis::TrellisError> for SubprocessBackendError {
+    fn from(err: trellis::TrellisError) -> Self {
+        SubprocessBackendError::Trellis(err)
     }
 }
 
@@ -386,7 +412,8 @@ impl SubprocessBackend {
     /// fails to start, or panics, prints straight into this test process's
     /// own output — the same visibility a real deployment's logs would give
     /// an operator, and essential for diagnosing an
-    /// [`SubprocessBackendError::EngineNotReady`] timeout.
+    /// [`SubprocessBackendError::EngineExited`] or
+    /// [`SubprocessBackendError::EngineNotReady`].
     async fn spawn_engine(&mut self, staging_worker: bool) -> Result<(), SubprocessBackendError> {
         let _ = std::fs::remove_file(&self.ready_marker_path);
 
@@ -421,16 +448,20 @@ impl SubprocessBackend {
             .stderr(Stdio::inherit());
 
         let guard = CrashGuard::spawn(&mut command).map_err(SubprocessBackendError::Spawn)?;
-        if staging_worker {
-            self.child = Some(guard);
+        let guard = if staging_worker {
+            self.child.insert(guard)
         } else {
             self.scale_out_children.push(guard);
-        }
+            self.scale_out_children.last_mut().expect("just pushed")
+        };
 
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if self.ready_marker_path.exists() {
                 return Ok(());
+            }
+            if let Some(status) = guard.try_wait().map_err(SubprocessBackendError::Spawn)? {
+                return Err(SubprocessBackendError::EngineExited { status });
             }
             if Instant::now() >= deadline {
                 return Err(SubprocessBackendError::EngineNotReady {
@@ -439,6 +470,34 @@ impl SubprocessBackend {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Waits, bounded by [`PRODUCER_RELEASE_TIMEOUT`], until no session
+    /// holds this instance's staging-worker singleton.
+    ///
+    /// A killed engine's sockets close as it exits, but each of its server
+    /// backends frees what it held only once Postgres schedules it to read
+    /// the EOF. Under CPU contention that can trail the process's exit by
+    /// several milliseconds, and a fresh engine that asks for the singleton
+    /// first fails its start with `ProducerAlreadyRunning`. That's the race
+    /// `ManualBackend::restart` retries around (issue #251); waiting here
+    /// instead makes the release happen before the fresh engine's acquire.
+    async fn wait_for_producer_release(&self) -> Result<(), SubprocessBackendError> {
+        let trellis = trellis::Trellis::connect(
+            Config::from_dsn(self.dsn.clone())?,
+            trellis::TrellisOptions::default(),
+        )
+        .await?;
+        let deadline = Instant::now() + PRODUCER_RELEASE_TIMEOUT;
+        while trellis.has_live_staging_worker().await? {
+            if Instant::now() >= deadline {
+                return Err(SubprocessBackendError::ProducerNotReleased {
+                    waited: PRODUCER_RELEASE_TIMEOUT,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
     }
 }
 
@@ -551,6 +610,8 @@ impl super::Backend for SubprocessBackend {
     /// in-process simulation: `SIGKILL`s the currently running primary
     /// subprocess (via [`CrashGuard::kill`]), waits for it to actually exit
     /// (recording the exit status — see [`SubprocessBackend::last_kill_status`]),
+    /// waits for Postgres to free the staging-worker singleton it held (see
+    /// [`SubprocessBackend::wait_for_producer_release`]),
     /// then spawns a fresh one against the exact same dsn `install`
     /// originally used (it reads the tables to capture from the catalog,
     /// issue #427). The ring is durable
@@ -574,6 +635,7 @@ impl super::Backend for SubprocessBackend {
         drop(guard);
         self.last_kill_status = status.ok();
 
+        self.wait_for_producer_release().await?;
         self.spawn_engine(true).await
     }
 

@@ -81,9 +81,10 @@ pub trait Backend {
     /// acquire and spuriously fail with `ProducerAlreadyRunning`; no
     /// subprocess/`SIGKILL` machinery is needed there either way.
     /// [`SubprocessBackend`] (issue #166) does the real thing: `SIGKILL`s the
-    /// actual OS process and *waits for it to actually exit* before spawning
-    /// a fresh one — the same "don't just drop, wait for the teardown to
-    /// really finish" discipline, one layer down.
+    /// actual OS process, *waits for it to actually exit* and then for
+    /// Postgres to free its singleton before spawning a fresh one — the same
+    /// "don't just drop, wait for the teardown to really finish" discipline,
+    /// one layer down.
     fn restart(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Starts an additional engine client alongside whatever is already

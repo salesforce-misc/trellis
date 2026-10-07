@@ -43,6 +43,13 @@ impl CrashGuard {
     pub fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         self.child.wait()
     }
+
+    /// The child's exit status if it has already exited, without blocking:
+    /// lets a caller waiting for the child's readiness signal notice that it
+    /// died first.
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
 }
 
 impl Drop for CrashGuard {

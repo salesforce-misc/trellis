@@ -22,12 +22,14 @@
 //! window — see `SubprocessBackend`'s own module doc comment for the full
 //! mechanism.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use generative::backend::{Backend, SubprocessBackend};
 use generative::generate::{RelInterleavingVariant, build_relationship_interleaving_scenario};
 use generative::run::check_program;
 use testkit::TestCluster;
+use tokio_postgres::NoTls;
+use trellis::dev::staging::producer_singleton_lock_key;
 use trellis::{Config, Pool};
 
 /// How long to wait for the primary engine subprocess to reach the
@@ -219,5 +221,99 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         "post-SIGKILL redrive must converge onto exactly the same state an uninterrupted drain \
          would have reached — both the target write and the relationship projection advance \
          redone together, or the batch wasn't atomic: {diverged:?}"
+    );
+}
+
+/// `restart` must not spawn the fresh engine while the killed one's
+/// staging-worker singleton is still held. A killed engine's backend frees it
+/// only once Postgres schedules that backend to read the EOF, which under CPU
+/// contention can trail the kill by milliseconds; a fresh engine that asked
+/// first failed its start with `ProducerAlreadyRunning`, and the restart above
+/// timed out waiting for a readiness marker that never came (PR #859's CI).
+///
+/// The stand-in for that slow backend is a session of this test's own,
+/// queued on the singleton behind the running primary: Postgres hands it the
+/// lock the instant the killed primary's backend frees it, and it holds it
+/// on for a while. The fresh engine can only start once it lets go.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_waits_for_the_killed_engines_singleton_to_free() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let program =
+        build_relationship_interleaving_scenario(RelInterleavingVariant::ParentFieldUpdate).program;
+
+    let engine_bin = env!("CARGO_BIN_EXE_engine_subprocess");
+    let mut backend = SubprocessBackend::connect(db.dsn(), engine_bin)
+        .await
+        .expect("connect subprocess backend");
+    backend
+        .install(&program)
+        .await
+        .expect("install program (spawns the primary engine subprocess)");
+
+    let key = producer_singleton_lock_key(trellis::config::DEFAULT_SCHEMA);
+    let (stand_in, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+        .await
+        .expect("connect the stand-in session");
+    tokio::spawn(connection);
+    let stand_in_pid: i32 = stand_in
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("read the stand-in's backend pid")
+        .get(0);
+
+    let hold = Duration::from_millis(1500);
+    let stand_in_task = tokio::spawn(async move {
+        stand_in
+            .execute("select pg_advisory_lock($1)", &[&key])
+            .await
+            .expect("queue on the singleton, then take it when the primary dies");
+        let taken_at = Instant::now();
+        tokio::time::sleep(hold).await;
+        stand_in
+            .execute("select pg_advisory_unlock($1)", &[&key])
+            .await
+            .expect("let the singleton go");
+        taken_at
+    });
+
+    // Kill only once the stand-in is queued, so it, not the fresh engine, is
+    // next in line for the singleton.
+    let (observer, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+        .await
+        .expect("connect the observer");
+    tokio::spawn(connection);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let queued: bool = observer
+            .query_one(
+                "select exists(select 1 from pg_locks \
+                 where pid = $1 and locktype = 'advisory' and not granted)",
+                &[&stand_in_pid],
+            )
+            .await
+            .expect("read the stand-in's lock wait")
+            .get(0);
+        if queued {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stand-in never queued on the singleton behind the running primary"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    backend
+        .restart()
+        .await
+        .expect("restart must wait for the singleton to free, then start the fresh engine on it");
+    let restarted_at = Instant::now();
+    let taken_at = stand_in_task.await.expect("stand-in task");
+    assert!(
+        restarted_at >= taken_at + hold,
+        "restart returned {:?} after the stand-in took the singleton, before it let go after \
+         {hold:?}: the fresh engine can't have started on it",
+        restarted_at - taken_at
     );
 }
