@@ -377,6 +377,95 @@ mod tests {
         trellis.shutdown().await.expect("shutdown");
     }
 
+    /// Waits until some session waits on `pid`'s locks, failing the test
+    /// if `what` never does: the interleaving it means to exercise didn't
+    /// happen.
+    async fn wait_until_blocked_by(watcher: &impl GenericClient, pid: i32, what: &str) {
+        for _ in 0..3000 {
+            let waiting: i64 = watcher
+                .query_one(
+                    "select count(*) from pg_stat_activity \
+                     where $1 = any(pg_blocking_pids(pid))",
+                    &[&pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{what} never waited on the peer, so this test would not exercise the race");
+    }
+
+    /// A reclaim of this worker's claim, still uncommitted when the worker
+    /// records its page's failure: the record waits for it, then finds the
+    /// claim gone and records nothing, so the new claimant's commit isn't
+    /// left a holdup to clear that it may already have missed.
+    #[tokio::test]
+    async fn a_record_behind_an_uncommitted_reclaim_records_nothing() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let trellis = crate::app::Trellis::connect(config.clone(), Default::default())
+            .await
+            .expect("connect, which migrates");
+        let pool = Pool::new(&config).expect("a same-crate pool");
+        let watcher = pool.get().await.expect("a connection");
+        watcher
+            .batch_execute(
+                "insert into segments (seg_seq, ring_slot, state) values (9201, 0, 'draining'); \
+                 insert into seg_claims (seg_seq, bucket, claimed_by) \
+                   values (9201, 2, 'worker-a')",
+            )
+            .await
+            .expect("seed a segment and a claim");
+
+        let mut reclaimer = pool.get().await.expect("a connection");
+        let reclaimer_pid: i32 = reclaimer
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("the reclaimer's pid")
+            .get(0);
+        let reclaim = reclaimer.transaction().await.expect("begin the reclaim");
+        reclaim
+            .execute("delete from seg_claims where seg_seq = 9201", &[])
+            .await
+            .expect("reclaim, uncommitted");
+
+        let step = SegmentStep {
+            seg_seq: 9201,
+            page: Some(PageClaim {
+                held: vec![2],
+                buckets: vec![2],
+                next: None,
+            }),
+        };
+        let commit_reclaim = async {
+            wait_until_blocked_by(&**watcher, reclaimer_pid, "the record").await;
+            reclaim.commit().await.expect("commit the reclaim");
+        };
+        let ((), ()) = tokio::join!(
+            record(
+                &pool,
+                std::slice::from_ref(&step),
+                "worker-a",
+                &[],
+                &ApplyError::ClaimLost
+            ),
+            commit_reclaim
+        );
+
+        let holdups: i64 = watcher
+            .query_one("select count(*) from drain_holdups", &[])
+            .await
+            .expect("count holdups")
+            .get(0);
+        assert_eq!(holdups, 0);
+        trellis.shutdown().await.expect("shutdown");
+    }
+
     /// A page's [`clear`] of `buckets` that has to wait on a peer's
     /// uncommitted write (`peer_write`) to the same segment's holdup, seeded
     /// with `seeded`: the clear waits, the peer commits, then the page does.
@@ -434,28 +523,7 @@ mod tests {
             }),
         };
         let commit_peer = async {
-            let mut blocked = false;
-            for _ in 0..3000 {
-                let waiting: i64 = watcher
-                    .query_one(
-                        "select count(*) from pg_stat_activity \
-                         where $1 = any(pg_blocking_pids(pid))",
-                        &[&peer_pid],
-                    )
-                    .await
-                    .expect("read pg_stat_activity")
-                    .get(0);
-                if waiting > 0 {
-                    blocked = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(
-                blocked,
-                "the clear never waited on the peer's write, so this test would not \
-                 exercise the race"
-            );
+            wait_until_blocked_by(&**watcher, peer_pid, "the clear").await;
             peer_txn.commit().await.expect("commit the peer");
         };
         let (cleared, ()) = tokio::join!(clear(&page, &step), commit_peer);
