@@ -2028,10 +2028,10 @@ fn logged_statements_naming(log: &str, table_ident: &str) -> Vec<String> {
 /// any(<array>)` index condition as one index descent per array element and
 /// counts each as an `idx_scan`, so the single batched refetch of the batch's
 /// 1,500 source keys alone counted 1,500 (PostgreSQL 17 counts it once). And
-/// a backend flushes its scan counters to the shared statistics up to a
-/// second or more after its statement ends, so whether the read saw them at
-/// all depended on timing: locally it usually saw 0, and under a loaded CI
-/// run it saw 1,501.
+/// a backend flushes its scan counters to the shared statistics lazily: one
+/// that flushed less than a second earlier holds them back until it has sat
+/// idle for ten seconds. So whether the read saw them at all depended on
+/// timing: locally it usually saw 0, and under a loaded CI run it saw 1,501.
 #[tokio::test]
 async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_scans() {
     const GROUP_COUNT: i64 = 750;
@@ -2128,9 +2128,9 @@ async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_sca
         (1..10).contains(&source_reads.len()),
         "backfilling {GROUP_COUNT} groups issued {} statements against order_items; the \
          bulk recompute must read it in a fixed handful of batched statements, not once \
-         per group (issue #59):\n{}",
+         per group (issue #59). The first few:\n{}",
         source_reads.len(),
-        source_reads.join("\n")
+        source_reads[..source_reads.len().min(3)].join("\n")
     );
 }
 
