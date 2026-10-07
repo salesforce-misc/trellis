@@ -1483,7 +1483,14 @@ async fn discharge_marker(
         .map(|(id, _)| *id)
         .collect();
 
-    let txn = client.transaction().await?;
+    // `read committed`, whatever the server's default: the orphan sweep's
+    // 1-1 delete re-checks the source on a snapshot of its own, taken after
+    // its lock statement (`resume_orphans`, "A 1-1 row backed again", #883).
+    let txn = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await?;
     // Issues #330, #485, #436: the targets whose unbacked rows this discharge
     // deletes, judged on its read's snapshot; see "Dropping what the source
     // no longer backs" above.

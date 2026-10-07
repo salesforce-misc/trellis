@@ -152,10 +152,13 @@
 //! the read already saw). The sweep locks its rows before it deletes them
 //! (see "Why the delete comes last"), so by the time the delete runs every
 //! page that wrote one of them has committed, and the delete, a statement of
-//! its own in a `READ COMMITTED` transaction, reads a snapshot that holds
-//! every source row such a page read. A row written since the lock, which the
-//! lock didn't find, the delete sees only if its page has committed, and then
-//! it sees that page's source row too.
+//! its own in a `READ COMMITTED` transaction (the discharge sets that level,
+//! whatever the server's default), reads a snapshot that holds every source
+//! row such a page read. A row written since the lock, which the lock didn't
+//! find, the delete sees only if its page has committed, and then it sees
+//! that page's source row too. A delete that took the locks itself would
+//! read the source on a snapshot from before it queued on them, and could
+//! delete a row a page wrote while it waited.
 //!
 //! Keeping a 1-1 row the source backs again is safe because whatever backed
 //! it writes the whole row: the page that re-derived it, or the change that
@@ -927,6 +930,11 @@ fn ledger_orphan_branch_sql(
 /// The delete alone would lock the rows in its plan's order (the target's
 /// heap order, under a hash join), so the lock takes them first, in key
 /// order, as a drain page takes the same rows (ADR-0002 I5, issue #716).
+///
+/// They stay two statements in a `read committed` transaction: a 1-1
+/// delete re-checks the source on its own snapshot, which must be taken
+/// after the lock has waited out every page writing those rows (issue #883,
+/// `a_sweep_rechecks_the_source_on_a_snapshot_taken_after_its_locks`).
 async fn delete_keys(
     txn: &Transaction<'_>,
     target: &SweptTarget,
@@ -1846,12 +1854,13 @@ mod db_tests {
     /// Issue #883's setup: `orders_copy`, a `catching_up` 1-1 copy of
     /// `public.orders` (ids 1 to 3), whose orders 1 and 3 are deleted with
     /// no CDC (a delete the definition skipped), so both copies are
-    /// unbacked. A `Recompute` of order 1, staged before the sweep's read
+    /// unbacked. A `Recompute` of order `id`, staged before the sweep's read
     /// (an earlier discharge's enumeration, say), waits in a sealed segment.
     /// Returns a same-crate pool, a raw connection, the copy's definition
     /// and that segment.
     async fn copy_with_a_pending_recompute(
         db: &testkit::TestDatabase,
+        id: i64,
     ) -> (Pool, tokio_postgres::Client, Vec<i64>, i64) {
         let (pool, mut raw) = connect(db).await;
         raw.batch_execute(
@@ -1887,7 +1896,7 @@ mod db_tests {
             &txn,
             &[crate::staging::append::StagedChange::Recompute {
                 src_table: "public.orders".to_string(),
-                key: "1".to_string(),
+                key: id.to_string(),
                 hop_gen: 0,
                 group_key: None,
                 src_changed: None,
@@ -1923,14 +1932,14 @@ mod db_tests {
         Ok(())
     }
 
-    /// Re-inserts order 1 (`a = 100`) and stages its CDC in the same
+    /// Re-inserts order `id` (`a = 100`) and stages its CDC in the same
     /// transaction, as a capture trigger does, so the Apply carries the
     /// insert's own transaction id. It lands in the active segment.
-    async fn reinsert_order_1(writer: &mut tokio_postgres::Client) {
+    async fn reinsert_order(writer: &mut tokio_postgres::Client, id: i64) {
         let txn = writer.transaction().await.expect("begin");
-        txn.execute("insert into public.orders values (1, 'a', 100)", &[])
+        txn.execute("insert into public.orders values ($1, 'a', 100)", &[&id])
             .await
-            .expect("re-insert order 1");
+            .expect("re-insert the order");
         let lsn: tokio_postgres::types::PgLsn = txn
             .query_one("select pg_current_wal_insert_lsn()", &[])
             .await
@@ -1940,11 +1949,11 @@ mod db_tests {
             &txn,
             &[crate::staging::append::StagedChange::Cdc {
                 src_table: "public.orders".to_string(),
-                key: "1".to_string(),
+                key: id.to_string(),
                 op: crate::staging::CdcOp::Insert,
                 lsn: Some(lsn),
                 old_image: None,
-                new_image: Some(r#"{"id":"1","g":"a","a":"100"}"#.to_string()),
+                new_image: Some(format!(r#"{{"id":"{id}","g":"a","a":"100"}}"#)),
                 origin_lsn: None,
                 src_changed: None,
                 hop_gen: 0,
@@ -1986,7 +1995,7 @@ mod db_tests {
     async fn a_sweep_keeps_a_one_to_one_row_a_page_rederived_after_its_read() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let (pool, mut raw, ids, pending) = copy_with_a_pending_recompute(&db).await;
+        let (pool, mut raw, ids, pending) = copy_with_a_pending_recompute(&db, 1).await;
 
         let (_, mut sweeper) = connect(&db).await;
         let txn = sweeper.transaction().await.expect("begin the discharge");
@@ -2004,7 +2013,7 @@ mod db_tests {
             .await
             .expect("fetch the read");
 
-        reinsert_order_1(&mut raw).await;
+        reinsert_order(&mut raw, 1).await;
         drain(&pool, pending).await.expect("drain the Recompute");
         assert_eq!(
             copy_rows(&raw).await,
@@ -2042,7 +2051,7 @@ mod db_tests {
         use crate::staging::interleave::{PausePoint, PauseScope};
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let (pool, mut raw, ids, pending) = copy_with_a_pending_recompute(&db).await;
+        let (pool, mut raw, ids, pending) = copy_with_a_pending_recompute(&db, 1).await;
 
         let (_, mut sweeper) = connect(&db).await;
         let txn = sweeper.transaction().await.expect("begin the discharge");
@@ -2060,7 +2069,7 @@ mod db_tests {
             .await
             .expect("fetch the read");
 
-        reinsert_order_1(&mut raw).await;
+        reinsert_order(&mut raw, 1).await;
         let (_, ctl) = connect(&db).await;
         ctl.execute("select pg_advisory_lock($1)", &[&PAGE_PAUSE])
             .await
@@ -2098,6 +2107,67 @@ mod db_tests {
             "the copy matches the source"
         );
         assert_eq!(swept.deleted, 1, "order 3's copy only");
+    }
+
+    /// Issue #883: the 1-1 delete's source re-check holds only because
+    /// [`lock_statement`] runs, in a statement of its own, before
+    /// [`delete_statement`] takes its snapshot. Another transaction holds
+    /// order 1's copy, so the sweep's lock queues on it before it reaches
+    /// order 3's. Order 3 is then re-inserted, and a page drains a
+    /// `Recompute` of it staged before the read: it writes order 3's copy
+    /// from the re-insert and stamps its entry with a basis the insert is
+    /// visible in. Then the holder lets go.
+    ///
+    /// The delete's snapshot is taken only now, so it sees the re-insert and
+    /// keeps the row. A delete that took its locks itself (without the
+    /// separate lock, or with it folded into the delete) would have taken its
+    /// snapshot before the re-insert, queued on order 1, then re-checked
+    /// order 3's new version against that old snapshot and deleted it: the
+    /// re-insert's Apply is refused, and the copy loses order 3 for good.
+    #[tokio::test]
+    async fn a_sweep_rechecks_the_source_on_a_snapshot_taken_after_its_locks() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw, ids, pending) = copy_with_a_pending_recompute(&db, 3).await;
+
+        let (_, mut holder) = connect(&db).await;
+        let held = holder.transaction().await.expect("begin the holder");
+        held.execute(
+            "select 1 from public.orders_copy where id = 1 for update",
+            &[],
+        )
+        .await
+        .expect("hold order 1's copy");
+        let holder_pid: i32 = held
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("the holder's backend")
+            .get(0);
+
+        let (_, sweeper) = connect(&db).await;
+        let sweep = spawn_sweep(sweeper, ids, crate::staging::interleave::PauseScope::new());
+        let (_, ctl) = connect(&db).await;
+        wait_blocked_behind(&ctl, holder_pid).await;
+
+        reinsert_order(&mut raw, 3).await;
+        drain(&pool, pending).await.expect("drain the Recompute");
+        held.commit().await.expect("let go of order 1's copy");
+        let swept = sweep
+            .await
+            .expect("the sweep task")
+            .expect("the sweep commits");
+
+        let active = seal(&mut raw).await;
+        drain(&pool, active).await.expect("drain the re-insert");
+        assert_eq!(
+            copy_rows(&raw).await,
+            vec![
+                ("2".to_string(), "2".to_string()),
+                ("3".to_string(), "100".to_string()),
+            ],
+            "the copy matches the source"
+        );
+        assert_eq!(swept.deleted, 1, "order 1's copy only");
     }
 
     /// The advisory lock key [`a_sweep_keeps_a_one_to_one_row_a_page_in_flight_rederived_after_its_read`]
