@@ -258,6 +258,21 @@ pub(crate) fn is_insufficient_privilege(err: &(dyn std::error::Error + 'static))
     false
 }
 
+/// The SQLSTATE of the first [`tokio_postgres::Error`] on `err`'s
+/// [`std::error::Error::source`] chain, if it has one: what `poison.sqlstate`
+/// records for a held key (#824), so [`release_retyped_keys`] can tell a
+/// value that didn't fit a column (`22001`, `22003`) from any other failure.
+pub(crate) fn sqlstate_of(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return pg.code().map(|code| code.code().to_string());
+        }
+        link = err.source();
+    }
+    None
+}
+
 /// The transient SQLSTATEs doc 05 names (`40001`/`40P01`, lock-not-available,
 /// statement timeout) plus a dropped connection — [`tokio_postgres::Error::code`]
 /// is `None` for a connection-level failure (never reached the server to get
@@ -545,6 +560,9 @@ struct PoisonedProbe {
     key: String,
     /// The definition whose apply the failure is attributed to.
     culprit: Culprit,
+    /// The SQLSTATE of the record's failure alone ([`sqlstate_of`]), which
+    /// the key's `poison` row keeps (#824).
+    sqlstate: Option<String>,
 }
 
 /// A definition [`attribute`] found a pinned key's failure in: the one its
@@ -587,15 +605,17 @@ async fn evict_key(
          death threshold, and every other definition reading it keeps applying it"
     );
     txn.execute(
-        "insert into poison (transform_id, src_table, key, last_error) \
-         values ($1, $2, $3, $4) \
+        "insert into poison (transform_id, src_table, key, last_error, sqlstate) \
+         values ($1, $2, $3, $4, $5) \
          on conflict (transform_id, src_table, key) do update set \
-             last_error = excluded.last_error, poisoned_at = now()",
+             last_error = excluded.last_error, sqlstate = excluded.sqlstate, \
+             poisoned_at = now()",
         &[
             &culprit.transform_id,
             &probe.canonical_src_table,
             &probe.key,
             &culprit.last_error,
+            &probe.sqlstate,
         ],
     )
     .await?;
@@ -1422,6 +1442,7 @@ async fn isolate_and_evict_probing(
                 canonical_src_table: canonical.clone(),
                 key: change.key.clone(),
                 culprit,
+                sqlstate: sqlstate_of(&err),
             });
         }
     }
@@ -1914,7 +1935,7 @@ pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
 
 /// Quarantines `key` of `src_table` (canonical) for the building definition
 /// `transform_id`, because a backfill chunk narrowed its failure,
-/// `last_error`, to that key alone (`defs::chunk_queue::fail_chunk`, #616),
+/// `last_error` with SQLSTATE `sqlstate`, to that key alone (`defs::chunk_queue::fail_chunk`, #616),
 /// in the caller's transaction. It is the chunk-shaped counterpart of a
 /// drain's eviction ([`isolate_and_evict`]):
 ///
@@ -1938,14 +1959,16 @@ pub(crate) async fn evict_build_key(
     src_table: &str,
     key: &str,
     last_error: &str,
+    sqlstate: Option<&str>,
 ) -> Result<(), ApplyError> {
     record_key_death(txn, transform_id, src_table, key, last_error).await?;
     txn.execute(
-        "insert into poison (transform_id, src_table, key, last_error) \
-         values ($1, $2, $3, $4) \
+        "insert into poison (transform_id, src_table, key, last_error, sqlstate) \
+         values ($1, $2, $3, $4, $5) \
          on conflict (transform_id, src_table, key) do update set \
-             last_error = excluded.last_error, poisoned_at = now()",
-        &[&transform_id, &src_table, &key, &last_error],
+             last_error = excluded.last_error, sqlstate = excluded.sqlstate, \
+             poisoned_at = now()",
+        &[&transform_id, &src_table, &key, &last_error, &sqlstate],
     )
     .await?;
     txn.execute(
@@ -3250,8 +3273,9 @@ async fn complete_resume(
 }
 
 /// How long the staging worker waits for the lock on a table whose copies
-/// it re-types before it leaves the resume for its next pass.
-const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// it re-types before it leaves the re-type for its next pass: a resume's,
+/// or one it makes in place (`staging::schema_change`, #824).
+pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The staging worker's half of every resume [`resume_transform`] left
 /// waiting on re-typed copies (`resume_requests`, #767): run at the start of
@@ -3747,6 +3771,100 @@ pub async fn release_key(
     Ok(held.len())
 }
 
+/// Releases the keys the staging worker's in-place re-types asked for
+/// (#824, `staging::schema_change`): for each `retype_releases` row, every
+/// key its definition holds whose failure had the row's SQLSTATE (`22001`
+/// after a `varchar` was re-typed, `22003` after a `numeric` was), each
+/// through [`release_key`], so its parked work is applied again. A key held
+/// for any other failure stays held, and so does one whose failure Trellis
+/// recorded no SQLSTATE for.
+///
+/// The staging worker runs it after each capture pass, so a release the
+/// re-type's transaction asked for is made even if the worker stopped in
+/// between. A row is deleted once all its keys are released, and only if no
+/// re-type asked again since it was read (`requested_at`). A release that
+/// waits out its lock timeout ([`ApplyError::ReleaseLockTimeout`]), or fails
+/// otherwise, keeps the row for the next pass. A row whose definition was
+/// dropped is deleted. Errs only when the rows can't be read or deleted.
+pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> {
+    let requests = {
+        let client = pool.get().await?;
+        client
+            .execute(
+                "delete from retype_releases r where not exists \
+                 (select 1 from transform_definitions d where d.id = r.transform_id)",
+                &[],
+            )
+            .await?;
+        client
+            .query(
+                "select r.transform_id, r.sqlstate, r.requested_at, \
+                        split_part(d.target_table, '.', 2) \
+                 from retype_releases r join transform_definitions d on d.id = r.transform_id \
+                 order by r.transform_id, r.sqlstate",
+                &[],
+            )
+            .await?
+    };
+    for request in requests {
+        let id: i64 = request.get(0);
+        let sqlstate: String = request.get(1);
+        let requested_at: SystemTime = request.get(2);
+        let transform: String = request.get(3);
+        let keys = pool
+            .get()
+            .await?
+            .query(
+                "select src_table, key from poison \
+                 where transform_id = $1 and sqlstate = $2 order by src_table, key",
+                &[&id, &sqlstate],
+            )
+            .await?;
+        let mut done = true;
+        let mut released = 0usize;
+        for row in keys {
+            let src_table: String = row.get(0);
+            let key: String = row.get(1);
+            match release_key(pool, &transform, &src_table, &key).await {
+                Ok(_) => released += 1,
+                // Released or dropped meanwhile.
+                Err(ApplyError::KeyNotHeld { .. } | ApplyError::TransformNotFound { .. }) => {}
+                Err(err) => {
+                    done = false;
+                    tracing::warn!(
+                        transform = %transform,
+                        src_table = %src_table,
+                        key = %key,
+                        error = %err,
+                        "couldn't release a key held for a value its column couldn't hold before \
+                         Trellis re-typed it; retrying next pass"
+                    );
+                }
+            }
+        }
+        if released > 0 {
+            tracing::info!(
+                transform = %transform,
+                sqlstate = %sqlstate,
+                released,
+                "released the keys held for values their columns couldn't hold before Trellis \
+                 re-typed them"
+            );
+        }
+        if done {
+            pool.get()
+                .await?
+                .execute(
+                    "delete from retype_releases \
+                     where transform_id = $1 and sqlstate = $2 and requested_at = $3",
+                    &[&id, &sqlstate, &requested_at],
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// The keys one definition holds in quarantine (#759): its `poison` rows,
 /// each a source key whose changes the definition's apply leaves out until
 /// a release ([`release_key`]), a resume or a drop. `None` where a
@@ -3941,6 +4059,7 @@ mod unit_tests {
                 epoch: None,
                 last_error: "boom".to_string(),
             },
+            sqlstate: None,
         }
     }
 

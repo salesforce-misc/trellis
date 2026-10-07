@@ -30,8 +30,10 @@
 //! differently, whose relationship's join columns no longer match, or that
 //! created a column, typed from one the table widened, that can't hold
 //! the type define would give it now (#760, #767, #824,
-//! [`crate::staging::schema_change::pause_readers_of_retyped`]). That check
-//! runs on the seam-fed tables too.
+//! [`crate::staging::schema_change::pause_readers_of_retyped`]). A table
+//! Trellis created whose every such column widened by changing only the
+//! catalog (a longer `varchar`, say) is re-typed in place instead, with no
+//! pause. That check runs on the seam-fed tables too.
 //!
 //! Before any of that, the pass finishes every resume left waiting on it to
 //! re-type Trellis's copies (#767,

@@ -130,9 +130,32 @@ request, and the next pass (or the next `RESUME`) finishes the work. A column wh
 re-type fails (a value its new type can't hold) ends the request with the error on
 the definition's `capture_failure`, and leaves that table's columns as they were;
 another table's, re-typed before it, keep their new types, and the next resume finds
-them current. The resume always rebuilds after it re-types, even when every re-type
-only changed the catalog. Trellis never re-types a column on its own, outside a
-resume.
+them current. The resume always rebuilds after it re-types. Each re-type keeps the
+column's collation.
+
+Outside a resume, Trellis re-types a column on its own in one case: when every column
+of a table it created that the source widened widened by changing only the catalog.
+Exactly four widenings qualify: `varchar(n)` to a longer `varchar(m)`, `varchar(n)` or
+`varchar` to `text`, `varchar(n)` to `varchar`, and `numeric(p,s)` to a larger
+precision at the same scale. Postgres rewrites nothing for them, changes no value and
+keeps every index. The capture pass then re-types that table's columns itself, one
+table per transaction, under the same lock timeout as a resume's re-type, and nothing
+pauses or rebuilds, a `varchar` key's copy included. The pass records the key's new
+type, as a resume would. Its `ALTER` is the transaction's first statement, so it
+waits for the table's `ACCESS EXCLUSIVE` holding no other lock, and once it has the
+table it takes only the locks of the table's own indexes and TOAST table. So it can't
+close a lock cycle with a drain page, a build or a release: a page queued behind it
+waits at most the timeout. A table whose lock it can't get in time is left as it is,
+nothing pauses, and the next pass tries again. A table where some widened column
+needs a rewrite pauses its definitions as above, and so does one whose re-type fails.
+
+A value written between the source's `ALTER` and that re-type fails its write
+(`22001` or `22003`), and its key may be held. The re-type's transaction records a
+release request for each definition with a column on the table (`retype_releases`).
+After the pass, the staging worker releases each key such a definition holds whose
+failure had that SQLSTATE, recorded on its `poison` row, one key at a time through the
+same release as `Trellis::release_key`, and the key's parked work is applied again. A
+key held for any other failure stays held.
 
 Resume also releases every key the definition holds in quarantine: it deletes the
 definition's own `poison`, `poison_held` and `key_deaths` rows in the same transaction.

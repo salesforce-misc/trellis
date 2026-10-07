@@ -396,8 +396,11 @@ pub(crate) async fn pause_readers_of_unsupported(
 ///    hold every value of the type define would give it now
 ///    ([`crate::defs::copies::CopyState::outgrown`]): `integer` to `bigint`
 ///    under a 1-1 target's key, a `SUM`, a `MIN` or a calculated field,
-///    `varchar(50)` to `text` under a passthrough or a to-one projection's
-///    column.
+///    `real` to `double precision` under a passthrough. A table whose every
+///    such column widened by changing only the catalog (`varchar(50)` to
+///    `text` under a passthrough or a to-one projection's column) is
+///    re-typed in place instead, and pauses nothing ([`retype_in_place`],
+///    #824).
 ///
 /// The types the third check compares against are those recorded in
 /// `definition_key_types`; a key column with none recorded (one that joined
@@ -405,12 +408,12 @@ pub(crate) async fn pause_readers_of_unsupported(
 /// recorded here instead.
 ///
 /// The pause's `capture_failure` names every reason and what to do. Only a
-/// deliberate resume clears it (or a drop): Trellis re-types nothing on its
-/// own. A resume re-validates the definition as define would, and refuses
-/// while the first two hold; otherwise it re-records the key types, brings
-/// every column it created to the type define would give it now, and
-/// rebuilds
-/// (`staging::quarantine::resume_transform`).
+/// deliberate resume clears it (or a drop). A resume re-validates the
+/// definition as define would, and refuses while the first two hold;
+/// otherwise it re-records the key types, brings every column it created to
+/// the type define would give it now, and rebuilds
+/// (`staging::quarantine::resume_transform`). A key column whose copy is
+/// re-typed in place is re-recorded here, as a resume would.
 ///
 /// A key column the table no longer has is
 /// [`pause_readers_of_missing`]'s, which the pass runs first. Returns whether
@@ -455,8 +458,12 @@ pub(crate) async fn pause_readers_of_retyped(
         );
     }
 
-    let mut pauses: Vec<(i64, Vec<String>, String)> = Vec::new();
+    let mut checked: Vec<Checked> = Vec::new();
     let mut unrecorded: Vec<(i64, String)> = Vec::new();
+    // Key columns whose recorded type the live one widens without
+    // re-rendering: re-recorded below where this pass re-types a copy of
+    // one in place.
+    let mut widened_keys: Vec<(i64, String)> = Vec::new();
     for reader in catalog
         .definitions
         .iter()
@@ -515,6 +522,7 @@ pub(crate) async fn pause_readers_of_retyped(
                         &mut columns,
                     );
                 }
+                Some((old, _)) if old != &now.ty => widened_keys.push((reader.id, column.clone())),
                 Some(_) => {}
                 None => {
                     if !unrecorded.contains(&(reader.id, column.clone())) {
@@ -568,8 +576,8 @@ pub(crate) async fn pause_readers_of_retyped(
             }
         }
 
-        // #767, #824: a column Trellis created, typed from columns of this
-        // table, that the type define would give it now outgrew.
+        // #767, #824: the columns Trellis created for it typed from columns
+        // of this table, each with the type define would give it now.
         let copies: Vec<copies::TypedCopy> = copies::typed_copies(
             &*client,
             schema,
@@ -582,10 +590,45 @@ pub(crate) async fn pause_readers_of_retyped(
         .into_iter()
         .filter(|c| c.columns_of(table).next().is_some())
         .collect();
-        // By the columns of this table each is typed from.
+        let states = copies::inspect(&*client, copies).await?;
+        checked.push(Checked {
+            id: reader.id,
+            columns,
+            reasons,
+            refused,
+            states,
+        });
+    }
+
+    // #824: each created table whose every drifted column widened by
+    // changing only the catalog is re-typed here, and pauses nothing.
+    let in_place = retype_in_place(client, table, &checked).await?;
+
+    let mut pauses: Vec<(i64, Vec<String>, String)> = Vec::new();
+    // The columns of this table a copy re-typed in place copies, by reader.
+    let mut copied_retyped: Vec<(i64, String)> = Vec::new();
+    for Checked {
+        id,
+        mut columns,
+        mut reasons,
+        refused,
+        states,
+    } in checked
+    {
+        // A column that outgrew the type define would give it now, on a
+        // table not re-typed in place, by the columns of this table each is
+        // typed from.
         let mut outgrown: BTreeMap<Vec<String>, Vec<copies::CopyState>> = BTreeMap::new();
-        for state in copies::inspect(&*client, copies).await? {
-            if !state.outgrown() {
+        for state in states {
+            if state.drifted()
+                && state.copy.inferred.is_none()
+                && in_place.retyped.contains(&state.copy.table)
+            {
+                for column in state.copy.columns_of(table) {
+                    copied_retyped.push((id, column.to_string()));
+                }
+            }
+            if !state.outgrown() || in_place.handles(&state.copy.table) {
                 continue;
             }
             let from: Vec<String> = state.copy.columns_of(table).map(str::to_string).collect();
@@ -597,12 +640,8 @@ pub(crate) async fn pause_readers_of_retyped(
         }
         for (from, states) in outgrown {
             let inputs = input_types(&*client, table, &live, &states).await?;
-            flag(
-                &from[0],
-                outgrown_reason(table, &from, &inputs, &states),
-                &mut columns,
-            );
-            for column in &from[1..] {
+            reasons.push(outgrown_reason(table, &from, &inputs, &states));
+            for column in &from {
                 if !columns.contains(column) {
                     columns.push(column.clone());
                 }
@@ -619,12 +658,15 @@ pub(crate) async fn pause_readers_of_retyped(
                  rebuilds it. Or drop the definition and define it again"
             };
             let error = format!("{}. {remedy}", reasons.join("; "));
-            pauses.push((reader.id, columns, error));
+            pauses.push((id, columns, error));
         }
     }
 
     // Recorded on its own: the next pass compares against it whether or not
-    // this one pauses anything.
+    // this one pauses anything. A key column whose copy this pass re-typed
+    // in place is recorded at its new type for each definition left live,
+    // as a resume records it: the definition stores keys of that type from
+    // now on, so a later narrowing is measured from it.
     let mut by_reader: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
     for (id, column) in unrecorded {
         by_reader
@@ -634,6 +676,20 @@ pub(crate) async fn pause_readers_of_retyped(
     }
     for (id, columns) in &by_reader {
         key_types::record(&*client, *id, columns).await?;
+    }
+    let mut widened: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
+    for (id, column) in widened_keys {
+        if copied_retyped.contains(&(id, column.clone()))
+            && !pauses.iter().any(|(paused, _, _)| *paused == id)
+        {
+            widened
+                .entry(id)
+                .or_default()
+                .push((table.to_string(), column));
+        }
+    }
+    for (id, columns) in &widened {
+        key_types::rerecord(&*client, *id, columns).await?;
     }
     if pauses.is_empty() {
         return Ok(false);
@@ -648,6 +704,155 @@ pub(crate) async fn pause_readers_of_retyped(
     }
     txn.commit().await?;
     Ok(true)
+}
+
+/// What [`pause_readers_of_retyped`] found for one definition before it
+/// decides what to pause: the key columns it flagged and why, and every
+/// column Trellis created for it typed from the table being checked.
+struct Checked {
+    id: i64,
+    columns: Vec<String>,
+    reasons: Vec<String>,
+    refused: bool,
+    states: Vec<copies::CopyState>,
+}
+
+/// Re-types each table Trellis created whose every widened column, across
+/// all of `checked`, widened by changing only the catalog
+/// ([`copies::CopyState::catalog_only`]): `varchar(n)` to a longer
+/// `varchar`, `text` or an unbounded `varchar`, or `numeric(p,s)` to more
+/// precision at the same scale (#824). A table where some column also
+/// outgrew its type by a widening that rewrites (`integer` to `bigint`) is
+/// left to the pause and its resume, which re-type all of it. A drifted
+/// column that wasn't widened (a narrowing, another type family) is left
+/// as it is, as the pause leaves it, and doesn't stop the table's re-type.
+///
+/// One table per transaction, under the resume's own lock timeout
+/// (`staging::quarantine::RETYPE_LOCK_TIMEOUT`). The `ALTER` is the
+/// transaction's first statement, so it waits for the table's `ACCESS
+/// EXCLUSIVE` while holding no lock of its own, and once it has it, takes
+/// only the locks of that table's own indexes and TOAST table, which nothing
+/// takes without the table's lock first. So it can't close a cycle with a
+/// drain page, a build or a release, whatever order they take their locks
+/// in: at worst a page queued behind it waits out the timeout.
+///
+/// - A table it re-types asks, in the same transaction, for the release of
+///   each owning definition's keys held for a value its old types couldn't
+///   hold (`retype_releases`, released by
+///   `staging::quarantine::release_retyped_keys` after the pass): `22001`
+///   for a `varchar`, `22003` for a `numeric`. A definition owns the table
+///   when it has any column there, so every reader of a shared projection
+///   does, since a projection write that fails is charged to each.
+/// - A table whose lock it can't get within the timeout is left as it is,
+///   and nothing is paused for it: the next pass tries again.
+/// - A table whose re-type fails otherwise (a view on the column, say) is
+///   left to the pause, as a rewriting widening is.
+///
+/// Returns the tables it re-typed, and those it left waiting for their
+/// lock: no definition pauses for either.
+async fn retype_in_place(
+    client: &mut Client,
+    checked_table: &str,
+    checked: &[Checked],
+) -> Result<InPlace, CaptureError> {
+    // Every widened column by its table, once each: a projection's columns
+    // are every reader's of the relationship. An unbounded `varchar` to
+    // `text` holds no more values, so it isn't outgrown, but it is re-typed
+    // here all the same, as a resume would.
+    let mut widened: BTreeMap<&str, Vec<&copies::CopyState>> = BTreeMap::new();
+    for state in checked.iter().flat_map(|c| &c.states) {
+        if !state.outgrown() && !state.catalog_only() {
+            continue;
+        }
+        let columns = widened.entry(state.copy.table.as_str()).or_default();
+        if !columns.iter().any(|s| s.copy.column == state.copy.column) {
+            columns.push(state);
+        }
+    }
+    let mut in_place = InPlace::default();
+    for (table, states) in widened {
+        if !states.iter().all(|s| s.catalog_only()) {
+            continue;
+        }
+        let owners: Vec<i64> = checked
+            .iter()
+            .filter(|c| c.states.iter().any(|s| s.copy.table == table))
+            .map(|c| c.id)
+            .collect();
+        let sqlstates: Vec<String> = states
+            .iter()
+            .map(|s| {
+                if s.copy_type.ty.type_name == "pg_catalog.numeric" {
+                    "22003".to_string()
+                } else {
+                    "22001".to_string()
+                }
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let owned: Vec<copies::CopyState> = states.iter().map(|s| (*s).clone()).collect();
+        let Some((sql, labels)) = copies::retype_statements(&owned).into_iter().next() else {
+            continue;
+        };
+        let txn = client.transaction().await?;
+        crate::locks::set_local_lock_timeout(&txn, crate::staging::quarantine::RETYPE_LOCK_TIMEOUT)
+            .await?;
+        match txn.batch_execute(&sql).await {
+            Ok(()) => {
+                txn.execute(
+                    "insert into retype_releases (transform_id, sqlstate) \
+                     select id, sqlstate from unnest($1::int8[]) as id \
+                     cross join unnest($2::text[]) as sqlstate \
+                     on conflict (transform_id, sqlstate) do update set requested_at = now()",
+                    &[&owners, &sqlstates],
+                )
+                .await?;
+                txn.commit().await?;
+                tracing::info!(
+                    table = %checked_table,
+                    copies = ?labels,
+                    "re-typed Trellis's columns in place: the source widened them without a rewrite"
+                );
+                in_place.retyped.insert(table.to_string());
+            }
+            Err(err) if crate::locks::is_lock_not_available(&err) => {
+                drop(txn);
+                tracing::info!(
+                    table = %checked_table,
+                    copies = ?labels,
+                    "re-typing Trellis's columns in place waits for their table's lock; \
+                     retrying next pass"
+                );
+                in_place.waiting.insert(table.to_string());
+            }
+            Err(err) => {
+                txn.rollback().await?;
+                tracing::warn!(
+                    table = %checked_table,
+                    copies = ?labels,
+                    error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
+                    "couldn't re-type Trellis's columns in place; pausing their definitions instead"
+                );
+            }
+        }
+    }
+    Ok(in_place)
+}
+
+/// The tables [`retype_in_place`] re-typed, and those it left waiting for
+/// their lock.
+#[derive(Default)]
+struct InPlace {
+    retyped: BTreeSet<String>,
+    waiting: BTreeSet<String>,
+}
+
+impl InPlace {
+    /// Whether `table`'s drift is the in-place re-type's, not a pause's.
+    fn handles(&self, table: &str) -> bool {
+        self.retyped.contains(table) || self.waiting.contains(table)
+    }
 }
 
 /// Every source column `states` are typed from, once each, as
@@ -825,6 +1030,7 @@ mod tests {
                 typmod: -1,
             },
             display: display.to_string(),
+            collatable: false,
         }
     }
 
@@ -847,6 +1053,7 @@ mod tests {
             },
             copy_type: ty("integer"),
             live_type: ty("bigint"),
+            collation: None,
         }
     }
 

@@ -24,9 +24,9 @@ them gets broken without Trellis noticing.
   a field to another type family, beyond the changes Trellis detects and
   pauses for (entries 1, 2 and 22). Retyping or re-collating a key, join or GROUP
   BY column, and widening any column Trellis creates a column from with its
-  type, pause the definitions concerned (see
-  [What isn't on this list](#what-isnt-on-this-list), and entry 4 for what a
-  widening costs).
+  type, pause the definitions concerned, except a widening that changes only
+  the catalog, which Trellis applies to its own columns in place (see
+  [What isn't on this list](#what-isnt-on-this-list)).
 * No row-level security policy applies to a role Trellis logs in as, or to
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
@@ -80,7 +80,6 @@ These are the tools the entries refer to:
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | #782 |
-| 4 | A catalog-only widening (`varchar(50)` → `varchar(100)`) of a column Trellis copies with its type | no (the definition pauses until resumed, then rebuilds) | yes, by the capture pass | #824 |
 | 5 | Capture switched off and back on between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
 | 7 | A source attached as a partition, or made to inherit, after define | yes | `self_check` (1-1 targets only) | #707, study pending |
@@ -126,7 +125,7 @@ need superuser (#699).
 `PAUSE`/`RESUME` every transform that reads the table. A type change to a
 key, join or GROUP BY column pauses its readers on its own (see
 [What isn't on this list](#what-isnt-on-this-list)), and so does a widening
-of one it reads only as a field (entry 4).
+of one it reads only as a field that needs a rewrite.
 
 ## 2. A column dropped and re-added under the same name
 
@@ -171,46 +170,6 @@ build that straddles the change is pinned to the collation it planned under
 **Planned work:** #782.
 
 **Repair:** start a new sweep after the change.
-
-## 4. A catalog-only widening of a column Trellis copies with its type
-
-**Trigger:** a widening that changes only the catalog, not the stored values
-(`varchar(n)` to a longer `varchar(m)`, `varchar` to `text`, dropping a
-`varchar`'s length, or a `numeric(p,s)` with a larger precision and the same
-scale), of a source column Trellis copies with its exact type:
-
-* a 1-1 target's key and passthrough columns;
-* a to-one relationship projection's key, and its column for each to-side
-  column read through it (`author.name`, `GROUP BY author.country`).
-
-The columns Trellis types by value family or by an expression (`GROUP BY`
-columns, calculated fields, aggregate and ledger contribution columns) are
-`text` or unconstrained `numeric` for these types, so these widenings don't
-reach them.
-
-**Effect:** loud, and it costs a rebuild. Trellis's column keeps the old
-type, so the staging worker's next capture pass pauses every definition
-that owns one the source column has outgrown, naming each column, its type
-and the type define would give it now. Until that pass (up to one
-`reconcile_interval`), a value the column can't hold fails its write with
-`22001` (too long) or `22003` (out of range), and the key is quarantined for
-that definition (see [Repair caveats](#repair-caveats)). The definition's
-target is stale until it's resumed and rebuilt. A widening that rewrites
-the table (`integer` to `bigint`, `real` to `double precision`) behaves the
-same way, and its rebuild is expected; a catalog-only one could be applied
-in place without either.
-
-**Detected?** Yes: the capture pass pauses the definition, with the reason
-on its `capture_failure`.
-
-**Planned work:** #824: the staging worker re-types a catalog-only widening
-in place, in its capture pass, without pausing or rebuilding, and releases
-the keys that failed with `22001` or `22003` in the window.
-
-**Repair:** `RESUME TRANSFORM <target>`. The resume brings every column the
-definition created to the type define would give it from the live schema,
-releases the definition's quarantined keys, and rebuilds the target
-([The repair tools](#the-repair-tools)).
 
 ## 5. Capture switched off and back on between two reconcile passes
 
@@ -609,7 +568,7 @@ argument, a to-side column read through a relationship) to another type
 family: `integer` to `double precision`, or `numeric` to `double precision`
 and back. An integer moved to `numeric` isn't this entry: every integer
 column Trellis created from it can no longer hold its values, so its readers
-pause (entry 4).
+pause (see [What isn't on this list](#what-isnt-on-this-list)).
 
 **Effect:** the columns Trellis created from it keep the types define gave
 them, and nothing pauses.
@@ -641,7 +600,9 @@ and the rebuild fails the keys it writes. Drop it and define it again.
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
   widening, the resume's `ALTER … TYPE` on the target (and its ledger, or the
   relationship's projection) waits for every reader of the table, and readers
-  queue behind it. `integer` to `bigint` rewrites the table, so at a billion
+  queue behind it. The capture pass's in-place re-type of a widening that
+  changes only the catalog takes the same lock, for at most two seconds
+  while it waits and briefly once it has it. `integer` to `bigint` rewrites the table, so at a billion
   rows reads of the target block for minutes, and the capture pass waits with
   it. The `RESUME` itself returns at once; the definition stays `paused`, its
   `capture_failure` saying it's resuming, until the staging worker has
@@ -654,8 +615,11 @@ and the rebuild fails the keys it writes. Drop it and define it again.
   the same source keeps applying the key, so two definitions can disagree on
   it. A widening of a column Trellis copies with its type causes such
   failures when an oversized value drains before the capture pass pauses
-  the definition (entry 4), and so does a field's move to another type
-  family (entry 22). The definition's `status` reports its held keys
+  the definition, and so does a field's move to another type family (entry
+  22). After a widening that changes only the catalog, the capture pass
+  re-types Trellis's column and then releases the definition's keys held
+  for `22001` or `22003` itself. A key whose eviction commits after that
+  release, from a failure reproduced before the re-type, stays held. The definition's `status` reports its held keys
   (`held_keys`: how many, and since when) whatever its status, `live`
   included, and `self_check` reports them with every audit. What clears a
   held key:
@@ -701,10 +665,19 @@ refusing them up front:
   ledger contribution, or a relationship projection's key or column;
   `bigint` to `numeric` under a `MIN`). A resume refuses until define would
   accept the definition again; otherwise it re-types those columns and
-  rebuilds (entry 4 for what that costs)
+  rebuilds
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and
-  the resume releases it. A change between deterministic collations needs
+  the resume releases it.
+* **A widening that changes only the catalog of a column Trellis copies with
+  its type.** `varchar(n)` to a longer `varchar`, to `text` or to
+  `varchar`, and `numeric(p,s)` to a larger precision at the same scale,
+  under a 1-1 target's key or passthrough or a to-one relationship
+  projection's key or column. The capture pass re-types Trellis's columns in
+  place, with no pause and no rebuild, and then releases the keys held for
+  a value the old type couldn't hold (`22001`, `22003`) in between
+  ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md)).
+  A table where another column needs a rewrite pauses as above. A change between deterministic collations needs
   nothing (but see entry 3). A field's move to another type family pauses
   nothing (entry 22).
 * **A source's primary key dropped, or retyped off the supported types.** The

@@ -260,6 +260,17 @@ async fn column_type(raw: &Client, table: &str, column: &str) -> String {
     .get(0)
 }
 
+/// `table`'s `relfilenode`: a rewrite gives the table a new one.
+async fn relfilenode(raw: &Client, table: &str) -> u32 {
+    raw.query_one(
+        "select relfilenode from pg_catalog.pg_class where oid = pg_catalog.to_regclass($1)",
+        &[&table],
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{table}: {err}"))
+    .get(0)
+}
+
 /// Whether `target`'s resume waits on the staging worker to re-type its
 /// copies: it is paused, its reason says so, and its request is recorded.
 async fn assert_retyping(trellis: &Trellis, raw: &Client, target: &str) -> String {
@@ -558,12 +569,14 @@ async fn widening_a_one_to_one_key_pauses_and_resume_widens_the_target_key() {
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
 }
 
-/// Widening a column a 1-1 target passes through (`varchar(10)` to
-/// `varchar(40)`) outgrows its copy: the pass pauses the definition, and a
-/// resume widens the copy and rebuilds, so a longer value lands. A
-/// narrowing of a passthrough pauses nothing: every value still fits.
+/// A table where one column widens without a rewrite (a passthrough's
+/// `varchar(10)` to `varchar(40)`) and another with one (the key's
+/// `integer` to `bigint`) isn't re-typed in place (#824): the pass pauses
+/// the definition, naming both, and a resume re-types both and rebuilds, so
+/// a longer value lands. A narrowing of a passthrough pauses nothing and
+/// re-types nothing: every value still fits.
 #[tokio::test]
-async fn widening_a_passthrough_pauses_and_resume_widens_its_copy() {
+async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -574,16 +587,28 @@ async fn widening_a_passthrough_pauses_and_resume_widens_its_copy() {
         .expect("narrow the passthrough");
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(10)"
+    );
 
-    raw.batch_execute("alter table public.items alter column name type varchar(40)")
-        .await
-        .expect("widen the passthrough");
+    raw.batch_execute(
+        "alter table public.items alter column name type varchar(40), \
+                                  alter column id type bigint",
+    )
+    .await
+    .expect("widen the passthrough and the key");
     capture_pass(&mut raw, &db.pool).await;
-    let error = paused_for(&trellis, "item_names", "public.items", &["name"]).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["id", "name"]).await;
     assert!(
         error.contains("widened to character varying(40)")
-            && error.contains("public.item_names.name (character varying(10))"),
+            && error.contains("public.item_names.name (character varying(10))")
+            && error.contains("widened to bigint"),
         "{error}"
+    );
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(10)"
     );
 
     resume(&trellis, "item_names").await;
@@ -593,8 +618,9 @@ async fn widening_a_passthrough_pauses_and_resume_widens_its_copy() {
         column_type(&raw, "public.item_names", "name").await,
         "character varying(40)"
     );
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
-    raw.batch_execute("insert into public.items values (3, 'a much longer name', 3)")
+    raw.batch_execute("insert into public.items values (3000000000, 'a much longer name', 3)")
         .await
         .expect("a longer value");
     full_pass(&mut raw, &db.pool).await;
@@ -1280,11 +1306,11 @@ async fn a_field_resume_refuses_a_definition_define_would_refuse_now() {
 /// An aggregate's `GROUP BY` key read through a to-one relationship
 /// (`GROUP BY author.country`) is read from the relationship's projection,
 /// whose column for it copies the to-side column's type. Widening the
-/// to-side column (`varchar(2)` to `varchar(20)`) outgrows that copy: the
-/// pass pauses the aggregate, naming it, and a resume re-types it and
-/// rebuilds, so a longer value groups.
+/// to-side column (`varchar(2)` to `varchar(20)`) outgrows that copy, but
+/// without a rewrite: one pass re-types the projection's column in place
+/// (#824), and the aggregate stays live, so a longer value groups.
 #[tokio::test]
-async fn widening_a_group_by_key_read_through_a_relationship_pauses_and_resume_widens_its_projection_column()
+async fn widening_a_group_by_key_read_through_a_relationship_re_types_its_projection_column_in_place()
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1313,30 +1339,17 @@ async fn widening_a_group_by_key_read_through_a_relationship_pauses_and_resume_w
         .get(0);
     let projection = format!("trellis.{projection}");
 
+    let before = relfilenode(&raw, &projection).await;
     raw.batch_execute("alter table public.users alter column country type varchar(20)")
         .await
         .expect("widen the GROUP BY key's to-side column");
     capture_pass(&mut raw, &db.pool).await;
-    let error = paused_for(&trellis, "per_country", "public.users", &["country"]).await;
-    assert!(
-        error.contains(&format!("{projection}.country (character varying(2))")),
-        "{error}"
-    );
-
-    resume(&trellis, "per_country").await;
-    let error = assert_retyping(&trellis, &raw, "per_country").await;
-    assert!(
-        error.contains(&format!(
-            "{projection}.country from character varying(2) to character varying(20)"
-        )),
-        "{error}"
-    );
-    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_country").await, TransformStatus::Live);
     assert_eq!(
         column_type(&raw, &projection, "country").await,
         "character varying(20)"
     );
-    bring_live(&mut raw, &db.pool, &["per_country"]).await;
+    assert_eq!(relfilenode(&raw, &projection).await, before, "no rewrite");
     raw.batch_execute("update public.users set country = 'United States' where id = 1")
         .await
         .expect("a longer value");
@@ -1773,95 +1786,6 @@ async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_down
     );
 }
 
-/// #824: widening a to-side column a 1-1 definition reads through a to-one
-/// relationship (`author.name`, `varchar(10)` to `varchar(40)`) outgrows the
-/// relationship projection's column for it. The target's column is `text`,
-/// which holds every value already, and isn't re-typed. The pass pauses
-/// the definition, and a resume widens the projection's column and
-/// rebuilds, so a longer name lands.
-#[tokio::test]
-async fn widening_a_column_read_through_a_relationship_pauses_and_resume_widens_its_projection_column()
- {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    raw.batch_execute(
-        "create table public.users (id int primary key, name varchar(10)); \
-         create table public.posts (id int primary key, author_id int); \
-         insert into public.users values (1, 'Ann'), (2, 'Bob'); \
-         insert into public.posts values (1, 1), (2, 2), (3, 1);",
-    )
-    .await
-    .expect("seed");
-    let trellis = definer(db.dsn()).await;
-    for text in [
-        "RELATIONSHIP author FROM posts.author_id TO users.id",
-        "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
-    ] {
-        trellis.apply(text).await.expect(text);
-    }
-    bring_live(&mut raw, &db.pool, &["post_authors"]).await;
-    let projection: String = raw
-        .query_one("select projection_table from relationship_projections", &[])
-        .await
-        .expect("the relationship's projection")
-        .get(0);
-    let projection = format!("trellis.{projection}");
-    assert_eq!(
-        column_type(&raw, &projection, "name").await,
-        "character varying(10)"
-    );
-
-    raw.batch_execute("alter table public.users alter column name type varchar(40)")
-        .await
-        .expect("widen the to-side column");
-    capture_pass(&mut raw, &db.pool).await;
-    let error = paused_for(&trellis, "post_authors", "public.users", &["name"]).await;
-    assert!(
-        error.contains(&format!("{projection}.name (character varying(10))")),
-        "{error}"
-    );
-    assert!(!error.contains("post_authors.author_name"), "{error}");
-
-    resume(&trellis, "post_authors").await;
-    let error = assert_retyping(&trellis, &raw, "post_authors").await;
-    assert!(
-        error.contains(&format!(
-            "{projection}.name from character varying(10) to character varying(40)"
-        )) && !error.contains("author_name"),
-        "{error}"
-    );
-    capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(
-        column_type(&raw, &projection, "name").await,
-        "character varying(40)"
-    );
-    assert_eq!(
-        column_type(&raw, "public.post_authors", "author_name").await,
-        "text"
-    );
-    bring_live(&mut raw, &db.pool, &["post_authors"]).await;
-    raw.batch_execute("update public.users set name = 'Ann With A Long Name' where id = 1")
-        .await
-        .expect("a longer value");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(status(&raw, "post_authors").await, TransformStatus::Live);
-    assert_eq!(
-        rows(
-            &raw,
-            "select id::text, author_name from public.post_authors order by id"
-        )
-        .await,
-        rows(
-            &raw,
-            "select p.id::text, u.name::text from public.posts p \
-             join public.users u on u.id = p.author_id order by p.id"
-        )
-        .await,
-    );
-}
-
 /// #824: a source change whose columns Trellis created from it hold every
 /// value of the types define would give them now pauses nothing: a
 /// widening under an expression typed by its family (`CHAR_LENGTH(name)`,
@@ -1960,5 +1884,520 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
              from public.lines group by kind order by kind"
         )
         .await,
+    );
+}
+
+/// The columns #824's in-place re-type reaches, over `public.users` and
+/// `public.posts` (`posts.author` related to `users.handle`):
+///
+/// - `user_labels`, a 1-1 definition: its target's key copies
+///   `users.handle`, and its passthrough `users.label`;
+/// - `post_labels` reads `author.label`: the relationship's projection
+///   copies `users.handle` as its key and `users.label` as a data column;
+/// - `per_author` takes `MAX(amount)` per `author`: its ledger's
+///   contribution column is typed as `posts.amount`'s family.
+///
+/// `key` is the type of `users.handle` and `posts.author`, `value` of
+/// `users.label` and `posts.amount`. Returns the projection, qualified.
+async fn widening_fixture(
+    dsn: &str,
+    raw: &mut Client,
+    pool: &trellis::Pool,
+    key: &str,
+    value: &str,
+) -> String {
+    raw.batch_execute(&format!(
+        "create table public.users (handle {key} primary key, label {value}); \
+         create table public.posts (id int primary key, author {key}, amount {value}); \
+         insert into public.users values ('ann', '1.50'), ('bob', '2.25'); \
+         insert into public.posts values (1, 'ann', '1.50'), (2, 'bob', '2.25'), \
+                                         (3, 'ann', '3.75');"
+    ))
+    .await
+    .expect("seed");
+    let trellis = definer(dsn).await;
+    for text in [
+        "RELATIONSHIP author FROM posts.author TO users.handle",
+        "TRANSFORM user_labels FROM public.users SELECT label AS label",
+        "TRANSFORM post_labels FROM public.posts SELECT author.label AS author_label",
+        "TRANSFORM per_author FROM public.posts GROUP BY author \
+         SELECT author AS author, MAX(amount) AS top",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(raw, pool, &WIDENING_TARGETS).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    format!("trellis.{projection}")
+}
+
+const WIDENING_TARGETS: [&str; 3] = ["user_labels", "post_labels", "per_author"];
+
+/// Each of [`widening_fixture`]'s targets against its oracle.
+async fn assert_widening_targets_match(raw: &Client) {
+    for (target, oracle) in [
+        (
+            "select handle::text, label::text from public.user_labels order by 1",
+            "select handle::text, label::text from public.users order by 1",
+        ),
+        (
+            "select id::text, author_label::text from public.post_labels order by 1",
+            "select p.id::text, u.label::text from public.posts p \
+             left join public.users u on u.handle = p.author order by 1",
+        ),
+        (
+            "select author::text, top::text from public.per_author order by 1",
+            "select author::text, max(amount)::text from public.posts group by 1 order by 1",
+        ),
+    ] {
+        assert_eq!(rows(raw, target).await, rows(raw, oracle).await, "{target}");
+    }
+}
+
+/// #824 rule 2: one catalog-only widening. The source's key columns are
+/// re-typed `key_to` (or kept, when `None`) and its value columns
+/// `value_to`; one staging-worker pass re-types every column Trellis copied
+/// from them in place, to `key_display` and `value_display`, without a
+/// rewrite, a pause or a rebuild: every definition stays live. A key and a
+/// value the old types couldn't hold then apply. The contribution column is
+/// typed by the value's family, so it holds them already and is left alone.
+async fn a_catalog_only_widening_re_types_in_place(
+    key: &str,
+    key_to: Option<(&str, &str)>,
+    value: &str,
+    (value_to, value_display): (&str, &str),
+    (long_key, long_value): (&str, &str),
+) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let projection = widening_fixture(db.dsn(), &mut raw, &db.pool, key, value).await;
+    let contribution = column_type(&raw, "public.per_author__ledger", "__arg0").await;
+    let target_file = relfilenode(&raw, "public.user_labels").await;
+    let projection_file = relfilenode(&raw, &projection).await;
+
+    let mut alter = format!(
+        "alter table public.users alter column label type {value_to}; \
+         alter table public.posts alter column amount type {value_to};"
+    );
+    if let Some((key_to, _)) = key_to {
+        alter.push_str(&format!(
+            "alter table public.users alter column handle type {key_to}; \
+             alter table public.posts alter column author type {key_to};"
+        ));
+    }
+    raw.batch_execute(&alter).await.expect("widen the source");
+    full_pass(&mut raw, &db.pool).await;
+
+    for target in WIDENING_TARGETS {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        column_type(&raw, "public.user_labels", "label").await,
+        value_display
+    );
+    assert_eq!(column_type(&raw, &projection, "label").await, value_display);
+    if let Some((_, key_display)) = key_to {
+        assert_eq!(
+            column_type(&raw, "public.user_labels", "handle").await,
+            key_display
+        );
+        assert_eq!(column_type(&raw, &projection, "handle").await, key_display);
+    }
+    assert_eq!(
+        column_type(&raw, "public.per_author__ledger", "__arg0").await,
+        contribution
+    );
+    assert_eq!(
+        relfilenode(&raw, "public.user_labels").await,
+        target_file,
+        "no rewrite"
+    );
+    assert_eq!(
+        relfilenode(&raw, &projection).await,
+        projection_file,
+        "no rewrite"
+    );
+
+    raw.execute(
+        &format!("insert into public.users values ($1, $2::text::{value_to})"),
+        &[&long_key, &long_value],
+    )
+    .await
+    .expect("a key and a value the old types can't hold");
+    raw.execute(
+        &format!("insert into public.posts values (4, $1, $2::text::{value_to})"),
+        &[&long_key, &long_value],
+    )
+    .await
+    .expect("a post by it");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for target in WIDENING_TARGETS {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    let held: i64 = raw
+        .query_one("select count(*) from poison", &[])
+        .await
+        .expect("read poison")
+        .get(0);
+    assert_eq!(held, 0);
+    assert_widening_targets_match(&raw).await;
+}
+
+#[tokio::test]
+async fn a_longer_varchar_is_re_typed_in_place() {
+    a_catalog_only_widening_re_types_in_place(
+        "varchar(10)",
+        Some(("varchar(40)", "character varying(40)")),
+        "varchar(10)",
+        ("varchar(40)", "character varying(40)"),
+        ("a handle past ten", "a label past ten characters"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_bounded_varchar_to_text_is_re_typed_in_place() {
+    a_catalog_only_widening_re_types_in_place(
+        "varchar(10)",
+        Some(("text", "text")),
+        "varchar(10)",
+        ("text", "text"),
+        ("a handle past ten", "a label past ten characters"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_unbounded_varchar_to_text_is_re_typed_in_place() {
+    a_catalog_only_widening_re_types_in_place(
+        "varchar",
+        Some(("text", "text")),
+        "varchar",
+        ("text", "text"),
+        ("a handle past ten", "a label past ten characters"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn removing_a_varchar_length_is_re_typed_in_place() {
+    a_catalog_only_widening_re_types_in_place(
+        "varchar(10)",
+        Some(("varchar", "character varying")),
+        "varchar(10)",
+        ("varchar", "character varying"),
+        ("a handle past ten", "a label past ten characters"),
+    )
+    .await;
+}
+
+/// `numeric` can't be a key, so only the value columns widen.
+#[tokio::test]
+async fn more_numeric_precision_at_the_same_scale_is_re_typed_in_place() {
+    a_catalog_only_widening_re_types_in_place(
+        "varchar(10)",
+        None,
+        "numeric(5,2)",
+        ("numeric(9,2)", "numeric(9,2)"),
+        ("dan", "12345.67"),
+    )
+    .await;
+}
+
+/// #824 rule 3: values written after the source widened and before the
+/// pass re-types Trellis's columns fail their writes, `22001` for a
+/// `varchar` and `22003` for a `numeric`, and their keys are held: a 1-1
+/// target's passthroughs, and a to-one projection's data column, whose
+/// failed write holds the to-side key for the definition reading through
+/// it. One pass re-types the columns in place and releases those keys, and
+/// the next drain applies them. A key held for another reason (a check
+/// constraint on the target, `23514`) stays held.
+#[tokio::test]
+async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_re_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.goods (id int primary key, name varchar(10), price numeric(5,2), \
+                                    qty int); \
+         insert into public.goods values (1, 'one', 1.00, 1), (2, 'two', 2.00, 2); \
+         create table public.users (id int primary key, name varchar(10)); \
+         create table public.posts (id int primary key, author_id int); \
+         insert into public.users values (1, 'Ann'), (2, 'Bob'); \
+         insert into public.posts values (1, 1), (2, 2), (3, 1);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM good_names FROM public.goods SELECT name AS name, price AS price, qty AS qty",
+        "RELATIONSHIP author FROM posts.author_id TO users.id",
+        "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    let targets = ["good_names", "post_authors"];
+    bring_live(&mut raw, &db.pool, &targets).await;
+    raw.batch_execute("alter table public.good_names add constraint few check (qty < 100)")
+        .await
+        .expect("a check on the target");
+
+    raw.batch_execute(
+        "alter table public.goods alter column name type varchar(40), \
+                                  alter column price type numeric(9,2); \
+         alter table public.users alter column name type varchar(40); \
+         insert into public.goods values (3, 'a name past ten characters', 3.00, 3), \
+                                         (4, 'four', 12345.67, 4), (5, 'five', 5.00, 500); \
+         update public.users set name = 'Ann With A Long Name' where id = 1;",
+    )
+    .await
+    .expect("widen, then write values the copies can't hold");
+    drain_past_failures(&db.pool, &mut raw).await;
+    let held = async |raw: &Client| {
+        rows(
+            raw,
+            "select split_part(d.target_table, '.', 2), p.src_table, p.key, p.sqlstate \
+             from poison p join transform_definitions d on d.id = p.transform_id order by 1, 3",
+        )
+        .await
+    };
+    let row = |target: &str, table: &str, key: &str, sqlstate: &str| {
+        [target, table, key, sqlstate]
+            .into_iter()
+            .map(|v| Some(v.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        held(&raw).await,
+        vec![
+            row("good_names", "public.goods", "3", "22001"),
+            row("good_names", "public.goods", "4", "22003"),
+            row("good_names", "public.goods", "5", "23514"),
+            row("post_authors", "public.users", "1", "22001"),
+        ]
+    );
+
+    full_pass(&mut raw, &db.pool).await;
+    for target in targets {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        column_type(&raw, "public.good_names", "name").await,
+        "character varying(40)"
+    );
+    assert_eq!(
+        column_type(&raw, "public.good_names", "price").await,
+        "numeric(9,2)"
+    );
+    assert_eq!(
+        held(&raw).await,
+        vec![row("good_names", "public.goods", "5", "23514")]
+    );
+    let requests: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("read retype_releases")
+        .get(0);
+    assert_eq!(requests, 0, "every requested release was made");
+
+    // The goods apply in the first drain. The released `users` key's
+    // re-derive reaches `post_authors`' rows through the reverse records it
+    // stages, which the second drain applies (#754). Key 5's held rows keep
+    // the ring from quiescence, so each drain is one bounded round.
+    drain_past_failures(&db.pool, &mut raw).await;
+    drain_past_failures(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name, price::text, qty::text from public.good_names order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name::text, price::text, qty::text from public.goods \
+             where id <> 5 order by id"
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, author_name from public.post_authors order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select p.id::text, u.name::text from public.posts p \
+             join public.users u on u.id = p.author_id order by p.id"
+        )
+        .await,
+    );
+}
+
+/// #824: only the named widenings are re-typed in place. A `character(n)`
+/// length change (its values are blank-padded to the length) and a `text`
+/// column made `varchar(n)` (binary-coercible, but a narrowing) are left
+/// as they were, and, as before, pause nothing: every value still fits a
+/// passthrough of either.
+#[tokio::test]
+async fn character_and_text_to_varchar_changes_are_not_re_typed_in_place() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.tags (id int primary key, code char(5), note text); \
+         insert into public.tags values (1, 'ab', 'x'), (2, 'cd', 'y');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tag_codes FROM public.tags SELECT code AS code, note AS note")
+        .await
+        .expect("define tag_codes");
+    bring_live(&mut raw, &db.pool, &["tag_codes"]).await;
+
+    raw.batch_execute(
+        "alter table public.tags alter column code type char(9), \
+                                 alter column note type varchar(20)",
+    )
+    .await
+    .expect("change both columns");
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "tag_codes").await, TransformStatus::Live);
+    assert_eq!(
+        column_type(&raw, "public.tag_codes", "code").await,
+        "character(5)"
+    );
+    assert_eq!(column_type(&raw, "public.tag_codes", "note").await, "text");
+}
+
+/// #824: the in-place re-type waits for its table's lock at most
+/// `RETYPE_LOCK_TIMEOUT`. While another session holds a lock on the
+/// target, the pass changes nothing and pauses nothing; the next pass,
+/// with the lock gone, re-types it.
+#[tokio::test]
+async fn a_re_type_that_cant_lock_its_table_changes_nothing_and_pauses_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute("alter table public.items alter column name type varchar(40)")
+        .await
+        .expect("widen the passthrough");
+    let locker = connect(db.dsn()).await;
+    locker
+        .batch_execute("begin; lock table public.item_names in access share mode")
+        .await
+        .expect("hold a lock on the target");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(10)"
+    );
+    let requests: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("read retype_releases")
+        .get(0);
+    assert_eq!(requests, 0);
+
+    locker.batch_execute("rollback").await.expect("let go");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(40)"
+    );
+}
+
+/// #824: a 1-1 key re-typed in place (`varchar(10)` to `varchar(40)`)
+/// keeps the collation it copied from the source key, and its index. It is
+/// recorded at its new type, as a resume records it. Its target stores
+/// keys of that type from then on, so a later narrowing (`varchar(20)`,
+/// truncating a key past it) is measured from it, and pauses the
+/// definition: the stored key no longer matches the source's.
+#[tokio::test]
+async fn a_key_re_typed_in_place_is_measured_from_its_new_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.codes (code varchar(10) collate \"C\" primary key, n int); \
+         insert into public.codes values ('a', 1), ('b', 2);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM code_counts FROM public.codes SELECT n AS n")
+        .await
+        .expect("define code_counts");
+    bring_live(&mut raw, &db.pool, &["code_counts"]).await;
+
+    let key_index = async |raw: &Client| {
+        rows(
+            raw,
+            "select i.indexrelid::regclass::text, c.relfilenode::text, \
+                    (select co.collname::text from pg_catalog.pg_attribute a \
+                     join pg_catalog.pg_collation co on co.oid = a.attcollation \
+                     where a.attrelid = i.indrelid and a.attname = 'code') \
+             from pg_catalog.pg_index i join pg_catalog.pg_class c on c.oid = i.indexrelid \
+             where i.indrelid = 'public.code_counts'::regclass and i.indisprimary",
+        )
+        .await
+    };
+    let before = key_index(&raw).await;
+    assert_eq!(before[0][2].as_deref(), Some("C"));
+    raw.batch_execute("alter table public.codes alter column code type varchar(40) collate \"C\"")
+        .await
+        .expect("widen the key");
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "code_counts").await, TransformStatus::Live);
+    assert_eq!(
+        column_type(&raw, "public.code_counts", "code").await,
+        "character varying(40)"
+    );
+    assert_eq!(
+        key_index(&raw).await,
+        before,
+        "the same collation and index"
+    );
+    raw.batch_execute("insert into public.codes values ('a code past twenty chars', 3)")
+        .await
+        .expect("a key the old type couldn't hold");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    raw.batch_execute(
+        "alter table public.codes alter column code type varchar(20) collate \"C\" \
+         using code::varchar(20)",
+    )
+    .await
+    .expect("narrow the key, truncating one");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "code_counts", "public.codes", &["code"]).await;
+    assert!(
+        error.contains("from character varying(40) to character varying(20)"),
+        "{error}"
     );
 }

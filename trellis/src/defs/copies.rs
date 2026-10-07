@@ -27,13 +27,26 @@
 //! column widens (`integer` to `bigint`, `varchar(50)` to `text`), the
 //! first value the column can't hold fails its write (`22003`, `22001`). So
 //! the staging worker's capture pass compares each column with the type
-//! define would give it from the live schema ([`inspect`]) and pauses every
-//! definition that owns one the source has outgrown
-//! ([`super::key_types::widens`], `staging::schema_change::pause_readers_of_retyped`).
-//! A resume brings every column whose type differs from that one to it
-//! ([`retype_statements`]) before it rebuilds. Trellis never re-types one
-//! on its own. A narrowing, or a change to another type family, pauses
-//! nothing here: every value still fits, or define's own checks own it.
+//! define would give it from the live schema ([`inspect`]), and acts on
+//! each table holding a column the source widened
+//! (`staging::schema_change::pause_readers_of_retyped`):
+//!
+//! - When every widened column of the table widened by changing only the
+//!   catalog ([`CopyState::catalog_only`]: a longer `varchar`, `text`, a
+//!   `varchar` without its length, or a `numeric` with more precision at the
+//!   same scale), the pass re-types those columns itself, in place. No value
+//!   changes, nothing is rewritten, and no definition pauses or rebuilds.
+//!   Then the keys its definitions held for a value the old type couldn't
+//!   hold are released (`staging::quarantine::release_retyped_keys`).
+//! - Otherwise it pauses every definition that owns a column the source has
+//!   outgrown ([`super::key_types::widens`]). A resume brings every column
+//!   whose type differs from define's to it ([`retype_statements`]) before
+//!   it rebuilds.
+//!
+//! Trellis re-types a column on its own only in the first case. Either
+//! re-type keeps the column's collation. A narrowing, or a change to another
+//! type family, pauses nothing here and is re-typed only by a resume: every
+//! value still fits, or define's own checks own it.
 //!
 //! The ledger's `__from_key` is always `text`, and an aggregate's hidden
 //! partials (`numeric` sums, `bigint` counts) have fixed types, so none of
@@ -480,6 +493,8 @@ pub(crate) struct CopyType {
     pub typmod: i32,
     pub ty: ColumnType,
     pub display: String,
+    /// Whether the type takes a collation.
+    pub collatable: bool,
 }
 
 /// A [`TypedCopy`] with its own type now and the type define would give it
@@ -489,6 +504,10 @@ pub(crate) struct CopyState {
     pub copy: TypedCopy,
     pub copy_type: CopyType,
     pub live_type: CopyType,
+    /// The copy's collation, quoted and qualified, when it isn't its type's
+    /// default: a 1-1 target's key keeps its source key's (#769). A re-type
+    /// keeps it.
+    pub collation: Option<String>,
 }
 
 impl CopyState {
@@ -502,6 +521,15 @@ impl CopyState {
     /// ([`super::key_types::widens`]).
     pub(crate) fn outgrown(&self) -> bool {
         super::key_types::widens(&self.copy_type.ty, &self.live_type.ty)
+    }
+
+    /// Whether the copy drifted by a widening its table takes by changing
+    /// only the catalog ([`super::key_types::catalog_only`]): no rewrite, no
+    /// value changed, every index kept. A group-delta table's column never
+    /// is one: its re-type generates the partition column again.
+    pub(crate) fn catalog_only(&self) -> bool {
+        self.copy.kind != CopyKind::DeltasGroup
+            && super::key_types::catalog_only(&self.copy_type.ty, &self.live_type.ty)
     }
 }
 
@@ -517,17 +545,24 @@ pub(crate) async fn inspect(
     if copies.is_empty() {
         return Ok(Vec::new());
     }
-    // The type of each `(i, table, column)`, by `i`.
+    // The type of each `(i, table, column)`, by `i`, and its collation
+    // when it isn't the type's default.
     let column_types = |columns: Vec<(i64, String, String)>| async move {
         let (indexes, (tables, names)): (Vec<i64>, (Vec<String>, Vec<String>)) =
             columns.into_iter().map(|(i, t, c)| (i, (t, c))).unzip();
         let rows = client
             .query(
-                "select k.i, a.atttypid, a.atttypmod \
+                "select k.i, a.atttypid, a.atttypmod, \
+                        pg_catalog.quote_ident(cn.nspname) || '.' \
+                            || pg_catalog.quote_ident(co.collname) \
                  from unnest($1::text[], $2::text[], $3::int8[]) as k(t, c, i) \
                  join pg_catalog.pg_attribute a \
                    on a.attrelid = pg_catalog.to_regclass(k.t) and a.attname = k.c \
-                  and a.attnum > 0 and not a.attisdropped",
+                  and a.attnum > 0 and not a.attisdropped \
+                 join pg_catalog.pg_type t on t.oid = a.atttypid \
+                 left join pg_catalog.pg_collation co \
+                   on co.oid = a.attcollation and a.attcollation <> t.typcollation \
+                 left join pg_catalog.pg_namespace cn on cn.oid = co.collnamespace",
                 &[&tables, &names, &indexes],
             )
             .await?;
@@ -535,9 +570,15 @@ pub(crate) async fn inspect(
             rows.into_iter()
                 .map(|row| {
                     let i: i64 = row.get(0);
-                    (i as usize, (row.get::<_, u32>(1), row.get::<_, i32>(2)))
+                    (
+                        i as usize,
+                        (
+                            (row.get::<_, u32>(1), row.get::<_, i32>(2)),
+                            row.get::<_, Option<String>>(3),
+                        ),
+                    )
                 })
-                .collect::<HashMap<usize, (u32, i32)>>(),
+                .collect::<HashMap<usize, ((u32, i32), Option<String>)>>(),
         )
     };
     let copied = column_types(
@@ -566,7 +607,7 @@ pub(crate) async fn inspect(
     let mut named: HashMap<String, Option<u32>> = HashMap::new();
     let mut states = Vec::new();
     for (i, copy) in copies.into_iter().enumerate() {
-        let Some(&copy_type) = copied.get(&i) else {
+        let Some((copy_type, collation)) = copied.get(&i).cloned() else {
             continue;
         };
         let live_type = match &copy.inferred {
@@ -575,7 +616,7 @@ pub(crate) async fn inspect(
                 None => continue,
             },
             None => {
-                let Some(&(source_oid, source_typmod)) = sources.get(&i) else {
+                let Some(&((source_oid, source_typmod), _)) = sources.get(&i) else {
                     continue;
                 };
                 if copy.kind.by_family() {
@@ -596,6 +637,7 @@ pub(crate) async fn inspect(
             copy,
             copy_type,
             live_type,
+            collation,
         });
     }
     Ok(states)
@@ -630,7 +672,7 @@ async fn describe(
     let row = client
         .query_one(
             "select n.nspname::text || '.' || t.typname::text, \
-                    pg_catalog.format_type(t.oid, $2) \
+                    pg_catalog.format_type(t.oid, $2), t.typcollation <> 0 \
              from pg_catalog.pg_type t \
              join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
              where t.oid = $1",
@@ -645,6 +687,7 @@ async fn describe(
             typmod,
         },
         display: row.get(1),
+        collatable: row.get(2),
     };
     described.insert((oid, typmod), ty.clone());
     Ok(ty)
@@ -671,8 +714,14 @@ pub(crate) fn retype_statements(states: &[CopyState]) -> Vec<(String, Vec<String
                 .iter()
                 .map(|s| {
                     let column = quote_ident(&s.copy.column);
+                    let collate = match &s.collation {
+                        Some(collation) if s.live_type.collatable => {
+                            format!(" collate {collation}")
+                        }
+                        _ => String::new(),
+                    };
                     format!(
-                        "alter column {column} type {ty} using {column}::{ty}",
+                        "alter column {column} type {ty}{collate} using {column}::{ty}",
                         ty = s.live_type.display
                     )
                 })
@@ -710,6 +759,7 @@ mod tests {
                 typmod: -1,
             },
             display: display.to_string(),
+            collatable: false,
         };
         CopyState {
             copy: TypedCopy {
@@ -722,6 +772,7 @@ mod tests {
             },
             copy_type: ty(from, if from == "integer" { 23 } else { 20 }),
             live_type: ty(to, if to == "integer" { 23 } else { 20 }),
+            collation: None,
         }
     }
 
@@ -865,6 +916,36 @@ mod tests {
                     vec!["public.t__ledger.__arg0".to_string()],
                 ),
             ]
+        );
+    }
+
+    /// A re-type keeps the copy's own collation (a 1-1 key keeps its
+    /// source key's, #769): `alter column … type` would otherwise give the
+    /// column its new type's default, and rebuild its index. A type that
+    /// takes none gets none.
+    #[test]
+    fn a_re_type_keeps_the_copy_s_collation() {
+        let mut key = state(
+            CopyKind::TargetKey,
+            "\"public\".\"t\"",
+            "code",
+            "varchar(10)",
+            "varchar(40)",
+        );
+        key.copy_type.typmod = 14;
+        key.live_type.typmod = 44;
+        key.collation = Some("pg_catalog.\"C\"".to_string());
+        key.live_type.collatable = true;
+        assert_eq!(
+            retype_statements(std::slice::from_ref(&key))[0].0,
+            "alter table \"public\".\"t\" alter column \"code\" type varchar(40) \
+             collate pg_catalog.\"C\" using \"code\"::varchar(40)"
+        );
+        key.live_type.collatable = false;
+        assert_eq!(
+            retype_statements(std::slice::from_ref(&key))[0].0,
+            "alter table \"public\".\"t\" alter column \"code\" type varchar(40) \
+             using \"code\"::varchar(40)"
         );
     }
 

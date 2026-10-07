@@ -67,7 +67,8 @@ failed, not any downstream target: one source row's change fans out to several
 transforms/columns at once, and a failure in one of them is that one's to hold.
 
 * **`poison`** — `(transform_id, src_table, key)` primary key, one record per
-  source row poisoned for a transform, for the whole-key fuse. `poison_held`
+  source row poisoned for a transform, for the whole-key fuse. It keeps the
+  failure's message and its SQLSTATE, if it had one. `poison_held`
   (the poisoned key's parked later changes) and `key_deaths` (its death
   counter) are keyed by the transform too, and every one of them goes with
   the transform's definition when it is dropped (`on delete cascade`).
@@ -262,6 +263,13 @@ until one of these releases it:
   `TransformNotFound`, and a key the transform doesn't hold (a table it doesn't
   read, a key it never held or one already released) is `KeyNotHeld`; both are
   `not_found`, and neither changes anything.
+* **After an in-place re-type.** When the staging worker re-types a column
+  Trellis created because the source widened it by changing only the catalog
+  ([ADR-0014](0014-pause-and-drop-a-transform.md)), it releases, through the
+  per-key release, every key a transform with a column on that table holds
+  whose failure was `22001` (after a `varchar` re-type) or `22003` (after a
+  `numeric` one), by the SQLSTATE its `poison` row keeps. A key held for any
+  other failure stays held.
 
 The release is purely operational, like `status`, so it is a call of its own
 rather than a statement of `apply`'s grammar: releasing a key changes nothing

@@ -886,6 +886,7 @@ pub async fn fail_chunk(
 ) -> Result<ChunkFailure, ChunkQueueError> {
     let kind = FailureKind::of(error);
     let message = error.to_string();
+    let sqlstate = crate::staging::quarantine::sqlstate_of(error);
     let (outcome, attempts, location) = match &chunk.work {
         ChunkWork::Range { lo, hi } => {
             let (outcome, attempts) = fail_range_chunk(
@@ -895,6 +896,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 RETRY_CAP,
             )
             .await?;
@@ -930,6 +932,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 REDERIVE_RETRY_CAP,
             )
             .await?;
@@ -950,6 +953,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 REDERIVE_RETRY_CAP,
             )
             .await?;
@@ -963,6 +967,7 @@ pub async fn fail_chunk(
                 claimed_by,
                 kind,
                 &message,
+                sqlstate.as_deref(),
                 REDERIVE_RETRY_CAP,
             )
             .await?;
@@ -1091,7 +1096,9 @@ async fn pause_for_build_failure(
 ///
 /// `narrow` is the range a data failure is narrowed within, or `None` when
 /// the chunk isn't narrowed: its data failures are charged like any other.
+/// `sqlstate` is the failure's, which a key it quarantines keeps (#824).
 /// `retry_cap` caps the backoff.
+#[allow(clippy::too_many_arguments)]
 async fn fail_range_chunk(
     pool: &Pool,
     chunk: &ClaimedChunk,
@@ -1099,6 +1106,7 @@ async fn fail_range_chunk(
     claimed_by: &str,
     kind: FailureKind,
     error: &str,
+    sqlstate: Option<&str>,
     retry_cap: Duration,
 ) -> Result<(ChunkFailure, i32), ChunkQueueError> {
     let mut client = pool.get().await?;
@@ -1186,6 +1194,7 @@ async fn fail_range_chunk(
                 &source_table,
                 &key,
                 error,
+                sqlstate,
             )
             .await
             .map_err(|err| ChunkQueueError::Quarantine(Box::new(err)))?;
