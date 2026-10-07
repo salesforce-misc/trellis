@@ -10,8 +10,9 @@
 //! - a refused read or write (`42501`) the catalog can't pin on a table, so
 //!   the halt pauses nothing (a column grant, a function's `EXECUTE`, one of
 //!   Trellis's own tables);
-//! - isolation that reproduced nothing (records that fail only together) or
-//!   stopped at its probe limit without pinning a key;
+//! - isolation that charged nobody (records that fail only together, or a
+//!   record that fails only in two separate combinations of the definitions
+//!   reading it) or stopped at its probe limit without pinning a key;
 //! - an isolate-eligible failure whose retries ran out.
 //!
 //! Each records a *holdup* for the page's segments ([`record`]), in a short

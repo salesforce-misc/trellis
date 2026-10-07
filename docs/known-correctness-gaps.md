@@ -31,6 +31,8 @@ them gets broken without Trellis noticing.
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
   statement that wrote it (entry 9).
+* No trigger or constraint refuses a change only when two separate pairs of
+  the definitions reading it apply it together (entry 24).
 
 Each entry gives:
 
@@ -97,6 +99,7 @@ These are the tools the entries refer to:
 | 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
+| 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -631,7 +634,32 @@ full key, and nothing deletes the truncated row.
 **Planned work:** none filed.
 
 **Repair:** `PAUSE`/`RESUME` every transform that copies the column, after
+
 the capture pass has re-typed it.
+## 24. A change only two separate pairs of definitions fail on together
+
+**Trigger:** a user trigger or constraint that refuses a write only when two
+definitions' targets are written in one transaction, spanning two separate
+pairs of the definitions that read one table: `a` and `b` refused together,
+and `c` and `d` too.
+
+**Effect:** isolation can't charge the change's key to anyone. Each
+definition applies it alone, and leaving any one of them out still leaves the
+other pair failing. The drain fails on the page on every pass, and every
+target reading the page's tables stops short of it, along with every
+watermark token taken since. It isn't silent: each pass surfaces the error.
+A single failing pair is charged to both of its definitions, which hold the
+key (see [Repair caveats](#repair-caveats)).
+
+**Detected?** Yes. The page is a drain holdup: `status()` reports it as
+`drain_failure` on every definition that isn't paused or quarantined and
+reads a table on the page, and `self_check` reports it as `drain_failures`.
+
+**Planned work:** none.
+
+**Repair:** fix the trigger or constraint, and the next pass commits the page.
+Or pause one definition of either pair: isolation then charges the other
+pair, whose definitions hold the key until it's released or they're resumed.
 
 ## Repair caveats
 
@@ -653,7 +681,11 @@ the capture pass has re-typed it.
 * **Quarantined keys stay held until they're released.** A key that's
   quarantined after repeated apply failures is held for the definition whose
   apply failed, with its parked work and its poison row, and that
-  definition's target row for it stays stale. Every other definition reading
+  definition's target row for it stays stale. A failure in a relationship's
+  reverse work holds the key for that relationship's readers. One that fails
+  only when several definitions apply it together holds it for each
+  definition in every failing combination (both of a failing pair), though
+  only one of their writes may be at fault. Every other definition reading
   the same source keeps applying the key, so two definitions can disagree on
   it. A widening of a column Trellis copies with its type causes such
   failures when an oversized value drains before the capture pass pauses

@@ -34,7 +34,7 @@
 //! key-shaped.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::SystemTime;
 
@@ -49,7 +49,7 @@ use crate::defs::model::TransformStatus;
 use crate::pool::Pool;
 
 use super::append::{self, RING_SIZE, StagedChange, ring_table_name};
-use super::apply::{self, ApplyError};
+use super::apply::{self, ApplyError, DirectFocus};
 use super::fold::FoldedChange;
 use super::watermark::StagedWatermark;
 
@@ -1131,10 +1131,12 @@ async fn probe_records(
 /// `folded`'s truncates and deferred relationship reverses are never probed.
 ///
 /// **Charged to a definition, not to the key (#799).** A record that fails
-/// alone is probed again to find which definition's apply it fails in
-/// (`attribute`), and its death, its eviction and the whole-transform fuse
-/// are that definition's alone. A record that fails alone but in no one
-/// definition (only with two of them together) is charged to nobody.
+/// alone is probed again to find which definition's apply, or which
+/// relationship's reverse work, it fails in (`attribute`), and its death,
+/// its eviction and the whole-transform fuse are those definitions' alone. A
+/// record that fails only when several definitions apply it together is
+/// charged to the ones in every failing combination, and to nobody when no
+/// one is (two separate failing pairs, say).
 ///
 /// Returns (see [`IsolationOutcome`]'s variants):
 /// - `Ok(FuseDisabled)` if `threshold == 0`, without probing anything.
@@ -1536,24 +1538,34 @@ struct ProbeSite<'a> {
 ///
 /// 1. With every definition that applies the record directly left out (the
 ///    readers of its source that aren't already poisoned for its key), what
-///    is left is the work done for the definitions reading the table through
-///    a relationship (the to-side's reverse recomputes and settled
-///    projection). If that fails, the failure is theirs, and it is charged to
-///    each of them the key isn't already poisoned for: their share of the
-///    work is skipped only once every one of them holds the key
+///    is left is the reverse work done for the definitions reading the table
+///    through a relationship (the to-side's reverse recomputes and settled
+///    projection). If that fails, the failure is in that work, and it is
+///    charged to the readers of the relationships whose work it is in
+///    ([`attribute_relationships`]). A relationship's share of the work is
+///    skipped only once every one of its readers holds the key
 ///    ([`super::apply::compute`]).
 /// 2. Otherwise, with one direct reader, it's that one.
 /// 3. Otherwise each direct reader is probed alone, the others left out, and
-///    every one that fails is charged. A record that fails only with two of
-///    them together fails in none alone, and is charged to nobody, as
-///    bisection charges nobody for a failure only a combination of records
-///    reproduces.
+///    every one that fails is charged.
+/// 4. If none fails alone, the record fails only when several of them apply
+///    it together. With two, it's both of them. With three or more, each is
+///    left out in turn, the others applying the record, and every one whose
+///    absence makes the failure go away is charged: it is in every failing
+///    combination. One that is in none of them (two separate failing pairs,
+///    say) leaves nobody charged, as bisection charges nobody for a failure
+///    only a combination of records reproduces, and the page is a drain
+///    holdup ([`super::holdup`]).
 ///
 /// A probe that hits a transient error or a version fence miss charges
-/// nothing for the definition it probed. One that hits a halting error or a
-/// lost claim propagates, as bisection's own do. Each probe counts toward
-/// [`MAX_ISOLATION_PROBES`]; at the limit, the record is charged to nobody on
-/// this drain.
+/// nothing for what it probed, and the combinations step 4 infers from step
+/// 3's probes need every one of them settled. One that hits a halting error
+/// or a lost claim propagates, as bisection's own do. Each probe counts
+/// toward [`MAX_ISOLATION_PROBES`]. At the limit, the definitions the probes
+/// had pinned are charged and nobody else is on this drain, except that step
+/// 1 also charges the readers of every relationship it hadn't probed yet.
+///
+/// Every probe runs on the failure path only: a page that applies runs none.
 async fn attribute(
     pool: &Pool,
     at: ProbeSite<'_>,
@@ -1592,91 +1604,209 @@ async fn attribute(
         .iter()
         .filter(|def| !poisoned.contains(&def.id))
         .collect();
-    let records = std::slice::from_ref(change);
+    let probe = Probe {
+        at,
+        change,
+        src_table,
+    };
 
-    // 1. The relationship readers' share alone. With none the key isn't
-    // already poisoned for, there is no such share left to fail: every
-    // direct reader left out drops the record whole.
-    let rel_readers: Vec<(i64, String)> = apply::relationship_readers_of(pool, src_table)
-        .await?
-        .into_iter()
-        .filter(|(id, _)| !poisoned.contains(id))
-        .collect();
-    if !rel_readers.is_empty() {
-        let Some(shared) =
-            attribution_probe(pool, at, records, src_table, &change.key, None, stats).await?
-        else {
-            return Ok(Vec::new());
-        };
-        if let Some(shared_err) = shared {
-            return Ok(rel_readers
-                .iter()
-                .map(|(id, target)| culprit(*id, target, shared_err.to_string()))
-                .collect());
+    // 1. The relationship readers' share alone. A relationship none of whose
+    // readers is left without the key holds no share left to fail: its work
+    // is left out once every reader of it holds the key.
+    let inbound: Vec<(i64, Vec<(i64, String)>)> =
+        apply::relationship_readers_by_rel(pool, src_table)
+            .await?
+            .into_iter()
+            .map(|(rel, readers)| {
+                let readers: Vec<(i64, String)> = readers
+                    .into_iter()
+                    .filter(|(id, _)| !poisoned.contains(id))
+                    .collect();
+                (rel, readers)
+            })
+            .filter(|(_, readers)| !readers.is_empty())
+            .collect();
+    if !inbound.is_empty() {
+        match probe.run(pool, DirectFocus::None, None, stats).await? {
+            Probed::Unsettled | Probed::OutOfProbes => return Ok(Vec::new()),
+            Probed::Failed(shared_err) => {
+                let charged =
+                    attribute_relationships(pool, &probe, &inbound, &shared_err, stats).await?;
+                return Ok(charged
+                    .iter()
+                    .map(|(id, (target, last_error))| culprit(*id, target, last_error.clone()))
+                    .collect());
+            }
+            Probed::Clean => {}
         }
     }
 
     // 2. The one direct reader.
-    if let [def] = direct.as_slice() {
-        return Ok(vec![culprit(def.id, &def.def.target, err.to_string())]);
+    match direct.as_slice() {
+        [] => return Ok(Vec::new()),
+        [def] => return Ok(vec![culprit(def.id, &def.def.target, err.to_string())]),
+        _ => {}
     }
 
     // 3. Each direct reader alone.
     let mut culprits = Vec::new();
-    for def in direct {
-        let probed = attribution_probe(
-            pool,
-            at,
-            records,
-            src_table,
-            &change.key,
-            Some(def.id),
-            stats,
-        )
-        .await?;
-        if let Some(Some(def_err)) = probed {
-            culprits.push(culprit(def.id, &def.def.target, def_err.to_string()));
+    let mut settled = true;
+    for def in &direct {
+        match probe
+            .run(pool, DirectFocus::Only(def.id), None, stats)
+            .await?
+        {
+            Probed::Failed(def_err) => {
+                culprits.push(culprit(def.id, &def.def.target, def_err.to_string()));
+            }
+            Probed::Clean => {}
+            Probed::Unsettled | Probed::OutOfProbes => settled = false,
+        }
+    }
+    if !culprits.is_empty() || !settled {
+        return Ok(culprits);
+    }
+
+    // 4. Only together. With two, leaving either out is the other's probe
+    // alone, which step 3 ran: it's both.
+    if direct.len() == 2 {
+        return Ok(direct
+            .iter()
+            .map(|def| culprit(def.id, &def.def.target, err.to_string()))
+            .collect());
+    }
+    for def in &direct {
+        match probe
+            .run(pool, DirectFocus::AllBut(def.id), None, stats)
+            .await?
+        {
+            Probed::Clean => culprits.push(culprit(def.id, &def.def.target, err.to_string())),
+            Probed::Failed(_) | Probed::Unsettled => {}
+            Probed::OutOfProbes => break,
         }
     }
     Ok(culprits)
 }
 
-/// One of [`attribute`]'s probes: `records` applied with every direct reader
-/// of `src_table` but `only` left out for `key`. `Some(None)` when it applies
-/// cleanly, `Some(Some(err))` when it fails with an [`FailureClass::Isolate`]
-/// error, and `None` when it settles nothing (a transient error, a version
-/// fence miss, or the probe limit). A halting error or a lost claim
-/// propagates.
-async fn attribution_probe(
+/// [`attribute`]'s step 1 past its combined probe, which failed with
+/// `shared_err`: the readers to charge, by id, each with its bare target and
+/// the error it is charged with. `inbound` is each relationship to the
+/// record's table that has a reader left without the key, with those
+/// readers, in relationship id order.
+///
+/// With one such relationship, the failure is in its work. With several,
+/// each is probed alone, the record left out of every other relationship's
+/// reverse work (#822), and the readers of each one that fails alone are
+/// charged, once each however many of them they read through. If none fails
+/// alone, the failure is in their work together, or in the work of a
+/// relationship no reader is left without the key, and every reader is
+/// charged. At the probe limit, every relationship not yet probed is charged
+/// as well. A probe that settles nothing charges nothing for its
+/// relationship, and if no other one failed alone, nobody is charged.
+async fn attribute_relationships(
     pool: &Pool,
-    at: ProbeSite<'_>,
-    records: &[FoldedChange],
-    src_table: &str,
-    key: &str,
-    only: Option<i64>,
+    probe: &Probe<'_>,
+    inbound: &[(i64, Vec<(i64, String)>)],
+    shared_err: &ApplyError,
     stats: &mut IsolationStats,
-) -> Result<Option<Option<ApplyError>>, ApplyError> {
-    if stats.probes >= MAX_ISOLATION_PROBES {
-        stats.stopped.get_or_insert(IsolationStop::ProbeLimit);
-        return Ok(None);
-    }
-    stats.probes += 1;
-    let focus = apply::ProbeFocus {
-        src_table,
-        key,
-        only,
+) -> Result<BTreeMap<i64, (String, String)>, ApplyError> {
+    let mut charged: BTreeMap<i64, (String, String)> = BTreeMap::new();
+    let charge = |charged: &mut BTreeMap<i64, (String, String)>,
+                  readers: &[(i64, String)],
+                  last_error: &ApplyError| {
+        for (id, target) in readers {
+            charged
+                .entry(*id)
+                .or_insert_with(|| (target.clone(), last_error.to_string()));
+        }
     };
-    let Some(err) = probe_records(pool, at, records, Some(&focus)).await? else {
-        return Ok(Some(None));
-    };
-    if is_claim_lost(&err) {
-        return Err(err);
+    if let [(_, readers)] = inbound {
+        charge(&mut charged, readers, shared_err);
+        return Ok(charged);
     }
-    Ok(match classify(&err) {
-        FailureClass::Halting => return Err(err),
-        FailureClass::Isolate => Some(Some(err)),
-        FailureClass::Transient | FailureClass::VersionFenceMiss => None,
-    })
+    let mut unsettled = false;
+    let mut out_of_probes = false;
+    for (rel, readers) in inbound {
+        if out_of_probes {
+            charge(&mut charged, readers, shared_err);
+            continue;
+        }
+        match probe
+            .run(pool, DirectFocus::None, Some(*rel), stats)
+            .await?
+        {
+            Probed::Failed(rel_err) => charge(&mut charged, readers, &rel_err),
+            Probed::Clean => {}
+            Probed::Unsettled => unsettled = true,
+            Probed::OutOfProbes => {
+                out_of_probes = true;
+                charge(&mut charged, readers, shared_err);
+            }
+        }
+    }
+    if charged.is_empty() && !unsettled {
+        for (_, readers) in inbound {
+            charge(&mut charged, readers, shared_err);
+        }
+    }
+    Ok(charged)
+}
+
+/// The record one of [`attribute`]'s probes applies, and where.
+struct Probe<'a> {
+    at: ProbeSite<'a>,
+    change: &'a FoldedChange,
+    /// The record's canonical source.
+    src_table: &'a str,
+}
+
+/// What one of [`attribute`]'s probes settled.
+enum Probed {
+    /// The record applied.
+    Clean,
+    /// It failed with an [`FailureClass::Isolate`] error.
+    Failed(ApplyError),
+    /// It hit a transient error or a version fence miss, which says nothing
+    /// about the work it probed.
+    Unsettled,
+    /// [`MAX_ISOLATION_PROBES`] were spent before it ran.
+    OutOfProbes,
+}
+
+impl Probe<'_> {
+    /// Applies the record with only the work `direct` and `only_rel` keep
+    /// ([`apply::ProbeFocus`]). A halting error or a lost claim propagates.
+    async fn run(
+        &self,
+        pool: &Pool,
+        direct: DirectFocus,
+        only_rel: Option<i64>,
+        stats: &mut IsolationStats,
+    ) -> Result<Probed, ApplyError> {
+        if stats.probes >= MAX_ISOLATION_PROBES {
+            stats.stopped.get_or_insert(IsolationStop::ProbeLimit);
+            return Ok(Probed::OutOfProbes);
+        }
+        stats.probes += 1;
+        let focus = apply::ProbeFocus {
+            src_table: self.src_table,
+            key: &self.change.key,
+            direct,
+            only_rel,
+        };
+        let records = std::slice::from_ref(self.change);
+        let Some(err) = probe_records(pool, self.at, records, Some(&focus)).await? else {
+            return Ok(Probed::Clean);
+        };
+        if is_claim_lost(&err) {
+            return Err(err);
+        }
+        Ok(match classify(&err) {
+            FailureClass::Halting => return Err(err),
+            FailureClass::Isolate => Probed::Failed(err),
+            FailureClass::Transient | FailureClass::VersionFenceMiss => Probed::Unsettled,
+        })
+    }
 }
 
 /// Takes `transform_id`'s fuse gate and its definition row, and says whether

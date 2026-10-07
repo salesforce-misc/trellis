@@ -97,8 +97,13 @@ Blame also names the **transform**: a key that fails alone is probed again
 with the transforms reading its table directly left out but one, to find the
 one(s) whose apply it fails in. One that still fails with every direct reader left
 out fails in the work done for the transforms reading the table through a
-relationship, and is charged to each of them. A failure in the source itself (an
-image that won't decode) fails for every reader, and is charged once per
+relationship: each relationship to the table is probed alone, and the readers of
+each one that fails alone are charged, or every relationship's readers when none
+does. One that fails with no direct reader alone fails only when several apply it
+together: with two, both are charged; with more, each is left out in turn, and
+every one whose absence lets it apply is charged. When no one is (two separate
+failing pairs), nobody is, and the page is a drain holdup. A failure in the source
+itself (an image that won't decode) fails for every reader, and is charged once per
 transform that hits it.
 
 **2. Count deaths per key, off the immutable rows.** Batch rows are immutable and

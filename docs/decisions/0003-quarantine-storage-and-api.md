@@ -104,12 +104,25 @@ needs pausing, as the per-column tier does.
 
 * **Isolation names the transform.** A record that fails alone is probed again
   with the transforms reading its table directly left out but one, to find the
-  one(s) whose apply it fails in (`staging::quarantine::attribute`). A record
-  that fails with every direct reader left out fails in the work done for the
-  transforms reading its table through a relationship (the to-side's reverse
-  recomputes and settled projection), and is charged to each of those. A
-  record that fails only with two transforms together is charged to nobody, as
-  a failure only two records reproduce together is.
+  one(s) whose apply it fails in (`staging::quarantine::attribute`). Every
+  probe runs on the failure path only.
+  * A record that fails with every direct reader left out fails in the work
+    done for the transforms reading its table through a relationship (the
+    to-side's reverse recomputes and settled projection). With several
+    relationships to the table, each is probed alone, the record left out of
+    every other one's reverse work, and the readers of each relationship that
+    fails alone are charged. If none fails alone, the failure is in their work
+    together, and every reader of every relationship is charged.
+  * A record that fails with no direct reader alone fails only when several
+    apply it together. With two, both are charged. With three or more, each
+    is left out in turn, and every one whose absence lets the record apply is
+    charged: it is in every failing combination. When no one is (two separate
+    failing pairs, say), the record is charged to nobody, as a failure only two
+    records reproduce together is, and the page is a drain holdup.
+  * Each probe counts toward the isolation's probe limit. At the limit, a
+    record is charged to the transforms its probes had pinned, and to every
+    relationship's readers it hadn't probed yet; a probe that hits a transient
+    error or a version fence miss charges nothing for what it probed.
 * **The fold runs once per key per page.** Only the poisoned transform's
   apply skips the key, and parks the change in `poison_held` for it. A
   relationship's reverse work skips the key only once every reader of the
@@ -314,8 +327,8 @@ it, is not charged to any key: it pauses the definitions it reaches
 
 A failure that is charged to no key and pauses nothing is a *drain holdup*: a refused
 read or write the catalog can't pin on a table (so the halt pauses nothing), isolation
-that reproduces nothing (records that fail only together) or stops at its probe limit
-without pinning a key, or a reproducing failure whose page runs out of retries. The
+that charges nobody (records that fail only together, or a record that fails only in two
+separate combinations of transforms) or stops at its probe limit without pinning a key, or a reproducing failure whose page runs out of retries. The
 drain surfaces it and records the page in `drain_holdups`, one row per segment, in a
 short transaction of its own after the page's transaction rolls back: the latest error
 and SQLSTATE, the source tables on the page, the buckets the failing pages covered, when

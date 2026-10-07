@@ -6763,7 +6763,8 @@ impl<'a> FromSideFence<'a> {
 /// isolation can charge to no reader of it, would otherwise fail the page on
 /// every drain once every direct reader holds the key. Its readers are read
 /// only when one of `changes` is poisoned. `focus` overrides one key's direct
-/// readers for an isolation probe, and never a relationship's.
+/// readers for an isolation probe, and can leave it out of every
+/// relationship's reverse work but one ([`ProbeFocus::only_rel`]).
 async fn key_exclusions(
     pool: &Pool,
     source_key: &str,
@@ -6808,6 +6809,14 @@ async fn key_exclusions(
                         if ids.contains(id) {
                             exclusion.park_for.insert(*id);
                         }
+                    }
+                }
+            }
+            if let Some(focus) = focus {
+                for rel in inbound_rels {
+                    if focus.excludes_rel(source_key, &change.key, rel.id) {
+                        exclusion.rels.insert(rel.id);
+                        exclusion.probe_rels.insert(rel.id);
                     }
                 }
             }
@@ -6890,24 +6899,24 @@ async fn relationship_reader_map(
         .collect())
 }
 
-/// The definitions that aren't frozen and read `table` (canonical) through a
-/// relationship to it, each with its bare target, in id order (#799): whose
-/// share of a to-side key's work isolation charges a failure in it to
-/// (`quarantine::attribute`).
-pub(super) async fn relationship_readers_of(
+/// Each relationship to `table` (canonical), by id, with the definitions that
+/// aren't frozen and read through it, each with its bare target, in id order
+/// (#799, #822): whose share of a to-side key's work isolation charges a
+/// failure in that relationship's work to (`quarantine::attribute`).
+pub(super) async fn relationship_readers_by_rel(
     pool: &Pool,
     table: &str,
-) -> Result<Vec<(i64, String)>, ApplyError> {
-    let rels = catalog::relationships_to_table(pool, table).await?;
+) -> Result<Vec<(i64, Vec<(i64, String)>)>, ApplyError> {
+    let mut rels = catalog::relationships_to_table(pool, table).await?;
     if rels.is_empty() {
         return Ok(Vec::new());
     }
+    rels.sort_by_key(|rel| rel.id);
     let mut by_rel = relationship_reader_map(pool).await?;
-    let mut readers: BTreeMap<i64, String> = BTreeMap::new();
-    for rel in rels {
-        readers.extend(by_rel.remove(&rel.id).unwrap_or_default());
-    }
-    Ok(readers.into_iter().collect())
+    Ok(rels
+        .into_iter()
+        .map(|rel| (rel.id, by_rel.remove(&rel.id).unwrap_or_default()))
+        .collect())
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -6936,22 +6945,57 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
 }
 
 /// One key an isolation probe (`quarantine::attribute`, #799) applies with
-/// every definition that reads its table directly left out, but `only`:
-/// the probe that tells which definition's apply a key fails in. The key's
-/// poison for the definitions reading it through a relationship stands as
-/// it is, so with `only` `None` the probe applies just their share.
+/// some of its work left out: the probe that tells which definition's apply,
+/// or which relationship's reverse work, a key fails in. `direct` picks the
+/// readers of its table that apply it; `only_rel`, when set, leaves it out
+/// of the reverse work of every relationship to its table but that one. The
+/// key's poison stands as it is wherever the focus doesn't override it.
 pub(super) struct ProbeFocus<'a> {
     /// Canonical, as `poison` keys it.
     pub src_table: &'a str,
     pub key: &'a str,
-    pub only: Option<i64>,
+    pub direct: DirectFocus,
+    /// The one relationship to the key's table whose reverse work the probe
+    /// keeps (#822), or `None` to keep every one its poison doesn't leave
+    /// out.
+    pub only_rel: Option<i64>,
+}
+
+/// Which readers of a [`ProbeFocus`]'s table apply its key.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DirectFocus {
+    /// None of them: the probe applies the relationship readers' share alone.
+    None,
+    /// That one alone.
+    Only(i64),
+    /// Every one the key isn't poisoned for, but that one (#822's
+    /// leave-one-out).
+    AllBut(i64),
 }
 
 impl ProbeFocus<'_> {
+    fn names(&self, src_table: &str, key: &str) -> bool {
+        self.src_table == src_table && self.key == key
+    }
+
     /// Whether this focus leaves `key` of `src_table` out of `transform_id`.
-    /// `None` for a key it doesn't name.
+    /// `None` where the focus leaves it to the key's poison: a key it
+    /// doesn't name, or a reader [`DirectFocus::AllBut`] doesn't name.
     fn excludes(&self, src_table: &str, key: &str, transform_id: i64) -> Option<bool> {
-        (self.src_table == src_table && self.key == key).then_some(self.only != Some(transform_id))
+        if !self.names(src_table, key) {
+            return None;
+        }
+        match self.direct {
+            DirectFocus::None => Some(true),
+            DirectFocus::Only(id) => Some(id != transform_id),
+            DirectFocus::AllBut(id) => (id == transform_id).then_some(true),
+        }
+    }
+
+    /// Whether this focus leaves `key` of `src_table` out of relationship
+    /// `rel`'s reverse work.
+    fn excludes_rel(&self, src_table: &str, key: &str, rel: i64) -> bool {
+        self.names(src_table, key) && self.only_rel.is_some_and(|only| only != rel)
     }
 }
 
@@ -6964,6 +7008,10 @@ struct KeyExclusion {
     defs: HashSet<i64>,
     /// Relationships to the change's table (ids) whose reverse work skips it.
     rels: HashSet<i64>,
+    /// Those of `rels` an isolation probe's focus leaves out
+    /// ([`ProbeFocus::only_rel`]): their work is skipped whole, with no
+    /// re-derive of the children of a value the fold erased.
+    probe_rels: HashSet<i64>,
     /// Every definition the change is parked for: each one above, and each
     /// relationship reader the key is poisoned for.
     park_for: BTreeSet<i64>,
@@ -7266,15 +7314,16 @@ pub(super) async fn compute_page(
         // which nothing parks, and a child may have read the parent live under
         // it. So its children are re-derived now, as for a change the
         // relationship applies. A key `to_col`'s only value is the ring key,
-        // which the release's `Recompute` names itself.
+        // which the release's `Recompute` names itself. A relationship an
+        // isolation probe's focus leaves out does none of this: the probe
+        // leaves the key out of its work whole.
         for (change, exclusion) in changes.iter().zip(exclusions.iter().flatten()) {
             if exclusion.rels.is_empty() || change.to_col_values.is_empty() {
                 continue;
             }
-            for rel in inbound_rels
-                .iter()
-                .filter(|rel| exclusion.rels.contains(&rel.id))
-            {
+            for rel in inbound_rels.iter().filter(|rel| {
+                exclusion.rels.contains(&rel.id) && !exclusion.probe_rels.contains(&rel.id)
+            }) {
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
                 let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (column, value) in &change.to_col_values {

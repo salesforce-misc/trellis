@@ -271,8 +271,9 @@ transform ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#releasing-hel
 holding changes to a table the transform reads, as its source or through a
 relationship, and the failure is charged to no key and pauses nothing (#817): a
 refused read or write the catalog can't pin on a table
-([A halting failure](#a-halting-failure)), records that fail only together, isolation
-stopping at its probe limit, or a failure that kept reproducing until the page's
+([A halting failure](#a-halting-failure)), records that fail only together, a record
+that fails only in two separate combinations of transforms, isolation stopping at its
+probe limit, or a failure that kept reproducing until the page's
 retries ran out. The drain records such a page as a *drain holdup*, and every pass
 retries it, so the transform's target stops short of it and every watermark token
 taken since waits on it. The field carries the segment, the source tables on the page,
