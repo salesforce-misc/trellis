@@ -1792,7 +1792,8 @@ pub(crate) struct ReverseRelationshipShape {
     /// [`from_side_rows_for_trigger_txn`]'s doc comment for how a
     /// multi-column key's row identity is encoded/decoded. `None` when it
     /// can't be used and every definition reading the from-table is frozen
-    /// ([`from_side_key`], issue #768): no recompute of its rows is staged.
+    /// ([`from_side_key`], issue #768), or for a key release's shape, which
+    /// is never asked (#831): no recompute of its rows is staged.
     from_pk: Option<Vec<PrimaryKeyColumn>>,
     /// Whether some definition on `from_table` reads this relationship. Each
     /// then re-derives every from-side row a parent change reaches: a 1-1
@@ -2018,10 +2019,15 @@ pub(crate) fn relationship_reverse_deferred_src_table(relationship_id: i64) -> S
 /// `needs_recompute_fallback` is set when any definition on the from-table
 /// reads the relationship; every such definition, 1-1 or aggregate, then
 /// re-derives each from-side row the parent reaches (#623 D5).
+///
+/// `from_side` is the page's fence, under which the from-side's key is
+/// resolved ([`from_side_key`]). A key release passes `None`: it writes only
+/// the projection and stages no recompute of the from-side's rows, so it
+/// resolves no key and leaves `from_pk` unset (#831).
 async fn build_reverse_relationship_shape(
     pool: &Pool,
     rel: &RelationshipDefinition,
-    skip_frozen: FromSideFence<'_>,
+    from_side: Option<FromSideFence<'_>>,
 ) -> Result<ReverseRelationshipShape, ApplyError> {
     let projection = catalog::relationship_projection(pool, rel.id).await?;
     let (qualified_projection, projection_schema, projection_table_bare) = match projection {
@@ -2044,7 +2050,10 @@ async fn build_reverse_relationship_shape(
     // relationship's own recorded one (issue #288), never `rel.def.from_table`
     // re-resolved through this session's `search_path`.
     let qualified_from_table = rel.qualified_from_table();
-    let from_pk = from_side_key(pool, &qualified_from_table, skip_frozen).await?;
+    let from_pk = match from_side {
+        Some(fence) => from_side_key(pool, &qualified_from_table, fence).await?,
+        None => None,
+    };
     let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
 
     let needs_recompute_fallback = defs.iter().any(|def| {
@@ -3326,7 +3335,14 @@ async fn apply_projection_from_live(
 /// never be left to them. Each relationship's
 /// refresh stamp is locked `for share` first and the projection rows `for
 /// update` in key order, the order a drain takes them (ADR-0002 I5), and the
-/// rows are stamped with the release's WAL position.
+/// rows are stamped with the release's WAL position. A define's or resume's
+/// refresh of the projection (`catalog::relationships_to_refresh`) locks
+/// the stamp `for update`, so it reads what the release wrote, or the
+/// release waits for it and reads what it wrote (#831).
+///
+/// It resolves no from-side's key. It stages no recompute of a from-side's
+/// rows: the `Recompute` re-derives them on a later page, under that page's
+/// fence. So a from-side whose key can't be used doesn't refuse the release.
 pub(crate) async fn release_to_one_projections(
     pool: &Pool,
     txn: &Transaction<'_>,
@@ -3352,25 +3368,9 @@ pub(crate) async fn release_to_one_projections(
         .get(0);
     let pk = ddl::source_primary_key(pool, src_table).await?;
     let pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
-    // A release is no drain page and commits under no fence, so what the
-    // shape reads of a from-side's fence goes unused. The from-side's
-    // key-gate skip (`from_side_key`) needs no fence here (#831). The skip
-    // only leaves the shape's `from_pk` unset, and the release stages no
-    // recompute of a from-side's rows whatever its key: the release's
-    // `Recompute` re-derives them on a later page, whose own skip is fenced.
-    // What a resumed reader reads of the release is the projection rows
-    // written below. While the skip holds, a resume of a reader of the
-    // relationship is its first reader to go unfrozen, so it refreshes the
-    // projection under the refresh stamp locked `for update`
-    // (`catalog::relationships_to_refresh`), which conflicts with the `for
-    // share` taken above, before any shape, and held to the release's
-    // commit. So the resume's refresh reads what the release wrote, or the
-    // release, queued behind the resume, reads the resumed reader.
-    let mut versions = HashMap::new();
+    // No from-side's key or fence (#831, see the doc comment).
     for rel in &relationships {
-        let shape =
-            build_reverse_relationship_shape(pool, rel, FromSideFence::new(&mut versions, false))
-                .await?;
+        let shape = build_reverse_relationship_shape(pool, rel, None).await?;
         if shape.qualified_projection.is_empty() {
             continue;
         }
@@ -6641,9 +6641,8 @@ async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyErro
 /// from-side's own fence is read first, then its readers
 /// ([`no_unfrozen_reader`]), and a definition, its resume and its edit each
 /// bump their source's fence, so a page can't commit after a resume it
-/// didn't see. A key release ([`release_to_one_projections`]) reaches the
-/// skips too and commits under no fence; its relationship refresh stamp
-/// locks are why it needs none (#831).
+/// didn't see. A key release ([`release_to_one_projections`]) never asks
+/// (#831).
 ///
 /// `fence.skip_frozen` is [`compute_page`]'s (issue #766): on the retry after
 /// Postgres refused the drain a read, a from-side no unfrozen definition
@@ -7571,7 +7570,7 @@ pub(super) async fn compute_page(
                         build_reverse_relationship_shape(
                             pool,
                             rel,
-                            FromSideFence::new(&mut versions, skip_frozen),
+                            Some(FromSideFence::new(&mut versions, skip_frozen)),
                         )
                         .await?,
                     );
@@ -7881,7 +7880,7 @@ pub(super) async fn compute_page(
                     build_reverse_relationship_shape(
                         pool,
                         &rel,
-                        FromSideFence::new(&mut versions, skip_frozen),
+                        Some(FromSideFence::new(&mut versions, skip_frozen)),
                     )
                     .await?,
                 );
