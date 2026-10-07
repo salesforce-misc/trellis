@@ -257,19 +257,23 @@ projection read in Phase 3, after the entry lock and the Re-derive read, for
 exactly the rows read (ADR-0002, "Relationships"). A page can sit between
 its Phase 2 and its lock for a long time, and a parent change whose
 recompute drained in that window would otherwise have its value written
-over by the page's older read (#838). A parent change that commits after
-the Re-derive's read stages a recompute whose page waits on the entry lock
-and writes after this one. The Apply's earlier read is safe. A to-one
-parent change can't advance the projection while the Apply's change is in
-flight, since guard (c) defers its reverse, and whenever the reverse applies
-it stages a recompute of the row; a to-many relationship's to-side change
-stages one at once. That recompute's Re-derive reads the row after the
-Apply's change, so I2 refuses the Apply if it lands later still. The
-Re-derive reads the projection by its primary key
-with sequential scans off, as the entry lock reads the ledger, so a
-projection whose statistics lag its size isn't read in full while the
-entries stay locked. A to-many relationship's to-side is read by its join
-column as Phase 2 reads it, since that column may have no index.
+over by the page's older read (#838). A parent change whose reverse
+commits after the Re-derive's read stages a recompute whose page waits on
+the entry lock and writes after this one. The Apply's earlier read doesn't
+need the lock. While the Apply's change is in flight, guard (c) defers the
+reverse of a to-one parent change that commits after the read, until the
+reverse's fairness escalation advances the projection anyway, and either
+way the reverse stages a recompute of the row; a to-many relationship's
+to-side change stages one at once. That recompute's Re-derive reads the
+row after the Apply's change, so I2 refuses the Apply if it lands later
+still. Both reads miss a parent change for a row that joins the parent
+while the parent's reverse page is uncommitted, after that page found the
+parent's children: the reverse's recompute doesn't reach it (#892). The
+Re-derive reads the projection by its primary key with sequential scans
+off, as the entry lock reads the ledger, so a projection whose statistics
+lag its size isn't read in full while the entries stay locked. A to-many
+relationship's to-side is read by its join column as Phase 2 reads it,
+since that column may have no index.
 
 `ALTER TRANSFORM`'s field rebuild and a column resume are field builds
 (`staging::build`, #625 F8b): background chunks that lock a range of keys'
