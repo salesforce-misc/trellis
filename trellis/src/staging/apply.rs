@@ -1382,8 +1382,9 @@ pub(crate) struct RelationshipGenBump {
 /// relationship is untouched: Phase 1 of this epic is to-one relationship
 /// *values* only (#94's shape), so `ToManyRelationship` still resolves via
 /// [`fetch_to_side_rows`]'s live read, exactly as before. The reads are
-/// [`RelationshipReads`], run here on a pooled connection; a direct writer
-/// runs the same reads in its own transaction instead ([`DirectRederive`]).
+/// [`RelationshipReads`], run here on a pooled connection and returned as
+/// well, so the page's Re-derives run them again under their entry lock
+/// ([`RederiveRelationships::Both`], issue #838).
 ///
 /// `old_rows` is the same-length, same-index decoded pre-image of each of
 /// `rows`' underlying changes — used to widen the gen-bump touched-key set
@@ -1402,7 +1403,14 @@ pub(crate) async fn build_relationship_context(
     rows: &[Option<Row>],
     old_rows: &[Option<Row>],
     changes: &[&FoldedChange],
-) -> Result<(RelationshipContext, HashMap<i64, RelationshipGenBump>), ApplyError> {
+) -> Result<
+    (
+        RelationshipReads,
+        RelationshipContext,
+        HashMap<i64, RelationshipGenBump>,
+    ),
+    ApplyError,
+> {
     let reads = RelationshipReads::resolve(pool, qualified_source, def).await?;
     // The join keys: the distinct non-NULL `from_col` values of the
     // from-side rows this batch evaluates, so only the related rows those
@@ -1469,16 +1477,17 @@ pub(crate) async fn build_relationship_context(
                 .extend(touched);
         }
     }
-    Ok((ctx, gen_bumps))
+    Ok((reads, ctx, gen_bumps))
 }
 
 /// A relationship-enriched definition's reads of its related rows: each
 /// relationship it reads, resolved from the catalog once, with the
 /// statement that fetches the related rows for a set of join keys.
 /// [`Self::fetch`] runs them on any client. A page's Phase 2 runs them on a
-/// pooled connection ([`build_relationship_context`]); a direct writer
-/// resolves them before its transaction and runs them inside it, after its
-/// entry lock and its read of the rows ([`DirectRederive`], issue #832).
+/// pooled connection for its Applies ([`build_relationship_context`]). A
+/// 1-1 Re-derive, a page's (issue #838) or a direct writer's
+/// ([`DirectRederive`], issue #832), runs them in its transaction, after its
+/// entry lock and its read of the rows ([`Self::fetch_under_lock`]).
 pub(crate) struct RelationshipReads {
     reads: Vec<RelationshipRead>,
 }
@@ -1629,8 +1638,8 @@ impl RelationshipReads {
         self.fetch_with(client, None, rows).await
     }
 
-    /// [`Self::fetch`] in a direct writer's transaction `txn`, under its
-    /// entry lock (issue #832). A to-one relationship's projection is read
+    /// [`Self::fetch`] in a 1-1 Re-derive's transaction `txn`, under its
+    /// entry lock (issues #832 and #838). A to-one relationship's projection is read
     /// by its primary key under `super::ledger::ENTRY_PLAN_SETTINGS` (no
     /// sequential scan, issue #835), so a projection whose statistics lag
     /// its size isn't read in full while the entries stay locked. A to-many
@@ -3538,9 +3547,9 @@ fn projection_rows_statement(
 
 /// Runs [`projection_rows_sql`]'s statement for `join_keys` on `client`, or,
 /// with `by_entry_key`, on that transaction under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan): a build
-/// chunk's read under its entry lock ([`RelationshipReads::fetch_under_lock`],
-/// issue #835).
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan): a 1-1
+/// Re-derive's read under its entry lock
+/// ([`RelationshipReads::fetch_under_lock`], issue #835).
 async fn fetch_relationship_projection_rows(
     client: &impl GenericClient,
     by_entry_key: Option<&Transaction<'_>>,
@@ -3881,19 +3890,10 @@ struct OneToOneRecord {
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
     origin_lsn: Option<PgLsn>,
-    /// The ring's spelling of the source table, for a re-stage.
-    src_table: String,
 }
 
 /// A 1-1 Apply's `(lsn, txid)` and its values, `None` for a delete.
 type OneToOneApply = (PgLsn, String, Option<Vec<Option<String>>>);
-
-/// A relationship-enriched definition's Phase 2 context, and each
-/// relationship's `from_col` with the join keys that context resolved.
-type JoinCoverage = (
-    RelationshipContext,
-    Vec<(String, std::collections::HashSet<String>)>,
-);
 
 /// Everything Phase 3 needs to settle one 1-1 target: its primary key shape
 /// (for the pre-lock/upsert/delete SQL), the calculated-field column names
@@ -3948,29 +3948,53 @@ impl std::fmt::Debug for Rederive {
     }
 }
 
-/// Where a 1-1 Re-derive reads a relationship's related rows from.
+/// Where a 1-1 definition reads a relationship's related rows from.
+///
+/// A Re-derive always reads them in its own transaction, after the entry
+/// lock and its read of the rows, for exactly the rows it read (ADR-0002,
+/// "Relationships"; issues #832 and #838). A parent change that commits
+/// before that read is in it; one that commits after stages a recompute of
+/// the rows it reaches, whose page waits on the entry lock and writes after
+/// this one. A read made before the lock would let a parent change and the
+/// page of the recompute it stages both commit in between, and the
+/// Re-derive would then write the value they replaced, with nothing left
+/// to heal it.
 enum RederiveRelationships {
     /// The definition reads no relationship.
     None,
-    /// A page's: the context Phase 2 read, and the join keys it resolved. A
-    /// row read in Phase 3 whose join key is not among them is re-staged, so
-    /// a later page builds a context for it.
-    Phase2(JoinCoverage),
-    /// A direct writer's ([`DirectRederive`], issue #832): the related rows
-    /// are read in its transaction, after the entry lock and its read of the
-    /// rows, for exactly the rows it read. A parent change that commits
-    /// before that read is in it; one that commits after stages a recompute
-    /// of the rows it reaches, whose page waits on the entry lock and writes
-    /// after the writer.
+    /// A page's: the context Phase 2 read for the page's Applies, and the
+    /// reads its Re-derives run under the entry lock. An Apply may evaluate
+    /// against Phase 2's context: a parent change that commits after that
+    /// read stages a recompute whose Re-derive reads the row after the
+    /// Apply's change, and I2 refuses the Apply if it comes later still.
+    /// Phase 2's read also named the parents the page bumps the generation
+    /// of (step 3c). A Re-derive whose row joins a parent outside that set
+    /// (the row was re-pointed after Phase 2) bumps nothing for it, which
+    /// is harmless: since #623 D5, guard (b) only defers a parent's reverse,
+    /// and the reverse's recomputes come from a live read of the from-side
+    /// rows under its own transaction, whether or not it deferred first.
+    Both(RelationshipContext, RelationshipReads),
+    /// A direct writer's ([`DirectRederive`], issue #832): it applies
+    /// nothing, so it only reads under the lock.
     UnderLock(RelationshipReads),
 }
 
 impl RederiveRelationships {
-    /// The context Phase 2 read, for a page's evaluation.
+    /// The context Phase 2 read, for a page's Applies.
     fn phase2(&self) -> Option<&RelationshipContext> {
         match self {
-            RederiveRelationships::Phase2((ctx, _)) => Some(ctx),
+            RederiveRelationships::Both(ctx, _) => Some(ctx),
             RederiveRelationships::None | RederiveRelationships::UnderLock(_) => None,
+        }
+    }
+
+    /// The reads a Re-derive runs under its entry lock.
+    fn under_lock(&self) -> Option<&RelationshipReads> {
+        match self {
+            RederiveRelationships::Both(_, reads) | RederiveRelationships::UnderLock(reads) => {
+                Some(reads)
+            }
+            RederiveRelationships::None => None,
         }
     }
 }
@@ -7726,14 +7750,15 @@ pub(super) async fn compute_page(
             // aggregate over one (to-many) needs the related to-side rows
             // built into a `RelationshipContext`. Built once per definition
             // over this source's from-side rows — the join keys are their
-            // `from_col` values — then threaded into every row eval below
-            // and into Phase 3's Re-derives (#623 D6). A definition with no
+            // `from_col` values — then threaded into every Apply's eval
+            // below. Phase 3's Re-derives (#623 D6) run the same reads again,
+            // under their entry lock (issue #838). A definition with no
             // relationship references stays on the plain `eval::evaluate`
             // path.
             let relationships = if eval::relationship_references(&def.def).is_empty() {
                 RederiveRelationships::None
             } else {
-                let (ctx, gen_bumps) = build_relationship_context(
+                let (reads, ctx, gen_bumps) = build_relationship_context(
                     pool,
                     &def.source_table,
                     &def.def,
@@ -7757,10 +7782,7 @@ pub(super) async fn compute_page(
                         })
                         .or_insert(bump);
                 }
-                RederiveRelationships::Phase2(join_coverage(
-                    ctx,
-                    rows.iter().chain(old_rows.iter()).flatten(),
-                ))
+                RederiveRelationships::Both(ctx, reads)
             };
             let rederive = Arc::new(Rederive {
                 def: def.def.clone(),
@@ -7815,7 +7837,6 @@ pub(super) async fn compute_page(
                     hop_gen: change.hop_gen,
                     src_changed: change.src_changed,
                     origin_lsn: change.origin_lsn,
-                    src_table: change.src_table.clone(),
                 });
                 buffer_transform_apply_metrics(
                     &def.def.target,
@@ -8637,8 +8658,8 @@ pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[&'a Vec<String>]) -> 
 
 /// What [`settle_one_to_one_target`] did to one target: how many keys it
 /// physically wrote and deleted (the keys themselves went to its
-/// [`TargetMutations`]), and the Re-derives it re-staged instead of applying.
-type AppliedTarget = (usize, usize, Vec<Restage>);
+/// [`TargetMutations`]).
+type AppliedTarget = (usize, usize);
 
 /// One evaluated row's values in `field_names` order, rendered to the text
 /// [`TargetWrite::values`] carries — shared by [`compute`]'s Applies and
@@ -8655,10 +8676,6 @@ fn evaluated_values(
         })
         .collect()
 }
-
-/// A key [`settle_one_to_one_target`] couldn't settle in Phase 3, to re-stage
-/// as an image-less recompute.
-type Restage = DerivedRecompute;
 
 /// Evaluates a 1-1 definition over one source row, without its paused
 /// columns: an Apply's image in Phase 2, or a Re-derive's row in Phase 3.
@@ -8716,34 +8733,13 @@ async fn one_to_one_field_types(
         .collect())
 }
 
-/// Each of `ctx`'s relationships' `from_col`, with the join keys `rows`
-/// carry for it: the ones the context resolved (see [`Rederive`]).
-fn join_coverage<'a>(
-    ctx: RelationshipContext,
-    rows: impl Iterator<Item = &'a Row> + Clone,
-) -> JoinCoverage {
-    let covered = ctx
-        .join_columns()
-        .map(|from_col| {
-            let keys = rows
-                .clone()
-                .filter_map(|row| row.get(from_col).cloned().flatten())
-                .collect();
-            (from_col.to_string(), keys)
-        })
-        .collect();
-    (ctx, covered)
-}
-
 /// A direct writer's Re-derive of 1-1 keys, outside a page (#623 D6):
 /// a field build's chunk over a relationship-enriched 1-1 target (a column
 /// resume, #625 F8b, `staging::build`). Settled on the
 /// ledger as a page settles a Re-derive ([`settle_one_to_one_target`]),
-/// except that it reads the related rows in the writer's transaction, after
-/// the entry lock and its read of the rows
-/// ([`RederiveRelationships::UnderLock`], issue #832). Built before the
-/// writer's transaction, since the catalog it resolves those reads from is
-/// read through the pool.
+/// except that it applies nothing ([`RederiveRelationships::UnderLock`]).
+/// Built before the writer's transaction, since the catalog it resolves its
+/// relationship reads from is read through the pool.
 pub(crate) struct DirectRederive {
     target: String,
     plan: TargetPlan,
@@ -8792,7 +8788,6 @@ impl DirectRederive {
                 hop_gen: 0,
                 src_changed: None,
                 origin_lsn: None,
-                src_table: source_table.to_string(),
             })
             .collect();
         Ok(Self {
@@ -8843,9 +8838,9 @@ impl DirectRederive {
 ///
 /// A key carried by more than one record settles once, from the record that
 /// reflects the latest state: a Re-derive, which reads it, or else the
-/// latest Apply. A Re-derive of a relationship-enriched definition whose row
-/// now joins through a key Phase 2's context didn't resolve is re-staged
-/// instead, so a later page builds a context for it.
+/// latest Apply. A Re-derive of a relationship-enriched definition reads the
+/// related rows of the rows it read, under the same entry lock
+/// ([`RederiveRelationships`]).
 ///
 /// `first_seg` and `seg_seq` are the lowest and highest segments of the
 /// page's batches. A page whose first is at or below the target's
@@ -8904,7 +8899,7 @@ async fn settle_one_to_one_target(
             .or_insert(record);
     }
     if by_key.is_empty() {
-        return Ok((0, 0, Vec::new()));
+        return Ok((0, 0));
     }
     // Planted bug (#557): #344/#392, apply every change without ADR-0002's
     // I2. See `crate::plant`.
@@ -8959,42 +8954,24 @@ async fn settle_one_to_one_target(
         .await?;
         (read.rows, Some(read.snapshot), seg_seq.max(read.seg))
     };
-    // A direct writer reads the related rows of the rows it just read, under
-    // the same entry lock (issue #832); a page evaluates against Phase 2's.
-    let under_lock;
-    let relationships = match &plan.rederive.relationships {
-        RederiveRelationships::UnderLock(reads) => {
+    // The related rows of the rows just read, under the same entry lock
+    // (issues #832 and #838; see `RederiveRelationships`).
+    let under_lock = match plan.rederive.relationships.under_lock() {
+        Some(reads) if !read.is_empty() => {
             let rows: Vec<&Row> = read.values().collect();
-            under_lock = reads.fetch_under_lock(txn, &rows).await?;
-            Some(&under_lock)
+            Some(reads.fetch_under_lock(txn, &rows).await?)
         }
-        other => other.phase2(),
+        _ => None,
     };
     let mut regex_cache = eval::RegexCache::new();
-    let mut restage: Vec<Restage> = Vec::new();
     let mut rederived: HashMap<&str, Option<Vec<Option<String>>>> = HashMap::new();
     for key in rederive_keys {
         let values = match read.remove(key) {
             None => None,
             Some(row) => {
-                if let RederiveRelationships::Phase2((_, covered)) = &plan.rederive.relationships
-                    && covered.iter().any(|(from_col, joined)| {
-                        matches!(row.get(from_col), Some(Some(value)) if !joined.contains(value))
-                    })
-                {
-                    let r = by_key[key];
-                    restage.push((
-                        r.src_table.clone(),
-                        r.pk_text.clone(),
-                        r.hop_gen,
-                        r.src_changed,
-                        r.origin_lsn,
-                    ));
-                    continue;
-                }
                 let mut evaluated = match evaluate_one_to_one(
                     &plan.rederive,
-                    relationships,
+                    under_lock.as_ref(),
                     &row,
                     &mut regex_cache,
                 ) {
@@ -9075,8 +9052,7 @@ async fn settle_one_to_one_target(
             }),
         }
     }
-    let (written, deleted) = apply_target(txn, target, plan, &writes, &deletes, mutations).await?;
-    Ok((written, deleted, restage))
+    apply_target(txn, target, plan, &writes, &deletes, mutations).await
 }
 
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed
@@ -9759,9 +9735,8 @@ pub(crate) async fn apply_page(
     // entry locks in one order: see `settle_one_to_one_target`.
     let page_seg = steps.iter().map(|step| step.seg_seq).max().unwrap_or(0);
     let page_first_seg = steps.iter().map(|step| step.seg_seq).min().unwrap_or(0);
-    let mut restaged: Vec<Restage> = Vec::new();
     for (target, target_plan) in &plan.targets {
-        let (written, deleted, restage) = settle_one_to_one_target(
+        let (written, deleted) = settle_one_to_one_target(
             txn,
             target,
             target_plan,
@@ -9770,7 +9745,6 @@ pub(crate) async fn apply_page(
             &mut mutations,
         )
         .await?;
-        restaged.extend(restage);
         keys_written += written;
         keys_deleted += deleted;
     }
@@ -10149,21 +10123,6 @@ pub(crate) async fn apply_page(
             src_changed: *src_changed,
             prior_image: None,
             origin_lsn: *origin_lsn,
-        });
-    }
-
-    // Re-derived keys whose row now joins through a key Phase 2 didn't
-    // resolve ([`settle_one_to_one_target`]), staged at their own `hop_gen`
-    // — a re-read of the same hop, not a step further downstream.
-    for (src_table, key, hop_gen, src_changed, origin_lsn) in restaged {
-        recompute_changes.push(StagedChange::Recompute {
-            src_table,
-            key,
-            hop_gen,
-            group_key: None,
-            src_changed,
-            prior_image: None,
-            origin_lsn,
         });
     }
 

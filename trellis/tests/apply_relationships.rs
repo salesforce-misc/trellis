@@ -1148,12 +1148,12 @@ async fn apply_computed(db: &testkit::TestDatabase, seg: i64, plan: &apply::Appl
 }
 
 /// A Re-derive of a relationship-enriched 1-1 key reads its row in Phase 3
-/// (#623 D6), but the related rows are only loaded in Phase 2. When the row
-/// read now joins through a parent Phase 2 didn't load, the key can be
-/// neither written from a stale parent nor dropped: it is re-staged as a
-/// recompute instead.
+/// (#623 D6), and the related rows of that row under the same entry lock
+/// (issue #838). When the row read now joins through a parent Phase 2
+/// didn't load, the Re-derive writes that parent's value directly, with
+/// nothing re-staged.
 #[tokio::test]
-async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
+async fn a_rederive_joining_a_parent_phase_2_did_not_load_writes_that_parent() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1195,12 +1195,12 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
     assert_eq!(
         target_to_one(&client).await,
         sci,
-        "the Re-derive must not write from a parent it didn't load"
+        "the Re-derive must write the parent it reads under its entry lock"
     );
     assert_eq!(
         staged_recompute_count(&client, "articles", "1").await,
-        1,
-        "the Re-derive must re-stage its key rather than drop it"
+        0,
+        "the Re-derive settles its key itself, re-staging nothing"
     );
     retire_drained_segments(&mut client)
         .await
@@ -1210,13 +1210,12 @@ async fn a_rederive_joining_a_parent_phase_2_did_not_load_is_restaged() {
     assert_eq!(target_to_one(&client).await, oracle_to_one(&client).await);
 }
 
-/// As above, but the key has no entry when its Re-derive is re-staged: its
-/// move to 'Sci' is in no batch yet. The entry lock gave it a placeholder,
-/// which the re-staged Re-derive leaves unwritten, and the tombstone GC
-/// never collects a placeholder, so the page must not leave it behind
-/// (#774).
+/// As above, but the key has no entry when its Re-derive runs: its move to
+/// 'Sci' is in no batch yet. The entry lock gives it a placeholder, which
+/// the Re-derive writes as the key's entry, with the parent it reads under
+/// the lock, rather than leaving it behind (#774).
 #[tokio::test]
-async fn a_restaged_rederive_of_a_key_with_no_entry_leaves_no_entry() {
+async fn a_rederive_of_a_key_with_no_entry_joining_a_new_parent_writes_its_entry() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1230,16 +1229,26 @@ async fn a_restaged_rederive_of_a_key_with_no_entry_leaves_no_entry() {
 
     assert_eq!(
         staged_recompute_count(&client, "articles", "1").await,
-        1,
-        "the Re-derive must re-stage its key rather than drop it"
+        0,
+        "the Re-derive settles its key itself, re-staging nothing"
     );
-    let entries: i64 = client
-        .query_one("select count(*) from public.article_cat__ledger", &[])
+    let entries: Vec<(String, bool)> = client
+        .query(
+            "select __from_key, __tombstone from public.article_cat__ledger",
+            &[],
+        )
         .await
-        .expect("count the ledger's entries")
-        .get(0);
-    assert_eq!(entries, 0, "the re-staged Re-derive left an entry behind");
-    assert_eq!(target_to_one(&client).await, HashMap::new());
+        .expect("read the ledger's entries")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        entries,
+        [("1".to_string(), false)],
+        "the Re-derive wrote the key's entry"
+    );
+    let sci = HashMap::from([("1".to_string(), Some("Sci".to_string()))]);
+    assert_eq!(target_to_one(&client).await, sci);
     retire_drained_segments(&mut client)
         .await
         .expect("free batch 1's ring slot");

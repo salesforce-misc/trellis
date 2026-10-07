@@ -437,14 +437,31 @@ entry lock and in the same statement as the child's own read (I1).
   has since moved off the parent has a change of its own pending, whose write
   reads its new parent. A relationship can therefore never double count or
   drop a child: the entry records the group the child was last counted under.
-- **Must:** a 1-1 target that reads through a relationship still evaluates against
-  the relationship projection the page resolves in Phase 2
-  ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md)),
-  under the entry lock like any 1-1 write. A field build's chunk over such a
-  target (a column resume) reads the projection after the entry lock (I1):
-  a chunk can sit between its plan and its lock for a long time, and the
-  page of a parent change's recompute drained in between would otherwise be
-  written over with the chunk's older read.
+- **Invariant: a value derived through a relationship is read after the
+  entry lock it is written under.** Every write of such a value reads the
+  related rows after taking the entry lock it writes under, in the same
+  transaction. A read made before the lock may feed evaluation or planning,
+  but never the value written. A writer can sit between an early read and
+  its lock for a long time (a stalled page, a chunk between its plan and its
+  lock), and a parent change and the page of the recompute it stages can
+  both commit in that window. The early read would then be written over the
+  newer value, and nothing would heal it: the parent change has drained, and
+  the child has no change left to apply.
+- **Must:** a 1-1 target that reads through a relationship reads the
+  relationship projection. An Apply evaluates its change's image against the
+  projection the page resolves in Phase 2
+  ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md)).
+  That read is not the value of record: a parent change that commits after it
+  stages a recompute of the child, and that Re-derive reads the child's row
+  after the Apply's change, so I2 refuses the Apply if it lands later still.
+  A Re-derive, a page's or a field build chunk's (a column resume), reads the
+  projection after the entry lock and its read of the rows, for exactly the
+  rows it read, by the projection's primary key. A parent change that commits
+  before that read is in it; one that commits after stages a recompute that
+  waits on the entry lock and writes after it. A Re-derive whose row joins a
+  parent outside the set the page's Phase 2 bumps the generation of is
+  harmless: guard (b) only defers a parent's reverse, and the reverse's
+  recomputes come from a live read of the from-side under its own lock.
 - **Replica identity is not a requirement on any table.** The ledger holds
   the group a child was last counted under, so a from-side FK re-point needs
   no pre-image, and a to-side change needs only its key. This replaces

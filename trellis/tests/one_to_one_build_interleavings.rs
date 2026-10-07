@@ -12,11 +12,12 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::{Driver, Running};
+use drain_driver::{Driver, Running, WAKE};
 use trellis::defs::ValueType;
 use trellis::staging::build::one_to_one::{self, OneToOneOutcome, OneToOnePlan};
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine::{FailureClass, classify};
+use trellis::staging::{StagedWatermark, apply, claim, fold};
 
 const TARGET: &str = "public.one";
 const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
@@ -225,12 +226,17 @@ async fn an_older_apply_the_chunks_snapshot_saw_is_refused() {
 /// Runs `sql` on the source with its capture triggers disabled, in one
 /// transaction: a change no ledger entry will ever hear about.
 async fn write_uncaptured(d: &Driver, sql: &str) {
+    write_uncaptured_on(d, "public.src", sql).await;
+}
+
+/// [`write_uncaptured`] on `table`.
+async fn write_uncaptured_on(d: &Driver, table: &str, sql: &str) {
     let toggle = |action: &str| {
         format!(
             "do $$ declare t text; begin \
                  for t in select tgname from pg_trigger \
-                          where tgrelid = 'public.src'::regclass and not tgisinternal loop \
-                     execute format('alter table public.src {action} trigger %I', t); \
+                          where tgrelid = '{table}'::regclass and not tgisinternal loop \
+                     execute format('alter table {table} {action} trigger %I', t); \
                  end loop; \
              end $$;"
         )
@@ -1324,9 +1330,8 @@ async fn a_field_chunk_reads_the_parent_after_its_entry_lock(change: ParentChang
     );
 }
 
-/// [`KID_DDL`] with `rk` live over it, then `rk.a` paused and resumed, and
-/// the field build's plan job run: its one chunk is enqueued, unclaimed.
-async fn start_kid_field_build() -> Driver {
+/// [`KID_DDL`] with `rk` live over it, both tables captured, drained.
+async fn start_kid() -> Driver {
     let d = Driver::start_with_relationships(
         KID_DDL,
         &[
@@ -1344,6 +1349,13 @@ async fn start_kid_field_build() -> Driver {
         d.rows(KID_EXPECTED).await,
         "the target before the scenario"
     );
+    d
+}
+
+/// [`start_kid`], then `rk.a` paused and resumed, and the field build's
+/// plan job run: its one chunk is enqueued, unclaimed.
+async fn start_kid_field_build() -> Driver {
+    let d = start_kid().await;
     trellis::staging::quarantine::pause_column(d.pool(), "rk", "a")
         .await
         .expect("pause rk.a");
@@ -1416,4 +1428,194 @@ async fn a_field_chunk_does_not_write_a_parent_value_read_before_its_entry_lock(
         d.rows(KID_EXPECTED).await,
         "the field chunk put back a related value it read before its entry lock"
     );
+}
+
+// ------------------- a relationship-enriched page Re-derive against a parent
+
+/// Issue #838: a page re-deriving a kid reads its parent only once it holds
+/// the kid's entry. The page's Phase 2 reads the parents' old values and the
+/// page stops before its entry lock (the steady load stalls a page there).
+/// The parent change then drains, and the page of the recompute it stages
+/// writes the kid's new related value. When the stopped page goes on, it
+/// must not put the old value back: nothing would heal it, since the parent
+/// change has drained and the kid has no change left to apply.
+async fn a_page_rederive_reads_the_parent_after_its_entry_lock(change: ParentChange) {
+    let mut d = start_kid().await;
+    let user = d.user().await;
+    user.batch_execute(change.sql())
+        .await
+        .expect("the parent change");
+    let parent_batch = d.seal().await;
+    d.stage_recomputes("public.kid", &["1", "2"]).await;
+    let stale_batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(
+            stale_batch,
+            "stale",
+            &[(PausePoint::AfterPlaceholders, KID_TARGET)],
+        )
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    // The parent change's page advances the projection and stages the kid's
+    // recompute in the next segment; that page writes the new value.
+    d.drain(parent_batch, "parent").await;
+    let recompute_batch = d.seal().await;
+    d.drain(recompute_batch, "recompute").await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the recompute's page wrote the new related value"
+    );
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    page.finish().await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the page put back a related value its Phase 2 read before its entry lock ({change:?})"
+    );
+}
+
+#[tokio::test]
+async fn a_page_rederive_does_not_write_a_parent_value_read_before_an_update() {
+    a_page_rederive_reads_the_parent_after_its_entry_lock(ParentChange::Update).await;
+}
+
+#[tokio::test]
+async fn a_page_rederive_does_not_write_null_for_a_parent_inserted_under_it() {
+    a_page_rederive_reads_the_parent_after_its_entry_lock(ParentChange::Insert).await;
+}
+
+#[tokio::test]
+async fn a_page_rederive_does_not_write_a_parent_deleted_under_it() {
+    a_page_rederive_reads_the_parent_after_its_entry_lock(ParentChange::Delete).await;
+}
+
+/// Issue #838, rule 4: a page's Re-derive that joins a parent outside the
+/// set its Phase 2 bumps the generation of is harmless. Kid 1's Re-derive
+/// reads it under parent 1 in Phase 2 and stops before its entry lock; kid
+/// 1 then moves to parent 2 past capture, so no change of its own bumps
+/// parent 2 or is in flight. Parent 2's change computes its page, reading
+/// parent 2's generation, and the Re-derive writes kid 1 from parent 2's
+/// old value, which it reads under its entry lock, bumping nothing for
+/// parent 2. The parent change's page then passes guard (b), which only
+/// ever deferred it since #623 D5, and stages a recompute of every kid it
+/// finds pointing at parent 2 in its own transaction, kid 1 included, whose
+/// page writes the new value.
+#[tokio::test]
+async fn a_page_rederive_joining_a_parent_outside_its_generation_bump_is_harmless() {
+    let mut d = start_kid().await;
+    let user = d.user().await;
+    user.batch_execute("insert into public.par values (2, 30)")
+        .await
+        .expect("parent 2");
+    d.settle().await;
+    let projection = kid_projection(&d).await;
+
+    d.stage_recomputes("public.kid", &["1"]).await;
+    let stale_batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(
+            stale_batch,
+            "stale",
+            &[(PausePoint::AfterPlaceholders, KID_TARGET)],
+        )
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    write_uncaptured_on(
+        &d,
+        "public.kid",
+        "update public.kid set par_id = 2 where id = 1",
+    )
+    .await;
+
+    // Parent 2's change, computed (Phase 2) before the Re-derive writes.
+    user.batch_execute("update public.par set val = 31 where id = 2")
+        .await
+        .expect("the parent change");
+    let parent_batch = d.seal().await;
+    let parent_plan = {
+        let mut client = d.pool().get().await.expect("a connection");
+        let txn = client.transaction().await.expect("begin phase 1");
+        claim::claim(&txn, parent_batch, "parent", 1)
+            .await
+            .expect("claim");
+        let share = claim::held_share(&*txn, parent_batch, "parent")
+            .await
+            .expect("held_share");
+        let folded = fold::fold(&txn, parent_batch, share.filter(share.buckets()))
+            .await
+            .expect("fold");
+        txn.commit().await.expect("commit phase 1");
+        apply::compute(d.pool(), &folded).await.expect("compute")
+    };
+    let generation = parent_generation(&d, &projection, 2).await;
+
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    page.finish().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        ["(1,5,30)", "(2,6,30)"],
+        "the Re-derive wrote kid 1 from the parent it read under its entry lock"
+    );
+    assert_eq!(
+        parent_generation(&d, &projection, 2).await,
+        generation,
+        "the Re-derive bumped nothing for a parent outside its Phase 2 set"
+    );
+
+    {
+        let mut client = d.pool().get().await.expect("a connection");
+        let txn = client.transaction().await.expect("begin phase 3");
+        apply::apply_and_mark_drained(
+            &txn,
+            parent_batch,
+            "parent",
+            &parent_plan,
+            WAKE,
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("apply the parent change");
+        txn.commit().await.expect("commit phase 3");
+    }
+    d.settle().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the parent change's recompute reached kid 1"
+    );
+}
+
+/// The quoted, qualified projection of [`KID_DDL`]'s relationship `p`.
+async fn kid_projection(d: &Driver) -> String {
+    let id: i64 = d
+        .ctl
+        .query_one(
+            &format!(
+                "select id from {}.relationship_definitions where name = 'p'",
+                trellis::config::DEFAULT_SCHEMA
+            ),
+            &[],
+        )
+        .await
+        .expect("relationship p")
+        .get(0);
+    trellis::defs::relationship_projection(d.pool(), id)
+        .await
+        .expect("read the projection catalog row")
+        .expect("p has a projection")
+        .qualified_table()
+}
+
+/// Parent `id`'s generation in `projection`.
+async fn parent_generation(d: &Driver, projection: &str, id: i32) -> i64 {
+    d.ctl
+        .query_one(
+            &format!("select __trellis_gen::bigint from {projection} where id = $1"),
+            &[&id],
+        )
+        .await
+        .expect("read the parent's generation")
+        .get(0)
 }

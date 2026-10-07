@@ -225,8 +225,8 @@ pass:
    then sets `__applied_lsn`. Either raises `__applied_seg` and marks a
    tombstone when the key has no row after it. The statement returns the keys
    it changed. A placeholder step 1 inserted that neither step wrote (an
-   Apply at or below the truncate floor, or a Re-derive the page re-staged
-   or skipped as failing to evaluate)
+   Apply at or below the truncate floor, or a Re-derive skipped as failing
+   to evaluate)
    is deleted in the same transaction (#774): it holds no ordering state, so
    I2 treats it as no entry, and the tombstone GC collects only tombstones.
 4. **The target rows** of exactly those keys are upserted or deleted.
@@ -243,28 +243,29 @@ Nothing has to be re-read for a hot key: an Apply is judged by its own
 position, so a key whose source changes faster than a batch drains still
 gets each batch's newest image.
 
-A relationship-enriched 1-1 target evaluates a Re-derive against the
-relationship projection Phase 2 read, as an Apply is. A Re-derived row that
-now joins through a key Phase 2 did not resolve is re-staged as a bare
-recompute instead, which a later page reads.
+A relationship-enriched 1-1 target evaluates an Apply against the
+relationship projection Phase 2 read. It evaluates a Re-derive against the
+projection read in Phase 3, after the entry lock and the Re-derive read, for
+exactly the rows read (ADR-0002, "Relationships"). A page can sit between
+its Phase 2 and its lock for a long time, and a parent change whose
+recompute drained in that window would otherwise have its value written
+over by the page's older read (#838). A parent change that commits after
+the Re-derive's read stages a recompute whose page waits on the entry lock
+and writes after this one. The Apply's earlier read is safe: that recompute's
+Re-derive reads the row after the Apply's change, so I2 refuses the Apply if
+it lands later still. The Re-derive reads the projection by its primary key
+with sequential scans off, as the entry lock reads the ledger, so a
+projection whose statistics lag its size isn't read in full while the
+entries stay locked. A to-many relationship's to-side is read by its join
+column as Phase 2 reads it, since that column may have no index.
 
 `ALTER TRANSFORM`'s field rebuild and a column resume are field builds
 (`staging::build`, #625 F8b): background chunks that lock a range of keys'
 entries as a page does and rewrite just the changed columns of their target
 rows from one snapshot, leaving the entries as they are. A relationship-
 enriched 1-1 target's field build re-derives each key's whole row instead,
-settled the same way as a page's Re-derive, except that its chunk reads the
-relationship projection in its transaction, after the entry lock and its
-read of the rows, rather than before it as a page's Phase 2 does. A chunk
-can sit between its plan and its lock for a long time, and a parent change
-whose recompute drained in that window would otherwise have its value
-written over by the chunk's older read (#832). A parent change that commits
-after the chunk's read stages a recompute whose page waits on the entry
-lock and writes after the chunk. The chunk reads the projection by its
-primary key with sequential scans off, as the entry lock reads the ledger, so
-a projection whose statistics lag its size isn't read in full while the
-entries stay locked. A to-many relationship's to-side is read by its join
-column as Phase 2 reads it, since that column may have no index.
+settled the same way as a page's Re-derive, the projection read after the
+entry lock included (#832).
 
 ### The ledger
 

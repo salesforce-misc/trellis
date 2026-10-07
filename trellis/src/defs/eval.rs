@@ -152,15 +152,6 @@ impl RelationshipContext {
         self.by_name.get(name).map(|rel| &rel.to_rows_by_key)
     }
 
-    /// Every relationship's `from_col`, to-one and to-many: the from-side
-    /// columns whose values this context resolved (#623 D6).
-    pub(crate) fn join_columns(&self) -> impl Iterator<Item = &str> {
-        self.by_name
-            .values()
-            .map(|r| r.from_col.as_str())
-            .chain(self.to_many_by_name.values().map(|r| r.from_col.as_str()))
-    }
-
     /// Adds the to-many relationship data (issue #29), for a context that has
     /// aggregate-wrapped relationship paths to resolve. Chains onto [`new`].
     #[must_use]
