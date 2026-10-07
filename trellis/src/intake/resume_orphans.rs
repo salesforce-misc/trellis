@@ -2684,6 +2684,126 @@ mod db_tests {
         );
     }
 
+    /// Issue #884: the sweep's Re-derive moves no entry into a group it
+    /// didn't lock before its first write. [`BY_G`]'s orders 2 (group `b`)
+    /// and 3 (group `c`) are deleted with no CDC, so the read finds both
+    /// entries unbacked, and the sweep locks them and then groups `b` and
+    /// `c`. It re-derives in batches of 1, and is frozen after its first
+    /// batch's read, of entry 2. Order 3 is then re-inserted into group `a`,
+    /// and a page locks group `a` and queues on `b`, in a page's order.
+    ///
+    /// Re-deriving every key it locked, the sweep's second batch read the
+    /// re-insert and moved entry 3 into group `a`, which the page held: the
+    /// page waited on the sweep for `b` and the sweep on the page for `a`, a
+    /// deadlock (40P01). Re-deriving only the keys its read finds no source
+    /// row for, it leaves entry 3 live in `c` and both commit. The
+    /// re-insert's own Apply then moves the entry to `a` and empties `c`.
+    #[tokio::test]
+    async fn a_sweep_leaves_an_entry_its_source_backs_again_to_the_insert() {
+        use crate::staging::interleave::{PausePoint, PauseScope};
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw, ids) = by_g_and_copy(&db, &[(1, "a"), (2, "b"), (3, "c")]).await;
+        raw.batch_execute("delete from public.orders where id in (2, 3)")
+            .await
+            .expect("unback entries 2 and 3");
+
+        let (_, ctl) = connect(&db).await;
+        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
+            .await
+            .expect("hold the pause lock");
+        let scope = PauseScope::new();
+        let reached = scope.arm(
+            PausePoint::AfterRederiveRead,
+            "public.orders_by_g",
+            SWEEP_PAUSE,
+        );
+        let (_, sweeper) = connect(&db).await;
+        let sweep = spawn_batched_sweep(sweeper, ids, scope, 1);
+        let frozen = reached
+            .await
+            .expect("the sweep reaches its first Re-derive read");
+
+        reinsert_order(&mut raw, 3).await;
+        let (_, pager) = connect(&db).await;
+        let page = spawn_page(
+            pager,
+            vec![
+                (
+                    "select 1 from public.orders_by_g where g = 'a' for update".to_string(),
+                    None,
+                ),
+                (
+                    "select 1 from public.orders_by_g where g = 'b' for update".to_string(),
+                    None,
+                ),
+            ],
+        );
+        wait_blocked_behind(&ctl, frozen.backend_pid).await;
+        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
+            .await
+            .expect("release the sweep");
+
+        let swept = sweep.await.expect("the sweep task");
+        let paged = page.await.expect("the page task");
+        assert!(
+            swept.is_ok() && paged.is_ok(),
+            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
+            swept.as_ref().err(),
+            paged.as_ref().err()
+        );
+        assert_eq!(
+            swept.expect("swept").deleted,
+            2 + 1,
+            "orders 2's and 3's copies, and group b"
+        );
+        let live: Vec<(String, String)> = raw
+            .query(
+                "select __from_key, g from public.orders_by_g__ledger \
+                 where __member and not __tombstone order by __from_key",
+                &[],
+            )
+            .await
+            .expect("read the live entries")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            live,
+            vec![
+                ("1".to_string(), "a".to_string()),
+                ("3".to_string(), "c".to_string()),
+            ],
+            "the sweep re-derived entry 2 and left entry 3 as it found it"
+        );
+
+        let active = seal(&mut raw).await;
+        drain(&pool, active).await.expect("drain the re-insert");
+        let groups: Vec<(String, String)> = raw
+            .query(
+                "select g, total::text from public.orders_by_g order by g",
+                &[],
+            )
+            .await
+            .expect("read orders_by_g")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![("a".to_string(), "100".to_string())],
+            "the re-insert's Apply moved entry 3 to group a and emptied c"
+        );
+        assert_eq!(
+            copy_rows(&raw).await,
+            vec![
+                ("1".to_string(), "1".to_string()),
+                ("3".to_string(), "100".to_string()),
+            ],
+            "the copy matches the source"
+        );
+    }
+
     /// Issue #883's setup: `orders_copy`, a `catching_up` 1-1 copy of
     /// `public.orders` (ids 1 to 3), whose orders 1 and 3 are deleted with
     /// no CDC (a delete the definition skipped), so both copies are
