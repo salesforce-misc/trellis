@@ -352,6 +352,52 @@ async fn a_failure_two_readers_reproduce_together_charges_both_without_more_prob
     assert_eq!(probes, 1 + 2);
 }
 
+/// Leave-one-out leaves a reader that already holds the key out of every
+/// probe. `c_t` refuses the change alone, so the first isolation charges it
+/// and, at a threshold of one, holds the key for it. `a_t` and `b_t` refuse it
+/// only together, so the second isolation, over the same page, finds them by
+/// leaving each of `a_t`, `b_t` and `d_t` out in turn: were `c_t` let back
+/// in, every leave-one-out probe would fail on its refusal, and nobody would
+/// be charged.
+#[tokio::test]
+async fn leave_one_out_leaves_a_reader_already_holding_the_key_out() {
+    let mut d = direct_readers(&["a_t", "b_t", "c_t", "d_t"]).await;
+    guard_pair(&d, "public.a_t", "public.b_t").await;
+    d.ctl
+        .batch_execute("alter table public.c_t add constraint small check (v < 2)")
+        .await
+        .expect("make c_t refuse the change alone");
+    change_t_1(&d).await;
+    let (seg, folded) = claimed_page(&mut d).await;
+    let evict = || isolate_and_evict(d.pool(), seg, WORKER, WAKE, &folded, 1, false);
+
+    let first = evict().await.expect("the first isolation");
+    assert!(
+        matches!(&first, IsolationOutcome::Evicted { evicted: 1, .. }),
+        "{first:?}"
+    );
+    assert_eq!(deaths_for(&d).await, vec!["c_t".to_string()]);
+
+    let second = evict().await.expect("the second isolation");
+    assert!(
+        matches!(&second, IsolationOutcome::Evicted { evicted: 2, .. }),
+        "{second:?}"
+    );
+    let held: Vec<String> = d
+        .ctl
+        .query(
+            "select split_part(t.target_table, '.', 2) from poison p \
+             join transform_definitions t on t.id = p.transform_id order by 1",
+            &[],
+        )
+        .await
+        .expect("read poison")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(held, vec!["a_t", "b_t", "c_t"]);
+}
+
 /// Two separate failing pairs, `a_t` with `b_t` and `c_t` with `d_t`: leaving
 /// any one reader out leaves the other pair failing, so leave-one-out pins
 /// nobody. Nobody is charged, and the drain records the page as a holdup.
