@@ -179,28 +179,53 @@ fn sqlstate(err: &(dyn std::error::Error + 'static)) -> Option<String> {
 /// bucket is left, and keeps the others' (a peer's page of the same segment
 /// may still be failing). A step with no explicit page completes the whole
 /// claim, so it deletes the row.
+///
+/// The row is locked first, and only then rewritten from what the lock
+/// returns. Under Read Committed a statement picks its rows from the
+/// snapshot it started with, and a peer recording or clearing another
+/// bucket of the segment may change the row while this waits for it: a
+/// write whose `WHERE` depends on the peer's buckets would then skip the
+/// row and leave this page's bucket behind. Whether the row holds one of
+/// this page's buckets can't change under the wait, since only the worker
+/// claiming a bucket records or clears it, and `for update` hands back the
+/// row as the peer committed it.
 pub(super) async fn clear(txn: &Transaction<'_>, step: &SegmentStep) -> Result<(), ApplyError> {
-    match &step.page {
-        Some(page) => {
-            txn.execute(
-                "with cleared as ( \
-                   delete from drain_holdups \
-                   where seg_seq = $1 and buckets <@ $2::smallint[]) \
-                 update drain_holdups h \
-                 set buckets = array(select b from unnest(h.buckets) b \
-                                     where b <> all($2::smallint[]) order by b) \
-                 where h.seg_seq = $1 and not h.buckets <@ $2::smallint[]",
-                &[&step.seg_seq, &page.buckets],
-            )
-            .await?;
-        }
-        None => {
-            txn.execute(
-                "delete from drain_holdups where seg_seq = $1",
-                &[&step.seg_seq],
-            )
-            .await?;
-        }
+    let Some(page) = &step.page else {
+        txn.execute(
+            "delete from drain_holdups where seg_seq = $1",
+            &[&step.seg_seq],
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(row) = txn
+        .query_opt(
+            "select buckets from drain_holdups \
+             where seg_seq = $1 and buckets && $2::smallint[] \
+             for update",
+            &[&step.seg_seq, &page.buckets],
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let left: Vec<i16> = row
+        .get::<_, Vec<i16>>(0)
+        .into_iter()
+        .filter(|bucket| !page.buckets.contains(bucket))
+        .collect();
+    if left.is_empty() {
+        txn.execute(
+            "delete from drain_holdups where seg_seq = $1",
+            &[&step.seg_seq],
+        )
+        .await?;
+    } else {
+        txn.execute(
+            "update drain_holdups set buckets = $2 where seg_seq = $1",
+            &[&step.seg_seq, &left],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -350,5 +375,129 @@ mod tests {
         let rows: Vec<(i64, Vec<i16>)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
         assert_eq!(rows, vec![(9002, vec![4])]);
         trellis.shutdown().await.expect("shutdown");
+    }
+
+    /// A page's [`clear`] of `buckets` that has to wait on a peer's
+    /// uncommitted write (`peer_write`) to the same segment's holdup, seeded
+    /// with `seeded`: the clear waits, the peer commits, then the page does.
+    /// Returns the row's buckets afterwards, `None` once it's gone.
+    async fn clear_behind_a_peer(
+        seeded: &[i16],
+        peer_write: &str,
+        buckets: Vec<i16>,
+    ) -> Option<Vec<i16>> {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let trellis = crate::app::Trellis::connect(config.clone(), Default::default())
+            .await
+            .expect("connect, which migrates");
+        let pool = Pool::new(&config).expect("a same-crate pool");
+        let watcher = pool.get().await.expect("a connection");
+        watcher
+            .execute(
+                "insert into segments (seg_seq, ring_slot, state) values (9101, 0, 'draining')",
+                &[],
+            )
+            .await
+            .expect("seed a segment");
+        watcher
+            .execute(
+                "insert into drain_holdups \
+                   (seg_seq, buckets, tables, error, since, last_seen, attempts) \
+                 values (9101, $1, '{}', 'it fails', now(), now(), 1)",
+                &[&seeded],
+            )
+            .await
+            .expect("seed a holdup");
+
+        let mut peer = pool.get().await.expect("a connection");
+        let peer_pid: i32 = peer
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("the peer's pid")
+            .get(0);
+        let peer_txn = peer.transaction().await.expect("begin the peer");
+        peer_txn
+            .batch_execute(peer_write)
+            .await
+            .expect("the peer's write, uncommitted");
+
+        let mut committer = pool.get().await.expect("a connection");
+        let page = committer.transaction().await.expect("begin the page");
+        let step = SegmentStep {
+            seg_seq: 9101,
+            page: Some(PageClaim {
+                held: buckets.clone(),
+                buckets,
+                next: None,
+            }),
+        };
+        let commit_peer = async {
+            let mut blocked = false;
+            for _ in 0..3000 {
+                let waiting: i64 = watcher
+                    .query_one(
+                        "select count(*) from pg_stat_activity \
+                         where $1 = any(pg_blocking_pids(pid))",
+                        &[&peer_pid],
+                    )
+                    .await
+                    .expect("read pg_stat_activity")
+                    .get(0);
+                if waiting > 0 {
+                    blocked = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                blocked,
+                "the clear never waited on the peer's write, so this test would not \
+                 exercise the race"
+            );
+            peer_txn.commit().await.expect("commit the peer");
+        };
+        let (cleared, ()) = tokio::join!(clear(&page, &step), commit_peer);
+        cleared.expect("clear");
+        page.commit().await.expect("commit the page");
+
+        let buckets = watcher
+            .query_opt(
+                "select buckets from drain_holdups where seg_seq = 9101",
+                &[],
+            )
+            .await
+            .expect("read the holdup")
+            .map(|row| row.get(0));
+        trellis.shutdown().await.expect("shutdown");
+        buckets
+    }
+
+    /// A peer records a failure on bucket 5 while this worker's page of
+    /// bucket 4 commits: the peer's bucket stays, and this page's goes.
+    #[tokio::test]
+    async fn a_commit_behind_a_peers_record_still_clears_its_own_bucket() {
+        let left = clear_behind_a_peer(
+            &[4],
+            "update drain_holdups set buckets = '{4,5}', attempts = attempts + 1 \
+             where seg_seq = 9101",
+            vec![4],
+        )
+        .await;
+        assert_eq!(left, Some(vec![5]));
+    }
+
+    /// Two pages of one segment's buckets 4 and 5 commit at once: once both
+    /// have, no holdup is left.
+    #[tokio::test]
+    async fn two_commits_of_one_segment_at_once_leave_no_holdup() {
+        let left = clear_behind_a_peer(
+            &[4, 5],
+            "update drain_holdups set buckets = '{4}' where seg_seq = 9101",
+            vec![4],
+        )
+        .await;
+        assert_eq!(left, None);
     }
 }
