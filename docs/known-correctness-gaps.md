@@ -86,7 +86,7 @@ These are the tools the entries refer to:
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
-| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge and catch-up: pause what they reach; one the catalog can't pin only logs (drain) or shows on `backfill_failure` (discharge); build chunk: `backfill_failure` | #817 |
+| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge and catch-up: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up); build chunk: `backfill_failure` | none |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #528, test ignored |
@@ -339,9 +339,12 @@ than filtering it. What follows depends on what was refused:
   every unfrozen definition whose tables that role can't use, not only those
   on the refused page. A `42501` the catalog can't pin on a table (a column
   the role isn't granted while it holds a grant on another, a function's
-  `EXECUTE`, one of Trellis's own tables) pauses nothing: the drain retries
-  the page and surfaces the error on every pass, charges no key, and puts
-  nothing in `status()`. The logs and a stalled watermark are the only signs.
+  `EXECUTE`, one of Trellis's own tables) pauses nothing and charges no key.
+  The drain records it as a drain holdup on the page: `status()` reports it
+  as `drain_failure` on every definition that isn't paused or quarantined and
+  reads a table on the page, directly or through a relationship, and
+  `self_check` reports it for the instance. Every pass retries the page, and
+  the holdup clears when the page commits.
 * **A build chunk** is retried, and its fifth charged attempt pauses its
   definition, with the error on `backfill_failure`. It's never narrowed to a
   key.
@@ -362,22 +365,23 @@ than filtering it. What follows depends on what was refused:
   reconcile pass pauses the table's readers.
 
 **Detected?** A refusal of a drain, a discharge or a catch-up pauses its
-definitions and shows in `status()`, except a `42501` the catalog can't pin:
-a drain's only logs, and a discharge's or catch-up's shows on
-`backfill_failure`. A build chunk's shows on `backfill_failure`. For the
-ring's owner, the reconcile pass pauses the readers and `self_check` reports
-a `capture` divergence (#745, #765). Define
-and declare refuse policies that already apply
+definitions and shows in `status()`, except a `42501` the catalog can't pin,
+which pauses nothing: a drain's shows on `drain_failure` and in
+`self_check`, and a discharge's or catch-up's on `backfill_failure`. A build
+chunk's shows on `backfill_failure`. For the ring's owner, the reconcile pass
+pauses the readers and `self_check` reports a `capture` divergence (#745,
+#765). Define and declare refuse policies that already apply
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
-**Planned work:** #817 decides what a refusal the halt can't pin on a table
-should do, for the drain and the discharge alike.
+**Planned work:** none.
 
 **Repair:** grant `BYPASSRLS` to every role Trellis logs in as and to the
 ring's owner (it isn't inherited), or make the role the table owner without
 `FORCE ROW LEVEL SECURITY`, and grant any missing privilege. Then resume the
-paused definitions, which rebuilds them. A discharge or catch-up backing off
-on a refusal the catalog couldn't pin succeeds on its next attempt.
+paused definitions, which rebuilds them. A drain page held on a refusal the
+catalog couldn't pin commits on its next pass, which clears its
+`drain_failure`, and a discharge or catch-up backing off on one succeeds on
+its next attempt.
 
 ## 12. A crash empties an unlogged source table
 

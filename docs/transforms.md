@@ -348,6 +348,15 @@ past the lock timeout every Trellis connection has (30 seconds at most), the
 release fails with a `timeout` error that says so, and changes nothing: the key is
 still held, and running the release again releases it once the pages commit.
 
+A failure the drain can't charge to a key and that pauses nothing (a read
+Postgres refuses that the catalog can't pin on a table, records that fail only
+together) holds a whole page back instead. Every drain pass retries it, and the
+status of each transform reading a table on the page, directly or through a
+relationship, reports it as `drain_failure`, with the error, the tables, and
+since when, while the status word stays what it was. `self_check` reports every
+such page. It clears when the page commits, so fix the cause the error names
+([observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
+
 An application can list defined transforms and read each one's status — enough to
 tell a newly-defined transform is still populating, without a metrics pipeline
 ([embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)

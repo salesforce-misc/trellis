@@ -267,6 +267,26 @@ until it is released. `self_check` reports the same `held_keys` with every audit
 errors; fix the cause and release each with `Trellis::release_key`, or resume the
 transform ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
 
+`drain_failure` on `DefinitionStatus` is set while the drain keeps failing on a page
+holding changes to a table the transform reads, as its source or through a
+relationship, and the failure is charged to no key and pauses nothing (#817): a
+refused read or write the catalog can't pin on a table
+([A halting failure](#a-halting-failure)), records that fail only together, isolation
+stopping at its probe limit, or a failure that kept reproducing until the page's
+retries ran out. The drain records such a page as a *drain holdup*, and every pass
+retries it, so the transform's target stops short of it and every watermark token
+taken since waits on it. The field carries the segment, the source tables on the page,
+the latest error and its SQLSTATE, when the drain first and last failed on it, and how
+many passes have. Every transform that isn't paused or quarantined and reads one of
+those tables reports it, the oldest holdup first. It clears in the transaction that
+commits the page; fix the cause the error names and the next pass does. A transient
+failure (a lock timeout, a serialization failure, a dropped connection) is never recorded,
+since retrying is how it resolves. `self_check` reports every open holdup with every
+audit, as `drain_failures`, whichever transform it audits: it is an instance-level
+finding, and the CLI's `trellis status` prints it under each transform it holds back.
+The holdup is separate from `capture_failure`: it pauses and charges nothing
+([ADR-0003](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
+
 ### Backfill status and the `xmin` caveat
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
@@ -380,8 +400,10 @@ without them:
   closure retries the page once. One that still pauses nothing (a refused
   read or write the catalog can't pin on a table,
   [gap 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as))
-  surfaces the error, and the drain worker re-claims the page at its poll
-  interval under a collapsed warning (#660).
+  surfaces the error and records the page as a drain holdup, which `status`
+  reports as `drain_failure` on the definitions reading its tables. The drain
+  worker re-claims the page at its poll interval under a collapsed warning
+  (#660).
 * **A refused backfill.** A backfill discharge or go-live catch-up that
   Postgres refuses (`42501`, while it plans a build or re-reads the source)
   halts the same way, as the staging worker's role (#813): it pauses what the

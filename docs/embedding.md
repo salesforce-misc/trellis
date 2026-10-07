@@ -349,6 +349,70 @@ Poll it on the same timer as the worker checks. Clear a halt by fixing its
 cause and resuming each halted definition (`RESUME TRANSFORM`), in any order;
 resuming while the cause persists halts it again.
 
+### Drain holdups
+
+Some failures stall a drain page without pausing anything or charging a key: a
+refused read or write the catalog can't pin on a table (a column grant, a
+function's `EXECUTE`, one of Trellis's own tables), records that fail only
+together, or a failure that keeps reproducing until the page's retries run out.
+Every drain pass retries the page, and the targets of the tables on it stop
+short of it, so every watermark token taken since waits on it (#817,
+[observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
+The drain records each as a *drain holdup*, which `status(target)` reports as
+`drain_failure` on every definition that isn't paused or quarantined and reads
+a table on the page, directly or through a relationship: the segment, the
+tables, the latest error and its SQLSTATE, when it started and last failed, and
+how many passes have. The definition's status stays what it was (`live`, say),
+so check the field, not the word. `self_check` reports every open holdup with
+each audit (`drain_failures`), whichever target it audits. A holdup clears in
+the transaction that commits its page, so fix the cause the error names; there
+is nothing to resume.
+
+`status` takes the bare target name, the part of `target_table` after the
+schema:
+
+```rust
+for summary in trellis.definitions().await? {
+    let bare = summary.target_table.split('.').nth(1).unwrap_or_default();
+    if let Some(status) = trellis.status(bare).await?
+        && let Some(held) = &status.drain_failure
+    {
+        // The drain has failed on segment `held.seg_seq` since `held.since`,
+        // `held.attempts` times: page someone with `held.error`.
+    }
+}
+```
+
+In Elixir, `drain_failure` is a `%Trellis.DrainFailure{}` or `nil`, and
+`self_check`'s report lists them in `drain_failures`; in Ruby, a
+`Trellis::DrainFailure` or `nil`, and `SelfCheckReport#drain_failures`. Both
+carry `seg_seq`, `tables`, `error`, `sqlstate` (`nil` for a failure that didn't
+come from Postgres), `since` and `last_seen` (a `DateTime` in Elixir, a `Time`
+in Ruby) and `attempts`:
+
+```elixir
+held_up =
+  Enum.flat_map(Trellis.definitions!(trellis), fn summary ->
+    bare = summary.target_table |> String.split(".") |> Enum.at(1)
+
+    case Trellis.status!(trellis, bare) do
+      %Trellis.Status{drain_failure: %Trellis.DrainFailure{} = held} -> [{bare, held}]
+      _ -> []
+    end
+  end)
+```
+
+```ruby
+held_up = Trellis.definitions.filter_map do |summary|
+  bare = summary.target_table.split(".")[1]
+  held = Trellis.status(bare)&.drain_failure
+  [bare, held] if held
+end
+```
+
+The CLI's `trellis status` prints each one on an indented line under the
+definition it holds back.
+
 ## Migrations and transactions
 
 **Trellis never joins your migration's transaction.** `migrate`, `define` and
@@ -576,6 +640,11 @@ Things a poll needs to handle:
   (`status` counts it in `held_keys`, `sample_quarantined` lists it, and
   `release_key` releases it once its cause is fixed); a build that keeps
   failing for a reason no row explains is paused.
+* **A drain page that keeps failing doesn't change the status.** A failure
+  charged to no key that pauses nothing, a refused read the catalog can't pin
+  on a table say, leaves the transform `live` (or wherever it was) while its
+  target stops short of the page. `drain_failure` names it until the page
+  commits ([drain holdups](#drain-holdups)).
 * **A schema change pauses, it never fails your writes.** Renaming or dropping a
   source column pauses every transform that reads it, with the table and column
   on `capture_failure`; the others on the table keep running.

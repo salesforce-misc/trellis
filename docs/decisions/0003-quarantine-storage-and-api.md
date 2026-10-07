@@ -310,8 +310,28 @@ whose apply it fails in, and the key is evicted to `poison` for that transform o
 `key_deaths` count reaches `DEFAULT_DEATH_THRESHOLD`.
 A failure that is structural rather than one key's fault, so that every key reproduces
 it, is not charged to any key: it pauses the definitions it reaches
-([ADR-0014](0014-pause-and-drop-a-transform.md)). `poison` and `poison_held` are where
-evicted work waits until it is released, or its transform is resumed or dropped
-([Releasing held keys](#releasing-held-keys)); nothing moves
-entries elsewhere by age. Whether it should, and whether the threshold should be
+([ADR-0014](0014-pause-and-drop-a-transform.md)).
+
+A failure that is charged to no key and pauses nothing is a *drain holdup*: a refused
+read or write the catalog can't pin on a table (so the halt pauses nothing), isolation
+that reproduces nothing (records that fail only together) or stops at its probe limit
+without pinning a key, or a reproducing failure whose page runs out of retries. The
+drain surfaces it and records the page in `drain_holdups`, one row per segment, in a
+short transaction of its own after the page's transaction rolls back: the latest error
+and SQLSTATE, the source tables on the page, the buckets the failing pages covered, when
+it first and last failed, and how many passes have. It charges and pauses nothing; every
+drain pass retries the page as before. `Trellis::status` reports the holdup as
+`drain_failure` on every unfrozen definition that reads a table on the page, directly or
+through a relationship, and `self_check` reports every open one as an instance-level
+finding. The transaction that commits a page clears its buckets from the row, deleting it
+once none is left, and deleting the segment (its retirement, or any other discard)
+cascades to it, so a holdup never outlives its page. Recording writes only the buckets
+the failing worker still claims, locking those claims until it commits, so a peer that
+reclaimed them and committed the page can't be left a stale row. A transient failure,
+including a storm of them that stops isolation, is never recorded: retrying is how it
+resolves.
+
+`poison` and `poison_held` are where evicted work waits until it is released, or its
+transform is resumed or dropped ([Releasing held keys](#releasing-held-keys)); nothing
+moves entries elsewhere by age. Whether it should, and whether the threshold should be
 configurable, is [#803](https://github.com/salesforce-misc/trellis/issues/803).
