@@ -153,7 +153,8 @@ definitions as above, and so does one whose re-type fails otherwise while some c
 there outgrew its type. One whose columns all still hold every value (`varchar` to
 `text`) keeps its old types and pauses nothing, since its writes still succeed. The
 worker doesn't retry a re-type that failed otherwise until the source's type changes
-again or the worker restarts, so it doesn't take the table's lock every pass.
+again, a definition with a column on the table is defined or dropped, or the worker
+restarts, so it doesn't take the table's lock every pass.
 
 A value written between the source's `ALTER` and that re-type fails its write (`22001`
 or `22003`), and its key may be held. One whose characters past the old `varchar`

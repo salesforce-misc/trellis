@@ -293,7 +293,8 @@ when some column there outgrew its type. When none did (`varchar` to
 `text`), its writes still succeed, so it pauses nothing and keeps its old
 types. Either way the worker doesn't try that re-type again, and so
 doesn't take the table's lock for it every pass, until the source's type
-changes again or the worker restarts.
+changes again, a definition with a column there is defined or dropped, or
+the worker restarts.
 
 A value written after the source widened and before the pass re-typed the
 column failed its write with `22001` (too long) or `22003` (numeric

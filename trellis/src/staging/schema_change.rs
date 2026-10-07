@@ -748,8 +748,8 @@ struct Checked {
 ///   (an unbounded `varchar` to `text`) pauses nothing, since its writes
 ///   still succeed. Either way, the failure is remembered in this process
 ///   ([`FAILED_RETYPES`]), and while the table's drift asks for the same
-///   statement, later passes don't try it again: it would only take the
-///   table's lock, fail and log again every pass.
+///   statement for the same definitions, later passes don't try it again:
+///   it would only take the table's lock, fail and log again every pass.
 ///
 /// Returns the tables it re-typed, and those it left waiting for their
 /// lock: no definition pauses for either.
@@ -774,8 +774,8 @@ async fn retype_in_place(
         }
     }
     let mut in_place = InPlace::default();
-    // Each table's re-type statement this pass, tried or not.
-    let mut attempted: Vec<(String, String)> = Vec::new();
+    // Each table's re-type this pass, tried or not.
+    let mut attempted: Vec<(String, FailedRetype)> = Vec::new();
     for (table, states) in widened {
         if !states.iter().all(|s| s.catalog_only()) {
             continue;
@@ -784,6 +784,8 @@ async fn retype_in_place(
             .iter()
             .filter(|c| c.states.iter().any(|s| s.copy.table == table))
             .map(|c| c.id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         let sqlstates: Vec<String> = states
             .iter()
@@ -806,8 +808,12 @@ async fn retype_in_place(
             checked_table.to_string(),
             table.to_string(),
         );
-        let failed_before = with_failed_retypes(|failed| failed.get(&key) == Some(&sql));
-        attempted.push((key.2.clone(), sql.clone()));
+        let retype = FailedRetype {
+            owners: owners.clone(),
+            sql: sql.clone(),
+        };
+        let failed_before = with_failed_retypes(|failed| failed.get(&key) == Some(&retype));
+        attempted.push((key.2.clone(), retype.clone()));
         if failed_before {
             tracing::debug!(
                 table = %checked_table,
@@ -860,17 +866,18 @@ async fn retype_in_place(
                     error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
                     "couldn't re-type Trellis's columns in place; {outcome}"
                 );
-                with_failed_retypes(|failed| failed.insert(key, sql));
+                with_failed_retypes(|failed| failed.insert(key, retype));
             }
         }
     }
     // A failure is forgotten once its table's drift no longer asks for the
-    // statement that failed: the drift went, or changed.
+    // statement that failed, for the same definitions: the drift went or
+    // changed, or a definition joined or left the table.
     with_failed_retypes(|failed| {
-        failed.retain(|(i, checked, table), sql| {
+        failed.retain(|(i, checked, table), retype| {
             i != instance
                 || checked != checked_table
-                || attempted.iter().any(|(t, s)| t == table && s == sql)
+                || attempted.iter().any(|(t, r)| t == table && r == retype)
         })
     });
     Ok(in_place)
@@ -878,10 +885,19 @@ async fn retype_in_place(
 
 /// The in-place re-types ([`retype_in_place`]) that failed for good, by
 /// capture instance (`capture::reconcile`'s key for a database and schema),
-/// the table checked and the table Trellis created: the statement that
-/// failed. Kept in this process only, so a restarted worker tries each once
-/// more.
-type FailedRetypes = BTreeMap<(String, String, String), String>;
+/// the table checked and the table Trellis created. Kept in this process
+/// only, so a restarted worker tries each once more.
+type FailedRetypes = BTreeMap<(String, String, String), FailedRetype>;
+
+/// One in-place re-type that failed: the definitions that owned the table
+/// then, and the statement. A definition defined again under the same
+/// target has a new id, so it tries the re-type afresh instead of inheriting
+/// a failure whose cause (a view since dropped) may be gone.
+#[derive(Clone, PartialEq, Eq)]
+struct FailedRetype {
+    owners: Vec<i64>,
+    sql: String,
+}
 
 static FAILED_RETYPES: std::sync::Mutex<FailedRetypes> = std::sync::Mutex::new(BTreeMap::new());
 

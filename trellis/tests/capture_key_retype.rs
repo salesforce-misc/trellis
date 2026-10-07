@@ -2380,6 +2380,57 @@ async fn a_re_type_in_place_that_fails_pauses_its_definition_instead() {
     assert_eq!(requests, 0);
 }
 
+/// #824: a failed in-place re-type is remembered for the definitions that
+/// owned the table, not for the table's name. A definition dropped and
+/// defined again under the same target, with no pass in between to see the
+/// old one gone, tries the same re-type afresh: it doesn't pause for the
+/// old definition's failure.
+#[tokio::test]
+async fn a_failed_re_type_in_place_is_not_held_against_a_definition_defined_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute(
+        "create view public.item_name_list as select name from public.item_names; \
+         alter table public.items alter column name type varchar(40)",
+    )
+    .await
+    .expect("a view on the target's column, then widen the passthrough");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "item_names", "public.items", &["name"]).await;
+
+    raw.batch_execute(
+        "drop view public.item_name_list; \
+         alter table public.items alter column name type varchar(10)",
+    )
+    .await
+    .expect("drop the view, and narrow the passthrough back");
+    trellis
+        .apply("DROP TRANSFORM item_names")
+        .await
+        .expect("drop item_names");
+    trellis
+        .apply("TRANSFORM item_names FROM public.items SELECT name AS name, qty + 1 AS next")
+        .await
+        .expect("define item_names again");
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(10)"
+    );
+    raw.batch_execute("alter table public.items alter column name type varchar(40)")
+        .await
+        .expect("widen the passthrough again");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_ne!(status(&raw, "item_names").await, TransformStatus::Paused);
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(40)"
+    );
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+}
+
 /// Counts each in-place re-type of `public.item_names` the server starts,
 /// in a sequence a rolled-back `ALTER` doesn't undo, and fails it with the
 /// SQLSTATE in `public.retype_injection`, if any. An event trigger at
