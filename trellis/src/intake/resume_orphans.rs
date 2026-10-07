@@ -2538,6 +2538,108 @@ mod db_tests {
         );
     }
 
+    /// Issue #884: the sweep's batches follow the key column's collation,
+    /// not the database's. `items` is keyed by `text collate "C"`, which its
+    /// 1-1 copy's key keeps (#769), and the database sorts `en-US`. The copy
+    /// loses all 4 rows, in batches of 2: `A`, `B`, then `a`, `b`. A page
+    /// locks row `B`, the sweep's first batch queues on it, and the page then
+    /// locks row `a`.
+    ///
+    /// Staging the keys in the database's collation, the sweep's first batch
+    /// was `a` and `A`, so it held `a` by the time its second batch (`b`,
+    /// `B`) queued on `B`, and the page then queued on `a`: a deadlock
+    /// (40P01). In the key's own collation, the sweep holds only `A` while it
+    /// waits, and both commit.
+    #[tokio::test]
+    async fn a_sweep_batches_keys_in_the_key_columns_collation() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.items (k text collate \"C\" primary key, a numeric); \
+             insert into public.items values ('A', 1), ('B', 2), ('a', 3), ('b', 4)",
+        )
+        .await
+        .expect("seed items");
+        let columns = HashMap::from([
+            ("k".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.items")
+            .await
+            .expect("make items read as another definition's target");
+        crate::defs::catalog::install_definition(
+            &pool,
+            "TRANSFORM items_copy FROM items SELECT a AS a",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register");
+        crate::intake::markers::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 1, "the build finished");
+        let row = raw
+            .query_one(
+                "select (select array_agg(k order by k) from public.items_copy) \
+                        = array['A', 'B', 'a', 'b'], \
+                        'a' < 'B'",
+                &[],
+            )
+            .await
+            .expect("read the collations");
+        assert_eq!(
+            (row.get::<_, bool>(0), row.get::<_, bool>(1)),
+            (true, true),
+            "the copy's key sorts in \"C\" and the database's text in en-US"
+        );
+        raw.batch_execute("delete from public.items")
+            .await
+            .expect("unback every item");
+
+        let (_, mut pager) = connect(&db).await;
+        let page = pager.transaction().await.expect("begin the page");
+        page.execute(
+            "select 1 from public.items_copy where k = 'B' for update",
+            &[],
+        )
+        .await
+        .expect("the page locks row B");
+        let page_pid: i32 = page
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("the page's backend")
+            .get(0);
+        let (_, sweeper) = connect(&db).await;
+        let sweep = spawn_batched_sweep(
+            sweeper,
+            ids,
+            crate::staging::interleave::PauseScope::new(),
+            2,
+        );
+        let (_, ctl) = connect(&db).await;
+        wait_blocked_behind(&ctl, page_pid).await;
+        let low = page
+            .execute(
+                "select 1 from public.items_copy where k = 'a' for update",
+                &[],
+            )
+            .await;
+        let paged = match low {
+            Ok(_) => page.commit().await,
+            Err(e) => Err(e),
+        };
+
+        let swept = sweep.await.expect("the sweep task");
+        assert!(
+            swept.is_ok() && paged.is_ok(),
+            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
+            swept.as_ref().err(),
+            paged.as_ref().err()
+        );
+        assert_eq!(swept.expect("swept").deleted, 4, "every copy");
+    }
+
     /// Issue #884: a sweep that re-derives a ledger target's entries in
     /// several batches locks every entry before any group. [`BY_G`]'s
     /// entries 1 and 2 are in group `b` and 3 to 5 in group `a`, all
