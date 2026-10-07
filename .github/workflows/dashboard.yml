@@ -1,0 +1,71 @@
+name: Dashboard
+
+# Publishes a public GitHub Pages dashboard: issue/PR activity, an open-issue
+# burndown and validation-logbook totals (run counts/hours/rows -- see
+# .github/scripts/gh-activity-report and the eng-manager skill's "Validation
+# logbook"). Issue/PR data comes live from this repo's API; the logbook
+# can't, since it's recorded on a dev box with no CI access, so a nightly job
+# on that box pushes a small aggregated snapshot (daily counts/hours/rows
+# only, never the per-run notes) to the `dashboard-data` branch on the
+# mmmries/trellis fork -- see .claude/scripts/publish-dashboard-data there.
+# That branch is a plain public ref, so the checkout below needs no token.
+#
+# Scheduled workflows only run off the default branch, which this repo's main
+# otherwise mirrors upstream exactly with no fork-only files -- so this one
+# file is the deliberate exception, rebased back onto main whenever this fork
+# re-syncs from upstream.
+on:
+  schedule:
+    # 13:00 UTC -- an hour after the dev box's 05:00 PDT logbook snapshot
+    # push, so the logbook side of the dashboard is never more than a day
+    # stale by the time this runs.
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: trellis
+
+      - name: Fetch the validation logbook snapshot from the fork
+        uses: actions/checkout@v4
+        with:
+          repository: mmmries/trellis
+          ref: dashboard-data
+          path: logbook-snapshot
+
+      - name: Generate the dashboard
+        run: |
+          python3 trellis/.github/scripts/gh-activity-report \
+            --repo salesforce-misc/trellis \
+            --logbook-json logbook-snapshot/logbook.json \
+            --out-dir _site
+          mv _site/report.html _site/index.html
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

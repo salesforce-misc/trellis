@@ -1,0 +1,920 @@
+#!/usr/bin/env python3
+"""Fetch issue/PR activity from a repo and (re)generate a standalone HTML
+report with charts of issues opened, issues closed, PRs merged, the open-issue
+burndown, and (optionally) validation logbook totals.
+
+Usage: gh-activity-report [--repo OWNER/NAME] [--out-dir DIR]
+                           [--logbook TSV_PATH | --logbook-json JSON_PATH]
+
+Re-running does a full refresh (re-fetches every issue/PR and rewrites
+data.json + report.html) rather than an incremental merge -- with a few
+hundred issues/PRs this is fast, and it sidesteps the correctness bugs an
+incremental merge invites (reopened issues, edited close dates, etc).
+
+Runs in two contexts:
+- On this box: reads the live validation logbook (local_docs/logbook.tsv,
+  see .claude/scripts/logbook) directly, and writes to
+  local_docs/github-activity/{data.json,report.html} by default.
+- In the nightly GitHub Actions workflow (salesforce-misc/trellis): has no
+  access to this box's logbook.tsv, so it takes a pre-aggregated snapshot via
+  --logbook-json (published nightly from this box to a branch on the fork --
+  see .claude/scripts/publish-dashboard-data) and writes to --out-dir for
+  actions/upload-pages-artifact.
+"""
+import argparse
+import csv
+import json
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+
+ISSUES_QUERY = """
+query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(first: 100, after: $endCursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes { createdAt closedAt }
+    }
+  }
+}
+"""
+
+PRS_QUERY = """
+query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 100, after: $endCursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes { createdAt mergedAt }
+    }
+  }
+}
+"""
+
+
+def resolve_token() -> str:
+    # SF_GH_TOKEN (this box's upstream credential) first, then whatever `gh`
+    # itself would use (GH_TOKEN/GITHUB_TOKEN -- what a GitHub Actions runner
+    # sets automatically), so the same script runs unmodified in CI.
+    for var in ("SF_GH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(var)
+        if token:
+            return token
+    # Per CLAUDE.md: load the full credential set if none of the above are
+    # in the environment yet (only applies on this box, not in CI).
+    env_file = os.path.expanduser("~/claude_env")
+    if os.path.exists(env_file):
+        result = subprocess.run(
+            ["bash", "-c", f"set -a; source {env_file}; set +a; echo -n \"$SF_GH_TOKEN\""],
+            capture_output=True,
+            text=True,
+        )
+        token = result.stdout.strip()
+        if token:
+            return token
+    sys.exit(
+        "error: no SF_GH_TOKEN, GH_TOKEN or GITHUB_TOKEN in the environment, and "
+        "~/claude_env didn't provide one either. This script needs repo access to "
+        "read issues/PRs."
+    )
+
+
+def fetch_nodes(token: str, owner: str, name: str, query: str, jq_path: str) -> list[dict]:
+    proc = subprocess.run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "--paginate",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "--jq",
+            jq_path,
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GH_TOKEN": token},
+    )
+    if proc.returncode != 0:
+        sys.exit(f"error: gh api graphql failed:\n{proc.stderr}")
+    # --jq applied per page emits one JSON node per line (NDJSON).
+    return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+
+
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
+def parse_date(ts: str) -> date:
+    # GitHub timestamps are UTC; bucket by the local calendar day so "today"
+    # matches what a reader on this box actually sees as today, not whatever
+    # day UTC happens to be at the moment.
+    utc_dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return utc_dt.astimezone(LOCAL_TZ).date()
+
+
+def aggregate(issues: list[dict], prs: list[dict]) -> list[dict]:
+    opened_issues = defaultdict(int)
+    closed_issues = defaultdict(int)
+    merged_prs = defaultdict(int)
+    seen_dates = set()
+
+    for issue in issues:
+        d = parse_date(issue["createdAt"])
+        opened_issues[d] += 1
+        seen_dates.add(d)
+        if issue.get("closedAt"):
+            cd = parse_date(issue["closedAt"])
+            closed_issues[cd] += 1
+            seen_dates.add(cd)
+
+    for pr in prs:
+        d = parse_date(pr["createdAt"])
+        seen_dates.add(d)
+        if pr.get("mergedAt"):
+            md = parse_date(pr["mergedAt"])
+            merged_prs[md] += 1
+            seen_dates.add(md)
+
+    if not seen_dates:
+        return []
+
+    start = min(seen_dates)
+    end = max(max(seen_dates), datetime.now(LOCAL_TZ).date())
+
+    days = []
+    d = start
+    open_total = 0
+    while d <= end:
+        opened = opened_issues.get(d, 0)
+        closed = closed_issues.get(d, 0)
+        open_total += opened - closed
+        days.append(
+            {
+                "date": d.isoformat(),
+                "opened_issues": opened,
+                "closed_issues": closed,
+                "merged_prs": merged_prs.get(d, 0),
+                "open_issues_total": open_total,
+            }
+        )
+        d += timedelta(days=1)
+    return days
+
+
+def read_logbook(path: str) -> list[dict]:
+    """Parse local_docs/logbook.tsv (see .claude/scripts/logbook and the
+    eng-manager skill's "Validation logbook" section). Only "done" rows carry
+    a finished_at/duration/rows; a "running" reservation (not yet finished)
+    is skipped."""
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f, delimiter="\t"))
+    return [r for r in rows if r.get("state") == "done" and r.get("finished_at")]
+
+
+def aggregate_logbook(entries: list[dict]) -> list[dict]:
+    runs = defaultdict(int)
+    hours = defaultdict(float)
+    rows_validated = defaultdict(int)
+    seen_dates = set()
+
+    for entry in entries:
+        # finished_at already carries its own UTC offset (e.g. -07:00), so its
+        # calendar date is the local day the run actually finished on.
+        d = datetime.fromisoformat(entry["finished_at"]).date()
+        runs[d] += 1
+        hours[d] += int(entry["duration_s"]) / 3600
+        rows_validated[d] += int(entry["rows"])
+        seen_dates.add(d)
+
+    if not seen_dates:
+        return []
+
+    start = min(seen_dates)
+    end = max(max(seen_dates), datetime.now(LOCAL_TZ).date())
+
+    days = []
+    d = start
+    while d <= end:
+        days.append(
+            {
+                "date": d.isoformat(),
+                "runs": runs.get(d, 0),
+                "hours": round(hours.get(d, 0.0), 2),
+                "rows_validated": rows_validated.get(d, 0),
+            }
+        )
+        d += timedelta(days=1)
+    return days
+
+
+HTML_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{repo} GitHub activity</title>
+<style>
+  .viz-root {{
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6;
+    --series-2:       #eb6834;
+    --series-3:       #1baf7a;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root:where(:not([data-theme="light"])) .viz-root {{
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --series-2:       #d95926;
+      --series-3:       #199e70;
+    }}
+  }}
+  :root[data-theme="dark"] .viz-root {{
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+    --series-3:       #199e70;
+  }}
+
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: var(--page);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text-primary);
+  }}
+  .viz-root {{ max-width: 980px; margin: 0 auto; padding: 32px 20px 60px; }}
+  header {{ display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 4px; }}
+  h1 {{ font-size: 20px; font-weight: 600; margin: 0; }}
+  h2 {{ font-size: 15px; font-weight: 600; margin: 40px 0 0; }}
+  .subtitle {{ color: var(--text-secondary); font-size: 13px; margin: 4px 0 20px; }}
+  .theme-toggle {{
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer;
+  }}
+
+  .filters {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }}
+  .filters .group {{ display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
+  .filters button {{
+    border: none; background: var(--surface-1); color: var(--text-secondary);
+    font-size: 12px; padding: 6px 12px; cursor: pointer; border-right: 1px solid var(--border);
+  }}
+  .filters .group button:last-child {{ border-right: none; }}
+  .filters button[aria-pressed="true"] {{ background: var(--series-1); color: #fff; }}
+  .filters .spacer {{ flex: 1; }}
+
+  .chart-card {{
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px 20px 8px; position: relative;
+  }}
+  .mini-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }}
+  .chart-card.mini {{ padding: 16px 16px 12px; }}
+  .mini-title {{ font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }}
+  .empty-state {{ color: var(--text-muted); font-size: 13px; padding: 24px 0; text-align: center; }}
+  .legend {{ display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 12px; font-size: 12px; color: var(--text-secondary); }}
+  .legend .item {{
+    display: flex; align-items: center; gap: 6px; cursor: pointer; border-radius: 4px;
+    padding: 2px 4px; margin: -2px -4px; transition: opacity 0.15s;
+  }}
+  .legend .item:hover {{ opacity: 0.8; }}
+  .legend .item:focus-visible {{ outline: 2px solid var(--series-1); outline-offset: 2px; }}
+  .legend .item.dimmed {{ opacity: 0.4; }}
+  .legend .swatch {{ width: 16px; height: 2px; border-radius: 1px; }}
+
+  svg.chart {{ width: 100%; height: auto; display: block; overflow: visible; }}
+  .gridline {{ stroke: var(--gridline); stroke-width: 1; }}
+  .baseline {{ stroke: var(--baseline); stroke-width: 1; }}
+  .axis-label {{ fill: var(--text-muted); font-size: 11px; }}
+  .end-label {{ fill: var(--text-primary); font-size: 11px; }}
+  .series-line {{ fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }}
+  .end-dot-ring {{ fill: var(--surface-1); }}
+  .crosshair {{ stroke: var(--text-muted); stroke-width: 1; pointer-events: none; }}
+  .hover-target {{ fill: transparent; }}
+
+  .tooltip {{
+    position: absolute; pointer-events: none; background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); white-space: nowrap;
+  }}
+  .tooltip .date {{ color: var(--text-secondary); margin-bottom: 4px; }}
+  .tooltip .row {{ display: flex; align-items: center; gap: 6px; margin-top: 2px; }}
+  .tooltip .row .key {{ width: 12px; height: 2px; border-radius: 1px; }}
+  .tooltip .row .value {{ font-weight: 600; color: var(--text-primary); }}
+  .tooltip .row .name {{ color: var(--text-secondary); }}
+  .tooltip[hidden] {{ display: none; }}
+
+  .table-toggle {{ margin-top: 12px; font-size: 12px; color: var(--text-secondary); background: none; border: none; cursor: pointer; text-decoration: underline; padding: 0; }}
+  .table-wrap {{ margin-top: 12px; max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }}
+  .table-wrap[hidden] {{ display: none; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  thead th {{ position: sticky; top: 0; background: var(--surface-1); text-align: right; padding: 8px 12px; color: var(--text-secondary); border-bottom: 1px solid var(--border); }}
+  thead th:first-child, td:first-child {{ text-align: left; }}
+  td {{ padding: 6px 12px; text-align: right; font-variant-numeric: tabular-nums; border-bottom: 1px solid var(--gridline); }}
+
+  @media (max-width: 640px) {{
+    .mini-grid {{ grid-template-columns: 1fr; }}
+  }}
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <header>
+    <div>
+      <h1>{repo} activity</h1>
+    </div>
+    <button class="theme-toggle" id="themeToggle" type="button">Toggle theme</button>
+  </header>
+  <p class="subtitle">Issues opened/closed and PRs merged, bucketed by {tz_label} calendar day &middot; generated {generated_at}</p>
+
+  <div class="filters">
+    <div class="group" id="rangeGroup" role="group" aria-label="Date range">
+      <button data-range="14">14d</button>
+      <button data-range="30">30d</button>
+      <button data-range="90">90d</button>
+      <button data-range="all" aria-pressed="true">All</button>
+    </div>
+    <div class="group" id="granularityGroup" role="group" aria-label="Granularity">
+      <button data-granularity="day" aria-pressed="true">Daily</button>
+      <button data-granularity="week">Weekly</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="table-toggle" id="tableToggle" type="button">View as table</button>
+  </div>
+
+  <div class="chart-card">
+    <div class="legend" id="legend"></div>
+    <svg class="chart" id="chart" viewBox="0 0 900 320" preserveAspectRatio="none"></svg>
+    <div class="tooltip" id="tooltip" hidden></div>
+  </div>
+
+  <div class="table-wrap" id="tableWrap" hidden>
+    <table id="dataTable">
+      <thead><tr><th>Date</th><th>Issues opened</th><th>Issues closed</th><th>PRs merged</th></tr></thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+
+  <h2>Open issues</h2>
+  <p class="subtitle">Net backlog &mdash; opened minus closed, running total</p>
+
+  <div class="chart-card">
+    <svg class="chart" id="burndownChart" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
+    <div class="tooltip" id="burndownTooltip" hidden></div>
+  </div>
+
+  <button class="table-toggle" id="burndownTableToggle" type="button">View as table</button>
+  <div class="table-wrap" id="burndownTableWrap" hidden>
+    <table id="burndownTable">
+      <thead><tr><th>Date</th><th>Open issues</th></tr></thead>
+      <tbody id="burndownTableBody"></tbody>
+    </table>
+  </div>
+
+  <h2>Validation logbook</h2>
+  <p class="subtitle">Benchmark, generative sweep, soak/chaos, acceptance and long repro runs &mdash; see the eng-manager skill's "Validation logbook"</p>
+
+  <div class="mini-grid" id="logbookGrid">
+    <div class="chart-card mini">
+      <div class="mini-title">Validation runs</div>
+      <svg class="chart" id="logbookRunsChart" viewBox="0 0 280 170" preserveAspectRatio="none"></svg>
+      <div class="tooltip" id="logbookRunsTooltip" hidden></div>
+    </div>
+    <div class="chart-card mini">
+      <div class="mini-title">Hours spent validating</div>
+      <svg class="chart" id="logbookHoursChart" viewBox="0 0 280 170" preserveAspectRatio="none"></svg>
+      <div class="tooltip" id="logbookHoursTooltip" hidden></div>
+    </div>
+    <div class="chart-card mini">
+      <div class="mini-title">Rows validated</div>
+      <svg class="chart" id="logbookRowsChart" viewBox="0 0 280 170" preserveAspectRatio="none"></svg>
+      <div class="tooltip" id="logbookRowsTooltip" hidden></div>
+    </div>
+  </div>
+  <div class="empty-state" id="logbookEmpty" hidden>No validation runs recorded yet.</div>
+
+  <button class="table-toggle" id="logbookTableToggle" type="button">View as table</button>
+  <div class="table-wrap" id="logbookTableWrap" hidden>
+    <table id="logbookTable">
+      <thead><tr><th>Date</th><th>Runs</th><th>Hours</th><th>Rows validated</th></tr></thead>
+      <tbody id="logbookTableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script type="application/json" id="activity-data">{data_json}</script>
+<script type="application/json" id="logbook-data">{logbook_json}</script>
+<script>
+(function () {{
+  "use strict";
+  var GITHUB_SERIES = [
+    {{ key: "opened_issues", name: "Issues opened", color: "var(--series-1)" }},
+    {{ key: "closed_issues", name: "Issues closed", color: "var(--series-2)" }},
+    {{ key: "merged_prs", name: "PRs merged", color: "var(--series-3)" }}
+  ];
+  var BURNDOWN_SERIES = {{ key: "open_issues_total", name: "Open issues", color: "var(--series-1)" }};
+  var LOGBOOK_SERIES = {{
+    runs: {{ key: "runs", name: "Validation runs", color: "var(--series-1)", format: function (v) {{ return String(v); }} }},
+    hours: {{ key: "hours", name: "Hours spent validating", color: "var(--series-1)", format: function (v) {{ return v.toFixed(1) + "h"; }} }},
+    rows_validated: {{ key: "rows_validated", name: "Rows validated", color: "var(--series-1)", format: function (v) {{ return Math.round(v).toLocaleString(); }} }}
+  }};
+  var ALL_DAYS = JSON.parse(document.getElementById("activity-data").textContent);
+  var ALL_LOGBOOK_DAYS = JSON.parse(document.getElementById("logbook-data").textContent);
+
+  var state = {{ range: "all", granularity: "day" }};
+  var svgNS = "http://www.w3.org/2000/svg";
+
+  function isoWeekStart(d) {{
+    var date = new Date(d + "T00:00:00Z");
+    var day = (date.getUTCDay() + 6) % 7; // Monday = 0
+    date.setUTCDate(date.getUTCDate() - day);
+    return date.toISOString().slice(0, 10);
+  }}
+
+  function filterByRange(days) {{
+    if (state.range === "all") return days;
+    var n = parseInt(state.range, 10);
+    return days.slice(Math.max(0, days.length - n));
+  }}
+
+  // Buckets daily rows into ISO weeks. `specs` is [{{ key, mode }}]; "sum" adds
+  // across the week (counts), "last" keeps the final day's value (running
+  // totals like open-issue count, where summing would be meaningless).
+  function bucketByGranularity(days, specs) {{
+    if (state.granularity === "day") return days;
+    var buckets = {{}};
+    var order = [];
+    days.forEach(function (d) {{
+      var weekKey = isoWeekStart(d.date);
+      if (!buckets[weekKey]) {{
+        var zeroed = {{ date: weekKey }};
+        specs.forEach(function (spec) {{ zeroed[spec.key] = spec.mode === "sum" ? 0 : null; }});
+        buckets[weekKey] = zeroed;
+        order.push(weekKey);
+      }}
+      specs.forEach(function (spec) {{
+        if (spec.mode === "sum") buckets[weekKey][spec.key] += d[spec.key];
+        else buckets[weekKey][spec.key] = d[spec.key];
+      }});
+    }});
+    return order.map(function (k) {{ return buckets[k]; }});
+  }}
+
+  function niceMax(value) {{
+    if (value <= 0) return 1;
+    var magnitude = Math.pow(10, Math.floor(Math.log10(value)));
+    var normalized = value / magnitude;
+    var step = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+    return step * magnitude;
+  }}
+
+  function el(tag, attrs) {{
+    var node = document.createElementNS(svgNS, tag);
+    for (var k in attrs) node.setAttribute(k, attrs[k]);
+    return node;
+  }}
+
+  function formatDateLabel(iso) {{
+    var d = new Date(iso + "T00:00:00Z");
+    return d.toLocaleDateString(undefined, {{ month: "short", day: "numeric", timeZone: "UTC" }});
+  }}
+
+  // Builds a renderer bound to one <svg>/legend/tooltip triple. `series` is
+  // one or more {{ key, name, color, format? }} definitions; a single series
+  // gets no legend (the panel title already names it) and a terser end-label.
+  // Clicking a legend item isolates the chart to just that series (click
+  // again to restore all); `opts.area` fills under a lone series' line.
+  function makeChartRenderer(chart, legend, tooltip, opts) {{
+    var W = opts.W, H = opts.H, PAD = opts.PAD;
+    var isolatedKey = null;
+
+    return function renderChart(days, series) {{
+      chart.innerHTML = "";
+      if (legend) legend.innerHTML = "";
+
+      if (legend && series.length >= 2) {{
+        series.forEach(function (s) {{
+          var item = document.createElement("div");
+          item.className = "item" + (isolatedKey && isolatedKey !== s.key ? " dimmed" : "");
+          item.setAttribute("role", "button");
+          item.setAttribute("tabindex", "0");
+          item.setAttribute("aria-pressed", String(isolatedKey === s.key));
+          var swatch = document.createElement("span");
+          swatch.className = "swatch";
+          swatch.style.background = s.color;
+          var label = document.createElement("span");
+          label.textContent = s.name;
+          item.appendChild(swatch);
+          item.appendChild(label);
+          var isolate = function () {{
+            isolatedKey = (isolatedKey === s.key) ? null : s.key;
+            renderChart(days, series);
+          }};
+          item.addEventListener("click", isolate);
+          item.addEventListener("keydown", function (evt) {{
+            if (evt.key === "Enter" || evt.key === " ") {{ evt.preventDefault(); isolate(); }}
+          }});
+          legend.appendChild(item);
+        }});
+      }}
+
+      if (days.length === 0) return;
+
+      var visible = isolatedKey ? series.filter(function (s) {{ return s.key === isolatedKey; }}) : series;
+      var format = function (s, v) {{ return s.format ? s.format(v) : String(v); }};
+
+      var maxValue = 0;
+      days.forEach(function (d) {{
+        visible.forEach(function (s) {{ maxValue = Math.max(maxValue, d[s.key]); }});
+      }});
+      var yMax = niceMax(maxValue);
+      var plotW = W - PAD.left - PAD.right;
+      var plotH = H - PAD.top - PAD.bottom;
+
+      function x(i) {{
+        return days.length === 1 ? PAD.left : PAD.left + (i / (days.length - 1)) * plotW;
+      }}
+      function y(v) {{
+        return PAD.top + plotH - (v / yMax) * plotH;
+      }}
+
+      // Gridlines + y ticks (0, mid, max)
+      [0, 0.5, 1].forEach(function (frac) {{
+        var value = yMax * frac;
+        var gy = y(value);
+        chart.appendChild(el("line", {{
+          x1: PAD.left, x2: W - PAD.right, y1: gy, y2: gy,
+          class: frac === 0 ? "baseline" : "gridline"
+        }}));
+        var label = el("text", {{ x: PAD.left - 8, y: gy + 4, class: "axis-label", "text-anchor": "end" }});
+        label.textContent = Math.round(value).toLocaleString();
+        chart.appendChild(label);
+      }});
+
+      // X-axis ticks: a handful evenly spaced, scaled to the chart's width
+      var tickCount = Math.min(days.length, Math.max(4, Math.round(W / 150)));
+      for (var t = 0; t < tickCount; t++) {{
+        var idx = tickCount === 1 ? 0 : Math.round((t / (tickCount - 1)) * (days.length - 1));
+        var tx = x(idx);
+        var label = el("text", {{ x: tx, y: H - PAD.bottom + 16, class: "axis-label", "text-anchor": "middle" }});
+        label.textContent = formatDateLabel(days[idx].date);
+        chart.appendChild(label);
+      }}
+
+      // Soft area fill under a lone trend line (burndown-style charts only)
+      if (opts.area && visible.length === 1) {{
+        var s0 = visible[0];
+        var top = days.map(function (d, i) {{ return x(i) + "," + y(d[s0.key]); }});
+        var baseY = H - PAD.bottom;
+        var areaPoints = top.concat([x(days.length - 1) + "," + baseY, x(0) + "," + baseY]);
+        chart.appendChild(el("polygon", {{ points: areaPoints.join(" "), style: "fill:" + s0.color + ";fill-opacity:0.1;stroke:none" }}));
+      }}
+
+      // Lines + end markers + end labels (stacked by value order to avoid overlap)
+      var ends = visible.map(function (s) {{
+        var last = days[days.length - 1];
+        return {{ s: s, value: last[s.key], py: y(last[s.key]) }};
+      }}).sort(function (a, b) {{ return a.py - b.py; }});
+      for (var e = 1; e < ends.length; e++) {{
+        if (ends[e].py - ends[e - 1].py < 12) ends[e].py = ends[e - 1].py + 12;
+      }}
+
+      visible.forEach(function (s) {{
+        var points = days.map(function (d, i) {{ return x(i) + "," + y(d[s.key]); }}).join(" ");
+        chart.appendChild(el("polyline", {{ points: points, class: "series-line", style: "stroke:" + s.color }}));
+
+        var lastIdx = days.length - 1;
+        var lx = x(lastIdx), ly = y(days[lastIdx][s.key]);
+        chart.appendChild(el("circle", {{ cx: lx, cy: ly, r: 6, class: "end-dot-ring" }}));
+        chart.appendChild(el("circle", {{ cx: lx, cy: ly, r: 4, style: "fill:" + s.color }}));
+      }});
+      ends.forEach(function (end) {{
+        var label = el("text", {{
+          x: x(days.length - 1) + 10, y: end.py + 4, class: "end-label", style: "fill:" + end.s.color
+        }});
+        label.textContent = series.length >= 2
+          ? end.s.name + " " + format(end.s, end.value)
+          : format(end.s, end.value);
+        chart.appendChild(label);
+      }});
+
+      // Hover layer: crosshair + tooltip
+      var hoverTarget = el("rect", {{
+        x: PAD.left, y: PAD.top, width: plotW, height: plotH, class: "hover-target"
+      }});
+      var crosshair = el("line", {{ x1: 0, x2: 0, y1: PAD.top, y2: H - PAD.bottom, class: "crosshair" }});
+      crosshair.style.display = "none";
+      chart.appendChild(crosshair);
+      chart.appendChild(hoverTarget);
+
+      function nearestIndex(mouseX) {{
+        if (days.length === 1) return 0;
+        var frac = (mouseX - PAD.left) / plotW;
+        var idx = Math.round(frac * (days.length - 1));
+        return Math.max(0, Math.min(days.length - 1, idx));
+      }}
+
+      hoverTarget.addEventListener("pointermove", function (evt) {{
+        var rect = chart.getBoundingClientRect();
+        var scaleX = W / rect.width;
+        var mouseX = (evt.clientX - rect.left) * scaleX;
+        var idx = nearestIndex(mouseX);
+        var d = days[idx];
+        var cx = x(idx);
+        crosshair.setAttribute("x1", cx);
+        crosshair.setAttribute("x2", cx);
+        crosshair.style.display = "block";
+
+        tooltip.innerHTML = "";
+        var dateRow = document.createElement("div");
+        dateRow.className = "date";
+        dateRow.textContent = d.date;
+        tooltip.appendChild(dateRow);
+        visible.forEach(function (s) {{
+          var row = document.createElement("div");
+          row.className = "row";
+          var key = document.createElement("span");
+          key.className = "key";
+          key.style.background = s.color;
+          var value = document.createElement("span");
+          value.className = "value";
+          value.textContent = format(s, d[s.key]);
+          var name = document.createElement("span");
+          name.className = "name";
+          name.textContent = s.name;
+          row.appendChild(key);
+          row.appendChild(value);
+          row.appendChild(name);
+          tooltip.appendChild(row);
+        }});
+        tooltip.hidden = false;
+        var cardRect = chart.parentElement.getBoundingClientRect();
+        var left = evt.clientX - cardRect.left + 16;
+        var top2 = evt.clientY - cardRect.top - 12;
+        if (left + 160 > cardRect.width) left = evt.clientX - cardRect.left - 176;
+        tooltip.style.left = left + "px";
+        tooltip.style.top = top2 + "px";
+      }});
+      hoverTarget.addEventListener("pointerleave", function () {{
+        crosshair.style.display = "none";
+        tooltip.hidden = true;
+      }});
+    }};
+  }}
+
+  var renderGithubChart = makeChartRenderer(
+    document.getElementById("chart"),
+    document.getElementById("legend"),
+    document.getElementById("tooltip"),
+    {{ W: 900, H: 320, PAD: {{ top: 12, right: 16, bottom: 28, left: 36 }} }}
+  );
+  var renderBurndownChart = makeChartRenderer(
+    document.getElementById("burndownChart"), null, document.getElementById("burndownTooltip"),
+    {{ W: 900, H: 220, PAD: {{ top: 12, right: 16, bottom: 28, left: 48 }}, area: true }}
+  );
+  var miniOpts = {{ W: 280, H: 170, PAD: {{ top: 10, right: 12, bottom: 24, left: 40 }} }};
+  var renderLogbookRuns = makeChartRenderer(
+    document.getElementById("logbookRunsChart"), null, document.getElementById("logbookRunsTooltip"), miniOpts
+  );
+  var renderLogbookHours = makeChartRenderer(
+    document.getElementById("logbookHoursChart"), null, document.getElementById("logbookHoursTooltip"), miniOpts
+  );
+  var renderLogbookRows = makeChartRenderer(
+    document.getElementById("logbookRowsChart"), null, document.getElementById("logbookRowsTooltip"), miniOpts
+  );
+
+  function renderGithubTable(days) {{
+    var tableBody = document.getElementById("tableBody");
+    tableBody.innerHTML = "";
+    days.forEach(function (d) {{
+      var tr = document.createElement("tr");
+      [d.date, d.opened_issues, d.closed_issues, d.merged_prs].forEach(function (v) {{
+        var td = document.createElement("td");
+        td.textContent = String(v);
+        tr.appendChild(td);
+      }});
+      tableBody.appendChild(tr);
+    }});
+  }}
+
+  function renderBurndownTable(days) {{
+    var tableBody = document.getElementById("burndownTableBody");
+    tableBody.innerHTML = "";
+    days.forEach(function (d) {{
+      var tr = document.createElement("tr");
+      [d.date, d.open_issues_total].forEach(function (v) {{
+        var td = document.createElement("td");
+        td.textContent = String(v);
+        tr.appendChild(td);
+      }});
+      tableBody.appendChild(tr);
+    }});
+  }}
+
+  function renderLogbookTable(days) {{
+    var tableBody = document.getElementById("logbookTableBody");
+    tableBody.innerHTML = "";
+    days.forEach(function (d) {{
+      var tr = document.createElement("tr");
+      [d.date, d.runs, d.hours.toFixed(1), d.rows_validated.toLocaleString()].forEach(function (v) {{
+        var td = document.createElement("td");
+        td.textContent = String(v);
+        tr.appendChild(td);
+      }});
+      tableBody.appendChild(tr);
+    }});
+  }}
+
+  function render() {{
+    var githubDays = bucketByGranularity(filterByRange(ALL_DAYS), [
+      {{ key: "opened_issues", mode: "sum" }},
+      {{ key: "closed_issues", mode: "sum" }},
+      {{ key: "merged_prs", mode: "sum" }},
+      {{ key: "open_issues_total", mode: "last" }}
+    ]);
+    renderGithubChart(githubDays, GITHUB_SERIES);
+    renderGithubTable(githubDays);
+    renderBurndownChart(githubDays, [BURNDOWN_SERIES]);
+    renderBurndownTable(githubDays);
+
+    var logbookDays = bucketByGranularity(filterByRange(ALL_LOGBOOK_DAYS), [
+      {{ key: "runs", mode: "sum" }},
+      {{ key: "hours", mode: "sum" }},
+      {{ key: "rows_validated", mode: "sum" }}
+    ]);
+    var hasLogbookData = logbookDays.length > 0;
+    document.getElementById("logbookGrid").hidden = !hasLogbookData;
+    document.getElementById("logbookEmpty").hidden = hasLogbookData;
+    document.getElementById("logbookTableToggle").hidden = !hasLogbookData;
+    if (hasLogbookData) {{
+      renderLogbookRuns(logbookDays, [LOGBOOK_SERIES.runs]);
+      renderLogbookHours(logbookDays, [LOGBOOK_SERIES.hours]);
+      renderLogbookRows(logbookDays, [LOGBOOK_SERIES.rows_validated]);
+      renderLogbookTable(logbookDays);
+    }}
+  }}
+
+  document.getElementById("rangeGroup").addEventListener("click", function (evt) {{
+    var btn = evt.target.closest("button[data-range]");
+    if (!btn) return;
+    state.range = btn.getAttribute("data-range");
+    this.querySelectorAll("button").forEach(function (b) {{ b.setAttribute("aria-pressed", String(b === btn)); }});
+    render();
+  }});
+  document.getElementById("granularityGroup").addEventListener("click", function (evt) {{
+    var btn = evt.target.closest("button[data-granularity]");
+    if (!btn) return;
+    state.granularity = btn.getAttribute("data-granularity");
+    this.querySelectorAll("button").forEach(function (b) {{ b.setAttribute("aria-pressed", String(b === btn)); }});
+    render();
+  }});
+  document.getElementById("tableToggle").addEventListener("click", function () {{
+    var wrap = document.getElementById("tableWrap");
+    wrap.hidden = !wrap.hidden;
+    this.textContent = wrap.hidden ? "View as table" : "Hide table";
+  }});
+  document.getElementById("burndownTableToggle").addEventListener("click", function () {{
+    var wrap = document.getElementById("burndownTableWrap");
+    wrap.hidden = !wrap.hidden;
+    this.textContent = wrap.hidden ? "View as table" : "Hide table";
+  }});
+  document.getElementById("logbookTableToggle").addEventListener("click", function () {{
+    var wrap = document.getElementById("logbookTableWrap");
+    wrap.hidden = !wrap.hidden;
+    this.textContent = wrap.hidden ? "View as table" : "Hide table";
+  }});
+  document.getElementById("themeToggle").addEventListener("click", function () {{
+    var root = document.documentElement;
+    var current = root.getAttribute("data-theme");
+    var next = current === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+  }});
+
+  render();
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", default="salesforce-misc/trellis", help="owner/name to report on")
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="output directory (default: local_docs/github-activity under the repo root)",
+    )
+    parser.add_argument(
+        "--logbook",
+        default=None,
+        help="path to the validation logbook TSV (default: local_docs/logbook.tsv under the repo root)",
+    )
+    parser.add_argument(
+        "--logbook-json",
+        default=None,
+        help=(
+            "path to a pre-aggregated logbook snapshot (the same per-day shape this "
+            "script writes to data.json's logbook_days) -- for environments like CI "
+            "that have no access to the live logbook.tsv. Takes priority over --logbook."
+        ),
+    )
+    args = parser.parse_args()
+
+    owner, name = args.repo.split("/", 1)
+
+    def repo_root() -> str:
+        # Only shelled out to when an output/logbook path is left to default
+        # -- in CI, $GITHUB_WORKSPACE isn't itself a git repo (the checkout
+        # lives in a subdirectory), and both paths are always given there.
+        return subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    out_dir = args.out_dir or os.path.join(repo_root(), "local_docs", "github-activity")
+    os.makedirs(out_dir, exist_ok=True)
+
+    token = resolve_token()
+
+    print(f"Fetching issues from {args.repo}...")
+    issues = fetch_nodes(token, owner, name, ISSUES_QUERY, ".data.repository.issues.nodes[]")
+    print(f"Fetching pull requests from {args.repo}...")
+    prs = fetch_nodes(token, owner, name, PRS_QUERY, ".data.repository.pullRequests.nodes[]")
+
+    days = aggregate(issues, prs)
+
+    if args.logbook_json:
+        with open(args.logbook_json) as f:
+            logbook_days = json.load(f)
+        logbook_run_count = sum(d["runs"] for d in logbook_days)
+    else:
+        logbook_path = args.logbook or os.path.join(repo_root(), "local_docs", "logbook.tsv")
+        logbook_entries = read_logbook(logbook_path)
+        logbook_days = aggregate_logbook(logbook_entries)
+        logbook_run_count = len(logbook_entries)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tz_label = datetime.now(LOCAL_TZ).strftime("%Z")
+
+    data = {
+        "repo": args.repo,
+        "generated_at": generated_at,
+        "timezone": tz_label,
+        "days": days,
+        "logbook_days": logbook_days,
+    }
+
+    data_path = os.path.join(out_dir, "data.json")
+    with open(data_path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+    html = HTML_TEMPLATE.format(
+        repo=args.repo,
+        generated_at=generated_at,
+        tz_label=tz_label,
+        data_json=json.dumps(days),
+        logbook_json=json.dumps(logbook_days),
+    )
+    report_path = os.path.join(out_dir, "report.html")
+    with open(report_path, "w") as f:
+        f.write(html)
+
+    print(f"{len(issues)} issues, {len(prs)} PRs, {len(days)} days of activity")
+    print(f"{logbook_run_count} logbook runs, {len(logbook_days)} days of validation history")
+    print(f"Wrote {data_path}")
+    print(f"Wrote {report_path}")
+
+
+if __name__ == "__main__":
+    main()
