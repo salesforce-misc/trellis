@@ -1037,23 +1037,10 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
     } = keyset(target, arrays);
     let mut guard = String::new();
     if let Some(ledger) = &target.ledger_guard {
-        use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
-        let matches: Vec<String> = target
-            .key_cols
-            .iter()
-            // Not `is not distinct from`, which no index serves.
-            .map(|c| {
-                format!(
-                    "(l.{0} = t.{0} or (l.{0} is null and t.{0} is null))",
-                    quote_ident(&c.name)
-                )
-            })
-            .collect();
-        guard.push_str(&format!(
-            " and not exists (select 1 from {ledger} as l where l.{} and not l.{} and {})",
-            quote_ident(MEMBER_COLUMN),
-            quote_ident(TOMBSTONE_COLUMN),
-            matches.join(" and "),
+        guard.push_str(&ledger_guard(
+            ledger,
+            &target.key_cols,
+            &null_patterns(arrays),
         ));
     }
     if let Some(source) = &target.source_guard {
@@ -1081,6 +1068,68 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
         "delete from {} as t using {relation} as k where {condition}{guard} returning {}",
         target.target_ident, target.returning,
     )
+}
+
+/// [`delete_statement`]'s guard for a ledger target's group sweep: it keeps
+/// a group row (aliased `t`) that a live entry of `ledger` (quoted) has the
+/// group of. It is one clause per `NULL` pattern of the batch's keys
+/// (`patterns`, from [`null_patterns`]), each ` and (<the row has another
+/// pattern> or not exists (<a live entry of the row's group>))`. The entry
+/// matches with `=` on the pattern's non-`NULL` columns and `is null` on its
+/// `NULL` ones, which together are `NULL`-safe equality for a row of that
+/// pattern. Every row the delete reaches has one of the batch's patterns,
+/// since [`keyset_match_cols`] matched it to a key.
+///
+/// So each `not exists` constrains every column of the ledger's `GROUP BY`
+/// index (`defs::ledger::aggregate_ledger_index_ddl`). The planner either
+/// probes the index once per key, for that key's group alone, or hashes the
+/// ledger's live groups once. Whichever it picks, stale statistics included,
+/// no key is compared with another group's entries. The `or` in front
+/// runs the probe only for rows of its pattern. A row of another pattern
+/// never reaches it, so it isn't compared with every entry that shares its
+/// non-`NULL` columns.
+///
+/// The obvious alternatives are worse here:
+/// - **A per-column match**, `(l.g = t.g or (l.g is null and t.g is null))`,
+///   can't be an index condition, a hash key or a merge key. With the
+///   ledger's statistics from before a reload, the planner compared every
+///   key with every live entry. With current statistics, it probed the index
+///   on the first column alone. For a 2-column key with 4 values in its
+///   first column, a batch of 4,000 of 200k groups took 11 s with current
+///   statistics and 23 s with stale ones. This guard takes 16 ms and 25 ms
+///   (issue #819).
+/// - **A record comparison** (`row(...)`), which the direct build's delete
+///   of the groups its ledger lost uses (`defs::backfill`), merges or hashes
+///   only against the whole ledger. It also needs nested loops off, which
+///   turns the keyset's own join into a merge over the target's index.
+///   That delete reads both tables whole anyway, but this one reads only its
+///   keys.
+fn ledger_guard(ledger: &str, key_cols: &[PrimaryKeyColumn], patterns: &[Vec<bool>]) -> String {
+    use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
+    patterns
+        .iter()
+        .map(|pattern| {
+            let mut other = Vec::with_capacity(key_cols.len());
+            let mut matches = Vec::with_capacity(key_cols.len());
+            for (c, &null) in key_cols.iter().zip(pattern) {
+                let col = quote_ident(&c.name);
+                if null {
+                    other.push(format!("t.{col} is not null"));
+                    matches.push(format!("l.{col} is null"));
+                } else {
+                    other.push(format!("t.{col} is null"));
+                    matches.push(format!("l.{col} = t.{col}"));
+                }
+            }
+            format!(
+                " and ({} or not exists (select 1 from {ledger} as l where l.{} and not l.{} and {}))",
+                other.join(" or "),
+                quote_ident(MEMBER_COLUMN),
+                quote_ident(TOMBSTONE_COLUMN),
+                matches.join(" and "),
+            )
+        })
+        .collect()
 }
 
 /// The `k`-alias column name for the `i`th `GROUP BY` column in a keyset
@@ -2570,6 +2619,187 @@ mod db_tests {
         }
     }
 
+    /// Issue #819: a ledger target's group delete ([`delete_statement`])
+    /// never compares every key with every live entry of the ledger, for the
+    /// key that made the per-column `OR` match quadratic (a 2-column key
+    /// whose first column has 4 values) and with the ledger's statistics
+    /// from before its reload, when every entry was in one group. The old
+    /// match planned as a nested loop over the whole ledger, once per key.
+    /// It covers a batch with one `NULL` pattern and one with four, and
+    /// deletes exactly the batch's groups with no live entry, `NULL`s
+    /// included.
+    #[tokio::test]
+    async fn the_sweep_group_delete_matches_the_ledger_by_whole_group_while_statistics_lag() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.grouped (a int, b int, n bigint, \
+                                          unique nulls not distinct (a, b)) \
+                 with (autovacuum_enabled = false); \
+             create table public.grouped_ledger (k text primary key, a int, b int, \
+                     __member boolean not null default true, \
+                     __tombstone boolean not null default false) \
+                 with (autovacuum_enabled = false); \
+             create index on public.grouped_ledger (a, b) where __member and not __tombstone; \
+             insert into public.grouped_ledger (k, a, b) \
+                 select n::text, 0, 0 from generate_series(1, 1000) n; \
+             analyze public.grouped_ledger; \
+             truncate public.grouped_ledger; \
+             insert into public.grouped (a, b, n) \
+                 select n % 4, n / 4, n from generate_series(1, 20000) n \
+                 union all values (null, 1, -1), (1, null, -2), (null, null, -3), (2, null, -4); \
+             insert into public.grouped_ledger (k, a, b) \
+                 select n::text, n % 4, n / 4 from generate_series(1, 20000) n \
+                 where n % 100 <> 0 \
+                 union all values ('x', null, 1), ('y', 1, null), ('z', null, null); \
+             insert into public.grouped_ledger (k, a, b, __member, __tombstone) \
+                 values ('gone', 0, 25, false, false), ('dead', 2, null, true, true); \
+             analyze public.grouped; \
+             insert into source_table_versions (source_table, version) values ('public.t', 1)",
+        )
+        .await
+        .expect("seed a group target and a reloaded ledger");
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.grouped', 'public.t', 1, 'unused', 'catching_up') \
+                 returning id",
+                &[],
+            )
+            .await
+            .expect("seed the definition")
+            .get(0);
+        let key_cols = ddl::identity_key_columns(&raw, "public.grouped")
+            .await
+            .expect("identity");
+        let key_sql = ddl::pk_key_sql_expr(&key_cols, Some("t"));
+        let target = SweptTarget {
+            id,
+            status: TransformStatus::CatchingUp,
+            lock_order: (true, "public.grouped".to_string()),
+            target: "public.grouped".to_string(),
+            target_ident: ddl::qualified_target_table_ident("public.grouped"),
+            returning: key_sql.clone(),
+            key_cols,
+            branches: Vec::new(),
+            has_image: false,
+            ledger_guard: Some("public.grouped_ledger".to_string()),
+            source_guard: None,
+            ledger_rederive: None,
+            unbacked: Vec::new(),
+        };
+        let ledger_rows: f64 = raw
+            .query_one("select count(*)::float8 from public.grouped_ledger", &[])
+            .await
+            .expect("count the ledger")
+            .get(0);
+        // Every 50th group, half of which (every 100th) have no live entry;
+        // then those and every group with a `NULL`.
+        let plain = "t.n % 50 = 0";
+        for batch in [plain, &format!("{plain} or t.n < 0")] {
+            let keys: Vec<(String, Option<String>, Option<String>)> = raw
+                .query(
+                    &format!(
+                        "select {key_sql}, t.a::text, t.b::text from public.grouped t where {batch}"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect();
+            let arrays = vec![
+                keys.iter().map(|(_, a, _)| a.clone()).collect::<Vec<_>>(),
+                keys.iter().map(|(_, _, b)| b.clone()).collect::<Vec<_>>(),
+            ];
+            let expected: std::collections::HashSet<String> = raw
+                .query(
+                    &format!(
+                        "select {key_sql} from public.grouped t where ({batch}) \
+                           and not exists (select 1 from public.grouped_ledger l \
+                                           where l.__member and not l.__tombstone \
+                                             and l.a is not distinct from t.a \
+                                             and l.b is not distinct from t.b)"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("the batch's groups with no live entry")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert!(
+                expected.len() >= 200 && expected.len() < keys.len(),
+                "{batch}: the batch keeps some groups and deletes others"
+            );
+            let sql = delete_statement(&target, &arrays);
+            let status = target.status.as_str();
+            let mut params: Vec<&(dyn ToSql + Sync)> =
+                arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+            params.push(&target.id);
+            params.push(&status);
+            let mut txn = raw.transaction().await.expect("begin");
+            let explain = txn.savepoint("explain").await.expect("savepoint");
+            let plan: String = crate::staging::ledger::query_by_entry_key(
+                &explain,
+                &format!("explain (analyze, timing off) {sql}"),
+                &params,
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+            explain
+                .rollback()
+                .await
+                .expect("roll back the explain's delete");
+            let filtered: u64 = plan
+                .lines()
+                .filter_map(|line| line.split("Rows Removed by Join Filter: ").nth(1))
+                .map(|n| n.trim().parse::<u64>().expect("a row count"))
+                .sum();
+            assert!(
+                filtered < keys.len() as u64,
+                "{batch}: the delete must not compare every key with every entry, got:\n{plan}"
+            );
+            // Read whole once, or probed by group: never whole once per key.
+            let read: f64 = plan
+                .lines()
+                .filter(|line| line.contains(" on grouped_ledger "))
+                .map(|scan| {
+                    let figure = |label: &str| -> f64 {
+                        scan.split(label)
+                            .nth(1)
+                            .and_then(|rest| rest.split([' ', ')']).next())
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or_else(|| panic!("{label} in {scan}"))
+                    };
+                    figure("actual rows=") * figure(" loops=")
+                })
+                .sum();
+            assert!(
+                read <= ledger_rows,
+                "{batch}: the delete must read the ledger at most once, got:\n{plan}"
+            );
+            let deleted: std::collections::HashSet<String> = delete_keys(&txn, &target, &arrays)
+                .await
+                .expect("delete")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            txn.rollback().await.expect("roll back");
+            assert_eq!(
+                deleted, expected,
+                "{batch}: the batch's groups with no live entry, and only those"
+            );
+        }
+    }
+
     /// How many sequential scans of `table` this transaction has started so
     /// far (`pg_stat_xact_user_tables` counts the open transaction's own).
     /// The plan above is explained through `query_by_entry_key`; this checks
@@ -2620,6 +2850,36 @@ mod tests {
             r#"((t."g" = k.c0 and t."h" = k.c1) or "#.to_string()
                 + r#"(t."g" = k.c0 and t."h" is null and k.c1 is null) or "#
                 + r#"(t."g" is null and k.c0 is null and t."h" = k.c1))"#
+        );
+    }
+
+    /// Issue #819: the ledger guard has one clause per `NULL` pattern, each
+    /// matching the entry on every grouping column, with `=` or `is null`.
+    #[test]
+    fn the_ledger_guard_matches_every_column_per_null_pattern() {
+        let key_cols: Vec<PrimaryKeyColumn> = ["g", "h"]
+            .into_iter()
+            .map(|name| PrimaryKeyColumn {
+                name: name.to_string(),
+                data_type: "integer".to_string(),
+                nullable: true,
+                collation: None,
+            })
+            .collect();
+        let live = r#"select 1 from led as l where l."__member" and not l."__tombstone""#;
+        assert_eq!(
+            ledger_guard("led", &key_cols, &[vec![false, false]]),
+            format!(
+                r#" and (t."g" is null or t."h" is null or not exists ({live} and l."g" = t."g" and l."h" = t."h"))"#
+            )
+        );
+        assert_eq!(
+            ledger_guard("led", &key_cols, &[vec![false, true], vec![true, true]]),
+            format!(
+                r#" and (t."g" is null or t."h" is not null or not exists ({live} and l."g" = t."g" and l."h" is null))"#
+            ) + &format!(
+                r#" and (t."g" is not null or t."h" is not null or not exists ({live} and l."g" is null and l."h" is null))"#
+            )
         );
     }
 
