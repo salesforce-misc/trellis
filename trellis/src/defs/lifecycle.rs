@@ -179,14 +179,20 @@ pub(crate) async fn pause_transform(
 /// quarantined) but still gets the record, since its resume is the same
 /// rebuild. An existing record is kept, so the first detection stands.
 /// Returns whether this call paused it.
+///
+/// `caused_by` is the definition whose resume re-typed the columns of its
+/// target that this pause is about, when that resume is what pauses it
+/// (#828, `staging::schema_change::pause_readers_of_retyped`), and is
+/// recorded with the pause.
 pub(crate) async fn pause_for_capture_failure(
     txn: &Transaction<'_>,
     id: i64,
     source_table: &str,
     columns: &[String],
     error: &str,
+    caused_by: Option<i64>,
 ) -> Result<bool, CatalogError> {
-    pause_with_record(txn, id, source_table, columns, error, "capture").await
+    pause_with_record(txn, id, source_table, columns, error, "capture", caused_by).await
 }
 
 /// [`pause_for_capture_failure`] for a drain's halt (#663,
@@ -200,12 +206,12 @@ pub(crate) async fn pause_for_halt(
     source_table: &str,
     error: &str,
 ) -> Result<bool, CatalogError> {
-    pause_with_record(txn, id, source_table, &[], error, "halt").await
+    pause_with_record(txn, id, source_table, &[], error, "halt", None).await
 }
 
-/// Records why `id` pauses in `capture_failures`, under `kind`, unless a
-/// record already stands, and pauses it unless it's frozen. Returns whether
-/// it paused it.
+/// Records why `id` pauses in `capture_failures`, under `kind` and with
+/// its upstream cause, unless a record already stands, and pauses it unless
+/// it's frozen. Returns whether it paused it.
 async fn pause_with_record(
     txn: &Transaction<'_>,
     id: i64,
@@ -213,12 +219,13 @@ async fn pause_with_record(
     columns: &[String],
     error: &str,
     kind: &str,
+    caused_by: Option<i64>,
 ) -> Result<bool, CatalogError> {
     txn.execute(
-        "insert into capture_failures (transform_id, source_table, columns, error, kind) \
-         select id, $2, $3, $4, $5 from transform_definitions where id = $1 \
+        "insert into capture_failures (transform_id, source_table, columns, error, kind, caused_by) \
+         select id, $2, $3, $4, $5, $6 from transform_definitions where id = $1 \
          on conflict (transform_id) do nothing",
-        &[&id, &source_table, &columns, &error, &kind],
+        &[&id, &source_table, &columns, &error, &kind, &caused_by],
     )
     .await?;
     let paused = txn

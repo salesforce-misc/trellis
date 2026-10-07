@@ -66,7 +66,11 @@ These are the tools the entries refer to:
 * **`DROP TRANSFORM <target>`, then define it again** is the repair when you
   keep a schema change the definition can't be rebuilt over: a resume refuses
   while define would, naming the column and what to change, and a 1-1
-  definition whose source key was redefined can only be defined again.
+  definition whose source key was redefined can only be defined again. It's
+  also the repair when a resume can't convert the values of a column Trellis
+  created to its new type (a key moved from `text` to `uuid` by a `USING`
+  that isn't a cast). The definition stays paused and its target keeps its
+  rows: Trellis doesn't empty a target the application reads on its own.
 * **`self_check(target, …)`** detects divergence but never repairs it. It
   audits the target's capture triggers, then compares the target with a
   recompute of it in Postgres
@@ -650,6 +654,12 @@ the capture pass has re-typed it.
   saying it's resuming, until the staging worker has re-typed the copies and
   started the rebuild. A rebuild follows every
   widening of a copied column.
+* **A resume that re-types a target pauses the definitions chained off it.**
+  A definition reading the target whose own columns were typed from the old
+  type pauses, its `capture_failure` naming the upstream resume. Resume it
+  once the upstream is live again. Its resume re-types its own target, which
+  pauses the next definition down the same way, so a chain of depth k takes
+  k resumes, each a full rebuild.
 * **Quarantined keys stay held until they're released.** A key that's
   quarantined after repeated apply failures is held for the definition whose
   apply failed, with its parked work and its poison row, and that

@@ -3107,7 +3107,9 @@ async fn request_retype(
 
 /// Sets definition `id`'s `capture_failure` (kind `capture`), replacing any
 /// it has: what a resume in progress, or one the staging worker couldn't
-/// finish, reports.
+/// finish, reports. It drops any upstream resume recorded as the pause's
+/// cause (`caused_by`, #828): the operator has resumed the definition, so
+/// what holds it now is its own resume.
 async fn set_capture_failure(
     client: &impl GenericClient,
     id: i64,
@@ -3121,7 +3123,8 @@ async fn set_capture_failure(
              values ($1, $2, $3, $4, 'capture') \
              on conflict (transform_id) do update \
              set source_table = excluded.source_table, columns = excluded.columns, \
-                 error = excluded.error, kind = excluded.kind, detected_at = now()",
+                 error = excluded.error, kind = excluded.kind, caused_by = null, \
+                 detected_at = now()",
             &[&id, &source_table, &columns, &error],
         )
         .await?;
@@ -3299,7 +3302,13 @@ pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration:
 ///   `RESUME` tries again. The failing table's copies keep their types;
 ///   another table's, re-typed before it in its own transaction, keep their
 ///   new ones, which the definition, still paused, never reads, and which
-///   the next resume finds current.
+///   the next resume finds current. The target keeps its rows: for values
+///   that can't be converted, the message names `DROP TRANSFORM` and define
+///   again as the repair ([`retype_failed_error`], #828).
+/// - The transaction that re-types the definition's target also records
+///   which of its columns it re-typed ([`record_retype_causes`]), so the
+///   pass's pause of a definition chained off the target names this resume
+///   as its cause (#828).
 ///
 /// A request's own failure is logged and doesn't stop the others. Errs only
 /// when the requests can't be read.
@@ -3395,17 +3404,44 @@ async fn finish_requested_resume(
         )
         .await?;
         let states = crate::defs::copies::inspect(&txn, copies).await?;
-        let statements = crate::defs::copies::retype_statements(&states);
+        // Each table's statements, with the columns of the definition's
+        // target they re-type: what a definition chained off the target
+        // reads (#828).
+        let mut by_table: std::collections::BTreeMap<String, Vec<crate::defs::copies::CopyState>> =
+            std::collections::BTreeMap::new();
+        for state in states {
+            by_table
+                .entry(state.copy.table.clone())
+                .or_default()
+                .push(state);
+        }
+        let mut statements: Vec<(String, Vec<String>, Vec<RetypedColumn>)> = Vec::new();
+        for states in by_table.into_values() {
+            let columns: Vec<RetypedColumn> = states
+                .iter()
+                .filter(|s| s.drifted() && s.copy.table_name == definition.target_table)
+                .map(|s| RetypedColumn {
+                    table: s.copy.table_name.clone(),
+                    column: s.copy.column.clone(),
+                    old_type: s.copy_type.display.clone(),
+                    new_type: s.live_type.display.clone(),
+                })
+                .collect();
+            for (sql, labels) in crate::defs::copies::retype_statements(&states) {
+                statements.push((sql, labels, columns.clone()));
+            }
+        }
         txn.commit().await?;
         (source_table, target, statements)
     };
 
     let mut retyped: Vec<String> = Vec::new();
-    for (sql, labels) in statements {
+    for (sql, labels, columns) in statements {
         let txn = client.transaction().await?;
         crate::locks::set_local_lock_timeout(&txn, RETYPE_LOCK_TIMEOUT).await?;
         match txn.batch_execute(&sql).await {
             Ok(()) => {
+                record_retype_causes(&txn, id, &columns).await?;
                 txn.commit().await?;
                 tracing::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
                 retyped.extend(labels);
@@ -3421,27 +3457,17 @@ async fn finish_requested_resume(
             }
             Err(err) => {
                 txn.rollback().await?;
-                // Each table is re-typed in its own transaction, so the
-                // copies of a table re-typed before this one keep their new
-                // types; the next resume finds them current.
-                let kept = if retyped.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({} were re-typed already)", retyped.join(", "))
-                };
                 end_request(
                     client,
                     id,
                     &source_table,
-                    &format!(
-                        "the resume couldn't re-type Trellis's columns {} to the types \
-                         define would give them now: {}. They keep their types{kept}, and the \
-                         definition stays paused. Fix the cause and resume the definition \
-                         again, or drop the definition and define it again",
-                        labels.join(", "),
-                        err.as_db_error()
+                    &retype_failed_error(
+                        &target,
+                        &labels,
+                        &err.as_db_error()
                             .map(ToString::to_string)
                             .unwrap_or_else(|| err.to_string()),
+                        &retyped,
                     ),
                 )
                 .await?;
@@ -3492,6 +3518,83 @@ async fn finish_requested_resume(
         Err(err) => return Err(err),
     }
     Ok(())
+}
+
+/// A column of a definition's target that its resume re-types
+/// ([`finish_requested_resume`]), from `old_type` to `new_type`
+/// (`format_type`): a definition chained off the target that reads it may
+/// pause for it (#828).
+#[derive(Debug, Clone)]
+struct RetypedColumn {
+    /// The target, `schema.table`.
+    table: String,
+    column: String,
+    old_type: String,
+    new_type: String,
+}
+
+/// Records, in the re-type's own transaction, that definition `id`'s resume
+/// re-typed `columns` of its target (`retype_causes`), replacing an earlier
+/// re-type's record of the same column. The capture pass then records `id`
+/// as the cause on the pause of each definition chained off the target
+/// that the re-type pauses
+/// (`staging::schema_change::pause_readers_of_retyped`), and names this
+/// resume in its `capture_failure`. Also deletes the records of a
+/// definition that's gone. Takes no lock on any definition's row (see
+/// `V76__retype_causes.sql`).
+async fn record_retype_causes(
+    txn: &Transaction<'_>,
+    id: i64,
+    columns: &[RetypedColumn],
+) -> Result<(), tokio_postgres::Error> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    txn.execute(
+        "delete from retype_causes r where not exists \
+         (select 1 from transform_definitions d where d.id = r.transform_id)",
+        &[],
+    )
+    .await?;
+    for c in columns {
+        txn.execute(
+            "insert into retype_causes (table_name, column_name, transform_id, old_type, new_type) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict (table_name, column_name) do update \
+             set transform_id = excluded.transform_id, old_type = excluded.old_type, \
+                 new_type = excluded.new_type, retyped_at = now()",
+            &[&c.table, &c.column, &id, &c.old_type, &c.new_type],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The `capture_failure` of a definition (bare target `target`) whose
+/// resume couldn't re-type `labels` (`error`, Postgres's) after it re-typed
+/// `retyped`. The definition stays paused and its target keeps its rows
+/// (#828, decision 1): when a value can't be converted, the repair is to
+/// drop the definition and define it again, which builds the target from
+/// empty. Trellis doesn't empty the target itself, because the application
+/// reads it.
+fn retype_failed_error(target: &str, labels: &[String], error: &str, retyped: &[String]) -> String {
+    // Each table is re-typed in its own transaction, so the copies of a
+    // table re-typed before this one keep their new types; the next resume
+    // finds them current.
+    let kept = if retyped.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} were re-typed already)", retyped.join(", "))
+    };
+    format!(
+        "the resume couldn't re-type Trellis's columns {} to the types define would give them \
+         now: {error}. They keep their types{kept}, the target keeps its rows, and the definition \
+         stays paused. If the cause can be removed (a view on the column, say), remove it and \
+         resume the definition again. If the values can't be converted, DROP TRANSFORM {target} \
+         and define it again, which builds the target from empty: Trellis doesn't empty a \
+         target on its own, since the application reads it",
+        labels.join(", "),
+    )
 }
 
 /// Ends definition `id`'s resume request without resuming it, in a

@@ -1405,10 +1405,16 @@ async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_it
             .expect("tag_labels");
         assert_eq!(reported.status, TransformStatus::Paused);
         let error = reported.capture_failure.expect("reason").error;
+        // #828: it names the repair, and why Trellis doesn't make it.
         assert!(
             error.contains("couldn't re-type Trellis's columns public.tag_labels.code")
                 && error.contains("invalid input syntax for type uuid")
-                && error.contains("drop the definition and define it again"),
+                && error.contains("the target keeps its rows")
+                && error.contains(
+                    "DROP TRANSFORM tag_labels and define it again, which builds the target \
+                     from empty: Trellis doesn't empty a target on its own, since the \
+                     application reads it"
+                ),
             "{error}"
         );
         let requests: i64 = raw
@@ -1678,7 +1684,8 @@ async fn widening_a_column_a_calculated_field_reads_pauses_and_resume_re_types_t
 /// `bigint` to `numeric` (`sum(bigint)`'s type) moves the column the
 /// downstream aggregate reads, and the pass pauses the downstream, whose
 /// `MIN` column and ledger contribution are `bigint`. Its resume re-types
-/// them, and a minimum above 2^63 lands.
+/// them, and a minimum above 2^63 lands. The downstream's pause names the
+/// upstream resume as its cause (#828).
 #[tokio::test]
 async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_downstream_reader() {
     let cluster = TestCluster::start();
@@ -1724,6 +1731,18 @@ async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_down
         "numeric"
     );
     let error = paused_for(&trellis, "smallest", "public.shop_totals", &["total"]).await;
+    // #828: the pause names the upstream resume that caused it.
+    assert!(
+        error.starts_with(
+            "the resume of transform shop_totals re-typed public.shop_totals.total from bigint \
+             to numeric"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        caused_by(&raw, "smallest").await.as_deref(),
+        Some("shop_totals")
+    );
     for column in [
         "public.smallest.least (bigint, now numeric)",
         "public.smallest__ledger.__arg0 (bigint, now numeric)",
@@ -1771,6 +1790,226 @@ async fn an_upstream_sum_re_typed_to_numeric_pauses_and_resume_re_types_its_down
         )
         .await,
     );
+}
+
+/// The upstream definition (its bare target) whose resume `target`'s pause
+/// records as its cause (#828), if any. `target` must have a pause record.
+async fn caused_by(raw: &Client, target: &str) -> Option<String> {
+    raw.query_one(
+        "select split_part(u.target_table, '.', 2) from capture_failures f \
+         join transform_definitions d on d.id = f.transform_id \
+         left join transform_definitions u on u.id = f.caused_by \
+         where split_part(d.target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{target}'s pause record: {err}"))
+    .get(0)
+}
+
+/// Whether `target` isn't paused and has no pause record. A reader of a
+/// target being rebuilt is `catching_up` (#476).
+async fn assert_unpaused(trellis: &Trellis, target: &str) {
+    let reported = trellis.status(target).await.expect("status").expect(target);
+    assert!(!reported.status.is_frozen(), "{target}: {reported:?}");
+    assert!(reported.capture_failure.is_none(), "{target}: {reported:?}");
+}
+
+/// #828: a resume that re-types a target's key (`integer` to `bigint`)
+/// pauses the definition chained off that target, whose own key copy is
+/// still `integer`. Its pause records the upstream resume as its cause and
+/// its message names that resume, not a column the operator altered. The
+/// definition chained off it is untouched until its own resume re-types its
+/// target, whose pause then names that resume in turn. Once each is resumed
+/// in order, all three are live with `bigint` keys.
+#[tokio::test]
+async fn a_resume_that_re_types_a_target_pauses_its_chained_readers_naming_the_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply("TRANSFORM b_names FROM public.item_names SELECT name AS name")
+        .await
+        .expect("define b_names");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names"]).await;
+    trellis
+        .apply("TRANSFORM c_names FROM public.b_names SELECT name AS name")
+        .await
+        .expect("define c_names");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "c_names"]).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    assert_eq!(caused_by(&raw, "item_names").await, None);
+    assert_unpaused(&trellis, "b_names").await;
+
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    let error = paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        error,
+        "the resume of transform item_names re-typed public.item_names.id from integer to \
+         bigint, which this definition reads, so the columns Trellis created for this \
+         definition from it can't hold every value of the types define would give them now: \
+         public.b_names.id (integer, now bigint). It waits on that resume: once item_names is \
+         live again, resume this definition to bring its columns to the new types and rebuild \
+         it, or drop the definition and define it again"
+    );
+    assert_eq!(
+        caused_by(&raw, "b_names").await.as_deref(),
+        Some("item_names")
+    );
+    assert_unpaused(&trellis, "c_names").await;
+
+    // Another pass keeps the first record.
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    assert_eq!(
+        caused_by(&raw, "b_names").await.as_deref(),
+        Some("item_names")
+    );
+    assert_unpaused(&trellis, "c_names").await;
+
+    resume(&trellis, "b_names").await;
+    assert_eq!(
+        caused_by(&raw, "b_names").await,
+        None,
+        "its own resume holds it now"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    let error = paused_for(&trellis, "c_names", "public.b_names", &["id"]).await;
+    assert!(
+        error.starts_with(
+            "the resume of transform b_names re-typed public.b_names.id from integer to bigint"
+        ) && error.contains("once b_names is live again"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "c_names").await.as_deref(), Some("b_names"));
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names"]).await;
+    resume(&trellis, "c_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "bigint");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "c_names"]).await;
+    raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
+        .await
+        .expect("a key above 2^31");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for target in ["item_names", "b_names", "c_names"] {
+        assert_unpaused(&trellis, target).await;
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.c_names order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name::text from public.items order by id"
+        )
+        .await,
+    );
+}
+
+/// #828: a definition the operator paused before the upstream's resume
+/// re-typed the target it reads was paused for another reason first. It
+/// gets the pause record, as before, but no cause: its message is the
+/// ordinary one. A sibling the resume did pause records it.
+#[tokio::test]
+async fn a_definition_paused_before_the_upstream_resume_records_no_cause() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    for text in [
+        "TRANSFORM b_names FROM public.item_names SELECT name AS name",
+        "TRANSFORM b_next FROM public.item_names SELECT next AS next",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "b_next"]).await;
+    trellis
+        .apply("PAUSE TRANSFORM b_next")
+        .await
+        .expect("pause b_next");
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+
+    paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        caused_by(&raw, "b_names").await.as_deref(),
+        Some("item_names")
+    );
+    let error = paused_for(&trellis, "b_next", "public.item_names", &["id"]).await;
+    assert!(
+        !error.contains("the resume of") && error.contains("Resume the definition"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "b_next").await, None);
+}
+
+/// #828: a definition the upstream's re-type pauses that also fails its own
+/// re-validation keeps its own error, with no cause: here the re-typed key
+/// is a relationship's to-side, whose join columns no longer match, which a
+/// resume refuses until the other side matches.
+#[tokio::test]
+async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute(
+        "create table public.notes (id int primary key, item int, body text); \
+         insert into public.notes values (1, 1, 'x'), (2, 2, 'y');",
+    )
+    .await
+    .expect("seed notes");
+    for text in [
+        "RELATIONSHIP item FROM notes.item TO item_names.id",
+        "TRANSFORM note_items FROM public.notes SELECT item.name AS item_name",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["item_names", "note_items"]).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+
+    // The pass checks the relationship's from-side first, and pauses it
+    // there.
+    let error = paused_for(&trellis, "note_items", "public.notes", &["item"]).await;
+    assert!(
+        !error.contains("the resume of") && error.contains("refuses until that is fixed"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "note_items").await, None);
+    resume_refused(&trellis, "note_items").await;
 }
 
 /// #824: a source change whose columns Trellis created from it hold every

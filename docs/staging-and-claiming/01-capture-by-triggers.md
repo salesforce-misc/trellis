@@ -332,7 +332,12 @@ request (`resume_requests`): the next pass re-types each such column (`ALTER
 ... TYPE`, one table per transaction, under `ACCESS EXCLUSIVE`, which
 rewrites the table for `integer` to `bigint`) and then completes the resume,
 which records the live key types and rebuilds. A crash between the two
-leaves the request, and the next pass finishes it.
+leaves the request, and the next pass finishes it. The re-type of a
+definition's target records which resume re-typed each column
+(`retype_causes`), so when the pass then pauses a definition chained off
+that target for those columns alone, its pause records the upstream as its
+cause (`capture_failures.caused_by`) and its `capture_failure` names the
+upstream resume.
 
 The pause doesn't stop a drain that reads a source key whose type is off the
 key allowlist: `staging::apply::compute` introspects every staged table's key

@@ -131,8 +131,27 @@ leaves the request, and the next pass (or the next `RESUME`) finishes the work. 
 column whose re-type fails (a value its new type can't hold) ends the request with the
 error on the definition's `capture_failure`, and leaves that table's columns as they
 were; another table's, re-typed before it, keep their new types, and the next resume
-finds them current. The resume always rebuilds after it re-types. Each re-type keeps
+finds them current. The target keeps its rows. When its values can't be converted (a key
+moved from `text` to `uuid` by a `USING` that isn't a cast), the error names the repair:
+`DROP TRANSFORM` and define the definition again, which builds the target from empty.
+Trellis doesn't empty the target itself, because the application reads it: emptying it
+is the operator's call. The resume always rebuilds after it re-types. Each re-type keeps
 the column's collation.
+
+A resume that re-types a definition's target can pause the definitions chained off it,
+when a column Trellis created for one of them, typed from the target's column, no longer
+has the type define would give it. The re-type's transaction records which definition's
+resume re-typed each target column (`retype_causes`). When the capture pass pauses a
+chained definition only for columns that resume re-typed, the pause records the upstream
+definition as its cause (`capture_failures.caused_by`), and the `capture_failure` names
+the upstream resume rather than a column the operator never altered. It says to resume
+the chained definition once the upstream is live again, since its rebuild reads the
+upstream's target. That resume re-types the chained definition's own target in turn, and
+the next definition down records it as its cause. Following the causes down from a
+definition finds every definition its resume paused, one level per resume. A chained
+definition the re-type leaves refused, failing its own re-validation (a relationship's join
+columns no longer match), keeps its own error and records no cause. So does one already
+paused for another reason, by the operator or by quarantine.
 
 Outside a resume, Trellis re-types a column on its own in one case: when every column
 of a table it created that the source widened widened by changing only the catalog.

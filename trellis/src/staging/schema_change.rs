@@ -35,7 +35,7 @@
 //! regenerates anything, whether or not a write has marked the change yet
 //! ([`pause_readers_of_missing`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use tokio_postgres::types::ToSql;
 
@@ -46,7 +46,7 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
-use crate::defs::model::RelationshipDefinition;
+use crate::defs::model::{RelationshipDefinition, TransformStatus};
 use crate::defs::validate::ValidationError;
 use crate::defs::{copies, key_types};
 use crate::pool::Pool;
@@ -163,7 +163,7 @@ async fn pause(
                 (columns, error)
             }
         };
-        if crate::defs::lifecycle::pause_for_capture_failure(txn, id, table, &columns, &error)
+        if crate::defs::lifecycle::pause_for_capture_failure(txn, id, table, &columns, &error, None)
             .await?
         {
             tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
@@ -364,7 +364,9 @@ pub(crate) async fn pause_readers_of_unsupported(
     }
     let txn = client.transaction().await?;
     for (id, error) in pauses {
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error).await? {
+        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
+            .await?
+        {
             tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }
@@ -407,8 +409,13 @@ pub(crate) async fn pause_readers_of_unsupported(
 /// the table's row-identity key after define, #687) gets the live one
 /// recorded here instead.
 ///
-/// The pause's `capture_failure` names every reason and what to do. Only a
-/// deliberate resume clears it (or a drop). A resume re-validates the
+/// The pause's `capture_failure` names every reason and what to do. When
+/// `table` is another definition's target and every reason is about a
+/// column that definition's resume re-typed (`retype_causes`, #828), it
+/// names that resume instead, and records the upstream definition as the
+/// pause's cause (`capture_failures.caused_by`), unless the definition was
+/// already frozen for another reason or a resume would refuse it
+/// ([`Pause::cause`]). Only a deliberate resume clears it (or a drop). A resume re-validates the
 /// definition as define would, and refuses while the first two hold;
 /// otherwise it re-records the key types, brings every column it created to
 /// the type define would give it now, and rebuilds
@@ -608,7 +615,7 @@ pub(crate) async fn pause_readers_of_retyped(
     // changing only the catalog is re-typed here, and pauses nothing.
     let in_place = retype_in_place(client, instance, table, &checked).await?;
 
-    let mut pauses: Vec<(i64, Vec<String>, String)> = Vec::new();
+    let mut pauses: Vec<Pause> = Vec::new();
     for Checked {
         id,
         mut columns,
@@ -617,6 +624,9 @@ pub(crate) async fn pause_readers_of_retyped(
         states,
     } in checked
     {
+        // Without a refusal, every key column flagged above is one whose
+        // change re-renders the keys stored.
+        let rerendered: Vec<String> = if refused { Vec::new() } else { columns.clone() };
         // A column that outgrew the type define would give it now, on a
         // table not re-typed in place, by the columns of this table each is
         // typed from.
@@ -632,10 +642,10 @@ pub(crate) async fn pause_readers_of_retyped(
             }
             outgrown.entry(from).or_default().push(state);
         }
-        for (from, states) in outgrown {
-            let inputs = input_types(&*client, table, &live, &states).await?;
-            reasons.push(outgrown_reason(table, &from, &inputs, &states));
-            for column in &from {
+        for (from, states) in &outgrown {
+            let inputs = input_types(&*client, table, &live, states).await?;
+            reasons.push(outgrown_reason(table, from, &inputs, states));
+            for column in from {
                 if !columns.contains(column) {
                     columns.push(column.clone());
                 }
@@ -652,7 +662,14 @@ pub(crate) async fn pause_readers_of_retyped(
                  rebuilds it. Or drop the definition and define it again"
             };
             let error = format!("{}. {remedy}", reasons.join("; "));
-            pauses.push((id, columns, error));
+            pauses.push(Pause {
+                id,
+                columns,
+                error,
+                refused,
+                rerendered,
+                outgrown: outgrown.into_iter().collect(),
+            });
         }
     }
 
@@ -675,7 +692,7 @@ pub(crate) async fn pause_readers_of_retyped(
     }
     let mut widened: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
     for (id, column) in widened_keys {
-        if !pauses.iter().any(|(paused, _, _)| *paused == id) {
+        if !pauses.iter().any(|p| p.id == id) {
             widened
                 .entry(id)
                 .or_default()
@@ -688,16 +705,202 @@ pub(crate) async fn pause_readers_of_retyped(
     if pauses.is_empty() {
         return Ok(false);
     }
+    // #828: a pause the re-type of an upstream definition's target caused,
+    // in a resume of that definition.
+    let causes = if pauses.iter().any(|p| !p.refused) {
+        retype_causes(&*client, table, &live).await?
+    } else {
+        HashMap::new()
+    };
     let txn = client.transaction().await?;
-    for (id, columns, error) in pauses {
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &columns, &error)
-            .await?
+    for pause in pauses {
+        let mut error = pause.error.clone();
+        let mut caused_by = None;
+        if let Some(cause) = pause.cause(&causes) {
+            // A definition already frozen (paused by the operator,
+            // quarantined) was paused for another reason first: it gets
+            // the record, as before, but not the cause. Read under the lock
+            // the pause takes on its row anyway.
+            let frozen = txn
+                .query_opt(
+                    "select status from transform_definitions where id = $1 for no key update",
+                    &[&pause.id],
+                )
+                .await?
+                .and_then(|row| TransformStatus::from_persisted(row.get(0)))
+                .is_some_and(TransformStatus::is_frozen);
+            if !frozen {
+                error = caused_error(table, &cause, &pause);
+                caused_by = Some(cause.upstream);
+            }
+        }
+        if crate::defs::lifecycle::pause_for_capture_failure(
+            &txn,
+            pause.id,
+            table,
+            &pause.columns,
+            &error,
+            caused_by,
+        )
+        .await?
         {
-            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+            tracing::warn!(transform_id = pause.id, table = %table, "definition paused: {error}");
         }
     }
     txn.commit().await?;
     Ok(true)
+}
+
+/// One definition [`pause_readers_of_retyped`] pauses, and why.
+struct Pause {
+    id: i64,
+    /// The columns of the checked table its reasons are about.
+    columns: Vec<String>,
+    /// Its `capture_failure` when no upstream resume caused it.
+    error: String,
+    /// Whether a resume would refuse it: define refuses what was found.
+    refused: bool,
+    /// Its key columns whose change re-renders the keys it stored (none
+    /// when `refused`).
+    rerendered: Vec<String>,
+    /// The columns Trellis created for it that outgrew their types, by the
+    /// columns of the checked table each is typed from.
+    outgrown: Vec<(Vec<String>, Vec<copies::CopyState>)>,
+}
+
+impl Pause {
+    /// The upstream resume that caused this pause (#828): every reason it
+    /// pauses for is about a column of the checked table one definition's
+    /// resume re-typed (`causes`, by column, from [`retype_causes`]). A
+    /// refused definition fails its own re-validation, so its own error
+    /// stands, with no cause.
+    fn cause(&self, causes: &HashMap<String, RetypeCause>) -> Option<RetypeCause> {
+        if self.refused {
+            return None;
+        }
+        let mut found: Vec<&RetypeCause> = Vec::new();
+        for column in &self.rerendered {
+            found.push(causes.get(column)?);
+        }
+        // A column typed from several columns of the table outgrew it
+        // because one of them changed: the cause, when one was re-typed.
+        for (from, _) in &self.outgrown {
+            found.push(from.iter().find_map(|c| causes.get(c))?);
+        }
+        let first = *found.first()?;
+        if found.iter().any(|c| c.upstream != first.upstream) || first.upstream == self.id {
+            return None;
+        }
+        // Every column of the table the upstream resume re-typed that this
+        // pause is about, for the message.
+        Some(RetypeCause {
+            upstream: first.upstream,
+            name: first.name.clone(),
+            columns: self
+                .columns
+                .iter()
+                .filter_map(|c| causes.get(c).filter(|k| k.upstream == first.upstream))
+                .flat_map(|k| k.columns.clone())
+                .collect(),
+        })
+    }
+}
+
+/// A definition whose resume re-typed columns of its target, as
+/// [`retype_causes`] reads it for one column, or [`Pause::cause`] gathers it
+/// for a pause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetypeCause {
+    upstream: i64,
+    /// The upstream definition's bare target: its name in `RESUME
+    /// TRANSFORM`.
+    name: String,
+    /// Each column re-typed, with its old and new type (`format_type`).
+    columns: Vec<(String, String, String)>,
+}
+
+/// The columns of `table` a resume of the definition that writes it
+/// re-typed (`retype_causes`, recorded by
+/// `staging::quarantine::finish_requested_resumes`), by column. A record
+/// counts only while its definition still writes `table` and the column
+/// still has the type it re-typed it to (`live`): a later change to the
+/// column is another cause.
+async fn retype_causes(
+    client: &impl tokio_postgres::GenericClient,
+    table: &str,
+    live: &HashMap<String, key_types::LiveColumn>,
+) -> Result<HashMap<String, RetypeCause>, tokio_postgres::Error> {
+    let mut causes = HashMap::new();
+    for row in client
+        .query(
+            "select r.column_name, r.transform_id, split_part(d.target_table, '.', 2), \
+                    r.old_type, r.new_type \
+             from retype_causes r \
+             join transform_definitions d \
+               on d.id = r.transform_id and d.target_table = r.table_name \
+             where r.table_name = $1",
+            &[&table],
+        )
+        .await?
+    {
+        let column: String = row.get(0);
+        let new_type: String = row.get(4);
+        if live.get(&column).is_none_or(|now| now.display != new_type) {
+            continue;
+        }
+        causes.insert(
+            column.clone(),
+            RetypeCause {
+                upstream: row.get(1),
+                name: row.get(2),
+                columns: vec![(column, row.get(3), new_type)],
+            },
+        );
+    }
+    Ok(causes)
+}
+
+/// The `capture_failure` of a definition `pause` that `cause`'s resume
+/// paused (#828), by re-typing columns of its target `table` the
+/// definition reads. It names that resume, not the columns as if the
+/// operator had altered them, and says to resume this definition once the
+/// upstream is live again: its rebuild reads the upstream's target.
+fn caused_error(table: &str, cause: &RetypeCause, pause: &Pause) -> String {
+    let retyped: Vec<String> = cause
+        .columns
+        .iter()
+        .map(|(column, old, new)| format!("{table}.{column} from {old} to {new}"))
+        .collect();
+    let mut effects: Vec<String> = Vec::new();
+    let outgrown: Vec<copies::CopyState> = pause
+        .outgrown
+        .iter()
+        .flat_map(|(_, states)| states.iter().cloned())
+        .collect();
+    if !outgrown.is_empty() {
+        effects.push(format!(
+            "the columns Trellis created for this definition from {} can't hold every value \
+             of the types define would give them now: {}",
+            if retyped.len() == 1 { "it" } else { "them" },
+            outgrown_columns(&outgrown)
+        ));
+    }
+    if !pause.rerendered.is_empty() {
+        effects.push(
+            "the keys Trellis stored for this definition no longer match the new type's \
+             rendering"
+                .to_string(),
+        );
+    }
+    format!(
+        "the resume of transform {name} re-typed {retyped}, which this definition reads, so \
+         {effects}. It waits on that resume: once {name} is live again, resume this definition \
+         to bring its columns to the new types and rebuild it, or drop the definition and \
+         define it again",
+        name = cause.name,
+        retyped = retyped.join(", "),
+        effects = effects.join(", and "),
+    )
 }
 
 /// What [`pause_readers_of_retyped`] found for one definition before it
@@ -1134,6 +1337,113 @@ mod tests {
 
     fn input(label: &str, now: &str) -> (String, String) {
         (label.to_string(), now.to_string())
+    }
+
+    /// The resume of definition `upstream` (`up`) re-typed `column` of the
+    /// checked table from `integer` to `bigint`.
+    fn cause(upstream: i64, column: &str) -> (String, RetypeCause) {
+        (
+            column.to_string(),
+            RetypeCause {
+                upstream,
+                name: "up".to_string(),
+                columns: vec![(
+                    column.to_string(),
+                    "integer".to_string(),
+                    "bigint".to_string(),
+                )],
+            },
+        )
+    }
+
+    /// Definition 7, paused for `outgrown` columns typed from columns of
+    /// `public.up` and for `rerendered` key columns.
+    fn pause(refused: bool, rerendered: &[&str], outgrown: &[&[&str]]) -> Pause {
+        let mut columns: Vec<String> = rerendered.iter().map(|c| c.to_string()).collect();
+        for from in outgrown {
+            for c in from.iter() {
+                if !columns.iter().any(|seen| seen == c) {
+                    columns.push(c.to_string());
+                }
+            }
+        }
+        Pause {
+            id: 7,
+            columns,
+            error: "its own reason".to_string(),
+            refused,
+            rerendered: rerendered.iter().map(|c| c.to_string()).collect(),
+            outgrown: outgrown
+                .iter()
+                .map(|from| {
+                    let reads: Vec<(&str, &str)> = from.iter().map(|c| ("public.up", *c)).collect();
+                    (
+                        from.iter().map(|c| c.to_string()).collect(),
+                        vec![state(from[0], &reads, from.len() > 1)],
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// #828: a pause is the upstream resume's only when every reason it
+    /// pauses for is about a column that resume re-typed, and the definition
+    /// doesn't fail its own re-validation.
+    #[test]
+    fn a_pause_is_caused_by_an_upstream_resume_only_when_every_reason_is_its() {
+        let causes: HashMap<String, RetypeCause> = [cause(3, "id"), cause(3, "n")].into();
+        let caused = pause(false, &[], &[&["id"]])
+            .cause(&causes)
+            .expect("caused");
+        assert_eq!(caused.upstream, 3);
+        assert_eq!(
+            caused.columns,
+            vec![(
+                "id".to_string(),
+                "integer".to_string(),
+                "bigint".to_string()
+            )]
+        );
+        // A column typed from several columns of the table, one re-typed.
+        assert!(
+            pause(false, &[], &[&["id", "qty"]])
+                .cause(&causes)
+                .is_some()
+        );
+        // A key column whose keys render differently, re-typed upstream.
+        assert!(pause(false, &["n"], &[]).cause(&causes).is_some());
+
+        // Refused: its own re-validation fails, so its own error stands.
+        assert_eq!(pause(true, &[], &[&["id"]]).cause(&causes), None);
+        // A reason no resume caused.
+        assert_eq!(pause(false, &[], &[&["id"], &["qty"]]).cause(&causes), None);
+        assert_eq!(pause(false, &["qty"], &[&["id"]]).cause(&causes), None);
+        // Two upstream resumes: nothing records which to wait for.
+        let mixed: HashMap<String, RetypeCause> = [cause(3, "id"), cause(4, "n")].into();
+        assert_eq!(pause(false, &[], &[&["id"], &["n"]]).cause(&mixed), None);
+        // Nothing re-typed at all.
+        assert_eq!(pause(false, &[], &[&["id"]]).cause(&HashMap::new()), None);
+        // A definition's own resume isn't its upstream.
+        let own: HashMap<String, RetypeCause> = [cause(7, "id")].into();
+        assert_eq!(pause(false, &[], &[&["id"]]).cause(&own), None);
+    }
+
+    /// #828: the message of a pause an upstream resume caused names that
+    /// resume, and says to resume this definition once the upstream is live.
+    #[test]
+    fn a_caused_pause_names_the_upstream_resume() {
+        let causes: HashMap<String, RetypeCause> = [cause(3, "id")].into();
+        let paused = pause(false, &[], &[&["id"]]);
+        let caused = paused.cause(&causes).expect("caused");
+        assert_eq!(
+            caused_error("public.up", &caused, &paused),
+            "the resume of transform up re-typed public.up.id from integer to bigint, which \
+             this definition reads, so the columns Trellis created for this definition from it \
+             can't hold every value of the types define would give them now: public.mix.id \
+             (integer, now bigint). It waits on that resume: once up is live again, resume this \
+             definition to bring its columns to the new types and rebuild it, or drop the \
+             definition and define it again"
+        );
     }
 
     /// A column is named as the one that widened only when it is the only
