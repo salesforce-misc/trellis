@@ -14,4 +14,4 @@
 #   other programs. Re-sweep the tier and redo its entries.
 #
 # tier        case    issue  what fails
-steady_load   7:7     #838   1-1 t4.rel_enrich keeps a superseded parent value, no action in the burst (rare)
+steady_load   7:7     #886   1-1 t4.rel_enrich keeps a superseded parent value, no action in the burst (rare)

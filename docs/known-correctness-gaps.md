@@ -95,7 +95,7 @@ These are the tools the entries refer to:
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
-| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #838 |
+| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
@@ -578,9 +578,9 @@ while the column is paused.
 (`author.name AS author_name`), and concurrent writes to both tables: child
 rows inserted, deleted and inserted again while their parent's value changes
 several times. No pause, resume, build or other action is involved. It is
-rare: one generated case fails in roughly one run in 100 under the
-steady-load tier's page and build chunk stalls, with other processes loading
-the machine.
+rare and depends on load: one generated case, under the steady-load tier's
+page and build chunk stalls, fails a few times in 100 runs while other
+processes load the machine, and didn't fail in 200 runs on a quiet one.
 
 **Effect:** every child of one parent kept a value the parent held only
 briefly, after two later updates replaced it (61, then 17, then `NULL`; the
@@ -590,7 +590,7 @@ since the write reads the same stale projection.
 **Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
 through a relationship (entry 16).
 
-**Planned work:** #838. The relationship projection's own row for the parent
+**Planned work:** #886. The relationship projection's own row for the parent
 keeps the superseded value once everything has drained (61, while the parent
 holds `NULL`), so every child read through it gets that value: a parent
 change's advance of the projection is lost. What loses it isn't known yet. It
@@ -599,7 +599,12 @@ missing projection key), and it needs no resume or build. Milestone E (#624)
 replaces the relationship projection a 1-1 target reads its to-one values
 from.
 
-**Repair:** `PAUSE`/`RESUME` the transform.
+**Repair:** `request_backfill` the parent table. Its catch-up refreshes the
+relationship projection from the table, then re-derives every child from it.
+`PAUSE`/`RESUME` of the transform repairs it only when every other
+transform on the child table that reads the same relationship is paused too:
+a resume refreshes the projection only when no unpaused transform reads it,
+and otherwise its rebuild reads the same stale projection.
 
 ## 22. A column read only as a field moved to another type family
 
