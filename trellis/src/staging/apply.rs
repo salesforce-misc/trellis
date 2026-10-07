@@ -3604,8 +3604,10 @@ async fn bump_generations(
 /// reverse records theirs one record at a time, in fold order, so two pages,
 /// or a page and the release, touching an overlapping set of keys in
 /// different orders would deadlock. A key with no row yet has nothing to
-/// lock here; a record that inserts its row takes that row's lock when it
-/// writes it.
+/// lock here: a row committed after this statement is locked by the record
+/// that reads it (its guards), and a record that inserts a row takes its
+/// lock when it writes it, both in record order. Two pages can still
+/// deadlock through such a row, but only while it is being created.
 async fn lock_page_projection_rows<'a>(
     txn: &Transaction<'_>,
     gen_bumps: &HashMap<i64, RelationshipGenBump>,
@@ -5326,6 +5328,19 @@ mod tests {
         .get(0)
     }
 
+    /// The rows `txn` has fetched from `public.stale_projection` through an
+    /// index.
+    async fn projection_index_fetches(txn: &Transaction<'_>) -> i64 {
+        txn.query_one(
+            "select idx_tup_fetch from pg_stat_xact_user_tables \
+             where relid = 'public.stale_projection'::regclass",
+            &[],
+        )
+        .await
+        .expect("fetches")
+        .get(0)
+    }
+
     /// Asserts that `plan` reads the projection only through its primary key
     /// index, by the keys: no sequential scan, and no filter, which a scan
     /// of the whole index (the order the release's lock asks for) applies
@@ -5527,6 +5542,124 @@ mod tests {
             .map(|row| (row.get(0), row.get(1)))
             .collect();
         assert_eq!(gens, vec![(1, 1), (2, 1)], "each key's row is bumped once");
+    }
+
+    /// Issue #848: a page's projection lock ([`lock_page_projection_rows`])
+    /// locks the rows of its generation bumps' keys and of each reverse
+    /// record's old and new key, and no other, reading a projection whose
+    /// statistics lag its size by its primary key, as the release's lock
+    /// does. The reverse records' statement is built from the shape's key
+    /// type, and the settings are put back afterwards. Under 4,900 keys
+    /// compared at the key's type, PostgreSQL 16 scans the projection unless
+    /// the statement runs under the entry plan settings; with the key cast to
+    /// `text`, it walks the whole key index.
+    #[tokio::test]
+    async fn a_page_locks_every_projection_row_it_writes_by_the_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, projection, key_pg_type, keys) = stale_projection(&db).await;
+        let bump = RelationshipGenBump {
+            lock_sql: projection_lock_statement(&projection, "id", key_pg_type.as_deref()),
+            sql: generation_bump_statement(&projection, "id", key_pg_type.as_deref()),
+            touched_keys: keys[..4900].iter().cloned().collect(),
+        };
+        let shape = Arc::new(ReverseRelationshipShape {
+            id: 2,
+            name: "parent".to_string(),
+            qualified_projection: projection.clone(),
+            projection_table_bare: "stale_projection".to_string(),
+            projection_schema: "public".to_string(),
+            to_col: "id".to_string(),
+            from_table: "public.src".to_string(),
+            from_col: "p".to_string(),
+            from_key_pg_type: std::sync::OnceLock::new(),
+            from_pk: None,
+            needs_recompute_fallback: false,
+            to_side: ToSide {
+                table: projection.clone(),
+                identity: "public.stale_projection".to_string(),
+                seam_fed: false,
+                key_pg_type: std::sync::OnceLock::new(),
+            },
+        });
+        let record = RelationshipReverseRecord {
+            shape,
+            old_row: None,
+            new_row: None,
+            old_image: None,
+            new_image: None,
+            lsn: None,
+            prev_lsn: None,
+            prev_gen: None,
+            watermark: PgLsn::from(0),
+            hop_gen: 0,
+            src_changed: None,
+            origin_lsn: None,
+            retry_count: 0,
+        };
+        // A key change, a key with no row yet, and a record with no key.
+        let reverse_keys = [
+            (Some(keys[4960].clone()), Some(keys[4950].clone())),
+            (None, Some("400001".to_string())),
+            (None, None),
+        ];
+        let bumps = HashMap::from([(1, bump)]);
+        let txn = client.transaction().await.expect("begin");
+        let before = projection_seq_scans(&txn).await;
+        let fetched_before = projection_index_fetches(&txn).await;
+        lock_page_projection_rows(
+            &txn,
+            &bumps,
+            reverse_keys.iter().map(|keys| (&record, keys)),
+        )
+        .await
+        .expect("lock");
+        assert_eq!(
+            projection_seq_scans(&txn).await,
+            before,
+            "the lock must not scan the projection"
+        );
+        let fetched = projection_index_fetches(&txn).await - fetched_before;
+        assert!(
+            fetched <= 4902,
+            "the lock fetches only the keys' rows, not the whole key index: {fetched}"
+        );
+        let setting: String = txn
+            .query_one("select current_setting('enable_seqscan')", &[])
+            .await
+            .expect("setting")
+            .get(0);
+        assert_eq!(setting, "on", "the settings are put back afterwards");
+        let (other, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let candidates: Vec<i32> = [0, 4899, 4900, 4950, 4960, 4999]
+            .iter()
+            .map(|&i| keys[i].parse().expect("an integer key"))
+            .collect();
+        let free: Vec<i32> = other
+            .query(
+                "select id from stale_projection where id = any($1) \
+                 order by stale_projection.id for update skip locked",
+                &[&candidates],
+            )
+            .await
+            .expect("free rows")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        txn.rollback().await.expect("rollback");
+        let expected_free: Vec<i32> = [4900, 4999]
+            .iter()
+            .map(|&i| keys[i].parse().expect("an integer key"))
+            .collect();
+        assert_eq!(
+            free, expected_free,
+            "the bump's keys and the reverse records' keys are locked, and no other"
+        );
     }
 
     /// Issue #835: Phase 3's single-key projection statements (the reverse

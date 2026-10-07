@@ -590,9 +590,13 @@ the one the reverse release uses. Left to themselves, the bump would write
 its rows in whatever order its plan reads them (physical order under a
 bitmap scan), and the reverse records would lock theirs one at a time in
 fold order. Either one deadlocks against a page or a release that reaches
-the same parents in another order. A reverse record whose key has no
-projection row yet inserts that row after the sorted lock and takes its
-lock as it writes it.
+the same parents in another order. The sorted lock finds only the rows
+that exist when it runs. A row it didn't find, because it doesn't exist yet
+or was committed after the lock, is locked when a reverse record reads or
+writes it, in record order, and a record inserting a key another page is
+inserting waits on that page's insert. Two pages can still deadlock through
+such a row, but only while a projection row both of them reach is being
+created; Postgres aborts one of them, which retries.
 
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on

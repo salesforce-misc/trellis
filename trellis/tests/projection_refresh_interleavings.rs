@@ -364,8 +364,8 @@ async fn projection_of(d: &Driver, name: &str) -> String {
 
 /// Issue #848: a page's relationship reverse records lock their projection
 /// rows in key order, the order a page's generation bump and the reverse
-/// release take them in (ADR-0002 I5). The page meets its records in fold
-/// order, by key text here, so parent 10 before parent 9. Locked one record
+/// release take them in (ADR-0002 I5). The page meets its records in page
+/// order, by route hash, which puts parent 10 before parent 9. Locked one record
 /// at a time, a reverse page frozen after its first record's guards holds
 /// parent 10's row; a forward page bumping parents 9 and 10 then locks 9 and
 /// queues on 10, and the reverse page, released, queues on 9: a cycle.
@@ -386,6 +386,23 @@ async fn a_page_locks_its_reverse_projection_rows_in_key_order() {
     // segment, which a seal waits for.
     write(&d, "update public.par set w = w + 1 where id in (9, 10)").await;
     let reverse_batch = d.seal().await;
+    // The cycle below needs the reverse page to meet parent 10 first. A page
+    // meets its records in page order, by the ring rows' `route` (a hash of
+    // the table and key), which puts 10 first. Without the fix the `free`
+    // assertion fails whichever comes first.
+    assert_eq!(
+        d.rows(
+            "select key from (select src_table, key, route from seg_0 \
+             union all select src_table, key, route from seg_1 \
+             union all select src_table, key, route from seg_2 \
+             union all select src_table, key, route from seg_3) r \
+             where src_table = 'public.par' and key in ('9', '10') \
+             group by key order by min(route)"
+        )
+        .await,
+        ["(10)", "(9)"],
+        "the page meets parent 10 before parent 9"
+    );
     write(&d, "update public.src set g = g + 1 where id in (4, 5)").await;
     let forward_batch = d.seal().await;
     let projection = projection_of(&d, "parent").await;

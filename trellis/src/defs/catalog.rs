@@ -5751,8 +5751,9 @@ pub(crate) fn pending_to_side_changes(
 /// projection row while it writes an aggregate consumer's target row the
 /// same discharge's orphan sweep deleted, or with a drain that carries no
 /// reverse record for the relationship (so took no stamp lock) and locks
-/// projection rows in key order (step 3c's `__trellis_gen` bump) while this
-/// locks them in scan order. Postgres aborts one side, the same bounded case
+/// projection rows in key order (its sorted lock for the step 3c
+/// `__trellis_gen` bump) while this locks them in scan order. Postgres
+/// aborts one side, the same bounded case
 /// as the sweep's own (`intake::resume_orphans`): an aborted apply is a
 /// transient error with no quarantine charge, and an aborted discharge rolls
 /// back whole and retries after the marker's backoff.
