@@ -27,7 +27,7 @@ class ValuesTest < Minitest::Test
       status: :waiting_to_backfill,
       backfill_failure: { source_table: "public.orders", attempts: 3,
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
-      capture_wait: nil, capture_failure: nil, held_keys: nil
+      capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -37,7 +37,8 @@ class ValuesTest < Minitest::Test
       ),
       capture_wait: nil,
       capture_failure: nil,
-      held_keys: nil
+      held_keys: nil,
+      drain_failure: nil
     ), status
   end
 
@@ -49,7 +50,8 @@ class ValuesTest < Minitest::Test
                       observed_at_micros: MICROS + 1, blockers: ["pid 42 holds RowExclusiveLock"] },
       capture_failure: { kind: :capture, source_table: "public.lines", columns: ["qty"],
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
-      held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 }
+      held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
+      drain_failure: nil
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -63,8 +65,38 @@ class ValuesTest < Minitest::Test
         kind: :capture, source_table: "public.lines", columns: ["qty"], error: "column \"qty\" was dropped",
         detected_at: Trellis::EpochMicros.to_time(MICROS)
       ),
-      held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2))
+      held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
+      drain_failure: nil
     ), status
+  end
+
+  def test_a_drain_failure_becomes_a_value_with_times
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
+      drain_failure: { seg_seq: 17, tables: ["public.lines", "public.orders"],
+                       error: "permission denied for function audit_hook", sqlstate: "42501",
+                       since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 }
+    )
+    assert_equal Trellis::DrainFailure.new(
+      seg_seq: 17, tables: ["public.lines", "public.orders"],
+      error: "permission denied for function audit_hook", sqlstate: "42501",
+      since: Trellis::EpochMicros.to_time(MICROS), last_seen: Trellis::EpochMicros.to_time(MICROS + 1),
+      attempts: 5
+    ), status.drain_failure
+  end
+
+  def test_a_self_check_reports_drain_failures_become_values_whatever_the_outcome
+    report = Trellis::SelfCheckReport.from_native(
+      target: "order_totals", outcome: :converged, divergences: [], rows_compared: 2,
+      next_after: nil, checked_through: "1/16B3748", held_keys: nil,
+      drain_failures: [{ seg_seq: 9, tables: ["public.orders"], error: "records fail only together",
+                         sqlstate: nil, since_micros: MICROS, last_seen_micros: MICROS, attempts: 1 }]
+    )
+    assert_equal [Trellis::DrainFailure.new(
+      seg_seq: 9, tables: ["public.orders"], error: "records fail only together", sqlstate: nil,
+      since: Trellis::EpochMicros.to_time(MICROS), last_seen: Trellis::EpochMicros.to_time(MICROS),
+      attempts: 1
+    )], report.drain_failures
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure

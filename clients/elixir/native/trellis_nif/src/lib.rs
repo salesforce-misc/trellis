@@ -47,12 +47,12 @@ use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisOptions
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus,
-    PlainDefinitionSummary, PlainDivergence, PlainError, PlainHeldKeys, PlainPoisonEntry,
-    PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
-    PlainSelfCheckReport, SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
+    PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES, capture_failure_kind_names,
+    decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
+    relationship_cardinality_names, require_transform_statement, self_check_mode,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -159,6 +159,34 @@ struct StatusTerm {
     capture_wait: Option<CaptureWaitTerm>,
     capture_failure: Option<CaptureFailureTerm>,
     held_keys: Option<HeldKeysTerm>,
+    drain_failure: Option<DrainFailureTerm>,
+}
+
+/// A drain page that keeps failing with nothing charged or paused, as
+/// `status/2` and `self_check/3` report it.
+#[derive(NifMap)]
+struct DrainFailureTerm {
+    seg_seq: i64,
+    tables: Vec<String>,
+    error: String,
+    sqlstate: Option<String>,
+    since_micros: i64,
+    last_seen_micros: i64,
+    attempts: u32,
+}
+
+impl From<PlainDrainFailure> for DrainFailureTerm {
+    fn from(failure: PlainDrainFailure) -> Self {
+        DrainFailureTerm {
+            seg_seq: failure.seg_seq,
+            tables: failure.tables,
+            error: failure.error,
+            sqlstate: failure.sqlstate,
+            since_micros: failure.since_micros,
+            last_seen_micros: failure.last_seen_micros,
+            attempts: failure.attempts,
+        }
+    }
 }
 
 /// How many keys a definition holds in quarantine, and since when, as
@@ -388,6 +416,7 @@ struct SelfCheckReportTerm {
     outcome: Atom,
     divergences: Vec<DivergenceTerm>,
     held_keys: Option<HeldKeysTerm>,
+    drain_failures: Vec<DrainFailureTerm>,
 }
 
 /// One divergence. `kind` is one of [`DIVERGENCE_KINDS`]; see
@@ -417,6 +446,11 @@ impl SelfCheckReportTerm {
                 .map(|divergence| DivergenceTerm::new(env, divergence))
                 .collect::<NifReply<_>>()?,
             held_keys: report.held_keys.map(HeldKeysTerm::from),
+            drain_failures: report
+                .drain_failures
+                .into_iter()
+                .map(DrainFailureTerm::from)
+                .collect(),
         })
     }
 }
@@ -797,6 +831,7 @@ fn status(
             .map(|failure| CaptureFailureTerm::new(env, failure))
             .transpose()?,
         held_keys: status.held_keys.map(HeldKeysTerm::from),
+        drain_failure: status.drain_failure.map(DrainFailureTerm::from),
     }))
 }
 

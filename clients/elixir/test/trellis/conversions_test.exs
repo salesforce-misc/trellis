@@ -65,6 +65,7 @@ defmodule Trellis.ConversionsTest do
         next_after: "2",
         outcome: :diverged,
         held_keys: nil,
+        drain_failures: [],
         divergences: [
           %{
             kind: :cell,
@@ -113,7 +114,8 @@ defmodule Trellis.ConversionsTest do
                  detail: "the capture trigger trellis_capture_insert on public.orders is missing"
                }
              ],
-             held_keys: nil
+             held_keys: nil,
+             drain_failures: []
            }
   end
 
@@ -126,13 +128,50 @@ defmodule Trellis.ConversionsTest do
         next_after: nil,
         outcome: :not_caught_up,
         divergences: [],
-        held_keys: %{count: 1, oldest_poisoned_at_micros: 1_727_222_400_654_321}
+        held_keys: %{count: 1, oldest_poisoned_at_micros: 1_727_222_400_654_321},
+        drain_failures: []
       })
 
     assert report.held_keys == %Trellis.HeldKeys{
              count: 1,
              oldest_poisoned_at: ~U[2024-09-25 00:00:00.654321Z]
            }
+  end
+
+  test "a self-check report's drain failures become structs with DateTimes, whatever the outcome" do
+    report =
+      SelfCheckReport.from_native(%{
+        target: "order_totals",
+        checked_through: "1/16B3748",
+        rows_compared: 2,
+        next_after: nil,
+        outcome: :converged,
+        divergences: [],
+        held_keys: nil,
+        drain_failures: [
+          %{
+            seg_seq: 9,
+            tables: ["public.orders"],
+            error: "records fail only together",
+            sqlstate: nil,
+            since_micros: 1_727_222_400_654_321,
+            last_seen_micros: 1_727_222_400_654_321,
+            attempts: 1
+          }
+        ]
+      })
+
+    assert report.drain_failures == [
+             %Trellis.DrainFailure{
+               seg_seq: 9,
+               tables: ["public.orders"],
+               error: "records fail only together",
+               sqlstate: nil,
+               since: ~U[2024-09-25 00:00:00.654321Z],
+               last_seen: ~U[2024-09-25 00:00:00.654321Z],
+               attempts: 1
+             }
+           ]
   end
 
   defp native_definition do

@@ -76,19 +76,41 @@ module Trellis
   #   target rows stay as they were, whatever its status, :live included.
   #   Trellis.sample_quarantined lists them, and Trellis.release_key releases
   #   one once its cause is fixed.
+  # - drain_failure: the drain keeps failing on a page holding changes to a
+  #   table it reads, with nothing charged or paused (a DrainFailure), so its
+  #   target stops short of that page, whatever its status, :live included.
+  #   Every drain pass retries the page; fix the cause its error names. A
+  #   paused or quarantined definition has none.
   # Every process sees them, whichever one runs the staging worker.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
-                       :held_keys) do
+                       :held_keys, :drain_failure) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
       capture_failure = hash[:capture_failure]
       held_keys = hash[:held_keys]
+      drain_failure = hash[:drain_failure]
       new(status: hash[:status],
           backfill_failure: failure && BackfillFailure.from_native(failure),
           capture_wait: wait && CaptureWait.from_native(wait),
           capture_failure: capture_failure && CaptureFailure.from_native(capture_failure),
-          held_keys: held_keys && HeldKeys.from_native(held_keys))
+          held_keys: held_keys && HeldKeys.from_native(held_keys),
+          drain_failure: drain_failure && DrainFailure.from_native(drain_failure))
+    end
+  end
+
+  # A drain page that keeps failing with nothing charged or paused, as
+  # Trellis.status and Trellis.self_check report it: the segment whose page
+  # fails (seg_seq), the qualified source tables it holds changes to
+  # (tables), the latest failure's error and its SQLSTATE (sqlstate, nil when
+  # it didn't come from Postgres), when a drain first and last failed on it
+  # (since and last_seen, Times), and how many drain passes have (attempts).
+  DrainFailure = Data.define(:seg_seq, :tables, :error, :sqlstate, :since, :last_seen,
+                             :attempts) do
+    def self.from_native(hash)
+      new(**hash.except(:since_micros, :last_seen_micros),
+          since: EpochMicros.to_time(hash.fetch(:since_micros)),
+          last_seen: EpochMicros.to_time(hash.fetch(:last_seen_micros)))
     end
   end
 
@@ -271,12 +293,17 @@ module Trellis
   #   keys in quarantine, nil otherwise. Their target rows are ones the audit
   #   can't vouch for, and a key with held changes keeps the target from
   #   catching up, so the outcome is :not_caught_up until it is released.
+  # - drain_failures: whatever the outcome, every DrainFailure open on the
+  #   instance, oldest first, whichever definitions read its tables; [] when
+  #   there is none. Each holds back the targets of the tables it holds
+  #   changes to, and with them the convergence the audit waits on.
   SelfCheckReport = Data.define(:target, :outcome, :divergences, :rows_compared, :next_after,
-                                :checked_through, :held_keys) do
+                                :checked_through, :held_keys, :drain_failures) do
     def self.from_native(hash)
       held_keys = hash[:held_keys]
       new(**hash, divergences: hash.fetch(:divergences).map { |d| Divergence.new(**d) },
-                  held_keys: held_keys && HeldKeys.from_native(held_keys))
+                  held_keys: held_keys && HeldKeys.from_native(held_keys),
+                  drain_failures: hash.fetch(:drain_failures).map { |f| DrainFailure.from_native(f) })
     end
   end
 

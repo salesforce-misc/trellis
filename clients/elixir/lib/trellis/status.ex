@@ -27,6 +27,12 @@ defmodule Trellis.Status do
       their target rows stay as they were, whatever its status, `:live`
       included. `Trellis.sample_quarantined/3` lists them, and
       `Trellis.release_key/4` releases one once its cause is fixed.
+    * `drain_failure` is set while the drain keeps failing on a page holding
+      changes to a table it reads, with nothing charged or paused (see
+      `Trellis.DrainFailure`), so its target stops short of that page,
+      whatever its status, `:live` included. Every drain pass retries the
+      page; fix the cause its error names. A paused or quarantined
+      transform has none.
 
   Every process sees them, whichever one runs the staging worker.
   """
@@ -40,10 +46,18 @@ defmodule Trellis.Status do
           backfill_failure: Trellis.BackfillFailure.t() | nil,
           capture_wait: Trellis.CaptureWait.t() | nil,
           capture_failure: Trellis.CaptureFailure.t() | nil,
-          held_keys: Trellis.HeldKeys.t() | nil
+          held_keys: Trellis.HeldKeys.t() | nil,
+          drain_failure: Trellis.DrainFailure.t() | nil
         }
 
-  @enforce_keys [:status, :backfill_failure, :capture_wait, :capture_failure, :held_keys]
+  @enforce_keys [
+    :status,
+    :backfill_failure,
+    :capture_wait,
+    :capture_failure,
+    :held_keys,
+    :drain_failure
+  ]
   defstruct @enforce_keys
 
   @doc false
@@ -52,14 +66,53 @@ defmodule Trellis.Status do
         backfill_failure: failure,
         capture_wait: wait,
         capture_failure: capture_failure,
-        held_keys: held_keys
+        held_keys: held_keys,
+        drain_failure: drain_failure
       }) do
     %__MODULE__{
       status: status,
       backfill_failure: failure && Trellis.BackfillFailure.from_native(failure),
       capture_wait: wait && Trellis.CaptureWait.from_native(wait),
       capture_failure: capture_failure && Trellis.CaptureFailure.from_native(capture_failure),
-      held_keys: held_keys && Trellis.HeldKeys.from_native(held_keys)
+      held_keys: held_keys && Trellis.HeldKeys.from_native(held_keys),
+      drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure)
+    }
+  end
+end
+
+defmodule Trellis.DrainFailure do
+  @moduledoc """
+  A drain page that keeps failing with nothing charged or paused, as
+  `Trellis.status/2` and `Trellis.self_check/3` report it: the segment whose
+  page fails (`seg_seq`), the qualified source tables it holds changes to
+  (`tables`), the latest failure's `error` and its `sqlstate` (`nil` when it
+  didn't come from Postgres), when a drain first and last failed on it
+  (`since`, `last_seen`), and how many drain passes have (`attempts`).
+  """
+
+  @type t :: %__MODULE__{
+          seg_seq: integer(),
+          tables: [String.t()],
+          error: String.t(),
+          sqlstate: String.t() | nil,
+          since: DateTime.t(),
+          last_seen: DateTime.t(),
+          attempts: pos_integer()
+        }
+
+  @enforce_keys [:seg_seq, :tables, :error, :sqlstate, :since, :last_seen, :attempts]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{since_micros: since, last_seen_micros: last_seen} = failure) do
+    %__MODULE__{
+      seg_seq: failure.seg_seq,
+      tables: failure.tables,
+      error: failure.error,
+      sqlstate: failure.sqlstate,
+      since: Trellis.Time.from_micros(since),
+      last_seen: Trellis.Time.from_micros(last_seen),
+      attempts: failure.attempts
     }
   end
 end

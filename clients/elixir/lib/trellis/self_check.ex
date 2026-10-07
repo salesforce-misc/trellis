@@ -21,6 +21,11 @@ defmodule Trellis.SelfCheckReport do
     in quarantine (see `Trellis.HeldKeys`): their target rows are ones the
     audit can't vouch for, and a key with held changes keeps the target from
     catching up, so the outcome is `:not_caught_up` until it is released.
+  - `drain_failures` lists, whatever the outcome, every page the drain keeps
+    failing on with nothing charged or paused (see `Trellis.DrainFailure`),
+    oldest first, whichever transforms read its tables; `[]` when there is
+    none. Each holds back the targets of the tables it holds changes to, and
+    with them the convergence the audit waits on.
   """
 
   @typedoc "The verdict of one `Trellis.self_check/3` page."
@@ -36,7 +41,8 @@ defmodule Trellis.SelfCheckReport do
           rows_compared: non_neg_integer(),
           next_after: cursor() | nil,
           checked_through: Trellis.watermark(),
-          held_keys: Trellis.HeldKeys.t() | nil
+          held_keys: Trellis.HeldKeys.t() | nil,
+          drain_failures: [Trellis.DrainFailure.t()]
         }
 
   @enforce_keys [
@@ -46,7 +52,8 @@ defmodule Trellis.SelfCheckReport do
     :rows_compared,
     :next_after,
     :checked_through,
-    :held_keys
+    :held_keys,
+    :drain_failures
   ]
   defstruct @enforce_keys
 
@@ -59,7 +66,8 @@ defmodule Trellis.SelfCheckReport do
       rows_compared: report.rows_compared,
       next_after: report.next_after,
       checked_through: report.checked_through,
-      held_keys: report.held_keys && Trellis.HeldKeys.from_native(report.held_keys)
+      held_keys: report.held_keys && Trellis.HeldKeys.from_native(report.held_keys),
+      drain_failures: Enum.map(report.drain_failures, &Trellis.DrainFailure.from_native/1)
     }
   end
 end

@@ -21,7 +21,8 @@ defmodule Trellis.StatusTest do
         },
         capture_wait: nil,
         capture_failure: nil,
-        held_keys: nil
+        held_keys: nil,
+        drain_failure: nil
       })
 
     assert %Trellis.Status{
@@ -57,7 +58,8 @@ defmodule Trellis.StatusTest do
           error: "column \"qty\" was dropped",
           detected_at_micros: 1_727_222_400_654_321
         },
-        held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323}
+        held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323},
+        drain_failure: nil
       })
 
     assert %Trellis.Status{
@@ -83,6 +85,36 @@ defmodule Trellis.StatusTest do
                oldest_poisoned_at: ~U[2024-09-25 00:00:00.654323Z]
              }
            } = status
+  end
+
+  test "a drain failure becomes a struct with DateTimes" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: %{
+          seg_seq: 17,
+          tables: ["public.lines", "public.orders"],
+          error: "permission denied for function audit_hook",
+          sqlstate: "42501",
+          since_micros: 1_727_222_400_654_321,
+          last_seen_micros: 1_727_222_400_654_322,
+          attempts: 5
+        }
+      })
+
+    assert status.drain_failure == %Trellis.DrainFailure{
+             seg_seq: 17,
+             tables: ["public.lines", "public.orders"],
+             error: "permission denied for function audit_hook",
+             sqlstate: "42501",
+             since: ~U[2024-09-25 00:00:00.654321Z],
+             last_seen: ~U[2024-09-25 00:00:00.654322Z],
+             attempts: 5
+           }
   end
 
   test "a definition summary's halt becomes a capture failure of kind halt" do

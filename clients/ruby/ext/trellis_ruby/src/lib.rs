@@ -55,10 +55,10 @@ use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisError, 
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
     PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
-    PlainDivergence, PlainError, PlainHeldKeys, PlainPoisonEntry, PlainQuarantineEntry,
-    PlainRelationship, PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport,
-    SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor, decode_watermark,
-    encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys, PlainPoisonEntry,
+    PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
+    PlainSelfCheckReport, SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
     require_transform_statement, self_check_mode, system_time_from_epoch_micros,
     transform_status_names,
 };
@@ -753,6 +753,10 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .held_keys
         .map(|held| held_keys_hash(ruby, held))
         .transpose()?;
+    let drain_failure = status
+        .drain_failure
+        .map(|failure| drain_failure_hash(ruby, failure))
+        .transpose()?;
     record(
         ruby,
         [
@@ -761,6 +765,26 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("capture_wait", ruby.into_value(wait)),
             ("capture_failure", ruby.into_value(capture_failure)),
             ("held_keys", ruby.into_value(held_keys)),
+            ("drain_failure", ruby.into_value(drain_failure)),
+        ],
+    )
+}
+
+/// A drain page that keeps failing with nothing charged or paused.
+fn drain_failure_hash(ruby: &Ruby, failure: PlainDrainFailure) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("seg_seq", ruby.into_value(failure.seg_seq)),
+            ("tables", ruby.into_value(failure.tables)),
+            ("error", ruby.into_value(failure.error)),
+            ("sqlstate", ruby.into_value(failure.sqlstate)),
+            ("since_micros", ruby.into_value(failure.since_micros)),
+            (
+                "last_seen_micros",
+                ruby.into_value(failure.last_seen_micros),
+            ),
+            ("attempts", ruby.into_value(failure.attempts)),
         ],
     )
 }
@@ -960,6 +984,7 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
         .held_keys
         .map(|held| held_keys_hash(ruby, held))
         .transpose()?;
+    let drain_failures = array(ruby, report.drain_failures, drain_failure_hash)?;
     record(
         ruby,
         [
@@ -970,6 +995,7 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
             ("outcome", word_symbol(ruby, report.outcome).as_value()),
             ("divergences", divergences.as_value()),
             ("held_keys", ruby.into_value(held_keys)),
+            ("drain_failures", drain_failures.as_value()),
         ],
     )
 }

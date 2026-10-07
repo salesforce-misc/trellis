@@ -15,8 +15,10 @@
 //! keyspace lifecycle status (issue #55's `TransformStatus`:
 //! `waiting_to_backfill`/`backfilling`/`live`/`quarantined`), plus, on a
 //! line of its own, the failure of its source's backfill if that keeps
-//! failing (`backfill_failure`, issue #461), and on another why the drain
-//! halted on it, if it did (`halt`, issue #663) — and every
+//! failing (`backfill_failure`, issue #461), on another why the drain
+//! halted on it, if it did (`halt`, issue #663), and on another the page the
+//! drain keeps failing on with nothing charged or paused, if one holds it
+//! back (`drain_failure` from [`Trellis::status`], issue #817) — and every
 //! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! "Decision 5" and the amendment to
@@ -37,7 +39,9 @@
 //! its watermark-shaped signature might suggest.
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use trellis::{Config, DefinitionSummary, RelationshipSummary, Trellis, TrellisOptions};
+use trellis::{
+    Config, DefinitionSummary, DrainFailure, RelationshipSummary, Trellis, TrellisOptions,
+};
 
 use super::release::shell_quote;
 
@@ -116,6 +120,17 @@ even though the engine tracks it.";
 /// then [`STATUS_NOTE`].
 async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
+    // `definitions()` doesn't carry a drain failure, so each definition's
+    // own status is read for it, by the bare target name `status` takes.
+    let mut listed = Vec::with_capacity(definitions.len());
+    for def in definitions {
+        let drain_failure = trellis
+            .status(bare_target(&def.target_table))
+            .await
+            .map_err(|err| err.to_string())?
+            .and_then(|status| status.drain_failure);
+        listed.push((def, drain_failure));
+    }
     let relationships = trellis
         .relationships()
         .await
@@ -127,7 +142,7 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
 
     let mut out = String::new();
     out.push_str("Transform definitions:\n");
-    out.push_str(&format_definitions(&definitions));
+    out.push_str(&format_definitions(&listed));
     out.push('\n');
     out.push_str("Relationships:\n");
     out.push_str(&format_relationships(&relationships));
@@ -165,13 +180,16 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
     out
 }
 
-fn format_definitions(definitions: &[DefinitionSummary]) -> String {
+/// One line per definition, each followed by an indented line per thing
+/// holding it back: a failing backfill, a halt, and the drain failure its
+/// status reports, if any.
+fn format_definitions(definitions: &[(DefinitionSummary, Option<DrainFailure>)]) -> String {
     if definitions.is_empty() {
         return "  no transform definitions registered\n".to_string();
     }
     definitions
         .iter()
-        .map(|def| {
+        .map(|(def, drain_failure)| {
             let mut line = format!(
                 "  id={} source={} target={} status={} created_at={}\n",
                 def.id,
@@ -204,9 +222,41 @@ fn format_definitions(definitions: &[DefinitionSummary]) -> String {
                     halt.error
                 ));
             }
+            // A page the drain keeps failing on holds the definition's
+            // target back without pausing it, so its status alone can read
+            // `live`. Every drain pass retries the page until the cause the
+            // error names is fixed.
+            if let Some(failure) = drain_failure {
+                line.push_str(&format_drain_failure(failure));
+            }
             line
         })
         .collect()
+}
+
+/// The bare name [`Trellis::status`] finds a qualified target by: the part
+/// after the first `.` and before any next one, which is how `status` itself
+/// matches it (`split_part(target_table, '.', 2)`), so the two agree even on
+/// a name holding a `.` of its own.
+fn bare_target(qualified: &str) -> &str {
+    qualified.split('.').nth(1).unwrap_or(qualified)
+}
+
+fn format_drain_failure(failure: &DrainFailure) -> String {
+    let sqlstate = failure
+        .sqlstate
+        .as_deref()
+        .map_or(String::new(), |code| format!(" sqlstate={code}"));
+    format!(
+        "    drain failing on segment {} ({}): attempts={} since={} last_seen={}{} error={:?}\n",
+        failure.seg_seq,
+        failure.tables.join(", "),
+        failure.attempts,
+        format_timestamp(failure.since),
+        format_timestamp(failure.last_seen),
+        sqlstate,
+        failure.error
+    )
 }
 
 fn format_relationships(relationships: &[RelationshipSummary]) -> String {
@@ -347,7 +397,7 @@ mod tests {
             backfill_failure: None,
             halt: None,
         };
-        let formatted = format_definitions(std::slice::from_ref(&def));
+        let formatted = format_definitions(&[(def, None)]);
         assert!(formatted.contains("id=7"));
         assert!(formatted.contains("source=orders"));
         assert!(formatted.contains("target=order_totals"));
@@ -367,7 +417,7 @@ mod tests {
             backfill_failure: None,
             halt: None,
         };
-        let formatted = format_definitions(std::slice::from_ref(&def));
+        let formatted = format_definitions(&[(def, None)]);
         assert_eq!(formatted.lines().count(), 1, "got {formatted:?}");
         assert!(!formatted.contains("backfill"), "got {formatted:?}");
     }
@@ -391,7 +441,7 @@ mod tests {
             }),
             halt: None,
         };
-        let formatted = format_definitions(std::slice::from_ref(&def));
+        let formatted = format_definitions(&[(def, None)]);
         assert_eq!(
             formatted,
             "  id=7 source=public.orders target=public.order_totals \
@@ -422,13 +472,76 @@ mod tests {
                 detected_at,
             }),
         };
-        let formatted = format_definitions(std::slice::from_ref(&def));
+        let formatted = format_definitions(&[(def, None)]);
         assert_eq!(
             formatted,
             "  id=7 source=public.orders target=public.order_totals \
              status=paused created_at=1970-01-01 00:00:00 UTC\n    \
              halted on public.orders at 2024-01-01 00:00:00 UTC: \
              error=\"the drain halted: no primary key\"\n"
+        );
+    }
+
+    #[test]
+    fn a_drain_failure_is_shown_under_its_definition() {
+        // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
+        let since = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::Live,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        };
+        let failure = DrainFailure {
+            seg_seq: 17,
+            tables: vec!["public.lines".to_string(), "public.orders".to_string()],
+            error: "permission denied for function audit_hook".to_string(),
+            sqlstate: Some("42501".to_string()),
+            since,
+            last_seen: since + Duration::from_secs(90),
+            attempts: 5,
+        };
+        let formatted = format_definitions(&[(def, Some(failure))]);
+        assert_eq!(
+            formatted,
+            "  id=7 source=public.orders target=public.order_totals \
+             status=live created_at=1970-01-01 00:00:00 UTC\n    \
+             drain failing on segment 17 (public.lines, public.orders): attempts=5 \
+             since=2024-01-01 00:00:00 UTC last_seen=2024-01-01 00:01:30 UTC \
+             sqlstate=42501 error=\"permission denied for function audit_hook\"\n"
+        );
+    }
+
+    #[test]
+    fn a_target_is_polled_by_the_bare_name_status_matches() {
+        assert_eq!(bare_target("public.order_totals"), "order_totals");
+        assert_eq!(bare_target("custom.order_totals"), "order_totals");
+        // `status` matches `split_part(target_table, '.', 2)`.
+        assert_eq!(bare_target("public.a.b"), "a");
+        assert_eq!(bare_target("order_totals"), "order_totals");
+    }
+
+    #[test]
+    fn a_drain_failure_without_a_sqlstate_leaves_it_out() {
+        let failure = DrainFailure {
+            seg_seq: 3,
+            tables: vec!["public.orders".to_string()],
+            error: "records fail only together\nDETAIL: twice".to_string(),
+            sqlstate: None,
+            since: UNIX_EPOCH,
+            last_seen: UNIX_EPOCH,
+            attempts: 1,
+        };
+        let formatted = format_drain_failure(&failure);
+        assert_eq!(formatted.lines().count(), 1, "got {formatted:?}");
+        assert!(!formatted.contains("sqlstate"), "got {formatted:?}");
+        assert!(
+            formatted.contains(r#"error="records fail only together\nDETAIL: twice""#),
+            "got {formatted:?}"
         );
     }
 
@@ -451,7 +564,7 @@ mod tests {
             }),
             halt: None,
         };
-        let formatted = format_definitions(std::slice::from_ref(&def));
+        let formatted = format_definitions(&[(def, None)]);
         assert_eq!(formatted.lines().count(), 2, "got {formatted:?}");
         assert!(
             formatted.contains(r"orders\nDETAIL: role lacks SELECT\nHINT: grant it"),

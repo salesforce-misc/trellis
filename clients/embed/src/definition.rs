@@ -9,8 +9,9 @@
 //! the source columns but no creation time, and [`DefinitionSummary`] (what
 //! `definitions()` lists) has the creation time but no source columns.
 //! [`DefinitionStatus`] (what `status()` polls) flattens here too, with its
-//! backfill failure's retry time, its capture wait's times and its capture
-//! failure's detection time in epoch microseconds. A capture failure's kind
+//! backfill failure's retry time, its capture wait's times, its capture
+//! failure's detection time and its drain failure's times in epoch
+//! microseconds. A capture failure's kind
 //! crosses as its word, one of [`capture_failure_kind_names`], which a host
 //! turns into an atom or symbol from that set, allocated at load.
 
@@ -18,7 +19,7 @@ use std::collections::BTreeMap;
 
 use trellis::{
     BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, Definition, DefinitionStatus,
-    DefinitionSummary,
+    DefinitionSummary, DrainFailure,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -114,6 +115,9 @@ pub struct PlainDefinitionStatus {
     /// Set while the definition holds keys in quarantine; see
     /// [`DefinitionStatus::held_keys`].
     pub held_keys: Option<PlainHeldKeys>,
+    /// Set while the drain keeps failing on a page holding changes to a table
+    /// the definition reads; see [`DefinitionStatus::drain_failure`].
+    pub drain_failure: Option<PlainDrainFailure>,
 }
 
 /// A [`CaptureWait`] flattened to plain data.
@@ -149,6 +153,27 @@ pub struct PlainCaptureFailure {
     pub detected_at_micros: i64,
 }
 
+/// A [`DrainFailure`] flattened to plain data: a drain page that keeps
+/// failing with nothing charged or paused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainDrainFailure {
+    /// The segment whose page fails.
+    pub seg_seq: i64,
+    /// The qualified source tables the failing page holds changes to.
+    pub tables: Vec<String>,
+    /// The latest failure's error, as the drain surfaced it.
+    pub error: String,
+    /// The latest failure's SQLSTATE, `None` when it didn't come from
+    /// Postgres.
+    pub sqlstate: Option<String>,
+    /// When a drain first failed on the page, as [`crate::epoch_micros`].
+    pub since_micros: i64,
+    /// When a drain last failed on it, as [`crate::epoch_micros`].
+    pub last_seen_micros: i64,
+    /// How many drain passes have failed on it.
+    pub attempts: u32,
+}
+
 /// A [`BackfillFailure`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainBackfillFailure {
@@ -176,6 +201,7 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .as_ref()
                 .map(PlainCaptureFailure::from),
             held_keys: status.held_keys.as_ref().map(PlainHeldKeys::from),
+            drain_failure: status.drain_failure.as_ref().map(PlainDrainFailure::from),
         }
     }
 }
@@ -201,6 +227,20 @@ impl From<&CaptureFailure> for PlainCaptureFailure {
             columns: failure.columns.clone(),
             error: failure.error.clone(),
             detected_at_micros: epoch_micros(failure.detected_at),
+        }
+    }
+}
+
+impl From<&DrainFailure> for PlainDrainFailure {
+    fn from(failure: &DrainFailure) -> Self {
+        PlainDrainFailure {
+            seg_seq: failure.seg_seq,
+            tables: failure.tables.clone(),
+            error: failure.error.clone(),
+            sqlstate: failure.sqlstate.clone(),
+            since_micros: epoch_micros(failure.since),
+            last_seen_micros: epoch_micros(failure.last_seen),
+            attempts: failure.attempts,
         }
     }
 }
@@ -382,6 +422,7 @@ mod tests {
             capture_wait: None,
             capture_failure: None,
             held_keys: None,
+            drain_failure: None,
         };
 
         assert_eq!(
@@ -392,6 +433,7 @@ mod tests {
                 capture_wait: None,
                 capture_failure: None,
                 held_keys: None,
+                drain_failure: None,
             }
         );
     }
@@ -407,6 +449,7 @@ mod tests {
                 count: 3,
                 oldest_poisoned_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
             }),
+            drain_failure: None,
         };
 
         assert_eq!(
@@ -414,6 +457,40 @@ mod tests {
             Some(PlainHeldKeys {
                 count: 3,
                 oldest_poisoned_at_micros: 1_727_222_400_654_321,
+            })
+        );
+    }
+
+    #[test]
+    fn a_drain_failure_crosses_with_its_times_in_microseconds() {
+        let at = |micros| UNIX_EPOCH + Duration::from_micros(micros);
+        let status = DefinitionStatus {
+            status: TransformStatus::Live,
+            backfill_failure: None,
+            capture_wait: None,
+            capture_failure: None,
+            held_keys: None,
+            drain_failure: Some(DrainFailure {
+                seg_seq: 17,
+                tables: vec!["public.lines".to_string(), "public.orders".to_string()],
+                error: "permission denied for function audit_hook".to_string(),
+                sqlstate: Some("42501".to_string()),
+                since: at(1_727_222_400_000_001),
+                last_seen: at(1_727_222_400_654_321),
+                attempts: 5,
+            }),
+        };
+
+        assert_eq!(
+            PlainDefinitionStatus::from(&status).drain_failure,
+            Some(PlainDrainFailure {
+                seg_seq: 17,
+                tables: vec!["public.lines".to_string(), "public.orders".to_string()],
+                error: "permission denied for function audit_hook".to_string(),
+                sqlstate: Some("42501".to_string()),
+                since_micros: 1_727_222_400_000_001,
+                last_seen_micros: 1_727_222_400_654_321,
+                attempts: 5,
             })
         );
     }
@@ -431,6 +508,7 @@ mod tests {
             capture_wait: None,
             capture_failure: None,
             held_keys: None,
+            drain_failure: None,
         };
 
         assert_eq!(
@@ -446,6 +524,7 @@ mod tests {
                 capture_wait: None,
                 capture_failure: None,
                 held_keys: None,
+                drain_failure: None,
             }
         );
     }
@@ -472,6 +551,7 @@ mod tests {
                 detected_at: at(1_727_222_400_000_003),
             }),
             held_keys: None,
+            drain_failure: None,
         };
 
         let plain = PlainDefinitionStatus::from(&status);

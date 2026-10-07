@@ -43,7 +43,8 @@ test`, `mix test`), so they run in the `ruby` and `elixir` CI jobs.
     `trellis::StatementKind`.
 - `conversions`: native maps (as the extension or NIF hands them over) for
   values a live run can't produce cheaply, such as a failing backfill, a
-  pre-epoch time, an `Applied` or an error code newer than the binding.
+  drain failure, a pre-epoch time, an `Applied` or an error code newer than
+  the binding.
 
 ## Arguments
 

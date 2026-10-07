@@ -24,11 +24,21 @@
       "backfill_failure": {"nullable": {"record": "BackfillFailure"}},
       "capture_wait": {"nullable": {"record": "CaptureWait"}},
       "capture_failure": {"nullable": {"record": "CaptureFailure"}},
-      "held_keys": {"nullable": {"record": "HeldKeys"}}
+      "held_keys": {"nullable": {"record": "HeldKeys"}},
+      "drain_failure": {"nullable": {"record": "DrainFailure"}}
     },
     "HeldKeys": {
       "count": "integer",
       "oldest_poisoned_at": "time"
+    },
+    "DrainFailure": {
+      "seg_seq": "integer",
+      "tables": {"list_of": "string"},
+      "error": "string",
+      "sqlstate": {"nullable": "string"},
+      "since": "time",
+      "last_seen": "time",
+      "attempts": "integer"
     },
     "CaptureWait": {
       "table": "string",
@@ -113,7 +123,8 @@
       "rows_compared": "integer",
       "next_after": {"nullable": "string"},
       "checked_through": "string",
-      "held_keys": {"nullable": {"record": "HeldKeys"}}
+      "held_keys": {"nullable": {"record": "HeldKeys"}},
+      "drain_failures": {"list_of": {"record": "DrainFailure"}}
     },
     "Divergence": {
       "kind": {"word_in": "divergence_kind"},
@@ -218,7 +229,7 @@
     {"op": "apply", "args": ["TRANSFORM parity_doubled FROM parity_ledger SELECT n + n AS doubled"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
     {"op": "apply", "args": ["TRANSFORM parity_gizmo_prices FROM parity_gizmos SELECT price AS price"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
     {"op": "definitions", "expect": {"list_of": {"record": "DefinitionSummary", "fields": {"backfill_failure": null, "halt": null}}}},
-    {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null}}},
+    {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}},
     {"about": "A column that isn't paused is live, with no pause time or error.", "op": "quarantine_status", "args": ["parity_prices.price"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices.price"}, "state": {"word": "live"}, "paused_at": null, "last_error": null}}},
     {"about": "A whole transform reports its lifecycle status as its state.", "op": "quarantine_status", "args": ["parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
     {"about": "An empty first page has no cursor.", "op": "sample_quarantined", "args": ["parity_prices.price"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": null}}},
@@ -240,7 +251,7 @@
     {"about": "A captured write to a defined source: the token below has work outstanding (#556).", "op": "sql", "args": ["insert into parity_scratch_src (id, price) values (1, 1)"]},
     {"op": "watermark_token", "save": "idle_token", "expect": "string"},
     {"about": "Nothing drains the write, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
-    {"about": "Likewise the audit: it gives up waiting rather than failing.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_caught_up"}, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null}}},
+    {"about": "Likewise the audit: it gives up waiting rather than failing.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_caught_up"}, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null, "drain_failures": {"list": []}}}},
     {"op": "shutdown", "expect": null},
 
     {"about": "connect is lazy, so an unreachable database is the first call's connectivity error.", "op": "connect", "opts": {"url": "host=/nonexistent-trellis-parity port=1 dbname=parity"}, "expect": null},
@@ -293,7 +304,7 @@
     },
     {"op": "status", "args": ["parity_scratch"], "expect": null},
 
-    {"about": "Self-check paging: five rows two at a time, the cursor carried from each report to the next.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000}, "save": "check_1", "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "converged"}, "divergences": {"list": []}, "rows_compared": {"eq": 2}, "next_after": "string"}}},
+    {"about": "Self-check paging: five rows two at a time, the cursor carried from each report to the next.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000}, "save": "check_1", "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "converged"}, "divergences": {"list": []}, "rows_compared": {"eq": 2}, "next_after": "string", "drain_failures": {"list": []}}}},
     {"op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000, "after": {"$ref": "check_1.next_after"}}, "save": "check_2", "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "rows_compared": {"eq": 2}, "next_after": "string"}}},
     {"about": "The last page: fewer rows than the limit, and no cursor.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000, "after": {"$ref": "check_2.next_after"}}, "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "rows_compared": {"eq": 1}, "next_after": null}}},
     {"about": "A target row edited behind Trellis's back is a cell divergence, its values as Postgres renders them.", "op": "sql", "args": ["update parity_prices set price = 999 where id = 1"]},
@@ -352,14 +363,26 @@
     {
       "about": "A failing backfill, which a live run can't produce cheaply: the retry time is rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null},
-      "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": {"record": "BackfillFailure", "fields": {"source_table": {"eq": "public.orders"}, "attempts": {"eq": 3}, "next_attempt_at": {"time_micros": 1727222400123456}}}, "capture_wait": null, "capture_failure": null, "held_keys": null}}
+      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null},
+      "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": {"record": "BackfillFailure", "fields": {"source_table": {"eq": "public.orders"}, "attempts": {"eq": 3}, "next_attempt_at": {"time_micros": 1727222400123456}}}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}
     },
     {
       "about": "A capture lock wait, a capture failure (#687) and held keys (#759), which need a held lock, a broken source table or a refused write, so a live run can't produce them all cheaply: their times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}},
-      "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"kind": {"word": "capture"}, "source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}, "held_keys": {"record": "HeldKeys", "fields": {"count": {"eq": 2}, "oldest_poisoned_at": {"time_micros": 1727222400123459}}}}}
+      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null},
+      "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"kind": {"word": "capture"}, "source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}, "held_keys": {"record": "HeldKeys", "fields": {"count": {"eq": 2}, "oldest_poisoned_at": {"time_micros": 1727222400123459}}}, "drain_failure": null}}
+    },
+    {
+      "about": "A drain failure (#817), which needs a page the drain keeps failing on with nothing charged or paused, so a live run can't produce it cheaply: its tables and SQLSTATE cross as they are, and its times are rehydrated from epoch microseconds exactly.",
+      "type": "Status",
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}},
+      "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 17}, "tables": {"list": [{"eq": "public.lines"}, {"eq": "public.orders"}]}, "error": {"eq": "permission denied for function audit_hook"}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123457}, "attempts": {"eq": 5}}}}}
+    },
+    {
+      "about": "A self-check reports every open drain failure, oldest first and whatever its outcome; one that didn't come from Postgres has no SQLSTATE.",
+      "type": "SelfCheckReport",
+      "native": {"target": "parity_prices", "outcome": {"$word": "converged"}, "divergences": [], "rows_compared": 2, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [{"seg_seq": 3, "tables": ["public.orders"], "error": "permission denied for column note", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123458, "attempts": 4}, {"seg_seq": 9, "tables": ["public.lines"], "error": "records fail only together", "sqlstate": null, "since_micros": 1727222400123457, "last_seen_micros": 1727222400123459, "attempts": 1}]},
+      "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "held_keys": null, "drain_failures": {"list": [{"record": "DrainFailure", "fields": {"seg_seq": {"eq": 3}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123458}, "attempts": {"eq": 4}}}, {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 9}, "tables": {"list": [{"eq": "public.lines"}]}, "error": {"eq": "records fail only together"}, "sqlstate": null, "since": {"time_micros": 1727222400123457}, "last_seen": {"time_micros": 1727222400123459}}}]}}}
     },
     {
       "about": "A time a microsecond before the epoch lands on that microsecond, not a second off.",

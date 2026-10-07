@@ -12,7 +12,7 @@
 
 use trellis::{Divergence, ErrorCode, SelfCheckMode, SelfCheckOutcome, SelfCheckReport};
 
-use crate::{PlainError, PlainHeldKeys, encode_watermark};
+use crate::{PlainDrainFailure, PlainError, PlainHeldKeys, encode_watermark};
 
 /// Every word [`PlainSelfCheckReport::outcome`] can be.
 pub const SELF_CHECK_OUTCOMES: [&str; 3] = ["converged", "not_caught_up", "diverged"];
@@ -63,6 +63,10 @@ pub struct PlainSelfCheckReport {
     /// The keys the audited definition holds in quarantine, whatever the
     /// outcome; see [`SelfCheckReport::held_keys`].
     pub held_keys: Option<PlainHeldKeys>,
+    /// Every page the drain keeps failing on with nothing charged or paused,
+    /// oldest first, whatever the outcome; see
+    /// [`SelfCheckReport::drain_failures`].
+    pub drain_failures: Vec<PlainDrainFailure>,
 }
 
 /// One [`Divergence`] flattened to plain data. `kind` is one of
@@ -106,6 +110,11 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
             outcome,
             divergences,
             held_keys: report.held_keys.as_ref().map(PlainHeldKeys::from),
+            drain_failures: report
+                .drain_failures
+                .iter()
+                .map(PlainDrainFailure::from)
+                .collect(),
         }
     }
 }
@@ -171,6 +180,7 @@ mod tests {
             next_after: Some("42".to_string()),
             outcome,
             held_keys: None,
+            drain_failures: Vec::new(),
         }
     }
 
@@ -188,6 +198,7 @@ mod tests {
                 outcome: "converged",
                 divergences: Vec::new(),
                 held_keys: None,
+                drain_failures: Vec::new(),
             }
         );
         // The position is a real watermark token, so a host can wait on it.
@@ -211,6 +222,56 @@ mod tests {
                 count: 2,
                 oldest_poisoned_at_micros: 1_727_222_400_000_001,
             })
+        );
+    }
+
+    #[test]
+    fn drain_failures_cross_with_any_outcome_oldest_first() {
+        let at = |micros| std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros);
+        let mut held_up = report(SelfCheckOutcome::Converged);
+        held_up.drain_failures = vec![
+            trellis::DrainFailure {
+                seg_seq: 3,
+                tables: vec!["public.orders".to_string()],
+                error: "permission denied for column note".to_string(),
+                sqlstate: Some("42501".to_string()),
+                since: at(1_727_222_400_000_001),
+                last_seen: at(1_727_222_400_000_002),
+                attempts: 4,
+            },
+            trellis::DrainFailure {
+                seg_seq: 9,
+                tables: vec!["public.lines".to_string()],
+                error: "records fail only together".to_string(),
+                sqlstate: None,
+                since: at(1_727_222_400_000_003),
+                last_seen: at(1_727_222_400_000_004),
+                attempts: 1,
+            },
+        ];
+
+        assert_eq!(
+            PlainSelfCheckReport::from(&held_up).drain_failures,
+            vec![
+                PlainDrainFailure {
+                    seg_seq: 3,
+                    tables: vec!["public.orders".to_string()],
+                    error: "permission denied for column note".to_string(),
+                    sqlstate: Some("42501".to_string()),
+                    since_micros: 1_727_222_400_000_001,
+                    last_seen_micros: 1_727_222_400_000_002,
+                    attempts: 4,
+                },
+                PlainDrainFailure {
+                    seg_seq: 9,
+                    tables: vec!["public.lines".to_string()],
+                    error: "records fail only together".to_string(),
+                    sqlstate: None,
+                    since_micros: 1_727_222_400_000_003,
+                    last_seen_micros: 1_727_222_400_000_004,
+                    attempts: 1,
+                },
+            ]
         );
     }
 
