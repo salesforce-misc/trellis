@@ -719,9 +719,9 @@ pub(crate) async fn enumerate_and_append(
 /// Every branch selects `(tag, key, key columns)`: the enumeration's rows
 /// are tagged [`super::resume_orphans::ENUMERATION_TAG`] and carry the
 /// encoded key, and a swept target's rows carry its tag and their key
-/// columns. The enumeration comes first, so the deletes come last and hold
-/// their row locks only for the end of the discharge. Nothing depends on
-/// that order.
+/// columns. Nothing depends on the branches' order: the sweep deletes its
+/// rows once the whole read is fetched
+/// ([`super::resume_orphans::Sweep::finish`]).
 pub(super) async fn declare_read(
     txn: &Transaction<'_>,
     enumerate: Option<&str>,
@@ -784,8 +784,10 @@ async fn enumeration_branch(txn: &Transaction<'_>, src_table: &str) -> Result<St
 
 /// The second half of the discharge's read: pages the cursor
 /// [`declare_read`] opened, appending each enumerated key into the active
-/// ring segment as an image-less `Recompute` for `src_table`, and deleting
-/// each swept row through `sweep`. Then closes the cursor.
+/// ring segment as an image-less `Recompute` for `src_table`, and passing
+/// each swept row's key to `sweep`, whose
+/// [`super::resume_orphans::Sweep::finish`] deletes them. Then closes the
+/// cursor.
 pub(super) async fn fetch_read(
     txn: &Transaction<'_>,
     src_table: &str,
@@ -802,12 +804,10 @@ pub(super) async fn fetch_read(
             break;
         }
         let mut page = Vec::with_capacity(rows.len());
-        let mut unbacked: std::collections::BTreeMap<i32, Vec<Vec<Option<String>>>> =
-            std::collections::BTreeMap::new();
         for row in &rows {
             let tag: i32 = row.get(0);
             if tag != super::resume_orphans::ENUMERATION_TAG {
-                unbacked.entry(tag).or_default().push(row.get(2));
+                sweep.push(tag, row.get(2));
                 continue;
             }
             // Already fully encoded by the enumeration branch's key
@@ -841,9 +841,6 @@ pub(super) async fn fetch_read(
         }
         if !page.is_empty() {
             append::append(txn, &page).await?;
-        }
-        for (tag, keys) in &unbacked {
-            sweep.delete(txn, *tag, keys).await?;
         }
     }
     txn.batch_execute(&format!("close {BACKFILL_CURSOR}"))
@@ -990,7 +987,8 @@ pub(super) async fn fetch_read(
 ///
 /// The sweep's anti-joins are branches of the same cursor as the enumeration
 /// ([`declare_read`]), so both are judged on one snapshot, and the deletes
-/// run as that cursor is fetched, after the watermark wait ([`fetch_read`]).
+/// run once that cursor is fetched, after the watermark wait, in a drain
+/// page's lock order.
 /// Judging the two on different snapshots left an aggregate group stale
 /// whichever order they ran in (issue #436). The `resume_orphans` module doc
 /// has the full argument.

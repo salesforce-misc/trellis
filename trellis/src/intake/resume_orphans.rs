@@ -42,7 +42,7 @@
 //! (`markers::declare_read`). One statement reads one snapshot, so a
 //! row is judged unbacked on exactly the snapshot, call it *S*, whose keys
 //! the enumeration stages. The cursor returns each unbacked row's key, and
-//! [`Sweep::delete`] deletes by key after the watermark wait, when the read is
+//! [`Sweep::finish`] deletes by key after the watermark wait, once the read is
 //! fetched.
 //!
 //! Every commit visible to *S* is in both halves of the read. Every commit
@@ -93,22 +93,36 @@
 //! target-mutation seam like this sweep's deletes (`defs::backfill`, "Groups
 //! the ledger no longer has").
 //!
-//! # Why the delete comes last (issue #503)
+//! # Why the delete comes last (issues #503 and #716)
 //!
-//! The delete runs as the read is fetched, after the watermark wait, and the
-//! enumeration branch comes first, so it runs at the end of the fetch. A
+//! The delete runs once the read is fetched, after the watermark wait. A
 //! target row the sweep deletes stays locked only from there to the
 //! discharge's commit, not across the watermark wait, where a drain of an
 //! already-sealed segment that touched it used to wait for the discharge.
 //!
-//! That tail can still deadlock with such a drain: the sweep locks its rows
-//! in the cursor's order, not apply's ascending key order, so a drain that
-//! touches two of them there (a bulk delete's CDC for a `catching_up`
-//! definition, say) can wait on the discharge while the discharge waits on
-//! it. Postgres aborts one side. An aborted apply is a transient error
-//! (40P01) with no quarantine charge, and an aborted discharge rolls back
-//! with nothing deleted and retries after the marker's backoff. Neither
-//! leaves anything stuck or wrong.
+//! Such a drain can still touch the rows the sweep deletes (a bulk delete's
+//! CDC for a `catching_up` definition, say), so the sweep takes its locks in
+//! a drain page's order (ADR-0002 I5): the 1-1 targets, then the
+//! aggregates, each by target name; within a ledger target its entries,
+//! then its groups; and each class of row in one statement, in key order.
+//! The cursor returns rows in no useful order, and a page of it holds some
+//! of every target's, so [`Sweep::push`] only collects the keys and
+//! [`Sweep::finish`] deletes them all at the end. Deleting each page of the
+//! read as it comes would take a later page's low keys after an earlier
+//! page's high ones, and one target's locks after another's, so a drain
+//! holding the low key, or the other target, would wait on the discharge
+//! while the discharge waits on it.
+//!
+//! One wait is still out of that order. A ledger target's group sweep comes
+//! after its entry sweep, whose Re-derive locks the groups it takes entries
+//! out of, so the sweep can hold such a group while it waits on a lower
+//! group it deletes. A drain that holds the lower group and wants the
+//! higher one closes a cycle. That drain applies a change into a group the
+//! read found with no member and no source row, one the read's snapshot had
+//! already undone. Postgres aborts one side of any such cycle. An aborted
+//! apply is a transient error (40P01) with no quarantine charge, and an
+//! aborted discharge rolls back with nothing deleted and retries after the
+//! marker's backoff. Neither leaves anything stuck or wrong.
 //!
 //! Each delete also re-checks the definition's status, which by then is
 //! after the watermark wait: a pause that landed since the discharge read it
@@ -241,6 +255,11 @@ struct SweptTarget {
     /// The definition, and the status the discharge read it in.
     id: i64,
     status: TransformStatus,
+    /// Where [`Sweep::finish`] takes this target's locks: a drain page's
+    /// target order (ADR-0002 I5). The 1-1 targets come before the
+    /// aggregates, each by the definition's bare target name, the key
+    /// `staging::apply` orders a page's targets by.
+    lock_order: (bool, String),
     target: String,
     target_ident: String,
     key_cols: Vec<PrimaryKeyColumn>,
@@ -257,18 +276,22 @@ struct SweptTarget {
     ledger_guard: Option<String>,
     /// #623 D3: `Some` for a ledger target's entry sweep. Its branch finds
     /// the ledger's live entries the source no longer backs, and
-    /// [`Sweep::delete`] re-derives them through this plan instead of
+    /// [`Sweep::finish`] re-derives them through this plan instead of
     /// deleting target rows: the Re-derive finds no source row and takes
     /// each entry out of its group, which deleting the group here would
     /// leave counted in the ledger.
     ledger_rederive: Option<crate::staging::ledger::LedgerTargetPlan>,
+    /// The unbacked keys the read has returned for this target so far, by
+    /// column: `unbacked[j]` holds every key's `j`th column, as text.
+    unbacked: Vec<Vec<Option<String>>>,
 }
 
 /// The targets one discharge sweeps, and what it has deleted from them so
 /// far. See the module doc for the protocol: [`Sweep::add`] each set of
 /// definitions, declare the read over [`Sweep::branches`] (with the
-/// enumeration, if any, in the same statement), then pass each fetched page
-/// of unbacked keys to [`Sweep::delete`] and end with [`Sweep::finish`].
+/// enumeration, if any, in the same statement), then pass each unbacked key
+/// it fetches to [`Sweep::push`] and end with [`Sweep::finish`], which
+/// deletes them.
 #[derive(Default)]
 pub(super) struct Sweep {
     targets: Vec<SweptTarget>,
@@ -281,7 +304,7 @@ impl Sweep {
     ///
     /// `status` is the status the caller read `ids` in: `waiting_to_backfill`
     /// for the definitions a discharge dispatches, `catching_up` for the ones
-    /// its catch-up may flip `live`. [`Sweep::delete`] checks it again, so a
+    /// its catch-up may flip `live`. [`Sweep::finish`] checks it again, so a
     /// pause that landed since (#331) leaves the target as the pause found
     /// it, and its own resume comes back here.
     pub(super) async fn add(
@@ -325,6 +348,10 @@ impl Sweep {
             let source_columns = crate::defs::catalog::source_columns_in(txn, id).await?;
             let relationships =
                 crate::defs::catalog::resolve_relationships_in(txn, &def, &source_table).await?;
+            let lock_order = (
+                matches!(def.key_space, KeySpace::Aggregate { .. }),
+                def.target.clone(),
+            );
             let ledger = match crate::staging::ledger::route(&def, &source_columns, &relationships)
             {
                 Some(shape) => {
@@ -334,6 +361,7 @@ impl Sweep {
                     self.targets.push(SweptTarget {
                         id,
                         status,
+                        lock_order: lock_order.clone(),
                         target: target.clone(),
                         target_ident: target_ident.clone(),
                         key_cols: key_cols.clone(),
@@ -353,6 +381,7 @@ impl Sweep {
                             key_cols.clone(),
                             shape,
                         )),
+                        unbacked: Vec::new(),
                     });
                     Some(ddl::qualified_target_table_ident(
                         &crate::defs::ledger::ledger_table_name(&target),
@@ -384,6 +413,7 @@ impl Sweep {
             self.targets.push(SweptTarget {
                 id,
                 status,
+                lock_order,
                 target,
                 target_ident,
                 key_cols,
@@ -392,6 +422,7 @@ impl Sweep {
                 has_image: image_expr.is_some(),
                 ledger_guard: ledger,
                 ledger_rederive: None,
+                unbacked: Vec::new(),
             });
         }
         Ok(())
@@ -404,7 +435,7 @@ impl Sweep {
 
     /// Every target's `UNION ALL` branches for the discharge's read. Each
     /// selects `(tag, NULL, key columns as text)`: the tag names the target
-    /// (for [`Sweep::delete`]), and the text array holds the unbacked row's
+    /// (for [`Sweep::push`]), and the text array holds the unbacked row's
     /// key columns in key order.
     pub(super) fn branches(&self) -> impl Iterator<Item = &str> {
         self.targets
@@ -412,95 +443,125 @@ impl Sweep {
             .flat_map(|t| t.branches.iter().map(String::as_str))
     }
 
-    /// Deletes `keys` (key-column values as text, in key order) from the
-    /// target `tag` names, if its definition is still in the status
-    /// [`Sweep::add`] read it in, and records each deleted row through the
-    /// target-mutation seam.
+    /// Records an unbacked key the read returned for the target `tag` names
+    /// (its key columns as text, in key order), for [`Sweep::finish`] to
+    /// delete.
+    pub(super) fn push(&mut self, tag: i32, key: Vec<Option<String>>) {
+        let target = usize::try_from(tag)
+            .ok()
+            .and_then(|i| self.targets.get_mut(i))
+            .unwrap_or_else(|| panic!("the discharge read returned an unknown sweep tag {tag}"));
+        if target.unbacked.is_empty() {
+            target.unbacked = vec![Vec::new(); key.len()];
+        }
+        for (column, part) in target.unbacked.iter_mut().zip(key) {
+            column.push(part);
+        }
+    }
+
+    /// Deletes every key [`Sweep::push`] recorded from its target, if the
+    /// target's definition is still in the status [`Sweep::add`] read it
+    /// in, flushes each deleted row through the target-mutation seam, and
+    /// returns what the sweep deleted.
     ///
     /// The read judged these rows unbacked on its snapshot, so this deletes
     /// them by key, whatever the source holds by now: a key the source has
     /// since backed again is re-derived by the change that backed it, which
     /// drains after this discharge commits (see the module doc).
-    pub(super) async fn delete(
-        &mut self,
-        txn: &Transaction<'_>,
-        tag: i32,
-        keys: &[Vec<Option<String>>],
-    ) -> Result<(), IntakeError> {
-        if keys.is_empty() {
-            return Ok(());
+    ///
+    /// It runs once the whole read is fetched, and takes its locks in a
+    /// drain page's order (ADR-0002 I5, issue #716): the 1-1 targets, then
+    /// the aggregates, each by target name, and each target's keys in one
+    /// sorted statement per class (a ledger's entries, then its groups). See
+    /// the module doc's "Why the delete comes last".
+    pub(super) async fn finish(self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
+        let Sweep {
+            mut targets,
+            mut mutations,
+            mut swept,
+        } = self;
+        // Stable, so a ledger target's entry sweep stays ahead of its group
+        // sweep, which `add` pushed after it.
+        targets.sort_by(|a, b| a.lock_order.cmp(&b.lock_order));
+        for target in &mut targets {
+            let unbacked = std::mem::take(&mut target.unbacked);
+            if unbacked.is_empty() {
+                continue;
+            }
+            swept.deleted += delete_unbacked(txn, target, unbacked, &mut mutations).await?;
         }
-        let target = usize::try_from(tag)
-            .ok()
-            .and_then(|i| self.targets.get(i))
-            .unwrap_or_else(|| panic!("the discharge read returned an unknown sweep tag {tag}"));
-        if let Some(template) = &target.ledger_rederive {
-            let applying: bool = txn
-                .query_one(
-                    "select exists (select 1 from transform_definitions \
-                     where id = $1 and status = $2)",
-                    &[&target.id, &target.status.as_str()],
-                )
-                .await?
-                .get(0);
-            if !applying {
-                return Ok(());
-            }
-            let mut plan = template.clone();
-            for key in keys.iter().filter_map(|key| key.first().cloned().flatten()) {
-                plan.push_rederive(key);
-            }
-            // A tombstone's `applied_seg`: the ring's latest segment, at or
-            // above any a change for these keys can still be pending in.
-            let seg_seq: Option<i64> = txn
-                .query_one("select max(seg_seq) from segments", &[])
-                .await?
-                .get(0);
-            let (_, deleted) = crate::staging::ledger::apply_ledger_target(
-                txn,
-                &plan,
-                seg_seq.unwrap_or(0),
-                seg_seq.unwrap_or(0),
-                &mut self.mutations,
+        mutations.flush(txn).await?;
+        Ok(swept)
+    }
+}
+
+/// [`Sweep::finish`]'s work on one target: deletes the keys `unbacked`
+/// holds (by column, as [`SweptTarget::unbacked`] does) if `target`'s
+/// definition is still in the status the sweep read it in, records each
+/// deleted row in `mutations`, and returns how many rows it deleted.
+async fn delete_unbacked(
+    txn: &Transaction<'_>,
+    target: &SweptTarget,
+    unbacked: Vec<Vec<Option<String>>>,
+    mutations: &mut TargetMutations,
+) -> Result<usize, IntakeError> {
+    if let Some(template) = &target.ledger_rederive {
+        let applying: bool = txn
+            .query_one(
+                "select exists (select 1 from transform_definitions \
+                 where id = $1 and status = $2)",
+                &[&target.id, &target.status.as_str()],
             )
-            .await?;
-            tracing::info!(
-                target = %target.target,
-                keys = keys.len(),
-                groups_deleted = deleted,
-                "re-derived ledger entries the source no longer backs"
-            );
-            self.swept.deleted += deleted;
-            return Ok(());
+            .await?
+            .get(0);
+        if !applying {
+            return Ok(0);
         }
-        let arity = target.key_cols.len();
-        let arrays: Vec<Vec<Option<String>>> = (0..arity)
-            .map(|j| keys.iter().map(|key| key[j].clone()).collect())
-            .collect();
-        let rows = delete_keys(txn, target, &arrays).await?;
-        if rows.is_empty() {
-            return Ok(());
+        // The entry branch selects the entry's one key column.
+        let keys = unbacked.into_iter().next().unwrap_or_default();
+        let count = keys.len();
+        let mut plan = template.clone();
+        for key in keys.into_iter().flatten() {
+            plan.push_rederive(key);
         }
+        // A tombstone's `applied_seg`: the ring's latest segment, at or
+        // above any a change for these keys can still be pending in.
+        let seg_seq: Option<i64> = txn
+            .query_one("select max(seg_seq) from segments", &[])
+            .await?
+            .get(0);
+        // One call, so the entries are locked in one sorted statement and
+        // the groups in another, as a page locks them.
+        let (_, deleted) = crate::staging::ledger::apply_ledger_target(
+            txn,
+            &plan,
+            seg_seq.unwrap_or(0),
+            seg_seq.unwrap_or(0),
+            mutations,
+        )
+        .await?;
         tracing::info!(
             target = %target.target,
-            deleted = rows.len(),
-            "dropped target rows the source no longer backs"
+            keys = count,
+            groups_deleted = deleted,
+            "re-derived ledger entries the source no longer backs"
         );
-        for row in &rows {
-            let prior = target.has_image.then(|| row.get::<_, String>(1));
-            self.mutations
-                .record(&target.target, row.get(0), prior, 0, None, None);
-        }
-        self.swept.deleted += rows.len();
-        Ok(())
+        return Ok(deleted);
     }
-
-    /// Flushes every deleted row through the target-mutation seam, in `txn`,
-    /// and returns what the sweep deleted.
-    pub(super) async fn finish(self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
-        self.mutations.flush(txn).await?;
-        Ok(self.swept)
+    let rows = delete_keys(txn, target, &unbacked).await?;
+    if rows.is_empty() {
+        return Ok(0);
     }
+    tracing::info!(
+        target = %target.target,
+        deleted = rows.len(),
+        "dropped target rows the source no longer backs"
+    );
+    for row in &rows {
+        let prior = target.has_image.then(|| row.get::<_, String>(1));
+        mutations.record(&target.target, row.get(0), prior, 0, None, None);
+    }
+    Ok(rows.len())
 }
 
 /// A 1-1 target's key is the source's own key, column for column, by name
@@ -811,28 +872,42 @@ fn ledger_orphan_branch_sql(
     )
 }
 
-/// Runs [`delete_statement`] for `arrays` under `ENTRY_PLAN_SETTINGS`
-/// (through `ledger::query_by_entry_key`), and returns the deleted rows:
-/// [`Sweep::delete`]'s statement as it runs, which its plan test runs too.
+/// Runs [`lock_statement`] and then [`delete_statement`] for `arrays`, each
+/// under `ENTRY_PLAN_SETTINGS` (through `ledger::query_by_entry_key`), and
+/// returns the deleted rows: [`Sweep::finish`]'s statements for a target it
+/// deletes rows of, as they run, which their plan test runs too.
+///
+/// The delete alone would lock the rows in its plan's order (the target's
+/// heap order, under a hash join), so the lock takes them first, in key
+/// order, as a drain page takes the same rows (ADR-0002 I5, issue #716).
 async fn delete_keys(
     txn: &Transaction<'_>,
     target: &SweptTarget,
     arrays: &[Vec<Option<String>>],
 ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    let sql = delete_statement(target, arrays);
     let status = target.status.as_str();
     let mut params: Vec<&(dyn ToSql + Sync)> =
         arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
     params.push(&target.id);
     params.push(&status);
-    crate::staging::ledger::query_by_entry_key(txn, &sql, &params).await
+    crate::staging::ledger::query_by_entry_key(txn, &lock_statement(target, arrays), &params)
+        .await?;
+    crate::staging::ledger::query_by_entry_key(txn, &delete_statement(target, arrays), &params)
+        .await
 }
 
-/// [`Sweep::delete`]'s statement: deletes `target`'s rows whose key is one
-/// of `arrays`' (column `j`'s values in `arrays[j]`, bound as `$j+1`), if
-/// the definition is still in the status the sweep read it in (`$arity+1`,
-/// `$arity+2`), and returns each deleted row's key (and prior image).
-fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> String {
+/// How [`lock_statement`] and [`delete_statement`] find `target`'s rows of
+/// the keys in `arrays` (column `j`'s values in `arrays[j]`, bound as
+/// `$j+1`), if the definition is still in the status the sweep read it in
+/// (`$arity+1`, `$arity+2`): the keyset relation, to alias `k`, and the
+/// condition on the target (aliased `t`) and `k`.
+struct Keyset {
+    relation: String,
+    condition: String,
+}
+
+/// The [`Keyset`] of `arrays` over `target`.
+fn keyset(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Keyset {
     let arity = target.key_cols.len();
     let cols: Vec<String> = (0..arity).map(keyset_col).collect();
     // Each value is cast back from its text on its own (rather than the
@@ -845,13 +920,62 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
         .map(|(c, k)| format!("{k}::{} as {k}", c.data_type))
         .collect();
     let arrays_sql: Vec<String> = (1..=arity).map(|i| format!("${i}::text[]")).collect();
-    let target_cols: Vec<String> = target
+    let target_cols = target_key_cols(target);
+    let patterns = null_patterns(arrays);
+    let bound = keyset_bound(&target_cols, &target.key_cols, &patterns);
+    Keyset {
+        relation: format!(
+            "(select {} from unnest({}) as u({}))",
+            typed.join(", "),
+            arrays_sql.join(", "),
+            cols.join(", "),
+        ),
+        condition: format!(
+            "{}{bound} and exists ( \
+                 select 1 from transform_definitions where id = ${} and status = ${} \
+             )",
+            keyset_match_cols(&target_cols, &patterns),
+            arity + 1,
+            arity + 2,
+        ),
+    }
+}
+
+/// `target`'s key columns, qualified by its alias `t`, in key order.
+fn target_key_cols(target: &SweptTarget) -> Vec<String> {
+    target
         .key_cols
         .iter()
         .map(|c| format!("t.{}", quote_ident(&c.name)))
-        .collect();
-    let patterns = null_patterns(arrays);
-    let bound = keyset_bound(&target_cols, &target.key_cols, &patterns);
+        .collect()
+}
+
+/// [`delete_keys`]'s lock: `target`'s rows of the keys in `arrays` (see
+/// [`keyset`]), `for update` in key order. A drain page locks a 1-1
+/// target's rows in that order (`staging::apply`'s pre-lock) and an
+/// aggregate's groups in it (the group upsert's `order by`), both ascending
+/// with `NULL`s last.
+fn lock_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> String {
+    let Keyset {
+        relation,
+        condition,
+    } = keyset(target, arrays);
+    format!(
+        "select 1 from {} as t, {relation} as k where {condition} \
+         order by {} for update of t",
+        target.target_ident,
+        target_key_cols(target).join(", "),
+    )
+}
+
+/// [`delete_keys`]'s delete: `target`'s rows of the keys in `arrays` (see
+/// [`keyset`]), with no live ledger entry left for a ledger target's group
+/// sweep, returning each deleted row's key (and prior image).
+fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> String {
+    let Keyset {
+        relation,
+        condition,
+    } = keyset(target, arrays);
     let guard = match &target.ledger_guard {
         Some(ledger) => {
             use crate::defs::ledger::{MEMBER_COLUMN, TOMBSTONE_COLUMN};
@@ -876,19 +1000,8 @@ fn delete_statement(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Str
         None => String::new(),
     };
     format!(
-        "delete from {} as t using (select {} from unnest({}) as u({})) as k \
-         where {}{bound}{guard} and exists ( \
-             select 1 from transform_definitions where id = ${} and status = ${} \
-         ) \
-         returning {}",
-        target.target_ident,
-        typed.join(", "),
-        arrays_sql.join(", "),
-        cols.join(", "),
-        keyset_match_cols(&target_cols, &patterns),
-        arity + 1,
-        arity + 2,
-        target.returning,
+        "delete from {} as t using {relation} as k where {condition}{guard} returning {}",
+        target.target_ident, target.returning,
     )
 }
 
@@ -1270,6 +1383,396 @@ mod db_tests {
         assert_eq!(groups, vec![Some("b".to_string())]);
     }
 
+    /// The advisory lock key a test holds to freeze the sweep at a pause
+    /// point (`crate::staging::interleave`).
+    const SWEEP_PAUSE: i64 = 716;
+
+    /// [`sweep`], committed, on a connection of its own and inside `scope`,
+    /// so a test can freeze it at a pause point and drive another
+    /// transaction against the locks it holds.
+    fn spawn_sweep(
+        mut client: tokio_postgres::Client,
+        ids: Vec<i64>,
+        scope: std::sync::Arc<crate::staging::interleave::PauseScope>,
+    ) -> tokio::task::JoinHandle<Result<Swept, IntakeError>> {
+        tokio::spawn(crate::staging::interleave::with_scope(scope, async move {
+            let txn = client.transaction().await?;
+            let mut sweep = Sweep::default();
+            sweep.add(&txn, &ids, TransformStatus::CatchingUp).await?;
+            if super::super::markers::declare_read(&txn, None, &sweep).await? {
+                super::super::markers::fetch_read(&txn, "", &mut sweep).await?;
+            }
+            let swept = sweep.finish(&txn).await?;
+            txn.commit().await?;
+            Ok(swept)
+        }))
+    }
+
+    /// Runs `statements` (each with one `text[]` parameter, or none) in one
+    /// transaction on a connection of its own, and commits: a drain page's
+    /// locks, taken in the order `staging::apply::apply_page` takes them.
+    fn spawn_page(
+        client: tokio_postgres::Client,
+        statements: Vec<(String, Option<Vec<String>>)>,
+    ) -> tokio::task::JoinHandle<Result<(), tokio_postgres::Error>> {
+        tokio::spawn(async move {
+            client.batch_execute("begin").await?;
+            for (sql, keys) in &statements {
+                match keys {
+                    Some(keys) => client.execute(sql.as_str(), &[keys]).await?,
+                    None => client.execute(sql.as_str(), &[]).await?,
+                };
+            }
+            client.batch_execute("commit").await
+        })
+    }
+
+    /// The first unbacked key the sweep of `ids` reads, declared as
+    /// `markers::declare_read` declares it.
+    async fn first_unbacked(db: &testkit::TestDatabase, ids: &[i64]) -> Vec<Option<String>> {
+        let (_, mut probe) = connect(db).await;
+        let txn = probe.transaction().await.expect("begin");
+        let mut planned = Sweep::default();
+        planned
+            .add(&txn, ids, TransformStatus::CatchingUp)
+            .await
+            .expect("plan the sweep");
+        let branches: Vec<&str> = planned.branches().collect();
+        txn.batch_execute(&format!(
+            "set local cursor_tuple_fraction = 1; \
+             declare probe cursor for {}",
+            branches.join(" union all ")
+        ))
+        .await
+        .expect("declare the read");
+        txn.query_one("fetch forward 1 from probe", &[])
+            .await
+            .expect("the read's first row")
+            .get(2)
+    }
+
+    /// Waits until a backend queues on a lock `pid` holds: a forced state,
+    /// reached once the other side's statement runs, not a convergence.
+    async fn wait_blocked_behind(ctl: &tokio_postgres::Client, pid: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let blocked: bool = ctl
+                .query_one(
+                    "select exists (select 1 from pg_stat_activity \
+                     where $1 = any(pg_blocking_pids(pid)))",
+                    &[&pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if blocked {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing queued behind the frozen sweep (pid {pid}) within 60 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The page's entry lock on [`BY_G`]'s ledger: `staging::ledger`'s
+    /// `lock_statement`, every entry of `$1` in key order.
+    fn by_g_entry_lock() -> String {
+        let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
+        format!(
+            "select 1 from public.orders_by_g__ledger \
+             where {key} = any($1::text[]) order by {key} for update"
+        )
+    }
+
+    /// Issue #716: the sweep locks a ledger target's entries in one sorted
+    /// statement over every key its read found, as a drain page does
+    /// (ADR-0002 I5), not one statement per page of the read. Every entry
+    /// of [`BY_G`] is unbacked and its ledger is laid out in descending key
+    /// order, so the read's first page holds the highest keys and its second
+    /// the lowest. A page locks the lowest and the highest while the sweep
+    /// is frozen after an entry lock.
+    ///
+    /// Locking per read page, the sweep held the highest key there and the
+    /// page queued on it holding the lowest, which the sweep's second read
+    /// page then wanted: a deadlock, which Postgres broke by aborting one of
+    /// the two (40P01). Locking every key at once, the sweep holds both, the
+    /// page waits for its commit, and both commit.
+    #[tokio::test]
+    async fn a_sweep_locks_entries_in_key_order_across_the_reads_pages() {
+        use crate::staging::interleave::{PausePoint, PauseScope};
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        // One more row than a page of the read (`markers::BACKFILL_PAGE_ROWS`).
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g text, a numeric); \
+             insert into public.orders select n, 'a', n from generate_series(1, 10001) n",
+        )
+        .await
+        .expect("seed orders");
+        relate_orders(&pool, &raw).await;
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::defs::catalog::install_definition(&pool, BY_G, &columns, "public")
+            .await
+            .expect("register");
+        crate::intake::markers::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 1, "the build finished");
+        let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
+        raw.batch_execute(&format!(
+            "delete from public.orders; \
+             create temp table entries as select * from public.orders_by_g__ledger; \
+             delete from public.orders_by_g__ledger; \
+             insert into public.orders_by_g__ledger select * from entries order by {key} desc; \
+             analyze public.orders, public.orders_by_g__ledger"
+        ))
+        .await
+        .expect("unback every entry, laid out in descending key order");
+        let row = raw
+            .query_one(
+                &format!("select min({key}), max({key}) from public.orders_by_g__ledger"),
+                &[],
+            )
+            .await
+            .expect("the ledger's key range");
+        let (lowest, highest): (String, String) = (row.get(0), row.get(1));
+
+        // The precondition: the read returns the highest key first, so it
+        // lands on the first of the read's two pages and the lowest on the
+        // second.
+        assert_eq!(
+            first_unbacked(&db, &ids).await,
+            vec![Some(highest.clone())],
+            "the read must return the ledger in its heap order"
+        );
+
+        let (_, ctl) = connect(&db).await;
+        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
+            .await
+            .expect("hold the pause lock");
+        let scope = PauseScope::new();
+        let reached = scope.arm(
+            PausePoint::AfterEntryLock,
+            "public.orders_by_g",
+            SWEEP_PAUSE,
+        );
+        let (_, sweeper) = connect(&db).await;
+        let sweep = spawn_sweep(sweeper, ids, scope);
+        let frozen = reached.await.expect("the sweep reaches its entry lock");
+
+        let (_, pager) = connect(&db).await;
+        let page = spawn_page(
+            pager,
+            vec![(by_g_entry_lock(), Some(vec![lowest, highest]))],
+        );
+        wait_blocked_behind(&ctl, frozen.backend_pid).await;
+        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
+            .await
+            .expect("release the sweep");
+
+        let swept = sweep.await.expect("the sweep task");
+        let paged = page.await.expect("the page task");
+        assert!(
+            swept.is_ok() && paged.is_ok(),
+            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
+            swept.as_ref().err(),
+            paged.as_ref().err()
+        );
+        assert_eq!(swept.expect("swept").deleted, 1, "the emptied group");
+    }
+
+    /// Issue #716's second shape: the sweep takes its targets in the order a
+    /// drain page does (ADR-0002 I5), a 1-1 target's rows before an
+    /// aggregate target's entries, whatever order it read them in. Order 1
+    /// is unbacked in both [`BY_G`] (installed first, so read first) and a
+    /// 1-1 copy. A page applying a change to order 1 locks the copy's row
+    /// and then [`BY_G`]'s entry, while the sweep is frozen after its entry
+    /// lock on [`BY_G`].
+    ///
+    /// Taking its targets in the order it read them, the sweep held the
+    /// entry there and the page queued on it holding the copy's row, which
+    /// the sweep then wanted: a deadlock (40P01). Taking the copy first, the
+    /// sweep holds the row there, the page waits for its commit, and both
+    /// commit.
+    #[tokio::test]
+    async fn a_sweep_takes_one_to_one_targets_before_ledger_entries() {
+        use crate::staging::interleave::{PausePoint, PauseScope};
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g text, a numeric); \
+             insert into public.orders values (1, 'a', 1), (2, 'b', 2)",
+        )
+        .await
+        .expect("seed orders");
+        relate_orders(&pool, &raw).await;
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.orders")
+            .await
+            .expect("make orders read as another definition's target");
+        for text in [BY_G, "TRANSFORM orders_copy FROM orders SELECT a AS a"] {
+            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
+                .await
+                .expect("register");
+        }
+        crate::intake::markers::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 2, "both builds finished");
+        raw.batch_execute("delete from public.orders where id = 1")
+            .await
+            .expect("unback order 1");
+
+        let (_, ctl) = connect(&db).await;
+        ctl.execute("select pg_advisory_lock($1)", &[&SWEEP_PAUSE])
+            .await
+            .expect("hold the pause lock");
+        let scope = PauseScope::new();
+        let reached = scope.arm(
+            PausePoint::AfterEntryLock,
+            "public.orders_by_g",
+            SWEEP_PAUSE,
+        );
+        let (_, sweeper) = connect(&db).await;
+        let sweep = spawn_sweep(sweeper, ids, scope);
+        let frozen = reached.await.expect("the sweep reaches its entry lock");
+
+        let (_, pager) = connect(&db).await;
+        let page = spawn_page(
+            pager,
+            vec![
+                (
+                    "select 1 from public.orders_copy where id = 1 for update".to_string(),
+                    None,
+                ),
+                (by_g_entry_lock(), Some(vec!["1".to_string()])),
+            ],
+        );
+        wait_blocked_behind(&ctl, frozen.backend_pid).await;
+        ctl.execute("select pg_advisory_unlock($1)", &[&SWEEP_PAUSE])
+            .await
+            .expect("release the sweep");
+
+        let swept = sweep.await.expect("the sweep task");
+        let paged = page.await.expect("the page task");
+        assert!(
+            swept.is_ok() && paged.is_ok(),
+            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
+            swept.as_ref().err(),
+            paged.as_ref().err()
+        );
+        assert_eq!(
+            swept.expect("swept").deleted,
+            2,
+            "the copy's row and the emptied group"
+        );
+    }
+
+    /// Issue #716: the sweep locks a target's rows in key order before it
+    /// deletes them, in one statement over every key its read found, as a
+    /// drain page's pre-lock takes them (ADR-0002 I5). Every row of a 1-1
+    /// copy is unbacked and laid out in descending key order, so the read's
+    /// first page holds the highest keys and its second the lowest. A page
+    /// locks the lowest, the sweep runs into it, and the page then locks the
+    /// highest.
+    ///
+    /// Deleting per read page, the sweep had deleted the highest row by
+    /// then: a deadlock (40P01). Locking every key in order, the sweep
+    /// queues on the lowest holding none of the rest, and both commit.
+    #[tokio::test]
+    async fn a_sweep_locks_rows_in_key_order_before_it_deletes_them() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        // One more row than a page of the read (`markers::BACKFILL_PAGE_ROWS`).
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g text, a numeric); \
+             insert into public.orders select n, 'a', n from generate_series(1, 10001) n",
+        )
+        .await
+        .expect("seed orders");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.orders")
+            .await
+            .expect("make orders read as another definition's target");
+        crate::defs::catalog::install_definition(
+            &pool,
+            "TRANSFORM orders_copy FROM orders SELECT a AS a",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register");
+        crate::intake::markers::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 1, "the build finished");
+        raw.batch_execute(
+            "delete from public.orders; \
+             create temp table copied as select * from public.orders_copy; \
+             delete from public.orders_copy; \
+             insert into public.orders_copy select * from copied order by id desc; \
+             analyze public.orders, public.orders_copy",
+        )
+        .await
+        .expect("unback every row, laid out in descending key order");
+        assert_eq!(
+            first_unbacked(&db, &ids).await,
+            vec![Some("10001".to_string())],
+            "the read must return the copy in its heap order"
+        );
+
+        let (_, mut pager) = connect(&db).await;
+        let page = pager.transaction().await.expect("begin the page");
+        page.execute(
+            "select 1 from public.orders_copy where id = 1 for update",
+            &[],
+        )
+        .await
+        .expect("the page locks the lowest row");
+        let page_pid: i32 = page
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("the page's backend")
+            .get(0);
+        let (_, sweeper) = connect(&db).await;
+        let sweep = spawn_sweep(sweeper, ids, crate::staging::interleave::PauseScope::new());
+        let (_, ctl) = connect(&db).await;
+        wait_blocked_behind(&ctl, page_pid).await;
+        let highest = page
+            .execute(
+                "select 1 from public.orders_copy where id = 10001 for update",
+                &[],
+            )
+            .await;
+        let paged = match highest {
+            Ok(_) => page.commit().await,
+            Err(e) => Err(e),
+        };
+
+        let swept = sweep.await.expect("the sweep task");
+        assert!(
+            swept.is_ok() && paged.is_ok(),
+            "the sweep and the page must not deadlock: sweep {:?}, page {:?}",
+            swept.as_ref().err(),
+            paged.as_ref().err()
+        );
+        assert_eq!(swept.expect("swept").deleted, 10001, "every row");
+    }
+
     /// Issue #518: a definition row whose text doesn't parse is an error the
     /// discharge fails its marker on (and backs off, #407), not a panic that
     /// takes down the maintenance loop.
@@ -1432,9 +1935,10 @@ mod db_tests {
     /// 100 rows, then grown to 400k with autovacuum off. Left to the keyset
     /// join alone, the planner hashed 5,000 keys against a sequential scan of
     /// the target; [`keyset_bound`] caps the target's side at the keys. The
-    /// delete is explained the way [`Sweep::delete`] runs it, under
+    /// delete is explained the way [`Sweep::finish`] runs it, under
     /// `ENTRY_PLAN_SETTINGS`: with the bound alone, PostgreSQL 16 still
-    /// scanned the target and filtered it (CI).
+    /// scanned the target and filtered it (CI). [`lock_statement`] reads the
+    /// same keyset the same way, and the scan count below covers it.
     ///
     /// A composite key isn't bounded. With fresh statistics, a four-column
     /// key at 2M rows must not be matched by comparing every target row with
@@ -1498,6 +2002,7 @@ mod db_tests {
             let target = SweptTarget {
                 id,
                 status: TransformStatus::CatchingUp,
+                lock_order: (false, table.to_string()),
                 target: table.to_string(),
                 target_ident: ddl::qualified_target_table_ident(table),
                 returning: ddl::pk_key_sql_expr(&key_cols, Some("t")),
@@ -1506,6 +2011,7 @@ mod db_tests {
                 has_image: false,
                 ledger_guard: None,
                 ledger_rederive: None,
+                unbacked: Vec::new(),
             };
             let columns: Vec<String> = target
                 .key_cols
@@ -1603,7 +2109,8 @@ mod db_tests {
             assert_eq!(
                 seq_scans_in_txn(&txn, table).await,
                 before,
-                "{table}: the sweep's delete must not scan the target, as its plan above doesn't"
+                "{table}: the sweep's lock and delete must not scan the target, \
+                 as the delete's plan above doesn't"
             );
             txn.rollback().await.expect("roll back");
             assert_eq!(
