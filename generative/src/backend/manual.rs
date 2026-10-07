@@ -1106,10 +1106,11 @@ impl super::Backend for ManualBackend {
     ///
     /// Matches [`super::SubprocessBackend::restart`]'s own explicit
     /// `kill`-then-`wait` (never just letting its `CrashGuard` drop) for the
-    /// identical layer-1 reason; `SubprocessBackend` doesn't need layer 2
-    /// because waiting on the real OS process's exit status is a stronger,
-    /// synchronous guarantee than anything an in-process `Drop`/`shutdown`
-    /// pair can give.
+    /// identical layer-1 reason. The process's exit doesn't close layer 2's
+    /// gap either: the killed engine's backend still has to be scheduled to
+    /// read the EOF (issue #870). `SubprocessBackend` waits for the singleton
+    /// to read free in `pg_locks` before spawning instead of retrying, since
+    /// a failed start there is a dead subprocess, not a typed error.
     async fn restart(&mut self) -> Result<(), ManualBackendError> {
         let options = self
             .client_options
