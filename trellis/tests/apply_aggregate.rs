@@ -1984,15 +1984,54 @@ async fn count_star_composes_with_avg_across_insert_update_delete_and_grain_migr
     );
 }
 
+/// The server-log entries in `log` for statements whose text names
+/// `table_ident`, one string per statement. `log_statement` writes each
+/// statement it logs as one `LOG:  statement: ...` (simple protocol) or `LOG:
+/// execute <name>: ...` (extended protocol) entry, and the server indents every
+/// continuation line of a multi-line entry with a tab, so an entry runs until
+/// the next line that doesn't start with one. Bind parameters land in a
+/// separate `DETAIL:` entry, so a parameter that spells the table's name (the
+/// catalog lookups pass it to `to_regclass`) is not counted as a read.
+fn logged_statements_naming(log: &str, table_ident: &str) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for line in log.lines() {
+        match entries.last_mut() {
+            Some(entry) if line.starts_with('\t') => {
+                entry.push('\n');
+                entry.push_str(line);
+            }
+            _ => entries.push(line.to_string()),
+        }
+    }
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let first_line = entry.lines().next().unwrap_or_default();
+            (first_line.contains("LOG:  statement: ") || first_line.contains("LOG:  execute "))
+                && entry.contains(table_ident)
+        })
+        .collect()
+}
+
 /// A from-scratch backfill (every source row staged image-less, so every
 /// group takes the full-recompute path — issue #59) over many groups must
-/// (a) land exactly the oracle's values for all of them, and (b) not scan
-/// the source table once per group. The pre-#59 per-group probe loop did an
-/// existence probe plus one probe per field for each group — `O(groups)`
-/// source scans — so with `GROUP_COUNT` groups it would scan `order_items`
-/// thousands of times; the bulk path is a fixed handful regardless. We read
-/// that scan count straight off `pg_stat_user_tables` as the regression
-/// guard.
+/// (a) land exactly the oracle's values for all of them, and (b) not read
+/// the source table once per group. The pre-#59 per-group probe loop issued
+/// an existence probe plus one probe per field for each group — `O(groups)`
+/// statements against the source — so with `GROUP_COUNT` groups it would
+/// query `order_items` thousands of times; the bulk path issues a fixed
+/// handful regardless. The regression guard counts those statements in the
+/// server's statement log.
+///
+/// It used to read `seq_scan + idx_scan` off `pg_stat_user_tables` instead,
+/// which flaked (#853) for two reasons. PostgreSQL 16's btree runs an `=
+/// any(<array>)` index condition as one index descent per array element and
+/// counts each as an `idx_scan`, so the single batched refetch of the batch's
+/// 1,500 source keys alone counted 1,500 (PostgreSQL 17 counts it once). And
+/// a backend flushes its scan counters to the shared statistics up to a
+/// second or more after its statement ends, so whether the read saw them at
+/// all depended on timing: locally it usually saw 0, and under a loaded CI
+/// run it saw 1,501.
 #[tokio::test]
 async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_scans() {
     const GROUP_COUNT: i64 = 750;
@@ -2047,7 +2086,23 @@ async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_sca
     }
 
     let seg0 = seal_active_segment(&mut client).await;
-    let outcome = drain(&db.pool, seg0, "worker").await;
+
+    // Log every statement the drain issues. A database-level setting
+    // applies to each connection opened after it, so the drain runs on a
+    // fresh pool: every one of its connections logs from its first
+    // statement, with no wait for a configuration reload to reach a
+    // connection that already exists.
+    client
+        .batch_execute(&format!(
+            "alter database \"{}\" set log_statement = 'all'",
+            db.name()
+        ))
+        .await
+        .expect("enable statement logging for the drain's connections");
+    let drain_pool =
+        trellis::Pool::new(&trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"))
+            .expect("build the drain's pool");
+    let outcome = drain(&drain_pool, seg0, "worker").await;
     assert_eq!(
         outcome.keys_written, GROUP_COUNT as usize,
         "every one of the {GROUP_COUNT} groups is newly created"
@@ -2060,25 +2115,22 @@ async fn backfilling_many_groups_matches_the_oracle_without_per_group_source_sca
         "the bulk backfill of {GROUP_COUNT} groups must match the oracle exactly"
     );
 
-    // The regression guard: source scans must stay a small constant, not
-    // scale with GROUP_COUNT. The bulk path scans `order_items` a handful of
-    // times per batch (the batched live-row refetch, the survivor probe, and
-    // the INSERT ... SELECT recompute); the pre-#59 loop scanned it
-    // `O(GROUP_COUNT)` times. A generous ceiling well below GROUP_COUNT
-    // fails loudly on regression while tolerating planner/refetch variation.
-    let scans: i64 = client
-        .query_one(
-            "select coalesce(seq_scan, 0) + coalesce(idx_scan, 0) \
-             from pg_stat_user_tables where relname = 'order_items'",
-            &[],
-        )
-        .await
-        .expect("read order_items scan count")
-        .get(0);
+    // The regression guard: the statements that read `order_items` must
+    // stay a small constant, not scale with GROUP_COUNT. Today that is the
+    // one batched refetch of the batch's live source rows; the pre-#59 loop
+    // issued `O(GROUP_COUNT)`. At least one must be logged, or the guard
+    // isn't seeing the drain's statements at all.
+    let log =
+        std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
+    let source_reads =
+        logged_statements_naming(&log, &format!("\"{DEFAULT_SCHEMA}\".\"order_items\""));
     assert!(
-        scans < 50,
-        "backfilling {GROUP_COUNT} groups scanned order_items {scans} times; \
-         the bulk recompute must not scan once per group (issue #59)"
+        (1..10).contains(&source_reads.len()),
+        "backfilling {GROUP_COUNT} groups issued {} statements against order_items; the \
+         bulk recompute must read it in a fixed handful of batched statements, not once \
+         per group (issue #59):\n{}",
+        source_reads.len(),
+        source_reads.join("\n")
     );
 }
 
