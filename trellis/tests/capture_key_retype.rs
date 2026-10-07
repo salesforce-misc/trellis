@@ -2348,6 +2348,38 @@ async fn a_re_type_that_cant_lock_its_table_changes_nothing_and_pauses_nothing()
     );
 }
 
+/// #824: an in-place re-type that fails for another reason than its lock
+/// (a view on the target's column) leaves the table as it was, asks for no
+/// release, and pauses the definition as a widening that needs a rewrite
+/// does, naming the column, for its resume to re-type.
+#[tokio::test]
+async fn a_re_type_in_place_that_fails_pauses_its_definition_instead() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute(
+        "create view public.item_name_list as select name from public.item_names; \
+         alter table public.items alter column name type varchar(40)",
+    )
+    .await
+    .expect("a view on the target's column, then widen the passthrough");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["name"]).await;
+    assert!(error.contains("character varying(40)"), "{error}");
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying(10)"
+    );
+    let requests: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("read retype_releases")
+        .get(0);
+    assert_eq!(requests, 0);
+}
+
 /// #824: a 1-1 key re-typed in place (`varchar(10)` to `varchar(40)`)
 /// keeps the collation it copied from the source key, and its index. It is
 /// recorded at its new type, as a resume records it. Its target stores
