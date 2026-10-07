@@ -144,9 +144,12 @@ table per transaction, under the same lock timeout as a resume's re-type, and no
 pauses or rebuilds, a `varchar` key's copy included. The pass records the key's new
 type, as a resume would. Its `ALTER` is the transaction's first statement, so it
 waits for the table's `ACCESS EXCLUSIVE` holding no other lock, and once it has the
-table it takes only the locks of the table's own indexes and TOAST table. So it can't
-close a lock cycle with a drain page, a build or a release: a page queued behind it
-waits at most the timeout. A table whose re-type fails transiently (its lock not got
+table it takes the locks of the table's own indexes and TOAST table, and of any
+object of the application's that depends on the column, such as a foreign key that
+references it. Trellis's own pages, builds and releases take nothing it waits on, so
+it can't close a lock cycle with them: a page queued behind it waits at most the
+timeout. A cycle through an application object ends in a deadlock error, which counts
+as transient. A table whose re-type fails transiently (its lock not got
 in time, a deadlock, a statement timeout) is left as it is, nothing pauses, and the
 next pass tries again. A table where some widened column needs a rewrite pauses its
 definitions as above, and so does one whose re-type fails otherwise while some column
