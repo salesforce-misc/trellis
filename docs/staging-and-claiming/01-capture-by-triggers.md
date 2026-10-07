@@ -273,9 +273,10 @@ The reason names each column, its old and new type, and each copy, and says
 what to do. Nothing clears it but a deliberate `RESUME`, or a drop.
 
 The fourth check has one exception, which pauses nothing (#824). When every
-widened column of a table Trellis created (a target, a ledger, a group-delta
-table or a relationship projection) widened by changing only the catalog,
-the pass re-types that table's columns itself. The widenings that qualify
+widened column of a table Trellis created widened by changing only the
+catalog, the pass re-types that table's columns itself. Only a 1-1 target's
+copies and a relationship projection's can: Trellis types every other
+column by value family or by an expression, with no length or precision. The widenings that qualify
 are exactly `varchar(n)` to a longer `varchar(m)`, `varchar(n)` or
 `varchar` to `text`, `varchar(n)` to `varchar`, and `numeric(p,s)` to a
 larger precision at the same scale. `character(n)` changes and `text` to
@@ -296,7 +297,9 @@ release request (`retype_releases`) for each definition with a column on
 the table. After the pass, the staging worker releases every key such a
 definition holds whose failure had that SQLSTATE (`poison.sqlstate`),
 through the same per-key release as `Trellis::release_key`, so the key's
-parked work is applied again. A key held for any other failure stays held.
+parked work is applied again, and does so after each pass for a minute
+more, for a key whose eviction was still committing. A key held for any
+other failure stays held.
 
 Changes that need neither pause nothing: widening a key no copy holds (an
 aggregate's source key, which its ledger keys by text), a `GROUP BY` key's

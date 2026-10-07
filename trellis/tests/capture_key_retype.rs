@@ -2197,12 +2197,18 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
         held(&raw).await,
         vec![row("good_names", "public.goods", "5", "23514")]
     );
-    let requests: i64 = raw
-        .query_one("select count(*) from retype_releases", &[])
-        .await
-        .expect("read retype_releases")
-        .get(0);
-    assert_eq!(requests, 0, "every requested release was made");
+    let requests = async |raw: &Client| -> i64 {
+        raw.query_one("select count(*) from retype_releases", &[])
+            .await
+            .expect("read retype_releases")
+            .get(0)
+    };
+    assert_eq!(
+        requests(&raw).await,
+        3,
+        "each request is kept for its window: 22001 and 22003 for good_names, 22001 for \
+         post_authors"
+    );
 
     // The goods apply in the first drain. The released `users` key's
     // re-derive reaches `post_authors`' rows through the reverse records it
@@ -2236,6 +2242,31 @@ async fn keys_held_for_a_value_the_old_type_couldnt_hold_are_released_after_the_
         )
         .await,
     );
+
+    // A drain that reproduced a key's failure before the re-type can commit
+    // its eviction after the pass's release read the keys held. The next
+    // pass within the request's window releases it.
+    raw.execute(
+        "insert into poison (transform_id, src_table, key, last_error, sqlstate) \
+         select id, 'public.goods', '2', 'value too long for type character varying(10)', \
+                '22001' \
+         from transform_definitions where target_table = 'public.good_names'",
+        &[],
+    )
+    .await
+    .expect("a key evicted after the release");
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        held(&raw).await,
+        vec![row("good_names", "public.goods", "5", "23514")]
+    );
+    // Past the window, a pass that finds nothing more to release consumes
+    // the requests.
+    raw.batch_execute("update retype_releases set requested_at = requested_at - interval '1 hour'")
+        .await
+        .expect("age the requests past their window");
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(requests(&raw).await, 0, "every requested release was made");
 }
 
 /// #824: only the named widenings are re-typed in place. A `character(n)`

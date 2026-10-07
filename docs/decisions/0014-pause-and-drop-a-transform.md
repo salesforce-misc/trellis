@@ -109,30 +109,30 @@ dependent's check fails.
 A resume then rebuilds from the schema as it is now. It records the source's live
 column types, which the rebuild casts through, and the type of each column the
 definition keys by (`definition_key_types`), which the staging worker's capture pass
-compares later changes against. The pass records a key column's new type itself when
-it accepts a change to it without a pause. And it brings every column Trellis created for the
-definition with a type that comes from the source to the type define would give it
-now. Some are copies of one source column: a 1-1 target's key and passthrough columns,
-an aggregate's `GROUP BY` columns in its target, ledger and group-delta table, and a
-to-one relationship projection's key and its column for each to-side column read
-through the relationship. Others are typed by an expression, and take the type
-define's inference gives it over the live schema: a 1-1 target's calculated fields,
-an aggregate's field columns (`SUM(qty)` is `bigint` over an `integer` `qty` and
-`numeric` over a `bigint` one), and its ledger's contribution columns, typed as the
-aggregate's argument. The staging worker's capture pass pauses a definition when the
-source widens past one of these columns, and the resume re-types every one whose type
-differs from define's, whichever change made it differ. Re-typing one is an `ALTER
-… TYPE` under `ACCESS EXCLUSIVE`, which waits for every reader of the table and, for
-`integer` to `bigint`, rewrites it, so it never runs inside `RESUME`: a resume with
-columns to re-type records a request (`resume_requests`) and returns at once, the
-definition still paused, and the staging worker's next capture pass re-types them, one
-table per transaction, then runs the resume itself. A crash between the two leaves the
-request, and the next pass (or the next `RESUME`) finishes the work. A column whose
-re-type fails (a value its new type can't hold) ends the request with the error on
-the definition's `capture_failure`, and leaves that table's columns as they were;
-another table's, re-typed before it, keep their new types, and the next resume finds
-them current. The resume always rebuilds after it re-types. Each re-type keeps the
-column's collation.
+compares later changes against. The pass records a key column's new type itself when it
+accepts a change to it without a pause. And the resume brings every column Trellis
+created for the definition with a type that comes from the source to the type define
+would give it now. Some are copies of one source column: a 1-1 target's key and
+passthrough columns, an aggregate's `GROUP BY` columns in its target, ledger and
+group-delta table, and a to-one relationship projection's key and its column for each
+to-side column read through the relationship. Others are typed by an expression, and
+take the type define's inference gives it over the live schema: a 1-1 target's
+calculated fields, an aggregate's field columns (`SUM(qty)` is `bigint` over an
+`integer` `qty` and `numeric` over a `bigint` one), and its ledger's contribution
+columns, typed as the aggregate's argument. The staging worker's capture pass pauses a
+definition when the source widens past one of these columns, and the resume re-types
+every one whose type differs from define's, whichever change made it differ. Re-typing
+one is an `ALTER … TYPE` under `ACCESS EXCLUSIVE`, which waits for every reader of the
+table and, for `integer` to `bigint`, rewrites it, so it never runs inside `RESUME`: a
+resume with columns to re-type records a request (`resume_requests`) and returns at
+once, the definition still paused, and the staging worker's next capture pass re-types
+them, one table per transaction, then runs the resume itself. A crash between the two
+leaves the request, and the next pass (or the next `RESUME`) finishes the work. A
+column whose re-type fails (a value its new type can't hold) ends the request with the
+error on the definition's `capture_failure`, and leaves that table's columns as they
+were; another table's, re-typed before it, keep their new types, and the next resume
+finds them current. The resume always rebuilds after it re-types. Each re-type keeps
+the column's collation.
 
 Outside a resume, Trellis re-types a column on its own in one case: when every column
 of a table it created that the source widened widened by changing only the catalog.
@@ -155,8 +155,10 @@ A value written between the source's `ALTER` and that re-type fails its write
 release request for each definition with a column on the table (`retype_releases`).
 After the pass, the staging worker releases each key such a definition holds whose
 failure had that SQLSTATE, recorded on its `poison` row, one key at a time through the
-same release as `Trellis::release_key`, and the key's parked work is applied again. A
-key held for any other failure stays held.
+same release as `Trellis::release_key`, and the key's parked work is applied again. It
+does so again after each pass for twice the session lock timeout, so a key whose
+eviction reproduced its failure before the re-type but committed after the release
+read the held keys is released too. A key held for any other failure stays held.
 
 Resume also releases every key the definition holds in quarantine: it deletes the
 definition's own `poison`, `poison_held` and `key_deaths` rows in the same transaction.

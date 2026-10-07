@@ -602,11 +602,15 @@ and the rebuild fails the keys it writes. Drop it and define it again.
   relationship's projection) waits for every reader of the table, and readers
   queue behind it. The capture pass's in-place re-type of a widening that
   changes only the catalog takes the same lock, for at most two seconds
-  while it waits and briefly once it has it. `integer` to `bigint` rewrites the table, so at a billion
-  rows reads of the target block for minutes, and the capture pass waits with
-  it. The `RESUME` itself returns at once; the definition stays `paused`, its
-  `capture_failure` saying it's resuming, until the staging worker has
-  re-typed the copies and started the rebuild. A rebuild follows every
+  while it waits and briefly once it has it. Either re-type changes the
+  table's row type, so a client that prepared a statement returning one of
+  its columns before the re-type gets `cached plan must not change result
+  type` the next time it runs it, once per prepared statement. `integer` to
+  `bigint` rewrites the table, so at a billion rows reads of the target
+  block for minutes, and the capture pass waits with it. The `RESUME` itself
+  returns at once; the definition stays `paused`, its `capture_failure`
+  saying it's resuming, until the staging worker has re-typed the copies and
+  started the rebuild. A rebuild follows every
   widening of a copied column.
 * **Quarantined keys stay held until they're released.** A key that's
   quarantined after repeated apply failures is held for the definition whose
@@ -618,11 +622,12 @@ and the rebuild fails the keys it writes. Drop it and define it again.
   the definition, and so does a field's move to another type family (entry
   22). After a widening that changes only the catalog, the capture pass
   re-types Trellis's column and then releases the definition's keys held
-  for `22001` or `22003` itself. A key whose eviction commits after that
-  release, from a failure reproduced before the re-type, stays held. The definition's `status` reports its held keys
-  (`held_keys`: how many, and since when) whatever its status, `live`
-  included, and `self_check` reports them with every audit. What clears a
-  held key:
+  for `22001` or `22003` itself, after that pass and each pass for a minute
+  more. A key whose eviction commits later than that, from a failure
+  reproduced before the re-type, stays held. The definition's `status`
+  reports its held keys (`held_keys`: how many, and since when) whatever its
+  status, `live` included, and `self_check` reports them with every audit.
+  What clears a held key:
   * `Trellis::release_key(transform, source_table, key)` (`trellis release`
     on the CLI, `release_key` in the bindings) releases one key, once its
     cause is fixed: every definition reading it re-derives it from its
@@ -668,7 +673,9 @@ refusing them up front:
   rebuilds
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and
-  the resume releases it.
+  the resume releases it. A change between deterministic collations needs
+  nothing (but see entry 3). A field's move to another type family pauses
+  nothing (entry 22).
 * **A widening that changes only the catalog of a column Trellis copies with
   its type.** `varchar(n)` to a longer `varchar`, to `text` or to
   `varchar`, and `numeric(p,s)` to a larger precision at the same scale,
@@ -677,9 +684,7 @@ refusing them up front:
   place, with no pause and no rebuild, and then releases the keys held for
   a value the old type couldn't hold (`22001`, `22003`) in between
   ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md)).
-  A table where another column needs a rewrite pauses as above. A change between deterministic collations needs
-  nothing (but see entry 3). A field's move to another type family pauses
-  nothing (entry 22).
+  A table where another column needs a rewrite pauses as above.
 * **A source's primary key dropped, or retyped off the supported types.** The
   drain pauses every definition it reaches, and what is downstream of them,
   with a `capture_failure` naming the cause, and the rest of the page commits.

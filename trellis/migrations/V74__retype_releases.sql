@@ -12,8 +12,8 @@ alter table poison add column sqlstate text;
 -- One row per definition and SQLSTATE whose held keys a re-type released
 -- the cause of, written in the re-type's own transaction, so a crash
 -- between the two doesn't lose the release. The staging worker releases
--- the keys (`staging::quarantine::release_retyped_keys`) and then deletes
--- the row. It has no foreign key on purpose: the re-type's transaction
+-- the keys (`staging::quarantine::release_retyped_keys`) after each pass,
+-- and deletes the row once they are released and its window has passed. It has no foreign key on purpose: the re-type's transaction
 -- holds `ACCESS EXCLUSIVE` on a table a drop takes after the definition's
 -- row, so it takes no lock on that row. The release deletes a row whose
 -- definition is gone.

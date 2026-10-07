@@ -3781,11 +3781,16 @@ pub async fn release_key(
 ///
 /// The staging worker runs it after each capture pass, so a release the
 /// re-type's transaction asked for is made even if the worker stopped in
-/// between. A row is deleted once all its keys are released, and only if no
-/// re-type asked again since it was read (`requested_at`). A release that
-/// waits out its lock timeout ([`ApplyError::ReleaseLockTimeout`]), or fails
-/// otherwise, keeps the row for the next pass. A row whose definition was
-/// dropped is deleted. Errs only when the rows can't be read or deleted.
+/// between. A row is kept, and its release run again after each pass, for
+/// [`RETYPE_RELEASE_WINDOW`] after the re-type asked for it: a drain that
+/// reproduced a key's failure before the re-type can commit the key's
+/// eviction after this read the keys held, and the next pass's release
+/// finds it. A row is deleted once all its keys are released and the window
+/// has passed, and only if no re-type asked again since it was read
+/// (`requested_at`). A release that waits out its lock timeout
+/// ([`ApplyError::ReleaseLockTimeout`]), or fails otherwise, keeps the row
+/// for the next pass. A row whose definition was dropped is deleted. Errs
+/// only when the rows can't be read or deleted.
 pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> {
     let requests = {
         let client = pool.get().await?;
@@ -3856,14 +3861,29 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
                 .await?
                 .execute(
                     "delete from retype_releases \
-                     where transform_id = $1 and sqlstate = $2 and requested_at = $3",
-                    &[&id, &sqlstate, &requested_at],
+                     where transform_id = $1 and sqlstate = $2 and requested_at = $3 \
+                       and requested_at < now() - $4::float8 * interval '1 second'",
+                    &[
+                        &id,
+                        &sqlstate,
+                        &requested_at,
+                        &RETYPE_RELEASE_WINDOW.as_secs_f64(),
+                    ],
                 )
                 .await?;
         }
     }
     Ok(())
 }
+
+/// How long [`release_retyped_keys`] keeps releasing the keys an in-place
+/// re-type asked for: twice the session lock timeout. An eviction that
+/// reproduced a failure from before the re-type commits within it unless
+/// its own lock waits, each short of the timeout (one that reaches it rolls
+/// the eviction back), add up to more. A key evicted later than that stays
+/// held until it is released by hand.
+pub(crate) const RETYPE_RELEASE_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(2 * crate::locks::LOCK_TIMEOUT.as_secs());
 
 /// The keys one definition holds in quarantine (#759): its `poison` rows,
 /// each a source key whose changes the definition's apply leaves out until
