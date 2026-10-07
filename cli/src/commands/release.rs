@@ -23,7 +23,9 @@ poisoned it is fixed. `trellis status` lists the held keys under
 
 <TRANSFORM> is the transform's bare target-table name. <SOURCE_TABLE> may be
 `schema.table` or a bare table name. <KEY> is the key as status prints it (a
-composite key's columns joined as status shows them).
+composite key's columns joined as status shows them). Status quotes each of
+the three for a POSIX shell where it needs it ('...', with a ' inside written
+'\\''), so paste them as printed.
 
 The release stages a recompute of the key, which every transform reading the
 table applies from the key's current row, and discards the changes held for
@@ -33,7 +35,9 @@ transform (`trellis apply 'RESUME TRANSFORM <TRANSFORM>'`) releases every key
 it holds.
 
 A transform that doesn't exist, or a key it doesn't hold, is an error, and
-nothing changes.
+nothing changes. The release first waits for the drain pages in flight on the
+table to commit; if one holds it past the 30-second lock timeout, the release
+fails with a `timeout` error and changes nothing: run it again.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
@@ -42,6 +46,20 @@ Options:
                              PGPASSWORD/PGDATABASE, if omitted.
   -h, --help                 Print this help and exit.
 ";
+
+/// `text` as one word of a POSIX shell command line: bare when every
+/// character is one no shell treats specially, otherwise inside single
+/// quotes, where nothing is special but the quote itself, written `'\''`
+/// (close the quotes, an escaped quote, reopen them). `status` prints held
+/// keys, their tables and transforms this way, so a line pasted from it
+/// passes `release` each one exactly as the engine reports it (#842).
+pub fn shell_quote(text: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-.,:/@%+=".contains(c);
+    if !text.is_empty() && text.chars().all(plain) {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
 
 /// A parsed `release` invocation.
 #[derive(Debug, PartialEq, Eq)]
@@ -89,8 +107,10 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     outcome?;
     shutdown_outcome?;
     Ok(format!(
-        "released key {:?} of {} for {}; a recompute re-derives it from its current row",
-        args.key, args.source_table, args.transform
+        "released key {} of {} for {}; a recompute re-derives it from its current row",
+        shell_quote(&args.key),
+        shell_quote(&args.source_table),
+        shell_quote(&args.transform)
     ))
 }
 
@@ -112,6 +132,22 @@ mod tests {
                 key: "42".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn a_plain_word_is_left_bare() {
+        for word in ["42", "public.orders", "order_totals", "a-b,c:d/e@f%g+h=i"] {
+            assert_eq!(shell_quote(word), word);
+        }
+    }
+
+    #[test]
+    fn anything_else_is_single_quoted_with_quotes_escaped() {
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+        assert_eq!(shell_quote(r#"a"b\c"#), r#"'a"b\c'"#);
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
     }
 
     #[test]

@@ -20,8 +20,9 @@ defmodule Trellis.Error do
   - `:conflict`: clashes with something that already exists.
   - `:not_found`: names something that doesn't exist.
   - `:timeout`: a bounded wait ran out before its condition held (for
-    example, the target hadn't caught up within the timeout you gave).
-    Expected, not a bug: retry, or allow longer.
+    example, the target hadn't caught up within the timeout you gave, or
+    `Trellis.release_key/4` waited out the lock timeout for the pages in
+    flight on its table). Expected, not a bug: retry, or allow longer.
   - `:internal`: a Trellis bug or an unexpected database failure.
   - `:unknown`: a code newer than this binding.
   """

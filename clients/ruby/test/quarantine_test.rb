@@ -180,6 +180,29 @@ class QuarantineTest < Minitest::Test
     end
   end
 
+  # A release first waits for the drain pages in flight on the key's table,
+  # behind the table's version fence, before it looks the key up. One whose
+  # wait runs past the session's lock timeout (100 ms here, behind a fence
+  # row another transaction hasn't committed) raises TimeoutError, which
+  # says to retry it, and changes nothing (#842).
+  def test_a_release_that_waits_out_the_lock_timeout_raises_a_timeout_error
+    Trellis.connect(url: "#{TestCluster.dsn} options='-c lock_timeout=100'")
+    pg = TestCluster.pg
+    pg.exec("begin")
+    pg.exec("insert into trellis.source_table_versions (source_table, version) " \
+            "values ('public.release_wait', 1)")
+
+    error = assert_raises(Trellis::TimeoutError) do
+      Trellis.release_key("release_wait", "public.release_wait", "1")
+    end
+    assert_equal :timeout, error.code
+    assert_match "in flight", error.message
+    assert_match "retry", error.message
+  ensure
+    pg&.exec("rollback")
+    pg&.close
+  end
+
   def test_the_quarantine_calls_refuse_malformed_arguments_before_calling_the_engine
     Trellis.connect(url: TestCluster.dsn)
 

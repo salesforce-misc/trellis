@@ -55,11 +55,14 @@ pub enum ErrorCode {
     /// before the condition it waits for held: the caller's own deadline
     /// expired, not a fault. Expected and retryable: retry with the same or a
     /// wider budget, or look at why the engine is behind. Today that's
-    /// [`crate::Trellis::await_converged`] exhausting its `timeout`. Kept
-    /// apart from `Internal` so a host can tell it from a bug (issue #586).
-    /// Not every timeout is this: a pool checkout timing out is
-    /// `Connectivity`, and a Postgres statement or lock timeout is
-    /// classified by its SQLSTATE like any other server error.
+    /// [`crate::Trellis::await_converged`] exhausting its `timeout`, and
+    /// [`crate::Trellis::release_key`] waiting out the lock timeout for the
+    /// drain pages in flight on the key's table (issue #842), which changes
+    /// nothing and succeeds on a retry once they commit. Kept apart from
+    /// `Internal` so a host can tell it from a bug (issue #586). Not every
+    /// timeout is this: a pool checkout timing out is `Connectivity`, and any
+    /// other Postgres statement or lock timeout is classified by its SQLSTATE
+    /// like any other server error.
     Timeout,
     /// Anything else: engine-internal failures, "should not happen"
     /// invariants, IO failures, and Postgres errors with no more specific

@@ -359,6 +359,77 @@ async fn a_release_naming_no_held_key_is_refused_and_changes_nothing() {
     assert_eq!(fence(&d).await, before, "each refusal rolled its bump back");
 }
 
+/// A release whose first lock, the bump of the key's table's version fence,
+/// waits out the lock timeout behind a page holding the fence (#842). It's
+/// [`ApplyError::ReleaseLockTimeout`], a retryable [`ErrorCode::Timeout`]
+/// rather than a raw `55P03`, and it changes nothing: the fence and the held
+/// key are as they were, and the same release succeeds once the page is
+/// gone. The release's session runs with a 100 ms `lock_timeout` (a shorter
+/// setting than Trellis's 30 s cap is kept), so the test waits on nothing
+/// but the release's own timeout.
+#[tokio::test]
+async fn a_release_that_waits_out_the_lock_timeout_is_a_retryable_timeout_and_changes_nothing() {
+    let mut d = start().await;
+    hold_key_1(&mut d).await;
+    let config = Config::with_schema(
+        format!("{} options='-c lock_timeout=100'", d.db.dsn()),
+        DEFAULT_SCHEMA,
+    )
+    .expect("config");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+    let before = fence(&d).await;
+
+    // A page's hold on the fence: `for share` from its first lock to its
+    // commit.
+    let mut page = d.user().await;
+    let txn = page.transaction().await.expect("begin");
+    txn.execute(
+        "select version from source_table_versions where source_table = $1 for share",
+        &[&NUMS],
+    )
+    .await
+    .expect("hold nums' fence");
+
+    let err = trellis
+        .release_key("doubles", NUMS, "1")
+        .await
+        .expect_err("the fence is held past the lock timeout");
+    assert!(
+        matches!(
+            &err,
+            TrellisError::Apply(ApplyError::ReleaseLockTimeout { transform, src_table, key })
+                if transform == "doubles" && src_table == NUMS && key == "1"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.code(), ErrorCode::Timeout);
+    let message = err.to_string();
+    assert!(message.contains("retry"), "{message}");
+    assert!(message.contains("in flight"), "{message}");
+    txn.rollback().await.expect("end the page");
+
+    assert_eq!(fence(&d).await, before, "the refusal rolled its bump back");
+    assert_eq!(
+        held(&d).await,
+        vec![("doubles".to_string(), "1".to_string())]
+    );
+    assert_eq!(rows_for(&d, "poison_held", "doubles").await, 1);
+
+    d.ctl
+        .batch_execute("alter table public.doubles drop constraint small")
+        .await
+        .expect("fix the cause");
+    trellis
+        .release_key("doubles", NUMS, "1")
+        .await
+        .expect("the retry releases the key");
+    assert!(held(&d).await.is_empty());
+    drain_all(&mut d).await;
+    assert_doubles_match_the_source(&d).await;
+}
+
 /// A page that parks a change for the held key and a release of the key
 /// (#759, ADR-0002 I1). The page holds `nums`' fence `for share` from its
 /// first lock to its commit, and parks the change before it commits. The

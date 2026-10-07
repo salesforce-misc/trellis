@@ -243,7 +243,9 @@ module Trellis
     # Resuming the transform releases every key it holds.
     #
     # An unknown transform raises NotFoundError, and so does a key it doesn't
-    # hold, which changes nothing.
+    # hold, which changes nothing. The release first waits for the drain
+    # pages in flight on the table to commit; a wait past the lock timeout
+    # (30 seconds) raises TimeoutError and changes nothing: call it again.
     #
     #   Trellis.release_key("order_totals", "public.orders", "42")
     def release_key(transform, source_table, key)

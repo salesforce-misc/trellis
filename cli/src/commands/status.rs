@@ -39,6 +39,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{Config, DefinitionSummary, RelationshipSummary, Trellis, TrellisOptions};
 
+use super::release::shell_quote;
+
 /// Help text for `trellis status -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.
 pub const USAGE: &str = "\
@@ -142,15 +144,23 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
         return "Quarantined source rows: none\n".to_string();
     }
     let mut out = format!("Quarantined source rows: {}\n", poisoned.len());
+    // The transform, table and key are quoted for a POSIX shell where they
+    // need it (`release::shell_quote`), so each pastes into `trellis
+    // release` as the engine reports it (#842). The error is only read, so
+    // it keeps Rust's escaping, which holds it on one line.
     for entry in poisoned {
         out.push_str(&format!(
-            "  transform={} table={} key={:?} error={:?}\n",
-            entry.transform, entry.src_table, entry.key, entry.last_error
+            "  transform={} table={} key={} error={:?}\n",
+            shell_quote(&entry.transform),
+            shell_quote(&entry.src_table),
+            shell_quote(&entry.key),
+            entry.last_error
         ));
     }
     out.push_str(
         "  Fix the cause, then release a key with \
-         `trellis release <transform> <table> <key>`.\n",
+         `trellis release <transform> <table> <key>`, pasting each as shown \
+         (quoted for the shell where it needs it).\n",
     );
     out
 }
@@ -495,7 +505,59 @@ mod tests {
         assert!(formatted.contains("Quarantined source rows: 1"));
         assert!(formatted.contains("transform=order_totals"));
         assert!(formatted.contains("table=orders"));
-        assert!(formatted.contains("key=\"42\""));
+        assert!(formatted.contains("key=42 "));
         assert!(formatted.contains("error=\"division by zero\""));
+    }
+
+    /// A held key that needs quoting round-trips from `status`'s listing to
+    /// `release`'s arguments through a real shell (#842): the line's
+    /// `transform=`, `table=` and `key=` words, pasted after `trellis
+    /// release` and split by `sh`, parse to exactly the entry's values.
+    #[test]
+    fn a_held_key_pastes_from_status_into_release_unchanged() {
+        use trellis::PoisonEntry;
+
+        use super::super::release;
+
+        let entry = PoisonEntry {
+            transform: "order_totals".to_string(),
+            src_table: "public.orders".to_string(),
+            key: r#"it's a "key" \ with $HOME `and` \"#.to_string(),
+            last_error: "division by zero".to_string(),
+            poisoned_at: UNIX_EPOCH,
+        };
+        let formatted = format_poisoned(std::slice::from_ref(&entry));
+        let line = formatted
+            .lines()
+            .find(|line| line.starts_with("  transform="))
+            .expect("the entry's line");
+        let words = &line.trim_start()[..line.trim_start().rfind(" error=").expect("error=")];
+
+        // `sh` splits the pasted words as an operator's shell would, and
+        // prints each argument NUL-terminated.
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {words}"))
+            .output()
+            .expect("run sh");
+        assert!(output.status.success(), "{output:?}");
+        let argv: Vec<String> = String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .split_terminator('\0')
+            .zip(["transform=", "table=", "key="])
+            .map(|(word, label)| {
+                word.strip_prefix(label)
+                    .unwrap_or_else(|| panic!("{word:?} starts with {label}"))
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            release::parse(&argv).expect("release takes the pasted words"),
+            release::Args {
+                transform: entry.transform,
+                source_table: entry.src_table,
+                key: entry.key,
+            }
+        );
     }
 }

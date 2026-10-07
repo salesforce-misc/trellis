@@ -1098,6 +1098,15 @@ impl Trellis {
     /// (wrapped in [`TrellisError::Apply`], [`ErrorCode::NotFound`]),
     /// changing nothing, if it holds no such key: a table it doesn't read, a
     /// key it never held, or one already released.
+    ///
+    /// The release first waits for the drain pages in flight on the key's
+    /// table to commit, so it never misses a change one of them is parking
+    /// for the key. A page that holds it past the session's `lock_timeout`
+    /// ([`crate::locks::LOCK_TIMEOUT`], 30 s) makes it error with
+    /// [`ApplyError::ReleaseLockTimeout`] (wrapped in
+    /// [`TrellisError::Apply`], [`ErrorCode::Timeout`]), changing nothing:
+    /// the key is still held, and retrying the call releases it once the
+    /// pages commit.
     pub async fn release_key(
         &self,
         transform: &str,

@@ -461,7 +461,9 @@ defmodule Trellis do
   Resuming the transform releases every key it holds.
 
   An unknown `transform` is a `:not_found` error, and so is a key it doesn't
-  hold, which changes nothing.
+  hold, which changes nothing. The release first waits for the drain pages in
+  flight on the table to commit; a wait past the lock timeout (30 seconds) is
+  a `:timeout` error and changes nothing: call it again.
 
       :ok = Trellis.release_key(trellis, "order_totals", "public.orders", "42")
   """

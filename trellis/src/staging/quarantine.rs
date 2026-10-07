@@ -3581,7 +3581,9 @@ async fn end_request(
 /// key text [`crate::app::Trellis::sample_quarantined`] reports. Errors with
 /// [`ApplyError::TransformNotFound`] for an unknown `transform`, and with
 /// [`ApplyError::KeyNotHeld`], changing nothing, when the transform holds no
-/// such key. Returns how many parked changes were discarded.
+/// such key. A first lock that waits out the session's `lock_timeout` is
+/// [`ApplyError::ReleaseLockTimeout`], also changing nothing: retryable.
+/// Returns how many parked changes were discarded.
 pub async fn release_key(
     pool: &Pool,
     transform: &str,
@@ -3603,7 +3605,19 @@ pub async fn release_key(
     // is the canonical name, the one a page's fence read set keys the
     // table's changes on. A name that resolves to no table bumps a fence no
     // page reads, and the release then refuses and rolls it back.
-    super::build::bump_version_fence(&*txn, &names[0]).await?;
+    // A page that holds the fence past the lock timeout makes the release
+    // give up (#842): name that wait, retryable, rather than return a raw
+    // `55P03`. The bump never landed, and dropping `txn` rolls it back.
+    if let Err(err) = super::build::bump_version_fence(&*txn, &names[0]).await {
+        if crate::locks::is_lock_not_available(&err) {
+            return Err(ApplyError::ReleaseLockTimeout {
+                transform: transform.to_string(),
+                src_table: src_table.to_string(),
+                key: key.to_string(),
+            });
+        }
+        return Err(err.into());
+    }
     let transform_id: i64 = txn
         .query_opt(
             "select id from transform_definitions where split_part(target_table, '.', 2) = $1 \

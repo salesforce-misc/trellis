@@ -246,6 +246,22 @@ pub enum ApplyError {
         src_table: String,
         key: String,
     },
+    /// [`super::quarantine::release_key`]'s first lock, the bump of the key's
+    /// table's version fence, waited out the session's `lock_timeout`
+    /// ([`crate::locks::LOCK_TIMEOUT`], 30 s, unless the session set a
+    /// shorter one) (#842). The release waits for every drain page holding
+    /// that fence, the pages in flight on the table, so a page that parked a
+    /// change for the key has committed before the release reads the key's
+    /// rows; a page that holds it longer than the timeout makes the release
+    /// give up. The bump never lands and its transaction rolls back, so
+    /// nothing changed and the key is still held: retry the release. Only
+    /// this wait is named: a lock timeout anywhere else in the release is the
+    /// raw [`ApplyError::Db`], as it is in every other operator call.
+    ReleaseLockTimeout {
+        transform: String,
+        src_table: String,
+        key: String,
+    },
     /// [`super::quarantine::resume_transform`] or
     /// [`super::quarantine::resume_column`] re-ran define-time validation
     /// against the live schema and it failed (#708, #760): define would
@@ -326,6 +342,9 @@ impl ApplyError {
             ApplyError::TransformNotFound { .. } => ErrorCode::NotFound,
             ApplyError::TransformNotPaused { .. } => ErrorCode::Conflict,
             ApplyError::KeyNotHeld { .. } => ErrorCode::NotFound,
+            // A wait that ran out, not a fault: the release changed nothing
+            // and the same call succeeds once the table's pages commit.
+            ApplyError::ReleaseLockTimeout { .. } => ErrorCode::Timeout,
             // The schema blocks the request, as define's own refusal does.
             ApplyError::ResumeRefused { reason, .. } => reason.code(),
         }
@@ -411,6 +430,17 @@ impl fmt::Display for ApplyError {
                 f,
                 "'{transform}' holds no key {key:?} of '{src_table}' in quarantine"
             ),
+            ApplyError::ReleaseLockTimeout {
+                transform,
+                src_table,
+                key,
+            } => write!(
+                f,
+                "releasing key {key:?} of '{src_table}' for '{transform}' timed out waiting for \
+                 the drain pages in flight on '{src_table}' to commit (a release waits for \
+                 every page on the key's table); nothing changed and the key is still held: \
+                 retry the release"
+            ),
             ApplyError::ResumeRefused { transform, reason } => write!(
                 f,
                 "'{transform}' can't resume: define would refuse it as the schema stands now: \
@@ -459,6 +489,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::TransformNotFound { .. }
             | ApplyError::TransformNotPaused { .. }
             | ApplyError::KeyNotHeld { .. }
+            | ApplyError::ReleaseLockTimeout { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. }
             | ApplyError::TruncateWithoutLsn { .. } => None,
         }
