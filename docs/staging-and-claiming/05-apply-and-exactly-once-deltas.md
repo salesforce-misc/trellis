@@ -259,9 +259,13 @@ its Phase 2 and its lock for a long time, and a parent change whose
 recompute drained in that window would otherwise have its value written
 over by the page's older read (#838). A parent change that commits after
 the Re-derive's read stages a recompute whose page waits on the entry lock
-and writes after this one. The Apply's earlier read is safe: that recompute's
-Re-derive reads the row after the Apply's change, so I2 refuses the Apply if
-it lands later still. The Re-derive reads the projection by its primary key
+and writes after this one. The Apply's earlier read is safe. A to-one
+parent change can't advance the projection while the Apply's change is in
+flight, since guard (c) defers its reverse, and whenever the reverse applies
+it stages a recompute of the row; a to-many relationship's to-side change
+stages one at once. That recompute's Re-derive reads the row after the
+Apply's change, so I2 refuses the Apply if it lands later still. The
+Re-derive reads the projection by its primary key
 with sequential scans off, as the entry lock reads the ledger, so a
 projection whose statistics lag its size isn't read in full while the
 entries stay locked. A to-many relationship's to-side is read by its join

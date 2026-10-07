@@ -1619,3 +1619,168 @@ async fn parent_generation(d: &Driver, projection: &str, id: i32) -> i64 {
         .expect("read the parent's generation")
         .get(0)
 }
+
+// ------------------- a relationship-enriched page Apply against a parent
+
+/// Issue #838's audit: a page's Apply evaluates its change against the
+/// parents its Phase 2 read before the entry lock. That read may feed the
+/// value written, unlike a Re-derive's: a parent change that commits after
+/// it can't advance the projection while the Apply's change is in flight
+/// (guard (c) defers the parent's reverse), so the Apply writes the value
+/// the projection still holds, and the reverse that follows re-derives the
+/// kids. Past guard (c)'s fairness escalation, the reverse's recompute reads
+/// the kids' rows after their changes, and I2 refuses the Apply if it comes
+/// later still (the to-many test below pins that path). Kids 1 and 2 change
+/// and their page stops before its entry lock; the parent change then
+/// drains and leaves the projection as it was until the stopped page
+/// commits.
+async fn a_page_apply_does_not_outlive_a_parent_change_after_its_read(change: ParentChange) {
+    let mut d = start_kid().await;
+    let user = d.user().await;
+    user.batch_execute("update public.kid set a = a + 1")
+        .await
+        .expect("the kids' change");
+    let kid_batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(
+            kid_batch,
+            "kids",
+            &[(PausePoint::AfterPlaceholders, KID_TARGET)],
+        )
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    user.batch_execute(change.sql())
+        .await
+        .expect("the parent change");
+    let parent_batch = d.seal().await;
+    d.drain(parent_batch, "parent").await;
+    let projection = kid_projection(&d).await;
+    assert_eq!(
+        d.rows(&format!("select id, val from {projection} order by id"))
+            .await,
+        ["(1,10)"],
+        "the parent's reverse waits for the kids' changes in flight"
+    );
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    page.finish().await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "the Apply's Phase 2 read outlived the parent change ({change:?})"
+    );
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_a_parent_update_after_its_read() {
+    a_page_apply_does_not_outlive_a_parent_change_after_its_read(ParentChange::Update).await;
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_a_parent_insert_after_its_read() {
+    a_page_apply_does_not_outlive_a_parent_change_after_its_read(ParentChange::Insert).await;
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_a_parent_delete_after_its_read() {
+    a_page_apply_does_not_outlive_a_parent_change_after_its_read(ParentChange::Delete).await;
+}
+
+// ------------------- a page Apply against a to-many relationship's rows
+
+const PAR_TARGET: &str = "public.rp";
+const PAR_ACTUAL: &str = "select id, val, n from public.rp order by id";
+const PAR_EXPECTED: &str = "select p.id, p.val, \
+         (select count(k.id) from public.kid k where k.par_id = p.id) \
+     from public.par p order by p.id";
+
+/// The kid change that races a parent's Apply.
+#[derive(Clone, Copy, Debug)]
+enum KidChange {
+    /// A kid joins parent 1: the Apply would write the old count.
+    Insert,
+    /// Kid 1 leaves parent 1.
+    Delete,
+    /// Kid 2 moves onto parent 1.
+    Repoint,
+}
+
+impl KidChange {
+    fn sql(self) -> &'static str {
+        match self {
+            KidChange::Insert => "insert into public.kid values (3, 7, 1)",
+            KidChange::Delete => "delete from public.kid where id = 1",
+            KidChange::Repoint => "update public.kid set par_id = 1 where id = 2",
+        }
+    }
+}
+
+/// Issue #838's audit: a page's Apply of a definition that reads a to-many
+/// relationship evaluates its change against the to-side rows its Phase 2
+/// read live, before the entry lock. Parent 1's change stops before its
+/// entry lock; a kid change then commits, and the recompute of parent 1 its
+/// page would stage (`accumulate_from_side_recomputes`, which no guard
+/// defers) drains and writes the new count. When the stopped page goes on, I2
+/// refuses its Apply: the recompute read parent 1's row after the Apply's
+/// change, so the Apply can't put its older count back.
+async fn a_page_apply_does_not_outlive_a_kid_change_after_its_read(change: KidChange) {
+    let mut d = Driver::start_with_relationships(
+        KID_DDL,
+        &[("id", ValueType::Numeric), ("val", ValueType::Numeric)],
+        &["RELATIONSHIP kids FROM par.id TO kid.par_id"],
+        &["TRANSFORM rp FROM public.par SELECT val AS val, COUNT(kids.id) AS n"],
+        &["public.par", "public.kid"],
+    )
+    .await;
+    assert_eq!(
+        d.rows(PAR_ACTUAL).await,
+        d.rows(PAR_EXPECTED).await,
+        "the target before the scenario"
+    );
+    let user = d.user().await;
+    user.batch_execute("update public.par set val = 11 where id = 1")
+        .await
+        .expect("the parent's change");
+    let parent_batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(
+            parent_batch,
+            "parent",
+            &[(PausePoint::AfterPlaceholders, PAR_TARGET)],
+        )
+        .await;
+    page.reached(PausePoint::AfterPlaceholders).await;
+    // The kid change and the recompute of parent 1 its page stages (the
+    // ring has room for one more segment while the parent's is undrained).
+    write_uncaptured_on(&d, "public.kid", change.sql()).await;
+    d.stage_recomputes("public.par", &["1"]).await;
+    let recompute_batch = d.seal().await;
+    d.drain(recompute_batch, "recompute").await;
+    assert_eq!(
+        d.rows(PAR_ACTUAL).await,
+        d.rows(PAR_EXPECTED).await,
+        "the recompute's page wrote the new count"
+    );
+    d.release(&mut page, PausePoint::AfterPlaceholders).await;
+    page.finish().await;
+    assert_eq!(
+        d.rows(PAR_ACTUAL).await,
+        d.rows(PAR_EXPECTED).await,
+        "the Apply put back a count its Phase 2 read before its entry lock ({change:?})"
+    );
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_a_kid_insert_after_its_read() {
+    a_page_apply_does_not_outlive_a_kid_change_after_its_read(KidChange::Insert).await;
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_a_kid_delete_after_its_read() {
+    a_page_apply_does_not_outlive_a_kid_change_after_its_read(KidChange::Delete).await;
+}
+
+#[tokio::test]
+async fn a_page_apply_does_not_outlive_a_kid_repoint_after_its_read() {
+    a_page_apply_does_not_outlive_a_kid_change_after_its_read(KidChange::Repoint).await;
+}

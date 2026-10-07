@@ -94,7 +94,7 @@ These are the tools the entries refer to:
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
-| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886 |
+| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886, #892 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 
@@ -551,24 +551,41 @@ briefly, after two later updates replaced it (61, then 17, then `NULL`; the
 children kept 61). This is silent. Writing a child again doesn't correct it,
 since the write reads the same stale projection.
 
+A second cause gives one child the same symptom: a child that joins a parent
+(inserted under it, or moved onto it) while a page is applying that
+parent's change, after the page found the parent's children and before it
+commits. The child's write reads the parent's value from before the change,
+and the page's recompute of the parent's children doesn't include the
+child. Here the projection holds the new value, so writing the child again
+corrects it.
+
 **Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
 through a relationship (entry 16).
 
-**Planned work:** #886. The relationship projection's own row for the parent
-keeps the superseded value once everything has drained (61, while the parent
-holds `NULL`), so every child read through it gets that value: a parent
-change's advance of the projection is lost. What loses it isn't known yet. It
-isn't the shape of #763's to-one projection ordering holes (an orphaned or
-missing projection key), and it needs no resume or build. Milestone E (#624)
-replaces the relationship projection a 1-1 target reads its to-one values
-from.
+**Planned work:**
+
+* #886. The relationship projection's own row for the parent keeps the
+  superseded value once everything has drained (61, while the parent holds
+  `NULL`), so every child read through it gets that value: a parent
+  change's advance of the projection is lost. What loses it isn't known
+  yet. It isn't the shape of #763's to-one projection ordering holes (an
+  orphaned or missing projection key), and it needs no resume or build.
+* #892, the second cause. A child's read of the projection doesn't wait for
+  a page that has advanced the parent's row and not yet committed. The fix
+  needs a design call: the page would lock the parents its rows join before
+  it evaluates them, or check the parent's row there and stage the child
+  again when it moved.
+
+Milestone E (#624) replaces the relationship projection a 1-1 target reads
+its to-one values from.
 
 **Repair:** `request_backfill` the parent table. Its catch-up refreshes the
 relationship projection from the table, then re-derives every child from it.
 `PAUSE`/`RESUME` of the transform repairs it only when every other
 transform on the child table that reads the same relationship is paused too:
 a resume refreshes the projection only when no unpaused transform reads it,
-and otherwise its rebuild reads the same stale projection.
+and otherwise its rebuild reads the same stale projection. For the second
+cause alone, any later write to the child repairs it.
 
 ## 22. A column read only as a field moved to another type family
 

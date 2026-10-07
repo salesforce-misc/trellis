@@ -441,7 +441,8 @@ entry lock and in the same statement as the child's own read (I1).
   entry lock it is written under.** Every write of such a value reads the
   related rows after taking the entry lock it writes under, in the same
   transaction. A read made before the lock may feed evaluation or planning,
-  but never the value written. A writer can sit between an early read and
+  but never the value written, except a page's Apply's, which the next
+  bullet orders by I2 instead. A writer can sit between an early read and
   its lock for a long time (a stalled page, a chunk between its plan and its
   lock), and a parent change and the page of the recompute it stages can
   both commit in that window. The early read would then be written over the
@@ -451,9 +452,13 @@ entry lock and in the same statement as the child's own read (I1).
   relationship projection. An Apply evaluates its change's image against the
   projection the page resolves in Phase 2
   ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md)).
-  That read is not the value of record: a parent change that commits after it
-  stages a recompute of the child, and that Re-derive reads the child's row
-  after the Apply's change, so I2 refuses the Apply if it lands later still.
+  That read is not the value of record. A to-one parent change that commits
+  after it can't advance the projection while the Apply's change is in
+  flight: guard (c) defers the parent's reverse. Whenever the reverse
+  applies, it stages a recompute of the child, and a to-many relationship's
+  to-side change stages one at once. The recompute's Re-derive reads the
+  child's row after the Apply's change, so I2 refuses the Apply if it lands
+  later still.
   A Re-derive, a page's or a field build chunk's (a column resume), reads the
   projection after the entry lock and its read of the rows, for exactly the
   rows it read, by the projection's primary key. A parent change that commits
