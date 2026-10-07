@@ -2012,6 +2012,72 @@ async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
     resume_refused(&trellis, "note_items").await;
 }
 
+/// #828: [`a_definition_the_re_type_leaves_refused_keeps_its_own_error`]
+/// with the refusal found on the re-typed target itself. The relationship's
+/// from-side is another definition's target (`z_notes`), which the pass
+/// checks after `item_names`, so the pairing that no longer matches is
+/// found while checking the table the upstream resume re-typed, alongside
+/// a projection column (`next`) that outgrew only because that resume
+/// re-typed it. The refusal still stands, with no cause, while a sibling
+/// the same check pauses for the re-type alone records it.
+#[tokio::test]
+async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute(
+        "create table public.notes (id int primary key, item int, body text); \
+         insert into public.notes values (1, 1, 'x'), (2, 2, 'y');",
+    )
+    .await
+    .expect("seed notes");
+    for text in [
+        "TRANSFORM z_notes FROM public.notes SELECT item AS item",
+        "TRANSFORM b_names FROM public.item_names SELECT name AS name",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["item_names", "z_notes", "b_names"]).await;
+    for text in [
+        "RELATIONSHIP item FROM z_notes.item TO item_names.id",
+        "TRANSFORM note_items FROM public.z_notes \
+         SELECT item.name AS item_name, item.next AS item_next",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(
+        &mut raw,
+        &db.pool,
+        &["item_names", "z_notes", "b_names", "note_items"],
+    )
+    .await;
+
+    raw.batch_execute(
+        "alter table public.items alter column id type bigint, alter column qty type bigint",
+    )
+    .await
+    .expect("widen the key and qty");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+
+    let error = paused_for(&trellis, "note_items", "public.item_names", &["id", "next"]).await;
+    assert!(
+        !error.contains("the resume of") && error.contains("refuses until that is fixed"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "note_items").await, None);
+    resume_refused(&trellis, "note_items").await;
+    // The sibling the same check pauses for the re-type alone records it.
+    paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        caused_by(&raw, "b_names").await.as_deref(),
+        Some("item_names")
+    );
+}
+
 /// #824: a source change whose columns Trellis created from it hold every
 /// value of the types define would give them now pauses nothing: a
 /// widening under an expression typed by its family (`CHAR_LENGTH(name)`,
