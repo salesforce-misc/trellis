@@ -1643,7 +1643,10 @@ fn rederive_read_ctes(
 /// autoanalyze that samples a mostly-dead heap records `reltuples = 0`, the
 /// planner then expects one claimed row, and joins the upsert's result back
 /// to the group sums (`up join d`) in a nested loop that is quadratic in the
-/// batch (#625 F2b: 1.8 s instead of 25 ms for 5,000 rows).
+/// batch (#625 F2b: 1.8 s instead of 25 ms for 5,000 rows). The final
+/// `left join ... on true` stays a nested loop, the one join no setting can
+/// change, so the plan's cost estimate carries the penalty for a disabled
+/// node (see `super::build::merge_deltas`'s plan settings).
 ///
 /// `keep_claimed` renders the `merge_without_delete` plant: the claimed rows
 /// are read and locked but not deleted (see `crate::plant`).

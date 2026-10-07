@@ -1377,6 +1377,52 @@ async fn the_merge_plan_survives_empty_statistics() {
     );
 }
 
+/// The merge statement is never JIT-compiled (#794). Its plan settings turn
+/// nested loops off, but the claimed count's `left join ... on true` has no
+/// other join method, so before PostgreSQL 18 the planner adds its penalty
+/// for a disabled node (`1e10`) to that join's cost, and the statement's
+/// estimate clears every JIT threshold. A Postgres built with LLVM then
+/// compiled, inlined and optimized it on every call: about 137 ms of a
+/// 138 ms merge of 35 rows. Trellis's sessions run with `jit` off, so the
+/// estimate decides nothing. Postgres's own rule: a plan is compiled when
+/// `jit` is on and its total cost is above `jit_above_cost`.
+#[tokio::test]
+async fn the_merge_is_never_jit_compiled() {
+    let (d, plan) = start_build_with(
+        Flavour::Sum,
+        "insert into public.src select i, i % 40, i from generate_series(1, 300) i;",
+    )
+    .await;
+    d.chunk(&plan, None, "300").await;
+    let mut client = d.db.pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let partition: i16 = txn
+        .query_one(
+            "select __part from public.agg__deltas group by 1 order by count(*) desc limit 1",
+            &[],
+        )
+        .await
+        .expect("the fullest partition")
+        .get(0);
+    let explained = build::explain_merge(&txn, &plan, 5_000, partition)
+        .await
+        .expect("explain the merge");
+    let row = txn
+        .query_one(
+            "select current_setting('jit')::bool, current_setting('jit_above_cost')::float8",
+            &[],
+        )
+        .await
+        .expect("read the JIT settings");
+    let (jit, jit_above_cost): (bool, f64) = (row.get(0), row.get(1));
+    let total_cost = total_cost(explained.lines().next().expect("a plan"));
+    assert!(
+        !(jit && jit_above_cost >= 0.0 && total_cost > jit_above_cost),
+        "jit = {jit}, jit_above_cost = {jit_above_cost}, the merge's total cost = \
+         {total_cost}:\n{explained}"
+    );
+}
+
 /// A build's Re-derive statements reach the ledger through the key's
 /// index, and the source through its primary key, while the ledger's
 /// statistics lag its growth (#778): never analyzed (`empty`), or analyzed
@@ -1470,6 +1516,17 @@ async fn the_entry_plan_settings_end_with_each_statement() {
         "the chunk's transaction plans as usual after its statements"
     );
     txn.commit().await.expect("commit");
+}
+
+/// The total cost of an `explain` line's node: the second figure of its
+/// `cost=`.
+fn total_cost(line: &str) -> f64 {
+    line.split("cost=")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|costs| costs.split("..").nth(1))
+        .and_then(|cost| cost.parse().ok())
+        .unwrap_or_else(|| panic!("no total cost in {line:?}"))
 }
 
 /// The row estimate of an `explain` line's node: its `rows=`.

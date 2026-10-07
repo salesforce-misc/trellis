@@ -708,6 +708,13 @@ impl MergeOutcome {
 /// group sums by hash whatever the claim's row estimate, and no sequential
 /// scan, so the claim walks the claim key's index. [`MERGE_PLAN_RESET`]
 /// puts them back after the statement.
+///
+/// The claimed count's `left join ... on true` has no join method but a
+/// nested loop, so the plan carries the planner's penalty for a disabled
+/// node there (before PostgreSQL 18), and its total cost is about `1e10`
+/// whatever the batch. The estimate decides only the plan's shape: Trellis's
+/// sessions run with JIT off ([`crate::pool::JIT_OFF`]), so it can't make
+/// Postgres compile the statement (#794).
 const MERGE_PLAN_SETTINGS: &str = "set local enable_nestloop = off; set local enable_seqscan = off";
 
 /// Undoes [`MERGE_PLAN_SETTINGS`] for the rest of the transaction.

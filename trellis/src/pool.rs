@@ -17,7 +17,8 @@
 //! value's text rendering depend on the value alone rather than on the
 //! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]), turns
 //! `row_security` off so a read row-level security would filter raises
-//! instead (see [`ROW_SECURITY_OFF`], issue #766), and turns on
+//! instead (see [`ROW_SECURITY_OFF`], issue #766), turns JIT compilation
+//! off (see [`JIT_OFF`], issue #794), and turns on
 //! TCP keepalives at both ends so a partitioned connection's locks don't
 //! outlive it by hours (see [`tcp_keepalive_gucs`], issue #364). The
 //! dedicated, non-pooled connections get the same through
@@ -375,6 +376,33 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
 /// failed application write. The capture pass pauses those readers instead.
 pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 
+/// Turns JIT compilation off (issue #794).
+///
+/// Postgres JIT-compiles a statement whose estimated cost is above
+/// `jit_above_cost`, and inlines and optimizes it above
+/// `jit_inline_above_cost` and `jit_optimize_above_cost`, whenever the server
+/// is built with LLVM (as the PGDG and most distribution packages are) and
+/// `jit` is on, its default. Compiling one of Trellis's statements costs
+/// 100–200 ms, and every one of them is bounded by a page, a chunk or a
+/// `limit`, so it never earns that back. Their cost estimates are what
+/// cross the thresholds, not their work:
+///
+/// * A statement run with a node type turned off (the build's merge,
+///   `staging::build::merge_deltas`, and the other plan pins) carries the
+///   planner's `1e10` penalty for a disabled node wherever no other node
+///   can do the job, before PostgreSQL 18. The merge's claimed count joins
+///   its result `on true`, which only a nested loop can, so every merge
+///   cleared the thresholds: about 137 ms of compiling for a 138 ms merge.
+/// * A build chunk's insert joins its keys (an `unnest`) to the source by
+///   an expression, whose row estimate is the planner's default guess: at
+///   10,000 keys it expected 21.7M rows, and spent 168 ms compiling a
+///   statement that ran in 40 ms.
+///
+/// It is applied by [`session_bootstrap`] and [`dedicated_session_setup`],
+/// so every connection Trellis opens itself carries it, whatever the
+/// server's, database's or role's default.
+pub(crate) const JIT_OFF: &str = "set jit to off";
+
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
 ///
@@ -384,7 +412,7 @@ pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 /// even when it lives outside both `schema` and `public`) and `public`
 /// (Postgres's own default, kept last as a fallback for anything that
 /// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`],
-/// [`ROW_SECURITY_OFF`], the server-side TCP keepalives
+/// [`ROW_SECURITY_OFF`], [`JIT_OFF`], the server-side TCP keepalives
 /// ([`tcp_keepalive_gucs`], without the user timeout: see
 /// [`DeadPeerDetection::KeepalivesOnly`]) and the session's
 /// `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`], ADR-0002
@@ -397,7 +425,7 @@ async fn session_bootstrap(
     client
         .batch_execute(&format!(
             "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; \
-             {ROW_SECURITY_OFF}; {}; {}",
+             {ROW_SECURITY_OFF}; {JIT_OFF}; {}; {}",
             quote_ident(schema),
             quote_ident(target_schema),
             tcp_keepalive_gucs(DeadPeerDetection::KeepalivesOnly),
@@ -618,13 +646,13 @@ pub(crate) async fn connect_dedicated(
 /// The session setup a dedicated connection runs straight after
 /// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
 /// pooled one: `search_path` pinned to `schema` then `public`,
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`ROW_SECURITY_OFF`],
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`ROW_SECURITY_OFF`], [`JIT_OFF`],
 /// [`tcp_keepalive_gucs`] with the user timeout, and the `lock_timeout` cap
 /// ([`crate::locks::session_lock_timeout_sql`]).
 pub(crate) fn dedicated_session_setup(schema: &str) -> String {
     format!(
         "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {ROW_SECURITY_OFF}; \
-         {}; {}",
+         {JIT_OFF}; {}; {}",
         quote_ident(schema),
         tcp_keepalive_gucs(DeadPeerDetection::KeepalivesAndUserTimeout),
         crate::locks::session_lock_timeout_sql()
@@ -855,12 +883,14 @@ mod tests {
         assert_eq!(render(&dedicated).await, expected, "dedicated");
     }
 
-    /// Issue #766: every kind of session Trellis opens itself (pooled,
-    /// unpooled, dedicated) runs with `row_security = off`, even when the
-    /// database's default says `on`, so a read that row-level security would
-    /// filter raises instead.
+    /// Every kind of session Trellis opens itself (pooled, unpooled,
+    /// dedicated) runs with `row_security` (issue #766) and `jit` (issue
+    /// #794) off, even when the database's default says `on`: a read that
+    /// row-level security would filter raises instead, and no statement is
+    /// JIT-compiled.
     #[tokio::test]
-    async fn row_security_is_off_on_every_session_kind() {
+    async fn row_security_and_jit_are_off_on_every_session_kind() {
+        const SETTINGS: [&str; 2] = ["row_security", "jit"];
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
@@ -869,37 +899,47 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        raw.batch_execute(&format!(
-            "alter database {} set row_security to on",
-            quote_ident(db.name())
-        ))
-        .await
-        .expect("an explicit database default of on");
-
-        async fn setting(client: &tokio_postgres::Client) -> String {
-            client
-                .query_one("select current_setting('row_security')", &[])
-                .await
-                .expect("read row_security")
-                .get(0)
+        for name in SETTINGS {
+            raw.batch_execute(&format!(
+                "alter database {} set {name} to on",
+                quote_ident(db.name())
+            ))
+            .await
+            .expect("an explicit database default of on");
         }
 
-        // Control: a session that pins nothing has it on.
+        async fn settings(client: &tokio_postgres::Client) -> Vec<String> {
+            let mut values = Vec::new();
+            for name in SETTINGS {
+                values.push(
+                    client
+                        .query_one("select current_setting($1)", &[&name])
+                        .await
+                        .expect("read the setting")
+                        .get(0),
+                );
+            }
+            values
+        }
+        let on = vec!["on".to_string(); SETTINGS.len()];
+        let off = vec!["off".to_string(); SETTINGS.len()];
+
+        // Control: a session that pins nothing has them on.
         let (unpinned, connection) = tokio_postgres::connect(db.dsn(), NoTls)
             .await
             .expect("connect unpinned");
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        assert_eq!(setting(&unpinned).await, "on", "unpinned");
+        assert_eq!(settings(&unpinned).await, on, "unpinned");
 
         let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
         let pool = Pool::new(&config).expect("pool");
         let pooled = pool.get().await.expect("pooled connection");
-        assert_eq!(setting(&pooled).await, "off", "pooled");
+        assert_eq!(settings(&pooled).await, off, "pooled");
 
         let unpooled = pool.connect_unpooled().await.expect("unpooled connection");
-        assert_eq!(setting(&unpooled).await, "off", "unpooled");
+        assert_eq!(settings(&unpooled).await, off, "unpooled");
 
         let (dedicated, connection) = connect_dedicated(db.dsn()).await.expect("dedicated");
         tokio::spawn(async move {
@@ -909,7 +949,7 @@ mod tests {
             .batch_execute(&dedicated_session_setup(crate::config::DEFAULT_SCHEMA))
             .await
             .expect("dedicated session setup");
-        assert_eq!(setting(&dedicated).await, "off", "dedicated");
+        assert_eq!(settings(&dedicated).await, off, "dedicated");
     }
 
     /// Issue #672 review: the SQL Trellis writes escapes a string literal by
