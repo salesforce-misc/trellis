@@ -211,6 +211,73 @@ async fn a_failure_only_two_relationships_work_reproduces_together_charges_every
     assert_eq!(probes, 4);
 }
 
+/// A failure in the re-derive of the children of a `to_col` value the fold
+/// erased, which is `ra`'s work alone. `ra` joins `par.code`, which isn't
+/// `par`'s key, so the fold carries `code`'s values (`to_col_values`); `rb`
+/// joins `par.id`. `par` 1's `code` goes 101 → 102 → 103 in one page, erasing
+/// 102, and the ring refuses the recompute staged for `sa` 3, the child of
+/// 102. Probing `rb` alone leaves the key out of `ra`'s work whole, the erased
+/// value's re-derive with it, so `rb`'s reader isn't charged.
+#[tokio::test]
+async fn a_failure_in_an_erased_values_rederive_charges_only_that_relationships_readers() {
+    let mut d = Driver::start_with_relationships(
+        "create table public.par (id integer primary key, code integer unique, w numeric); \
+         create table public.sa (id integer primary key, p integer); \
+         create table public.sb (id integer primary key, p integer); \
+         insert into public.par values (1, 101, 10); \
+         insert into public.sa values (1, 101), (3, 102); \
+         insert into public.sb values (1, 1);",
+        &[
+            ("id", ValueType::Numeric),
+            ("w", ValueType::Numeric),
+            ("p", ValueType::Numeric),
+        ],
+        &[
+            "RELATIONSHIP ra FROM sa.p TO par.code",
+            "RELATIONSHIP rb FROM sb.p TO par.id",
+        ],
+        &[
+            "TRANSFORM sa_w FROM public.sa SELECT ra.w AS pw",
+            "TRANSFORM sb_w FROM public.sb SELECT rb.w AS pw",
+        ],
+        &["public.par", "public.sa", "public.sb"],
+    )
+    .await;
+    d.ctl
+        .batch_execute(
+            "update public.par set code = 102 where id = 1; \
+             update public.par set code = 103 where id = 1;",
+        )
+        .await
+        .expect("move par 1's code through 102");
+    d.ctl
+        .batch_execute(
+            "create function public.refuse_sa_3() returns trigger language plpgsql as $$ \
+             begin \
+               if new.src_table = 'public.sa' and new.key = '3' then \
+                 raise exception 'sa 3 refused' using errcode = 'check_violation'; \
+               end if; \
+               return new; \
+             end $$;",
+        )
+        .await
+        .expect("refuse_sa_3");
+    for seg in 0..4 {
+        d.ctl
+            .batch_execute(&format!(
+                "create trigger refuse_sa_3 before insert on {DEFAULT_SCHEMA}.seg_{seg} \
+                 for each row execute function public.refuse_sa_3()"
+            ))
+            .await
+            .expect("make the ring refuse a recompute of sa 3");
+    }
+
+    let (outcome, probes) = isolate(&mut d).await;
+    assert_eq!(charged(&outcome), vec!["sa_w".to_string()], "{outcome:?}");
+    // The record alone, the relationships' share, then `ra`'s and `rb`'s.
+    assert_eq!(probes, 4);
+}
+
 // ---------------------------------------------------------------------
 // A failure only several direct readers reproduce together (#822 question 2)
 // ---------------------------------------------------------------------
