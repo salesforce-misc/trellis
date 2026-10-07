@@ -206,7 +206,8 @@ impl Trellis {
     /// anything [`Trellis`]'s own methods already cover. Its connections run
     /// with `row_security = off` (issue #766), so a query that row-level
     /// security would filter for the login role fails instead: read through
-    /// your own connection where you rely on policies to filter.
+    /// your own connection where you rely on policies to filter. They also
+    /// run with `jit = off` (issue #794).
     pub fn pool(&self) -> &Pool {
         &self.pool
     }

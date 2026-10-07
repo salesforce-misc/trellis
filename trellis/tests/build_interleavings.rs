@@ -1381,8 +1381,8 @@ async fn the_merge_plan_survives_empty_statistics() {
 /// nested loops off, but the claimed count's `left join ... on true` has no
 /// other join method, so before PostgreSQL 18 the planner adds its penalty
 /// for a disabled node (`1e10`) to that join's cost, and the statement's
-/// estimate clears every JIT threshold. A Postgres built with LLVM then
-/// compiled, inlined and optimized it on every call: about 137 ms of a
+/// estimate clears every JIT threshold. A Postgres built with LLVM would
+/// then compile, inline and optimize it on every call: about 137 ms of a
 /// 138 ms merge of 35 rows. Trellis's sessions run with `jit` off, so the
 /// estimate decides nothing. Postgres's own rule: a plan is compiled when
 /// `jit` is on and its total cost is above `jit_above_cost`.

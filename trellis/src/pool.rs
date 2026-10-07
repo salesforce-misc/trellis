@@ -382,21 +382,29 @@ pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 /// `jit_above_cost`, and inlines and optimizes it above
 /// `jit_inline_above_cost` and `jit_optimize_above_cost`, whenever the server
 /// is built with LLVM (as the PGDG and most distribution packages are) and
-/// `jit` is on, its default. Compiling one of Trellis's statements costs
-/// 100–200 ms, and every one of them is bounded by a page, a chunk or a
-/// `limit`, so it never earns that back. Their cost estimates are what
-/// cross the thresholds, not their work:
+/// `jit` is on, its default. Inlining and optimizing one of Trellis's
+/// statements costs 100–200 ms, and most of them are bounded by a page, a
+/// chunk or a `limit`, so they never earn that back. Their cost estimates
+/// are what cross the thresholds, not their work:
 ///
 /// * A statement run with a node type turned off (the build's merge,
 ///   `staging::build::merge_deltas`, and the other plan pins) carries the
 ///   planner's `1e10` penalty for a disabled node wherever no other node
 ///   can do the job, before PostgreSQL 18. The merge's claimed count joins
 ///   its result `on true`, which only a nested loop can, so every merge
-///   cleared the thresholds: about 137 ms of compiling for a 138 ms merge.
+///   clears the thresholds: a merge of 35 rows does about 0.4 ms of work
+///   and spends about 137 ms compiling.
 /// * A build chunk's insert joins its keys (an `unnest`) to the source by
 ///   an expression, whose row estimate is the planner's default guess: at
-///   10,000 keys it expected 21.7M rows, and spent 168 ms compiling a
-///   statement that ran in 40 ms.
+///   10,000 keys it expects 21.7M rows, and spends 168 ms compiling a
+///   statement that runs in 40 ms.
+///
+/// The statements that do read a whole table (the direct build's ledger
+/// load and group writes, its delete of groups the ledger no longer has,
+/// the discharge's enumeration and the resume's orphan sweep) gain nothing
+/// from JIT either: at 5M rows each takes the same time, within 2%, with it
+/// on or off, since its time goes to writing, sorting and hashing rows, not
+/// to evaluating expressions.
 ///
 /// It is applied by [`session_bootstrap`] and [`dedicated_session_setup`],
 /// so every connection Trellis opens itself carries it, whatever the
