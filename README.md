@@ -30,7 +30,7 @@ This repo is home to a few key components:
 
 * `trellis` is the rust crate that users will download and install into their application code
 * `cli` (package `trellis-cli`) builds the `trellis` operator-facing binary, which wraps the `trellis` library crate for defining transforms/relationships, running the live pipeline, and checking status from a shell — run `cargo run -p trellis-cli -- --help` (or `trellis --help` once installed) to see what it can do
-* `docs` outlines the key ideas and decisions this project has taken; [docs/recommendations.md](docs/recommendations.md) is the operator's guide to running Trellis well (WAL and checkpoint tuning, roles and permissions)
+* `docs` outlines the key ideas and decisions this project has taken; [docs/recommendations.md](docs/recommendations.md) is the operator's guide to running Trellis well (WAL and checkpoint tuning, ring sizing, roles and permissions)
 * `clients` holds the Elixir and Ruby bindings for running Trellis inside a host app; [docs/embedding.md](docs/embedding.md) is the guide to embedding it
 * `benchmark` is a harness for measuring throughput, latency and other key-metrics
 * `generative` is a generative test suite that is used to validate correctness under various scenarios and loads

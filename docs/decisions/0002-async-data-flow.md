@@ -745,8 +745,29 @@ Each alternative below is recorded with the number that rejected it.
   ledger), and the ring lives in the application's database at ~188 B per
   captured row when nothing drains
   ([E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)).
-  A growth bound and the policy at the bound are
-  open: [#808](https://github.com/salesforce-misc/trellis/issues/808).
+  The bound on that growth is designed but not built
+  ([#808](https://github.com/salesforce-misc/trellis/issues/808)):
+  - **Gauges** report the ring's rows and bytes, the age of its oldest
+    undrained row, and its undrained bytes per source table.
+  - **A soft bound, `ring_warn_bytes`, is on by default.** Above it,
+    `self_check` and `status()` report a backlog warning, and the drain takes
+    priority over optional work, as a build already yields to it
+    ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
+    Nothing is paused.
+  - **A hard bound, `ring_max_bytes`, is opt-in and off by default.** At it,
+    capture pauses for the definitions whose source tables hold the most
+    undrained bytes, largest first, until the ring is back under the bound.
+    Their pause kind is `backpressure`, their triggers are dropped under the
+    `lock_timeout` fence (I6), and their ring rows are discarded. `status()`
+    shows them paused with the reason, and `RESUME` rebuilds them from the
+    source: they are stale until then, never silently wrong. No application
+    writer is slowed or failed, and no captured row is skipped while capture
+    is on.
+  - **No bound applies while every Trellis process is down.** The capture
+    triggers keep appending, and only the database's own disk alerts guard
+    the disk. On restart, the bounds are checked first. Sizing the disk for
+    an outage:
+    [recommendations — Ring sizing](../recommendations.md#ring-sizing).
 - **Build time is per-row work on every worker**, not one `GROUP BY`. The
   acceptance bar is linear time with a per-row cost independent of table
   size, checked at 100M ([validation 3](#validation-and-acceptance)).
