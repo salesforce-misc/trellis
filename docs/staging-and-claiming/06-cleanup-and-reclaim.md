@@ -84,11 +84,14 @@ A change that reliably crashes the apply must not wedge its batch forever — bu
 silently skipping it makes a caller waiting on that change wait forever, or worse,
 be told it converged.
 
-**1. Isolate before blaming.** On a non-transient, non-halting apply failure (a
+**1. Isolate before blaming.** On a non-transient, non-halting apply failure,
+the page's `COMMIT` included (a
 halting one pauses its closure instead — see *What must never be quarantined*
 below), the batch is bisected with `BEGIN … ROLLBACK` probes: each half is
 applied on its own, and only a half that fails is split and probed again, down to
-single records. Blame lands only on the specific key(s) that fail on their own, so
+single records. A probe runs `SET CONSTRAINTS ALL IMMEDIATE` before its
+`ROLLBACK`, so a deferred constraint on a target fails in the probe as it does
+at `COMMIT`. Blame lands only on the specific key(s) that fail on their own, so
 an innocent batch-mate is neither charged nor evicted. If no single key reproduces it, the error is
 surfaced, not blamed. Bisection finds a failing key in about `2·log2(n)` probes
 rather than `n`, and a per-call probe cap bounds the rest.

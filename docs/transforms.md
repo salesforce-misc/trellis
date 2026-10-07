@@ -281,7 +281,12 @@ undefined. Treat a target as read-only, and specifically:
   completeness checks it.
 
 Indexes, and grants to other roles, are yours to add. They live and die with the
-table, so `DROP TRANSFORM` takes them with it. Another Trellis instance may read
+table, so `DROP TRANSFORM` takes them with it. A unique index, constraint or
+trigger you add that refuses a row Trellis writes, whether it checks the
+statement or is deferred to the commit, fails that row's key like any value its
+target refuses: the key ends up held in quarantine, and rows that fail only
+together hold their page back as a `drain_failure` (see [Status](#status)).
+Another Trellis instance may read
 a 1-1 target as a source, exactly as it would any table with a primary key. An
 aggregate target may not be read that way (see [Supported sources and targets](#supported-sources-and-targets)).
 

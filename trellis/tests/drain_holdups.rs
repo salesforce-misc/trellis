@@ -2,7 +2,9 @@
 //! key and pausing no definition is recorded in `drain_holdups`, reported by
 //! `status` on every unfrozen definition reading a table on the page and by
 //! `self_check` for the instance, and cleared by the transaction that
-//! commits the page.
+//! commits the page. A page that fails at COMMIT, on a deferred constraint an
+//! application put on a target (#856), is classified like any other: retried,
+//! charged to its key, or held up.
 //!
 //! Trellis runs as a non-superuser login role, `holdup_trellis`, owning the
 //! application's tables, and the drain as a second one, `holdup_worker`,
@@ -17,7 +19,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
 use trellis::intake::markers;
-use trellis::staging::{StagedWatermark, apply, seal};
+use trellis::staging::{StagedWatermark, apply, quarantine, seal};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
@@ -562,5 +564,164 @@ async fn a_transient_failure_records_no_holdup() {
     drain(&impatient, seg).await.expect("the page commits");
     assert!(holdups(&it.admin).await.is_empty());
     assert_eq!(status(&it, "c_copy").await.drain_failure, None);
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The key-by-key rows the quarantine charged: `(key, deaths)`.
+async fn deaths(admin: &Client) -> Vec<(String, i32)> {
+    admin
+        .query(
+            &format!("select key, deaths from {SCHEMA}.key_deaths order by key"),
+            &[],
+        )
+        .await
+        .expect("read the charged keys")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+/// `c_copy`'s amount for `id`.
+async fn copied_amount(admin: &Client, id: i32) -> i32 {
+    admin
+        .query_one("select amount from public.c_copy where id = $1", &[&id])
+        .await
+        .expect("read the target")
+        .get(0)
+}
+
+/// A deferred constraint an application put on a target fails at COMMIT
+/// (#856). A deferrable foreign key from `c_copy.amount` to `q.id`, and a
+/// page with two keys of `c`: key 3 names no `q`, key 4 names one. The
+/// drain classifies the COMMIT's failure like any other, and isolation, whose
+/// probes check deferred constraints before rolling back, charges key 3 alone
+/// on the first pass; nothing is held up. Once key 3 reaches the death
+/// threshold it is poisoned, and the page commits without it.
+#[tokio::test]
+async fn a_deferred_constraint_failing_at_commit_is_charged_to_its_key() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &READERS[2..]).await;
+    it.admin
+        .batch_execute(
+            "alter table public.c_copy add constraint c_copy_amount_q \
+               foreign key (amount) references public.q (id) deferrable initially deferred; \
+             update public.c set amount = 99 where id = 3; \
+             update public.c set amount = 2 where id = 4",
+        )
+        .await
+        .expect("a deferred foreign key, a key that violates it and one that doesn't");
+    let seg = seal(&mut it.raw).await;
+
+    let err = drain(&it.pool, seg)
+        .await
+        .expect_err("the page fails at COMMIT");
+    assert!(err.contains("c_copy_amount_q"), "{err}");
+    assert_eq!(
+        deaths(&it.admin).await,
+        vec![("3".to_string(), 1)],
+        "isolation reproduced the deferred failure on key 3 alone"
+    );
+    assert!(
+        holdups(&it.admin).await.is_empty(),
+        "a charged key isn't a holdup"
+    );
+    assert_eq!(status(&it, "c_copy").await.drain_failure, None);
+
+    for pass in 2..quarantine::DEFAULT_DEATH_THRESHOLD {
+        drain(&it.pool, seg)
+            .await
+            .expect_err("each pass charges key 3 again");
+        assert_eq!(deaths(&it.admin).await, vec![("3".to_string(), pass)]);
+    }
+    drain(&it.pool, seg)
+        .await
+        .expect("key 3 reaches the threshold and the page commits without it");
+    assert_eq!(copied_amount(&it.admin, 4).await, 2, "key 4 applied");
+    assert_eq!(copied_amount(&it.admin, 3).await, 3, "key 3 didn't");
+    assert!(holdups(&it.admin).await.is_empty());
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Records failing only together at COMMIT (#856): two keys of `c` set to one
+/// amount, which a deferrable unique constraint on `c_copy` refuses when the
+/// page commits. Each key passes alone, deferred check included, so
+/// isolation charges nothing and the drain records a holdup.
+#[tokio::test]
+async fn records_failing_only_together_at_commit_are_a_holdup() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &READERS[2..]).await;
+    it.admin
+        .batch_execute(
+            "alter table public.c_copy add constraint c_copy_amount \
+               unique (amount) deferrable initially deferred; \
+             update public.c set amount = 100 where id in (1, 2)",
+        )
+        .await
+        .expect("a deferred unique amount, and two keys that collide on it");
+    let seg = seal(&mut it.raw).await;
+    let err = drain(&it.pool, seg)
+        .await
+        .expect_err("the page fails at COMMIT while both keys are in it");
+    assert!(err.contains("c_copy_amount"), "{err}");
+
+    let rows = holdups(&it.admin).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].seg_seq, seg);
+    assert_eq!(rows[0].sqlstate.as_deref(), Some("23505"));
+    assert_eq!(rows[0].tables, vec!["public.c".to_string()]);
+    assert_eq!(charged(&it.admin).await, 0, "isolation charged nothing");
+    assert_eq!(
+        status(&it, "c_copy").await.drain_failure.map(|f| f.seg_seq),
+        Some(seg)
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A transient failure at COMMIT is retried (#856): a deferred constraint
+/// trigger on `c_copy` raises a serialization failure the first time it
+/// fires, counted by a sequence, which a rollback doesn't take back. One
+/// drain call retries the page, and it commits.
+#[tokio::test]
+async fn a_transient_failure_at_commit_is_retried() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &READERS[2..]).await;
+    it.admin
+        .batch_execute(
+            "create sequence public.commit_attempts; \
+             grant usage on sequence public.commit_attempts to holdup_trellis; \
+             create function public.fail_first_commit() returns trigger \
+               language plpgsql as $$ \
+               begin \
+                 if nextval('public.commit_attempts') = 1 then \
+                   raise exception 'the first commit fails' using errcode = '40001'; \
+                 end if; \
+                 return null; \
+               end $$; \
+             create constraint trigger c_copy_fail_first_commit \
+               after insert or update or delete on public.c_copy \
+               deferrable initially deferred \
+               for each row execute function public.fail_first_commit(); \
+             update public.c set amount = 100 where id = 1",
+        )
+        .await
+        .expect("a deferred trigger failing the first commit");
+    let seg = seal(&mut it.raw).await;
+
+    drain(&it.pool, seg)
+        .await
+        .expect("the drain retries the page past the failed commit");
+    let fired: i64 = it
+        .admin
+        .query_one("select last_value from public.commit_attempts", &[])
+        .await
+        .expect("read the sequence")
+        .get(0);
+    assert!(
+        fired >= 2,
+        "the first commit failed and a retry fired it again"
+    );
+    assert_eq!(copied_amount(&it.admin, 1).await, 100);
+    assert!(holdups(&it.admin).await.is_empty());
+    assert_eq!(charged(&it.admin).await, 0);
     it.trellis.shutdown().await.expect("shutdown");
 }

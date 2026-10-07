@@ -11202,9 +11202,26 @@ async fn drain_batch(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        match apply_page(&txn, steps, claimed_by, &plan, wake_channel, watermark).await {
+        let applied =
+            match apply_page(&txn, steps, claimed_by, &plan, wake_channel, watermark).await {
+                // #856: COMMIT fails like any statement of the page does: a
+                // deferred constraint or constraint trigger an application put
+                // on a target fires here, and a connection can drop here. Either
+                // is classified like an `apply_page` failure, which isolation can
+                // charge because its probes check deferred constraints too
+                // (`quarantine::probe_records`).
+                Ok(outcome) => txn
+                    .commit()
+                    .await
+                    .map(|()| outcome)
+                    .map_err(ApplyError::from),
+                Err(err) => {
+                    let _ = txn.rollback().await;
+                    Err(err)
+                }
+            };
+        match applied {
             Ok(outcome) => {
-                txn.commit().await?;
                 // Epic #49 cross-cutting review fix (issues #51/#52): only
                 // flush `plan`'s buffered metrics now, once this attempt's
                 // transaction has actually committed — never from inside
@@ -11222,7 +11239,6 @@ async fn drain_batch(
                 return Ok(outcome);
             }
             Err(err) => {
-                let _ = txn.rollback().await;
                 // Issue #670: isolation can run for many probes, each with
                 // its own compute and pooled connection. Holding this page's
                 // plan and connection across it cost about 1.5x the page's
@@ -11252,7 +11268,8 @@ async fn drain_batch(
 
 /// Classifies `err` (per [`quarantine::classify`]) and either retries or
 /// propagates, shared by both [`drain_once`] and [`drain_many`]'s Phase 2
-/// and Phase 3 failure arms so a bad key is attributed identically
+/// and Phase 3 failure arms, the page's COMMIT included (#856), so a bad key
+/// is attributed identically
 /// regardless of which phase — or which of the two orchestrators —
 /// first surfaced it.
 ///

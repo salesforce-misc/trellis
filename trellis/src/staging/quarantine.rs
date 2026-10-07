@@ -1038,8 +1038,9 @@ fn random_dead_end_offset() -> usize {
 }
 
 /// Computes and applies `records` inside a transaction that always rolls
-/// back (so it never commits the drained mark), and returns the error it
-/// failed with, if any. `Err` only for failing to check out a connection or
+/// back (so it never commits the drained mark), checking its deferred
+/// constraints before the rollback as COMMIT would (#856), and returns the
+/// error it failed with, if any. `Err` only for failing to check out a connection or
 /// open the transaction. `focus`, and `at`'s `skip_frozen`, are
 /// [`apply::compute_page`]'s.
 async fn probe_records(
@@ -1071,6 +1072,20 @@ async fn probe_records(
         &StagedWatermark::saturated(),
     )
     .await;
+    // #856: a probe never commits, so a deferred constraint or constraint
+    // trigger an application put on a target would never fire in it, and a
+    // page failing at COMMIT would reproduce on no key. Checking every
+    // deferred constraint here, after the apply, as COMMIT would, reproduces
+    // it per key. Constraints that aren't deferred were already checked as
+    // each statement ran, and none of Trellis's own tables declares a
+    // deferrable one, so this changes nothing else.
+    let outcome = match outcome {
+        Ok(_) => txn
+            .batch_execute("set constraints all immediate")
+            .await
+            .map_err(ApplyError::from),
+        Err(err) => Err(err),
+    };
     let _ = txn.rollback().await;
     Ok(outcome.err())
 }
