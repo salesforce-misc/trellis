@@ -165,3 +165,8 @@ silent loss is not.
 
 The slot is freed by **removing the registry row**, not truncating the table —
 see [06](06-cleanup-and-reclaim.md).
+
+The slots bound the number of segments, not their bytes. While a seal is refused,
+the capture triggers keep appending to the active segment, so the ring grows with
+the backlog; [recommendations — Ring sizing](../recommendations.md#ring-sizing)
+sizes the disk for it.

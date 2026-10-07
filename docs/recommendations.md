@@ -90,7 +90,8 @@ outruns the drain, which it can by about 20 times
 no Trellis process is running. Each undrained change takes about 188 B for a
 narrow row
 ([#565, E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119));
-a ring row carries the columns definitions read, so wider ones take more.
+a ring row carries the primary key and the columns definitions read, so wider
+rows take more, and an update carries both its old and new image.
 
 Size the free disk for the longest Trellis outage you want to ride out:
 
@@ -101,11 +102,17 @@ ring bytes ≈ 188 B × captured changes per second × outage seconds
 At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
 
 * Take the change rate from your own database: sum `n_tup_ins`, `n_tup_upd`
-  and `n_tup_del` in `pg_stat_user_tables` over the captured tables (every
-  source, and every target another transform reads) at two points of steady
-  load, and divide by the seconds between.
+  and `n_tup_del` in `pg_stat_user_tables` over the tables Trellis captures
+  (each definition's source, and every table its relationships reach) at two
+  points of steady load, and divide by the seconds between. It errs high:
+  capture skips an update that changes no column a definition reads. Leave
+  out Trellis's own targets: Trellis stages a target's changes for the
+  transforms that read it as it writes them, so those rows add to the ring
+  only while Trellis runs.
 * While every Trellis process is down, nothing drains or bounds the ring, and
   the database's own disk alerts are the only guard. Alert on free disk.
+* To see the ring's size on disk, sum `pg_total_relation_size` over the ring
+  tables `seg_0` to `seg_3` in Trellis's schema.
 * The ring's gauges and its soft and hard bounds are designed but not built
   ([#808](https://github.com/salesforce-misc/trellis/issues/808),
   [ADR-0002 — Consequences](decisions/0002-async-data-flow.md#consequences-and-costs)).
