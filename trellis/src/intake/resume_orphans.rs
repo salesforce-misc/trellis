@@ -2369,6 +2369,17 @@ mod db_tests {
              analyze public.wide; \
              create table public.single_src (id int primary key) \
                  with (autovacuum_enabled = false); \
+             create table public.pair (g int, h text, total int, primary key (g, h)) \
+                 with (autovacuum_enabled = false); \
+             create table public.pair_src (g int, h text, primary key (g, h)) \
+                 with (autovacuum_enabled = false); \
+             insert into public.pair select i, 'k' || i, i from generate_series(1, 100) i; \
+             insert into public.pair_src select i, 'k' || i from generate_series(1, 100) i \
+                 where i % 79 <> 0; \
+             analyze public.pair; analyze public.pair_src; \
+             insert into public.pair select i, 'k' || i, i from generate_series(101, 400000) i; \
+             insert into public.pair_src select i, 'k' || i from generate_series(101, 400000) i \
+                 where i % 79 <> 0; \
              insert into public.single select i, i from generate_series(1, 100) i; \
              insert into public.single_src select i from generate_series(1, 100) i \
                  where i % 79 <> 0; \
@@ -2392,6 +2403,12 @@ mod db_tests {
                 Some("public.single_src"),
             ),
             ("public.wide", "t.total % 79 = 0", false, None),
+            (
+                "public.pair",
+                "t.total % 79 = 0",
+                false,
+                Some("public.pair_src"),
+            ),
             (
                 "public.composite",
                 "t.g is null or t.h is null or t.total % 79 = 0",
@@ -2495,14 +2512,21 @@ mod db_tests {
                     .collect();
                 assert!(!scans.is_empty(), "{table}: no scan of {read} in:\n{plan}");
                 for scan in scans {
-                    let estimate: f64 = scan
-                        .split("rows=")
-                        .nth(1)
-                        .and_then(|rest| rest.split(' ').next())
-                        .and_then(|rows| rows.parse().ok())
-                        .expect("a row estimate");
+                    let figure = |label: &str, nth: usize| -> f64 {
+                        scan.split(label)
+                            .nth(nth)
+                            .and_then(|rest| rest.split([' ', ')']).next())
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or_else(|| panic!("{label} in {scan}"))
+                    };
+                    // The estimate lags with the statistics, so the rows the
+                    // scan actually read are checked too: a whole-index scan
+                    // of a stale table is estimated as small as a probe.
+                    let read_rows = figure("actual rows=", 1) * figure(" loops=", 1);
                     assert!(
-                        !scan.contains("Seq Scan") && estimate <= rows.len() as f64,
+                        !scan.contains("Seq Scan")
+                            && figure("rows=", 1) <= rows.len() as f64
+                            && read_rows <= rows.len() as f64,
                         "{table}: {read} must be read through the keys, got:\n{plan}"
                     );
                 }
