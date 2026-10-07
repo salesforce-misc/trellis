@@ -18,8 +18,6 @@ them gets broken without Trellis noticing.
 * Trellis is the only writer to its target tables (entry 8).
 * The capture triggers stay installed, enabled and `ENABLE ALWAYS`, and the
   capture functions keep their bodies (entries 5 and 6).
-* The source tables stay plain tables, outside any partition or inheritance
-  hierarchy (entry 7).
 * No DDL rewrites a column a definition reads, or moves one it reads only as
   a field to another type family, beyond the changes Trellis detects and
   pauses for (entries 1, 2 and 22). Retyping or re-collating a key, join or GROUP
@@ -89,7 +87,6 @@ These are the tools the entries refer to:
 | 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | #782 |
 | 5 | Capture switched off and back on between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
-| 7 | A source attached as a partition, or made to inherit, after define | yes | `self_check` (1-1 targets only) | #707, study pending |
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
@@ -235,24 +232,6 @@ table, so the writes made in between stay lost.
 re-read the table the way a reinstall does.
 
 **Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` its readers.
-
-## 7. A source attached as a partition, or made to inherit, after define
-
-**Trigger:** `ALTER TABLE parent ATTACH PARTITION orders …`, or
-`ALTER TABLE orders INHERIT parent` (or the reverse), after a definition reads
-`orders`. Define refuses such tables, but nothing refuses the later change.
-
-**Effect:** a write through the parent fires the parent's statement triggers,
-not the child's, so the change is missed or attributed to the wrong table.
-This is silent.
-
-**Detected?** The reconcile pass doesn't check for it, so nothing pauses. The
-`self_check` audit reports it as a `capture` divergence on 1-1 targets.
-
-**Planned work:** #707 (case 3).
-
-**Repair:** detach the table (or `NO INHERIT`) so it's a plain table again,
-then `PAUSE`/`RESUME` its readers.
 
 ## 8. Hand edits to a target table
 
@@ -750,8 +729,8 @@ refusing them up front:
 * **DML under `session_replication_role = replica`.** The capture triggers are
   `ENABLE ALWAYS`, so they fire. This is only a gap through entry 5.
 * **A capture trigger left disabled, dropped, or not `ALWAYS`, or a source
-  table dropped and recreated.** The next reconcile pass reinstalls capture and
-  re-reads the table for its readers.
+  table dropped and recreated as a plain table.** The next reconcile pass
+  reinstalls capture and re-reads the table for its readers.
 * **`TRUNCATE` of a source**, including `CASCADE`.
 * **A read column renamed or dropped, or the primary key redefined (once the
   pass sees it).** Trellis pauses the readers with a `capture_failure`, and
@@ -792,11 +771,18 @@ refusing them up front:
   drain pauses every definition it reaches, and what is downstream of them,
   with a `capture_failure` naming the cause, and the rest of the page commits.
   Resume once the key is right, which rebuilds them.
-* **Row-level security on the ring owner or defining role, and a
-  logical-replication subscription into a source.** These are refused at define,
-  paused by the pass, and reported by `self_check`
+* **Row-level security on the ring owner or defining role, a
+  logical-replication subscription into a source, and a source in a partition
+  or inheritance hierarchy.** These are refused at define, paused by the pass,
+  and reported by `self_check`
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
-  Capture's window before the pass sees row-level security is entry 11.
+  A source joins a hierarchy after define through `ATTACH PARTITION`,
+  `INHERIT`, a child table created `INHERITS` it, or by being dropped and
+  recreated as a partitioned table, a partition or an inheritance child. The
+  pass installs no capture on such a table, and a resume refuses until it's
+  a plain table again. Writes made through the hierarchy before the pass sees
+  it aren't captured, and the resume's rebuild re-reads them. Capture's
+  window before the pass sees row-level security is entry 11.
 * **A capture function's privilege revoked, or the function made
   `SECURITY INVOKER`.** This is loud rather than silent: every write to the
   captured table fails, naming the capture function, so no change is lost.

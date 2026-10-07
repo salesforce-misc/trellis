@@ -35,6 +35,7 @@ pub(crate) mod copies;
 pub mod ddl;
 pub mod error;
 pub mod eval;
+pub mod hierarchy;
 pub mod invertibility;
 pub(crate) mod key_types;
 pub mod ledger;

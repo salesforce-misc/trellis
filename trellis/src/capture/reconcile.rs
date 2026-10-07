@@ -10,6 +10,12 @@
 //! - a table this instance captures that nothing reads any more is
 //!   uninstalled.
 //!
+//! First, the pass pauses every definition that reads a table in a
+//! partition or inheritance hierarchy, which it can't capture (#707,
+//! [`crate::staging::schema_change::pause_readers_in_hierarchy`]), and leaves
+//! that table's capture as it is. Define refuses such a table, but it can
+//! join a hierarchy later, or be dropped and recreated as one.
+//!
 //! Before it regenerates a table's functions, the pass pauses every
 //! definition that reads a column the table no longer has (#622 C6,
 //! [`crate::staging::schema_change::pause_readers_of_missing`]), or reads a
@@ -144,6 +150,23 @@ pub async fn reconcile(
     let mut outcome = PassOutcome::default();
 
     for table in desired {
+        // #707: a table that joined a partition or inheritance hierarchy
+        // after define, or was recreated as one, can't be captured: its
+        // readers pause, and its capture is left as it is.
+        match crate::staging::schema_change::pause_readers_in_hierarchy(
+            client,
+            &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
         // #745: row-level security that applies to Trellis's role filters
         // every read of the table, and #751: a subscription's changes to it
         // are never captured, so its readers pause, whatever capture does.

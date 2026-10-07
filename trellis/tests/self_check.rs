@@ -52,6 +52,7 @@ use std::time::Duration;
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::hierarchy::Hierarchy;
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{
     CaptureFault, Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis,
@@ -1086,10 +1087,10 @@ async fn a_source_attached_as_a_partition_is_reported() {
 
     assert_eq!(
         capture_faults(&audit_widgets(&trellis).await),
-        vec![CaptureFault::Partition {
+        vec![CaptureFault::Hierarchy(Hierarchy::Partition {
             table: WIDGETS.to_string(),
             parent: "trellis.widgets_all".to_string(),
-        }]
+        })]
     );
 
     trellis.shutdown().await.expect("shutdown");
@@ -1111,10 +1112,10 @@ async fn a_source_in_an_inheritance_hierarchy_is_reported() {
     .expect("make the source an inheritance child");
     assert_eq!(
         capture_faults(&audit_widgets(&trellis).await),
-        vec![CaptureFault::InheritanceChild {
+        vec![CaptureFault::Hierarchy(Hierarchy::InheritanceChild {
             table: WIDGETS.to_string(),
             parent: "trellis.widgets_base".to_string(),
-        }]
+        })]
     );
 
     raw.batch_execute(
@@ -1125,10 +1126,10 @@ async fn a_source_in_an_inheritance_hierarchy_is_reported() {
     .expect("make the source an inheritance parent instead");
     assert_eq!(
         capture_faults(&audit_widgets(&trellis).await),
-        vec![CaptureFault::InheritanceParent {
+        vec![CaptureFault::Hierarchy(Hierarchy::InheritanceParent {
             table: WIDGETS.to_string(),
             child: "trellis.widgets_more".to_string(),
-        }]
+        })]
     );
 
     trellis.shutdown().await.expect("shutdown");

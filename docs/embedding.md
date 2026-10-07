@@ -102,8 +102,9 @@ So:
   `self_check` reports it.
 * **Tables Trellis can read.** Row-level security that applies to the Trellis
   role, a logical-replication subscription into a source, a source without a
-  primary key, a partition or an inheritance hierarchy: each is refused at
-  define time, or pauses the transform if it comes about later. The full list
+  primary key, and a partitioned table or a table in a partition or
+  inheritance hierarchy: each is refused at define time, and pauses the
+  transform if it comes about later. The full list
   is [transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
   The same goes for each target table, which the workers write as their login
   role: a target belongs to the role that defined it, so run the workers as

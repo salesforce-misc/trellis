@@ -226,7 +226,7 @@ What it does there is one append.
   recompute comparison (five triggers, one Trellis
   role). Replica-mode sessions are covered by
   `ENABLE ALWAYS`; an owner who disables or drops the trigger by name is
-  documented as uncaptured until the audit runs (see also gaps 5–7 in
+  documented as uncaptured until the audit runs (see also gaps 5 and 6 in
   [known correctness gaps](../known-correctness-gaps.md)). *Evidence:*
   [E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119).
 - **Only the staging worker creates or drops triggers**, from the catalog
@@ -761,7 +761,7 @@ Each alternative below is recorded with the number that rejected it.
   the trigger by name, which the audit reports; the others are the
   disable-and-restore and replaced-function cases in
   [known correctness gaps](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes)
-  (gaps 5–7).
+  (gaps 5 and 6).
 - **Hosted compatibility** is core Postgres for everything required
   (statement triggers, transition tables, `SECURITY DEFINER`, the `TRIGGER`
   privilege); no event trigger is needed

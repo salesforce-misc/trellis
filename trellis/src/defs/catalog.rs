@@ -5157,19 +5157,12 @@ async fn to_col_cardinality_in_txn(
 /// one can't be captured, whatever unique index it has. That also rules out
 /// #589's key mismatch between a unique index and the primary key.
 ///
-/// A partitioned table (`relkind = 'p'`) is refused as well. Statement
-/// triggers on the parent miss writes aimed at a partition directly, and a
-/// partition attached later gets no triggers, so it could only be captured
-/// partially. So is a table in a partition or inheritance hierarchy (a
-/// partition, an inheritance parent or an inheritance child). A statement
-/// trigger fires only for the table a statement names, never for its
-/// partitions or children: one on a partition misses every write routed
-/// through its parent, and one on an inheritance child misses a write
-/// through its parent, while one on an inheritance parent sees the children's
-/// rows in its transition tables and would stage them under the parent,
-/// whose primary key doesn't span them. A view, foreign table or anything
-/// else that isn't a plain table is refused too. `false` for a table that
-/// doesn't exist.
+/// A table in a partition or inheritance hierarchy (a partitioned table, a
+/// partition, an inheritance parent or an inheritance child) is refused as
+/// well, by the check the staging worker's capture pass and `self_check`'s
+/// capture audit share ([`super::hierarchy::hierarchy`], whose module doc
+/// says why). A view, foreign table or anything else that isn't a plain
+/// table is refused too. `false` for a table that doesn't exist.
 pub(crate) async fn change_keyed(
     client: &impl GenericClient,
     schema: &str,
@@ -5178,19 +5171,23 @@ pub(crate) async fn change_keyed(
     let regclass = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let keyed: Option<bool> = client
         .query_opt(
-            "select c.relkind = 'r' and not c.relispartition \
+            "select c.relkind = 'r' \
                  and exists ( \
                      select 1 from pg_catalog.pg_index i \
                      where i.indrelid = c.oid and i.indisprimary) \
-                 and not exists ( \
-                     select 1 from pg_catalog.pg_inherits h \
-                     where h.inhrelid = c.oid or h.inhparent = c.oid) \
              from pg_catalog.pg_class c where c.oid = pg_catalog.to_regclass($1)",
             &[&regclass],
         )
         .await?
         .map(|row| row.get(0));
-    Ok(keyed.unwrap_or(false))
+    if keyed != Some(true) {
+        return Ok(false);
+    }
+    Ok(
+        super::hierarchy::hierarchy(client, &format!("{schema}.{table}"))
+            .await?
+            .is_empty(),
+    )
 }
 
 /// Issue #376: rejects a definition whose source this instance would capture

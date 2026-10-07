@@ -374,6 +374,51 @@ pub(crate) async fn pause_readers_of_unsupported(
     Ok(true)
 }
 
+/// The staging worker's capture pass's check for a captured table in a
+/// partition or inheritance hierarchy (issue #707,
+/// [`crate::defs::hierarchy`]): a partitioned table, a partition, or an
+/// inheritance parent or child, whose writes its statement triggers can't
+/// all see. Define refuses such a table, by the same check, but the table
+/// can join a hierarchy later (`ATTACH PARTITION`, `INHERIT`), or be dropped
+/// and recreated under the same name as one.
+///
+/// Returns whether `table` is in one, in which case the caller installs or
+/// changes no capture on it. Before it returns `true`, it pauses every
+/// definition that reads `table` and isn't paused for a capture failure
+/// yet, recording why in `capture_failures`, as
+/// [`pause_readers_of_unsupported`] does. A definition only frozen keeps its
+/// status but gets the record. A resume re-validates the definition as
+/// define would, so it is refused until the table is plain again.
+///
+/// Only for a table the pass captures: a table another definition targets
+/// is fed by the target-mutation seam, and define exempts it the same way.
+/// Costs one catalog query.
+pub(crate) async fn pause_readers_in_hierarchy(
+    client: &mut Client,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    let found = crate::defs::hierarchy::hierarchy(&*client, table).await?;
+    if found.is_empty() {
+        return Ok(false);
+    }
+    let readers = unpaused_readers(catalog, table);
+    if readers.is_empty() {
+        return Ok(true);
+    }
+    let error = hierarchy_error(&found);
+    let txn = client.transaction().await?;
+    for id in readers {
+        if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
+            .await?
+        {
+            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
 /// The staging worker's capture pass's check of the types and collations
 /// of `table`'s columns that a definition keys by, or that a column it
 /// created takes its type from (issues #760, #767 and #824,
@@ -1270,6 +1315,16 @@ fn subscribed_error(sub: &crate::defs::subscription::Subscribed) -> String {
 /// applies to a table it reads.
 fn row_security_error(rls: &crate::defs::row_security::RowSecurity) -> String {
     format!("{rls}; then resume the definition to rebuild it, or drop the definition")
+}
+
+/// The `capture_failure` sentence for a definition paused because a table it
+/// reads is in a hierarchy, every way it is in one.
+fn hierarchy_error(found: &[crate::defs::hierarchy::Hierarchy]) -> String {
+    let causes: Vec<String> = found.iter().map(ToString::to_string).collect();
+    format!(
+        "{}; then resume the definition to rebuild it, or drop the definition",
+        causes.join("; ")
+    )
 }
 
 /// Every definition whose target is `table` (at most one) and that isn't

@@ -7,9 +7,10 @@
 //! getting the table's changes, and the target goes stale. So does the
 //! table joining a partition or inheritance hierarchy after its definition
 //! was accepted, because a statement trigger fires only for the table a
-//! statement names (`defs::catalog::change_keyed` refuses such a table at
-//! acceptance, but nothing refuses the later `ATTACH PARTITION` or
-//! `INHERIT`). A function handed to a role without the privileges its body
+//! statement names ([`crate::defs::hierarchy`]: define refuses such a table,
+//! but nothing refuses the later `ATTACH PARTITION` or `INHERIT`; the
+//! staging worker's capture pass pauses the table's readers for it, by the
+//! same check the audit runs). A function handed to a role without the privileges its body
 //! uses, a `SECURITY INVOKER` function, or a privilege revoked from the
 //! Trellis role is loud instead: every captured write to the table fails,
 //! naming the capture function. The audit names the cause either way.
@@ -96,6 +97,7 @@ use crate::capture::install::RING_OWNER;
 use crate::capture::sql::{CaptureEvent, function_name, trigger_name};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::regclass_arg;
+use crate::defs::hierarchy::{self, Hierarchy};
 use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::row_security::{self, RowSecurity};
 use crate::defs::subscription::{self, Subscribed};
@@ -150,17 +152,14 @@ pub enum CaptureFault {
         privilege: String,
         object: String,
     },
-    /// The table became a partition of `parent` after its definition was
-    /// accepted. A write through `parent` fires `parent`'s statement
-    /// triggers, not the table's, so it isn't captured.
-    Partition { table: String, parent: String },
-    /// The table became an inheritance child of `parent`. A write through
-    /// `parent` to the table's rows isn't captured.
-    InheritanceChild { table: String, parent: String },
-    /// `child` inherits from the table. A statement on the table that reaches
-    /// `child`'s rows puts them in the table's transition tables, keyed as if
-    /// they were the table's own.
-    InheritanceParent { table: String, child: String },
+    /// The table is in a partition or inheritance hierarchy (issue #707,
+    /// [`crate::defs::hierarchy`]): it became a partition or an inheritance
+    /// parent or child after its definition was accepted, or was dropped and
+    /// recreated as a partitioned table or as one of those. Its statement
+    /// triggers miss some writes to it, or capture another table's rows as
+    /// its own. One fault per way it is in one. The staging worker's capture
+    /// pass pauses the table's readers for it.
+    Hierarchy(Hierarchy),
     /// The table's row-level security policies apply to the ring's owner, or
     /// to the role `self_check` runs as (issue #745,
     /// [`crate::defs::row_security`]). Capture still sees
@@ -192,10 +191,8 @@ impl CaptureFault {
             | CaptureFault::MissingFunction { table, .. }
             | CaptureFault::WrongFunction { table, .. }
             | CaptureFault::FunctionOwner { table, .. }
-            | CaptureFault::NotSecurityDefiner { table, .. }
-            | CaptureFault::Partition { table, .. }
-            | CaptureFault::InheritanceChild { table, .. }
-            | CaptureFault::InheritanceParent { table, .. } => Some(table),
+            | CaptureFault::NotSecurityDefiner { table, .. } => Some(table),
+            CaptureFault::Hierarchy(hierarchy) => Some(hierarchy.table()),
             CaptureFault::RowSecurity(rls) => Some(&rls.table),
             CaptureFault::Subscribed(sub) => Some(&sub.table),
             CaptureFault::MissingPrivilege { .. } => None,
@@ -262,20 +259,7 @@ impl fmt::Display for CaptureFault {
                 f,
                 "role {role}, which the capture functions run as, lacks {privilege} on {object}"
             ),
-            CaptureFault::Partition { table, parent } => write!(
-                f,
-                "{table} became a partition of {parent}, so writes through {parent} aren't \
-                 captured"
-            ),
-            CaptureFault::InheritanceChild { table, parent } => write!(
-                f,
-                "{table} inherits from {parent}, so writes through {parent} aren't captured"
-            ),
-            CaptureFault::InheritanceParent { table, child } => write!(
-                f,
-                "{child} inherits from {table}, so a statement on {table} captures {child}'s \
-                 rows as {table}'s"
-            ),
+            CaptureFault::Hierarchy(hierarchy) => write!(f, "{hierarchy}"),
             CaptureFault::RowSecurity(rls) => write!(f, "{rls}"),
             CaptureFault::Subscribed(sub) => write!(f, "{sub}"),
         }
@@ -313,7 +297,12 @@ pub async fn audit(
                 runs_as.entry(owner).or_default().insert(table.clone());
             }
             faults.extend(installed_faults(&table, &installed));
-            faults.extend(hierarchy_faults(client, &table).await?);
+            faults.extend(
+                hierarchy::hierarchy(client, &table)
+                    .await?
+                    .into_iter()
+                    .map(CaptureFault::Hierarchy),
+            );
         }
         // A table the seam feeds has no capture function, so only the
         // workers read it, as their own role, which the caller's stands in
@@ -550,54 +539,6 @@ fn installed_faults(table: &str, installed: &InstalledCapture) -> Vec<CaptureFau
         }
     }
     faults
-}
-
-/// A partition, inheritance-parent or inheritance-child fault for each
-/// `pg_inherits` row naming `table`, either way.
-async fn hierarchy_faults(
-    client: &impl GenericClient,
-    table: &str,
-) -> Result<Vec<CaptureFault>, CatalogError> {
-    let rows = client
-        .query(
-            "select case when c.relispartition then 'partition' else 'child' end, \
-                    pn.nspname::text || '.' || p.relname::text \
-             from pg_catalog.pg_inherits h \
-             join pg_catalog.pg_class c on c.oid = h.inhrelid \
-             join pg_catalog.pg_class p on p.oid = h.inhparent \
-             join pg_catalog.pg_namespace pn on pn.oid = p.relnamespace \
-             where h.inhrelid = pg_catalog.to_regclass($1) \
-             union all \
-             select 'parent', cn.nspname::text || '.' || c.relname::text \
-             from pg_catalog.pg_inherits h \
-             join pg_catalog.pg_class c on c.oid = h.inhrelid \
-             join pg_catalog.pg_namespace cn on cn.oid = c.relnamespace \
-             where h.inhparent = pg_catalog.to_regclass($1) \
-             order by 1, 2",
-            &[&crate::defs::ddl::regclass_arg(table)],
-        )
-        .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let table = table.to_string();
-            let other: String = row.get(1);
-            match row.get::<_, &str>(0) {
-                "partition" => CaptureFault::Partition {
-                    table,
-                    parent: other,
-                },
-                "child" => CaptureFault::InheritanceChild {
-                    table,
-                    parent: other,
-                },
-                _ => CaptureFault::InheritanceParent {
-                    table,
-                    child: other,
-                },
-            }
-        })
-        .collect())
 }
 
 /// Each privilege a capture function's body uses that `role` lacks (see the

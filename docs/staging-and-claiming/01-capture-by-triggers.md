@@ -26,6 +26,12 @@ segment with one `INSERT … SELECT`:
   key, a partitioned table, or a table in a partition or inheritance
   hierarchy is refused (see
   [supported sources and targets](../transforms.md#supported-sources-and-targets)).
+  A table can join a hierarchy after define (`ATTACH PARTITION`, `INHERIT`),
+  or be dropped and recreated as one. The reconcile pass checks every table
+  it captures with the same check define runs (`defs::hierarchy`), before
+  anything else: it pauses every definition that reads one, with its
+  `capture_failure`, and installs or changes no capture on it. A resume
+  refuses until the table is plain again.
 - **Images.** `old_image` and `new_image` hold the primary key plus every
   column some reader of the table needs (`capture::columns`), rendered with
   `format('%s', col)` under the same five pinned output settings as every
