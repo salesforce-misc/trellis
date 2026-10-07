@@ -3295,7 +3295,10 @@ pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration:
 ///
 /// - A table whose lock it can't get within the timeout is left for the next
 ///   pass, the request kept: re-typing takes `ACCESS EXCLUSIVE`, which every
-///   reader of the target waits behind while it is queued.
+///   reader of the target waits behind while it is queued. So is one whose
+///   re-type fails any other transient way ([`is_transient_error`]: a
+///   deadlock, a serialization failure, a cancelled statement, a lost
+///   connection), which says nothing about whether its values convert.
 /// - A re-validation that now fails, or a re-type that fails (a value the
 ///   new type can't hold, a view on the column), ends the request: the
 ///   definition stays paused, its `capture_failure` says why, and the next
@@ -3446,12 +3449,14 @@ async fn finish_requested_resume(
                 tracing::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
                 retyped.extend(labels);
             }
-            Err(err) if crate::locks::is_lock_not_available(&err) => {
+            Err(err) if is_transient_error(&err) => {
                 drop(txn);
                 tracing::info!(
                     transform_id = id,
                     copies = ?labels,
-                    "re-typing copies for a resume waits for the table's lock; retrying next pass"
+                    error = %err,
+                    "re-typing copies for a resume failed transiently (its table's lock, say); \
+                     retrying next pass"
                 );
                 return Ok(());
             }

@@ -332,7 +332,10 @@ request (`resume_requests`): the next pass re-types each such column (`ALTER
 ... TYPE`, one table per transaction, under `ACCESS EXCLUSIVE`, which
 rewrites the table for `integer` to `bigint`) and then completes the resume,
 which records the live key types and rebuilds. A crash between the two
-leaves the request, and the next pass finishes it. The re-type of a
+leaves the request, and the next pass finishes it. So does a re-type that
+fails transiently (its lock not got in time, a deadlock, a serialization
+failure, a statement timeout, a lost connection): the request stays, with
+no failure reported, and the next pass tries again. The re-type of a
 definition's target records which resume re-typed each column
 (`retype_causes`), so when the pass then pauses a definition chained off
 that target for those columns alone, its pause records the upstream as its

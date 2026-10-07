@@ -2824,6 +2824,58 @@ async fn a_re_type_in_place_that_fails_transiently_pauses_nothing() {
     );
 }
 
+/// #828: a resume's re-type that fails transiently (a deadlock, a statement
+/// timeout's cancel) leaves the request queued, as one that can't get its
+/// lock does: the definition stays paused waiting on the re-type, with no
+/// failed-conversion message and no `DROP TRANSFORM` advice, and the next
+/// clean pass completes the resume.
+#[tokio::test]
+async fn a_resume_re_type_that_fails_transiently_keeps_the_request() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    resume(&trellis, "item_names").await;
+    watch_item_names_retypes(&raw).await;
+
+    for (attempt, code) in ["40P01", "57014"].into_iter().enumerate() {
+        raw.execute("insert into public.retype_injection values ($1)", &[&code])
+            .await
+            .expect("inject the error");
+        capture_pass(&mut raw, &db.pool).await;
+        assert_eq!(retype_attempts(&raw).await, attempt as i64 + 1, "{code}");
+        let error = assert_retyping(&trellis, &raw, "item_names").await;
+        assert!(
+            !error.contains("couldn't re-type") && !error.contains("DROP TRANSFORM"),
+            "{code}: {error}"
+        );
+        assert_eq!(
+            column_type(&raw, "public.item_names", "id").await,
+            "integer",
+            "{code}"
+        );
+        raw.batch_execute("delete from public.retype_injection")
+            .await
+            .expect("stop injecting");
+    }
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(retype_attempts(&raw).await, 3);
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    assert_item_names_match(&raw).await;
+}
+
 /// #824: an in-place re-type that fails for good on a column that isn't
 /// outgrown (an unbounded `varchar` to `text`, with a view on the target's
 /// column) pauses nothing, since the column still holds every value. The
