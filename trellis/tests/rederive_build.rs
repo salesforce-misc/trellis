@@ -78,13 +78,22 @@ impl Fixture {
         ))
         .await
         .expect("seed the source");
+        // The source's own types: a resume re-types every column Trellis
+        // created whose type differs from the one define gives it from
+        // the live schema.
         let columns = [
-            ("id".to_string(), ValueType::Numeric),
+            (
+                "id".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int8),
+            ),
             (
                 "g".to_string(),
                 ValueType::Integer(trellis::integer::IntWidth::Int4),
             ),
-            ("v".to_string(), ValueType::Numeric),
+            (
+                "v".to_string(),
+                ValueType::Integer(trellis::integer::IntWidth::Int8),
+            ),
         ]
         .into_iter()
         .collect();
@@ -1018,12 +1027,18 @@ async fn two_definitions_on_one_source_take_one_build_path_each() {
         .await
         .expect("create the to-one relationship");
     let columns = [
-        ("id".to_string(), ValueType::Numeric),
+        (
+            "id".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
         (
             "g".to_string(),
             ValueType::Integer(trellis::integer::IntWidth::Int4),
         ),
-        ("v".to_string(), ValueType::Numeric),
+        (
+            "v".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
     ]
     .into_iter()
     .collect();
@@ -1180,12 +1195,18 @@ async fn the_start_waits_for_the_widens_capture_gate() {
         .await
         .expect("write before the widen");
     let columns = [
-        ("id".to_string(), ValueType::Numeric),
+        (
+            "id".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
         (
             "g".to_string(),
             ValueType::Integer(trellis::integer::IntWidth::Int4),
         ),
-        ("v".to_string(), ValueType::Numeric),
+        (
+            "v".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
     ]
     .into_iter()
     .collect();
@@ -1518,7 +1539,10 @@ async fn a_rebuild_sweeps_a_composite_typed_key() {
             "g".to_string(),
             ValueType::Integer(trellis::integer::IntWidth::Int4),
         ),
-        ("v".to_string(), ValueType::Numeric),
+        (
+            "v".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
     ]
     .into_iter()
     .collect();
@@ -2014,12 +2038,18 @@ async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted
         .expect("drain the newer batch");
 
     let columns = [
-        ("id".to_string(), ValueType::Numeric),
+        (
+            "id".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
         (
             "g".to_string(),
             ValueType::Integer(trellis::integer::IntWidth::Int4),
         ),
-        ("v".to_string(), ValueType::Numeric),
+        (
+            "v".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
     ]
     .into_iter()
     .collect();
@@ -2077,12 +2107,18 @@ async fn a_batch_older_than_a_one_to_one_start_drained_after_it_does_not_revive_
         .expect("drain the newer batch");
 
     let columns = [
-        ("id".to_string(), ValueType::Numeric),
+        (
+            "id".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
         (
             "g".to_string(),
             ValueType::Integer(trellis::integer::IntWidth::Int4),
         ),
-        ("v".to_string(), ValueType::Numeric),
+        (
+            "v".to_string(),
+            ValueType::Integer(trellis::integer::IntWidth::Int8),
+        ),
     ]
     .into_iter()
     .collect();

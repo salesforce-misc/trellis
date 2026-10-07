@@ -373,9 +373,10 @@ pub(crate) async fn pause_readers_of_unsupported(
 }
 
 /// The staging worker's capture pass's check of the types and collations
-/// of `table`'s columns that a definition keys by or keeps a typed copy of
-/// (issues #760 and #767, [`crate::defs::key_types`],
-/// [`crate::defs::copies`]). It pauses every definition that reads `table`
+/// of `table`'s columns that a definition keys by, or that a column it
+/// created takes its type from (issues #760, #767 and #824,
+/// [`crate::defs::key_types`], [`crate::defs::copies`]). It pauses every
+/// definition that reads `table`
 /// and isn't paused for a capture failure yet when, on `table`,
 ///
 /// 1. one of its key columns has a type or collation define would refuse
@@ -391,9 +392,12 @@ pub(crate) async fn pause_readers_of_unsupported(
 ///    already stored differently ([`key_types::renders_differently`]):
 ///    `timestamp` to `timestamptz`, `text` to `uuid`, a narrower
 ///    `varchar(n)`; or
-/// 4. a column it keeps a typed copy of widened past the copy
+/// 4. a column Trellis created for it, typed from columns of `table`, can't
+///    hold every value of the type define would give it now
 ///    ([`crate::defs::copies::CopyState::outgrown`]): `integer` to `bigint`
-///    under a 1-1 target's key, `varchar(50)` to `text` under a passthrough.
+///    under a 1-1 target's key, a `SUM`, a `MIN` or a calculated field,
+///    `varchar(50)` to `text` under a passthrough or a to-one projection's
+///    column.
 ///
 /// The types the third check compares against are those recorded in
 /// `definition_key_types`; a key column with none recorded (one that joined
@@ -404,7 +408,8 @@ pub(crate) async fn pause_readers_of_unsupported(
 /// deliberate resume clears it (or a drop): Trellis re-types nothing on its
 /// own. A resume re-validates the definition as define would, and refuses
 /// while the first two hold; otherwise it re-records the key types, brings
-/// the copies to their live types and rebuilds
+/// every column it created to the type define would give it now, and
+/// rebuilds
 /// (`staging::quarantine::resume_transform`).
 ///
 /// A key column the table no longer has is
@@ -563,7 +568,8 @@ pub(crate) async fn pause_readers_of_retyped(
             }
         }
 
-        // #767: a copy whose source column on this table outgrew it.
+        // #767, #824: a column Trellis created, typed from columns of this
+        // table, that the type define would give it now outgrew.
         let copies: Vec<copies::TypedCopy> = copies::typed_copies(
             &*client,
             schema,
@@ -574,32 +580,32 @@ pub(crate) async fn pause_readers_of_retyped(
         )
         .await?
         .into_iter()
-        .filter(|c| c.source_table == table)
+        .filter(|c| c.columns_of(table).next().is_some())
         .collect();
-        let mut outgrown: BTreeMap<String, Vec<copies::CopyState>> = BTreeMap::new();
+        // By the columns of this table each is typed from.
+        let mut outgrown: BTreeMap<Vec<String>, Vec<copies::CopyState>> = BTreeMap::new();
         for state in copies::inspect(&*client, copies).await? {
-            if state.outgrown() && !columns.contains(&state.copy.source_column) {
-                outgrown
-                    .entry(state.copy.source_column.clone())
-                    .or_default()
-                    .push(state);
+            if !state.outgrown() {
+                continue;
             }
+            let from: Vec<String> = state.copy.columns_of(table).map(str::to_string).collect();
+            // A copy of a key column flagged above is reported once, there.
+            if state.copy.inferred.is_none() && columns.contains(&from[0]) {
+                continue;
+            }
+            outgrown.entry(from).or_default().push(state);
         }
-        for (column, states) in outgrown {
-            let held: Vec<String> = states
-                .iter()
-                .map(|s| format!("{} ({})", s.copy.label(), s.copy_type.display))
-                .collect();
+        for (from, states) in outgrown {
             flag(
-                &column,
-                format!(
-                    "column {column:?} of {table} widened to {}, and Trellis keeps a copy of it \
-                     that can't hold every value of that type: {}",
-                    states[0].live_type.display,
-                    held.join(", ")
-                ),
+                &from[0],
+                outgrown_reason(table, &from, &live, &states),
                 &mut columns,
             );
+            for column in &from[1..] {
+                if !columns.contains(column) {
+                    columns.push(column.clone());
+                }
+            }
         }
 
         if !reasons.is_empty() {
@@ -641,6 +647,65 @@ pub(crate) async fn pause_readers_of_retyped(
     }
     txn.commit().await?;
     Ok(true)
+}
+
+/// The reason a definition is paused for `states`, the columns it created
+/// typed from `columns` of `table` whose types define would now give a
+/// wider type ([`copies::CopyState::outgrown`]). `live` is `table`'s
+/// columns.
+fn outgrown_reason(
+    table: &str,
+    columns: &[String],
+    live: &std::collections::HashMap<String, key_types::LiveColumn>,
+    states: &[copies::CopyState],
+) -> String {
+    if let ([column], true) = (columns, states.iter().all(|s| s.copy.inferred.is_none())) {
+        let held: Vec<String> = states
+            .iter()
+            .map(|s| format!("{} ({})", s.copy.label(), s.copy_type.display))
+            .collect();
+        return format!(
+            "column {column:?} of {table} widened to {}, and Trellis keeps a copy of it that \
+             can't hold every value of that type: {}",
+            states[0].live_type.display,
+            held.join(", ")
+        );
+    }
+    let held: Vec<String> = states
+        .iter()
+        .map(|s| {
+            format!(
+                "{} ({}, now {})",
+                s.copy.label(),
+                s.copy_type.display,
+                s.live_type.display
+            )
+        })
+        .collect();
+    let changed = match columns {
+        [column] => format!(
+            "column {column:?} of {table} widened to {}",
+            live.get(column)
+                .map(|c| c.display.as_str())
+                .unwrap_or("another type")
+        ),
+        _ => {
+            let named: Vec<String> = columns
+                .iter()
+                .map(|c| match live.get(c) {
+                    Some(now) => format!("{c:?} ({})", now.display),
+                    None => format!("{c:?}"),
+                })
+                .collect();
+            format!("columns {} of {table} changed type", named.join(", "))
+        }
+    };
+    format!(
+        "{changed}, and Trellis keeps columns typed from {} that can't hold every value of the \
+         types define would give them now: {}",
+        if columns.len() == 1 { "it" } else { "them" },
+        held.join(", ")
+    )
 }
 
 /// The `capture_failure` sentence for a definition paused because `sub`

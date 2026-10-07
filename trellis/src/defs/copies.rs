@@ -1,4 +1,4 @@
-//! The columns Trellis keeps a typed copy of (issue #767).
+//! The columns Trellis creates with a type that comes from the source.
 //!
 //! Some tables Trellis creates hold a source column's values in a column of
 //! that source column's type, as define found it:
@@ -10,27 +10,40 @@
 //!   ledger and its group-delta table, typed as the key's value family
 //!   ([`super::ddl::pg_type_name`]: `integer`, `bigint`, `text`, `numeric`);
 //! - a to-one relationship's settled projection's key, typed as the
-//!   to-side's join column, and the projection's column for each `GROUP BY`
-//!   key an aggregate reads through the relationship (`GROUP BY
-//!   author.country`), typed as that to-side column.
+//!   to-side's join column, and the projection's column for each to-side
+//!   column a definition reads through the relationship (`author.name`,
+//!   `GROUP BY author.country`), typed as that to-side column.
+//!
+//! Others are typed by an expression over source columns, as define's type
+//! inference ([`super::validate::infer_field_types`]) gives it from the
+//! source's column types:
+//!
+//! - a 1-1 target's calculated field (`qty + 1`);
+//! - an aggregate target's field column (`SUM(qty)`, `MIN(qty)`);
+//! - an aggregate ledger's contribution column, typed as the aggregate's
+//!   argument ([`super::ledger::contribution_pg_type`]).
 //!
 //! None of them changes type when the source column does. After the source
 //! column widens (`integer` to `bigint`, `varchar(50)` to `text`), the
-//! first value the copy can't hold fails its write (`22003`, `22001`). So
-//! the staging worker's capture pass pauses every definition that owns a
-//! copy its source column has outgrown ([`super::key_types::widens`],
-//! `staging::schema_change::pause_readers_of_retyped`), and a resume brings
-//! each copy to the type define would create from the live schema
-//! ([`retype`]) before it rebuilds. Trellis never re-types a copy on its own.
+//! first value the column can't hold fails its write (`22003`, `22001`). So
+//! the staging worker's capture pass compares each column with the type
+//! define would give it from the live schema ([`inspect`]) and pauses every
+//! definition that owns one the source has outgrown
+//! ([`super::key_types::widens`], `staging::schema_change::pause_readers_of_retyped`).
+//! A resume brings every column whose type differs from that one to it
+//! ([`retype_statements`]) before it rebuilds. Trellis never re-types one
+//! on its own. A narrowing, or a change to another type family, pauses
+//! nothing here: every value still fits, or define's own checks own it.
 //!
-//! The ledger's `__from_key` is always `text`, so it has no copy to check,
-//! and a calculated field's column is typed by its expression, not copied.
+//! The ledger's `__from_key` is always `text`, and an aggregate's hidden
+//! partials (`numeric` sums, `bigint` counts) have fixed types, so none of
+//! them is checked.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tokio_postgres::GenericClient;
 
-use super::ast::{Expr, GroupByKey, KeySpace, TransformDef};
+use super::ast::{Expr, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains};
 use super::key_types::ColumnType;
 use super::model::{RelationshipCardinality, RelationshipDefinition};
 use crate::pool::quote_ident;
@@ -53,6 +66,15 @@ pub(crate) enum CopyKind {
     /// A to-one relationship projection's column for a `GROUP BY` key read
     /// through the relationship: the aggregate's groups are read from it.
     ProjectionGroupBy,
+    /// A to-one relationship projection's column for any other to-side
+    /// column read through the relationship (`author.name`).
+    ProjectionData,
+    /// A 1-1 target's calculated field, typed by its expression.
+    Field,
+    /// An aggregate target's field column, typed by its expression.
+    AggregateField,
+    /// An aggregate ledger's contribution column, typed as its argument.
+    Contribution,
 }
 
 impl CopyKind {
@@ -66,19 +88,25 @@ impl CopyKind {
     }
 }
 
-/// One column Trellis keeps a typed copy of a source column in.
+/// One column Trellis creates with a type that comes from the source: a
+/// copy of one source column, or a column typed by an expression over some.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TypedCopy {
     pub kind: CopyKind,
-    /// The table holding the copy, quoted and qualified: ready for SQL text
-    /// and for `to_regclass`.
+    /// The table holding the column, quoted and qualified: ready for SQL
+    /// text and for `to_regclass`.
     pub table: String,
     /// The same table as messages name it, `schema.table`.
     pub table_name: String,
     pub column: String,
-    /// The qualified, unquoted table whose column it copies.
-    pub source_table: String,
-    pub source_column: String,
+    /// The source columns its type comes from, each as a qualified,
+    /// unquoted table and a column: the one column it copies, or every
+    /// column its expression reads.
+    pub reads: Vec<(String, String)>,
+    /// For a column typed by an expression, the type define's inference
+    /// gives it from the live schema, as [`super::ddl::pg_type_name`]
+    /// renders it. `None` for a copy of one column, typed from that column.
+    pub inferred: Option<String>,
 }
 
 impl TypedCopy {
@@ -86,10 +114,20 @@ impl TypedCopy {
     pub(crate) fn label(&self) -> String {
         format!("{}.{}", self.table_name, self.column)
     }
+
+    /// The columns of `table` its type comes from.
+    pub(crate) fn columns_of<'a>(&'a self, table: &'a str) -> impl Iterator<Item = &'a str> {
+        self.reads
+            .iter()
+            .filter(move |(t, _)| t == table)
+            .map(|(_, c)| c.as_str())
+    }
 }
 
-/// Every typed copy definition `def` keeps, read from `source` (qualified)
-/// into `target` (qualified). `rels` are the relationships declared on
+/// Every column definition `def` created with a type that comes from the
+/// source, reading `source` (qualified) into `target` (qualified): its
+/// typed copies, and the columns typed by an expression
+/// ([`inferred_copies`]). `rels` are the relationships declared on
 /// `source`; the to-one ones `def` reads through have a projection, in
 /// `schema`, the catalog schema. A copy of a source column that no longer
 /// exists is left out (the missing-column check owns that case).
@@ -110,8 +148,8 @@ pub(crate) async fn typed_copies(
             table: table.to_string(),
             table_name: table_name.to_string(),
             column: column.to_string(),
-            source_table: from.to_string(),
-            source_column: from_col.to_string(),
+            reads: vec![(from.to_string(), from_col.to_string())],
+            inferred: None,
         };
     match &def.key_space {
         KeySpace::OneToOne => {
@@ -198,14 +236,11 @@ pub(crate) async fn typed_copies(
             }
         }
     }
-    let read: HashSet<String> = super::eval::relationship_references(def)
-        .into_iter()
-        .map(|(rel, _)| rel)
-        .collect();
-    for rel in rels
-        .iter()
-        .filter(|r| r.cardinality == RelationshipCardinality::ToOne && read.contains(&r.def.name))
-    {
+    let references = super::eval::relationship_references(def);
+    let read: HashSet<&str> = references.iter().map(|(rel, _)| rel.as_str()).collect();
+    for rel in rels.iter().filter(|r| {
+        r.cardinality == RelationshipCardinality::ToOne && read.contains(r.def.name.as_str())
+    }) {
         let Some(row) = client
             .query_opt(
                 "select projection_table from relationship_projections \
@@ -245,8 +280,196 @@ pub(crate) async fn typed_copies(
                 }
             }
         }
+        // Every other to-side column it reads through the relationship.
+        for (name, column) in &references {
+            if name != &rel.def.name
+                || column == &rel.def.to_col
+                || copies
+                    .iter()
+                    .any(|c| c.table == table && &c.column == column)
+            {
+                continue;
+            }
+            copies.push(copy(
+                CopyKind::ProjectionData,
+                &table,
+                &table_name,
+                column,
+                &to_table,
+                column,
+            ));
+        }
+    }
+    copies.extend(inferred_copies(client, def, source, target, rels).await?);
+    Ok(copies)
+}
+
+/// The columns of `def`'s target and ledger typed by an expression
+/// ([`CopyKind::Field`], [`CopyKind::AggregateField`],
+/// [`CopyKind::Contribution`]), each with the type define's inference gives
+/// it from the live schema: the same inference, over the same source column
+/// and relationship types, that define created it with
+/// ([`super::ddl::target_table_ddl`], [`super::ddl::aggregate_target_table_ddl`]).
+/// A column whose expression reads no source column (`COUNT(*)`) has no
+/// source to drift from and is left out. Empty while the definition doesn't
+/// validate against the live schema: a resume's re-validation owns that.
+async fn inferred_copies(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    source: &str,
+    target: &str,
+    rels: &[&RelationshipDefinition],
+) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
+    use super::catalog::CatalogError;
+    let source_columns = match super::catalog::live_source_columns(client, source).await {
+        Ok(columns) => columns,
+        Err(CatalogError::Db(err)) => return Err(err),
+        Err(_) => return Ok(Vec::new()),
+    };
+    let relationships = match super::catalog::resolve_relationships_in(client, def, source).await {
+        Ok(relationships) => relationships,
+        Err(CatalogError::Db(err)) => return Err(err),
+        Err(_) => return Ok(Vec::new()),
+    };
+    let Ok(field_types) = super::validate::infer_field_types(def, &source_columns, &relationships)
+    else {
+        return Ok(Vec::new());
+    };
+    let Ok(substituted) = super::backfill::substituted_field_exprs(def) else {
+        return Ok(Vec::new());
+    };
+    let (target_schema, target_bare) = target.split_once('.').unwrap_or(("", target));
+    let quoted_target = super::ddl::qualified_target_table_ident(target);
+    let reads = |expr: &Expr| {
+        let mut out = Vec::new();
+        expr_reads(expr, source, &source_columns, rels, &mut out);
+        out
+    };
+    let field_type = |name: &str| {
+        super::ddl::pg_type_name(field_types.get(name).copied().unwrap_or(ValueType::Numeric))
+            .into_owned()
+    };
+    let mut copies = Vec::new();
+    let mut push = |kind, table: &str, table_name: &str, column: &str, reads, inferred| {
+        let reads: Vec<(String, String)> = reads;
+        if !reads.is_empty() {
+            copies.push(TypedCopy {
+                kind,
+                table: table.to_string(),
+                table_name: table_name.to_string(),
+                column: column.to_string(),
+                reads,
+                inferred: Some(inferred),
+            });
+        }
+    };
+    match &def.key_space {
+        KeySpace::OneToOne => {
+            for field in &def.fields {
+                // A bare passthrough is a copy of its column, as
+                // `ddl::target_table_ddl` decides one is.
+                let passthrough = matches!(&field.expr, Expr::Column(name)
+                    if source_columns.contains_key(name)
+                        && (name == &field.name || !def.fields.iter().any(|f| &f.name == name)));
+                if passthrough {
+                    continue;
+                }
+                let Some(expr) = substituted.get(&field.name) else {
+                    continue;
+                };
+                push(
+                    CopyKind::Field,
+                    &quoted_target,
+                    target,
+                    &field.name,
+                    reads(expr),
+                    field_type(&field.name),
+                );
+            }
+        }
+        KeySpace::Aggregate { group_by } => {
+            for field in &def.fields {
+                if group_by_contains(group_by, &field.name) {
+                    continue;
+                }
+                let Some(expr) = substituted.get(&field.name) else {
+                    continue;
+                };
+                push(
+                    CopyKind::AggregateField,
+                    &quoted_target,
+                    target,
+                    &field.name,
+                    reads(expr),
+                    field_type(&field.name),
+                );
+            }
+            let ledger = super::ledger::qualified_ledger_table(target_schema, target_bare);
+            let ledger_name = format!(
+                "{target_schema}.{}",
+                super::ledger::ledger_table_name(target_bare)
+            );
+            for contribution in super::ledger::contributions(&def.fields, group_by, &substituted) {
+                let Ok(value_type) = super::validate::infer_expr_type(
+                    &contribution.arg,
+                    &source_columns,
+                    &relationships,
+                ) else {
+                    continue;
+                };
+                push(
+                    CopyKind::Contribution,
+                    &ledger,
+                    &ledger_name,
+                    &contribution.column,
+                    reads(&contribution.arg),
+                    super::ledger::contribution_pg_type(value_type),
+                );
+            }
+        }
     }
     Ok(copies)
+}
+
+/// The source columns `expr` (substituted: it names no other field) reads,
+/// appended to `out` once each: a column of `source` (qualified), or a
+/// to-side column read through one of `rels`.
+fn expr_reads(
+    expr: &Expr,
+    source: &str,
+    source_columns: &HashMap<String, ValueType>,
+    rels: &[&RelationshipDefinition],
+    out: &mut Vec<(String, String)>,
+) {
+    let read = match expr {
+        Expr::Column(name) if source_columns.contains_key(name) => {
+            Some((source.to_string(), name.clone()))
+        }
+        Expr::RelationshipPath { rel, column } => rels
+            .iter()
+            .find(|r| &r.def.name == rel)
+            .map(|r| (r.qualified_to_table(), column.clone())),
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                expr_reads(arg, source, source_columns, rels, out);
+            }
+            None
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            expr_reads(lhs, source, source_columns, rels, out);
+            expr_reads(rhs, source, source_columns, rels, out);
+            None
+        }
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => None,
+    };
+    if let Some(read) = read
+        && !out.contains(&read)
+    {
+        out.push(read);
+    }
 }
 
 /// A column type: its OID and modifier, its `schema.typname` and modifier
@@ -274,16 +497,19 @@ impl CopyState {
         (self.copy_type.oid, self.copy_type.typmod) != (self.live_type.oid, self.live_type.typmod)
     }
 
-    /// Whether the source column widened past what the copy holds
+    /// Whether the source widened past what the column holds: the type
+    /// define would give it now holds values its type can't
     /// ([`super::key_types::widens`]).
     pub(crate) fn outgrown(&self) -> bool {
         super::key_types::widens(&self.copy_type.ty, &self.live_type.ty)
     }
 }
 
-/// The types of each of `copies`, and of the column each copies, as
-/// [`CopyState`]s. A copy whose table or column, or whose source column, no
-/// longer exists is left out.
+/// The types of each of `copies` now, and the types define would give them
+/// from the live schema, as [`CopyState`]s: a copy of one column is typed
+/// as that column (or as its value family), and a column typed by an
+/// expression as [`TypedCopy::inferred`]. A copy whose table or column, or
+/// whose source column, no longer exists is left out.
 pub(crate) async fn inspect(
     client: &impl GenericClient,
     copies: Vec<TypedCopy>,
@@ -291,61 +517,78 @@ pub(crate) async fn inspect(
     if copies.is_empty() {
         return Ok(Vec::new());
     }
-    let column_types = |tables: Vec<String>, columns: Vec<String>| async move {
+    // The type of each `(i, table, column)`, by `i`.
+    let column_types = |columns: Vec<(i64, String, String)>| async move {
+        let (indexes, (tables, names)): (Vec<i64>, (Vec<String>, Vec<String>)) =
+            columns.into_iter().map(|(i, t, c)| (i, (t, c))).unzip();
         let rows = client
             .query(
                 "select k.i, a.atttypid, a.atttypmod \
-                 from unnest($1::text[], $2::text[]) with ordinality as k(t, c, i) \
+                 from unnest($1::text[], $2::text[], $3::int8[]) as k(t, c, i) \
                  join pg_catalog.pg_attribute a \
                    on a.attrelid = pg_catalog.to_regclass(k.t) and a.attname = k.c \
                   and a.attnum > 0 and not a.attisdropped",
-                &[&tables, &columns],
+                &[&tables, &names, &indexes],
             )
             .await?;
         Ok::<_, tokio_postgres::Error>(
             rows.into_iter()
                 .map(|row| {
                     let i: i64 = row.get(0);
-                    (i as usize - 1, (row.get::<_, u32>(1), row.get::<_, i32>(2)))
+                    (i as usize, (row.get::<_, u32>(1), row.get::<_, i32>(2)))
                 })
                 .collect::<HashMap<usize, (u32, i32)>>(),
         )
     };
     let copied = column_types(
-        copies.iter().map(|c| c.table.clone()).collect(),
-        copies.iter().map(|c| c.column.clone()).collect(),
+        copies
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as i64, c.table.clone(), c.column.clone()))
+            .collect(),
     )
     .await?;
     let sources = column_types(
         copies
             .iter()
-            .map(|c| super::ddl::regclass_arg(&c.source_table))
+            .enumerate()
+            .filter(|(_, c)| c.inferred.is_none())
+            .filter_map(|(i, c)| {
+                c.reads.first().map(|(table, column)| {
+                    (i as i64, super::ddl::regclass_arg(table), column.clone())
+                })
+            })
             .collect(),
-        copies.iter().map(|c| c.source_column.clone()).collect(),
     )
     .await?;
 
     let mut described: BTreeMap<(u32, i32), CopyType> = BTreeMap::new();
+    let mut named: HashMap<String, Option<u32>> = HashMap::new();
     let mut states = Vec::new();
     for (i, copy) in copies.into_iter().enumerate() {
-        let (Some(&copy_type), Some(&(source_oid, source_typmod))) =
-            (copied.get(&i), sources.get(&i))
-        else {
+        let Some(&copy_type) = copied.get(&i) else {
             continue;
         };
-        let live_type = if copy.kind.by_family() {
-            let value_type = super::pg_type::value_type_for_oid(client, source_oid).await?;
-            let name = super::ddl::pg_type_name(value_type);
-            let oid: Option<u32> = client
-                .query_one("select pg_catalog.to_regtype($1)::oid", &[&name.as_ref()])
-                .await?
-                .get(0);
-            match oid {
+        let live_type = match &copy.inferred {
+            Some(name) => match regtype(client, &mut named, name).await? {
                 Some(oid) => (oid, -1),
                 None => continue,
+            },
+            None => {
+                let Some(&(source_oid, source_typmod)) = sources.get(&i) else {
+                    continue;
+                };
+                if copy.kind.by_family() {
+                    let value_type = super::pg_type::value_type_for_oid(client, source_oid).await?;
+                    let name = super::ddl::pg_type_name(value_type);
+                    match regtype(client, &mut named, &name).await? {
+                        Some(oid) => (oid, -1),
+                        None => continue,
+                    }
+                } else {
+                    (source_oid, source_typmod)
+                }
             }
-        } else {
-            (source_oid, source_typmod)
         };
         let copy_type = describe(client, &mut described, copy_type).await?;
         let live_type = describe(client, &mut described, live_type).await?;
@@ -356,6 +599,23 @@ pub(crate) async fn inspect(
         });
     }
     Ok(states)
+}
+
+/// The OID of the type `name` names, memoized in `named`; `None` for none.
+async fn regtype(
+    client: &impl GenericClient,
+    named: &mut HashMap<String, Option<u32>>,
+    name: &str,
+) -> Result<Option<u32>, tokio_postgres::Error> {
+    if let Some(known) = named.get(name) {
+        return Ok(*known);
+    }
+    let oid: Option<u32> = client
+        .query_one("select pg_catalog.to_regtype($1)::oid", &[&name])
+        .await?
+        .get(0);
+    named.insert(name.to_string(), oid);
+    Ok(oid)
 }
 
 /// `(oid, typmod)` as a [`CopyType`], memoized in `described`.
@@ -457,8 +717,8 @@ mod tests {
                 table: table.to_string(),
                 table_name: table.replace('"', ""),
                 column: column.to_string(),
-                source_table: "public.s".to_string(),
-                source_column: column.to_string(),
+                reads: vec![("public.s".to_string(), column.to_string())],
+                inferred: None,
             },
             copy_type: ty(from, if from == "integer" { 23 } else { 20 }),
             live_type: ty(to, if to == "integer" { 23 } else { 20 }),
@@ -536,6 +796,76 @@ mod tests {
             "{sql}"
         );
         assert!(sql.ends_with("(\"__part\", \"__seq\")"), "{sql}");
+    }
+
+    /// The source columns an expression-typed column reads: each once,
+    /// through the substitution of another field's name, and none for
+    /// `COUNT(*)` or a literal.
+    #[test]
+    fn an_expression_reads_each_source_column_once() {
+        let def = crate::defs::parser::parse(
+            "TRANSFORM t FROM s GROUP BY k \
+             SELECT k AS k, SUM(a) AS total, total + MIN(a) + MAX(b) AS mixed, COUNT(*) AS n",
+        )
+        .expect("parse");
+        let substituted = crate::defs::backfill::substituted_field_exprs(&def).expect("subst");
+        let columns: HashMap<String, ValueType> = ["k", "a", "b", "c"]
+            .into_iter()
+            .map(|c| (c.to_string(), ValueType::Numeric))
+            .collect();
+        let reads = |field: &str| {
+            let mut out = Vec::new();
+            expr_reads(&substituted[field], "public.s", &columns, &[], &mut out);
+            out
+        };
+        let read = |c: &str| ("public.s".to_string(), c.to_string());
+        assert_eq!(reads("total"), vec![read("a")]);
+        assert_eq!(reads("mixed"), vec![read("a"), read("b")]);
+        assert!(reads("n").is_empty());
+    }
+
+    #[test]
+    fn expression_typed_columns_are_re_typed_with_their_table() {
+        let states = [
+            state(
+                CopyKind::AggregateField,
+                "\"public\".\"t\"",
+                "least",
+                "integer",
+                "bigint",
+            ),
+            state(
+                CopyKind::Contribution,
+                "\"public\".\"t__ledger\"",
+                "__arg0",
+                "integer",
+                "bigint",
+            ),
+            state(
+                CopyKind::Contribution,
+                "\"public\".\"t__ledger\"",
+                "__arg1",
+                "bigint",
+                "bigint",
+            ),
+        ];
+        assert_eq!(
+            retype_statements(&states),
+            vec![
+                (
+                    "alter table \"public\".\"t\" alter column \"least\" type bigint \
+                     using \"least\"::bigint"
+                        .to_string(),
+                    vec!["public.t.least".to_string()],
+                ),
+                (
+                    "alter table \"public\".\"t__ledger\" alter column \"__arg0\" type bigint \
+                     using \"__arg0\"::bigint"
+                        .to_string(),
+                    vec!["public.t__ledger.__arg0".to_string()],
+                ),
+            ]
+        );
     }
 
     #[test]

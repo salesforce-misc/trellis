@@ -28,7 +28,8 @@
 //! relationship it reads through) now has a type or collation define would
 //! refuse, or changed type in a way that renders the keys already stored
 //! differently, whose relationship's join columns no longer match, or that
-//! keeps a typed copy of a column the table widened (#760, #767,
+//! created a column, typed from one the table widened, that can't hold
+//! the type define would give it now (#760, #767, #824,
 //! [`crate::staging::schema_change::pause_readers_of_retyped`]). That check
 //! runs on the seam-fed tables too.
 //!

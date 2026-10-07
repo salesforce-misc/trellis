@@ -236,9 +236,9 @@ pause are arcs of one lifecycle:
   source key was redefined), the resume fails with `ApplyError::ResumeRefused`,
   whose message is define's own error naming the column and what to change, and the
   transform stays paused, untouched. A field resume (`RESUME TRANSFORM t.col`) runs the
-  same check. Otherwise the resume returns it to `waiting_to_backfill`. If Trellis's
-  typed copies of its columns no longer have their sources' types (after `integer` to
-  `bigint`, say), the resume returns at once but the transform stays `paused`, its
+  same check. Otherwise the resume returns it to `waiting_to_backfill`. If columns
+  Trellis created for it no longer have the types define would give them now (after
+  `integer` to `bigint`, say), the resume returns at once but the transform stays `paused`, its
   `capture_failure` reading "resuming: …", until the staging worker has re-typed them
   (an `ALTER … TYPE` that waits for the table's lock) and moved it to
   `waiting_to_backfill`. A re-type that fails puts its error on `capture_failure`, and

@@ -83,15 +83,19 @@ string, unconstrained `numeric`, a temporal type at full precision. A to-one
 relationship's projection keys by the to-side column's exact type, and holds
 each to-side column read through it in that column's exact type.
 
-None of them changes on its own when the source column does. A widening the
-column's copy can't hold (`integer` to `bigint`, `varchar(50)` to `text`, a
-wider `numeric` or temporal precision) pauses the transforms that own the copy,
-and `RESUME` re-types the copies to the source's live type before it rebuilds
+A calculated field's column, an aggregate's field column and its ledger's
+contribution column (typed as the aggregate's argument) take the type
+define's inference gives their expression: `SUM` over an `integer` is
+`bigint`, `MIN` over one is `integer`.
+
+None of them changes on its own when the source column does. A widening a
+column can't hold (`integer` to `bigint`, `varchar(50)` to `text`, a wider
+`numeric` or temporal precision, `real` to `double precision`) pauses the
+transforms that own the column, and `RESUME` re-types every column to the
+type define would give it from the live schema before it rebuilds
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
-A projection's column for a `GROUP BY` key read through the relationship
-counts as such a copy. A column typed from a calculated field or an aggregate's
-argument, or a projection's column for a field read through the relationship,
-isn't re-typed ([known correctness gaps, entry 4](known-correctness-gaps.md#4-widening-a-column-read-only-as-a-field-that-trellis-copies-with-its-type)).
+A widening that changes only the catalog pauses and rebuilds too
+([known correctness gaps, entry 4](known-correctness-gaps.md#4-a-catalog-only-widening-of-a-column-trellis-copies-with-its-type)).
 
 ## Text rendering
 

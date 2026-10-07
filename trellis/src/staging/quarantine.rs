@@ -2973,8 +2973,10 @@ enum ResumeStep {
 ///    it: a key, join or `GROUP BY` column of a type or collation define
 ///    refuses, a relationship whose join columns no longer match (#590), a
 ///    redefined source key.
-/// 2. **It compares each of Trellis's typed copies with the type define
-///    would give it now** ([`crate::defs::copies`], #767). If any differ, the
+/// 2. **It compares each column Trellis created with a type from the
+///    source (typed copies, and calculated, aggregate and contribution
+///    columns) with the type define would give it now**
+///    ([`crate::defs::copies`], #767, #824). If any differ, the
 ///    copies are re-typed before the rebuild, by the staging worker, under
 ///    `ACCESS EXCLUSIVE` (a table rewrite for `integer` to `bigint`). So the
 ///    operator's resume, `from_pass` false, only records a resume request
@@ -3055,9 +3057,9 @@ async fn request_retype(
     )
     .await?;
     let mut columns: Vec<String> = Vec::new();
-    for state in drifted {
-        if state.copy.source_table == source_table && !columns.contains(&state.copy.source_column) {
-            columns.push(state.copy.source_column.clone());
+    for column in drifted.iter().flat_map(|s| s.copy.columns_of(source_table)) {
+        if !columns.iter().any(|c| c == column) {
+            columns.push(column.to_string());
         }
     }
     let changes: Vec<String> = drifted
@@ -3072,8 +3074,9 @@ async fn request_retype(
         })
         .collect();
     let error = format!(
-        "resuming: the staging worker is re-typing Trellis's copies to their source columns' \
-         types ({}), then it rebuilds the definition. It stays paused until then",
+        "resuming: the staging worker is re-typing the columns Trellis created to the types \
+         define would give them now ({}), then it rebuilds the definition. It stays paused \
+         until then",
         changes.join(", ")
     );
     set_capture_failure(txn, id, source_table, &columns, &error).await
@@ -3407,10 +3410,10 @@ async fn finish_requested_resume(
                     id,
                     &source_table,
                     &format!(
-                        "the resume couldn't re-type Trellis's copies {} to their source \
-                         columns' types: {}. They keep their types{kept}, and the definition \
-                         stays paused. Fix the cause and resume the definition again, or drop \
-                         the definition and define it again",
+                        "the resume couldn't re-type Trellis's columns {} to the types \
+                         define would give them now: {}. They keep their types{kept}, and the \
+                         definition stays paused. Fix the cause and resume the definition \
+                         again, or drop the definition and define it again",
                         labels.join(", "),
                         err.as_db_error()
                             .map(ToString::to_string)

@@ -237,10 +237,14 @@ fire no trigger at all.
 So the same pass also checks, for every definition that reads the table,
 the columns it keys by there (its source key, its `GROUP BY` keys, and each
 relationship it reads through's join columns and to-side key) and the
-columns Trellis keeps a typed copy of (`defs::copies`: a 1-1 target's key and
-passthrough fields, an aggregate's `GROUP BY` columns in its target, ledger
-and group-delta table, and a to-one relationship projection's key and its
-column for a `GROUP BY` key read through the relationship). Before
+columns Trellis created from them with a type that comes from the source
+(`defs::copies`: a 1-1 target's key, passthrough and calculated columns, an
+aggregate's `GROUP BY` columns in its target, ledger and group-delta table,
+its field columns and its ledger's contribution columns, and a to-one
+relationship projection's key and its column for each to-side column read
+through the relationship). A column typed by an expression is compared
+with the type define's inference gives the expression over the live
+schema. Before
 it regenerates anything, it pauses the definition, with its
 `capture_failure`, when
 
@@ -257,9 +261,11 @@ it regenerates anything, it pauses the definition, with its
    spaces past the new length). It compares against the type recorded in
    `definition_key_types` when the definition was accepted or last resumed;
    or
-4. a column it keeps a typed copy of widened past the copy: `integer` to
-   `bigint` under a 1-1 target's key, `varchar(50)` to `text` under a
-   passthrough, `integer` to `bigint` under a `GROUP BY` key. The copy's next
+4. a column Trellis created can't hold every value of the type define would
+   give it now: `integer` to `bigint` under a 1-1 target's key, a `GROUP BY`
+   key, a calculated field (`qty + 1`) or a `SUM` or `MIN` (whose ledger
+   contribution is typed as the argument), `varchar(50)` to `text` under a
+   passthrough or a projection's column for `author.name`. The column's next
    value that doesn't fit would fail its write.
 
 The reason names each column, its old and new type, and each copy, and says
@@ -271,15 +277,17 @@ aggregate's source key, which its ledger keys by text), a `GROUP BY` key's
 `varchar` widening or move to `text` (its copy is `text`), a `numeric`
 precision change or wider scale, or a wider timestamp precision, on a
 `GROUP BY` key (its copy is unconstrained), a narrowing every copy still
-holds, any change to a column read only as a field, and a change between
+holds, a change to a column read only as a field that every column typed
+from it still holds (a `varchar` widening under a calculated field, whose
+column is `text`), and a change between
 deterministic collations (byte equality is unchanged, even across a join
 pair; define and a resume still require a pair's collations to match).
 
 A resume re-validates the definition as define would and refuses while the
-first two hold, naming the columns and what to change. Otherwise, if any of
-its copies no longer has the type define would give it from the live
+first two hold, naming the columns and what to change. Otherwise, if any
+column it created no longer has the type define would give it from the live
 schema, the resume returns at once and leaves it paused with a resume
-request (`resume_requests`): the next pass re-types each such copy (`ALTER
+request (`resume_requests`): the next pass re-types each such column (`ALTER
 ... TYPE`, one table per transaction, under `ACCESS EXCLUSIVE`, which
 rewrites the table for `integer` to `bigint`) and then completes the resume,
 which records the live key types and rebuilds. A crash between the two

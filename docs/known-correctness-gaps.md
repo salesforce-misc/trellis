@@ -20,11 +20,13 @@ them gets broken without Trellis noticing.
   capture functions keep their bodies (entries 5 and 6).
 * The source tables stay plain tables, outside any partition or inheritance
   hierarchy (entry 7).
-* No DDL rewrites a column a definition reads, or retypes one it reads only
-  as a field, beyond the changes Trellis detects and pauses for (entries 1, 2
-  and 4). Retyping or re-collating a key, join or GROUP BY column, and
-  widening a column Trellis keeps a typed copy of, pause the definitions
-  concerned (see [What isn't on this list](#what-isnt-on-this-list)).
+* No DDL rewrites a column a definition reads, or moves one it reads only as
+  a field to another type family, beyond the changes Trellis detects and
+  pauses for (entries 1 and 2). Retyping or re-collating a key, join or GROUP
+  BY column, and widening any column Trellis creates a column from with its
+  type, pause the definitions concerned (see
+  [What isn't on this list](#what-isnt-on-this-list), and entry 4 for what a
+  widening costs).
 * No row-level security policy applies to a role Trellis logs in as, or to
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
@@ -48,10 +50,12 @@ These are the tools the entries refer to:
   target from the source. Run it through `Trellis::apply` or
   `trellis apply '<statement>'`. A resume first re-runs define's validation
   against the live schema, and refuses, leaving the definition paused, while
-  define would refuse it. It then brings Trellis's typed copies of the
-  definition's key, passthrough, GROUP BY and projection-key columns to their
-  sources' live types, re-reads every current source row and deletes target
-  rows the source no longer backs
+  define would refuse it. It then brings every column Trellis created for
+  the definition with a type from the source (its key, passthrough and GROUP
+  BY copies, its calculated, aggregate and ledger contribution columns, and
+  its relationship projections' columns) to the type define would give it
+  now, re-reads every current source row and deletes target rows the source
+  no longer backs
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). It doesn't replay
   buffered changes, so it repairs anything that's wrong because a change was
   missed. It also releases every key the definition holds in quarantine, and
@@ -62,8 +66,7 @@ These are the tools the entries refer to:
 * **`DROP TRANSFORM <target>`, then define it again** is the repair when you
   keep a schema change the definition can't be rebuilt over: a resume refuses
   while define would, naming the column and what to change, and a 1-1
-  definition whose source key was redefined can only be defined again. It is
-  also the repair for entry 4.
+  definition whose source key was redefined can only be defined again.
 * **`self_check(target, …)`** detects divergence but never repairs it. It
   audits the target's capture triggers, then compares the target with a
   recompute of it in Postgres
@@ -77,7 +80,7 @@ These are the tools the entries refer to:
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | #782 |
-| 4 | Widening a column read only as a field that Trellis copies with its type (`SUM(qty)` with `qty` `int` → `bigint`) | no (writes fail) | at failure only | none filed |
+| 4 | A catalog-only widening (`varchar(50)` → `varchar(100)`) of a column Trellis copies with its type | no (the definition pauses until resumed, then rebuilds) | yes, by the capture pass | #824 |
 | 5 | Capture switched off and back on between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
 | 7 | A source attached as a partition, or made to inherit, after define | yes | `self_check` (1-1 targets only) | #707, study pending |
@@ -121,8 +124,8 @@ need superuser (#699).
 **Repair:** right after the `ALTER`, run `request_backfill('orders')`, or
 `PAUSE`/`RESUME` every transform that reads the table. A type change to a
 key, join or GROUP BY column pauses its readers on its own (see
-[What isn't on this list](#what-isnt-on-this-list)); a field's widening is
-entry 4.
+[What isn't on this list](#what-isnt-on-this-list)), and so does a widening
+of one it reads only as a field (entry 4).
 
 ## 2. A column dropped and re-added under the same name
 
@@ -168,41 +171,45 @@ build that straddles the change is pinned to the collation it planned under
 
 **Repair:** start a new sweep after the change.
 
-## 4. Widening a column read only as a field that Trellis copies with its type
+## 4. A catalog-only widening of a column Trellis copies with its type
 
-**Trigger:** a routine widening, such as `ALTER COLUMN qty TYPE bigint` or a
-`varchar(n)` widening, of a column a definition reads only as a field, where
-Trellis created a column of the field's type from it:
+**Trigger:** a widening that changes only the catalog, not the stored values
+(`varchar(n)` to a longer `varchar(m)`, `varchar` to `text`, dropping a
+`varchar`'s length, or a `numeric(p,s)` with a larger precision and the same
+scale), of a source column Trellis copies with its exact type:
 
-* an aggregate's contribution column in its ledger, and its target column,
-  for `SUM(qty)`, `MIN(qty)` and `MAX(qty)` over an integer column;
-* a 1-1 calculated field over an integer column (`qty + 1`);
-* a to-one relationship projection's column for a to-side field read through
-  it (`author.name`), which copies the to-side column's type exactly. The same
-  column read as a `GROUP BY` key (`GROUP BY author.country`) is a key copy,
-  not this entry.
+* a 1-1 target's key and passthrough columns;
+* a to-one relationship projection's key, and its column for each to-side
+  column read through it (`author.name`, `GROUP BY author.country`).
 
-A key, passthrough, GROUP BY or projection-key column is not this entry:
-widening one pauses its definitions, and a resume re-types Trellis's copies
-(see [What isn't on this list](#what-isnt-on-this-list)).
+The columns Trellis types by value family or by an expression (`GROUP BY`
+columns, calculated fields, aggregate and ledger contribution columns) are
+`text` or unconstrained `numeric` for these types, so these widenings don't
+reach them.
 
-**Effect:** loud, but not self-healing. Trellis's column keeps the old type,
-so the first value that doesn't fit fails every write to its row with
-`22003` (out of range) or `22001` (too long). The key is quarantined for each
-definition whose column is too narrow, and stays held there, while the other
-definitions reading it keep applying it (see
-[Repair caveats](#repair-caveats)). Rows written before that are fine.
+**Effect:** loud, and it costs a rebuild. Trellis's column keeps the old
+type, so the staging worker's next capture pass pauses every definition
+that owns one the source column has outgrown, naming each column, its type
+and the type define would give it now. Until that pass (up to one
+`reconcile_interval`), a value the column can't hold fails its write with
+`22001` (too long) or `22003` (out of range), and the key is quarantined for
+that definition (see [Repair caveats](#repair-caveats)). The definition's
+target is stale until it's resumed and rebuilt. A widening that rewrites
+the table (`integer` to `bigint`, `real` to `double precision`) behaves the
+same way, and its rebuild is expected; a catalog-only one could be applied
+in place without either.
 
-**Detected?** Only when the first oversized value fails.
+**Detected?** Yes: the capture pass pauses the definition, with the reason
+on its `capture_failure`.
 
-**Planned work:** none filed. The capture pass's widening check covers the
-copies of key, passthrough, GROUP BY and projection-key columns only; a
-field's columns are #703's R1, which leaves columns read only as fields out.
+**Planned work:** #824: the staging worker re-types a catalog-only widening
+in place, in its capture pass, without pausing or rebuilding, and releases
+the keys that failed with `22001` or `22003` in the window.
 
-**Repair:** `DROP TRANSFORM` and define it again. `PAUSE`/`RESUME` doesn't
-help: the resume doesn't re-type these columns, so the rebuild fails the same
-way. The drop deletes the definition's quarantined keys with it, so the new
-definition starts with none.
+**Repair:** `RESUME TRANSFORM <target>`. The resume brings every column the
+definition created to the type define would give it from the live schema,
+releases the definition's quarantined keys, and rebuilds the target
+([The repair tools](#the-repair-tools)).
 
 ## 5. Capture switched off and back on between two reconcile passes
 
@@ -609,9 +616,9 @@ from.
   apply failed, with its parked work and its poison row, and that
   definition's target row for it stays stale. Every other definition reading
   the same source keeps applying the key, so two definitions can disagree on
-  it. Entry 4 can cause such failures, and so can a widening of a copied
-  column whose oversized value drains before the capture pass pauses the
-  definition. The definition's `status` reports its held keys (`held_keys`:
+  it. A widening of a column Trellis copies with its type causes such
+  failures when an oversized value drains before the capture pass pauses
+  the definition (entry 4). The definition's `status` reports its held keys (`held_keys`:
   how many, and since when) whatever its status, `live` included, and
   `self_check` reports them with every audit. What clears a held key:
   * `Trellis::release_key(transform, source_table, key)` (`trellis release`
@@ -643,17 +650,19 @@ refusing them up front:
   you resume once the schema is right
   ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md)).
 * **A key, join or GROUP BY column retyped or re-collated, or a column
-  Trellis keeps a typed copy of widened.** The staging worker's capture pass
+  Trellis creates a column from with its type widened.** The staging worker's capture pass
   pauses the definitions concerned, with a `capture_failure` naming each
   column, its old and new type, and what to do, when define would now refuse
   the column or a relationship's join columns no longer match, when the
   change renders the stored keys differently or rounds them (`timestamp` to
   `timestamptz`, `text` to `uuid`, a narrower `numeric` scale or
-  `varchar(n)`), and when a 1-1 target's key or passthrough, a GROUP BY key
-  (including a relationship projection's column for one read through the
-  relationship) or a projection's key can no longer hold its source's values
-  (`int` to `bigint`). A resume refuses until define would accept the definition again;
-  otherwise it re-types the copies and rebuilds
+  `varchar(n)`), and when a column Trellis created from the source can no
+  longer hold every value of the type define would give it now (`int` to
+  `bigint` under a 1-1 target's key, passthrough or calculated field, a
+  GROUP BY key, a `SUM` or `MIN` and its ledger contribution, or a
+  relationship projection's key or column). A resume refuses until define
+  would accept the definition again; otherwise it re-types those columns
+  and rebuilds (entry 4 for what that costs)
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and
   the resume releases it. A change between deterministic collations needs

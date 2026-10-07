@@ -262,7 +262,8 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType) -> bool {
 /// Whether a typed copy of type `copy` can't hold every value of its source
 /// column's live type `live`, because `live` is a widening of it (#767):
 ///
-/// - a wider integer (`smallint` → `integer` → `bigint`);
+/// - a wider integer (`smallint` → `integer` → `bigint`), or `real` →
+///   `double precision`;
 /// - a longer string bound (`varchar(n)` → `varchar(m>n)`, `text`, or an
 ///   unbounded `varchar`);
 /// - a `numeric` with room for more integer or fractional digits, or none
@@ -281,6 +282,9 @@ pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
     }
     if let (Some(was), Some(is)) = (copy.string_bound(), live.string_bound()) {
         return narrower_bound(was, is);
+    }
+    if copy.builtin() && live.builtin() && copy.base() == "float4" && live.base() == "float8" {
+        return true;
     }
     if copy.type_name != live.type_name || !copy.builtin() {
         return false;
@@ -667,6 +671,7 @@ mod tests {
             (ty("int2", -1), ty("int4", -1)),
             (ty("int4", -1), ty("int8", -1)),
             (ty("int2", -1), ty("int8", -1)),
+            (ty("float4", -1), ty("float8", -1)),
             (varchar(50), varchar(100)),
             (varchar(50), ty("text", -1)),
             (varchar(50), ty("varchar", -1)),
@@ -700,7 +705,8 @@ mod tests {
             (ty("timestamp", 6), ty("timestamp", -1)),
             (ty("timestamp", -1), ty("timestamptz", -1)),
             (ty("int4", -1), ty("numeric", -1)),
-            (ty("float4", -1), ty("float8", -1)),
+            (ty("float8", -1), ty("float4", -1)),
+            (ty("public.float4", -1), ty("pg_catalog.float8", -1)),
             (ty("text", -1), ty("uuid", -1)),
             (ty("bpchar", 9), ty("bpchar", 12)),
             (ty("varbit", 16), ty("varbit", 8)),

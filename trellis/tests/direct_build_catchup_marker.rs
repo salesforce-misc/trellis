@@ -41,6 +41,7 @@ use trellis::defs::{
     TransformStatus, ValueType, chunk_queue, create_relationship, install_definition,
 };
 use trellis::intake::markers;
+use trellis::integer::IntWidth;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -250,9 +251,9 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
         &db.pool,
         SKU_TOTALS,
         &columns(&[
-            ("id", ValueType::Numeric),
+            ("id", ValueType::Integer(IntWidth::Int4)),
             ("sku", ValueType::Text),
-            ("amount", ValueType::Numeric),
+            ("amount", ValueType::Integer(IntWidth::Int4)),
         ]),
         "public",
     )
@@ -344,9 +345,9 @@ async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
         pool,
         SKU_TOTALS,
         &columns(&[
-            ("id", ValueType::Numeric),
+            ("id", ValueType::Integer(IntWidth::Int4)),
             ("sku", ValueType::Text),
-            ("amount", ValueType::Numeric),
+            ("amount", ValueType::Integer(IntWidth::Int4)),
         ]),
         "public",
     )
@@ -821,9 +822,9 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
         &db.pool,
         SKU_TOTALS,
         &columns(&[
-            ("id", ValueType::Numeric),
+            ("id", ValueType::Integer(IntWidth::Int4)),
             ("sku", ValueType::Text),
-            ("amount", ValueType::Numeric),
+            ("amount", ValueType::Integer(IntWidth::Int4)),
         ]),
         "public",
     )

@@ -1406,7 +1406,7 @@ async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_it
         assert_eq!(reported.status, TransformStatus::Paused);
         let error = reported.capture_failure.expect("reason").error;
         assert!(
-            error.contains("couldn't re-type Trellis's copies public.tag_labels.code")
+            error.contains("couldn't re-type Trellis's columns public.tag_labels.code")
                 && error.contains("invalid input syntax for type uuid")
                 && error.contains("drop the definition and define it again"),
             "{error}"
@@ -1498,6 +1498,365 @@ async fn a_crash_between_two_tables_re_types_leaves_the_rest_to_the_next_pass() 
         rows(
             &raw,
             "select shop::text, sum(amount)::text from public.orders group by shop order by shop"
+        )
+        .await,
+    );
+}
+
+/// #824: widening a column an aggregate sums and takes the minimum of
+/// (`integer` to `bigint`) outgrows the ledger's contribution column, typed
+/// as the argument, and the target's `MIN` column. The pass pauses the
+/// aggregate, naming each. A resume re-types them, and the `SUM` column,
+/// which define now gives `numeric` (`sum(bigint)`'s type) rather than
+/// `bigint`, and nothing else, then rebuilds, and a value above 2^31 lands.
+#[tokio::test]
+async fn widening_a_summed_column_pauses_and_resume_re_types_its_contribution_and_target_columns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount int, note text); \
+         insert into public.orders values (1, 1, 10, 'a'), (2, 1, 20, 'b'), (3, 2, 5, 'c');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, MIN(amount) AS least, \
+                    MAX(note) AS last_note, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    let types = async |raw: &Client| {
+        let mut types = Vec::new();
+        for (table, column) in [
+            ("public.per_shop", "shop"),
+            ("public.per_shop", "total"),
+            ("public.per_shop", "least"),
+            ("public.per_shop", "last_note"),
+            ("public.per_shop", "n"),
+            ("public.per_shop__ledger", "shop"),
+            ("public.per_shop__ledger", "__arg0"),
+            ("public.per_shop__ledger", "__arg1"),
+        ] {
+            types.push(column_type(raw, table, column).await);
+        }
+        types
+    };
+    assert_eq!(
+        types(&raw).await,
+        [
+            "integer", "bigint", "integer", "text", "bigint", "integer", "integer", "text"
+        ]
+    );
+
+    raw.batch_execute("alter table public.orders alter column amount type bigint")
+        .await
+        .expect("widen the summed column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_shop", "public.orders", &["amount"]).await;
+    for column in [
+        "public.per_shop.least (integer, now bigint)",
+        "public.per_shop__ledger.__arg0 (integer, now bigint)",
+    ] {
+        assert!(error.contains(column), "{column}: {error}");
+    }
+    for untouched in ["per_shop.shop", "last_note", "per_shop.n ", "__arg1"] {
+        assert!(!error.contains(untouched), "{untouched}: {error}");
+    }
+
+    resume(&trellis, "per_shop").await;
+    let error = assert_retyping(&trellis, &raw, "per_shop").await;
+    assert!(
+        error.contains("public.per_shop__ledger.__arg0 from integer to bigint")
+            && error.contains("public.per_shop.total from bigint to numeric"),
+        "{error}"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        types(&raw).await,
+        [
+            "integer", "numeric", "bigint", "text", "bigint", "integer", "bigint", "text"
+        ]
+    );
+    assert_eq!(
+        status(&raw, "per_shop").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    raw.batch_execute(
+        "insert into public.orders values (4, 1, 3000000000, 'd'), (5, 3, 9000000000000000000, 'e')",
+    )
+    .await
+    .expect("values above 2^31");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
+    assert_eq!(
+        rows(
+            &raw,
+            "select shop::text, total::text, least::text, last_note, n::text \
+             from public.per_shop where n <> 0 order by shop"
+        )
+        .await,
+        rows(
+            &raw,
+            "select shop::text, sum(amount)::text, min(amount)::text, max(note), \
+                    count(*)::text \
+             from public.orders group by shop order by shop"
+        )
+        .await,
+    );
+
+    // The types moved with the resume: nothing pauses again.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
+}
+
+/// #824: widening a column a 1-1 calculated field reads (`qty + 1`, with
+/// `qty` `integer` to `bigint`) outgrows the field's column: the pass
+/// pauses the definition, and a resume re-types that column, leaving the
+/// key and the passthrough as they are, then rebuilds.
+#[tokio::test]
+async fn widening_a_column_a_calculated_field_reads_pauses_and_resume_re_types_the_field() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "integer"
+    );
+
+    raw.batch_execute("alter table public.items alter column qty type bigint")
+        .await
+        .expect("widen the calculated field's column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["qty"]).await;
+    assert!(
+        error.contains("column \"qty\" of public.items widened to bigint")
+            && error.contains("public.item_names.next (integer, now bigint)")
+            && error.contains("Resume the definition"),
+        "{error}"
+    );
+    assert!(!error.contains("item_names.name"), "{error}");
+
+    resume(&trellis, "item_names").await;
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(
+        error.contains("public.item_names.next from integer to bigint"),
+        "{error}"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    for (column, ty) in [
+        ("id", "integer"),
+        ("name", "character varying(10)"),
+        ("next", "bigint"),
+    ] {
+        assert_eq!(
+            column_type(&raw, "public.item_names", column).await,
+            ty,
+            "{column}"
+        );
+    }
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    raw.batch_execute("insert into public.items values (3, 'three', 3000000000)")
+        .await
+        .expect("a value above 2^31");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_item_names_match(&raw).await;
+}
+
+/// #824: widening a to-side column a 1-1 definition reads through a to-one
+/// relationship (`author.name`, `varchar(10)` to `varchar(40)`) outgrows the
+/// relationship projection's column for it. The target's column is `text`,
+/// which holds every value already, and isn't re-typed. The pass pauses
+/// the definition, and a resume widens the projection's column and
+/// rebuilds, so a longer name lands.
+#[tokio::test]
+async fn widening_a_column_read_through_a_relationship_pauses_and_resume_widens_its_projection_column()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.users (id int primary key, name varchar(10)); \
+         create table public.posts (id int primary key, author_id int); \
+         insert into public.users values (1, 'Ann'), (2, 'Bob'); \
+         insert into public.posts values (1, 1), (2, 2), (3, 1);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "RELATIONSHIP author FROM posts.author_id TO users.id",
+        "TRANSFORM post_authors FROM public.posts SELECT author.name AS author_name",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["post_authors"]).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    let projection = format!("trellis.{projection}");
+    assert_eq!(
+        column_type(&raw, &projection, "name").await,
+        "character varying(10)"
+    );
+
+    raw.batch_execute("alter table public.users alter column name type varchar(40)")
+        .await
+        .expect("widen the to-side column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "post_authors", "public.users", &["name"]).await;
+    assert!(
+        error.contains(&format!("{projection}.name (character varying(10))")),
+        "{error}"
+    );
+    assert!(!error.contains("post_authors.author_name"), "{error}");
+
+    resume(&trellis, "post_authors").await;
+    let error = assert_retyping(&trellis, &raw, "post_authors").await;
+    assert!(
+        error.contains(&format!(
+            "{projection}.name from character varying(10) to character varying(40)"
+        )) && !error.contains("author_name"),
+        "{error}"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, &projection, "name").await,
+        "character varying(40)"
+    );
+    assert_eq!(
+        column_type(&raw, "public.post_authors", "author_name").await,
+        "text"
+    );
+    bring_live(&mut raw, &db.pool, &["post_authors"]).await;
+    raw.batch_execute("update public.users set name = 'Ann With A Long Name' where id = 1")
+        .await
+        .expect("a longer value");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "post_authors").await, TransformStatus::Live);
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, author_name from public.post_authors order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select p.id::text, u.name::text from public.posts p \
+             join public.users u on u.id = p.author_id order by p.id"
+        )
+        .await,
+    );
+}
+
+/// #824: a source change whose columns Trellis created from it hold every
+/// value of the types define would give them now pauses nothing: a
+/// widening under an expression typed by its family (`CHAR_LENGTH(name)`,
+/// `qty + 2.5`, `MAX(name)`, `SUM(price)` over a `numeric(10,2)`), and a
+/// narrowing under a `SUM`, a `MIN` and a calculated field.
+#[tokio::test]
+async fn changes_no_created_column_outgrows_pause_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.lines (id int primary key, name varchar(10), qty bigint, \
+                                    price numeric(10,2), kind int); \
+         insert into public.lines values (1, 'a', 1, 1.50, 1), (2, 'bb', 2, 2.50, 1), \
+                                         (3, 'ccc', 3, 3.50, 2);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM line_sizes FROM public.lines \
+         SELECT CHAR_LENGTH(name) AS len, qty + 2.5 AS scaled, qty + 1 AS next",
+        "TRANSFORM per_kind FROM public.lines GROUP BY kind \
+         SELECT kind AS kind, MAX(name) AS top, SUM(price) AS total, SUM(qty) AS qty_total, \
+                MIN(qty) AS least",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    let targets = ["line_sizes", "per_kind"];
+    bring_live(&mut raw, &db.pool, &targets).await;
+    let snapshot = async |raw: &Client| {
+        rows(
+            raw,
+            "select c.relname::text, a.attname::text, \
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid \
+             where c.relname in ('line_sizes', 'per_kind', 'per_kind__ledger') \
+               and a.attnum > 0 and not a.attisdropped order by 1, 2",
+        )
+        .await
+    };
+    let before = snapshot(&raw).await;
+
+    for alter in [
+        "alter table public.lines alter column name type varchar(40)",
+        "alter table public.lines alter column name type text",
+        "alter table public.lines alter column price type numeric(12,2)",
+        "alter table public.lines alter column qty type integer",
+    ] {
+        raw.batch_execute(alter).await.expect(alter);
+        capture_pass(&mut raw, &db.pool).await;
+        for target in targets {
+            assert_eq!(status(&raw, target).await, TransformStatus::Live, "{alter}");
+        }
+    }
+    assert_eq!(snapshot(&raw).await, before);
+
+    raw.batch_execute(
+        "insert into public.lines values (4, 'a much longer name', 4, 1234567890.25, 2)",
+    )
+    .await
+    .expect("writes");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for target in targets {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, len::text, scaled::text, next::text from public.line_sizes \
+             order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, char_length(name)::text, (qty + 2.5)::text, (qty + 1)::text \
+             from public.lines order by id"
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select kind::text, top, total::text, qty_total::text, least::text \
+             from public.per_kind order by kind"
+        )
+        .await,
+        rows(
+            &raw,
+            "select kind::text, max(name), sum(price)::text, sum(qty)::text, min(qty)::text \
+             from public.lines group by kind order by kind"
         )
         .await,
     );
