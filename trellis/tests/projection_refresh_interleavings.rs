@@ -344,3 +344,90 @@ async fn assert_two(d: &Driver) {
         "two (left) differs from the join (right)"
     );
 }
+
+/// The quoted, qualified projection of the relationship `name`, the name a
+/// page arms [`PausePoint::AfterReverseGuards`] by.
+async fn projection_of(d: &Driver, name: &str) -> String {
+    let table: String = d
+        .ctl
+        .query_one(
+            "select p.projection_table from relationship_projections p \
+             join relationship_definitions r on r.id = p.relationship_id \
+             where r.name = $1",
+            &[&name],
+        )
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    format!("\"{}\".\"{table}\"", trellis::config::DEFAULT_SCHEMA)
+}
+
+/// Issue #848: a page's relationship reverse records lock their projection
+/// rows in key order, the order a page's generation bump and the reverse
+/// release take them in (ADR-0002 I5). The page meets its records in fold
+/// order, by key text here, so parent 10 before parent 9. Locked one record
+/// at a time, a reverse page frozen after its first record's guards holds
+/// parent 10's row; a forward page bumping parents 9 and 10 then locks 9 and
+/// queues on 10, and the reverse page, released, queues on 9: a cycle.
+/// Locked in key order up front, the reverse page holds both rows when it
+/// freezes, and the forward page queues on 9 holding neither.
+#[tokio::test]
+async fn a_page_locks_its_reverse_projection_rows_in_key_order() {
+    let mut d = start_parent().await;
+    write(
+        &d,
+        "insert into public.par values (9, 90, 900), (10, 100, 1000); \
+         insert into public.src values (4, 9, 9, null), (5, 10, 10, null);",
+    )
+    .await;
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    d.settle().await;
+    // Both sealed first: a page frozen before it commits holds its
+    // segment, which a seal waits for.
+    write(&d, "update public.par set w = w + 1 where id in (9, 10)").await;
+    let reverse_batch = d.seal().await;
+    write(&d, "update public.src set g = g + 1 where id in (4, 5)").await;
+    let forward_batch = d.seal().await;
+    let projection = projection_of(&d, "parent").await;
+    let mut reverse = d
+        .drain_frozen(
+            reverse_batch,
+            "reverse",
+            &[(PausePoint::AfterReverseGuards, &projection)],
+        )
+        .await;
+    let frozen = reverse.reached(PausePoint::AfterReverseGuards).await;
+    // Which of the two rows the frozen page left free, read without
+    // waiting, and checked once the pages are done.
+    let free = d
+        .rows(&format!(
+            "select id from {projection} where id in (9, 10) order by id for update skip locked"
+        ))
+        .await;
+    let forward = d.drain_frozen(forward_batch, "forward", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut reverse, PausePoint::AfterReverseGuards)
+        .await;
+    let reversed = reverse.finish_result().await;
+    let forwarded = forward.finish_result().await;
+    assert_no_deadlock(&d);
+    reversed.expect("the reverse page commits");
+    forwarded.expect("the forward page commits");
+    assert_eq!(
+        free,
+        Vec::<String>::new(),
+        "the reverse page holds every projection row its records touch before its \
+         first record's guards"
+    );
+    trellis::intake::markers::settle_registrations(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select id, g, pw from public.one order by id").await,
+        d.rows(
+            "select s.id, s.g, p.w from public.src s left join public.par p on p.id = s.p \
+             order by s.id"
+        )
+        .await,
+        "one (left) differs from the join (right)"
+    );
+}

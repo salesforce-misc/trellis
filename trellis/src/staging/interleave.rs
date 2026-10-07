@@ -44,6 +44,7 @@
 //! | [`PausePoint::AfterEntryLock`] | after the sorted entry lock | after the sorted entry lock |
 //! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key | directly after the one read-and-snapshot statement, when the page re-derives any key |
 //! | [`PausePoint::AfterGroupUpsert`] | never reached | after the entries-and-groups statement |
+//! | [`PausePoint::AfterReverseGuards`] | after a relationship reverse record's guards, named by the projection | the same |
 //! | [`PausePoint::BeforeCommit`] | after the page's last write | after the page's last write |
 //!
 //! A build chunk (`super::build::run_chunk`, #625 F1) fires the ledger
@@ -128,6 +129,10 @@ pub enum PausePoint {
     AfterChunkSnapshot,
     /// After the page's group increments (aggregate targets only).
     AfterGroupUpsert,
+    /// After a page's guards for a relationship reverse record, for the
+    /// relationship's projection (its quoted, qualified name), with the
+    /// projection rows the page locks for its reverses held (#848).
+    AfterReverseGuards,
     /// After every write the page makes, just before it commits.
     BeforeCommit,
 }

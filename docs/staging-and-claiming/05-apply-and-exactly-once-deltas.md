@@ -582,10 +582,17 @@ statement**. The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
 [the aggregate ledger](#aggregate-groups-the-ledger)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its
-groups in group order. A page's to-one relationship projection rows, whose
-generation it bumps, are locked in key order before the bump writes them,
-the order the reverse release locks them in: the bump alone writes them in
-whatever order its plan reads them, physical order under a bitmap scan.
+groups in group order. After its targets, a page locks every to-one
+relationship projection row it writes, in one sorted statement per
+relationship, in relationship order. Those are the rows whose generation it
+bumps and the rows its reverse records guard and advance, and the order is
+the one the reverse release uses. Left to themselves, the bump would write
+its rows in whatever order its plan reads them (physical order under a
+bitmap scan), and the reverse records would lock theirs one at a time in
+fold order. Either one deadlocks against a page or a release that reaches
+the same parents in another order. A reverse record whose key has no
+projection row yet inserts that row after the sorted lock and takes its
+lock as it writes it.
 
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
