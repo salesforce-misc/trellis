@@ -253,7 +253,9 @@ pub enum ApplyError {
     /// that fence, the pages in flight on the table, so a page that parked a
     /// change for the key has committed before the release reads the key's
     /// rows; a page that holds it longer than the timeout makes the release
-    /// give up. The bump never lands and its transaction rolls back, so
+    /// give up. A define, an alter or a column build on the table holds the
+    /// fence to its commit too, so it can be one of those the release waits
+    /// out. The bump never lands and its transaction rolls back, so
     /// nothing changed and the key is still held: retry the release. Only
     /// this wait is named: a lock timeout anywhere else in the release is the
     /// raw [`ApplyError::Db`], as it is in every other operator call.
@@ -437,9 +439,9 @@ impl fmt::Display for ApplyError {
             } => write!(
                 f,
                 "releasing key {key:?} of '{src_table}' for '{transform}' timed out waiting for \
-                 the drain pages in flight on '{src_table}' to commit (a release waits for \
-                 every page on the key's table); nothing changed and the key is still held: \
-                 retry the release"
+                 the work in flight on '{src_table}' to commit (its drain pages, and any define, \
+                 alter or column build on it, which hold its version fence); nothing changed \
+                 and the key is still held: retry the release"
             ),
             ApplyError::ResumeRefused { transform, reason } => write!(
                 f,

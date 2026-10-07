@@ -165,6 +165,30 @@ class QuarantineTest < Minitest::Test
         assert_raises(Trellis::NotFoundError) { Trellis.release_key("gizmo_prices", "gizmos", "1") }
         assert_raises(Trellis::NotFoundError) { Trellis.release_key("nowhere", "gizmos", "2") }
 
+        # A release first waits for the work in flight on the key's table,
+        # behind the table's version fence. One that waits past the session's
+        # lock timeout (100 ms here, behind the `for share` hold a drain page
+        # takes, from another connection) raises TimeoutError, which says to
+        # retry it, and changes nothing (#842). Trellis is one connection per
+        # process, so this reconnects with the shorter timeout, and back.
+        Trellis.shutdown
+        Trellis.connect(url: "#{dsn} options='-c lock_timeout=100'")
+        page = TestCluster.pg(cluster)
+        page.exec("begin")
+        fence = page.exec("select version from trellis.source_table_versions " \
+                          "where source_table = 'public.gizmos' for share")
+        assert_equal 1, fence.ntuples
+        error = assert_raises(Trellis::TimeoutError) do
+          Trellis.release_key("gizmo_prices", "gizmos", "2")
+        end
+        assert_equal :timeout, error.code
+        assert_match "in flight", error.message
+        assert_match "retry", error.message
+        page.exec("rollback")
+        assert_equal held, Trellis.status("gizmo_prices").held_keys
+        Trellis.shutdown
+        Trellis.connect(url: dsn, staging: true, drain_threads: 1)
+
         pg.exec("alter table gizmo_prices drop constraint cheap")
         assert_nil Trellis.release_key("gizmo_prices", "gizmos", "2")
         assert_nil Trellis.status("gizmo_prices").held_keys
@@ -176,31 +200,9 @@ class QuarantineTest < Minitest::Test
         # Before the private cluster goes away under it.
         Trellis.shutdown
         pg.close
+        page&.close
       end
     end
-  end
-
-  # A release first waits for the drain pages in flight on the key's table,
-  # behind the table's version fence, before it looks the key up. One whose
-  # wait runs past the session's lock timeout (100 ms here, behind a fence
-  # row another transaction hasn't committed) raises TimeoutError, which
-  # says to retry it, and changes nothing (#842).
-  def test_a_release_that_waits_out_the_lock_timeout_raises_a_timeout_error
-    Trellis.connect(url: "#{TestCluster.dsn} options='-c lock_timeout=100'")
-    pg = TestCluster.pg
-    pg.exec("begin")
-    pg.exec("insert into trellis.source_table_versions (source_table, version) " \
-            "values ('public.release_wait', 1)")
-
-    error = assert_raises(Trellis::TimeoutError) do
-      Trellis.release_key("release_wait", "public.release_wait", "1")
-    end
-    assert_equal :timeout, error.code
-    assert_match "in flight", error.message
-    assert_match "retry", error.message
-  ensure
-    pg&.exec("rollback")
-    pg&.close
   end
 
   def test_the_quarantine_calls_refuse_malformed_arguments_before_calling_the_engine

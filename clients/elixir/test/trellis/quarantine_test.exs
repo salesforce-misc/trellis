@@ -23,34 +23,6 @@ defmodule Trellis.QuarantineTest do
     :ok
   end
 
-  # A release first waits for the drain pages in flight on the key's table,
-  # behind the table's version fence, before it looks the key up. One whose
-  # wait runs past the session's lock timeout (100 ms here, behind a fence row
-  # another transaction hasn't committed) is a `:timeout` error, which says to
-  # retry it, and changes nothing (#842).
-  test "a release that waits out the lock timeout is a :timeout error" do
-    trellis = Trellis.connect!(url: TestCluster.info()["dsn"] <> " options='-c lock_timeout=100'")
-    on_exit(fn -> Trellis.shutdown(trellis) end)
-    pg = TestCluster.postgrex!()
-
-    {:error, :rolled_back} =
-      Postgrex.transaction(pg, fn conn ->
-        Postgrex.query!(
-          conn,
-          "insert into trellis.source_table_versions (source_table, version)
-           values ('public.release_wait', 1)",
-          []
-        )
-
-        assert {:error, %Trellis.Error{code: :timeout, message: message}} =
-                 Trellis.release_key(trellis, "release_wait", "public.release_wait", "1")
-
-        assert message =~ "in flight"
-        assert message =~ "retry"
-        Postgrex.rollback(conn, :rolled_back)
-      end)
-  end
-
   test "a poisoned column is listed, sampled page by page, resumed and cleared" do
     pg = TestCluster.postgrex!()
     Postgrex.query!(pg, "create table ledger (id integer primary key, n integer)", [])
@@ -233,6 +205,36 @@ defmodule Trellis.QuarantineTest do
 
     assert {:error, %Trellis.Error{code: :not_found}} =
              Trellis.release_key(trellis, "nowhere", "gizmos", "2")
+
+    # A release first waits for the work in flight on the key's table, behind
+    # the table's version fence. One that waits past the session's lock
+    # timeout (100 ms here, behind the `for share` hold a drain page takes,
+    # from another connection) is a `:timeout` error, which says to retry it,
+    # and changes nothing (#842).
+    waiter = Trellis.connect!(url: dsn <> " options='-c lock_timeout=100'")
+
+    {:error, :rolled_back} =
+      Postgrex.transaction(pg, fn conn ->
+        %Postgrex.Result{num_rows: 1} =
+          Postgrex.query!(
+            conn,
+            "select version from trellis.source_table_versions
+             where source_table = 'public.gizmos' for share",
+            []
+          )
+
+        assert {:error, %Trellis.Error{code: :timeout, message: message}} =
+                 Trellis.release_key(waiter, "gizmo_prices", "gizmos", "2")
+
+        assert message =~ "in flight"
+        assert message =~ "retry"
+        Postgrex.rollback(conn, :rolled_back)
+      end)
+
+    :ok = Trellis.shutdown!(waiter)
+
+    assert %Status{held_keys: %Trellis.HeldKeys{count: 1, oldest_poisoned_at: ^poisoned_at}} =
+             Trellis.status!(trellis, "gizmo_prices")
 
     Postgrex.query!(pg, "alter table gizmo_prices drop constraint cheap", [])
     assert :ok = Trellis.release_key(trellis, "gizmo_prices", "gizmos", "2")
