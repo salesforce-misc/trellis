@@ -1623,14 +1623,6 @@ pub async fn alter_transform(
         )));
     }
 
-    let mut fields = current.def.fields.clone();
-    let mut added = Vec::new();
-    let mut altered = Vec::new();
-    let mut dropped = Vec::new();
-    let mut real_adds: Vec<FieldDef> = Vec::new();
-    let mut real_alters: Vec<FieldDef> = Vec::new();
-    let mut real_drops: Vec<String> = Vec::new();
-
     // Issue #830: the clauses were parsed without the source, so a
     // `<source>.<column>` in them came out as a relationship path.
     let mut clauses = alter.clauses.clone();
@@ -1640,63 +1632,22 @@ pub async fn alter_transform(
         }
     }
 
-    for clause in &clauses {
-        match clause {
-            AlterClause::Add(new_field) => {
-                match fields.iter().find(|f| f.name == new_field.name) {
-                    Some(existing) if existing.expr == new_field.expr => {
-                        // Idempotent no-op: this field already exists with
-                        // this exact formula.
-                    }
-                    Some(_) => {
-                        return Err(CatalogError::AlterFieldAlreadyExists {
-                            transform: alter.target.clone(),
-                            field: new_field.name.clone(),
-                        });
-                    }
-                    None => {
-                        fields.push(new_field.clone());
-                        added.push(new_field.name.clone());
-                        real_adds.push(new_field.clone());
-                    }
-                }
-            }
-            AlterClause::Alter(new_field) => {
-                match fields.iter().position(|f| f.name == new_field.name) {
-                    None => {
-                        return Err(CatalogError::AlterFieldNotFound {
-                            transform: alter.target.clone(),
-                            field: new_field.name.clone(),
-                            declared: fields.iter().map(|f| f.name.clone()).collect(),
-                        });
-                    }
-                    Some(idx) if fields[idx].expr == new_field.expr => {
-                        // Idempotent no-op: already this exact formula.
-                    }
-                    Some(idx) => {
-                        fields[idx] = new_field.clone();
-                        altered.push(new_field.name.clone());
-                        real_alters.push(new_field.clone());
-                    }
-                }
-            }
-            AlterClause::Drop(name) => match fields.iter().position(|f| &f.name == name) {
-                None => {
-                    // Idempotent no-op: already absent.
-                }
-                Some(idx) => {
-                    fields.remove(idx);
-                    dropped.push(name.clone());
-                    real_drops.push(name.clone());
-                }
-            },
-        }
-    }
+    let AlterPlan {
+        fields,
+        real_adds,
+        real_alters,
+        real_drops,
+    } = plan_alter(&alter.target, &current.def.fields, &clauses)?;
+    let names = |fields: &[FieldDef]| fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+    let added = names(&real_adds);
+    let altered = names(&real_alters);
+    let dropped = real_drops.clone();
 
     if real_adds.is_empty() && real_alters.is_empty() && real_drops.is_empty() {
         // Every clause was an idempotent no-op — ADR-0015's "edits are
-        // idempotent in both directions": no version bump, no DDL, nothing
-        // written.
+        // idempotent in both directions" — or the clauses cancelled (an
+        // `ADD` and a `DROP` of one name, issue #919): no version bump, no
+        // DDL, nothing written.
         return Ok(AlterOutcome {
             definition: current,
             added,
@@ -2063,6 +2014,107 @@ pub async fn alter_transform(
         added,
         dropped,
         altered,
+    })
+}
+
+/// What an edit's clauses change, net of each other: [`plan_alter`]'s result.
+#[derive(Debug, PartialEq)]
+struct AlterPlan {
+    /// The definition's fields once every clause is applied, in order.
+    fields: Vec<FieldDef>,
+    /// Fields the edit adds, as they end up: each needs a new column.
+    real_adds: Vec<FieldDef>,
+    /// Fields the definition had, kept, whose formula ends up different.
+    real_alters: Vec<FieldDef>,
+    /// Fields the definition had that a `DROP` removed, in clause order:
+    /// each loses its column, even if an `ADD` then brings the name back.
+    real_drops: Vec<String>,
+}
+
+/// Applies an edit's `clauses`, in order, to the fields `current` the
+/// definition `target` has, and works out what the edit changes as a whole
+/// rather than clause by clause (issue #919): a field added and then dropped
+/// in the same edit never had a column, so it is neither added nor dropped,
+/// and an `ALTER` of a field the edit added just changes what is added.
+///
+/// A field the definition had and the edit drops is a real drop, even when
+/// a later `ADD` brings the name back: `DROP z, ADD z` replaces the column,
+/// the supported path for a change of result type (see
+/// [`check_no_type_changing_alter`]).
+///
+/// Refuses, as [`alter_transform`] does, an `ADD` of a name already
+/// present with a different formula and an `ALTER` of a name not present,
+/// each as of its own clause. An `ADD` with a present field's formula, an
+/// `ALTER` to it, or a `DROP` of an absent name is an idempotent no-op.
+fn plan_alter(
+    target: &str,
+    current: &[FieldDef],
+    clauses: &[AlterClause],
+) -> Result<AlterPlan, CatalogError> {
+    let mut fields = current.to_vec();
+    // The names whose field in `fields` this edit added. Every other name
+    // in `fields` is one of `current`'s, not dropped.
+    let mut fresh: HashSet<String> = HashSet::new();
+    let mut real_drops: Vec<String> = Vec::new();
+
+    for clause in clauses {
+        match clause {
+            AlterClause::Add(new_field) => match fields.iter().find(|f| f.name == new_field.name) {
+                Some(existing) if existing.expr == new_field.expr => {}
+                Some(_) => {
+                    return Err(CatalogError::AlterFieldAlreadyExists {
+                        transform: target.to_string(),
+                        field: new_field.name.clone(),
+                    });
+                }
+                None => {
+                    fields.push(new_field.clone());
+                    fresh.insert(new_field.name.clone());
+                }
+            },
+            AlterClause::Alter(new_field) => {
+                match fields.iter().position(|f| f.name == new_field.name) {
+                    None => {
+                        return Err(CatalogError::AlterFieldNotFound {
+                            transform: target.to_string(),
+                            field: new_field.name.clone(),
+                            declared: fields.iter().map(|f| f.name.clone()).collect(),
+                        });
+                    }
+                    Some(idx) => fields[idx] = new_field.clone(),
+                }
+            }
+            AlterClause::Drop(name) => {
+                if let Some(idx) = fields.iter().position(|f| &f.name == name) {
+                    fields.remove(idx);
+                    // A field this edit added cancels; one the definition
+                    // had loses its column.
+                    if !fresh.remove(name) {
+                        real_drops.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let (real_adds, kept): (Vec<FieldDef>, Vec<FieldDef>) = fields
+        .iter()
+        .cloned()
+        .partition(|f| fresh.contains(&f.name));
+    let real_alters = kept
+        .into_iter()
+        .filter(|f| {
+            current
+                .iter()
+                .find(|old| old.name == f.name)
+                .is_some_and(|old| old.expr != f.expr)
+        })
+        .collect();
+    Ok(AlterPlan {
+        fields,
+        real_adds,
+        real_alters,
+        real_drops,
     })
 }
 
@@ -8151,6 +8203,121 @@ mod type_changing_alter_tests {
         )
         .await
         .expect("an unchanged type passes");
+    }
+}
+
+/// Issue #919: [`plan_alter`] nets an edit's clauses against each other.
+#[cfg(test)]
+mod plan_alter_tests {
+    use super::*;
+    use crate::defs::ast::Statement;
+    use crate::defs::parser::parse_statement;
+
+    /// The definition `t`'s fields, `a` and `z` (`a + a`), edited by
+    /// `ALTER TRANSFORM t <clauses>`.
+    fn plan(clauses: &str) -> Result<AlterPlan, CatalogError> {
+        let current = parse("TRANSFORM t FROM s SELECT a AS a, a + a AS z")
+            .expect("parse the definition")
+            .fields;
+        plan_without(&current, clauses)
+    }
+
+    fn plan_without(current: &[FieldDef], clauses: &str) -> Result<AlterPlan, CatalogError> {
+        let Statement::AlterTransform(alter) =
+            parse_statement(&format!("ALTER TRANSFORM t {clauses}")).expect("parse the edit")
+        else {
+            panic!("expected an ALTER TRANSFORM");
+        };
+        plan_alter("t", current, &alter.clauses)
+    }
+
+    /// Only `a`: the edit's `z` is new.
+    fn plan_new_z(clauses: &str) -> Result<AlterPlan, CatalogError> {
+        let current = parse("TRANSFORM t FROM s SELECT a AS a")
+            .expect("parse the definition")
+            .fields;
+        plan_without(&current, clauses)
+    }
+
+    fn names(fields: &[FieldDef]) -> Vec<&str> {
+        fields.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    #[test]
+    fn an_add_then_a_drop_of_the_same_field_cancel() {
+        let plan = plan_new_z("ADD a + a AS z, DROP z").expect("plan");
+        assert_eq!(names(&plan.fields), ["a"]);
+        assert!(plan.real_adds.is_empty(), "{plan:?}");
+        assert!(plan.real_alters.is_empty(), "{plan:?}");
+        assert!(plan.real_drops.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn an_add_altered_and_then_dropped_cancels() {
+        let plan = plan_new_z("ADD a + a AS z, ALTER z AS a + a + a, DROP z").expect("plan");
+        assert_eq!(names(&plan.fields), ["a"]);
+        assert!(
+            plan.real_adds.is_empty() && plan.real_alters.is_empty(),
+            "{plan:?}"
+        );
+        assert!(plan.real_drops.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_drop_then_an_add_replaces_the_field() {
+        let plan = plan("DROP z, ADD a > a AS z").expect("plan");
+        assert_eq!(names(&plan.fields), ["a", "z"]);
+        assert_eq!(plan.real_drops, ["z"]);
+        assert_eq!(names(&plan.real_adds), ["z"]);
+        assert!(plan.real_alters.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_replace_dropped_again_is_only_a_drop() {
+        let plan = plan("DROP z, ADD a > a AS z, DROP z").expect("plan");
+        assert_eq!(names(&plan.fields), ["a"]);
+        assert_eq!(plan.real_drops, ["z"]);
+        assert!(
+            plan.real_adds.is_empty() && plan.real_alters.is_empty(),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn an_alter_of_an_added_field_changes_what_is_added() {
+        let plan = plan_new_z("ADD a + a AS z, ALTER z AS a > a").expect("plan");
+        assert_eq!(names(&plan.real_adds), ["z"]);
+        assert_eq!(plan.real_adds[0], plan.fields[1]);
+        assert!(
+            plan.real_alters.is_empty() && plan.real_drops.is_empty(),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn an_alter_and_its_reversal_cancel() {
+        let plan = plan("ALTER z AS a + a + a, ALTER z AS a + a").expect("plan");
+        assert!(plan.real_alters.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_field_added_twice_is_added_once() {
+        let plan = plan_new_z("ADD a + a AS z, ADD a + a AS z").expect("plan");
+        assert_eq!(names(&plan.real_adds), ["z"]);
+        assert_eq!(names(&plan.fields), ["a", "z"]);
+
+        let err = plan_new_z("ADD a + a AS z, ADD a > a AS z").expect_err("two formulas");
+        assert!(
+            matches!(err, CatalogError::AlterFieldAlreadyExists { ref field, .. } if field == "z"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_dropped_twice_is_dropped_once() {
+        let plan = plan("DROP z, DROP z").expect("plan");
+        assert_eq!(plan.real_drops, ["z"]);
+        assert_eq!(names(&plan.fields), ["a"]);
     }
 }
 

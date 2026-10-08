@@ -1569,6 +1569,140 @@ async fn edits_are_idempotent_in_both_directions() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// Issue #919: an `ADD` and a `DROP` of the same name in one edit cancel,
+/// so the edit is a no-op. Neither its physical column nor any pause state
+/// survives it, and a later `ADD` of that name with a different result type
+/// creates the column with the new type.
+#[tokio::test]
+async fn an_add_and_a_drop_of_the_same_field_in_one_edit_cancel() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS z, DROP z")
+        .await
+        .expect("an ADD and a DROP of the same field cancel");
+    assert!(
+        !column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc")
+            .await
+            .contains("z"),
+        "the edit must leave no physical column z behind"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a net no-op edit writes nothing"
+    );
+    let (added, dropped, altered) = into_altered(applied);
+    assert!(added.is_empty(), "z was not added: {added:?}");
+    assert!(dropped.is_empty(), "z was not dropped: {dropped:?}");
+    assert!(altered.is_empty());
+    let pause_rows: i64 = raw
+        .query_one(
+            "select (select count(*) from column_status where column_name = 'z') \
+                  + (select count(*) from column_pause_cascades \
+                     where upstream_column = 'z' or downstream_column = 'z')",
+            &[],
+        )
+        .await
+        .expect("read pause state")
+        .get(0);
+    assert_eq!(pause_rows, 0, "the edit must leave no pause state for z");
+
+    // The name is free: an ADD with a different result type gets its type.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD a > 1 AS z")
+        .await
+        .expect("add z as a boolean");
+    wait_for_live(&raw, "order_calc").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "z").await,
+        "boolean"
+    );
+    let rows = raw
+        .query(
+            &format!("select a::text, z from {DEFAULT_TARGET_SCHEMA}.order_calc order by id"),
+            &[],
+        )
+        .await
+        .expect("read target");
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let z: Option<bool> = row.get(1);
+        assert_eq!(z, Some(a > 1.0));
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Issue #919's other order: `DROP z, ADD z` replaces the field, which is
+/// the supported path for a change of result type, so it drops the old
+/// column and adds one with the new type.
+#[tokio::test]
+async fn a_drop_then_add_of_the_same_field_replaces_it_with_the_new_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, a + a AS z")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "z").await,
+        "numeric"
+    );
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc DROP z, ADD a > 1 AS z")
+        .await
+        .expect("replace z");
+    let (added, dropped, altered) = into_altered(applied);
+    assert_eq!(added, vec!["z".to_string()]);
+    assert_eq!(dropped, vec!["z".to_string()]);
+    assert!(altered.is_empty());
+    wait_for_live(&raw, "order_calc").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "z").await,
+        "boolean"
+    );
+    let rows = raw
+        .query(
+            &format!("select a::text, z from {DEFAULT_TARGET_SCHEMA}.order_calc order by id"),
+            &[],
+        )
+        .await
+        .expect("read target");
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let z: Option<bool> = row.get(1);
+        assert_eq!(z, Some(a > 1.0));
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn add_an_existing_field_with_a_different_formula_is_rejected() {
     let cluster = TestCluster::start();

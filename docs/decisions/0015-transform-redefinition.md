@@ -42,6 +42,11 @@ Each clause names one calculated field and the operation on it. `ADD` introduces
 column, `DROP` removes one, `ALTER` replaces an existing column's formula. The key-space
 is not named and cannot be changed.
 
+The clauses apply in order, and the edit is what they change together. A field added and
+dropped in one edit cancels, and never gets a column. An `ALTER` of a field the same edit
+added changes what it adds. `DROP z, ADD z` replaces `z`'s column, which is the way to
+change its result type.
+
 Only the delta form exists; it is what the common case (one column on a wide table)
 wants. A declarative form (restating the full field list and letting the engine diff
 it) would be another production the same entrypoint discriminates.
