@@ -2305,10 +2305,16 @@ async fn pause_reader_in_txn(
 ///
 /// - `column_status` and cascade-edge rows of a target whose lock it holds.
 ///   Every pause, resume and edit above writes those under that lock. The
-///   two other deleters close no cycle: a field build's start deletes only
-///   rows awaiting their capture, which a define doesn't read, and an edit
-///   that only drops fields deletes their rows once its DDL holds the
-///   target's table, which a define waiting on those rows can't hold.
+///   updates made without it (a resume's clear of `local_fuse` on a column
+///   that stays paused, the walk's clear of `cascade_pending`, a field
+///   build's start clearing `awaiting_capture`) change no key, so a `for key
+///   share` read doesn't wait on them. Two other deleters close no cycle: a
+///   field build's start deletes only rows awaiting their capture, which a
+///   define doesn't read, and an edit that only drops fields deletes their
+///   rows once its DDL holds the target's table, which a define waiting on
+///   those rows can't hold. `DROP TRANSFORM` deletes its target's rows and
+///   edges without the lock too, and isn't covered by this argument: it can
+///   deadlock against a resume deleting the same edges.
 /// - For a resume or an edit, its own definition's row and its field
 ///   build's registration, which only transactions on its own fence write.
 pub(crate) async fn lock_column_pauses(
