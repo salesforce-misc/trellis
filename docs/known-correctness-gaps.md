@@ -102,6 +102,7 @@ These are the tools the entries refer to:
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
+| 25 | A `MERGE` whose `UPDATE` action moves a row to another partition of a partitioned source | yes | no | #942, awaiting a Postgres response; reachable with #897 |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -672,6 +673,46 @@ reads a table on the page, directly or through a relationship, and
 Or pause a definition in a failing combination (one of either pair): once
 some definition is in every combination left, isolation charges the ones it
 pins, which hold the key until it's released or they're resumed.
+
+## 25. A `MERGE` that moves a row to another partition
+
+**Trigger:** a `MERGE` on a partitioned source whose `UPDATE` action
+(including `WHEN NOT MATCHED BY SOURCE … UPDATE`) changes a row's partition.
+It applies to any capture shape. A `MERGE` that keeps every row in its
+partition, and a plain `UPDATE` that moves one, are unaffected.
+
+**Reachability:** Trellis refuses a partitioned table or a partition as a
+source today (`change_keyed`), so nobody can hit this yet. It applies once
+partitioned sources are supported (epic #897).
+
+**Effect:** silent, and a Postgres defect, not Trellis's. Postgres leaves the
+moved row's images out of the `UPDATE` transition tables, so Trellis receives
+empty or partial ones and can't tell a `MERGE` from an `UPDATE`. It came in
+with Postgres commits `c0bfdaf2b` (15.6) and `06a546382` (16.2), which fixed an
+unrelated row-trigger failure. It's reported upstream, and Trellis is waiting
+to hear whether Postgres accepts it as a bug and fixes it.
+
+* **15.6+, 16.2+, 17 and 18:** the images go only to the `DELETE` `old` and
+  `INSERT` `new` tables, and only if the `MERGE` has a `DELETE` or `INSERT`
+  action. With an `INSERT` action and no `DELETE`, the row is counted twice;
+  with a `DELETE` action and no `INSERT`, it's dropped; with neither, both
+  images are lost. Only a `MERGE` with both is exact.
+* **15.0–15.5 and 16.0–16.1:** the images go to the `UPDATE` tables as they
+  should, and, if the `MERGE` has an `INSERT` or `DELETE` action, to that
+  action's table too, so the row is counted twice. 15.5 was observed; the
+  rest is inferred.
+
+**Detected?** No.
+
+**Planned work:** #942 tracks the upstream report. Nothing in Trellis changes
+until Postgres answers.
+
+**Workaround:** change the partition key with `UPDATE`, or with `DELETE` and
+`INSERT`, not with a `MERGE`. A `MERGE` with both `DELETE` and `INSERT` actions
+isn't a safe form: it's wrong on the older minors.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it.
 
 ## Repair caveats
 
