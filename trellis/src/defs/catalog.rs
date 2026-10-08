@@ -404,6 +404,10 @@ pub enum CatalogError {
     /// both exist). Refused rather than resolved through `search_path`; the
     /// caller qualifies the address to say which one it means. See
     /// [`relationship_at_address`].
+    /// A define, `ALTER TRANSFORM` or `DROP TRANSFORM` waited for the
+    /// column-pause lock ([`crate::locks::lock_column_pauses`]) past its
+    /// transaction's `lock_timeout` (#922). Nothing changed: retry the call.
+    ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
     AmbiguousRelationshipAddress {
         from_table: String,
         name: String,
@@ -464,6 +468,8 @@ impl CatalogError {
             // The statement itself is under-specified — the fix is to
             // rewrite it with a schema qualifier, not to change any state.
             CatalogError::AmbiguousRelationshipAddress { .. } => ErrorCode::Validation,
+            // A wait that ran out, not a fault: the call changed nothing.
+            CatalogError::ColumnPauseLockTimeout(_) => ErrorCode::Timeout,
         }
     }
 }
@@ -649,6 +655,7 @@ impl fmt::Display for CatalogError {
             CatalogError::UnsupportedAlter(detail) => {
                 write!(f, "unsupported ALTER TRANSFORM: {detail}")
             }
+            CatalogError::ColumnPauseLockTimeout(err) => write!(f, "{err}"),
             CatalogError::AmbiguousRelationshipAddress {
                 from_table,
                 name,
@@ -693,6 +700,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AlterFieldAlreadyExists { .. } => None,
             CatalogError::UnsupportedAlter(_) => None,
             CatalogError::AmbiguousRelationshipAddress { .. } => None,
+            CatalogError::ColumnPauseLockTimeout(err) => Some(err),
         }
     }
 }
@@ -706,6 +714,17 @@ impl From<ParseError> for CatalogError {
 impl From<ValidationError> for CatalogError {
     fn from(err: ValidationError) -> Self {
         CatalogError::Validate(err)
+    }
+}
+
+impl From<crate::locks::ColumnPauseLockError> for CatalogError {
+    fn from(err: crate::locks::ColumnPauseLockError) -> Self {
+        match err {
+            crate::locks::ColumnPauseLockError::Timeout(err) => {
+                CatalogError::ColumnPauseLockTimeout(err)
+            }
+            crate::locks::ColumnPauseLockError::Db(err) => CatalogError::Db(err),
+        }
     }
 }
 
@@ -1784,6 +1803,22 @@ pub async fn alter_transform(
     )
     .await?;
 
+    // The column-pause lock, exclusive (#922), after the fence and before the
+    // definition row: an edit that builds a field can pause it at birth
+    // (`pause_readers_of_paused_columns` below) and one that drops a field
+    // deletes its pause rows and edges, so both write pause state, and what
+    // it reads of its upstreams' pauses must not change under it. See
+    // `crate::locks::lock_column_pauses` for the order. A no-op edit takes
+    // nothing.
+    if !build_fields.is_empty() || !real_drops.is_empty() {
+        crate::locks::lock_column_pauses(
+            &*txn,
+            crate::locks::ColumnPauseLock::Exclusive,
+            crate::locks::ColumnPauseOp::Alter,
+        )
+        .await?;
+    }
+
     // Row-lock the definition and recheck its status: a pause, a drop, or
     // another concurrent alter must not interleave between the checks above
     // and this commit (issue #231's lesson, applied here the same way
@@ -1882,19 +1917,11 @@ pub async fn alter_transform(
     // same as it already does for a same-type `ADD`.
 
     // Issue #915: an edit that builds fields can pause one at birth that
-    // already has readers (see `pause_readers_of_paused_columns` below), so
-    // it takes this target's pause lock exclusive, as every write of a pause
-    // does, with its upstreams' shared, in one name order. It takes them
-    // after the DDL: a define reading this target can hold a lock on the
-    // target table to its commit, and waiting for that while holding this
-    // lock could close a cycle. And before this target's pause rows below
-    // are written or deleted: a define that holds this lock shared reads
-    // them `for key share`. See `lock_column_pauses` for the order.
+    // already has readers (see `pause_readers_of_paused_columns` below). The
+    // column-pause lock it holds since its fence covers that and its
+    // upstreams' pauses it reads (#922).
     let upstreams = if builds_fields {
-        let upstreams =
-            definition_targets_read(&*txn, &current.source_table, &relationships).await?;
-        lock_column_pauses_in_order(&*txn, &upstreams, Some(&alter.target)).await?;
-        upstreams
+        definition_targets_read(&*txn, &current.source_table, &relationships).await?
     } else {
         Vec::new()
     };
@@ -2125,9 +2152,8 @@ fn plan_alter(
 /// The definition targets a 1-1 definition with source `qualified_source`
 /// and `relationships` reads (its source, and each relationship's to-side,
 /// that is a definition's target), each as `(bare, qualified)`: bare as
-/// `column_status` keys it and [`lock_column_pauses`] takes it, qualified as
-/// a field's reads resolve. In bare-name order, the order
-/// [`lock_column_pauses_in_order`] locks them in.
+/// `column_status` keys it, qualified as a field's reads resolve. In
+/// bare-name order.
 async fn definition_targets_read(
     txn: &impl GenericClient,
     qualified_source: &str,
@@ -2148,29 +2174,6 @@ async fn definition_targets_read(
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect())
-}
-
-/// Takes the pause locks ([`lock_column_pauses`]) a define or edit of a 1-1
-/// definition holds to its commit: each of `upstreams`' shared, as it reads
-/// their paused columns ([`pause_readers_of_paused_columns`]), and, for an
-/// edit, its own target's (`own`) exclusive, as it writes pauses of fields
-/// that already have readers (issue #915). All in one bare-name order, so
-/// no two such transactions take two of the same locks in opposite orders.
-async fn lock_column_pauses_in_order(
-    txn: &impl GenericClient,
-    upstreams: &[(String, String)],
-    own: Option<&str>,
-) -> Result<(), CatalogError> {
-    let mut locks: Vec<(&str, bool)> = upstreams
-        .iter()
-        .map(|(upstream, _)| (upstream.as_str(), false))
-        .chain(own.map(|own| (own, true)))
-        .collect();
-    locks.sort();
-    for (transform, exclusive) in locks {
-        lock_column_pauses(txn, transform, exclusive).await?;
-    }
-    Ok(())
 }
 
 /// Pauses each of `fields`, of the 1-1 definition `def` targeting `target`
@@ -2210,16 +2213,16 @@ async fn lock_column_pauses_in_order(
 /// Runs in the define or edit's own transaction, whose first lock bumped
 /// the version fence of `def`'s source: the fence `staging::quarantine`'s
 /// pause of one of `def`'s fields bumps, so this takes no fence of its own.
-/// The caller holds `upstreams`' pause locks ([`lock_column_pauses_in_order`]),
-/// and each row read is locked `for key share`:
+/// The caller holds the column-pause lock ([`crate::locks::lock_column_pauses`]):
+/// shared for a define, exclusive for an edit. Every pause and resume of an
+/// upstream column writes its rows under it exclusive, so:
 ///
 /// - A pause of an upstream column that commits first is read here. One
 ///   that comes later waits for this commit, and its cascade then reads the
 ///   definition as it stands and finds this reader paused already.
-/// - A resume of an upstream column takes the upstream's pause lock
-///   exclusive before it deletes a row (issue #917). One that commits first
-///   leaves nothing to read. One that comes later waits for this commit and
-///   then deletes the edge with the rest, releasing the reader.
+/// - A resume of an upstream column that commits first leaves nothing to
+///   read. One that comes later waits for this commit and then deletes the
+///   edge with the rest, releasing the reader.
 #[allow(clippy::too_many_arguments)]
 async fn pause_readers_of_paused_columns(
     txn: &impl GenericClient,
@@ -2246,7 +2249,7 @@ async fn pause_readers_of_paused_columns(
             txn.query(
                 "select column_name from column_status \
                  where transform_table = $1 and not awaiting_capture \
-                 order by column_name for key share",
+                 order by column_name",
                 &[upstream],
             )
             .await?
@@ -2363,81 +2366,6 @@ async fn pause_reader_in_txn(
     .await?;
     Ok(edged > 0)
 }
-
-/// Takes the transaction-scoped lock that orders a column pause or resume
-/// of `transform` (bare) against a reader of its columns being defined or
-/// edited (issue #914): `exclusive` for a transaction that writes a pause
-/// of one of `transform`'s columns or deletes one, shared for a define or
-/// edit about to read them ([`pause_readers_of_paused_columns`]).
-///
-/// Without it, a define could read no pause, the pause commit, and its
-/// cascade read the dependency graph before the define committed, so
-/// neither would pause the new reader. With it, one of them waits for the
-/// other to commit. A resume needs it too (issue #917): it deletes the
-/// resumed column's row and then each sibling's it releases, in walk order,
-/// while the define locks the same rows in name order, so without it each
-/// could hold a row the other waits for. Pauses and resumes of one target
-/// don't wait on each other here (a 1-1 target's already wait on its
-/// source's fence), nor do two defines. An advisory lock rather than a row
-/// lock: nothing else takes it, so the only transactions it orders are
-/// these.
-///
-/// **Lock order.** Each taker's first lock is a version fence (an aggregate
-/// target's pause or resume has none), and it takes these locks only after
-/// it:
-///
-/// - `staging::quarantine`'s operator pause, fuse trip and cascade pair
-///   take one, exclusive, right after their fence bump (issue #744), then
-///   write their `column_status` rows.
-/// - A column resume (`staging::quarantine::resume_column`) takes its
-///   target's, exclusive, right after its fence bump and before the
-///   definition's row (issue #917), then deletes that target's rows and
-///   the edges out of them, one transaction per target.
-/// - A define takes its upstreams' shared, after its DDL and catalog rows,
-///   in bare-name order ([`lock_column_pauses_in_order`]), then reads their
-///   paused columns.
-/// - `ALTER TRANSFORM` takes its upstreams' shared and its own target's
-///   exclusive (issue #915), after its DDL and before it writes or deletes
-///   a `column_status` row of its target, in the same one name order.
-///
-/// So a transaction waiting for one of these locks holds only those before
-/// it in name order, plus, for a define or edit, its DDL and catalog rows,
-/// which no holder of the lock goes on to wait for. Once it holds them it
-/// waits only on rows:
-///
-/// - `column_status` and cascade-edge rows of a target whose lock it holds.
-///   Every pause, resume and edit above writes those under that lock. The
-///   updates made without it (a resume's clear of `local_fuse` on a column
-///   that stays paused, the walk's clear of `cascade_pending`, a field
-///   build's start clearing `awaiting_capture`) change no key, so a `for key
-///   share` read doesn't wait on them. Two other deleters close no cycle: a
-///   field build's start deletes only rows awaiting their capture, which a
-///   define doesn't read, and an edit that only drops fields deletes their
-///   rows once its DDL holds the target's table, which a define waiting on
-///   those rows can't hold. `DROP TRANSFORM` deletes its target's rows and
-///   edges without the lock too, and isn't covered by this argument: it can
-///   deadlock against a resume deleting the same edges.
-/// - For a resume or an edit, its own definition's row and its field
-///   build's registration, which only transactions on its own fence write.
-pub(crate) async fn lock_column_pauses(
-    client: &impl GenericClient,
-    transform: &str,
-    exclusive: bool,
-) -> Result<(), tokio_postgres::Error> {
-    let sql = if exclusive {
-        "select pg_advisory_xact_lock($1, hashtext($2))"
-    } else {
-        "select pg_advisory_xact_lock_shared($1, hashtext($2))"
-    };
-    client
-        .execute(sql, &[&COLUMN_PAUSE_LOCK_CLASS, &transform])
-        .await?;
-    Ok(())
-}
-
-/// The first key of [`lock_column_pauses`]'s two-key advisory lock: a
-/// namespace of its own, so it shares no key with another advisory lock.
-const COLUMN_PAUSE_LOCK_CLASS: i32 = 914;
 
 /// Whether `edited` reads a source column `original` doesn't (issue #622):
 /// one the source's capture triggers may not image yet. A column `original`
@@ -2762,6 +2690,19 @@ async fn create_definition_inner(
         )
         .await?
         .get(0);
+    // The column-pause lock, shared (#922), right after the fence and before
+    // the definition row or any DDL: the pause state a field reading a
+    // paused column is born under (below) is read under it, so a pause
+    // either commits before this define reads it or waits for this commit
+    // and finds the define in the graph its cascade walks. Held to the
+    // commit of this catalog transaction only: the build and backfill a
+    // define starts run after it, in transactions of their own.
+    crate::locks::lock_column_pauses(
+        &*txn,
+        crate::locks::ColumnPauseLock::Shared,
+        crate::locks::ColumnPauseOp::Define,
+    )
+    .await?;
 
     // Issue #73 / #76, ADR-0007: resolve `def.target` — likewise always bare
     // — to its fully-qualified identity exactly once, here, mirroring
@@ -3120,7 +3061,6 @@ async fn create_definition_inner(
     // 1-1 plan holds a paused column out (known correctness gap 19).
     if matches!(def.key_space, KeySpace::OneToOne) {
         let upstreams = definition_targets_read(&*txn, &qualified_source, &relationships).await?;
-        lock_column_pauses_in_order(&*txn, &upstreams, None).await?;
         let all_fields: Vec<String> = def.fields.iter().map(|f| f.name.clone()).collect();
         pause_readers_of_paused_columns(
             &*txn,

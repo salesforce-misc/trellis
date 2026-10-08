@@ -46,6 +46,7 @@ use crate::defs::catalog;
 use crate::defs::ddl::{self, DdlError};
 use crate::defs::eval::AliasReaders;
 use crate::defs::model::TransformStatus;
+use crate::locks::{ColumnPauseLock, ColumnPauseOp};
 use crate::pool::Pool;
 
 use super::append::{self, RING_SIZE, StagedChange, ring_table_name};
@@ -2608,7 +2609,8 @@ async fn trip_column_fuse(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     bump_pause_fence(&*txn, fence.as_deref()).await?;
-    catalog::lock_column_pauses(&*txn, transform, true).await?;
+    crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Fuse)
+        .await?;
     let mark: String = txn
         .query_one(
             "insert into column_status \
@@ -2700,9 +2702,9 @@ async fn bump_pause_fence(
 ///   transaction: a retry doesn't bump the fences of the pairs it already
 ///   reached, nor wait on their writers again.
 /// - A pair commits only while its upstream column is still paused, read
-///   under a key-share lock after the fence bump, so a walk racing that
-///   column's [`resume_column`] can't pause a reader the resume already
-///   released. The walk goes no further down that branch.
+///   under the column-pause lock, taken after the fence bump, so a walk
+///   racing that column's [`resume_column`] can't pause a reader the resume
+///   already released. The walk goes no further down that branch.
 ///
 /// A pause records the walk as owed (`column_status.cascade_pending`) in
 /// the transaction that writes its own row, and the walk clears it once it
@@ -2805,14 +2807,15 @@ async fn cascaded_already(
 /// One pair of [`cascade_pause`]: records the edge from `upstream` and
 /// pauses `downstream`, in a transaction whose first lock bumps
 /// `downstream`'s definition's source fence ([`bump_pause_fence`]), so no
-/// transaction holds two sources' fences. It then takes `downstream`'s pause
-/// lock ([`catalog::lock_column_pauses`]), as every write of a pause does,
-/// so a definition being defined or edited to read `downstream`'s column
-/// either reads this pause or commits before the walk goes on to read the
-/// graph (issue #914). False, with nothing written, when
-/// `upstream` is no longer paused: the key-share lock on its row waits for
-/// a [`resume_column`] deleting it, and a resume that comes later waits for
-/// this commit and then deletes the edge with the rest.
+/// transaction holds two sources' fences. It then takes the column-pause lock
+/// exclusive ([`crate::locks::lock_column_pauses`]), as every write of a
+/// pause does, so a definition being defined or edited to read
+/// `downstream`'s column either reads this pause or commits before the walk
+/// goes on to read the graph (issue #914). False, with nothing written,
+/// when `upstream` is no longer paused: the read of its row is made under
+/// the lock, so a [`resume_column`] deleting it has committed already, and
+/// one that comes later waits for this commit and then deletes the edge with
+/// the rest.
 async fn pause_dependent(
     pool: &Pool,
     (downstream_transform, downstream_column): (&str, &str),
@@ -2834,12 +2837,12 @@ async fn pause_dependent(
         downstream_transform,
     )
     .await?;
-    catalog::lock_column_pauses(&*txn, downstream_transform, true).await?;
+    crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Cascade)
+        .await?;
     let upstream_paused = txn
         .query_opt(
             "select 1 from column_status \
-             where transform_table = $1 and column_name = $2 \
-             for key share",
+             where transform_table = $1 and column_name = $2",
             &[&upstream_transform, &upstream_column],
         )
         .await?
@@ -3010,13 +3013,13 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// **A reader defined after it** (issue #914). Define and `ALTER TRANSFORM`
 /// pause a field that reads a column paused when they run, with the row and
 /// edge [`cascade_pause`] would write. The transaction that writes the
-/// column's row takes the target's pause lock after its fence bump
-/// ([`catalog::lock_column_pauses`]); a define reading the target's paused
-/// columns holds it shared to its commit. So a define either reads this
-/// pause, or commits before it and is in the graph [`cascade_pause`] walks.
-/// An edit that pauses a field which already has readers takes the field's
-/// target's lock exclusive too, and marks the field as owing its cascade
-/// (issue #915), which it walks once it commits ([`cascade_edit_pauses`]).
+/// column's row takes the column-pause lock exclusive after its fence bump
+/// ([`crate::locks::lock_column_pauses`]); a define reading paused columns
+/// holds it shared to its commit. So a define either reads this pause, or
+/// commits before it and is in the graph [`cascade_pause`] walks. An edit
+/// that pauses a field which already has readers takes it exclusive too,
+/// and marks the field as owing its cascade (issue #915), which it walks
+/// once it commits ([`cascade_edit_pauses`]).
 ///
 /// **`local_fuse` is set even though no fuse tripped.** That column records
 /// "this pair has a reason of its own to stay paused", as opposed to a pause
@@ -3052,7 +3055,8 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
         bump_pause_fence(&*txn, fence.as_deref()).await?;
-        catalog::lock_column_pauses(&*txn, transform, true).await?;
+        crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Pause)
+            .await?;
         let mark: String = txn
             .query_one(
                 "insert into column_status \
@@ -3262,18 +3266,26 @@ pub async fn resume_column(
         if one_to_one {
             super::build::bump_version_fence(&*txn, &def.source_table).await?;
         }
-        // The target's pause lock, exclusive, as every write of a pause
-        // takes it (issue #917): this deletes `t`'s rows one by one, in walk
-        // order, and a define or edit reading them `for key share`, in name
-        // order, holds the lock shared, so it reads either before this
-        // starts or after it commits. See `catalog::lock_column_pauses`.
-        catalog::lock_column_pauses(&*txn, &t, true).await?;
-        let row = txn
-            .query_one(
+        // The column-pause lock, exclusive, after the fence and before the
+        // definition row, as every write of pause state takes it: this
+        // deletes `t`'s rows one by one, in walk order, and a define or
+        // edit reading them holds the lock too, so it reads either before
+        // this starts or after it commits. See
+        // `crate::locks::lock_column_pauses` for the order.
+        crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
+            .await?;
+        let Some(row) = txn
+            .query_opt(
                 "select status, build from transform_definitions where id = $1 for update",
                 &[&def.id],
             )
-            .await?;
+            .await?
+        else {
+            // Dropped (`DROP TRANSFORM`) since the lookup above: there is
+            // nothing left of it to resume, and its rows went with it.
+            txn.rollback().await?;
+            continue;
+        };
         let status_text: String = row.get(0);
         let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
             panic!("transform_definitions.status held unrecognized value '{status_text}'")

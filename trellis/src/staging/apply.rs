@@ -264,6 +264,13 @@ pub enum ApplyError {
         src_table: String,
         key: String,
     },
+    /// A column pause, resume, fuse trip or cascade pair, or a build's
+    /// release of capture-widen pauses, waited for the column-pause lock
+    /// ([`crate::locks::lock_column_pauses`]) past its transaction's
+    /// `lock_timeout` (#922). Its transaction rolled back with nothing
+    /// written: retry the call. A fuse trip and the capture pass's
+    /// callers retry on their next pass.
+    ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
     /// [`super::quarantine::resume_transform`] or
     /// [`super::quarantine::resume_column`] re-ran define-time validation
     /// against the live schema and it failed (#708, #760): define would
@@ -357,6 +364,8 @@ impl ApplyError {
             // A wait that ran out, not a fault: the release changed nothing
             // and the same call succeeds once the table's pages commit.
             ApplyError::ReleaseLockTimeout { .. } => ErrorCode::Timeout,
+            // The same kind of wait, on the column-pause lock.
+            ApplyError::ColumnPauseLockTimeout(_) => ErrorCode::Timeout,
             // The schema blocks the request, as define's own refusal does.
             ApplyError::ResumeRefused { reason, .. } => reason.code(),
         }
@@ -453,6 +462,7 @@ impl fmt::Display for ApplyError {
                  alter or column build on it, which hold its version fence); nothing changed \
                  and the key is still held: retry the release"
             ),
+            ApplyError::ColumnPauseLockTimeout(err) => write!(f, "{err}"),
             ApplyError::ResumeRefused { transform, reason } => write!(
                 f,
                 "'{transform}' can't resume: define would refuse it as the schema stands now: \
@@ -493,6 +503,7 @@ impl std::error::Error for ApplyError {
             ApplyError::Db(err) => Some(err),
             ApplyError::Pool(err) => Some(err),
             ApplyError::Intake(err) => Some(err),
+            ApplyError::ColumnPauseLockTimeout(err) => Some(err),
             ApplyError::ResumeRefused { reason, .. } => Some(reason.as_ref()),
             ApplyError::ClaimLost
             | ApplyError::VersionFenceMiss { .. }
@@ -553,6 +564,17 @@ impl From<crate::defs::backfill::BackfillError> for ApplyError {
 impl From<crate::intake::IntakeError> for ApplyError {
     fn from(err: crate::intake::IntakeError) -> Self {
         ApplyError::Intake(err)
+    }
+}
+
+impl From<crate::locks::ColumnPauseLockError> for ApplyError {
+    fn from(err: crate::locks::ColumnPauseLockError) -> Self {
+        match err {
+            crate::locks::ColumnPauseLockError::Timeout(err) => {
+                ApplyError::ColumnPauseLockTimeout(err)
+            }
+            crate::locks::ColumnPauseLockError::Db(err) => ApplyError::Db(err),
+        }
     }
 }
 

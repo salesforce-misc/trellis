@@ -79,6 +79,13 @@ Supporting counters/gauges keep the histograms interpretable:
   once per folded change, so `transform_latency_seconds_count` is the
   folded-change rate. Folded changes with no origin timestamp (bare recompute
   triggers) aren't observed there.
+* `column_pause_lock_timeouts_total{op}` — waits for the column-pause lock that ran
+  out the transaction's `lock_timeout` (30 s, or one second for the capture pass's
+  cascade pairs), by the operation that waited: `pause`, `resume`, `fuse`, `cascade`,
+  `define`, `drop`, `alter` or `capture`. Pause operations serialize on that one lock
+  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)), so a nonzero rate means a
+  holder stayed in it too long, or column pauses became a hot path. Each timeout failed
+  one call with a retryable error; nothing is retried in a loop.
 * `staging_segments{state}` — a cheap system-level gauge counting segments by
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
   chosen over a per-transform depth gauge for lower cost.

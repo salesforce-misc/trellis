@@ -296,6 +296,19 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
+    // The column-pause lock, exclusive (#922, #921): this deletes the
+    // target's pause rows and the cascade edges into and out of them, which
+    // a column resume deletes too, in walk order, and a define reads. No
+    // fence: a paused definition has no writer to wait out. First, so it
+    // precedes the definition row below, as every taker of the lock orders
+    // it (`crate::locks::lock_column_pauses`).
+    crate::locks::lock_column_pauses(
+        &*txn,
+        crate::locks::ColumnPauseLock::Exclusive,
+        crate::locks::ColumnPauseOp::Drop,
+    )
+    .await?;
+
     // Read under `for update` and check *here*, not on a pooled connection
     // before this transaction opened: pause/drop are explicitly not
     // transactional with a host migration, so a concurrent resume could

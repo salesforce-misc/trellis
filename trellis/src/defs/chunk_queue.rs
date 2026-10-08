@@ -175,6 +175,12 @@ impl From<BackfillError> for ChunkQueueError {
     }
 }
 
+impl From<crate::locks::ColumnPauseLockError> for ChunkQueueError {
+    fn from(err: crate::locks::ColumnPauseLockError) -> Self {
+        ChunkQueueError::Build(Box::new(err.into()))
+    }
+}
+
 impl From<CatalogError> for ChunkQueueError {
     fn from(err: CatalogError) -> Self {
         ChunkQueueError::Catalog(err)

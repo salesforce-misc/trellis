@@ -3782,15 +3782,18 @@ async fn a_pause_waits_for_a_define_reading_its_column_that_read_no_pause() {
 
 /// The same one hop further down: a pause's cascade into a column of
 /// `sib_sum` waits for a define reading `sib_sum` that read no pause of it.
-/// Without the cascade pair's own pause lock, the pair would pause
+/// Without the column-pause lock in the cascade pair, the pair would pause
 /// `sib_sum.t1` while the define, having read it live, was still to
 /// commit, and the walk, reading the graph before that commit, would miss
-/// the new reader. Here the pair can't wait (100 ms), so the pause returns
-/// the error with the walk still owed; once the define commits, finishing
-/// the walk reaches it.
+/// the new reader. The pause's own transaction commits first, and its walk
+/// is frozen at the pair's fence bump while the define of `sib_down` reads
+/// its upstream's pauses and freezes holding the lock. The pair can't wait
+/// (100 ms), so the pause returns the error with the walk still owed; once
+/// the define commits, finishing the walk reaches it.
 #[tokio::test]
 async fn a_cascade_pair_waits_for_a_define_reading_its_column_that_read_no_pause() {
-    const PAUSE_LOCK: i64 = 9141;
+    const PAIR_GATE: i64 = 9141;
+    const DEFINE_GATE: i64 = 9142;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -3804,9 +3807,24 @@ async fn a_cascade_pair_waits_for_a_define_reading_its_column_that_read_no_pause
     trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_staged(&mut client, &db.pool).await;
 
-    let gate = take_gate(&db, PAUSE_LOCK).await;
+    // The pause commits its own row, then its walk freezes at the pair.
+    let pair_gate = take_gate(&db, PAIR_GATE).await;
     let scope = PauseScope::new();
-    let reached = scope.arm(PausePoint::AfterUpstreamPausesRead, "sib_down", PAUSE_LOCK);
+    let pair_reached = scope.arm(PausePoint::AfterCascadeFenceBump, "sib_sum", PAIR_GATE);
+    let impatient = impatient_pool(&db);
+    let mut pause = tokio::spawn(with_scope(scope, async move {
+        quarantine::pause_column(&impatient, "sib", "total").await
+    }));
+    tokio::select! {
+        reached = pair_reached => { reached.expect("pause scope dropped"); }
+        finished = &mut pause => panic!("the pause finished without reaching its pair: {finished:?}"),
+    }
+    assert!(column_status_row(&client, "sib", "total").await.is_some());
+
+    // The define reads `sib_sum`'s pauses (none) and freezes, holding the lock.
+    let define_gate = take_gate(&db, DEFINE_GATE).await;
+    let scope = PauseScope::new();
+    let define_reached = scope.arm(PausePoint::AfterUpstreamPausesRead, "sib_down", DEFINE_GATE);
     let pool = db.pool.clone();
     let mut define = tokio::spawn(with_scope(scope, async move {
         create_definition(
@@ -3817,20 +3835,21 @@ async fn a_cascade_pair_waits_for_a_define_reading_its_column_that_read_no_pause
         .await
     }));
     tokio::select! {
-        reached = reached => { reached.expect("pause scope dropped"); }
+        reached = define_reached => { reached.expect("pause scope dropped"); }
         finished = &mut define => panic!("the define finished without reaching its read: {finished:?}"),
     }
 
-    let early = quarantine::pause_column(&impatient_pool(&db), "sib", "total").await;
+    // The pair goes on, and can't get the lock the define holds.
+    release_gate(&pair_gate, PAIR_GATE).await;
+    let early = pause.await.expect("pause task");
     assert!(
-        early.is_err(),
+        matches!(early, Err(ApplyError::ColumnPauseLockTimeout(_))),
         "the cascade pair waits for the define that read no pause, got {early:?}"
     );
-    assert!(column_status_row(&client, "sib", "total").await.is_some());
     assert_eq!(cascade_pending(&client, "sib", "total").await, Some(true));
     assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
 
-    release_gate(&gate, PAUSE_LOCK).await;
+    release_gate(&define_gate, DEFINE_GATE).await;
     define
         .await
         .expect("define task")
@@ -4213,9 +4232,10 @@ async fn blocked_behind(client: &Client, pid: i32) -> i32 {
 /// paused rows in name order, `cost` then `total`. Frozen between its two
 /// deletes, the resume holds `total`'s row; the define then takes `cost`'s
 /// and waits for `total`'s, and the resume's delete of `cost` closes the
-/// cycle (`deadlock detected`). The resume's pause lock on `sib` makes the
+/// cycle (`deadlock detected`). The resume's column-pause lock makes the
 /// define wait for the whole resume instead, so both commit, and the define
-/// finds nothing paused.
+/// finds nothing paused. With the one column-pause lock (#922) the define
+/// waits for the resume at the lock, before it reads any row.
 #[tokio::test]
 async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_sorts_first() {
     const PAUSE_LOCK: i64 = 9170;
@@ -4270,4 +4290,404 @@ async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_s
         .expect("the define commits");
     assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
     assert_eq!(column_status_row(&client, "sib", "cost").await, None);
+}
+
+// ---------------------------------------------------------------------
+// Issue #922: one global column-pause lock. Lock order, DROP vs RESUME
+// (#921), the timeout, and a define holding the lock for its catalog
+// transaction only.
+// ---------------------------------------------------------------------
+
+/// Whether backend `pid` holds the column-pause lock, in either mode.
+async fn holds_column_pause_lock(client: &Client, pid: i32) -> bool {
+    client
+        .query_one(
+            "select exists (select 1 from pg_locks \
+             where pid = $1 and locktype = 'advisory' and granted \
+               and classid = 922 and objid = 0 and objsubid = 2)",
+            &[&pid],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0)
+}
+
+/// Whether anything holds the column-pause lock.
+async fn column_pause_lock_is_held(client: &Client) -> bool {
+    client
+        .query_one(
+            "select exists (select 1 from pg_locks \
+             where locktype = 'advisory' and granted \
+               and classid = 922 and objid = 0 and objsubid = 2)",
+            &[],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0)
+}
+
+/// Whether `target`'s source fence is write-locked by some transaction.
+async fn fence_is_write_locked(db: &TestDatabase, target: &str) -> bool {
+    let mut probe = connect_raw(db.dsn()).await;
+    let txn = probe.transaction().await.expect("begin");
+    let err = txn
+        .execute(
+            "select v.version from source_table_versions v \
+             join transform_definitions d on d.source_table = v.source_table \
+             where split_part(d.target_table, '.', 2) = $1 for update of v nowait",
+            &[&target],
+        )
+        .await;
+    match err {
+        Ok(_) => false,
+        Err(err) => {
+            assert!(trellis::locks::is_lock_not_available(&err), "{err}");
+            true
+        }
+    }
+}
+
+/// Holds `target`'s definition row `for update`, as a transaction that took
+/// its row lock before the column-pause lock would, until the returned
+/// transaction ends. Returns it with its backend pid.
+async fn hold_definition_row<'a>(
+    raw: &'a mut Client,
+    target: &str,
+) -> (tokio_postgres::Transaction<'a>, i32) {
+    let holder = raw.transaction().await.expect("begin the row holder");
+    let held = holder
+        .execute(
+            "select id from transform_definitions \
+             where split_part(target_table, '.', 2) = $1 for update",
+            &[&target],
+        )
+        .await
+        .expect("hold the definition row");
+    assert_eq!(held, 1, "{target}'s definition row is held");
+    let pid = holder
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("read the backend pid")
+        .get(0);
+    (holder, pid)
+}
+
+/// A pause waits out its source's fence before it takes the column-pause
+/// lock, so a pause stuck behind busy writers (up to the lock timeout)
+/// never holds the lock against everything else. Rule 3 of #922: the fence
+/// comes first.
+#[tokio::test]
+async fn a_pause_waits_out_its_fence_without_holding_the_column_pause_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+
+    let mut raw = connect_raw(db.dsn()).await;
+    let writer = hold_fence_of(&mut raw, "sib").await;
+    let writer_pid: i32 = writer
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("read the backend pid")
+        .get(0);
+    let pool = db.pool.clone();
+    let pause = tokio::spawn(async move { quarantine::pause_column(&pool, "sib", "total").await });
+    let waiting = blocked_behind(&client, writer_pid).await;
+    assert!(
+        !holds_column_pause_lock(&client, waiting).await,
+        "the pause waits for the writer's fence first"
+    );
+    assert!(!column_pause_lock_is_held(&client).await);
+
+    writer.commit().await.expect("the writer commits");
+    pause.await.expect("pause task").expect("the pause commits");
+    assert!(column_status_row(&client, "sib", "total").await.is_some());
+}
+
+/// A define waits out its source's fence before it takes the column-pause
+/// lock (shared), for the same reason.
+#[tokio::test]
+async fn a_define_waits_out_its_fence_without_holding_the_column_pause_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+
+    let mut raw = connect_raw(db.dsn()).await;
+    let writer = hold_fence_of(&mut raw, "sib").await;
+    let writer_pid: i32 = writer
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("read the backend pid")
+        .get(0);
+    let pool = db.pool.clone();
+    let define = tokio::spawn(async move {
+        create_definition(
+            &pool,
+            "TRANSFORM sib_two FROM items SELECT price + 1 AS p1",
+            &numeric_columns(&["id", "price", "tax", "bonus"]),
+        )
+        .await
+    });
+    let waiting = blocked_behind(&client, writer_pid).await;
+    assert!(
+        !holds_column_pause_lock(&client, waiting).await,
+        "the define waits for the writer's fence first"
+    );
+
+    writer.commit().await.expect("the writer commits");
+    define
+        .await
+        .expect("define task")
+        .expect("the define commits");
+}
+
+/// A resume takes the column-pause lock after its fence and before its
+/// definition row: stopped at the row, it holds the fence and the lock.
+#[tokio::test]
+async fn a_resume_takes_the_fence_then_the_column_pause_lock_then_the_definition_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+
+    let mut raw = connect_raw(db.dsn()).await;
+    let (row, row_pid) = hold_definition_row(&mut raw, "sib").await;
+    let pool = db.pool.clone();
+    let resume =
+        tokio::spawn(async move { quarantine::resume_column(&pool, "sib", "total").await });
+    let waiting = blocked_behind(&client, row_pid).await;
+    assert!(holds_column_pause_lock(&client, waiting).await);
+    assert!(fence_is_write_locked(&db, "sib").await);
+
+    row.commit().await.expect("release the row");
+    resume
+        .await
+        .expect("resume task")
+        .expect("the resume commits");
+}
+
+/// `ALTER TRANSFORM` that builds a field: fence, then the column-pause lock,
+/// then the definition row.
+#[tokio::test]
+async fn an_alter_takes_the_fence_then_the_column_pause_lock_then_the_definition_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    let trellis = trellis_on(&db).await;
+
+    let mut raw = connect_raw(db.dsn()).await;
+    let (row, row_pid) = hold_definition_row(&mut raw, "sib").await;
+    let mut alter = tokio::spawn(async move {
+        trellis
+            .apply("ALTER TRANSFORM sib ADD price + price AS twice")
+            .await
+    });
+    let waiting = tokio::select! {
+        waiting = blocked_behind(&client, row_pid) => waiting,
+        finished = &mut alter => panic!("the alter finished without waiting: {finished:?}"),
+    };
+    assert!(holds_column_pause_lock(&client, waiting).await);
+    assert!(fence_is_write_locked(&db, "sib").await);
+
+    row.commit().await.expect("release the row");
+    alter.await.expect("alter task").expect("the alter commits");
+}
+
+/// `DROP TRANSFORM` has no fence: the column-pause lock is its first lock,
+/// before the definition row (#921).
+#[tokio::test]
+async fn a_drop_takes_the_column_pause_lock_before_the_definition_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    let trellis = trellis_on(&db).await;
+    trellis
+        .apply("PAUSE TRANSFORM sib")
+        .await
+        .expect("pause the transform");
+
+    let mut raw = connect_raw(db.dsn()).await;
+    let (row, row_pid) = hold_definition_row(&mut raw, "sib").await;
+    let drop = tokio::spawn(async move { trellis.apply("DROP TRANSFORM sib").await });
+    let waiting = blocked_behind(&client, row_pid).await;
+    assert!(holds_column_pause_lock(&client, waiting).await);
+
+    row.commit().await.expect("release the row");
+    drop.await.expect("drop task").expect("the drop commits");
+}
+
+/// Issue #921: a `DROP TRANSFORM` of a paused reader races a `RESUME` of the
+/// upstream column it reads, and both delete the same cascade edges, in
+/// different orders. Frozen after the resume has deleted its column's row,
+/// the resume holds the column-pause lock; the drop must wait for the whole
+/// resume instead of interleaving its edge deletes with it, and both
+/// commit, in whichever order they take the lock.
+#[tokio::test]
+async fn a_drop_serializes_with_a_resume_deleting_the_same_edges() {
+    const PAUSE_LOCK: i64 = 9210;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total, total + 0 AS cost").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    let trellis = trellis_on(&db).await;
+    trellis
+        .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1, cost + 1 AS t2")
+        .await
+        .expect("define the reader");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
+    assert!(cascade_edge_exists(&client, "sib_sum", "t2", "sib", "cost").await);
+    trellis
+        .apply("PAUSE TRANSFORM sib_sum")
+        .await
+        .expect("pause the reader");
+
+    let gate = take_gate(&db, PAUSE_LOCK).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterResumedColumnDeleted, "sib", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut resume = tokio::spawn(with_scope(scope, async move {
+        quarantine::resume_column(&pool, "sib", "total").await
+    }));
+    let resume_pid = tokio::select! {
+        reached = reached => reached.expect("pause scope dropped").backend_pid,
+        finished = &mut resume => panic!("the resume finished without reaching its delete: {finished:?}"),
+    };
+
+    let drop = tokio::spawn(async move { trellis.apply("DROP TRANSFORM sib_sum").await });
+    let waiting = blocked_behind(&client, resume_pid).await;
+    assert!(
+        !holds_column_pause_lock(&client, waiting).await,
+        "the drop waits for the lock the resume holds"
+    );
+    assert!(column_pause_lock_is_held(&client).await);
+
+    release_gate(&gate, PAUSE_LOCK).await;
+    resume
+        .await
+        .expect("resume task")
+        .expect("the resume commits");
+    drop.await.expect("drop task").expect("the drop commits");
+    let edges: i64 = client
+        .query_one(
+            "select count(*) from column_pause_cascades \
+             where downstream_transform in ('sib', 'sib_sum') \
+                or upstream_transform in ('sib', 'sib_sum')",
+            &[],
+        )
+        .await
+        .expect("count edges")
+        .get(0);
+    assert_eq!(edges, 0);
+    assert_eq!(column_status_row(&client, "sib", "total").await, None);
+    assert_eq!(column_status_row(&client, "sib", "cost").await, None);
+    assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
+}
+
+async fn status(client: &Client) -> String {
+    client
+        .query_one(
+            "select status from transform_definitions \
+             where split_part(target_table, '.', 2) = 'sib_sum'",
+            &[],
+        )
+        .await
+        .expect("read the status")
+        .get(0)
+}
+
+/// A define holds the (shared) column-pause lock for its catalog
+/// transaction, and not past it: registration reads no source rows, and the
+/// build and backfill it starts run later in transactions of their own.
+/// With the definition registered (`waiting_to_backfill`, its build not yet
+/// begun), nothing holds the lock, and a pause (exclusive) isn't kept
+/// waiting behind it.
+#[tokio::test]
+async fn a_define_does_not_hold_the_column_pause_lock_across_its_build() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    let trellis = trellis_on(&db).await;
+    trellis
+        .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1")
+        .await
+        .expect("define the reader");
+
+    assert_eq!(status(&client).await, "waiting_to_backfill");
+    assert!(!column_pause_lock_is_held(&client).await);
+    quarantine::pause_column(&impatient_pool(&db), "sib", "total")
+        .await
+        .expect("a pause doesn't wait behind a registered define");
+    quarantine::resume_column(&impatient_pool(&db), "sib", "total")
+        .await
+        .expect("nor a resume");
+
+    // Its build and backfill run after, in transactions of their own, and
+    // take the lock only to release an edit's capture wait. Run to the end,
+    // none leaves it held, and a second define takes it at once.
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    assert_eq!(status(&client).await, "live");
+    assert!(!column_pause_lock_is_held(&client).await);
+    create_definition(
+        &impatient_pool(&db),
+        "TRANSFORM sib_two FROM items SELECT price + 1 AS p1",
+        &numeric_columns(&["id", "price", "tax", "bonus"]),
+    )
+    .await
+    .expect("a second define takes the lock at once");
+}
+
+/// Issue #922 rule 5: a held column-pause lock makes a pause fail with the
+/// named, retryable error (code `Timeout`) after the transaction's
+/// `lock_timeout`, writing nothing; the same call succeeds once it is free.
+#[tokio::test]
+async fn a_pause_behind_a_held_column_pause_lock_times_out_retryably() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+
+    let mut holder = db.pool.get().await.expect("connect");
+    let hold = holder.transaction().await.expect("begin");
+    trellis::locks::lock_column_pauses(
+        &*hold,
+        trellis::locks::ColumnPauseLock::Exclusive,
+        trellis::locks::ColumnPauseOp::Resume,
+    )
+    .await
+    .expect("take the lock");
+
+    let err = quarantine::pause_column(&impatient_pool(&db), "sib", "total")
+        .await
+        .expect_err("the pause waits for the lock");
+    assert!(
+        matches!(&err, ApplyError::ColumnPauseLockTimeout(timeout)
+            if timeout.op == trellis::locks::ColumnPauseOp::Pause),
+        "{err:?}"
+    );
+    assert_eq!(err.code(), trellis::ErrorCode::Timeout);
+    assert_eq!(column_status_row(&client, "sib", "total").await, None);
+
+    hold.commit().await.expect("release the lock");
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("the retry pauses");
+    assert!(column_status_row(&client, "sib", "total").await.is_some());
 }

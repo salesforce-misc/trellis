@@ -145,6 +145,12 @@ const BUILD_CHUNK_LOCK_TIMEOUTS_METRIC: &str = "trellis_build_chunk_lock_timeout
 /// retirement the seal answers that with (`staging::seal_if_active_nonempty`).
 const SEAL_REFUSED_METRIC: &str = "trellis_seal_refused_total";
 
+/// #922: waits for the column-pause lock (`locks::lock_column_pauses`) that
+/// ran out the transaction's `lock_timeout`, labeled `op` (`pause`, `resume`,
+/// `fuse`, `cascade`, `define`, `drop`, `alter`, `capture`). Nonzero means a
+/// holder stayed in the lock longer than the timeout, or the path got hot.
+const COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC: &str = "trellis_column_pause_lock_timeouts_total";
+
 /// [`BUILD_CHUNK_METRIC`]'s buckets: finer than [`LATENCY_BUCKETS`], since a
 /// chunk's percentiles are a profile column (#625 §4). About 25% apart from
 /// 1 ms to 2 minutes.
@@ -266,6 +272,13 @@ pub fn increment_build_chunk_lock_timeouts() {
     metrics::counter!(BUILD_CHUNK_LOCK_TIMEOUTS_METRIC).increment(1);
 }
 
+/// Counts a wait for the column-pause lock that timed out (#922). `op` is
+/// `locks::ColumnPauseOp::label`.
+pub fn increment_column_pause_lock_timeouts(op: &'static str) {
+    ensure_installed();
+    metrics::counter!(COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC, "op" => op).increment(1);
+}
+
 /// Counts a seal refused for a full ring (#625 F2).
 pub fn increment_seal_refused() {
     ensure_installed();
@@ -344,6 +357,11 @@ fn describe_metrics() {
         BUILD_CHUNK_LOCK_TIMEOUTS_METRIC,
         "Count of Re-derive build chunks that gave up on their entry lock's timeout and were \
          released for a retry."
+    );
+    metrics::describe_counter!(
+        COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC,
+        "Count of waits for the column-pause lock that ran out the transaction's lock_timeout, \
+         by the operation that waited."
     );
     metrics::describe_counter!(
         SEAL_REFUSED_METRIC,

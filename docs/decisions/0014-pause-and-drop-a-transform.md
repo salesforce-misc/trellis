@@ -72,6 +72,39 @@ column it reads is paused is paused at birth, and that column's resume releases 
 edited field that already has readers owes their cascade, which the edit walks once it
 commits. If that walk fails, the edit still succeeds and the capture pass finishes it.
 
+### One lock orders every column-pause write and read
+
+Every read-to-decide and write of a column's pause state (`column_status` rows, cascade
+edges, the marks that a pause still owes its cascade) goes through one transaction-level
+advisory lock, taken by one helper (`locks::lock_column_pauses`). Column pauses are
+operator commands plus rare fuse trips, so correctness and simplicity win over
+concurrency here. An earlier design locked each target by name; two deadlocks came from
+the sites it missed (a define against a `RESUME`, a `DROP TRANSFORM` against a `RESUME`),
+and each fix needed its own lock-order argument. One lock makes those cycles impossible
+by construction.
+
+- **Exclusive:** a pause, a column fuse trip, each pair of a cascade, `RESUME`, `DROP
+  TRANSFORM`, an `ALTER TRANSFORM` that builds or drops a field, and the build start that
+  releases the pauses an `ALTER` made while it awaited its source's capture.
+- **Shared:** a define. It reads the pause state of what it reads and writes only its own
+  new target's rows, and defines don't wait on each other. It holds the lock for its
+  catalog transaction only: validation, the definition and edge rows, and the read of its
+  upstreams' pauses. It never holds it across the build or backfill it starts.
+- **Order.** A transaction takes, in this order: its source's version fence, when it needs
+  one; the lock; the fuse gate, when it needs one; definition and `column_status` rows.
+  The lock comes after the fence wait so that a pause waiting up to the lock timeout on
+  busy writers never holds it, and before the definition row, which the fuse and
+  `evict_for` take after the gate. No site that takes this lock takes the gate today.
+- **Timeout.** The wait ends at the transaction's `lock_timeout` (30 s, or the one second
+  of a capture-pass cascade pair). The transaction rolls back with nothing written and
+  the caller gets a retryable error (`ErrorCode::Timeout`). A fuse trip and the capture
+  pass's callers retry on their next pass. Each timeout is counted by
+  `column_pause_lock_timeouts_total{op}` ([observability](../observability.md)).
+- **Costs accepted.** Pauses, resumes and fuse trips on unrelated targets serialize. A
+  holder that stalls, such as an idle-in-transaction session, blocks pause activity until
+  `lock_timeout`. A fuse trip in the capture pass can wait briefly behind an operator
+  pause.
+
 ### Resume reconciles with source, not by catch-up
 
 A paused definition must not pin the staging ring. Holding ring segments open for a

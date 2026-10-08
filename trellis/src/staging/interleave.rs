@@ -163,8 +163,8 @@ pub enum PausePoint {
     /// transform (`super::quarantine::cascade_pause`, #912).
     AfterCascadeFenceBump,
     /// After a define or `ALTER TRANSFORM` reads the paused columns of the
-    /// targets its definition reads, holding their pause locks shared (and,
-    /// for an edit, its own target's exclusive, #915), before it pauses its
+    /// targets its definition reads, holding the column-pause lock (shared
+    /// for a define, exclusive for an edit, #922), before it pauses its
     /// readers of them, for its own (bare) target
     /// (`defs::catalog`'s `pause_readers_of_paused_columns`, #914).
     AfterUpstreamPausesRead,

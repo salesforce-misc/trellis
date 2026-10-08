@@ -109,6 +109,152 @@ pub fn is_lock_not_available(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// The one advisory lock every read-to-decide and every write of the column
+/// pauses' state takes (#922, ADR-0014 "Locking"): `column_status` rows, the
+/// cascade edges (`column_pause_cascades`) and the pending marks on them.
+/// A two-int key, so it shares nothing with the single-`bigint` session locks.
+const COLUMN_PAUSE_LOCK_KEY: (i32, i32) = (922, 0);
+
+/// How a transaction holds the column-pause lock ([`lock_column_pauses`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPauseLock {
+    /// A pause, fuse trip, cascade pair, `RESUME`, `DROP TRANSFORM`, an
+    /// `ALTER TRANSFORM` that builds or drops a field, and a build start's
+    /// release of `awaiting_capture` rows: transactions that write the
+    /// pause state. They serialize with each other and with a define.
+    Exclusive,
+    /// A define: it reads the pause state of what it reads and writes the
+    /// rows of its own new target. Defines run together.
+    Shared,
+}
+
+/// Who takes the column-pause lock, the `op` label of
+/// `trellis_column_pause_lock_timeouts_total` and the name in
+/// [`ColumnPauseLockTimeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPauseOp {
+    /// `PAUSE TRANSFORM t.col`.
+    Pause,
+    /// `RESUME TRANSFORM t.col`.
+    Resume,
+    /// A column fuse trip.
+    Fuse,
+    /// One pair of a pause's cascade walk.
+    Cascade,
+    /// A define.
+    Define,
+    /// `DROP TRANSFORM`.
+    Drop,
+    /// `ALTER TRANSFORM` that builds or drops a field.
+    Alter,
+    /// A build's release of the `awaiting_capture` pauses an `ALTER`
+    /// made.
+    Capture,
+}
+
+impl ColumnPauseOp {
+    /// The metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ColumnPauseOp::Pause => "pause",
+            ColumnPauseOp::Resume => "resume",
+            ColumnPauseOp::Fuse => "fuse",
+            ColumnPauseOp::Cascade => "cascade",
+            ColumnPauseOp::Define => "define",
+            ColumnPauseOp::Drop => "drop",
+            ColumnPauseOp::Alter => "alter",
+            ColumnPauseOp::Capture => "capture",
+        }
+    }
+}
+
+/// The column-pause lock wasn't granted before the transaction's
+/// `lock_timeout` ran out (`55P03`). The transaction has failed and rolls
+/// back with nothing written; the call is retryable. A fuse trip and the
+/// capture pass's callers retry on their next pass.
+#[derive(Debug)]
+pub struct ColumnPauseLockTimeout {
+    /// Which operation was waiting.
+    pub op: ColumnPauseOp,
+    source: tokio_postgres::Error,
+}
+
+impl std::fmt::Display for ColumnPauseLockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timed out waiting for the column-pause lock for a {} (another pause, resume, \
+             define, alter or drop holds it); nothing changed: retry",
+            self.op.label()
+        )
+    }
+}
+
+impl std::error::Error for ColumnPauseLockTimeout {
+    /// The `55P03` itself, so a retry classifier that walks the chain
+    /// (`staging::quarantine::is_transient_error`) sees a lock timeout.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// [`lock_column_pauses`]'s failure.
+#[derive(Debug)]
+pub enum ColumnPauseLockError {
+    /// The wait ran out ([`ColumnPauseLockTimeout`]).
+    Timeout(ColumnPauseLockTimeout),
+    /// Any other database error.
+    Db(tokio_postgres::Error),
+}
+
+/// Takes the transaction-scoped column-pause lock in `mode` for `op`: the
+/// only place a column-pause advisory lock is taken (rule 8 of #922; the
+/// guard `tests::only_the_helper_takes_the_column_pause_lock` greps for it).
+///
+/// **Lock order.** A transaction that needs it takes these in this order,
+/// and holds each to its commit:
+///
+/// 1. its source's version fence (`staging::build::bump_version_fence`),
+///    when it needs one: the wait there can last the whole `lock_timeout`
+///    behind busy writers, so nothing else is held for it;
+/// 2. this lock;
+/// 3. the fuse gate (`transform_fuse_gate`), when it needs one. No column-pause
+///    site takes the gate today; `evict_for` takes it and then the definition
+///    row without this lock;
+/// 4. definition rows and `column_status` / cascade-edge rows.
+///
+/// With one lock for every writer and reader of the pause state, no two of
+/// these transactions can each hold a row the other waits for: the second to
+/// arrive waits here, holding only what comes before this in the order.
+///
+/// It waits as long as the transaction's `lock_timeout` in force: the
+/// session's ([`LOCK_TIMEOUT`], 30 s) unless the caller narrowed it (a
+/// capture-pass cascade pair uses one second). On `55P03` it counts
+/// `trellis_column_pause_lock_timeouts_total{op}` and returns
+/// [`ColumnPauseLockError::Timeout`]; the caller's transaction is aborted.
+pub async fn lock_column_pauses(
+    txn: &impl tokio_postgres::GenericClient,
+    mode: ColumnPauseLock,
+    op: ColumnPauseOp,
+) -> Result<(), ColumnPauseLockError> {
+    let sql = match mode {
+        ColumnPauseLock::Exclusive => "select pg_advisory_xact_lock($1, $2)",
+        ColumnPauseLock::Shared => "select pg_advisory_xact_lock_shared($1, $2)",
+    };
+    let (class, object) = COLUMN_PAUSE_LOCK_KEY;
+    match txn.execute(sql, &[&class, &object]).await {
+        Ok(_) => Ok(()),
+        Err(err) if is_lock_not_available(&err) => {
+            crate::metrics::increment_column_pause_lock_timeouts(op.label());
+            Err(ColumnPauseLockError::Timeout(ColumnPauseLockTimeout {
+                op,
+                source: err,
+            }))
+        }
+        Err(err) => Err(ColumnPauseLockError::Db(err)),
+    }
+}
+
 /// The retry loop for DDL on a user table (I6): `CREATE`/`DROP TRIGGER`
 /// (#622), under [`USER_TABLE_DDL_LOCK_TIMEOUT`] per attempt (the module
 /// doc). Each attempt is its own transaction that runs its DDL under
@@ -336,6 +482,154 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(1)),
         );
         assert!(retry.again(&err).await, "a 50 ms attempt fits");
+    }
+
+    /// How many timeouts `trellis_column_pause_lock_timeouts_total` has
+    /// counted for `op` so far in this process.
+    fn timeouts_counted(op: ColumnPauseOp) -> u64 {
+        let prefix = format!(
+            "trellis_column_pause_lock_timeouts_total{{op=\"{}\"}} ",
+            op.label()
+        );
+        crate::metrics::Metrics::new()
+            .render_prometheus()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map_or(0, |count| count.trim().parse().expect("a counter value"))
+    }
+
+    /// Rule 5 and 6 of #922: a wait that outlasts the transaction's
+    /// `lock_timeout` returns the named, retryable error, counts the metric
+    /// under its caller, and leaves the lock free for a retry. Two shared
+    /// holders (defines) don't wait on each other; an exclusive one waits
+    /// for them, and they wait for it.
+    #[tokio::test]
+    async fn a_held_lock_times_out_with_the_retryable_error_and_counts_the_metric() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut holder = db.pool.get().await.expect("connect");
+        let mut waiter = db.pool.get().await.expect("connect");
+        let hold = holder.transaction().await.expect("begin");
+        lock_column_pauses(&*hold, ColumnPauseLock::Exclusive, ColumnPauseOp::Pause)
+            .await
+            .expect("an idle lock is granted at once");
+
+        let before = timeouts_counted(ColumnPauseOp::Resume);
+        let attempt = waiter.transaction().await.expect("begin");
+        set_local_lock_timeout(&*attempt, Duration::from_millis(100))
+            .await
+            .expect("set the timeout");
+        let err = lock_column_pauses(&*attempt, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
+            .await
+            .expect_err("the lock is held");
+        let ColumnPauseLockError::Timeout(timeout) = &err else {
+            panic!("a named timeout, got {err:?}");
+        };
+        assert_eq!(timeout.op, ColumnPauseOp::Resume);
+        assert!(is_lock_not_available(timeout), "the 55P03 is its source");
+        assert_eq!(timeouts_counted(ColumnPauseOp::Resume), before + 1);
+
+        // Through the operator-facing errors: retryable, and still a
+        // transient lock failure for the drain's and the build's retry rules.
+        let apply: crate::staging::apply::ApplyError = err.into();
+        assert_eq!(apply.code(), crate::error_code::ErrorCode::Timeout);
+        assert!(crate::staging::quarantine::is_transient_error(&apply));
+        drop(attempt);
+
+        // A shared taker waits for the exclusive holder too.
+        let attempt = waiter.transaction().await.expect("begin");
+        set_local_lock_timeout(&*attempt, Duration::from_millis(100))
+            .await
+            .expect("set the timeout");
+        let before = timeouts_counted(ColumnPauseOp::Define);
+        let err = lock_column_pauses(&*attempt, ColumnPauseLock::Shared, ColumnPauseOp::Define)
+            .await
+            .expect_err("the lock is held exclusive");
+        assert!(matches!(err, ColumnPauseLockError::Timeout(_)));
+        assert_eq!(timeouts_counted(ColumnPauseOp::Define), before + 1);
+        drop(attempt);
+
+        hold.commit().await.expect("release");
+        let retry = waiter.transaction().await.expect("begin");
+        lock_column_pauses(&*retry, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
+            .await
+            .expect("the retry finds it free");
+        retry.commit().await.expect("commit");
+
+        // Two shared holders at once, then an exclusive one that has to wait.
+        let shared_a = holder.transaction().await.expect("begin");
+        lock_column_pauses(&*shared_a, ColumnPauseLock::Shared, ColumnPauseOp::Define)
+            .await
+            .expect("shared");
+        let shared_b = waiter.transaction().await.expect("begin");
+        set_local_lock_timeout(&*shared_b, Duration::from_millis(100))
+            .await
+            .expect("set the timeout");
+        lock_column_pauses(&*shared_b, ColumnPauseLock::Shared, ColumnPauseOp::Define)
+            .await
+            .expect("defines don't wait on each other");
+        let mut third = db.pool.get().await.expect("connect");
+        let exclusive = third.transaction().await.expect("begin");
+        set_local_lock_timeout(&*exclusive, Duration::from_millis(100))
+            .await
+            .expect("set the timeout");
+        assert!(
+            lock_column_pauses(
+                &*exclusive,
+                ColumnPauseLock::Exclusive,
+                ColumnPauseOp::Alter
+            )
+            .await
+            .is_err(),
+            "an exclusive taker waits for the shared holders"
+        );
+    }
+
+    /// Rule 8 of #922: one function takes the column-pause lock, so a new
+    /// call site can't skip the order or the timeout handling. Any
+    /// `pg_advisory_xact_lock` in `src` outside that function's file fails
+    /// this, except the test-only gates (`staging::interleave`, the `__pause`
+    /// column `staging::ledger` adds for it, and a gate function in
+    /// `client.rs`'s tests), which hold a lock key of the test's choosing and
+    /// never the pause lock's.
+    #[test]
+    fn only_the_helper_takes_the_column_pause_lock() {
+        const ALLOWED: [&str; 4] = [
+            "locks.rs",
+            "client.rs",
+            "staging/interleave.rs",
+            "staging/ledger.rs",
+        ];
+        fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    visit(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        visit(&src, &mut files);
+        assert!(files.len() > 50, "the walk found the sources");
+        let offenders: Vec<String> = files
+            .iter()
+            .filter_map(|path| {
+                let rel = path.strip_prefix(&src).expect("under src");
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if ALLOWED.contains(&rel.as_str()) {
+                    return None;
+                }
+                let text = std::fs::read_to_string(path).expect("read a source");
+                text.contains("pg_advisory_xact_lock").then_some(rel)
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "take the column-pause lock through locks::lock_column_pauses: {offenders:?}"
+        );
     }
 
     /// A real `55P03`, from a `NOWAIT` lock another session holds.
