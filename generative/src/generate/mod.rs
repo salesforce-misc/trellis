@@ -4057,12 +4057,176 @@ mod strategy {
         hot_key_case_with(cooling_draws().prop_map(CaseExtras::Cooling).boxed())
     }
 
+    /// The concurrent tier's cooling-backfill case (#734): a
+    /// [`cooling_key_case`] whose cooling table a `GROUP BY` definition
+    /// reads instead of a 1-1 one, re-read by `request_backfill` while its
+    /// keys go quiet, under a steady load paced from each burst's start.
+    ///
+    /// It is the closest random shape to the `lsn_only_skip` plant's
+    /// (ADR-0002 I2's visibility term). Re-applying a change whose image an
+    /// entry already holds is a no-op, so a change applied twice only
+    /// diverges when:
+    ///
+    /// 1. a key's last change is folded into a page's Re-derive, because the
+    ///    catch-up's `Recompute` for the key sealed into the same batch, so
+    ///    the change never applies on its own;
+    /// 2. an older change to the key sits in a batch that drains after that
+    ///    page; and
+    /// 3. nothing writes the key again.
+    ///
+    /// The engine's xmin fence, seal gate and oldest-first claims keep (2)
+    /// from happening under a random stall, so the plant is gated by the
+    /// deterministic `a_change_the_rederive_read_is_not_applied_again_aggregate`
+    /// pin (#734), not by this tier. The tier is random coverage of a
+    /// `request_backfill` during load over keys that cool, with the
+    /// aggregate ledger target the catch-up re-reads.
+    ///
+    /// The cooling keys give (3). One `request_backfill` of the cooling
+    /// table goes in every burst after the first, at
+    /// [`COOLING_BACKFILL_AT`] thousandths of its ops, among the cooling
+    /// keys' last writes. Its catch-up starts at a reconcile pass on the
+    /// seal cadence, and the lanes keep to a [`LOAD_PACE_MICROS`] pace from
+    /// each burst's start, so the catch-up stages while those writes still
+    /// come in (1). The steady-load tier's entry-lock stall, up to
+    /// [`LOAD_STALL_SEALS`] seal intervals, drains some batches after newer
+    /// ones (2).
+    ///
+    /// Its programs are the hot table and the cooling table alone: no
+    /// second table, no relationship and no drawn definition, only the hot
+    /// table's `GROUP BY` and the cooling table's. The cooling table's
+    /// always has a `SUM`, so a change applied twice moves a value, not
+    /// only a count.
+    pub fn cooling_backfill_case() -> impl Strategy<Value = ConcurrentCase> {
+        hot_key_case_with(
+            cooling_backfill_draws()
+                .prop_map(CaseExtras::CoolingBackfill)
+                .boxed(),
+        )
+    }
+
     /// What a case adds to the hot-key shape.
     #[derive(Debug, Clone)]
     enum CaseExtras {
         None,
         MidBurst(MidBurstDraws),
         Cooling(CoolingDraws),
+        CoolingBackfill(CoolingBackfillDraws),
+    }
+
+    /// What [`cooling_backfill_case`] adds to a [`hot_key_case`].
+    #[derive(Debug, Clone)]
+    struct CoolingBackfillDraws {
+        /// The cooling table, with grain values drawn, and its keys' places.
+        /// Its `derived` goes unused: no 1-1 definition reads the table.
+        cooling: CoolingDraws,
+        /// The cooling table's `GROUP BY` fields.
+        functions: Vec<AggregateFn>,
+        /// Where each burst's `request_backfill` fires, in thousandths of
+        /// its ops: burst `i`'s at `backfills[i % len]`.
+        backfills: Vec<u16>,
+        /// How long after its burst's `request_backfill` each cooling key's
+        /// last write goes, in thousandths of the burst's ops, key by key:
+        /// [`CoolingPlace::last`] is the request's place plus this.
+        lags: Vec<u16>,
+        load: LoadDraws,
+    }
+
+    /// How long after its burst's `request_backfill` a
+    /// [`cooling_backfill_case`]'s cooling key takes its last write, in
+    /// thousandths of the burst's ops: within the time the catch-up takes
+    /// to be staged, so its `Recompute` seals into the same batch as many
+    /// keys' last writes.
+    pub const COOLING_BACKFILL_LAG: std::ops::RangeInclusive<u16> = 0..=150;
+
+    /// The range of [`SteadyLoad::stall`]s a [`cooling_backfill_case`]
+    /// draws, in multiples of its seal interval.
+    pub const COOLING_BACKFILL_STALL_SEALS: std::ops::RangeInclusive<u32> = 10..=25;
+
+    /// Where in its burst a [`cooling_backfill_case`]'s `request_backfill`
+    /// fires, in thousandths of the burst's ops: inside [`COOLING_LAST`]'s
+    /// span, so the catch-up stages while cooling keys still take their
+    /// last writes, with some of the span left after it.
+    pub const COOLING_BACKFILL_AT: std::ops::RangeInclusive<u16> = 250..=650;
+
+    fn cooling_backfill_draws() -> impl Strategy<Value = CoolingBackfillDraws> {
+        cooling_draws()
+            .prop_flat_map(|cooling| {
+                let keys = cooling.table.seed_values.len();
+                (
+                    Just(cooling),
+                    prop::collection::vec(grain_value(), keys),
+                    aggregate_functions(),
+                    prop::collection::vec(COOLING_BACKFILL_AT, 1..=4),
+                    prop::collection::vec(COOLING_BACKFILL_LAG, keys),
+                    load_draws(),
+                    COOLING_BACKFILL_STALL_SEALS,
+                )
+            })
+            .prop_map(
+                |(mut cooling, grains, mut functions, backfills, lags, mut load, stall_seals)| {
+                    load.stall_seals = stall_seals;
+                    cooling.table.grain_values = grains;
+                    if !functions.iter().any(|f| matches!(f, AggregateFn::Sum(_))) {
+                        functions.insert(0, AggregateFn::Sum(AggregateColumn::C1));
+                    }
+                    CoolingBackfillDraws {
+                        cooling,
+                        functions,
+                        backfills,
+                        lags,
+                        load,
+                    }
+                },
+            )
+    }
+
+    /// Moves each cooling key of a [`cooling_backfill_case`] into a burst
+    /// after the first, the ones that take a `request_backfill`, with its
+    /// last write its lag after the request (#734). `ops` is the program's
+    /// op count, which cuts its bursts as [`place_cooling_keys`] does.
+    fn places_after_backfills(
+        draws: &CoolingBackfillDraws,
+        ops: usize,
+        burst_size: usize,
+    ) -> Vec<CoolingPlace> {
+        let bursts = (ops / burst_size).max(1);
+        draws
+            .cooling
+            .places
+            .iter()
+            .zip(&draws.lags)
+            .map(|(place, lag)| {
+                if bursts < 2 {
+                    return *place;
+                }
+                let burst = 1 + place.burst % (bursts - 1);
+                let at = draws.backfills[burst % draws.backfills.len()];
+                CoolingPlace {
+                    burst,
+                    last: (at + lag).min(1000),
+                    gap: place.gap,
+                }
+            })
+            .collect()
+    }
+
+    /// Adds a `request_backfill` of `table` to every burst of `plan` after
+    /// the first, at `at[i % len]` thousandths of burst `i`'s ops (#734).
+    /// By the second burst the first has quiesced, so the table's reader is
+    /// `live`, which `request_backfill` requires.
+    fn add_backfills(mut plan: ConcurrentPlan, table: &str, at: &[u16]) -> ConcurrentPlan {
+        for (index, burst) in plan.bursts.iter_mut().enumerate().skip(1) {
+            let ops = burst.ops().len();
+            let after = usize::from(at[index % at.len()].min(1000)) * ops / 1000;
+            burst.actions.push(TimedAction {
+                after,
+                action: BurstAction::RequestBackfill {
+                    table: table.to_string(),
+                },
+            });
+        }
+        sort_actions(&mut plan);
+        plan
     }
 
     /// What [`cooling_key_case`] adds to a [`hot_key_case`].
@@ -4316,15 +4480,36 @@ mod strategy {
             .prop_map(
                 |(
                     hot,
-                    others,
-                    (functions, hot_rel),
-                    extra,
+                    mut others,
+                    (functions, mut hot_rel),
+                    mut extra,
                     burst_size,
                     lanes,
                     workers,
                     seal,
                     extras,
                 )| {
+                    let (extras, cooling, backfill) = match extras {
+                        CaseExtras::None => (None, None, None),
+                        CaseExtras::MidBurst(extras) => (Some(extras), None, None),
+                        CaseExtras::Cooling(cooling) => (None, Some(cooling), None),
+                        CaseExtras::CoolingBackfill(draws) => {
+                            (None, Some(draws.cooling.clone()), Some(draws))
+                        }
+                    };
+                    if backfill.is_some() {
+                        // The hot table and the cooling table alone: see
+                        // `cooling_backfill_case`.
+                        others.clear();
+                        hot_rel = None;
+                        extra.clear();
+                    }
+                    let extras = extras.unwrap_or(MidBurstDraws {
+                        parent_truncate: None,
+                        deferred: None,
+                        actions: Vec::new(),
+                        load: None,
+                    });
                     let mut tables = vec![hot];
                     tables.extend(others);
                     let mut defs = vec![(0, DefShape::Aggregate { functions })];
@@ -4335,17 +4520,6 @@ mod strategy {
                         derived.push(derived_shape);
                         rel_fields.push(rel_field);
                     }
-                    let (extras, cooling) = match extras {
-                        CaseExtras::None => (None, None),
-                        CaseExtras::MidBurst(extras) => (Some(extras), None),
-                        CaseExtras::Cooling(cooling) => (None, Some(cooling)),
-                    };
-                    let extras = extras.unwrap_or(MidBurstDraws {
-                        parent_truncate: None,
-                        deferred: None,
-                        actions: Vec::new(),
-                        load: None,
-                    });
                     if let (Some(at), Some(parent)) = (extras.parent_truncate, tables.get_mut(1)) {
                         let position = usize::from(at) * parent.mutates.len() / 1000;
                         parent.mutates.insert(position, Mutate::Truncate);
@@ -4364,9 +4538,29 @@ mod strategy {
                     let cooling_table = tables.len();
                     if let Some(cooling) = &cooling {
                         tables.push(cooling.table.clone());
-                        defs.push((cooling_table, DefShape::OneToOne));
-                        derived.push(Some(cooling.derived.clone()));
-                        rel_fields.push(None);
+                        match &backfill {
+                            Some(backfill) => {
+                                let at = defs.len();
+                                defs.insert(
+                                    at,
+                                    (
+                                        cooling_table,
+                                        DefShape::Aggregate {
+                                            functions: backfill.functions.clone(),
+                                        },
+                                    ),
+                                );
+                                derived.insert(at, None);
+                                rel_fields.insert(at, None);
+                            }
+                            None => {
+                                defs.push((cooling_table, DefShape::OneToOne));
+                                derived.push(Some(cooling.derived.clone()));
+                            }
+                        }
+                        if backfill.is_none() {
+                            rel_fields.push(None);
+                        }
                     }
                     let program = build_program_multi_with_relationships(
                         &tables,
@@ -4376,7 +4570,13 @@ mod strategy {
                     );
                     let mut program = match &cooling {
                         Some(cooling) => {
-                            place_cooling_keys(program, cooling_table, &cooling.places, burst_size)
+                            let places = match &backfill {
+                                Some(backfill) => {
+                                    places_after_backfills(backfill, program.ops.len(), burst_size)
+                                }
+                                None => cooling.places.clone(),
+                            };
+                            place_cooling_keys(program, cooling_table, &places, burst_size)
                         }
                         None => {
                             let schedule = spread_schedule(&program);
@@ -4388,23 +4588,30 @@ mod strategy {
                         let after_op = 1 + usize::from(at) * (ops - 2) / 1000;
                         program = defer_def_install(program, def, after_op);
                     }
-                    let load = extras.load;
+                    let seal = cooling.as_ref().map_or(seal, |c| c.seal_interval_ms);
+                    let load = extras.load.or(backfill.as_ref().map(|b| b.load));
                     let mut plan = concurrent_plan(&program, burst_size, lanes);
                     plan.steady_load = load.map(|load| SteadyLoad {
                         pace: std::time::Duration::from_micros(load.pace_micros),
+                        pace_from_start: backfill.is_some(),
                         stall: std::time::Duration::from_millis(seal * u64::from(load.stall_seals)),
                     });
-                    let plan = add_burst_actions(plan, &program, &extras.actions);
+                    let mut plan = add_burst_actions(plan, &program, &extras.actions);
+                    if let Some(backfill) = &backfill {
+                        let table = &program.tables[cooling_table].name;
+                        plan = add_backfills(plan, table, &backfill.backfills);
+                    }
                     ConcurrentCase {
                         program,
                         burst_size,
                         plan,
                         workers: cooling.as_ref().map_or(workers, |c| c.workers),
-                        seal_interval_ms: cooling.map_or(seal, |c| c.seal_interval_ms),
-                        build_chunk_rows: load.map(|load| load.chunk_rows),
-                        // A build starts at the reconcile pass after its
-                        // install or resume: at the engine's 5s default,
-                        // long after the burst that started it.
+                        seal_interval_ms: seal,
+                        // A cooling-backfill case starts no build mid-burst.
+                        build_chunk_rows: extras.load.map(|load| load.chunk_rows),
+                        // A build, or a catch-up, starts at the reconcile
+                        // pass after the action that asked for it: at the
+                        // engine's 5s default, long after its burst.
                         reconcile_interval_ms: load.map(|_| seal),
                     }
                 },
@@ -4737,11 +4944,12 @@ mod strategy {
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS, MAX_ACTION_DRAWS, bulk_insert_program,
-    checkpoint_plan_for, cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case,
-    noise_plan_for, program_with_client_restart, program_with_mid_stream_def_install,
-    program_with_scale_out, restore_plan_for, steady_load_case, trivial_one_to_one_program_with,
-    trivial_program, trivial_program_with,
+    COOLING_BACKFILL_AT, COOLING_BACKFILL_LAG, LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS,
+    MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, cooling_backfill_case,
+    cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for,
+    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
+    restore_plan_for, steady_load_case, trivial_one_to_one_program_with, trivial_program,
+    trivial_program_with,
 };
 
 #[cfg(test)]

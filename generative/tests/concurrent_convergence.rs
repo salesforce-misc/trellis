@@ -102,6 +102,17 @@
 //! hasn't taken its entry lock yet, so that a tombstone the older change
 //! needs can be collected (`early_tombstone_gc`).
 //!
+//! The cooling-backfill tier (#734) draws `generate::cooling_backfill_case`: a
+//! cooling-key case whose cooling table a `GROUP BY` definition reads rather
+//! than a 1-1 one, with a `request_backfill` of that table in every burst
+//! after the first, at 25 to 65% of its ops, among the cooling keys' last
+//! writes. It runs under the steady-load tier's stall, with the lanes paced
+//! from each burst's start (`SteadyLoad::pace_from_start`), so the
+//! backfill's catch-up lands among writes still coming in. It is a sweep tier
+//! only, like the steady-load one. It was built for `lsn_only_skip`, which it
+//! doesn't gate (see above), and it gates the plants a backfill under load
+//! reaches.
+//!
 //! The stall is process-wide, so the tier has no property test: it runs
 //! only in [`planted_bugs_are_caught`]'s sweep processes, one case at a time
 //! with nothing else in the process, and `run_concurrent_case` refuses a
@@ -119,7 +130,12 @@
 //! It draws from the cooling-key tier by default. Each tier gates the
 //! plants whose shapes it runs, and says why it doesn't gate the others
 //! (`SweepTier::not_gated`): the build plants, `skip_ledger_lock` and
-//! `early_tombstone_gc` are the steady-load tier's.
+//! `early_tombstone_gc` are the steady-load tier's. `lsn_only_skip` is no
+//! tier's: the engine's own ordering (the discharge's xmin fence, the ring's
+//! seal gate, oldest-first claims) closes its window unless a drain order is
+//! forced by hand, so the deterministic pin
+//! `a_change_the_rederive_read_is_not_applied_again_aggregate`
+//! (`trellis/tests/ledger_interleavings.rs`) gates it (#734).
 //! `trellis/src/plant.rs`'s module doc says how to add a plant. Epic #556's
 //! milestones add theirs there (#623, #625), and this sweep is their gate.
 //!
@@ -236,8 +252,8 @@ use generative::baseline_quarantine;
 use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
-    cooling_key_case, defer_def_install, hot_key_case, mid_burst_case, schedule_restart,
-    schedule_scale_out, steady_load_case, trivial_program,
+    cooling_backfill_case, cooling_key_case, defer_def_install, hot_key_case, mid_burst_case,
+    schedule_restart, schedule_scale_out, steady_load_case, trivial_program,
 };
 use generative::run::{
     RunError, check_program, run_convergence, run_convergence_bursty, run_convergence_concurrent,
@@ -1436,7 +1452,7 @@ const PLANT_SEEDS_ENV: &str = "GENERATIVE_PLANT_SEEDS";
 /// How many cases a sweep draws from each seed (default [`PLANT_CASES`]).
 const PLANT_CASES_ENV: &str = "GENERATIVE_PLANT_CASES";
 /// Which tier's cases a sweep draws: `cooling_key` (the default),
-/// `hot_key`, `mid_burst` or `steady_load`.
+/// `hot_key`, `mid_burst`, `steady_load` or `cooling_backfill`.
 const PLANT_TIER_ENV: &str = "GENERATIVE_PLANT_TIER";
 /// Runs one case only, as `<seed>:<case>` (1-based), to look at a failure
 /// the sweep reported. Each failing case's report heads are printed to
@@ -1485,23 +1501,33 @@ struct SweepTier {
 /// that catches it.
 const STALE_ONE_TO_ONE_MISS: &str = "stale_one_to_one_write";
 
-/// Why no tier gates `lsn_only_skip` (#623 D3) yet (#734): re-applying a
-/// change whose image the entry already holds is a no-op, so it diverges
-/// only when a key's last change is folded into a page's Re-derive (a staged
-/// re-read in the same batch), an older change to the key drains after that
-/// page, and nothing rewrites the key afterwards. The hot-key-based tiers'
-/// keys keep changing until the burst ends, and the cooling-key tier's
-/// cooling keys feed a 1-1 target and get no re-read. Every tier caught it
-/// in 0 or 1 of 44 to 48 cases. The deterministic
-/// `a_change_the_rederive_read_is_not_applied_again_aggregate` pins it
-/// meanwhile.
-const LSN_ONLY_SKIP_MISS: &str = "lsn_only_skip";
-
 /// The cooling-key tier's known misses.
-const COOLING_KEY_MISSES: &[&str] = &[LSN_ONLY_SKIP_MISS];
+const COOLING_KEY_MISSES: &[&str] = &[];
 /// The known misses of the tiers built on the hot-key case: hot-key,
 /// mid-burst and steady-load.
-const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS, LSN_ONLY_SKIP_MISS];
+const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS];
+
+/// `lsn_only_skip` (#623 D3, ADR-0002 I2), which no tier gates: a
+/// deterministic pin does (#734). Re-applying a change whose image the entry
+/// already holds is a no-op, so the plant diverges only when a key's last
+/// change is folded into a page's Re-derive, an older change to the key then
+/// drains after that page, and nothing rewrites the key. The engine closes
+/// that window on purpose: the discharge's xmin fence (#431) waits for every
+/// page in flight before it stages a catch-up, the ring's seal gate holds a
+/// catch-up's segment behind an older slow one, and claims go oldest-first
+/// and coalesce, folding an unclaimed older segment into the catch-up. Only a
+/// by-hand drain order breaks all three. The cooling-key, mid-burst and
+/// steady-load tiers caught it in 0, 1 and 0 of 44 to 48 cases each, and the
+/// cooling-backfill tier, built for it, in none of about 90 instrumented
+/// ones.
+const LSN_ONLY_SKIP_PIN: (&str, &str) = (
+    "lsn_only_skip",
+    "its window opens only when an ordering the engine enforces is broken by \
+     hand (the discharge's xmin fence, the ring's seal gate, oldest-first \
+     coalescing claims), which no random stall does; the deterministic pin \
+     `a_change_the_rederive_read_is_not_applied_again_aggregate` \
+     (trellis/tests/ledger_interleavings.rs) gates it (#734)",
+);
 
 /// The steady-load tier's plants, which a tier without its load doesn't
 /// gate (#720, #725). The counts are on main after #623 D5.
@@ -1539,15 +1565,50 @@ const NO_MID_BURST_BUILD: (&str, &str) = (
      steady-load tiers gate it",
 );
 
-const COOLING_KEY_NOT_GATED: &[(&str, &str)] =
-    &[BUILD_UNDER_LOAD, NO_MID_BURST_BUILD, OUT_OF_ORDER_DRAIN];
+const COOLING_KEY_NOT_GATED: &[(&str, &str)] = &[
+    BUILD_UNDER_LOAD,
+    NO_MID_BURST_BUILD,
+    OUT_OF_ORDER_DRAIN,
+    LSN_ONLY_SKIP_PIN,
+];
 const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[
     BUILD_UNDER_LOAD,
     NO_MID_BURST_BUILD,
     OUT_OF_ORDER_DRAIN,
     HELD_ENTRY,
+    LSN_ONLY_SKIP_PIN,
 ];
-const MID_BURST_NOT_GATED: &[(&str, &str)] = &[BUILD_UNDER_LOAD, OUT_OF_ORDER_DRAIN, HELD_ENTRY];
+const MID_BURST_NOT_GATED: &[(&str, &str)] = &[
+    BUILD_UNDER_LOAD,
+    OUT_OF_ORDER_DRAIN,
+    HELD_ENTRY,
+    LSN_ONLY_SKIP_PIN,
+];
+
+/// The cooling-backfill tier's programs are the hot table and the cooling
+/// table, each read by a `GROUP BY` definition, and install nothing
+/// mid-burst (#734). It gates the plants a `request_backfill` under load
+/// reaches, and not these two.
+const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "stale_one_to_one_write",
+        "it needs a 1-1 definition, and the tier's programs have none (0 of 48 \
+         cases fired it); the cooling-key tier gates it",
+    ),
+    (
+        "chunk_without_entry_lock",
+        "it needs a build chunk reading an entry while a page holds it, and the \
+         tier installs nothing mid-burst, so only a backfill's catch-up builds \
+         (it fired in 1 of 48 cases, caught in 0); the steady-load tier gates it",
+    ),
+    (
+        "merge_without_delete",
+        "it needs a mid-burst install or resume, which the tier has none of (0 \
+         of 48 cases fired it); the mid-burst and steady-load tiers gate it",
+    ),
+    LSN_ONLY_SKIP_PIN,
+];
+const STEADY_LOAD_NOT_GATED: &[(&str, &str)] = &[LSN_ONLY_SKIP_PIN];
 
 /// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
 ///
@@ -1589,7 +1650,13 @@ fn sweep_tier_named(name: &str) -> Option<SweepTier> {
             name: "steady_load",
             strategy: steady_load_case().boxed(),
             known_misses: HOT_KEY_BASED_MISSES,
-            not_gated: &[],
+            not_gated: STEADY_LOAD_NOT_GATED,
+        },
+        "cooling_backfill" => SweepTier {
+            name: "cooling_backfill",
+            strategy: cooling_backfill_case().boxed(),
+            known_misses: &[],
+            not_gated: COOLING_BACKFILL_NOT_GATED,
         },
         _ => return None,
     })

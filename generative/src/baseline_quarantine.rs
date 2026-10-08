@@ -20,7 +20,13 @@ pub const CHECKED_IN: &str = include_str!("../baseline-quarantine.txt");
 
 /// The sweep tiers an entry can name (`concurrent_convergence.rs`'s
 /// `GENERATIVE_PLANT_TIER` values).
-pub const TIERS: &[&str] = &["cooling_key", "hot_key", "mid_burst", "steady_load"];
+pub const TIERS: &[&str] = &[
+    "cooling_key",
+    "cooling_backfill",
+    "hot_key",
+    "mid_burst",
+    "steady_load",
+];
 
 /// The repository whose issues the entries name.
 pub const ISSUE_REPO: &str = "salesforce-misc/trellis";

@@ -48,7 +48,8 @@ pub struct ConcurrentRun {
 /// With a [`ConcurrentPlan::steady_load`], the engine's pages and build
 /// chunks stall at their entry-lock step for the whole run, and once an
 /// action starts a build ([`BurstAction::starts_build`]) each lane waits
-/// its pace after every op for the rest of the burst.
+/// its pace after every op for the rest of the burst; from the burst's
+/// start, with [`crate::model::SteadyLoad::pace_from_start`].
 ///
 /// # Panics
 ///
@@ -123,6 +124,7 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
     // is cleared when the run ends, however it ends.
     let _stall = plan.steady_load.map(|load| StallGuard::set(load.stall));
     let pace = plan.steady_load.map(|load| load.pace);
+    let paced_from_start = plan.steady_load.is_some_and(|load| load.pace_from_start);
 
     let lane_count = plan.bursts.iter().map(|b| b.lanes.len()).max().unwrap_or(0);
     let mut appliers = Vec::with_capacity(lane_count);
@@ -145,9 +147,10 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
         // is what an action waits on. A lane that stops at a failed op
         // counts the rest of its ops as applied, so no action waits forever.
         let progress = Arc::new(watch::channel(0usize).0);
-        // Set once one of the burst's actions starts a build: from then on,
-        // under a steady load, the lanes keep to its pace.
-        let building = Arc::new(AtomicBool::new(false));
+        // Set once one of the burst's actions starts a build (or from the
+        // start, for a load paced from it): from then on, under a steady
+        // load, the lanes keep to its pace.
+        let building = Arc::new(AtomicBool::new(paced_from_start));
         let mut tasks = JoinSet::new();
         for (lane_index, lane) in burst.lanes.iter().enumerate() {
             let building = Arc::clone(&building);

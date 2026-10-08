@@ -272,7 +272,8 @@ unplanted, as the baseline, then once per planted bug, and judges each plant
 only on cases the baseline passed. **No unknown failure is accepted in a
 generative case**: the baseline passes only with **zero failures outside
 the quarantine list**, `generative/baseline-quarantine.txt`. The rule is the same
-for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`).
+for every tier (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`,
+`cooling_backfill`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
   The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
@@ -410,7 +411,10 @@ Two structural notes for when faults enter the stream:
   catches it, against an unplanted baseline that must have zero failures outside
   the quarantine list (§6). A plant in the tier's `known_misses` is run and
   reported but doesn't fail the sweep when uncaught, and one in `not_gated` (with
-  its reason) is left out of `GENERATIVE_PLANTS=all`.
+  its reason) is left out of `GENERATIVE_PLANTS=all`. `lsn_only_skip` is in every
+  tier's `not_gated`: its window needs a drain order the engine's xmin fence, seal
+  gate and oldest-first claims rule out, so the deterministic pin `a_change_the_rederive_read_is_not_applied_again_aggregate`
+  (`trellis/tests/ledger_interleavings.rs`) is its gate (#734).
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 

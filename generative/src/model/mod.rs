@@ -422,14 +422,21 @@ pub struct ConcurrentPlan {
 /// reading an entry that a page has locked but not yet written, and a
 /// segment draining past an older one whose page hasn't taken its entry
 /// lock yet. The pace holds only from an action that starts a build to the
-/// end of its burst: every other burst still goes flat out, so it still
-/// seals into batches large enough to split across workers.
+/// end of its burst, unless [`SteadyLoad::pace_from_start`]: every other
+/// burst still goes flat out, so it still seals into batches large enough
+/// to split across workers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SteadyLoad {
     /// How long each lane waits after each op, once an action has started a
     /// build, so the rest of the burst's writes trickle in, as a steady
     /// source's do, while the build runs.
     pub pace: std::time::Duration,
+    /// Whether the pace holds from every burst's start, rather than only
+    /// once an action starts a build. The cooling-backfill tier (#734) paces
+    /// its whole run, so a `request_backfill`'s catch-up lands among the
+    /// writes of the keys going quiet around it rather than after a burst
+    /// written flat out in tens of milliseconds.
+    pub pace_from_start: bool,
     /// The longest stall a page or a build chunk takes at its entry-lock
     /// step (`trellis::dev::interleave::set_stall`), all run long, so some
     /// pages are slow next to others, as a busy worker's are.
