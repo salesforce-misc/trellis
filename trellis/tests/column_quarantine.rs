@@ -4068,3 +4068,82 @@ async fn an_alter_pausing_a_field_waits_for_a_define_reading_it_that_read_no_pau
     assert!(cascade_edge_exists(&client, "sib_down", "d1", "sib_sum", "c1").await);
     assert!(column_status_row(&client, "sib_down", "d1").await.is_some());
 }
+
+/// An edit whose field both waits for its capture widen and reads a paused
+/// sibling by alias: `ALTER sib ALTER cost AS total + bonus` reads `bonus`,
+/// which `sib` didn't read, so `cost` is written `awaiting_capture`, and
+/// then reads the paused `total`, so the sibling path gives it an edge. The
+/// edge is a reason to cascade that the capture wait alone isn't, so the
+/// row is marked even though it was written awaiting its capture, and the
+/// capture pass pauses `cost`'s readers. Releasing the capture wait leaves
+/// `cost` paused on its edge, and `total`'s resume releases the chain.
+#[tokio::test]
+async fn an_alter_pausing_a_field_awaiting_its_capture_on_a_paused_sibling_cascades_to_its_readers()
+{
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_total_paused(&db).await;
+
+    trellis
+        .apply("ALTER TRANSFORM sib ALTER cost AS total + bonus")
+        .await
+        .expect("edit cost to read a new source column and the paused sibling");
+    let awaiting: bool = client
+        .query_one(
+            "select awaiting_capture from column_status \
+             where transform_table = 'sib' and column_name = 'cost'",
+            &[],
+        )
+        .await
+        .expect("read cost's row")
+        .get(0);
+    assert!(awaiting, "cost waits for its capture widen");
+    assert!(cascade_edge_exists(&client, "sib", "cost", "sib", "total").await);
+    assert_eq!(cascade_pending(&client, "sib", "cost").await, Some(true));
+
+    quarantine::complete_pause_cascades(&db.pool)
+        .await
+        .expect("finish the walk");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert!(cascade_edge_exists(&client, "sib_down", "d1", "sib_sum", "c1").await);
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    let still_awaiting: Option<bool> = client
+        .query_opt(
+            "select awaiting_capture from column_status \
+             where transform_table = 'sib' and column_name = 'cost'",
+            &[],
+        )
+        .await
+        .expect("read cost's row")
+        .map(|row| row.get(0));
+    assert_eq!(
+        still_awaiting,
+        Some(false),
+        "the capture release leaves cost paused on its edge"
+    );
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib".to_string(), "cost".to_string()),
+            ("sib_sum".to_string(), "c1".to_string()),
+            ("sib_down".to_string(), "d1".to_string()),
+        ]
+    );
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["16"]));
+    let d1: Option<String> = client
+        .query_one("select d1::text from public.sib_down where id = 1", &[])
+        .await
+        .expect("read sib_down")
+        .get(0);
+    assert_eq!(d1.as_deref(), Some("17"));
+}
