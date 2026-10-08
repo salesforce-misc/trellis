@@ -3779,3 +3779,71 @@ async fn a_pause_waits_for_a_define_reading_its_column_that_read_no_pause() {
     assert!(column_status_row(&client, "sib_sum", "t1").await.is_some());
     assert!(cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
 }
+
+/// The same one hop further down: a pause's cascade into a column of
+/// `sib_sum` waits for a define reading `sib_sum` that read no pause of it.
+/// Without the cascade pair's own pause lock, the pair would pause
+/// `sib_sum.t1` while the define, having read it live, was still to
+/// commit, and the walk, reading the graph before that commit, would miss
+/// the new reader. Here the pair can't wait (100 ms), so the pause returns
+/// the error with the walk still owed; once the define commits, finishing
+/// the walk reaches it.
+#[tokio::test]
+async fn a_cascade_pair_waits_for_a_define_reading_its_column_that_read_no_pause() {
+    const PAUSE_LOCK: i64 = 9141;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    trellis_on(&db)
+        .await
+        .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1")
+        .await
+        .expect("define the middle definition");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+
+    let gate = take_gate(&db, PAUSE_LOCK).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterUpstreamPausesRead, "sib_down", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut define = tokio::spawn(with_scope(scope, async move {
+        create_definition(
+            &pool,
+            "TRANSFORM sib_down FROM sib_sum SELECT t1 + 1 AS d1",
+            &numeric_columns(&["id", "t1"]),
+        )
+        .await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut define => panic!("the define finished without reaching its read: {finished:?}"),
+    }
+
+    let early = quarantine::pause_column(&impatient_pool(&db), "sib", "total").await;
+    assert!(
+        early.is_err(),
+        "the cascade pair waits for the define that read no pause, got {early:?}"
+    );
+    assert!(column_status_row(&client, "sib", "total").await.is_some());
+    assert_eq!(cascade_pending(&client, "sib", "total").await, Some(true));
+    assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
+
+    release_gate(&gate, PAUSE_LOCK).await;
+    define
+        .await
+        .expect("define task")
+        .expect("the define commits");
+    assert_eq!(column_status_row(&client, "sib_down", "d1").await, None);
+
+    assert_eq!(
+        quarantine::complete_pause_cascades(&db.pool)
+            .await
+            .expect("finish the walk"),
+        1
+    );
+    assert!(cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
+    assert!(cascade_edge_exists(&client, "sib_down", "d1", "sib_sum", "t1").await);
+    assert_eq!(cascade_pending(&client, "sib", "total").await, Some(false));
+}
