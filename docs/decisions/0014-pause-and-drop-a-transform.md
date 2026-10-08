@@ -64,7 +64,10 @@ column granularity: a paused column holds a deliberately stale value while the r
 the target stays live. A column pause freezes the column from the moment it returns. It
 bumps its source's version fence, so a drain page or build chunk that planned the column
 as live either commits before the pause does or finds the fence moved and plans again
-without it.
+without it. The pause then cascades to the column's readers, each fenced the same way in
+a transaction of its own. If a reader's fence bump waits out the lock timeout, the pause
+returns the error and stays marked as owing its cascade, and the staging worker's capture
+pass finishes the cascade.
 
 ### Resume reconciles with source, not by catch-up
 

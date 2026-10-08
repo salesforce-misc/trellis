@@ -2455,10 +2455,11 @@ async fn trip_column_fuse(
     let txn = client.transaction().await?;
     bump_pause_fence(&*txn, fence.as_deref()).await?;
     txn.execute(
-        "insert into column_status (transform_table, column_name, paused_at, last_error, local_fuse) \
-         values ($1, $2, now(), $3, true) \
+        "insert into column_status \
+             (transform_table, column_name, paused_at, last_error, local_fuse, cascade_pending) \
+         values ($1, $2, now(), $3, true, true) \
          on conflict (transform_table, column_name) do update set \
-             local_fuse = true, last_error = excluded.last_error",
+             local_fuse = true, last_error = excluded.last_error, cascade_pending = true",
         &[&transform, &column, &last_error],
     )
     .await?;
@@ -2528,70 +2529,206 @@ async fn bump_pause_fence(
 /// `async fn` self-recursion's `Box::pin` boilerplate.
 ///
 /// Each dependent's edge and row commit together, fenced against its
-/// definition's writers in flight ([`bump_pause_fence`]).
+/// definition's writers in flight ([`bump_pause_fence`]), so a pair can wait
+/// out the lock timeout and fail the walk part-way (issue #912). The walk is
+/// idempotent, so running it again finishes the job:
 ///
-/// A dependent already paused (by an earlier cascade, or its own
-/// `local_fuse`) still gets this new cascade edge recorded (so un-cascading
-/// `transform`/`column` later can't wrongly resume it out from under a
-/// *different* still-live reason), but its own further dependents are not
-/// re-walked — they were already reached when this dependent first paused.
+/// - It walks every dependent's dependents, whether this walk paused it or
+///   found it paused already, once each (a visited set). A dependent already
+///   paused (by an earlier cascade, or its own `local_fuse`) still gets this
+///   walk's edge recorded, so un-cascading `transform`/`column` later can't
+///   resume it out from under a *different* still-live reason.
+/// - A pair whose edge and row are both there already is skipped without a
+///   transaction: a retry doesn't bump the fences of the pairs it already
+///   reached, nor wait on their writers again.
+/// - A pair commits only while its upstream column is still paused, read
+///   under a key-share lock after the fence bump, so a walk racing that
+///   column's [`resume_column`] can't pause a reader the resume already
+///   released. The walk goes no further down that branch.
+///
+/// A pause records the walk as owed (`column_status.cascade_pending`) in
+/// the transaction that writes its own row, and the walk clears it once it
+/// has reached every dependent. [`complete_pause_cascades`] finishes the
+/// walk of any pause still marked.
 async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(), ApplyError> {
+    let mut visited: HashSet<(String, String)> = HashSet::new();
     let mut queue: VecDeque<(String, String)> = VecDeque::new();
+    visited.insert((transform.to_string(), column.to_string()));
     queue.push_back((transform.to_string(), column.to_string()));
 
     while let Some((upstream_transform, upstream_column)) = queue.pop_front() {
         let deps = catalog::column_dependents(pool, &upstream_transform, &upstream_column).await?;
         for (downstream_transform, downstream_column) in deps {
-            // Each pair's pause fences its own definition's writers
-            // ([`bump_pause_fence`]), in its own transaction, so no
-            // transaction holds two sources' fences.
-            let fence = pause_fence(pool, &downstream_transform).await?;
-            let mut client = pool.get().await?;
-            let txn = client.transaction().await?;
-            bump_pause_fence(&*txn, fence.as_deref()).await?;
-            txn.execute(
-                "insert into column_pause_cascades \
-                     (downstream_transform, downstream_column, upstream_transform, upstream_column) \
-                 values ($1, $2, $3, $4) \
-                 on conflict do nothing",
-                &[
-                    &downstream_transform,
-                    &downstream_column,
-                    &upstream_transform,
-                    &upstream_column,
-                ],
+            if !cascaded_already(
+                pool,
+                (&downstream_transform, &downstream_column),
+                (&upstream_transform, &upstream_column),
             )
-            .await?;
-
-            let newly_paused = txn
-                .execute(
-                    "insert into column_status (transform_table, column_name, paused_at, last_error, local_fuse) \
-                     values ($1, $2, now(), $3, false) \
-                     on conflict (transform_table, column_name) do nothing",
-                    &[
-                        &downstream_transform,
-                        &downstream_column,
-                        &format!(
-                            "paused because upstream column '{upstream_transform}.{upstream_column}' \
-                             is paused"
-                        ),
-                    ],
+            .await?
+                && !pause_dependent(
+                    pool,
+                    (&downstream_transform, &downstream_column),
+                    (&upstream_transform, &upstream_column),
                 )
-                .await?;
-            txn.commit().await?;
-            if newly_paused > 0 {
-                tracing::warn!(
-                    transform = %downstream_transform,
-                    column = %downstream_column,
-                    upstream_transform = %upstream_transform,
-                    upstream_column = %upstream_column,
-                    "column paused via cascade from an upstream pause"
-                );
-                queue.push_back((downstream_transform, downstream_column));
+                .await?
+            {
+                // The upstream column was resumed under this walk.
+                continue;
+            }
+            let pair = (downstream_transform, downstream_column);
+            if visited.insert(pair.clone()) {
+                queue.push_back(pair);
             }
         }
     }
+
+    pool.get()
+        .await?
+        .execute(
+            "update column_status set cascade_pending = false \
+             where transform_table = $1 and column_name = $2 and cascade_pending",
+            &[&transform, &column],
+        )
+        .await?;
     Ok(())
+}
+
+/// Whether [`cascade_pause`] reached `downstream` from `upstream` already:
+/// its edge and its row commit together, so both being there means the
+/// pair's transaction committed and nothing has resumed it since.
+async fn cascaded_already(
+    pool: &Pool,
+    (downstream_transform, downstream_column): (&str, &str),
+    (upstream_transform, upstream_column): (&str, &str),
+) -> Result<bool, ApplyError> {
+    Ok(pool
+        .get()
+        .await?
+        .query_opt(
+            "select 1 from column_pause_cascades e \
+             join column_status s \
+               on s.transform_table = e.downstream_transform \
+              and s.column_name = e.downstream_column \
+             where e.downstream_transform = $1 and e.downstream_column = $2 \
+               and e.upstream_transform = $3 and e.upstream_column = $4",
+            &[
+                &downstream_transform,
+                &downstream_column,
+                &upstream_transform,
+                &upstream_column,
+            ],
+        )
+        .await?
+        .is_some())
+}
+
+/// One pair of [`cascade_pause`]: records the edge from `upstream` and
+/// pauses `downstream`, in a transaction whose first lock bumps
+/// `downstream`'s definition's source fence ([`bump_pause_fence`]), so no
+/// transaction holds two sources' fences. False, with nothing written, when
+/// `upstream` is no longer paused: the key-share lock on its row waits for
+/// a [`resume_column`] deleting it, and a resume that comes later waits for
+/// this commit and then deletes the edge with the rest.
+async fn pause_dependent(
+    pool: &Pool,
+    (downstream_transform, downstream_column): (&str, &str),
+    (upstream_transform, upstream_column): (&str, &str),
+) -> Result<bool, ApplyError> {
+    let fence = pause_fence(pool, downstream_transform).await?;
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    bump_pause_fence(&*txn, fence.as_deref()).await?;
+    let upstream_paused = txn
+        .query_opt(
+            "select 1 from column_status \
+             where transform_table = $1 and column_name = $2 \
+             for key share",
+            &[&upstream_transform, &upstream_column],
+        )
+        .await?
+        .is_some();
+    if !upstream_paused {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    txn.execute(
+        "insert into column_pause_cascades \
+             (downstream_transform, downstream_column, upstream_transform, upstream_column) \
+         values ($1, $2, $3, $4) \
+         on conflict do nothing",
+        &[
+            &downstream_transform,
+            &downstream_column,
+            &upstream_transform,
+            &upstream_column,
+        ],
+    )
+    .await?;
+    let newly_paused = txn
+        .execute(
+            "insert into column_status (transform_table, column_name, paused_at, last_error, local_fuse) \
+             values ($1, $2, now(), $3, false) \
+             on conflict (transform_table, column_name) do nothing",
+            &[
+                &downstream_transform,
+                &downstream_column,
+                &format!(
+                    "paused because upstream column '{upstream_transform}.{upstream_column}' \
+                     is paused"
+                ),
+            ],
+        )
+        .await?;
+    txn.commit().await?;
+    if newly_paused > 0 {
+        tracing::warn!(
+            transform = %downstream_transform,
+            column = %downstream_column,
+            upstream_transform = %upstream_transform,
+            upstream_column = %upstream_column,
+            "column paused via cascade from an upstream pause"
+        );
+    }
+    Ok(true)
+}
+
+/// Finishes the cascade of every column pause still marked as owing one
+/// (`column_status.cascade_pending`, issue #912). A pause writes its own row
+/// and the mark in one transaction, then walks its dependents
+/// ([`cascade_pause`]), each pair in a transaction of its own whose fence
+/// bump can wait out the lock timeout behind a writer in flight. A walk that
+/// fails part-way, or whose process dies, leaves the mark, and a reader of
+/// the paused column unpaused (decision #5). An operator's `PAUSE` returns
+/// the error and can be re-run, but a column fuse trip has no caller to
+/// retry it, and its column, now paused, stops failing, so no new charge
+/// trips it again.
+///
+/// The staging worker's capture pass calls this each pass, as it releases
+/// the keys an in-place re-type held. A walk that fails again stops this
+/// call at that pause and is retried next pass; the marks stay until their
+/// walks finish. Returns how many walks finished.
+pub async fn complete_pause_cascades(pool: &Pool) -> Result<usize, ApplyError> {
+    let pending: Vec<(String, String)> = pool
+        .get()
+        .await?
+        .query(
+            "select transform_table, column_name from column_status \
+             where cascade_pending order by transform_table, column_name",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    for (transform, column) in &pending {
+        tracing::info!(
+            transform = %transform,
+            column = %column,
+            "finishing a column pause's cascade that didn't complete"
+        );
+        cascade_pause(pool, transform, column).await?;
+    }
+    Ok(pending.len())
 }
 
 /// Pauses one calculated column deliberately — the operator-driven trigger
@@ -2651,9 +2788,11 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
         let txn = client.transaction().await?;
         bump_pause_fence(&*txn, fence.as_deref()).await?;
         txn.execute(
-            "insert into column_status (transform_table, column_name, paused_at, local_fuse) \
-             values ($1, $2, now(), true) \
-             on conflict (transform_table, column_name) do update set local_fuse = true",
+            "insert into column_status \
+                 (transform_table, column_name, paused_at, local_fuse, cascade_pending) \
+             values ($1, $2, now(), true, true) \
+             on conflict (transform_table, column_name) do update set \
+                 local_fuse = true, cascade_pending = true",
             &[&transform, &column],
         )
         .await?;

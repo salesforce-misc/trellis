@@ -216,7 +216,16 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   `defs::catalog::column_dependents`), so no downstream reader silently consumes
   a frozen value. The column-level fuse only ever freezes a column of a 1-1
   transform, and the cascade stops at aggregates
-  ([known correctness gaps](../known-correctness-gaps.md)).
+  ([known correctness gaps](../known-correctness-gaps.md)). Each reader's pause
+  commits in a transaction of its own, fenced against its writers in flight, so
+  a cascade can fail part-way. The walk is idempotent: it walks on through a
+  reader that is paused already, so running it again reaches the readers the
+  failed run didn't. The pause marks its own `column_status` row
+  (`cascade_pending`) in the transaction that writes it, the walk clears the
+  mark once it has reached every reader, and the staging worker's capture pass
+  finishes the walk of any pause still marked. A cascade that fails part-way
+  completes whether or not anyone retries the `PAUSE`, and a fuse trip has no
+  caller to retry it.
 * **Sibling readers** — a field of the same 1-1 definition that reads a paused
   field by alias, directly or through other fields, is paused with it (a
   `column_status` row and a cascade edge), so Apply freezes it rather than
