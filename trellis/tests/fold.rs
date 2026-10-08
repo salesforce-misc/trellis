@@ -15,7 +15,9 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::staging::{BucketFilter, FoldedChange, TRUNCATE_SENTINEL_KEY, fold, seal};
+use trellis::staging::{
+    BucketFilter, FoldedChange, StagedChange, TRUNCATE_SENTINEL_KEY, append, fold, seal,
+};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `sealing.rs`/`staging_ring.rs`'s convention.
@@ -1349,4 +1351,75 @@ async fn to_col_values_union_every_raw_rows_new_image_by_column() {
         owned(&[("code", "b"), ("code", "m"), ("fk", "x")])
     );
     assert!(pairs("1", "orders").is_empty());
+}
+
+/// #944: a release's `ReleasedJoinValue`s fold into its `Recompute`, naming
+/// their join values in `to_col_values` and nothing else: the record stays
+/// image-less, with the `Recompute`'s prior image and provenance.
+#[tokio::test]
+async fn a_released_join_value_folds_into_the_recompute_as_a_to_col_value() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.par (id integer primary key, code text unique); \
+             create table public.src (id integer primary key, p text)",
+        )
+        .await
+        .expect("create the tables");
+    trellis::defs::create_relationship(&db.pool, "RELATIONSHIP parent FROM src.p TO par.code")
+        .await
+        .expect("declare the relationship");
+    let origin = Some(PgLsn::from(77));
+    let joined = |code: &str| StagedChange::ReleasedJoinValue {
+        src_table: "public.par".to_string(),
+        key: "1".to_string(),
+        image: format!(r#"{{"code": "{code}"}}"#),
+        hop_gen: 0,
+        src_changed: None,
+        origin_lsn: origin,
+    };
+    let txn = client.transaction().await.expect("begin append txn");
+    append(
+        &txn,
+        &[
+            StagedChange::Recompute {
+                src_table: "public.par".to_string(),
+                key: "1".to_string(),
+                hop_gen: 0,
+                group_key: None,
+                src_changed: None,
+                prior_image: Some(r#"{"id": 1, "code": "a"}"#.to_string()),
+                origin_lsn: origin,
+            },
+            joined("b"),
+            joined("c"),
+        ],
+    )
+    .await
+    .expect("append the release");
+    txn.commit().await.expect("commit the append");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+    assert_eq!(folded.len(), 1, "{folded:?}");
+    let change = &folded[0];
+    assert_eq!((&change.old_image, &change.new_image), (&None, &None));
+    assert_eq!(
+        change.prior_image.as_deref(),
+        Some(r#"{"id": 1, "code": "a"}"#)
+    );
+    assert_eq!(change.origin_lsn, origin);
+    assert!(change.has_recompute);
+    assert_eq!(
+        change.to_col_values,
+        vec![
+            ("code".to_string(), "b".to_string()),
+            ("code".to_string(), "c".to_string())
+        ]
+    );
 }

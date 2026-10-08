@@ -7329,17 +7329,18 @@ pub(super) async fn compute_page(
         )
         .await?;
         // #785 review: a change a relationship's reverse work leaves out (its
-        // key is poisoned for every reader of the relationship) has its
-        // release re-staged as an image-less `Recompute`
-        // (`quarantine::release_key`), whose reverse names only the first
-        // parked pre-image and the live row. A non-key `to_col` value the fold
-        // erased between them lives only in this change's `to_col_values`,
-        // which nothing parks, and a child may have read the parent live under
+        // key is poisoned for every reader of the relationship) waits for its
+        // release (`quarantine::release_key`). A non-key `to_col` value the
+        // fold erased between its images lives only in this change's
+        // `to_col_values`, and a child may have read the parent live under
         // it. So its children are re-derived now, as for a change the
-        // relationship applies. A key `to_col`'s only value is the ring key,
-        // which the release's `Recompute` names itself. A relationship an
-        // isolation probe's focus leaves out does none of this: the probe
-        // leaves the key out of its work whole.
+        // relationship applies, rather than left stale for as long as the
+        // key is held. (The release re-derives them again: the park keeps
+        // every such value in the held row's `join_values`, and the release
+        // stages each beside its `Recompute`, #944.) A key `to_col`'s only
+        // value is the ring key, which the release's `Recompute` names
+        // itself. A relationship an isolation probe's focus leaves out does
+        // none of this: the probe leaves the key out of its work whole.
         for (change, exclusion) in changes.iter().zip(exclusions.iter().flatten()) {
             if exclusion.rels.is_empty() || change.to_col_values.is_empty() {
                 continue;

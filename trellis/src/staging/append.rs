@@ -181,6 +181,29 @@ pub enum StagedChange {
         /// commit behind it.
         origin_lsn: Option<PgLsn>,
     },
+    /// Issue #944: one join value a released key's parked changes held in a
+    /// relationship's `to_col`, staged beside the release's
+    /// [`StagedChange::Recompute`] (`quarantine::release_key`) so the key's
+    /// reverse path re-derives the from-side rows under it too. Batches drain
+    /// out of order, so a value the key held between its prior image and its
+    /// live row may have been read by from-side rows that drained unheld, and
+    /// neither of those two images names it.
+    ///
+    /// `image` is a `{to_col: value}` object (a `poison_held.join_values`
+    /// element). The row is a `recompute` with no prior image and `image` as
+    /// its new image, which only the fold's `to_col_values` reads
+    /// (`FoldedChange::to_col_values`, #785), so it folds into the release's
+    /// `Recompute` and names its value there. It carries that `Recompute`'s
+    /// `hop_gen`, `src_changed` and `origin_lsn`, so the folded provenance is
+    /// the `Recompute`'s alone.
+    ReleasedJoinValue {
+        src_table: String,
+        key: String,
+        image: String,
+        hop_gen: i32,
+        src_changed: Option<SystemTime>,
+        origin_lsn: Option<PgLsn>,
+    },
     /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
     /// relation, key-less (see [`TRUNCATE_SENTINEL_KEY`]) and image-less —
     /// it asserts nothing about any one row's state, only "every row this
@@ -350,6 +373,27 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 src_changed: *src_changed,
                 hop_gen: *hop_gen,
                 group_key: group_key.as_deref(),
+                retry_count: 0,
+                relationship_id: None,
+            },
+            StagedChange::ReleasedJoinValue {
+                src_table,
+                key,
+                image,
+                hop_gen,
+                src_changed,
+                origin_lsn,
+            } => ChangeRow {
+                src_table,
+                key,
+                op: "recompute",
+                lsn: None,
+                old_image: None,
+                new_image: Some(image),
+                origin_lsn: *origin_lsn,
+                src_changed: *src_changed,
+                hop_gen: *hop_gen,
+                group_key: None,
                 retry_count: 0,
                 relationship_id: None,
             },

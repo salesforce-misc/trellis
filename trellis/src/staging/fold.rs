@@ -237,6 +237,11 @@ pub struct FoldedChange {
     /// row is the folded `old_image`'s, which the reverse record names
     /// already.
     ///
+    /// A `recompute` row's new image is read here too, though nothing else
+    /// reads it: only a release stages one (#944,
+    /// `StagedChange::ReleasedJoinValue`), to name a value its key's parked
+    /// changes held, which no image left on the ring does.
+    ///
     /// Empty when its table is no such to-side.
     pub to_col_values: Vec<(String, String)>,
 }
@@ -709,7 +714,8 @@ fn fold_sql(
     // (#785 review, 50,000 rows of a table that is no to-side). Even a
     // group of one row needs its values: the cross-segment merge
     // (`merge_folded_changes`) folds it with the key's later segments, which
-    // can erase its new image.
+    // can erase its new image. A `recompute` row's new image counts too: a
+    // release's `ReleasedJoinValue` (#944) is the only one that has one.
     //
     // #622 C6: a `schema_changed` marker is no change to any key. The drain
     // acts on it before the fold (`staging::schema_change`), so `filtered`
@@ -732,7 +738,7 @@ fn fold_sql(
                                     or op = 'delete') \
                                and op <> 'recompute'))";
     let to_images = format!(
-        "array_agg(new_image) filter (where new_image is not null and op <> 'recompute' \
+        "array_agg(new_image) filter (where new_image is not null \
                                          and src_table = any(${to_tables_idx}::text[]))"
     );
     format!(

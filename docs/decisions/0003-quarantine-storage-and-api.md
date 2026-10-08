@@ -315,7 +315,11 @@ until one of these releases it:
   them, the table in either spelling (#283). In one transaction it deletes the
   transform's `poison`, `poison_held` and `key_deaths` rows for the key and
   stages one image-less `Recompute` of it, which re-derives the key from its
-  current row, including the to-one projection rewrite of #754. The parked
+  current row, including the to-one projection rewrite of #754. Beside it, it
+  stages each join value the held row names (`join_values`), so the
+  `Recompute` also re-derives the relationship readers that may have read the
+  key under a value between its first parked pre-image and its current row,
+  which an out-of-order drain can leave behind (#944). The parked
   changes are discarded, not replayed. The `Recompute` reaches every reader of
   the table: one that doesn't hold the key re-derives it, which is idempotent,
   and one that does parks it. If the cause is still there, the `Recompute`

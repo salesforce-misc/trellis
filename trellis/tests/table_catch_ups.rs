@@ -1465,6 +1465,140 @@ async fn releasing_a_key_parked_around_an_out_of_order_drain_removes_its_stale_p
         projected_by_code(&client, &projection, "d").await,
         Some(Some("ann".to_string()))
     );
+    // #944: order 10 read the customer under `c`, which neither the prior
+    // image (`a`) nor the live row (`d`) names, so only the held row's
+    // `join_values` tell the release to re-derive it.
+    assert_eq!(
+        order_names(&client).await,
+        vec![(10, None), (11, Some("ann".to_string()))],
+        "every order reads the customer by its live code"
+    );
+}
+
+/// `customer_orders`' counts, by customer.
+async fn counts(client: &Client) -> Vec<(i32, Option<i64>)> {
+    client
+        .query("select id, n from customer_orders order by id", &[])
+        .await
+        .expect("read customer_orders")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+/// Order 10 moving from join value `old` to `new`, as its capture stages it.
+fn order_recode(lsn: PgLsn, old: &str, new: &str) -> StagedChange {
+    let image = |code: &str| format!(r#"{{"id":"10","customer_code":"{code}"}}"#);
+    StagedChange::Cdc {
+        src_table: "public.orders".to_string(),
+        key: "10".to_string(),
+        op: CdcOp::Update,
+        lsn: Some(lsn),
+        old_image: Some(image(old)),
+        new_image: Some(image(new)),
+        origin_lsn: None,
+        src_changed: None,
+        hop_gen: 0,
+        group_key: None,
+    }
+}
+
+/// #944, the to-many twin of the test above: the release re-derives every
+/// from-side row a held to-side key's parked changes could have been read
+/// under. Order 10's `customer_code` moved `a` -> `b` -> `c` -> `d`: the
+/// `b` -> `c` batch drained first and counted it for customer 1 (`c`), then
+/// the `a` -> `b` and `c` -> `d` batches parked it. The release's prior
+/// image names `a` and its live row `d`; only the held row's `join_values`
+/// name `c`, so without them customer 1 kept counting an order it no longer
+/// has.
+#[tokio::test]
+async fn releasing_a_to_many_key_parked_around_an_out_of_order_drain_recounts_every_parent() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.customers (id integer primary key, code text); \
+             create table public.orders (id integer primary key, customer_code text); \
+             insert into public.customers values (1, 'c'), (2, 'd'); \
+             insert into public.orders values (10, 'b')",
+        )
+        .await
+        .expect("create and seed customers and orders");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP orders FROM customers.code TO orders.customer_code",
+    )
+    .await
+    .expect("declare the relationship");
+    let trellis = connect_trellis(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM customer_orders FROM customers SELECT count(orders.id) AS n")
+        .await
+        .expect("register the consumer");
+    bring_live(&db.pool, &mut client).await;
+    // The `b` -> `c` batch, drained before the key was held.
+    commit_and_stage(
+        &mut client,
+        "update public.orders set customer_code = 'c' where id = 10",
+        |lsn| order_recode(lsn, "b", "c"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(counts(&client).await, vec![(1, Some(1)), (2, Some(0))]);
+
+    // The `a` -> `b` batch, drained after it, held the key and parked its
+    // change.
+    client
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, 'public.orders', '10', 'test' from transform_definitions \
+             where target_table like '%.customer_orders'",
+            &[],
+        )
+        .await
+        .expect("mark the order poisoned");
+    client
+        .execute(
+            "insert into poison_held \
+                 (transform_id, src_table, key, seg_seq, lsn, old_image, join_values) \
+             select id, 'public.orders', '10', 0, pg_current_wal_insert_lsn(), \
+                    '{\"id\": 10, \"customer_code\": \"a\"}', \
+                    array['{\"customer_code\": \"b\"}'::jsonb] \
+             from transform_definitions where target_table like '%.customer_orders'",
+            &[],
+        )
+        .await
+        .expect("park the a -> b change");
+
+    // The `c` -> `d` batch parks the key through the real page path.
+    commit_and_stage(
+        &mut client,
+        "update public.orders set customer_code = 'd' where id = 10",
+        |lsn| order_recode(lsn, "c", "d"),
+    )
+    .await;
+    let parked = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, parked.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    drain_sealed(&db.pool, parked.sealed_seg_seq).await;
+    assert_eq!(
+        counts(&client).await,
+        vec![(1, Some(1)), (2, Some(0))],
+        "the parked c -> d change moved no count"
+    );
+
+    trellis::staging::release_key(&db.pool, "customer_orders", "public.orders", "10")
+        .await
+        .expect("release the parked order");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        counts(&client).await,
+        vec![(1, Some(0)), (2, Some(1))],
+        "every customer counts the orders that name its live code"
+    );
 }
 
 /// Issue #754 review: a change whose bucket already applied it, while

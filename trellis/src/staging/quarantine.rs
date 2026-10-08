@@ -34,7 +34,7 @@
 //! key-shaped.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::SystemTime;
 
@@ -386,10 +386,11 @@ pub(super) async fn poisoned_keys_among(
 /// so a key held for good costs one row however often it changes.
 ///
 /// The park's SQL ([`MERGE_HELD_ROW`]) merges the same way, field for field.
-/// The row also carries what only the release's to-one projection rewrite
-/// reads (#754), which this leaves out: the greatest parked `lsn`, and the
-/// join values the parked changes' raw new images and pre-images held
-/// (`join_values`).
+/// The row also carries two fields this leaves out: the greatest parked
+/// `lsn`, which only the release's to-one projection rewrite reads (#754),
+/// and the join values the parked changes' raw new images and pre-images
+/// held (`join_values`), which that rewrite reads and
+/// [`HeldKey::release`] stages beside the `Recompute` (#944).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeldKey {
     /// The spelling the earliest parked change was held under, which the
@@ -469,27 +470,64 @@ impl HeldKey {
     /// The image-less `Recompute` a release stages for `key` from this row:
     /// see [`release_key`]'s doc comment for what each field carries.
     pub(crate) fn recompute(self, key: &str) -> StagedChange {
+        let hop_gen = self.recompute_hop_gen();
         StagedChange::Recompute {
             src_table: self.src_table,
             key: key.to_string(),
-            hop_gen: if self.src_changed.is_some() {
-                0
-            } else {
-                self.hop_gen
-            },
+            hop_gen,
             group_key: (!self.group_key.is_empty()).then_some(self.group_key),
             src_changed: self.src_changed,
             prior_image: self.prior_image,
             origin_lsn: self.origin_lsn,
         }
     }
+
+    /// Everything a release stages for `key` from this row: its
+    /// [`HeldKey::recompute`], then one [`StagedChange::ReleasedJoinValue`]
+    /// per element of the row's `join_values` (#944), with the
+    /// `Recompute`'s provenance, so they fold into it.
+    ///
+    /// The `Recompute`'s reverse path re-derives the from-side rows of its
+    /// prior image's join values and its live row's. Batches drain out of
+    /// order, so a parked change can have held a value between the two that
+    /// a batch drained unheld wrote into from-side rows (the projection
+    /// rewrite, `apply::release_to_one_projections`, fixes the to-one
+    /// projection row, but not those rows). The join values name it, and
+    /// the fold's `to_col_values` hands it to the reverse path, which
+    /// re-derives those rows on a later page under that page's fences: the
+    /// release takes no lock for them.
+    pub(crate) fn release(self, key: &str, join_values: BTreeSet<String>) -> Vec<StagedChange> {
+        let carried = join_values
+            .into_iter()
+            .map(|image| StagedChange::ReleasedJoinValue {
+                src_table: self.src_table.clone(),
+                key: key.to_string(),
+                image,
+                hop_gen: self.recompute_hop_gen(),
+                src_changed: self.src_changed,
+                origin_lsn: self.origin_lsn,
+            })
+            .collect::<Vec<_>>();
+        let mut staged = vec![self.recompute(key)];
+        staged.extend(carried);
+        staged
+    }
+
+    /// The deepest parked `hop_gen`, or 0 if any parked change was a source
+    /// change.
+    fn recompute_hop_gen(&self) -> i32 {
+        if self.src_changed.is_some() {
+            0
+        } else {
+            self.hop_gen
+        }
+    }
 }
 
 /// The `on conflict` clause every park into `poison_held` ends with: merges
 /// the parked change (`excluded`) into the key's held row (`h`), as
-/// [`HeldKey::merge`] does, plus the two fields only the release's to-one
-/// projection rewrite reads (#754): the union of `join_values` and the
-/// greatest `lsn`. Every right-hand side reads `h` as it was before the
+/// [`HeldKey::merge`] does, plus the two fields it leaves out: the union of
+/// `join_values` and the greatest `lsn`. Every right-hand side reads `h` as it was before the
 /// update, so `old_image` compares the old `seg_seq`.
 const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do update set \
          seg_seq = least(h.seg_seq, excluded.seg_seq), \
@@ -4347,6 +4385,16 @@ async fn end_request(
 /// (`apply::release_to_one_projections`, issue #754), before the
 /// `Recompute` re-derives the key's from-side rows from it.
 ///
+/// The `Recompute`'s reverse path re-derives the from-side rows of its
+/// prior image's join values and its live row's, and batches drain out of
+/// order, so a value between them may have been read by from-side rows a
+/// batch drained unheld. The release stages one
+/// [`StagedChange::ReleasedJoinValue`] per `join_values` element beside the
+/// `Recompute` (#944, [`HeldKey::release`]), which folds into it, so its
+/// reverse path re-derives every such value's from-side rows on a later
+/// page, to-one and to-many alike. That page takes their fences and locks;
+/// the release takes none for them.
+///
 /// **Concurrency.** Three things write a definition's held keys: a drain
 /// page parks a change for one ([`park_batch_contribution`]), an eviction
 /// poisons one ([`isolate_and_evict`], a build chunk's [`evict_build_key`]),
@@ -4474,9 +4522,15 @@ pub async fn release_key(
             )
         })
         .reduce(HeldKey::merge);
-    let change = match merged {
-        Some(merged) => merged.recompute(key),
-        None => StagedChange::Recompute {
+    // #944: every join value the held row names rides along with the
+    // `Recompute` (`HeldKey::release`).
+    let join_values: BTreeSet<String> = held
+        .iter()
+        .flat_map(|row| row.get::<_, Vec<String>>(7))
+        .collect();
+    let staged = match merged {
+        Some(merged) => merged.release(key, join_values),
+        None => vec![StagedChange::Recompute {
             src_table: marked[0].get(0),
             key: key.to_string(),
             hop_gen: 0,
@@ -4484,9 +4538,9 @@ pub async fn release_key(
             src_changed: None,
             prior_image: None,
             origin_lsn: None,
-        },
+        }],
     };
-    append::append(&txn, &[change]).await?;
+    append::append(&txn, &staged).await?;
 
     txn.execute(
         "delete from key_deaths \
@@ -6980,7 +7034,7 @@ mod unit_tests {
                             origin_lsn \
                      from (select * from seg_0 union all select * from seg_1 \
                            union all select * from seg_2 union all select * from seg_3) ring \
-                     where key = $1 and op = 'recompute'",
+                     where key = $1 and op = 'recompute' and new_image is null",
                     &[&key],
                 )
                 .await
@@ -7000,8 +7054,33 @@ mod unit_tests {
                 .collect();
             assert_eq!(
                 staged,
-                vec![recompute_fields(model.recompute(&key))],
+                vec![recompute_fields(model.clone().recompute(&key))],
                 "case {case}: the release stages the merged row's Recompute"
+            );
+            // #944: and one join value per `join_values` element beside it,
+            // with the `Recompute`'s provenance.
+            let carried: Vec<(String, i32, Option<SystemTime>, Option<PgLsn>)> = raw
+                .query(
+                    "select c || '=' || (new_image ->> c), hop_gen, src_changed, origin_lsn \
+                     from (select * from seg_0 union all select * from seg_1 \
+                           union all select * from seg_2 union all select * from seg_3) ring, \
+                          jsonb_object_keys(new_image) c \
+                     where key = $1 and op = 'recompute' and new_image is not null \
+                     order by c || '=' || (new_image ->> c) collate \"C\"",
+                    &[&key],
+                )
+                .await
+                .expect("read the staged join values")
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+                .collect();
+            let expected: Vec<_> = join_values
+                .iter()
+                .map(|value| (value.clone(), staged[0].2, staged[0].4, staged[0].6))
+                .collect();
+            assert_eq!(
+                carried, expected,
+                "case {case}: the release stages every join value"
             );
             assert_eq!(read_count(&raw, &key).await, 0, "case {case}: released");
         }
