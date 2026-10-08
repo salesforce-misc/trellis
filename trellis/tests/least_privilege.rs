@@ -28,7 +28,11 @@
 //!
 //! It runs the real background pipeline, so it polls `status` the way an
 //! embedder does (`docs/embedding.md`, "Poll to `live`, don't wait"),
-//! bounded at 60s per wait. Some worker failures are only logged and
+//! bounded at 60s per wait. The pipeline is the [`trellis::Client`] that
+//! `TrellisOptions { staging: true, drain_threads: 2 }` starts, but with a
+//! 200ms reconcile pass instead of the 5s default: most steps wait on a pass
+//! (a capture install, a discharge, a pause or resume landing), and at 5s
+//! they made up most of the test's time. Some worker failures are only logged and
 //! retried, so the test also records every warning or error event logged
 //! anywhere in the process, and fails on any that reads as a privilege
 //! refusal.
@@ -38,7 +42,8 @@ use std::time::{Duration, Instant};
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::{
-    Config, DefinitionStatus, SelfCheckOutcome, TransformStatus, Trellis, TrellisOptions,
+    ClientOptions, Config, DefinitionStatus, SelfCheckOutcome, TransformStatus, Trellis,
+    TrellisOptions,
 };
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -106,7 +111,9 @@ mod logged {
                 let event = event.to_lowercase();
                 event.contains("permission denied")
                     || event.contains("must be owner")
-                    || event.contains("42501")
+                    // `SqlState(E42501)`, as an error's `Debug` spells it;
+                    // a bare `42501` could be part of a pid or a count.
+                    || event.contains("e42501")
                     || event.contains("insufficient privilege")
             })
             .cloned()
@@ -332,16 +339,19 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     trellis::migrate(&pool, &config)
         .await
         .expect("migrate as the Trellis role");
-    let trellis = Trellis::connect(
+    let trellis = Trellis::connect(config.clone(), TrellisOptions::default())
+        .await
+        .expect("connect as the Trellis role");
+    let workers = trellis::Client::start_with_config(
         config,
-        TrellisOptions {
-            staging: true,
-            drain_threads: 2,
-            ..TrellisOptions::default()
+        ClientOptions {
+            staging_worker: true,
+            application_threads: 2,
+            reconcile_interval: Duration::from_millis(200),
+            ..ClientOptions::default()
         },
     )
-    .await
-    .expect("connect as the Trellis role");
+    .expect("start the staging and drain workers as the Trellis role");
     let app = connect(&as_role(db.dsn(), "app")).await;
 
     // Define a 1-1, an aggregate and a to-one relationship transform.
@@ -498,6 +508,6 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
         .await
         .expect("the application writes without capture");
     assert_no_privilege_refusal("DROP");
-    trellis.shutdown().await.expect("shutdown");
+    workers.shutdown().await.expect("shutdown");
     assert_no_privilege_refusal("shutdown");
 }
