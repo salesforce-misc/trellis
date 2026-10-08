@@ -146,6 +146,9 @@ Why each is needed, and what Trellis does when one is missing:
 [embedding — What the staging worker needs from the database](embedding.md#what-the-staging-worker-needs-from-the-database),
 [transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)
 and [known correctness gaps, entry 11](known-correctness-gaps.md#11-row-level-security-on-a-role-trellis-runs-as).
+Define refuses a source or relationship endpoint whose schema the role lacks
+`USAGE` on, or that the role neither owns nor holds any privilege on, and
+names the table and what the role lacks.
 
 A setup, with `app_owner` owning the source tables, `app_writer` writing them
 and `app_reader` reading targets:

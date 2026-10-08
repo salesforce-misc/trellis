@@ -149,6 +149,22 @@ pub enum CatalogError {
     /// dropped, renamed, or never existed under that bare name. Also a table
     /// dropped between resolving it and a later check that reads it.
     SourceTableNotFound(String),
+    /// A table a definition or relationship names exists, but the role
+    /// Trellis connects as can't use it (issue #933): it lacks `USAGE` on the
+    /// table's schema, holds no privilege on the table itself (it neither
+    /// owns it nor inherits a role that does), or both. Postgres's name
+    /// resolution and `information_schema` hide such a table, so without this
+    /// check define reports it as missing, or blames its shape.
+    TableNotAccessible {
+        /// `schema.table`.
+        table: String,
+        /// The role the session runs as (`current_user`).
+        role: String,
+        /// The table's owner, the role to grant membership in.
+        owner: String,
+        lacks_schema_usage: bool,
+        lacks_table_privilege: bool,
+    },
     /// A 1-1 definition's source was given another row-identity key after
     /// define (issues #687, #708): its target is keyed by the old one, so a
     /// resume can't rebuild into it. [`revalidate`] refuses it; the repair
@@ -415,6 +431,9 @@ impl CatalogError {
             CatalogError::UnknownValueType { .. } => ErrorCode::Internal,
             CatalogError::Backfill(err) => err.code(),
             CatalogError::SourceTableNotFound(_) => ErrorCode::NotFound,
+            // A setup the definition can't run under, like
+            // `RowSecurityApplies`: the fix is a grant.
+            CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             // Collides with existing state (another live definition's
             // persisted target), not a structural/semantic rejection of this
@@ -470,6 +489,38 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
+            }
+            CatalogError::TableNotAccessible {
+                table,
+                role,
+                owner,
+                lacks_schema_usage,
+                lacks_table_privilege,
+            } => {
+                let schema = schema_of(table).unwrap_or(table);
+                write!(
+                    f,
+                    "table \"{table}\" exists, but role \"{role}\", which Trellis runs as, "
+                )?;
+                match (lacks_schema_usage, lacks_table_privilege) {
+                    (true, true) => write!(
+                        f,
+                        "lacks USAGE on schema \"{schema}\", and isn't a member of \"{owner}\", \
+                         the table's owner, or granted any privilege on the table"
+                    )?,
+                    (true, false) => write!(f, "lacks USAGE on schema \"{schema}\"")?,
+                    _ => write!(
+                        f,
+                        "isn't a member of \"{owner}\", the table's owner, or granted any \
+                         privilege on the table"
+                    )?,
+                }
+                write!(
+                    f,
+                    ". Trellis needs USAGE on the schema of every source, and must own each \
+                     source and relationship to-side table or be a member of the role that owns \
+                     it, with INHERIT: see \"One Trellis role\" in docs/recommendations.md"
+                )
             }
             CatalogError::SourceKeyChanged {
                 source_table,
@@ -623,6 +674,7 @@ impl std::error::Error for CatalogError {
             CatalogError::UnknownValueType { .. } => None,
             CatalogError::Backfill(err) => Some(err),
             CatalogError::SourceTableNotFound(_) => None,
+            CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
@@ -825,14 +877,8 @@ pub async fn install_definition(
     // function) ever run. This one is a pure fail-fast nicety for the far
     // more common `install_definition` path, redundant-but-harmless on the
     // path that also reaches `create_definition_inner`.
-    if let Some(schema) = &def.explicit_source_schema
-        && !confirm_qualified_table_exists(pool, schema, &def.source).await?
-    {
-        return Err(ValidationError::QualifiedSourceTableNotFound {
-            schema: schema.clone(),
-            table: def.source.clone(),
-        }
-        .into());
+    if let Some(schema) = &def.explicit_source_schema {
+        confirm_qualified_source(&**pool.get().await?, schema, &def.source).await?;
     }
 
     // Validate *before* any DDL is generated or executed, for every key-space
@@ -856,7 +902,7 @@ pub async fn install_definition(
             .iter()
             .any(|f| source_columns.contains_key(&f.name))
     {
-        let qualified_source = resolve_source_for_install(pool, &def).await?;
+        let qualified_source = resolve_source_to_define(pool, &def).await?;
         reject_fields_named_after_primary_key(pool, &qualified_source, &def.fields, source_columns)
             .await?;
     }
@@ -881,7 +927,7 @@ pub async fn install_definition(
     // DDL/direct-build step below — see [`resolve_source_for_install`]'s own
     // doc comment for why this function needs its own copy rather than
     // waiting for `create_definition_inner`'s later, authoritative one.
-    let qualified_source = resolve_source_for_install(pool, &def).await?;
+    let qualified_source = resolve_source_to_define(pool, &def).await?;
     // Issue #315: fail fast, before any DDL, on a source that is another
     // definition's not-yet-live target (see `reject_non_live_upstream`).
     reject_non_live_upstream(&**pool.get().await?, &qualified_source).await?;
@@ -2571,7 +2617,7 @@ async fn create_definition_inner(
     //
     // * `Some(schema)` (issue #76): the definition wrote `FROM
     //   <schema>.<source>` explicitly, so `schema` is trusted outright —
-    //   [`confirm_qualified_table_exists_in_txn`] checks that *exact*
+    //   [`confirm_qualified_source`] checks that *exact*
     //   relation is real, never walking `search_path` the way the bare case
     //   does (ADR-0007 grammar clause 4: a qualified spelling resolves to
     //   that one relation, full stop).
@@ -2598,16 +2644,17 @@ async fn create_definition_inner(
     // them.
     let qualified_source = match &def.explicit_source_schema {
         Some(schema) => {
-            if !confirm_qualified_table_exists_in_txn(&txn, schema, &def.source).await? {
-                return Err(ValidationError::QualifiedSourceTableNotFound {
-                    schema: schema.clone(),
-                    table: def.source.clone(),
-                }
-                .into());
-            }
+            confirm_qualified_source(&*txn, schema, &def.source).await?;
             crate::intake::markers::qualify(schema, &def.source)?
         }
-        None => resolve_graph_identity_in_txn(&txn, &def.source).await?,
+        None => match resolve_graph_identity_in_txn(&txn, &def.source).await {
+            // Issue #933: a source the role can't see doesn't resolve.
+            Err(err @ CatalogError::SourceTableNotFound(_)) => {
+                reject_inaccessible_table(&*txn, None, &def.source).await?;
+                return Err(err);
+            }
+            result => result?,
+        },
     };
     // Issue #315: the authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
@@ -2675,7 +2722,7 @@ async fn create_definition_inner(
     // below, after every check on the definition itself (issue #440).
     if target_ddl.is_none()
         && let Some(schema) = &def.explicit_target_schema
-        && !confirm_qualified_table_exists_in_txn(&txn, schema, &def.target).await?
+        && !qualified_table_exists(&*txn, schema, &def.target).await?
     {
         return Err(ValidationError::QualifiedTargetTableNotFound {
             schema: schema.clone(),
@@ -4071,7 +4118,12 @@ async fn resolve_relationship_endpoint_in_txn(
 ) -> Result<String, CatalogError> {
     match resolve_graph_identity_in_txn(txn, table).await {
         Ok(qualified) => Ok(qualified),
-        Err(CatalogError::SourceTableNotFound(_)) => Ok(table.to_string()),
+        // Issue #933: an endpoint the role can't see doesn't resolve either,
+        // and the checks below would blame its shape or its columns.
+        Err(CatalogError::SourceTableNotFound(_)) => {
+            reject_inaccessible_table(txn, None, table).await?;
+            Ok(table.to_string())
+        }
         Err(err) => Err(err),
     }
 }
@@ -4162,6 +4214,152 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
         .await?;
     row.map(|row| row.get(0))
         .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
+}
+
+/// Refuses `table` with [`CatalogError::TableNotAccessible`] when it exists
+/// but the role this session runs as can't use it (issue #933). `schema`
+/// names the schema a qualified reference spelled; `None` looks where a bare
+/// name would resolve, the schemas this session's `search_path` setting
+/// lists.
+///
+/// The lookup reads `pg_class` and `pg_namespace`, which show every relation
+/// whatever the role's privileges, because the two places a name resolves
+/// through hide exactly the tables this is for: `current_schemas` leaves out
+/// a schema the role lacks `USAGE` on, and `information_schema.tables` a
+/// table it holds no privilege on. "Holds a privilege" is
+/// `information_schema.tables`' own test, so a table this passes is one that
+/// view shows.
+///
+/// `Ok(())` when nothing by that name exists in those schemas, or the first
+/// one the path reaches is usable: the caller's own not-found (or whatever
+/// else it found) stands. Define paths call this only once a name failed to
+/// resolve, or on a qualified name before reading it, so a name that
+/// resolves never costs the lookup; and the runtime's own resolution
+/// ([`resolve_graph_identity`]) never calls it.
+pub(crate) async fn reject_inaccessible_table(
+    client: &impl GenericClient,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<(), CatalogError> {
+    let schemas = match schema {
+        Some(schema) => vec![schema.to_string()],
+        None => {
+            let row = client
+                .query_one(
+                    "select current_setting('search_path'), current_user::text",
+                    &[],
+                )
+                .await?;
+            search_path_schemas(row.get(0), row.get(1))
+        }
+    };
+    let Some(row) = client
+        .query_opt(
+            "select n.nspname::text, current_user::text, pg_get_userbyid(c.relowner)::text, \
+                    has_schema_privilege(n.oid, 'USAGE'), \
+                    pg_has_role(c.relowner, 'USAGE') \
+                      or has_table_privilege(c.oid, \
+                           'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                      or has_any_column_privilege(c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') \
+             from pg_catalog.pg_class c \
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+             where c.relname::text = $1 and n.nspname::text = any($2) \
+               and c.relkind in ('r', 'p', 'v', 'f') \
+             order by array_position($2, n.nspname::text) \
+             limit 1",
+            &[&table, &schemas],
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let has_schema_usage: bool = row.get(3);
+    let has_table_privilege: bool = row.get(4);
+    if has_schema_usage && has_table_privilege {
+        return Ok(());
+    }
+    let schema: String = row.get(0);
+    Err(CatalogError::TableNotAccessible {
+        table: format!("{schema}.{table}"),
+        role: row.get(1),
+        owner: row.get(2),
+        lacks_schema_usage: !has_schema_usage,
+        lacks_table_privilege: !has_table_privilege,
+    })
+}
+
+/// The schemas a `search_path` setting lists, in order, the way Postgres
+/// splits it (`SplitIdentifierString`): comma-separated, a double-quoted
+/// element taken as written (`""` is a quote), an unquoted one lowercased,
+/// and `$user` read as `user`. Schemas that don't exist are kept; the caller
+/// matches them against `pg_namespace`.
+fn search_path_schemas(setting: &str, user: &str) -> Vec<String> {
+    let mut schemas = Vec::new();
+    let mut chars = setting.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(&first) = chars.peek() else { break };
+        let mut name = String::new();
+        if first == '"' {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '"' && chars.next_if_eq(&'"').is_none() {
+                    break;
+                }
+                name.push(c);
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| *c != ',' && !c.is_whitespace()) {
+                name.extend(c.to_lowercase());
+            }
+        }
+        schemas.push(if name == "$user" {
+            user.to_string()
+        } else {
+            name
+        });
+        while chars.next_if(|c| *c != ',').is_some() {}
+        if chars.next().is_none() {
+            break;
+        }
+    }
+    schemas
+}
+
+/// [`resolve_source_for_install`] for a definition being defined: a bare
+/// source that doesn't resolve because the role can't see it is refused as
+/// [`CatalogError::TableNotAccessible`] rather than not found (issue #933).
+async fn resolve_source_to_define(pool: &Pool, def: &TransformDef) -> Result<String, CatalogError> {
+    match resolve_source_for_install(pool, def).await {
+        Err(err @ CatalogError::SourceTableNotFound(_)) => {
+            reject_inaccessible_table(&**pool.get().await?, None, &def.source).await?;
+            Err(err)
+        }
+        result => result,
+    }
+}
+
+/// Confirms an explicitly qualified `FROM <schema>.<table>` names a table the
+/// role can use (issue #933) and that exists (issue #76), refusing it as
+/// [`CatalogError::TableNotAccessible`] or
+/// [`ValidationError::QualifiedSourceTableNotFound`]. The privilege check
+/// runs first: a role without `USAGE` on the schema still finds the table in
+/// `information_schema.tables`, and one without any privilege on the table
+/// doesn't.
+async fn confirm_qualified_source(
+    client: &impl GenericClient,
+    schema: &str,
+    table: &str,
+) -> Result<(), CatalogError> {
+    reject_inaccessible_table(client, Some(schema), table).await?;
+    if !qualified_table_exists(client, schema, table).await? {
+        return Err(ValidationError::QualifiedSourceTableNotFound {
+            schema: schema.to_string(),
+            table: table.to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Refuses a 1-1 field named after one of `qualified_source`'s primary key
@@ -4286,41 +4484,20 @@ pub(crate) async fn resolve_source_for_install(
     }
 }
 
-/// Confirms `schema.table` is a real relation (issue #76, ADR-0007 grammar
-/// clause 4) — the existence check an explicitly-qualified `FROM`/`TRANSFORM`
+/// Whether `schema.table` is a real relation (issue #76, ADR-0007 grammar
+/// clause 4): the existence check an explicitly-qualified `FROM`/`TRANSFORM`
 /// reference gets *instead of* [`resolve_source_schema_in_txn`]'s
-/// `search_path` walk: a qualified spelling names its schema directly, so
+/// `search_path` walk. A qualified spelling names its schema directly, so
 /// this checks that one relation is real rather than asking which schema on
 /// the path would have won. Same `information_schema.tables` table that
 /// function itself queries, just filtered to the one named schema instead of
-/// `current_schemas(false)`.
-async fn confirm_qualified_table_exists_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
+/// `current_schemas(false)`. A qualified source goes through
+/// [`confirm_qualified_source`], which checks the role can use it first.
+async fn qualified_table_exists(
+    client: &impl GenericClient,
     schema: &str,
     table: &str,
 ) -> Result<bool, CatalogError> {
-    let exists: bool = txn
-        .query_one(
-            "select exists (select 1 from information_schema.tables \
-             where table_schema = $1 and table_name = $2)",
-            &[&schema, &table],
-        )
-        .await?
-        .get(0);
-    Ok(exists)
-}
-
-/// Pooled (non-transaction) counterpart to
-/// [`confirm_qualified_table_exists_in_txn`], for [`install_definition`]'s
-/// own fail-fast pass — run on a plain connection, before that function opens
-/// any transaction or runs any DDL, mirroring [`column_type`]/
-/// [`column_type_in_txn`]'s same pool-vs-txn split.
-async fn confirm_qualified_table_exists(
-    pool: &Pool,
-    schema: &str,
-    table: &str,
-) -> Result<bool, CatalogError> {
-    let client = pool.get().await?;
     let exists: bool = client
         .query_one(
             "select exists (select 1 from information_schema.tables \
@@ -8395,5 +8572,69 @@ mod relationship_name_tests {
                 "{text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod table_not_accessible_tests {
+    use super::*;
+
+    #[test]
+    fn a_search_path_splits_the_way_postgres_splits_it() {
+        assert_eq!(
+            search_path_schemas("\"$user\", public", "trellis"),
+            ["trellis", "public"]
+        );
+        assert_eq!(
+            search_path_schemas("trellis,trellis_targets ,  public", "x"),
+            ["trellis", "trellis_targets", "public"]
+        );
+        // Unquoted is lowercased, quoted is kept, and `""` is a quote.
+        assert_eq!(
+            search_path_schemas("App, \"My, \"\"Odd\"\" Schema\", $user", "Who"),
+            ["app", "My, \"Odd\" Schema", "Who"]
+        );
+        assert_eq!(search_path_schemas("", "x"), Vec::<String>::new());
+        assert_eq!(search_path_schemas("  ", "x"), Vec::<String>::new());
+    }
+
+    fn not_accessible(usage: bool, privilege: bool) -> CatalogError {
+        CatalogError::TableNotAccessible {
+            table: "public.orders".to_string(),
+            role: "trellis".to_string(),
+            owner: "app_owner".to_string(),
+            lacks_schema_usage: usage,
+            lacks_table_privilege: privilege,
+        }
+    }
+
+    #[test]
+    fn the_message_names_what_the_role_lacks_and_the_doc_section() {
+        let doc = "see \"One Trellis role\" in docs/recommendations.md";
+        let usage = not_accessible(true, false).to_string();
+        assert!(
+            usage.contains("lacks USAGE on schema \"public\""),
+            "{usage}"
+        );
+        assert!(!usage.contains("app_owner"), "{usage}");
+        let privilege = not_accessible(false, true).to_string();
+        assert!(
+            privilege.contains("isn't a member of \"app_owner\", the table's owner"),
+            "{privilege}"
+        );
+        assert!(!privilege.contains("USAGE on schema"), "{privilege}");
+        let both = not_accessible(true, true).to_string();
+        assert!(both.contains("lacks USAGE on schema \"public\""), "{both}");
+        assert!(both.contains("\"app_owner\""), "{both}");
+        for message in [usage, privilege, both] {
+            assert!(
+                message.starts_with(
+                    "table \"public.orders\" exists, but role \"trellis\", which Trellis runs as, "
+                ),
+                "{message}"
+            );
+            assert!(message.ends_with(doc), "{message}");
+        }
+        assert_eq!(not_accessible(true, true).code(), ErrorCode::Validation);
     }
 }

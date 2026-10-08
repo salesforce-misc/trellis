@@ -1394,11 +1394,25 @@ impl Trellis {
         source_table: &str,
         explicit_source_schema: Option<&str>,
     ) -> Result<HashMap<String, ValueType>, TrellisError> {
+        // Issue #933: a table the role can't use is refused as such, naming
+        // the missing privilege, rather than as not found (or, without
+        // `USAGE` on a qualified name's schema, as Postgres's own refusal of
+        // the column read below).
         let qualified = match explicit_source_schema {
             Some(schema) => {
+                let client = self.pool.get().await?;
+                defs::catalog::reject_inaccessible_table(&**client, Some(schema), source_table)
+                    .await?;
                 crate::intake::markers::qualify(schema, source_table).map_err(CatalogError::from)?
             }
-            None => defs::catalog::resolve_graph_identity(&self.pool, source_table).await?,
+            None => match defs::catalog::resolve_graph_identity(&self.pool, source_table).await {
+                Err(err @ CatalogError::SourceTableNotFound(_)) => {
+                    let client = self.pool.get().await?;
+                    defs::catalog::reject_inaccessible_table(&**client, None, source_table).await?;
+                    return Err(err.into());
+                }
+                result => result?,
+            },
         };
         debug_assert!(
             qualified.contains('.'),

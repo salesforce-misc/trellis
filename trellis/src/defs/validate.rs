@@ -438,7 +438,7 @@ pub enum ValidationError {
     /// (issue #76, ADR-0007 grammar clause 4) named a schema that does not
     /// actually contain a table by that name, as introspected live against
     /// `information_schema.tables`
-    /// ([`super::catalog::confirm_qualified_table_exists_in_txn`]). Distinct
+    /// ([`super::catalog::confirm_qualified_source`]). Distinct
     /// from [`super::catalog::CatalogError::SourceTableNotFound`]: that
     /// variant means "no schema on `search_path` has this bare name",
     /// whereas this one means "the exact schema the definition named is
