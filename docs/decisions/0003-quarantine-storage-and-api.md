@@ -81,8 +81,9 @@ transforms/columns at once, and a failure in one of them is that one's to hold.
   earliest parked change's batch and pre-image, the earliest origin position
   (unknown once any change's is, so the key keeps holding back every
   read-your-writes token), the earliest source-change time, the deepest hop,
-  the union of the group keys, the join values the changes' new images held
-  for a relationship's `to_col`, and the greatest WAL position. A held key
+  the union of the group keys, the join values the changes' images held for
+  a relationship's `to_col` (each change's raw new images and its pre-image),
+  and the greatest WAL position. A held key
   costs one row, not one per batch.
 * **`column_failures`** — keyed on `(transform_table, column_name, src_table,
   key)`, one row per `(transform, column)` pair that failed while propagating a

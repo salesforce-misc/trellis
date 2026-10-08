@@ -413,10 +413,10 @@ async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_
 }
 
 /// Issue #442, the quarantine half: a change from before the build, parked in
-/// `poison_held`, has left the ring, but releasing its key after go-live
-/// replays it into the now-`live` definition. Release keeps each replayed
-/// row's original LSN and txid (doc 06), so the replay meets the entry's basis
-/// like any other late delta.
+/// `poison_held`, has left the ring, and its key is released after go-live.
+/// The release doesn't replay the parked change (#623 D3): it discards it and
+/// stages an image-less `Recompute`, which re-derives the key from its live
+/// row, so the build's count of the change is the only one.
 #[tokio::test]
 async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_released_after_go_live() {
     let cluster = TestCluster::start();
@@ -429,7 +429,7 @@ async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_release
         .expect("commit the change");
 
     build_sku_totals_to_go_live(&db.pool, &client).await;
-    // Whole-key poison is per transform (#799), so the parked CDC is
+    // Whole-key poison is per transform (#799), so the parked change is
     // sku_totals', recorded once the definition exists.
     client
         .batch_execute(
@@ -438,12 +438,12 @@ async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_release
              from transform_definitions where target_table = 'public.sku_totals'",
         )
         .await
-        .expect("park the change's CDC");
+        .expect("park the change");
 
-    let replayed = trellis::staging::release_key(&db.pool, "sku_totals", "public.sales", "4")
+    let held_rows = trellis::staging::release_key(&db.pool, "sku_totals", "public.sales", "4")
         .await
         .expect("release the parked key");
-    assert_eq!(replayed, 1);
+    assert_eq!(held_rows, 1);
     assert_the_read_change_is_counted_once(&db.pool, &mut client).await;
 }
 

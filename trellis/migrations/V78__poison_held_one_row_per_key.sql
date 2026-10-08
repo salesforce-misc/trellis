@@ -18,14 +18,16 @@
 --   * `hop_gen`: the deepest;
 --   * `group_key`: the sorted, deduplicated union;
 --   * `join_values`: one `{to_col: value}` object per value the parked
---     changes' raw rows held in some relationship's `to_col`
---     (`FoldedChange::to_col_values`, #785), sorted and deduplicated, which
---     the release's to-one projection rewrite (#754) reads with `old_image`;
+--     changes held in some relationship's `to_col`, deduplicated: every raw
+--     row's new image (`FoldedChange::to_col_values`, #785) and every
+--     park's pre-image (batches drain out of order, so a later park's
+--     pre-image can name a value no parked new image did), which the
+--     release's to-one projection rewrite (#754) reads;
 --   * `lsn`: the greatest, the release's `parked_through` (#754).
 --
 -- `op`, `new_image` and `held_seq` are gone: nothing reads `op`, the release
 -- no longer needs an order among one key's rows, and `join_values` names
--- every to-side key a new image did.
+-- every to-side key the parked images did.
 --
 -- Trellis is unreleased, so the table is recreated empty rather than folded.
 

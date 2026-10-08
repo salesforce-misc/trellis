@@ -388,7 +388,8 @@ pub(super) async fn poisoned_keys_among(
 /// The park's SQL ([`MERGE_HELD_ROW`]) merges the same way, field for field.
 /// The row also carries what only the release's to-one projection rewrite
 /// reads (#754), which this leaves out: the greatest parked `lsn`, and the
-/// join values the parked changes' new images held (`join_values`).
+/// join values the parked changes' raw new images and pre-images held
+/// (`join_values`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeldKey {
     /// The spelling the earliest parked change was held under, which the
@@ -567,8 +568,14 @@ pub(super) async fn park_batch_contribution(
               hop_gen, group_key, join_values, lsn) \
          select $1::bigint, $2::text, $3::text, $4::bigint, $5::text::jsonb, $6::pg_lsn, \
                 $7::timestamptz, $8::integer, $9::text[], \
-                array(select distinct jsonb_build_object(c, v) \
-                      from unnest($10::text[], $11::text[]) u(c, v)), \
+                array(select distinct j from ( \
+                          select jsonb_build_object(c, v) as j \
+                          from unnest($10::text[], $11::text[]) u(c, v) \
+                          union all \
+                          select jsonb_build_object(r.to_col, $5::text::jsonb ->> r.to_col) \
+                          from relationship_definitions r \
+                          where r.to_schema || '.' || r.to_table = $2 \
+                            and $5::text::jsonb ->> r.to_col is not null) named), \
                 $12::pg_lsn \
          where exists (select 1 from poison p \
                        where p.transform_id = $1 and p.src_table = $2 and p.key = $3) \
@@ -582,6 +589,12 @@ pub(super) async fn park_batch_contribution(
         } else {
             &change.old_image
         };
+        // The key's join values: every one its raw rows' new images held
+        // (`to_col_values`), and its pre-image's. Batches drain out of order
+        // (doc 04), so the change before this one may have been applied, not
+        // parked, and only this pre-image names the value it left: the held
+        // row keeps the earliest park's pre-image alone, and a release that
+        // missed the value would leave its to-one projection row behind.
         let (columns, values): (Vec<&str>, Vec<&str>) = change
             .to_col_values
             .iter()
@@ -4328,7 +4341,8 @@ async fn end_request(
 /// A `Recompute` builds no reverse record, so it never moves a to-one
 /// relationship's projection of the key's table. The release writes each
 /// projection row the parked changes named (the held row's pre-image and
-/// `join_values`, the `to_col` values of every new image they folded), and
+/// `join_values`, the `to_col` values of every new image they folded and of
+/// every park's pre-image), and
 /// the live row names, from the live row itself in the same transaction
 /// (`apply::release_to_one_projections`, issue #754), before the
 /// `Recompute` re-derives the key's from-side rows from it.
