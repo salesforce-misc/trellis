@@ -305,7 +305,8 @@ pub enum ApplyError {
     /// Not reachable: only the writers that change keys in batches spill,
     /// and each stages through `flush`, which reads the spill back. Refused
     /// rather than staged, since the spilled keys would never reach the
-    /// ring.
+    /// ring. A programming error no key caused, so it classifies as
+    /// halting (`quarantine::classify`), never isolated against a key.
     SpilledMutationsNotFlushed,
 }
 

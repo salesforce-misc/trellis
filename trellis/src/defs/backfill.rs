@@ -3053,6 +3053,80 @@ mod tests {
         );
     }
 
+    /// Issue #926: the batches take the lost groups in the target's key
+    /// order, ascending under the key's collation with the `NULL` group
+    /// last, as a drain page's group upsert and the orphan sweep lock them
+    /// (ADR-0002 I5), not in the order the target's heap holds them. The
+    /// heap is laid out in descending key order with the `NULL` group first,
+    /// and a batch of 1 makes each delete one group, so a row trigger logs
+    /// the order the batches took.
+    #[tokio::test]
+    async fn a_batched_delete_of_lost_groups_takes_them_in_key_order() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = lose_groups(&db).await;
+        let target = "items_sum_by_g";
+        raw.batch_execute(&format!(
+            "create temp table laid_out as select * from public.{target}; \
+             delete from public.{target}; \
+             insert into public.{target} select * from laid_out order by g desc nulls first; \
+             create table public.deleted_log (n bigserial primary key, g text); \
+             create function public.log_deleted() returns trigger language plpgsql as \
+                 $$ begin insert into public.deleted_log (g) values (old.g); return old; end $$; \
+             create trigger log_deleted before delete on public.{target} \
+                 for each row execute function public.log_deleted()"
+        ))
+        .await
+        .expect("lay the target out against its key order, and log its deletes");
+        let lost = |order: &str| {
+            format!(
+                "select g from public.{target} where g not in ('0', '1') or g is null order by {order}"
+            )
+        };
+        let groups = |rows: Vec<tokio_postgres::Row>| -> Vec<Option<String>> {
+            rows.iter().map(|row| row.get(0)).collect()
+        };
+        let in_key_order = groups(raw.query(&lost("g"), &[]).await.expect("key order"));
+        let in_heap_order = groups(raw.query(&lost("ctid"), &[]).await.expect("heap order"));
+        assert_eq!(in_key_order.len(), 11);
+        assert_eq!(
+            in_key_order.last(),
+            Some(&None),
+            "the NULL group sorts last"
+        );
+        assert_eq!(
+            in_heap_order.first(),
+            Some(&None),
+            "the heap holds it first"
+        );
+        assert_ne!(in_key_order, in_heap_order);
+
+        let (_, mut client) = connect_pool(&db).await;
+        let txn = client.transaction().await.expect("begin");
+        let deleted = delete_stale_groups(
+            &txn,
+            &format!("public.{target}"),
+            &format!("public.{}", quote_ident(target)),
+            &super::super::ledger::qualified_ledger_table("public", target),
+            &[quote_ident("g")],
+            1,
+        )
+        .await
+        .expect("delete the lost groups a group at a time");
+        txn.commit().await.expect("commit");
+        assert_eq!(deleted.deleted, 11);
+        assert_eq!(deleted.largest_batch, 1);
+        let taken = groups(
+            raw.query("select g from public.deleted_log order by n", &[])
+                .await
+                .expect("read the delete log"),
+        );
+        assert_eq!(
+            taken, in_key_order,
+            "the batches take the groups in key order, NULL last"
+        );
+    }
+
     /// Issue #769: every column of a key range is compared under its
     /// recorded collation, and a column with none bare, so an index of that
     /// collation serves the range.

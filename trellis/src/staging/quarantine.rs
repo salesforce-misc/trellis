@@ -139,6 +139,11 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // A truncate the drain can't raise a floor for (#774) is no key's
         // fault: every page holding it reproduces it.
         ApplyError::TruncateWithoutLsn { .. } => FailureClass::Halting,
+        // A spilled accumulator staged in memory (#926) is a programming
+        // error, no key's fault either. It names no table, so the halt
+        // pauses nothing: the page retries once and surfaces it as a drain
+        // holdup, charging no key, where isolating it could evict one.
+        ApplyError::SpilledMutationsNotFlushed => FailureClass::Halting,
         // Both of these mean "this definition can never work against this
         // source's real schema" — a structural, schema-shape diagnosis
         // exactly like the hop bound, not a per-row data problem. By the
@@ -5418,6 +5423,17 @@ mod unit_tests {
             src_table: "public.src".to_string(),
         };
         assert_eq!(classify(&err), FailureClass::Halting);
+    }
+
+    /// Issue #926: a spilled accumulator staged in memory is a programming
+    /// error no key caused, so it halts (pausing nothing, as it names no
+    /// table) rather than isolate and charge a key for it.
+    #[test]
+    fn classify_maps_a_spilled_accumulator_staged_in_memory_to_halting() {
+        assert_eq!(
+            classify(&ApplyError::SpilledMutationsNotFlushed),
+            FailureClass::Halting
+        );
     }
 
     #[test]

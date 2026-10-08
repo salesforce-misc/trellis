@@ -4,8 +4,11 @@
 //! can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a propagation
 //! wave past the hop bound (`HopBoundExceeded`), an aggregate target off
 //! the ledger (`AggregateOffLedger`), a truncate with no ring `lsn`
-//! (`TruncateWithoutLsn`), or Postgres refusing the drain's role a read or
-//! write (`42501`, see below). Every key it touches reproduces it, so
+//! (`TruncateWithoutLsn`), Postgres refusing the drain's role a read or
+//! write (`42501`, see below), or a spilled target-mutation accumulator
+//! staged in memory (`SpilledMutationsNotFlushed`, a programming error that
+//! names no table, so it pauses nothing and surfaces as a holdup). Every
+//! key it touches reproduces it, so
 //! retrying the page re-fails it forever, and quarantining a key blames one
 //! for nobody's fault. Instead [`halt_closure`] pauses the definitions the
 //! failure reaches, and the drain retries the page without them:
