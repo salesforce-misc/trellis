@@ -1963,8 +1963,8 @@ pub async fn alter_transform(
     // writes its readers, whenever they were added
     // (`staging::build::FieldPlan::for_chunk`). Issue #915: an edited field,
     // or a sibling paused with it, may already have readers, so each row
-    // this writes owes the cascade to them, which the capture pass runs
-    // once this commits.
+    // this writes owes the cascade to them, which this call walks once this
+    // commits.
     if builds_fields {
         pause_readers_of_paused_columns(
             &*txn,
@@ -1996,6 +1996,18 @@ pub async fn alter_transform(
     }
 
     txn.commit().await?;
+
+    // Issue #915: walk the cascade each field this paused owes, now that
+    // nothing is held. See `staging::quarantine::cascade_edit_pauses`.
+    if builds_fields
+        && let Err(err) = crate::staging::quarantine::cascade_edit_pauses(pool, &alter.target).await
+    {
+        tracing::warn!(
+            transform = %alter.target,
+            error = %err,
+            "couldn't read the column pauses this edit owes a cascade; the capture pass walks them"
+        );
+    }
 
     let definition = definition_by_target(pool, &alter.target)
         .await?
@@ -2085,11 +2097,13 @@ async fn lock_column_pauses_in_order(
 /// edit pauses may already have readers: definitions reading it, and
 /// fields of `def` reading it by alias that the edit didn't touch. Each row
 /// this writes then owes the cascade a pause writes
-/// (`column_status.cascade_pending`), and the staging worker's capture pass
-/// walks it after this commits (`staging::quarantine`'s
-/// `complete_pause_cascades`). The walk isn't run here: each reader's pause
-/// bumps its own definition's source fence, and this transaction holds
-/// `def`'s already. A define's fields have no readers yet, so it owes none.
+/// (`column_status.cascade_pending`), and [`alter_transform`] walks it
+/// right after this commits (`staging::quarantine`'s
+/// `cascade_edit_pauses`), leaving a walk that fails to the staging worker's
+/// capture pass (`complete_pause_cascades`). The walk isn't run here: each
+/// reader's pause bumps its own definition's source fence, and this
+/// transaction holds `def`'s already. A define's fields have no readers yet,
+/// so it owes none.
 ///
 /// Runs in the define or edit's own transaction, whose first lock bumped
 /// the version fence of `def`'s source: the fence `staging::quarantine`'s

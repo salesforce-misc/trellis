@@ -2750,8 +2750,9 @@ async fn pause_dependent(
 /// the error and can be re-run, but a column fuse trip has no caller to
 /// retry it, and its column, now paused, stops failing, so no new charge
 /// trips it again. An `ALTER TRANSFORM` that pauses a field at birth
-/// (issue #915) marks it and runs no walk of its own: its transaction holds
-/// its definition's source fence, and each reader's pair bumps its own.
+/// (issue #915) walks it once it commits ([`cascade_edit_pauses`]), but the
+/// edit has already committed, so a walk that fails there leaves its mark
+/// to this.
 ///
 /// The staging worker's capture pass calls this each pass, as it releases
 /// the keys an in-place re-type held. That pass runs on the maintenance
@@ -2763,13 +2764,45 @@ async fn pause_dependent(
 /// finishes. Returns how many walks finished. Only reading the marks
 /// fails the call.
 pub async fn complete_pause_cascades(pool: &Pool) -> Result<usize, ApplyError> {
+    walk_marked_pauses(pool, None, Some(CASCADE_COMPLETION_LOCK_TIMEOUT)).await
+}
+
+/// Walks the cascade of each of `transform`'s column pauses marked as owing
+/// one (`column_status.cascade_pending`), right after an `ALTER TRANSFORM`
+/// of `transform` that marked them commits (issue #915), as [`pause_column`]
+/// walks its own pause right after its commit. The edit's own transaction
+/// can't run the walk: it holds its definition's source fence, and each
+/// reader's pair bumps that reader's own ([`pause_dependent`]). So the walk
+/// runs here, with nothing else held, and its readers stop applying the
+/// edited field's frozen value by the time the edit returns.
+///
+/// The edit has committed by then, so it shouldn't fail for its walk: a walk
+/// that fails is logged and keeps its mark, which the capture pass's
+/// [`complete_pause_cascades`] finishes. Each pair waits for its locks as
+/// long as the session's lock timeout, as a `PAUSE`'s walk does. Returns how
+/// many walks finished. Only reading the marks fails the call.
+pub async fn cascade_edit_pauses(pool: &Pool, transform: &str) -> Result<usize, ApplyError> {
+    walk_marked_pauses(pool, Some(transform), None).await
+}
+
+/// Walks ([`cascade_pause`]) each column pause marked as owing its cascade,
+/// of `transform` when given and of every target otherwise, in
+/// `(transform, column)` order, with each pair's lock waits capped at
+/// `lock_timeout` when given. Logs a walk that fails and goes on to the
+/// next. Returns how many walks finished.
+async fn walk_marked_pauses(
+    pool: &Pool,
+    transform: Option<&str>,
+    lock_timeout: Option<std::time::Duration>,
+) -> Result<usize, ApplyError> {
     let pending: Vec<(String, String, String)> = pool
         .get()
         .await?
         .query(
             "select transform_table, column_name, xmin::text from column_status \
-             where cascade_pending order by transform_table, column_name",
-            &[],
+             where cascade_pending and ($1::text is null or transform_table = $1) \
+             order by transform_table, column_name",
+            &[&transform],
         )
         .await?
         .into_iter()
@@ -2780,23 +2813,15 @@ pub async fn complete_pause_cascades(pool: &Pool) -> Result<usize, ApplyError> {
         tracing::info!(
             transform = %transform,
             column = %column,
-            "finishing a column pause's cascade that didn't complete"
+            "walking a column pause's owed cascade"
         );
-        match cascade_pause(
-            pool,
-            transform,
-            column,
-            mark,
-            Some(CASCADE_COMPLETION_LOCK_TIMEOUT),
-        )
-        .await
-        {
+        match cascade_pause(pool, transform, column, mark, lock_timeout).await {
             Ok(()) => finished += 1,
             Err(err) => tracing::warn!(
                 transform = %transform,
                 column = %column,
                 error = %err,
-                "couldn't finish a column pause's cascade; retrying next pass"
+                "couldn't finish a column pause's cascade; the capture pass retries it"
             ),
         }
     }
@@ -2842,7 +2867,7 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// pause, or commits before it and is in the graph [`cascade_pause`] walks.
 /// An edit that pauses a field which already has readers takes the field's
 /// target's lock exclusive too, and marks the field as owing its cascade
-/// (issue #915), which [`complete_pause_cascades`] runs.
+/// (issue #915), which it walks once it commits ([`cascade_edit_pauses`]).
 ///
 /// **`local_fuse` is set even though no fuse tripped.** That column records
 /// "this pair has a reason of its own to stay paused", as opposed to a pause

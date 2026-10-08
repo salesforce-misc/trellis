@@ -69,7 +69,8 @@ a transaction of its own. If a reader's fence bump waits out the lock timeout, t
 returns the error and stays marked as owing its cascade, and the staging worker's capture
 pass finishes the cascade. A definition defined, or a field added or edited, while a
 column it reads is paused is paused at birth, and that column's resume releases it. An
-edited field that already has readers owes their cascade, which the capture pass runs.
+edited field that already has readers owes their cascade, which the edit walks once it
+commits. If that walk fails, the edit still succeeds and the capture pass finishes it.
 
 ### Resume reconciles with source, not by catch-up
 
