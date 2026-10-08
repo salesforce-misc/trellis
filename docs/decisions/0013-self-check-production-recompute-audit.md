@@ -34,7 +34,7 @@ as current as the capture feeding it, and a broken capture
 is invisible to the convergence wait: convergence is a predicate over ring
 rows, and a capture that has stopped writes none. So before it awaits or
 compares anything, `self_check` reads from the catalog (`pg_trigger`,
-`pg_proc`, `pg_inherits` and the `has_*_privilege` functions) that every table
+`pg_proc`, `pg_class`, `pg_inherits` and the `has_*_privilege` functions) that every table
 the target is computed from (its source and the to-side of each relationship
 it reads through, less any this instance's seam feeds) is still captured as
 the staging worker installed it:
@@ -48,10 +48,12 @@ the staging worker installed it:
 - the role each function runs as still has `USAGE` on the schema, `INSERT` on
   every ring segment, and `USAGE` on the change-id sequence and the ring slot
   mirror;
-- the table is still outside any partition or inheritance hierarchy.
-  Acceptance refuses such a table, but nothing refuses a later `ATTACH
-  PARTITION` or `INHERIT`, and a statement trigger fires only for the table a
-  statement names.
+- the table is still a plain table outside any partition or inheritance
+  hierarchy. Acceptance refuses such a table, but nothing refuses a later
+  `ATTACH PARTITION` or `INHERIT`, or the table dropped and recreated as one,
+  and a statement trigger fires only for the table a statement names. The
+  staging worker's reconcile pass runs the same check
+  (`defs::hierarchy`) and pauses the table's readers.
 
 Any fault is reported as a `capture` divergence, and the report stops there:
 no recompute comparison runs, because it would only show the symptom. The

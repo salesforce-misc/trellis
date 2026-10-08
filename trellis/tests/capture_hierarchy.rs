@@ -316,6 +316,79 @@ async fn a_source_recreated_in_a_hierarchy_pauses_its_readers_and_gets_no_captur
     }
 }
 
+/// The false-positive gate: hierarchy membership is a catalog fact that only
+/// DDL naming the hierarchy changes. Routine maintenance that rewrites the
+/// heap or its indexes, and Trellis's own widen, narrow and repair of the
+/// table's capture, each followed by a pass, pause nothing.
+#[tokio::test]
+async fn routine_maintenance_and_trellis_capture_ddl_pause_nothing() {
+    let cluster = TestCluster::start();
+    let mut it = instance(
+        &cluster,
+        &[
+            "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+            "TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total",
+        ],
+    )
+    .await;
+    // Each on its own: `VACUUM` and `REINDEX CONCURRENTLY` refuse a
+    // transaction block.
+    for statement in [
+        "vacuum full public.c",
+        "cluster public.c using c_pkey",
+        "reindex table public.c",
+        "reindex table concurrently public.c",
+        "vacuum (freeze) pg_catalog.pg_class",
+        "vacuum (freeze) pg_catalog.pg_inherits",
+        "analyze public.c",
+        "update public.c set amount = amount + 1",
+    ] {
+        it.raw.batch_execute(statement).await.expect(statement);
+        capture_pass(&mut it.raw, &it.db.pool).await;
+        assert_unpaused(&it, statement).await;
+    }
+
+    // Trellis's own capture DDL on the table: a widen for a definition that
+    // reads a new column, the narrow when it's dropped, and the repair of a
+    // disabled trigger.
+    it.trellis
+        .apply("TRANSFORM c_pids FROM public.c SELECT pid AS pid")
+        .await
+        .expect("define a reader of a new column");
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    markers::settle_registrations(&it.db.pool).await;
+    assert_unpaused(&it, "widen").await;
+    for statement in ["PAUSE TRANSFORM c_pids", "DROP TRANSFORM c_pids"] {
+        it.trellis.apply(statement).await.expect(statement);
+    }
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    assert_unpaused(&it, "narrow").await;
+    it.raw
+        .batch_execute("alter table public.c disable trigger all")
+        .await
+        .expect("disable capture");
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    assert_unpaused(&it, "repair").await;
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Asserts the check finds nothing for `public.c` and neither of its readers
+/// is paused or has a `capture_failure`, after `step`.
+async fn assert_unpaused(it: &Instance, step: &str) {
+    assert_eq!(
+        trellis::defs::hierarchy::hierarchy(&it.raw, "public.c")
+            .await
+            .expect("the check"),
+        vec![],
+        "{step}"
+    );
+    for target in ["c_copy", "c_sums"] {
+        let reported = status(&it.trellis, target).await;
+        assert_ne!(reported.status, TransformStatus::Paused, "{step}: {target}");
+        assert_eq!(reported.capture_failure, None, "{step}: {target}");
+    }
+}
+
 /// The shared check reads every way a table is in a hierarchy: a
 /// partitioned table once (not once per partition), a sub-partitioned
 /// partition both ways, and nothing for a plain table or one that doesn't

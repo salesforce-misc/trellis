@@ -781,7 +781,9 @@ refusing them up front:
   recreated as a partitioned table, a partition or an inheritance child. The
   pass installs no capture on such a table, and a resume refuses until it's
   a plain table again. Writes made through the hierarchy before the pass sees
-  it aren't captured, and the resume's rebuild re-reads them. Capture's
+  it are missed, or, on an inheritance parent, a child's rows are staged as
+  the parent's own; the resume's rebuild re-reads the table and repairs
+  both. Capture's
   window before the pass sees row-level security is entry 11.
 * **A capture function's privilege revoked, or the function made
   `SECURITY INVOKER`.** This is loud rather than silent: every write to the
