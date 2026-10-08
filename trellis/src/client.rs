@@ -3155,10 +3155,10 @@ mod backfill_chunk_failure_tests {
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].key, "30000");
         assert!(quarantined[0].error_message.contains("out of range"));
-        let parked: Vec<(String, i64)> = f
+        let parked: Vec<(i64, Option<String>)> = f
             .raw
             .query(
-                "select op, seg_seq from poison_held where key = '30000'",
+                "select seg_seq, old_image::text from poison_held where key = '30000'",
                 &[],
             )
             .await
@@ -3168,10 +3168,7 @@ mod backfill_chunk_failure_tests {
             .collect();
         assert_eq!(
             parked,
-            vec![(
-                "recompute".to_string(),
-                crate::staging::quarantine::BUILD_PARK_SEG_SEQ
-            )],
+            vec![(crate::staging::quarantine::BUILD_PARK_SEG_SEQ, None)],
             "a release re-derives the key"
         );
 

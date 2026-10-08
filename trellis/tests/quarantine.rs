@@ -200,33 +200,30 @@ async fn insert_poison_marker(client: &Client, transform: &str, src_table: &str,
         .expect("insert poison marker");
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Holds `key` for `transform` with one `poison_held` row (#803: one per
+/// held key), as parked changes leave it: their earliest segment, pre-image
+/// and origin.
 async fn insert_poison_held(
     client: &Client,
     transform: &str,
     src_table: &str,
     key: &str,
     seg_seq: i64,
-    op: &str,
     old_image: Option<&str>,
-    new_image: Option<&str>,
     origin_lsn: Option<u64>,
 ) {
     let id = transform_id(client, transform).await;
     client
         .execute(
             "insert into poison_held \
-                 (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, \
-                  origin_lsn, hop_gen) \
-             values ($9, $1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, $8, 0)",
+                 (transform_id, src_table, key, seg_seq, lsn, old_image, origin_lsn, hop_gen) \
+             values ($7, $1, $2, $3, $4, $5::text::jsonb, $6, 0)",
             &[
                 &src_table,
                 &key,
                 &seg_seq,
-                &op,
                 &Some(testkit::wal_insert_lsn(client).await),
                 &old_image,
-                &new_image,
                 &origin_lsn.map(PgLsn::from),
                 &id,
             ],
@@ -294,18 +291,7 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
         .expect("seed orders row");
 
     insert_poison_marker(&client, "order_totals", "orders", "1").await;
-    insert_poison_held(
-        &client,
-        "order_totals",
-        "orders",
-        "1",
-        1,
-        "insert",
-        None,
-        Some(r#"{"id":"1","price":"10.00","tax":"1.50"}"#),
-        Some(10),
-    )
-    .await;
+    insert_poison_held(&client, "order_totals", "orders", "1", 1, None, Some(10)).await;
 
     let token = PgLsn::from(50);
     assert!(
@@ -1111,66 +1097,31 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     );
 }
 
-/// Scenario: `poison_held` is idempotent on `(transform_id, src_table, key,
-/// seg_seq)` — a retried park for the exact same definition, batch and key
-/// must not duplicate or overwrite the row already parked for it.
+/// Scenario: `poison_held` holds one row per `(transform_id, src_table,
+/// key)` (#803), whichever batch parked into it: a second row for a key
+/// already held, from another batch, is refused, since a park merges into the
+/// first one instead (`staging::quarantine::park_batch_contribution`).
 #[tokio::test]
-async fn poison_held_is_idempotent_on_table_key_batch() {
+async fn poison_held_holds_one_row_per_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
     seed_order_totals(&db, &client).await;
 
-    let insert = "insert into poison_held \
-                      (transform_id, src_table, key, seg_seq, op, old_image, new_image, hop_gen) \
-                  select id, $1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0 \
-                  from transform_definitions \
-                  on conflict (transform_id, src_table, key, seg_seq) do nothing";
-
+    let insert = "insert into poison_held (transform_id, src_table, key, seg_seq) \
+                  select id, 'orders', '1', $1 from transform_definitions";
     client
-        .execute(
-            insert,
-            &[
-                &"orders",
-                &"1",
-                &1i64,
-                &"insert",
-                &None::<&str>,
-                &Some(r#"{"price":"10.00"}"#),
-            ],
-        )
+        .execute(insert, &[&1i64])
         .await
-        .expect("first park attempt");
-    client
-        .execute(
-            insert,
-            &[
-                &"orders",
-                &"1",
-                &1i64,
-                &"update",
-                &None::<&str>,
-                &Some(r#"{"price":"999.00"}"#),
-            ],
-        )
+        .expect("the first batch's park");
+    let second = client
+        .execute(insert, &[&2i64])
         .await
-        .expect("second, conflicting park attempt for the same triple");
-
-    let rows = client
-        .query(
-            "select op, new_image::text from poison_held where src_table = 'orders' and key = '1' and seg_seq = 1",
-            &[],
-        )
-        .await
-        .expect("read poison_held");
-    assert_eq!(rows.len(), 1, "the retried park must not duplicate the row");
-    let op: String = rows[0].get(0);
-    let new_image: String = rows[0].get(1);
+        .expect_err("a second row for the held key");
     assert_eq!(
-        op, "insert",
-        "the first park's content must survive, not be overwritten"
+        second.code(),
+        Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
     );
-    assert!(new_image.contains("10.00"));
 }
 
 /// Scenario: the dropped-table purge is the only path allowed to write a
@@ -1232,19 +1183,17 @@ async fn dropped_table_purge_lets_a_wedged_batch_drain() {
     );
 }
 
-/// Scenario: release replays `poison_held` rows in batch order (`seg_seq`)
-/// then position order, so a key with more than one parked contribution
-/// telescopes to the same final state the oracle would produce, not to
-/// whichever row happened to be inserted first.
+/// Scenario: a key held across several batches has one merged held row
+/// (#803), and its release re-derives the key from the live source row, so
+/// it reaches the oracle's final state, not any batch's parked value.
 #[tokio::test]
-async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_oracle() {
+async fn release_of_a_key_held_across_batches_re_derives_it_to_the_oracle() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
     let def = seed_order_totals(&db, &client).await;
-    // The live source's final state matches the *later* (higher seg_seq)
-    // parked contribution below.
+    // The live source's final state is the later batch's change.
     client
         .execute(
             "insert into orders (id, price, tax) values (1, 30.00, 3.00)",
@@ -1255,30 +1204,14 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
 
     let orders = qualify_fixture_table("orders");
     insert_poison_marker(&client, "order_totals", &orders, "1").await;
-    // Two excluding batches' own parked contributions for the same key,
-    // inserted out of seg_seq order here to prove release doesn't just
-    // replay insertion order.
-    insert_poison_held(
-        &client,
-        "order_totals",
-        &orders,
-        "1",
-        2,
-        "update",
-        None,
-        Some(r#"{"price":"30.00","tax":"3.00"}"#),
-        Some(20),
-    )
-    .await;
+    // Batches 1 and 2 parked into one row: batch 1's pre-image and origin.
     insert_poison_held(
         &client,
         "order_totals",
         &orders,
         "1",
         1,
-        "update",
-        None,
-        Some(r#"{"price":"10.00","tax":"1.00"}"#),
+        Some(r#"{"price":"5.00","tax":"0.50"}"#),
         Some(10),
     )
     .await;
@@ -1286,7 +1219,7 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
     let replayed = trellis::staging::release_key(&db.pool, "order_totals", &orders, "1")
         .await
         .expect("release_key");
-    assert_eq!(replayed, 2);
+    assert_eq!(replayed, 1, "one held row for the key");
 
     let seg_seq = seal_active_segment(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
@@ -1306,9 +1239,9 @@ async fn release_replays_in_batch_then_position_order_and_telescopes_to_the_orac
             .as_ref()
             .map(|n| n.to_string())
             .unwrap(),
-        "the final applied total must match the oracle's, not the earlier batch's parked value"
+        "the final applied total must match the oracle's, not a parked value"
     );
-    assert_eq!(total, "33.00", "batch 2 (seg_seq 2) must win over batch 1");
+    assert_eq!(total, "33.00", "the live row's total");
 }
 
 /// Scenario: doc 06's isolate-before-blaming can find that **no** single key
@@ -2629,8 +2562,8 @@ async fn a_key_one_definition_fails_on_stays_live_in_every_other_reader() {
     );
     assert_eq!(
         rows_for(&client, "poison_held", "order_prices").await,
-        2,
-        "the evicting page's change and the later one are both held for order_prices"
+        1,
+        "the evicting page's change and the later one are held for order_prices in one row"
     );
     assert_eq!(rows_for(&client, "poison_held", "order_totals").await, 0);
 }
@@ -2688,9 +2621,7 @@ async fn resuming_a_definition_releases_its_own_held_keys_only() {
         &orders,
         "2",
         1,
-        "update",
-        None,
-        Some(r#"{"price":"20","tax":"1"}"#),
+        Some(r#"{"price":"10","tax":"1"}"#),
         Some(10),
     )
     .await;

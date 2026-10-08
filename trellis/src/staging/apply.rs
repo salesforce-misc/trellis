@@ -3345,10 +3345,11 @@ async fn apply_projection_from_live(
 /// Issue #754: writes, from the live to-side row, the projection row of
 /// every key a released to-side key's parked changes named, for each to-one
 /// relationship whose to-side is `src_table` (the canonical name). `images`
-/// are the parked changes' images, as JSON text; the live row of `key` names
-/// one more.
+/// are JSON objects, as text, naming them: the held row's pre-image and its
+/// `join_values` (#803). The live row of `key` names one more, and so does
+/// `key` itself where the `to_col` is the table's whole row identity.
 ///
-/// `quarantine::release_key` discards the parked rows and stages an
+/// `quarantine::release_key` discards the parked changes and stages an
 /// image-less `Recompute`, which builds no reverse record, so without this
 /// nothing would carry what the parked changes did to the to-side into the
 /// projection. The write is [`apply_projection_from_live`]'s, counting the
@@ -3393,6 +3394,7 @@ pub(crate) async fn release_to_one_projections(
         .get(0);
     let pk = ddl::source_primary_key(pool, src_table).await?;
     let pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
+    let sole_key = ddl::sole_key_column(&pk);
     // No from-side's key or fence (#831, see the doc comment).
     for rel in &relationships {
         let shape = build_reverse_relationship_shape(pool, rel, None).await?;
@@ -3400,17 +3402,22 @@ pub(crate) async fn release_to_one_projections(
             continue;
         }
         let key_ident = quote_ident(&shape.to_col);
+        // A `to_col` that is the table's whole row identity has the ring key
+        // as its only value, which the parked changes' `join_values` leave
+        // out (`FoldedChange::to_col_values`), so it is named here.
+        let to_col_is_key = sole_key == Some(shape.to_col.as_str());
         let keys: Vec<String> = txn
             .query(
                 &format!(
                     "select k from ( \
                          select i::jsonb ->> $3 as k from unnest($1::text[]) i \
+                         union select $2 where $4 \
                          union select t.{key_ident}::text from {to_table} t \
                          where {pk_expr} = $2) keys \
                      where k is not null order by k collate \"C\"",
                     to_table = shape.to_side.table,
                 ),
-                &[&images, &key, &shape.to_col],
+                &[&images, &key, &shape.to_col, &to_col_is_key],
             )
             .await?
             .into_iter()

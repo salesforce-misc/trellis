@@ -433,9 +433,8 @@ async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_release
     // sku_totals', recorded once the definition exists.
     client
         .batch_execute(
-            "insert into poison_held (transform_id, src_table, key, seg_seq, op, lsn, new_image) \
-             select id, 'public.sales', '4', 1, 'insert', pg_current_wal_insert_lsn(), \
-                    '{\"id\":\"4\",\"sku\":\"a\",\"amount\":\"1000\"}' \
+            "insert into poison_held (transform_id, src_table, key, seg_seq, lsn) \
+             select id, 'public.sales', '4', 1, pg_current_wal_insert_lsn() \
              from transform_definitions where target_table = 'public.sku_totals'",
         )
         .await

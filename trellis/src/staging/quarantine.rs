@@ -3,7 +3,7 @@
 //! "Quarantine" section (the design this module implements) and
 //! docs/decisions/0003-quarantine-storage-and-api.md (storage shape,
 //! settled, including its "Retry policy" section). [`DEFAULT_DEATH_THRESHOLD`]
-//! is this module's answer for the fuse threshold; issue #803 tracks making it
+//! is this module's answer for the fuse threshold; issue #862 tracks making it
 //! configurable.
 //!
 //! **Failure classification** ([`classify`]) is the entry point [`super::apply::drain_once`]
@@ -59,9 +59,9 @@ use super::watermark::StagedWatermark;
 /// this to `0` has chosen to let a poisoning key wedge the instance (doc 06,
 /// condition 4: an undrainable batch below the retirement boundary wedges
 /// every candidate), rather than have this module evict silently. Not yet
-/// wired to any per-instance or per-transform config surface — this crate
-/// has none today — so every call site uses this constant directly; issue #803 tracks a
-/// config surface for it.
+/// wired to any per-instance or per-transform setting (`TrellisOptions` has
+/// none for it), so every call site uses this constant directly; issue #862
+/// tracks making it configurable.
 pub const DEFAULT_DEATH_THRESHOLD: i32 = 5;
 
 /// The column-fuse's threshold (`docs/decisions/0003-quarantine-storage-and-api.md`'s
@@ -379,14 +379,150 @@ pub(super) async fn poisoned_keys_among(
     Ok(poisoned)
 }
 
+/// What a definition's parked changes for one held key tell [`release_key`]:
+/// the fields of one `poison_held` row it stages the key's `Recompute` from
+/// (#803). A definition holds one row per `(src_table, key)`, and each park
+/// merges into it ([`HeldKey::merge`]) rather than adding a row per segment,
+/// so a key held for good costs one row however often it changes.
+///
+/// The park's SQL ([`MERGE_HELD_ROW`]) merges the same way, field for field.
+/// The row also carries what only the release's to-one projection rewrite
+/// reads (#754), which this leaves out: the greatest parked `lsn`, and the
+/// join values the parked changes' new images held (`join_values`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldKey {
+    /// The spelling the earliest parked change was held under, which the
+    /// `Recompute` is staged under.
+    pub(crate) src_table: String,
+    /// The segment of the earliest parked change.
+    pub(crate) seg_seq: i64,
+    /// The earliest parked change's pre-image (a recompute's prior-image
+    /// hint): the state readers last saw.
+    pub(crate) prior_image: Option<String>,
+    /// The earliest origin, or `None` (unknown) once any parked change's is
+    /// unknown ([`super::fold::earliest_origin`]).
+    pub(crate) origin_lsn: Option<PgLsn>,
+    /// The earliest known source-change time. `Some` exactly when some parked
+    /// change was a source change, so it also decides the `Recompute`'s
+    /// `hop_gen`.
+    pub(crate) src_changed: Option<SystemTime>,
+    /// The deepest parked `hop_gen`.
+    pub(crate) hop_gen: i32,
+    /// The union of the parked `group_key`s, sorted and deduplicated, as
+    /// the fold's own cross-segment merge keeps it.
+    pub(crate) group_key: Vec<String>,
+}
+
+impl HeldKey {
+    /// One parked change, before any merge.
+    pub(crate) fn parked(
+        src_table: &str,
+        seg_seq: i64,
+        prior_image: Option<String>,
+        origin_lsn: Option<PgLsn>,
+        src_changed: Option<SystemTime>,
+        hop_gen: i32,
+        group_key: Option<Vec<String>>,
+    ) -> Self {
+        let mut group_key = group_key.unwrap_or_default();
+        group_key.sort_unstable();
+        group_key.dedup();
+        HeldKey {
+            src_table: src_table.to_string(),
+            seg_seq,
+            prior_image,
+            origin_lsn,
+            src_changed,
+            hop_gen,
+            group_key,
+        }
+    }
+
+    /// Merges a later-parked change (`other`) into this held row: the earlier
+    /// segment's image and spelling, the earliest origin (unknown if either
+    /// is) and source-change time, the deepest `hop_gen`, the union of
+    /// `group_key`s. On a segment tie the row already held wins, as the
+    /// park's `on conflict` does. Every other field is order-free, so a key's
+    /// row is the same whatever order its parks commit in.
+    pub(crate) fn merge(self, other: HeldKey) -> HeldKey {
+        let (first, second) = if other.seg_seq < self.seg_seq {
+            (other, self)
+        } else {
+            (self, other)
+        };
+        let mut group_key = first.group_key;
+        group_key.extend(second.group_key);
+        group_key.sort_unstable();
+        group_key.dedup();
+        HeldKey {
+            src_table: first.src_table,
+            seg_seq: first.seg_seq,
+            prior_image: first.prior_image,
+            origin_lsn: super::fold::earliest_origin(first.origin_lsn, second.origin_lsn),
+            src_changed: super::apply::earliest_src_changed(first.src_changed, second.src_changed),
+            hop_gen: first.hop_gen.max(second.hop_gen),
+            group_key,
+        }
+    }
+
+    /// The image-less `Recompute` a release stages for `key` from this row:
+    /// see [`release_key`]'s doc comment for what each field carries.
+    pub(crate) fn recompute(self, key: &str) -> StagedChange {
+        StagedChange::Recompute {
+            src_table: self.src_table,
+            key: key.to_string(),
+            hop_gen: if self.src_changed.is_some() {
+                0
+            } else {
+                self.hop_gen
+            },
+            group_key: (!self.group_key.is_empty()).then_some(self.group_key),
+            src_changed: self.src_changed,
+            prior_image: self.prior_image,
+            origin_lsn: self.origin_lsn,
+        }
+    }
+}
+
+/// The `on conflict` clause every park into `poison_held` ends with: merges
+/// the parked change (`excluded`) into the key's held row (`h`), as
+/// [`HeldKey::merge`] does, plus the two fields only the release's to-one
+/// projection rewrite reads (#754): the union of `join_values` and the
+/// greatest `lsn`. Every right-hand side reads `h` as it was before the
+/// update, so `old_image` compares the old `seg_seq`.
+const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do update set \
+         seg_seq = least(h.seg_seq, excluded.seg_seq), \
+         old_image = case when excluded.seg_seq < h.seg_seq \
+                          then excluded.old_image else h.old_image end, \
+         origin_lsn = case when h.origin_lsn is null or excluded.origin_lsn is null \
+                           then null else least(h.origin_lsn, excluded.origin_lsn) end, \
+         src_changed = least(h.src_changed, excluded.src_changed), \
+         hop_gen = greatest(h.hop_gen, excluded.hop_gen), \
+         group_key = case when h.group_key is null and excluded.group_key is null then null \
+                          else array(select distinct g collate \"C\" \
+                                     from unnest(coalesce(h.group_key, '{}') \
+                                                 || coalesce(excluded.group_key, '{}')) g \
+                                     order by 1) end, \
+         join_values = array(select distinct j \
+                             from unnest(h.join_values || excluded.join_values) j), \
+         lsn = greatest(h.lsn, excluded.lsn)";
+
 /// Parks `changes` — a batch's own folded contribution for keys already
 /// poisoned for a definition, each paired with that definition's id — into
-/// `poison_held`, keyed `(transform_id, src_table, key, seg_seq)` and
-/// idempotent on that key. Must run **inside the same Phase-3 transaction**
+/// `poison_held`. A definition holds one row per key (#803): the first park
+/// inserts it, and every later one merges into it ([`MERGE_HELD_ROW`],
+/// [`HeldKey::merge`]), keeping what [`release_key`] stages the key's
+/// `Recompute` from. Must run **inside the same Phase-3 transaction**
 /// as the rest of the batch's apply, before the drained mark — see the
 /// module doc comment's "Parked work... is the source of truth" and doc 06's
 /// matching section: this is what keeps a held key's band blocked for as
 /// long as the definition holds it.
+///
+/// **Lock order (ADR-0002 I5).** The definitions' rows are locked first,
+/// in id order, then each held row in `(transform_id, src_table, key)`
+/// order, so two pages parking overlapping keys queue on their first shared
+/// row rather than deadlock. Two pages parking the same key contend for its
+/// one row, and the second merges into what the first committed.
 ///
 /// **Parks only while the definition still holds the key.** `changes` were
 /// chosen from `poison` when the page was computed, outside this transaction.
@@ -402,8 +538,8 @@ pub(super) async fn poisoned_keys_among(
 /// waits for the resume to commit and then finds the key no longer held. A
 /// release ([`release_key`]) bumps the version fence of the key's table
 /// first, which waits for this page to commit, since the page holds that
-/// fence `for share` until then; the release then reads the parked rows and
-/// releases them too. A page that read the fence before the release and
+/// fence `for share` until then; the release then reads the parked row and
+/// releases it too. A page that read the fence before the release and
 /// reaches it after misses it and computes again.
 pub(super) async fn park_batch_contribution(
     txn: &Transaction<'_>,
@@ -421,58 +557,56 @@ pub(super) async fn park_batch_contribution(
         &[&ids],
     )
     .await?;
-    for (transform_id, change) in changes {
-        let op = folded_change_op(change);
+    let mut ordered: Vec<&(i64, FoldedChange)> = changes.iter().collect();
+    ordered.sort_by(|(a_id, a), (b_id, b)| {
+        (a_id, &a.src_table, &a.key).cmp(&(b_id, &b.src_table, &b.key))
+    });
+    let statement = format!(
+        "insert into poison_held as h \
+             (transform_id, src_table, key, seg_seq, old_image, origin_lsn, src_changed, \
+              hop_gen, group_key, join_values, lsn) \
+         select $1::bigint, $2::text, $3::text, $4::bigint, $5::text::jsonb, $6::pg_lsn, \
+                $7::timestamptz, $8::integer, $9::text[], \
+                array(select distinct jsonb_build_object(c, v) \
+                      from unnest($10::text[], $11::text[]) u(c, v)), \
+                $12::pg_lsn \
+         where exists (select 1 from poison p \
+                       where p.transform_id = $1 and p.src_table = $2 and p.key = $3) \
+         {MERGE_HELD_ROW}"
+    );
+    for (transform_id, change) in ordered {
         // Issue #315: a recompute's prior-image hint rides in `old_image`,
-        // exactly as it does in the ring, so `release_key` replays it.
-        let old_image = if op == "recompute" {
+        // exactly as it does in the ring, so `release_key` hands it on.
+        let old_image = if change.old_image.is_none() && change.new_image.is_none() {
             &change.prior_image
         } else {
             &change.old_image
         };
+        let (columns, values): (Vec<&str>, Vec<&str>) = change
+            .to_col_values
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_str()))
+            .unzip();
         txn.execute(
-            "insert into poison_held \
-                 (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, \
-                  origin_lsn, src_changed, hop_gen, group_key) \
-             select $1::bigint, $2::text, $3::text, $4::bigint, $5::text, $6::pg_lsn, \
-                    $7::text::jsonb, $8::text::jsonb, $9::pg_lsn, $10::timestamptz, \
-                    $11::integer, $12::text[] \
-             where exists (select 1 from poison p \
-                           where p.transform_id = $1 and p.src_table = $2 and p.key = $3) \
-             on conflict (transform_id, src_table, key, seg_seq) do nothing",
+            &statement,
             &[
                 transform_id,
                 &change.src_table,
                 &change.key,
                 &seg_seq,
-                &op,
-                &change.lsn,
                 old_image,
-                &change.new_image,
                 &change.origin_lsn,
                 &change.src_changed,
                 &change.hop_gen,
                 &change.group_key,
+                &columns,
+                &values,
+                &change.lsn,
             ],
         )
         .await?;
     }
     Ok(())
-}
-
-/// A [`FoldedChange`]'s shape, rendered to the same three-way-plus-recompute
-/// vocabulary `poison_held.op`'s CHECK constraint accepts — derived purely
-/// from image presence, matching [`super::apply::compute`]'s own "three
-/// shapes" dispatch (its doc comment on the `Some`/`(None, Some)`/`(None,
-/// None)` match), so a held row's `op` records exactly the shape
-/// [`release_key`] will later need to reconstruct.
-fn folded_change_op(change: &FoldedChange) -> &'static str {
-    match (&change.old_image, &change.new_image) {
-        (Some(_), Some(_)) => "update",
-        (None, Some(_)) => "insert",
-        (Some(_), None) => "delete",
-        (None, None) => "recompute",
-    }
 }
 
 /// Clears `key_deaths` for every `(src_table, key)` pair in `keys` — called
@@ -1350,14 +1484,9 @@ async fn isolate_and_evict_probing(
     // must never be probed/poisoned/parked here, for the same reason
     // `park_batch_contribution`/`poisoned_park` already exclude it at
     // the `compute()` level (that module's own comment) — `poison_held`
-    // has no columns for `relationship_id`/`retry_count` and no
-    // `rel_reverse_deferred` `op` value in its own CHECK constraint
-    // (`V13__quarantine.sql`, deliberately not widened when V28 added
-    // the new ring op — see that migration's own doc comment), so
-    // parking one would silently derive a *wrong* `op` from image shape
-    // alone (`folded_change_op`), drop `relationship_id`/`retry_count`
-    // entirely, and — worse — `release_key` would later re-append it as
-    // a bogus `StagedChange::Cdc` against this op's synthetic sentinel
+    // has no columns for `relationship_id`/`retry_count`, so parking one
+    // would drop them entirely, and — worse — `release_key` would later
+    // stage a `Recompute` against this op's synthetic sentinel
     // `src_table` (`apply::relationship_reverse_deferred_src_table`),
     // which is not a real table at all. Skipping it here is the loud,
     // safe failure mode doc 06 asks for: if nothing else in this batch
@@ -1365,9 +1494,8 @@ async fn isolate_and_evict_probing(
     // caller (`classify_and_retry`'s `Isolate` arm) surfaces the
     // original failure rather than silently corrupting quarantine
     // state. A complete fix — genuinely quarantine-safe deferred
-    // reverses, with their own `poison_held` columns/op mirroring this
-    // issue's V28 migration — is real and larger than this follow-up;
-    // tracked separately rather than attempted here.
+    // reverses — is real and larger than this follow-up; tracked
+    // separately rather than attempted here.
     let probeable = |c: &FoldedChange| !c.is_truncate && c.relationship_reverse_deferred.is_none();
     let candidates: Cow<'_, [FoldedChange]> = if folded.iter().all(probeable) {
         Cow::Borrowed(folded)
@@ -1518,10 +1646,16 @@ async fn isolate_and_evict_probing(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     let mut evicted = 0;
-    for (transform_id, probes) in by_transform {
+    for (transform_id, mut probes) in by_transform {
         if !evict_for(&txn, transform_id, probes[0].culprit.epoch).await? {
             continue;
         }
+        // Its keys in key order, the order a page parks its held rows in
+        // (`park_batch_contribution`), so the two never wait on each other's
+        // rows in opposite orders (ADR-0002 I5).
+        probes.sort_by(|a, b| {
+            (&a.canonical_src_table, &a.key).cmp(&(&b.canonical_src_table, &b.key))
+        });
         for probe in probes {
             let contribution = folded.iter().find(|c| {
                 !c.is_truncate && c.src_table == probe.raw_src_table && c.key == probe.key
@@ -2086,11 +2220,11 @@ fn not_frozen_sql() -> String {
 }
 
 /// The `poison_held.seg_seq` a build's parked re-derive ([`evict_build_key`])
-/// is held under. No batch has it, so it never collides with a batch's own
-/// parked contribution for the key (which `on conflict do nothing` would
-/// drop), and it sorts after every one of them: [`release_key`] takes its
-/// prior image from the first held row, and a batch's parked change carries
-/// the image readers last saw, which the build's re-derive doesn't know.
+/// is held under. No batch has it, and it sorts after every one, so a batch's
+/// parked change merged into the same held row ([`HeldKey::merge`]) keeps its
+/// pre-image there: [`release_key`] hands on the earliest parked change's
+/// prior image, the image readers last saw, which the build's re-derive
+/// doesn't know.
 pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
 
 /// Quarantines `key` of `src_table` (canonical) for the building definition
@@ -2103,7 +2237,7 @@ pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
 ///   and, once the definition applies, the drain leaves it out of the
 ///   definition's apply;
 /// - a death in `key_deaths`, with the error;
-/// - a parked `recompute` in `poison_held`, so [`release_key`] re-stages the
+/// - a parked re-derive in `poison_held`, so [`release_key`] re-stages the
 ///   key as a re-derive once its cause is fixed. It carries the WAL insert
 ///   position as its origin, so, like a batch's parked change, it holds
 ///   every watermark token taken from then on until the release drains
@@ -2132,9 +2266,11 @@ pub(crate) async fn evict_build_key(
     )
     .await?;
     txn.execute(
-        "insert into poison_held (transform_id, src_table, key, seg_seq, op, origin_lsn) \
-         values ($1, $2, $3, $4, 'recompute', pg_current_wal_insert_lsn()) \
-         on conflict (transform_id, src_table, key, seg_seq) do nothing",
+        &format!(
+            "insert into poison_held as h (transform_id, src_table, key, seg_seq, origin_lsn) \
+             values ($1, $2, $3, $4, pg_current_wal_insert_lsn()) \
+             {MERGE_HELD_ROW}"
+        ),
         &[&transform_id, &src_table, &key, &BUILD_PARK_SEG_SEQ],
     )
     .await?;
@@ -4155,7 +4291,7 @@ async fn end_request(
 
 /// Operator-driven release ([`crate::app::Trellis::release_key`]), one
 /// transaction: stages one image-less `Recompute` of `(src_table, key)` into
-/// the active batch, then deletes the key's `poison_held` rows, its marker,
+/// the active batch, then deletes the key's `poison_held` row, its marker,
 /// and its death counter for the definition whose bare target is `transform`
 /// (#799: whole-key poison is per transform, and so is its release). Another
 /// definition holding the same key keeps holding it. If the key's cause is
@@ -4167,21 +4303,23 @@ async fn end_request(
 /// row, which is idempotent, and one that does parks it, as it parks every
 /// change to a key it holds.
 ///
-/// The parked rows are discarded, not replayed (#623 D3, the D split's
+/// The parked changes are discarded, not replayed (#623 D3, the D split's
 /// finding 7). A replayed CDC row would carry the releaser's `row_txid`, not
 /// its source transaction's, and a ledger target decides whether a change is
 /// already counted by that id (ADR-0002 I2), so a replay could regress an
 /// entry a later Re-derive already moved past. The `Recompute` re-derives
 /// the key from its current row instead, on every target that reads it. It
-/// carries what the parked rows told a reader beyond the current row:
+/// carries what the parked changes told a reader beyond the current row,
+/// which every park merged into the key's one held row ([`HeldKey`], #803):
 ///
-/// - the first parked row's pre-image (a recompute's own hint, or a CDC
-///   row's old image) as its prior image, the state readers last saw, which
-///   the relationship paths still read for the old join value (#624 drops it);
-/// - the parked rows' earliest `origin_lsn` (unknown if any is) and
+/// - the earliest parked change's pre-image (a recompute's own hint, or a
+///   CDC change's old image) as its prior image, the state readers last saw,
+///   which the relationship paths still read for the old join value (#624
+///   drops it);
+/// - the parked changes' earliest `origin_lsn` (unknown if any is) and
 ///   `src_changed`, and their deepest `hop_gen` (0 if any is a source
 ///   change), so the key's band stays blocked until the release drains (doc
-///   06), as the replayed rows' own positions used to keep it;
+///   06), as the replayed changes' own positions used to keep it;
 /// - the union of their `group_key`s.
 ///
 /// A key marked poisoned with nothing parked is re-derived the same way,
@@ -4189,8 +4327,9 @@ async fn end_request(
 ///
 /// A `Recompute` builds no reverse record, so it never moves a to-one
 /// relationship's projection of the key's table. The release writes each
-/// projection row the parked changes named, and the live row names, from the
-/// live row itself in the same transaction
+/// projection row the parked changes named (the held row's pre-image and
+/// `join_values`, the `to_col` values of every new image they folded), and
+/// the live row names, from the live row itself in the same transaction
 /// (`apply::release_to_one_projections`, issue #754), before the
 /// `Recompute` re-derives the key's from-side rows from it.
 ///
@@ -4231,7 +4370,9 @@ async fn end_request(
 /// [`ApplyError::KeyNotHeld`], changing nothing, when the transform holds no
 /// such key. A first lock that waits out the session's `lock_timeout` is
 /// [`ApplyError::ReleaseLockTimeout`], also changing nothing: retryable.
-/// Returns how many parked changes were discarded.
+/// Returns how many held rows it deleted: 1 for a key with parked changes,
+/// 0 for one only marked poisoned (#803; one more for a key also held
+/// under its other spelling, #283).
 pub async fn release_key(
     pool: &Pool,
     transform: &str,
@@ -4290,8 +4431,8 @@ pub async fn release_key(
         .query(
             "delete from poison_held \
              where transform_id = $3 and src_table = any($1::text[]) and key = $2 \
-             returning old_image::text, origin_lsn, src_changed, hop_gen, group_key, src_table, \
-                       new_image::text, lsn, seg_seq, held_seq",
+             returning src_table, seg_seq, old_image::text, origin_lsn, src_changed, hop_gen, \
+                       group_key, join_values::text[], lsn",
             &[&names, &key, &transform_id],
         )
         .await?;
@@ -4303,41 +4444,24 @@ pub async fn release_key(
             key: key.to_string(),
         });
     }
-    // `returning` gives no order, so the parked rows are put back in the
-    // order they were parked in: the first one's pre-image is the state
-    // readers last saw.
-    let mut held = held;
-    held.sort_by_key(|row| (row.get::<_, i64>(8), row.get::<_, i64>(9)));
-
-    let change = match held.first() {
-        Some(first) => {
-            let mut origin_lsn: Option<PgLsn> = first.get(1);
-            let mut src_changed: Option<SystemTime> = None;
-            let mut hop_gen = 0;
-            let mut source_change = false;
-            let mut group_key: Vec<String> = Vec::new();
-            for row in &held {
-                origin_lsn = super::fold::earliest_origin(origin_lsn, row.get(1));
-                let changed: Option<SystemTime> = row.get(2);
-                source_change |= changed.is_some();
-                src_changed = super::apply::earliest_src_changed(src_changed, changed);
-                hop_gen = hop_gen.max(row.get::<_, i32>(3));
-                for value in row.get::<_, Option<Vec<String>>>(4).unwrap_or_default() {
-                    if !group_key.contains(&value) {
-                        group_key.push(value);
-                    }
-                }
-            }
-            StagedChange::Recompute {
-                src_table: first.get(5),
-                key: key.to_string(),
-                hop_gen: if source_change { 0 } else { hop_gen },
-                group_key: (!group_key.is_empty()).then_some(group_key),
-                src_changed,
-                prior_image: first.get(0),
-                origin_lsn,
-            }
-        }
+    // One held row per spelling the key was parked under (#803), merged as
+    // a park would have merged them under one.
+    let merged = held
+        .iter()
+        .map(|row| {
+            HeldKey::parked(
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+                row.get(6),
+            )
+        })
+        .reduce(HeldKey::merge);
+    let change = match merged {
+        Some(merged) => merged.recompute(key),
         None => StagedChange::Recompute {
             src_table: marked[0].get(0),
             key: key.to_string(),
@@ -4365,12 +4489,15 @@ pub async fn release_key(
     // parked ones are discarded here and will never write the key.
     let images: Vec<String> = held
         .iter()
-        .flat_map(|row| [row.get::<_, Option<String>>(0), row.get(6)])
-        .flatten()
+        .flat_map(|row| {
+            row.get::<_, Option<String>>(2)
+                .into_iter()
+                .chain(row.get::<_, Vec<String>>(7))
+        })
         .collect();
     let parked_through: Option<PgLsn> = held
         .iter()
-        .filter_map(|row| row.get::<_, Option<PgLsn>>(7))
+        .filter_map(|row| row.get::<_, Option<PgLsn>>(8))
         .max();
     apply::release_to_one_projections(pool, &txn, &names[0], key, &images, parked_through).await?;
 
@@ -4386,7 +4513,7 @@ pub async fn release_key(
         transform,
         src_table = %names[0],
         key,
-        discarded = held.len(),
+        held_rows = held.len(),
         "released a held key; a recompute re-derives it from its current row"
     );
     Ok(held.len())
@@ -6242,5 +6369,775 @@ mod unit_tests {
 
         assert!(trip_candidate(&pool, &candidates[0]).await);
         assert_eq!(status_of(&raw).await, "quarantined");
+    }
+
+    // -----------------------------------------------------------------
+    // #803: one held row per key
+    // -----------------------------------------------------------------
+
+    /// One park as the pre-#803 table stored it: one row per segment.
+    #[derive(Debug, Clone, PartialEq)]
+    struct ParkedRow {
+        seg_seq: i64,
+        old_image: Option<String>,
+        origin_lsn: Option<PgLsn>,
+        src_changed: Option<SystemTime>,
+        hop_gen: i32,
+        group_key: Option<Vec<String>>,
+    }
+
+    impl ParkedRow {
+        fn held(&self) -> HeldKey {
+            HeldKey::parked(
+                "public.orders",
+                self.seg_seq,
+                self.old_image.clone(),
+                self.origin_lsn,
+                self.src_changed,
+                self.hop_gen,
+                self.group_key.clone(),
+            )
+        }
+    }
+
+    /// `Recompute`'s fields, which `StagedChange` has no `PartialEq` for.
+    type RecomputeFields = (
+        String,
+        String,
+        i32,
+        Option<Vec<String>>,
+        Option<SystemTime>,
+        Option<String>,
+        Option<PgLsn>,
+    );
+
+    fn recompute_fields(change: StagedChange) -> RecomputeFields {
+        match change {
+            StagedChange::Recompute {
+                src_table,
+                key,
+                hop_gen,
+                group_key,
+                src_changed,
+                prior_image,
+                origin_lsn,
+            } => (
+                src_table,
+                key,
+                hop_gen,
+                group_key,
+                src_changed,
+                prior_image,
+                origin_lsn,
+            ),
+            other => panic!("expected a Recompute, got {other:?}"),
+        }
+    }
+
+    /// The pre-#803 park and release, verbatim in what they computed: each
+    /// park inserted a row per segment, `on conflict do nothing` (so a second
+    /// park of one segment was dropped), and the release sorted the rows by
+    /// `(seg_seq, held_seq)` and folded them into its `Recompute`.
+    fn old_release(parks: &[ParkedRow]) -> RecomputeFields {
+        let mut held: Vec<(i64, i64, &ParkedRow)> = Vec::new();
+        for (held_seq, park) in parks.iter().enumerate() {
+            if !held.iter().any(|(seg_seq, _, _)| *seg_seq == park.seg_seq) {
+                held.push((park.seg_seq, held_seq as i64, park));
+            }
+        }
+        held.sort_by_key(|(seg_seq, held_seq, _)| (*seg_seq, *held_seq));
+        let first = held[0].2;
+        let mut origin_lsn = first.origin_lsn;
+        let mut src_changed: Option<SystemTime> = None;
+        let mut hop_gen = 0;
+        let mut source_change = false;
+        let mut group_key: Vec<String> = Vec::new();
+        for (_, _, row) in &held {
+            origin_lsn = super::super::fold::earliest_origin(origin_lsn, row.origin_lsn);
+            source_change |= row.src_changed.is_some();
+            src_changed = super::super::apply::earliest_src_changed(src_changed, row.src_changed);
+            hop_gen = hop_gen.max(row.hop_gen);
+            for value in row.group_key.clone().unwrap_or_default() {
+                if !group_key.contains(&value) {
+                    group_key.push(value);
+                }
+            }
+        }
+        recompute_fields(StagedChange::Recompute {
+            src_table: "public.orders".to_string(),
+            key: "1".to_string(),
+            hop_gen: if source_change { 0 } else { hop_gen },
+            group_key: (!group_key.is_empty()).then_some(group_key),
+            src_changed,
+            prior_image: first.old_image.clone(),
+            origin_lsn,
+        })
+    }
+
+    /// The release's `Recompute` from the one merged row.
+    fn new_release(parks: &[ParkedRow]) -> RecomputeFields {
+        let merged = parks
+            .iter()
+            .map(ParkedRow::held)
+            .reduce(HeldKey::merge)
+            .expect("at least one park");
+        recompute_fields(merged.recompute("1"))
+    }
+
+    /// `group_key` is a set: the fold's cross-segment merge keeps it sorted
+    /// (`fold::merge_group_keys`), and the old release's first-seen order
+    /// was only the order its rows happened to sort in.
+    fn as_set(mut fields: RecomputeFields) -> RecomputeFields {
+        if let Some(group_key) = fields.3.as_mut() {
+            group_key.sort();
+        }
+        fields
+    }
+
+    fn at(secs: u64) -> Option<SystemTime> {
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+
+    fn lsn(position: u64) -> Option<PgLsn> {
+        Some(PgLsn::from(position))
+    }
+
+    fn page(seg_seq: i64, old_image: Option<&str>, origin_lsn: Option<PgLsn>) -> ParkedRow {
+        ParkedRow {
+            seg_seq,
+            old_image: old_image.map(str::to_string),
+            origin_lsn,
+            src_changed: at(seg_seq as u64 * 10),
+            hop_gen: 0,
+            group_key: None,
+        }
+    }
+
+    /// A build chunk's parked re-derive (`evict_build_key`).
+    fn build_park(origin_lsn: u64) -> ParkedRow {
+        ParkedRow {
+            seg_seq: BUILD_PARK_SEG_SEQ,
+            old_image: None,
+            origin_lsn: lsn(origin_lsn),
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }
+    }
+
+    fn keys(values: &[&str]) -> Option<Vec<String>> {
+        Some(values.iter().map(|v| v.to_string()).collect())
+    }
+
+    /// #803: the release stages the same `Recompute` from the one merged row
+    /// as the old release folded from a row per segment, case by case, and
+    /// whichever order the parks committed in.
+    #[test]
+    fn a_merged_held_row_releases_the_recompute_the_per_segment_rows_did() {
+        let cases: Vec<(&str, Vec<ParkedRow>)> = vec![
+            (
+                "one park",
+                vec![page(3, Some(r#"{"id":"1","v":"a"}"#), lsn(30))],
+            ),
+            (
+                "three segments, earliest pre-image and origin win",
+                vec![
+                    page(1, Some(r#"{"v":"a"}"#), lsn(10)),
+                    page(2, Some(r#"{"v":"b"}"#), lsn(20)),
+                    page(3, Some(r#"{"v":"c"}"#), lsn(5)),
+                ],
+            ),
+            (
+                "a null origin first stays unknown",
+                vec![page(1, None, None), page(2, None, lsn(20))],
+            ),
+            (
+                "a null origin later blanks a known one",
+                vec![page(1, None, lsn(10)), page(2, None, None)],
+            ),
+            (
+                "group keys union without duplicates",
+                vec![
+                    ParkedRow {
+                        group_key: keys(&["b", "a"]),
+                        ..page(1, None, lsn(10))
+                    },
+                    ParkedRow {
+                        group_key: None,
+                        ..page(2, None, lsn(20))
+                    },
+                    ParkedRow {
+                        group_key: keys(&["c", "a"]),
+                        ..page(3, None, lsn(30))
+                    },
+                ],
+            ),
+            (
+                "hop changes only keep the deepest hop",
+                vec![
+                    ParkedRow {
+                        src_changed: None,
+                        hop_gen: 2,
+                        ..page(1, None, lsn(10))
+                    },
+                    ParkedRow {
+                        src_changed: None,
+                        hop_gen: 4,
+                        ..page(2, None, lsn(20))
+                    },
+                ],
+            ),
+            (
+                "a source change among hop changes resets the hop",
+                vec![
+                    ParkedRow {
+                        src_changed: None,
+                        hop_gen: 3,
+                        ..page(1, None, lsn(10))
+                    },
+                    page(2, None, lsn(20)),
+                ],
+            ),
+            (
+                "a build park after a page park keeps the page's pre-image",
+                vec![page(4, Some(r#"{"v":"seen"}"#), lsn(40)), build_park(15)],
+            ),
+            (
+                "a build park before a page park keeps the page's pre-image",
+                vec![build_park(15), page(4, Some(r#"{"v":"seen"}"#), lsn(40))],
+            ),
+            ("a build park alone", vec![build_park(15)]),
+            (
+                "a segment parked twice merges once",
+                vec![
+                    page(2, Some(r#"{"v":"b"}"#), lsn(20)),
+                    page(2, Some(r#"{"v":"b"}"#), lsn(20)),
+                    page(1, Some(r#"{"v":"a"}"#), lsn(10)),
+                ],
+            ),
+        ];
+        for (name, parks) in cases {
+            assert_eq!(
+                new_release(&parks),
+                as_set(old_release(&parks)),
+                "{name}: the merged row's Recompute differs from the old fold's"
+            );
+            let mut reversed = parks.clone();
+            reversed.reverse();
+            assert_eq!(
+                new_release(&reversed),
+                new_release(&parks),
+                "{name}: the merged row depends on the order the parks committed in"
+            );
+        }
+    }
+
+    /// #803's equivalence over generated park sequences: segments out of
+    /// order and parked more than once, null and known origins, source and
+    /// hop changes, differing group keys, and build parks among page parks.
+    /// Deterministic: a fixed-seed xorshift, no proptest dependency here.
+    #[test]
+    fn generated_park_sequences_release_the_old_folds_recompute() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let images = [None, Some(r#"{"v":"a"}"#), Some(r#"{"v":"b"}"#)];
+        let groups = ["p", "q", "r", "s"];
+        for case in 0..5_000 {
+            let segments = 1 + next(6) as usize;
+            let mut distinct: Vec<ParkedRow> = Vec::new();
+            for _ in 0..segments {
+                let seg_seq = if next(8) == 0 {
+                    BUILD_PARK_SEG_SEQ
+                } else {
+                    1 + next(12) as i64
+                };
+                if distinct.iter().any(|row| row.seg_seq == seg_seq) {
+                    continue;
+                }
+                let row = if seg_seq == BUILD_PARK_SEG_SEQ {
+                    build_park(1 + next(100))
+                } else {
+                    let source = next(2) == 0;
+                    let group_key = match next(3) {
+                        0 => None,
+                        _ => Some(
+                            (0..next(4))
+                                .map(|_| groups[next(groups.len() as u64) as usize].to_string())
+                                .collect(),
+                        ),
+                    };
+                    ParkedRow {
+                        seg_seq,
+                        old_image: images[next(images.len() as u64) as usize].map(str::to_string),
+                        origin_lsn: if next(5) == 0 {
+                            None
+                        } else {
+                            lsn(1 + next(100))
+                        },
+                        src_changed: if source { at(1 + next(100)) } else { None },
+                        hop_gen: if source { 0 } else { next(4) as i32 },
+                        group_key,
+                    }
+                };
+                distinct.push(row);
+            }
+            // The order the parks commit in, with some segments parked twice
+            // (an eviction's park, then its page's retry parking the same
+            // contribution).
+            let mut parks: Vec<ParkedRow> = Vec::new();
+            for row in &distinct {
+                parks.push(row.clone());
+                if next(4) == 0 {
+                    parks.push(row.clone());
+                }
+            }
+            for i in (1..parks.len()).rev() {
+                parks.swap(i, next(i as u64 + 1) as usize);
+            }
+            assert_eq!(
+                new_release(&parks),
+                as_set(old_release(&parks)),
+                "case {case}: parks {parks:?}"
+            );
+        }
+    }
+
+    /// A same-crate pool and a raw connection onto `db`, with a live
+    /// `order_totals` definition over `public.orders`. Returns its id too.
+    async fn held_ready(db: &testkit::TestDatabase) -> (Pool, tokio_postgres::Client, i64) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let raw = connect_raw(db).await;
+        raw.batch_execute("create table public.orders (id bigint primary key, price numeric)")
+            .await
+            .expect("seed source table");
+        let columns: HashMap<String, crate::defs::ast::ValueType> = ["id", "price"]
+            .iter()
+            .map(|name| (name.to_string(), crate::defs::ast::ValueType::Numeric))
+            .collect();
+        catalog::create_definition(
+            &pool,
+            "TRANSFORM order_totals FROM public.orders SELECT price AS total",
+            &columns,
+        )
+        .await
+        .expect("create definition");
+        let id: i64 = raw
+            .query_one(
+                "select id from transform_definitions where target_table like '%.order_totals'",
+                &[],
+            )
+            .await
+            .expect("read the definition's id")
+            .get(0);
+        (pool, raw, id)
+    }
+
+    async fn poison_keys(raw: &tokio_postgres::Client, transform_id: i64, keys: &[&str]) {
+        for key in keys {
+            raw.execute(
+                "insert into poison (transform_id, src_table, key, last_error) \
+                 values ($1, 'public.orders', $2, 'test')",
+                &[&transform_id, key],
+            )
+            .await
+            .expect("insert poison marker");
+        }
+    }
+
+    /// `row` parked for `key` as a page's folded change, with the
+    /// relationship `to_col` values and the window `lsn` only the held row's
+    /// projection fields read.
+    fn parked_change(
+        key: &str,
+        row: &ParkedRow,
+        to_col_values: &[(&str, &str)],
+        at_lsn: u64,
+    ) -> FoldedChange {
+        FoldedChange {
+            old_image: row.old_image.clone(),
+            new_image: Some(format!(r#"{{"id": "{key}"}}"#)),
+            src_changed: row.src_changed,
+            origin_lsn: row.origin_lsn,
+            lsn: lsn(at_lsn),
+            hop_gen: row.hop_gen,
+            group_key: row.group_key.clone(),
+            to_col_values: to_col_values
+                .iter()
+                .map(|(c, v)| (c.to_string(), v.to_string()))
+                .collect(),
+            ..folded_key(key)
+        }
+    }
+
+    async fn park_one(pool: &Pool, transform_id: i64, seg_seq: i64, change: FoldedChange) {
+        let mut client = pool.get().await.expect("pool connection");
+        let txn = client.transaction().await.expect("begin");
+        park_batch_contribution(&txn, seg_seq, &[(transform_id, change)])
+            .await
+            .expect("park");
+        txn.commit().await.expect("commit the park");
+    }
+
+    /// The key's held row, as [`HeldKey`], with its `join_values` (as
+    /// `col=value`, sorted) and `lsn`, and how many rows the key has.
+    async fn read_held(
+        raw: &tokio_postgres::Client,
+        key: &str,
+    ) -> (HeldKey, Vec<String>, Option<PgLsn>, i64) {
+        let count: i64 = raw
+            .query_one("select count(*) from poison_held where key = $1", &[&key])
+            .await
+            .expect("count held rows")
+            .get(0);
+        let row = raw
+            .query_one(
+                "select src_table, seg_seq, old_image::text, origin_lsn, src_changed, hop_gen, \
+                        group_key, \
+                        array(select e.key || '=' || e.value \
+                              from unnest(join_values) j, jsonb_each_text(j) e \
+                              order by e.key || '=' || e.value collate \"C\"), \
+                        lsn \
+                 from poison_held where key = $1",
+                &[&key],
+            )
+            .await
+            .expect("read the held row");
+        let group_key: Option<Vec<String>> = row.get(6);
+        let held = HeldKey {
+            src_table: row.get(0),
+            seg_seq: row.get(1),
+            prior_image: row.get(2),
+            origin_lsn: row.get(3),
+            src_changed: row.get(4),
+            hop_gen: row.get(5),
+            group_key: group_key.unwrap_or_default(),
+        };
+        (held, row.get(7), row.get(8), count)
+    }
+
+    /// #803: parks of one key, page parks and a build chunk's alike, merge
+    /// into one `poison_held` row whose fields are [`HeldKey::merge`]'s,
+    /// whatever order they commit in, plus the union of their join values
+    /// and their greatest `lsn`; and the release stages the merged row's
+    /// `Recompute` and deletes the row.
+    #[tokio::test]
+    async fn parks_of_one_key_merge_into_one_held_row_that_the_release_stages() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, id) = held_ready(&db).await;
+
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let images = [None, Some(r#"{"v": "a"}"#), Some(r#"{"v": "b"}"#)];
+        let groups = ["p", "q", "r"];
+        let codes = ["x", "y", "z"];
+        for case in 0..24 {
+            let key = format!("{}", 100 + case);
+            poison_keys(&raw, id, &[&key]).await;
+            let mut model: Option<HeldKey> = None;
+            let mut join_values: Vec<String> = Vec::new();
+            let mut greatest_lsn: Option<PgLsn> = None;
+            let parks = 1 + next(5);
+            for _ in 0..parks {
+                if next(6) == 0 {
+                    let mut client = pool.get().await.expect("pool connection");
+                    let txn = client.transaction().await.expect("begin");
+                    evict_build_key(&txn, id, "public.orders", &key, "boom", None)
+                        .await
+                        .expect("build park");
+                    txn.commit().await.expect("commit the build park");
+                    // Its origin is the WAL position at the park, read back.
+                    let origin: Option<PgLsn> = raw
+                        .query_one("select origin_lsn from poison_held where key = $1", &[&key])
+                        .await
+                        .expect("read origin")
+                        .get(0);
+                    let build = HeldKey::parked(
+                        "public.orders",
+                        BUILD_PARK_SEG_SEQ,
+                        None,
+                        None,
+                        None,
+                        0,
+                        None,
+                    );
+                    // The build park's own origin isn't known up front, so the
+                    // model takes the row's: it is the earliest known one, or
+                    // unknown, exactly when the merge says so.
+                    model = Some(match model.take() {
+                        None => HeldKey {
+                            origin_lsn: origin,
+                            ..build
+                        },
+                        Some(held) => {
+                            let merged = held.clone().merge(build);
+                            HeldKey {
+                                origin_lsn: origin,
+                                ..merged
+                            }
+                        }
+                    });
+                    continue;
+                }
+                let source = next(2) == 0;
+                let row = ParkedRow {
+                    seg_seq: 1 + next(10) as i64,
+                    old_image: images[next(3) as usize].map(str::to_string),
+                    origin_lsn: if next(4) == 0 {
+                        None
+                    } else {
+                        lsn(1 + next(1_000))
+                    },
+                    src_changed: if source { at(1 + next(1_000)) } else { None },
+                    hop_gen: if source { 0 } else { next(4) as i32 },
+                    group_key: match next(3) {
+                        0 => None,
+                        _ => Some(
+                            (0..next(3))
+                                .map(|_| groups[next(3) as usize].to_string())
+                                .collect(),
+                        ),
+                    },
+                };
+                let code = codes[next(3) as usize];
+                let at_lsn = 1 + next(1_000);
+                park_one(
+                    &pool,
+                    id,
+                    row.seg_seq,
+                    parked_change(&key, &row, &[("code", code)], at_lsn),
+                )
+                .await;
+                // A key's held row keeps the first park's spelling and
+                // seg_seq on a tie, as the park's `on conflict` does.
+                let parked = HeldKey::parked(
+                    "public.orders",
+                    row.seg_seq,
+                    row.old_image.clone(),
+                    row.origin_lsn,
+                    row.src_changed,
+                    row.hop_gen,
+                    row.group_key.clone(),
+                );
+                model = Some(match model.take() {
+                    None => parked,
+                    Some(held) => held.merge(parked),
+                });
+                join_values.push(format!("code={code}"));
+                greatest_lsn = greatest_lsn.max(lsn(at_lsn));
+            }
+            join_values.sort();
+            join_values.dedup();
+            let model = model.expect("at least one park");
+
+            let (held, held_join_values, held_lsn, count) = read_held(&raw, &key).await;
+            assert_eq!(count, 1, "case {case}: one held row per key");
+            assert_eq!(
+                held, model,
+                "case {case}: the SQL merge differs from HeldKey::merge"
+            );
+            assert_eq!(held_join_values, join_values, "case {case}: join values");
+            assert_eq!(
+                held_lsn, greatest_lsn,
+                "case {case}: the greatest parked lsn"
+            );
+
+            let deleted = release_key(&pool, "order_totals", "public.orders", &key)
+                .await
+                .expect("release");
+            assert_eq!(
+                deleted, 1,
+                "case {case}: the release deletes the one held row"
+            );
+            let staged: Vec<RecomputeFields> = raw
+                .query(
+                    "select src_table, key, hop_gen, group_key, src_changed, old_image::text, \
+                            origin_lsn \
+                     from (select * from seg_0 union all select * from seg_1 \
+                           union all select * from seg_2 union all select * from seg_3) ring \
+                     where key = $1 and op = 'recompute'",
+                    &[&key],
+                )
+                .await
+                .expect("read the staged recompute")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get(0),
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        row.get(4),
+                        row.get(5),
+                        row.get(6),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                staged,
+                vec![recompute_fields(model.recompute(&key))],
+                "case {case}: the release stages the merged row's Recompute"
+            );
+            assert_eq!(read_count(&raw, &key).await, 0, "case {case}: released");
+        }
+    }
+
+    async fn read_count(raw: &tokio_postgres::Client, key: &str) -> i64 {
+        raw.query_one("select count(*) from poison_held where key = $1", &[&key])
+            .await
+            .expect("count held rows")
+            .get(0)
+    }
+
+    /// #803: a page parks its held rows in key order, whatever order its
+    /// changes come in, so two pages parking overlapping keys queue on the
+    /// first shared row rather than each holding a row the other waits on
+    /// (ADR-0002 I5). A third session holds key `a`'s row: the page parking
+    /// `[b, a]` waits on it without having touched `b`'s, and a second page
+    /// parking `[a, b]` queues behind it, and both park once it lets go.
+    #[tokio::test]
+    async fn pages_parking_overlapping_keys_in_opposite_orders_lock_them_in_key_order() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, id) = held_ready(&db).await;
+        poison_keys(&raw, id, &["a", "b"]).await;
+        let row = page(1, None, lsn(10));
+        for key in ["a", "b"] {
+            park_one(&pool, id, 1, parked_change(key, &row, &[], 10)).await;
+        }
+
+        let holder = connect_raw(&db).await;
+        holder
+            .batch_execute("begin; select 1 from poison_held where key = 'a' for update")
+            .await
+            .expect("hold a's row");
+
+        let park = |order: [&'static str; 2], seg_seq: i64| {
+            let pool = pool.clone();
+            let row = page(seg_seq, None, lsn(seg_seq as u64 * 10));
+            tokio::spawn(async move {
+                let changes: Vec<(i64, FoldedChange)> = order
+                    .iter()
+                    .map(|key| (id, parked_change(key, &row, &[], seg_seq as u64 * 10)))
+                    .collect();
+                let mut client = pool.get().await.expect("pool connection");
+                let txn = client.transaction().await.expect("begin");
+                park_batch_contribution(&txn, seg_seq, &changes).await?;
+                txn.commit().await?;
+                Ok::<_, ApplyError>(())
+            })
+        };
+        let waiting_on_a = |n: i64| {
+            let sql = "select count(*) from pg_stat_activity \
+                       where wait_event_type = 'Lock' and query like 'insert into poison_held%'";
+            let raw = &raw;
+            async move {
+                for _ in 0..600 {
+                    let waiting: i64 = raw.query_one(sql, &[]).await.expect("read waits").get(0);
+                    if waiting >= n {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                panic!("{n} parks never waited on a's row");
+            }
+        };
+
+        let first = park(["b", "a"], 2);
+        waiting_on_a(1).await;
+        holder
+            .batch_execute("savepoint s; select 1 from poison_held where key = 'b' for update nowait; release savepoint s")
+            .await
+            .expect("the page waiting on a's row must not hold b's: it parks a first");
+        let second = park(["a", "b"], 3);
+        waiting_on_a(2).await;
+        holder
+            .batch_execute("rollback")
+            .await
+            .expect("let go of a's row");
+
+        first.await.expect("join").expect("the first page parks");
+        second.await.expect("join").expect("the second page parks");
+        for key in ["a", "b"] {
+            let (held, _, held_lsn, count) = read_held(&raw, key).await;
+            assert_eq!(count, 1);
+            assert_eq!(held.seg_seq, 1, "the earliest segment's row");
+            assert_eq!(held_lsn, lsn(30), "both pages merged into {key}'s row");
+        }
+    }
+
+    /// #803: `converge`'s condition 4 holds back on a held key's earliest
+    /// origin, which its one merged row keeps however its parks arrive, and
+    /// on every token once a park's origin is unknown.
+    #[tokio::test]
+    async fn a_merged_held_row_holds_back_convergence_from_its_earliest_origin() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, id) = held_ready(&db).await;
+        poison_keys(&raw, id, &["1"]).await;
+        let converged = |token: u64| {
+            let raw = &raw;
+            async move {
+                super::super::converge::converged_through(raw, PgLsn::from(token))
+                    .await
+                    .expect("converged_through")
+            }
+        };
+        assert!(converged(1_000).await, "nothing is held yet");
+
+        park_one(
+            &pool,
+            id,
+            2,
+            parked_change("1", &page(2, None, lsn(500)), &[], 500),
+        )
+        .await;
+        park_one(
+            &pool,
+            id,
+            1,
+            parked_change("1", &page(1, None, lsn(200)), &[], 200),
+        )
+        .await;
+        park_one(
+            &pool,
+            id,
+            3,
+            parked_change("1", &page(3, None, lsn(800)), &[], 800),
+        )
+        .await;
+        assert!(
+            converged(199).await,
+            "a token below the earliest origin isn't held back"
+        );
+        assert!(
+            !converged(200).await,
+            "the earliest origin holds back its own token"
+        );
+        assert!(!converged(1_000).await, "and every later one");
+
+        park_one(
+            &pool,
+            id,
+            4,
+            parked_change("1", &page(4, None, None), &[], 900),
+        )
+        .await;
+        assert!(
+            !converged(1).await,
+            "an unknown origin holds back every token"
+        );
+        assert_eq!(read_count(&raw, "1").await, 1);
     }
 }

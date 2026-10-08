@@ -129,15 +129,23 @@ a sibling's.
 **every** later batch, so a later change to it in a different batch would vanish
 for that transform when that batch retired. Therefore **every batch that leaves a
 poisoned key out of a transform parks its own folded contribution for that
-transform before it marks drained, in the same transaction**, keyed
-`(transform, table, key, batch)`.
+transform before it marks drained, in the same transaction**. The transform holds
+one row per key, keyed `(transform, table, key)`, and each batch merges its
+contribution into it (#803), so a key held for good doesn't gain a row per batch:
 
 ```sql
--- inside the Phase-3 transaction, before the drained mark
-INSERT INTO poison_held (transform_id, src_table, key, seg_seq, op, lsn, old_image, new_image, origin_lsn, ...)
+-- inside the Phase-3 transaction, before the drained mark, in key order
+INSERT INTO poison_held AS h (transform_id, src_table, key, seg_seq, old_image, origin_lsn, ...)
 SELECT ... -- this batch's fold, restricted to keys poisoned for the transform
-ON CONFLICT (transform_id, src_table, key, seg_seq) DO NOTHING;
+ON CONFLICT (transform_id, src_table, key) DO UPDATE SET
+    seg_seq = least(h.seg_seq, excluded.seg_seq),  -- and the earlier batch's old_image
+    origin_lsn = ...,  -- the earliest, or NULL once either is NULL
+    ...;               -- earliest src_changed, deepest hop_gen, unions, greatest lsn
 ```
+
+The row keeps exactly what the release reads (below), so merging loses nothing it
+would need. Two pages parking the same key queue on its one row; they take the rows
+in key order, so pages parking several keys never deadlock.
 
 A batch parks for a transform only while the transform still holds the key: a
 release or resume that deleted the key's rows after the batch was computed has
@@ -151,24 +159,25 @@ relationship that isn't frozen holds the key, or none is left that isn't frozen
 every reader holds is dropped from the batch before its images are decoded.
 
 It is deliberately **not** bucket-scoped: it parks the whole batch's contribution,
-complete and idempotent on the extended key, so a co-worker on another bucket
-parking the same rows is a no-op, not a conflict.
+and a merge of the same contribution again changes nothing, so a co-worker on
+another bucket parking the same rows waits on the key's row and leaves it as it
+was.
 
 **Release is operator-driven, one transaction** (`Trellis::release_key`): stage one
-`Recompute` of the key into the active batch, then delete the transform's held rows,
+`Recompute` of the key into the active batch, then delete the transform's held row,
 its marker, and its death counter for the key. Its first lock is a bump of the key's
 table's version fence, which waits for every page holding the fence: a page that parks
-a change for the key commits first and the release takes its row too, one that
+a change for the key commits first and the release finds it merged into the row, one that
 computed before the release misses its fence and computes again, and one that read
 the key as held but the fence after the release parks nothing, since a page parks
 only while the key's `poison` row is there. The
-held rows are not replayed: a replayed row would carry the releaser's `row_txid`,
+parked changes are not replayed: a replayed row would carry the releaser's `row_txid`,
 not its source commit's, so a replay could regress a ledger entry a later
 Re-derive already moved past. The `Recompute` is a Re-derive of the key from its
 current row on every target that reads it
 ([05](05-apply-and-exactly-once-deltas.md#the-ledger)): idempotent for a transform
 that applied the key all along, and parked again for one that still holds it. It
-keeps the held rows' earliest origin position, so the key's band stays blocked
+keeps the held row's earliest origin position, so the key's band stays blocked
 until the release actually drains — the key is never in neither place, which
 would make the read-your-writes predicate lie ([07](07-convergence-and-await.md)).
 A resume of the transform releases every key it holds: it deletes its held rows,

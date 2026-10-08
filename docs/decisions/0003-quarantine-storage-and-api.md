@@ -72,6 +72,18 @@ transforms/columns at once, and a failure in one of them is that one's to hold.
   (the poisoned key's parked later changes) and `key_deaths` (its death
   counter) are keyed by the transform too, and every one of them goes with
   the transform's definition when it is dropped (`on delete cascade`).
+* **`poison_held`** — also `(transform_id, src_table, key)`, one row per held
+  key however many batches change it while it is held
+  ([#803](https://github.com/salesforce-misc/trellis/issues/803)). A release
+  re-derives the key from its live row rather than replaying what was parked,
+  so the row keeps only what the release reads, and each batch that leaves the
+  key out merges its change into it, in the batch's own transaction: the
+  earliest parked change's batch and pre-image, the earliest origin position
+  (unknown once any change's is, so the key keeps holding back every
+  read-your-writes token), the earliest source-change time, the deepest hop,
+  the union of the group keys, the join values the changes' new images held
+  for a relationship's `to_col`, and the greatest WAL position. A held key
+  costs one row, not one per batch.
 * **`column_failures`** — keyed on `(transform_table, column_name, src_table,
   key)`, one row per `(transform, column)` pair that failed while propagating a
   source row.
@@ -397,5 +409,8 @@ resolves.
 
 `poison` and `poison_held` are where evicted work waits until it is released, or its
 transform is resumed or dropped ([Releasing held keys](#releasing-held-keys)); nothing
-moves entries elsewhere by age. Whether it should, and whether the threshold should be
-configurable, is [#803](https://github.com/salesforce-misc/trellis/issues/803).
+moves entries elsewhere by age. A held key's parked work is one row, so it doesn't grow
+while the key waits. Dead-letter by age was rejected, since a release never replays the
+parked changes; an opt-in backoff retry is
+[#861](https://github.com/salesforce-misc/trellis/issues/861), and a configurable
+threshold is [#862](https://github.com/salesforce-misc/trellis/issues/862).

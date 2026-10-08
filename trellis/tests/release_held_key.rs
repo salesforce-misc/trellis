@@ -221,12 +221,12 @@ async fn a_released_key_whose_cause_persists_is_held_again() {
     );
     assert_eq!(
         d.rows(
-            "select h.op from poison_held h join transform_definitions d \
+            "select count(*) from poison_held h join transform_definitions d \
              on d.id = h.transform_id where d.target_table = 'public.doubles'"
         )
         .await,
-        vec!["(recompute)"],
-        "the recompute is parked for the next release"
+        vec!["(1)"],
+        "the recompute is parked for the next release, in the key's one held row"
     );
     assert_eq!(
         d.rows("select doubled from public.doubles where id = 1")
@@ -459,6 +459,13 @@ async fn a_release_waits_for_a_page_parking_a_change_for_the_key_and_releases_it
         .await;
     let reached = page.reached(PausePoint::BeforeCommit).await;
 
+    // The eviction's parked change, before the page merges its own into the
+    // key's held row (#803).
+    let evicted = d
+        .rows("select origin_lsn::text, old_image::text from poison_held")
+        .await;
+    assert_eq!(evicted.len(), 1, "{evicted:?}");
+
     let pool = d.pool().clone();
     let release =
         tokio::spawn(
@@ -467,10 +474,21 @@ async fn a_release_waits_for_a_page_parking_a_change_for_the_key_and_releases_it
     d.wait_blocked_behind(reached.backend_pid).await;
     d.release(&mut page, PausePoint::BeforeCommit).await;
     page.finish().await;
-    let discarded = release.await.expect("release task").expect("release key 1");
+    let deleted = release.await.expect("release task").expect("release key 1");
     assert_eq!(
-        discarded, 2,
-        "the eviction's parked change and the page's are both released"
+        deleted, 1,
+        "the page merged its parked change into the key's one held row"
+    );
+    assert_eq!(
+        d.rows(
+            "select origin_lsn::text, old_image::text from ( \
+                 select * from seg_0 union all select * from seg_1 \
+                 union all select * from seg_2 union all select * from seg_3) ring \
+             where key = '1' and op = 'recompute'"
+        )
+        .await,
+        evicted,
+        "the release's recompute carries the earliest parked change's origin and pre-image"
     );
     for table in ["poison", "poison_held", "key_deaths"] {
         assert_eq!(rows_for(&d, table, "doubles").await, 0, "{table}");
