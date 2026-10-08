@@ -299,6 +299,14 @@ pub enum ApplyError {
     /// definitions reading `src_table` rather than clearing their targets
     /// without the floor.
     TruncateWithoutLsn { src_table: String },
+    /// A [`TargetMutations`](super::target_mutations::TargetMutations) that
+    /// spilled its touched set to a temporary table (issue #924) was staged
+    /// through `into_staged`, which stages only the keys it holds in memory.
+    /// Not reachable: only the writers that change keys in batches spill,
+    /// and each stages through `flush`, which reads the spill back. Refused
+    /// rather than staged, since the spilled keys would never reach the
+    /// ring.
+    SpilledMutationsNotFlushed,
 }
 
 impl ApplyError {
@@ -327,7 +335,8 @@ impl ApplyError {
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::AggregateOffLedger { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. }
-            | ApplyError::TruncateWithoutLsn { .. } => ErrorCode::Internal,
+            | ApplyError::TruncateWithoutLsn { .. }
+            | ApplyError::SpilledMutationsNotFlushed => ErrorCode::Internal,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
             // The definition's persisted status conflicts with what
@@ -462,6 +471,11 @@ impl fmt::Display for ApplyError {
                  raise its targets' truncate floor; the capture trigger always stamps one, so \
                  the ring row was written by something else"
             ),
+            ApplyError::SpilledMutationsNotFlushed => write!(
+                f,
+                "a target write that spilled its changed keys was staged in memory, which \
+                 would drop the spilled keys; a writer that spills must stage through flush"
+            ),
         }
     }
 }
@@ -493,7 +507,8 @@ impl std::error::Error for ApplyError {
             | ApplyError::KeyNotHeld { .. }
             | ApplyError::ReleaseLockTimeout { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. }
-            | ApplyError::TruncateWithoutLsn { .. } => None,
+            | ApplyError::TruncateWithoutLsn { .. }
+            | ApplyError::SpilledMutationsNotFlushed => None,
         }
     }
 }

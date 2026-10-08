@@ -1607,7 +1607,8 @@ impl SourceScan {
 /// row has joined the group (#815's double count). Nothing else writes the
 /// target or the ledger in between: the definition is `backfilling`, which
 /// Apply skips. Unlike the group writes, the delete goes through the
-/// target-mutation seam ([`delete_groups_without_entries`]): a reader's
+/// target-mutation seam ([`delete_groups_without_entries`]), a batch at a
+/// time (issue #926): a reader's
 /// catch-up (`intake::markers::park_target_catchup_if_read`) re-reads the
 /// target's current keys, which no longer name a deleted group.
 ///
@@ -2019,15 +2020,18 @@ async fn backfill_aggregate(
 }
 
 /// Plan settings for [`delete_groups_without_entries`]' anti-join, which
-/// must not run as a nested loop (see there), and their reset, so the seam's
-/// own statements after it plan as everywhere else.
+/// must not run as a nested loop (see there), and their reset, so the
+/// batched deletes and the seam's statements after it plan as everywhere
+/// else.
 const STALE_GROUPS_PLAN_SETTINGS: &str = "set local enable_nestloop = off";
 const STALE_GROUPS_PLAN_RESET: &str = "set local enable_nestloop to default";
 
 /// Deletes every row of `target` (quoted; `target_table` is its catalog
 /// name) whose `GROUP BY` values (`group_idents`) no live entry of `ledger`
 /// (quoted) has, and records each deleted row through the target-mutation
-/// seam, in one transaction that holds `fence` (issue #815).
+/// seam, in one transaction that holds `fence` (issue #815). It finds them
+/// all with one anti-join and deletes them in batches in key order
+/// ([`delete_stale_groups`], issue #926).
 ///
 /// The seam is what tells a reader the group is gone. The go-live catch-up
 /// this build parks for the target's readers re-reads its *current* keys, so
@@ -2047,6 +2051,10 @@ const STALE_GROUPS_PLAN_RESET: &str = "set local enable_nestloop to default";
 /// before the build's reload a single-column key planned as a nested loop
 /// over the whole ledger too. With nested loops off, every shape measured
 /// was a merge anti-join, about 2.7 s at 1M groups.
+///
+/// The `row(...)` match is the anti-join's alone ([`stale_groups_stage_sql`]).
+/// The deletes after it find each stale row by its `ctid`, so they need no
+/// `NULL`-safe match of their own.
 async fn delete_groups_without_entries(
     client: &mut crate::pool::Client,
     fence: Option<ClaimFence<'_>>,
@@ -2061,51 +2069,203 @@ async fn delete_groups_without_entries(
     {
         return Err(BackfillError::Superseded);
     }
-    let mut mutations = crate::staging::target_mutations::TargetMutations::new();
-    let key_cols = ddl::identity_key_columns(&*txn, target_table).await?;
-    let image = mutations.image_sql(&txn, target_table, "t").await?;
-    let mut returning = ddl::pk_key_sql_expr(&key_cols, Some("t"));
-    if let Some(image) = &image {
-        returning.push_str(&format!(", ({image})::text"));
-    }
-    let sql = groups_without_entries_delete_sql(target, ledger, group_idents, &returning);
-    txn.batch_execute(STALE_GROUPS_PLAN_SETTINGS).await?;
-    let rows = txn.query(&sql, &[]).await?;
-    txn.batch_execute(STALE_GROUPS_PLAN_RESET).await?;
-    for row in &rows {
-        let prior = image.is_some().then(|| row.get::<_, String>(1));
-        mutations.record(target_table, row.get(0), prior, 0, None, None);
-    }
-    mutations.flush(&txn).await?;
+    let deleted = delete_stale_groups(
+        &txn,
+        target_table,
+        target,
+        ledger,
+        group_idents,
+        STALE_GROUPS_BATCH,
+    )
+    .await?;
     txn.commit().await?;
-    if !rows.is_empty() {
+    if deleted.deleted > 0 {
         tracing::info!(
             target = %target_table,
-            deleted = rows.len(),
+            deleted = deleted.deleted,
             "dropped groups the rebuilt ledger has no entry for"
         );
     }
     Ok(())
 }
 
-/// [`delete_groups_without_entries`]' statement, returning `returning` over
-/// the deleted row `t`.
-fn groups_without_entries_delete_sql(
+/// What [`delete_stale_groups`] deleted, and how many keys it held and
+/// bound at once.
+#[derive(Debug)]
+struct StaleGroupsDeleted {
+    /// The group rows deleted.
+    deleted: u64,
+    /// The most rows one of its deletes bound.
+    largest_batch: usize,
+    /// What the target-mutation seam held and bound at once.
+    seam: crate::staging::target_mutations::SeamStats,
+}
+
+/// The most stale groups one of [`delete_stale_groups`]' deletes binds, and
+/// the most its seam holds before it spills them (issue #926). It is the
+/// rebuild's orphan sweep's batch (`intake::resume_orphans::SWEEP_BATCH`),
+/// for the same reason: a rebuild can lose more groups than one statement
+/// can bind under PostgreSQL's 1 GB message limit, and the transaction is
+/// one either way, so a bigger batch saves only round trips.
+const STALE_GROUPS_BATCH: usize = 10_000;
+
+/// The temporary table [`delete_stale_groups`] stages the stale groups in,
+/// and the cursor it reads them back through.
+const STALE_GROUPS_TABLE: &str = "pg_temp.trellis_stale_groups";
+const STALE_GROUPS_CURSOR: &str = "trellis_stale_groups";
+
+/// [`delete_groups_without_entries`]' work in `txn`, deleting at most
+/// `batch` groups per statement.
+///
+/// # In batches, in key order (issue #926)
+///
+/// A rebuild can lose millions of groups, so nothing here holds, binds or
+/// returns them all at once:
+///
+/// 1. The anti-join runs once, under [`STALE_GROUPS_PLAN_SETTINGS`], into a
+///    temporary table ([`STALE_GROUPS_TABLE`]) of each stale row's `ctid`
+///    and key columns ([`stale_groups_stage_sql`]). Running it per batch
+///    would read both tables whole once per batch.
+/// 2. A cursor reads the `ctid`s back a batch at a time, sorted by the
+///    target's key columns under its key index's collations, ascending with
+///    `NULL`s last.
+/// 3. Each batch is locked in that order, then deleted, returning each
+///    row's key (and prior image). So the batches together lock the groups
+///    in key order, as a drain page's group upsert does (ADR-0002 I5).
+/// 4. The seam records each batch's rows and spills them once it holds a
+///    batch ([`TargetMutations::spill_over`], issue #924). The one flush at
+///    the end stages them from its spill table a batch at a time, so an
+///    endpoint target's new-image re-read binds at most a batch too.
+///
+/// A `ctid` names its row for the whole transaction: the anti-join's read
+/// holds the target's `ACCESS SHARE` lock until commit, which keeps a
+/// `VACUUM FULL` or `CLUSTER` from moving rows, and nothing else writes the
+/// target meanwhile (see "Groups the ledger no longer has" on
+/// [`backfill_aggregate`]). Deleting by `ctid` needs no `NULL`-safe match of
+/// a group's key. Spilling takes no target lock, so the write token the
+/// flush reads is still after the transaction's last one.
+///
+/// [`TargetMutations::spill_over`]: crate::staging::target_mutations::TargetMutations::spill_over
+async fn delete_stale_groups(
+    txn: &tokio_postgres::Transaction<'_>,
+    target_table: &str,
     target: &str,
     ledger: &str,
     group_idents: &[String],
-    returning: &str,
+    batch: usize,
+) -> Result<StaleGroupsDeleted, BackfillError> {
+    let batch = batch.max(1);
+    let mut mutations = crate::staging::target_mutations::TargetMutations::new();
+    let key_cols = ddl::identity_key_columns(txn, target_table).await?;
+    let image = mutations.image_sql(txn, target_table, "t").await?;
+    let mut returning = ddl::pk_key_sql_expr(&key_cols, Some("t"));
+    if let Some(image) = &image {
+        returning.push_str(&format!(", ({image})::text"));
+    }
+    txn.batch_execute(STALE_GROUPS_PLAN_SETTINGS).await?;
+    let stale = txn
+        .execute(
+            &format!(
+                "create temporary table {STALE_GROUPS_TABLE} on commit drop as {}",
+                stale_groups_stage_sql(target, ledger, group_idents, &key_cols)
+            ),
+            &[],
+        )
+        .await?;
+    txn.batch_execute(STALE_GROUPS_PLAN_RESET).await?;
+    let mut deleted = StaleGroupsDeleted {
+        deleted: 0,
+        largest_batch: 0,
+        seam: Default::default(),
+    };
+    if stale > 0 {
+        let staged_order: Vec<String> = key_cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| col.ordered(&format!("s.c{i}")))
+            .collect();
+        let target_order: Vec<String> = key_cols
+            .iter()
+            .map(|col| col.ordered(&format!("t.{}", quote_ident(&col.name))))
+            .collect();
+        txn.batch_execute(&format!(
+            "declare {STALE_GROUPS_CURSOR} no scroll cursor for \
+             select s.tid::text from {STALE_GROUPS_TABLE} as s order by {}",
+            staged_order.join(", ")
+        ))
+        .await?;
+        let fetch = format!("fetch forward {batch} from {STALE_GROUPS_CURSOR}");
+        let lock = txn
+            .prepare(&format!(
+                "select 1 from {target} as t where t.ctid = any($1::text[]::tid[]) \
+                 order by {} for update of t",
+                target_order.join(", ")
+            ))
+            .await?;
+        let delete = txn
+            .prepare(&format!(
+                "delete from {target} as t where t.ctid = any($1::text[]::tid[]) \
+                 returning {returning}"
+            ))
+            .await?;
+        loop {
+            let tids: Vec<String> = txn
+                .query(&fetch, &[])
+                .await?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            if tids.is_empty() {
+                break;
+            }
+            deleted.largest_batch = deleted.largest_batch.max(tids.len());
+            txn.query(&lock, &[&tids]).await?;
+            let rows = txn.query(&delete, &[&tids]).await?;
+            for row in &rows {
+                let prior = image.is_some().then(|| row.get::<_, String>(1));
+                mutations.record(target_table, row.get(0), prior, 0, None, None);
+            }
+            deleted.deleted += rows.len() as u64;
+            mutations.spill_over(txn, batch).await?;
+        }
+        txn.batch_execute(&format!("close {STALE_GROUPS_CURSOR}"))
+            .await?;
+    }
+    txn.batch_execute(&format!("drop table {STALE_GROUPS_TABLE}"))
+        .await?;
+    deleted.seam = mutations.flush_counted(txn).await?;
+    Ok(deleted)
+}
+
+/// [`delete_stale_groups`]' anti-join: every row of `target` (quoted) whose
+/// `GROUP BY` values (`group_idents`) no live entry of `ledger` (quoted)
+/// has, as its `ctid` (`tid`) and its key columns (`key_cols`, as `c0`,
+/// `c1`, …, with their types and collations), for [`STALE_GROUPS_TABLE`].
+/// See [`delete_groups_without_entries`] on why it matches by record.
+fn stale_groups_stage_sql(
+    target: &str,
+    ledger: &str,
+    group_idents: &[String],
+    key_cols: &[PrimaryKeyColumn],
 ) -> String {
     let groups = group_idents.join(", ");
+    let keys: Vec<String> = key_cols
+        .iter()
+        .enumerate()
+        .map(|(i, col)| format!("t.{} as c{i}", quote_ident(&col.name)))
+        .collect();
+    let staged: Vec<String> = (0..key_cols.len()).map(|i| format!("g.c{i}")).collect();
     format!(
-        "delete from {target} as t where t.ctid in ( \
-             select g.ctid from (select ctid, row({groups}) as k from {target}) as g \
-             where not exists ( \
-                 select 1 from ( \
-                     select row({groups}) as k from {ledger} where {} and not {} \
-                 ) as l \
-                 where l.k = g.k)) \
-         returning {returning}",
+        "select g.tid, {} from ( \
+             select t.ctid as tid, row({groups}) as k, {} from {target} as t \
+         ) as g \
+         where not exists ( \
+             select 1 from ( \
+                 select row({groups}) as k from {ledger} where {} and not {} \
+             ) as l \
+             where l.k = g.k)",
+        staged.join(", "),
+        keys.join(", "),
         quote_ident(super::ledger::MEMBER_COLUMN),
         quote_ident(super::ledger::TOMBSTONE_COLUMN),
     )
@@ -2616,8 +2776,8 @@ mod tests {
     /// a set-based anti-join, never a nested loop, for the key that made the
     /// per-column `OR` match quadratic (a 2-column key whose first column has
     /// 4 values) and with the ledger's statistics from before its reload,
-    /// when every entry was in one group. It deletes exactly the lost groups,
-    /// `NULL`s included.
+    /// when every entry was in one group. It stages exactly the lost groups,
+    /// `NULL`s included (issue #926 deletes them from there in batches).
     #[tokio::test]
     async fn the_delete_of_groups_without_entries_is_a_merge_anti_join() {
         let cluster = testkit::TestCluster::start();
@@ -2651,7 +2811,10 @@ mod tests {
             .await
             .expect("seed a target and a reloaded ledger");
         let idents = vec![quote_ident("a"), quote_ident("b")];
-        let sql = groups_without_entries_delete_sql("t", "l", &idents, "t.a, t.b");
+        let key_cols = ddl::identity_key_columns(&client, "t")
+            .await
+            .expect("read t's key");
+        let sql = stale_groups_stage_sql("t", "l", &idents, &key_cols);
         let txn = client.transaction().await.expect("begin");
         txn.batch_execute(STALE_GROUPS_PLAN_SETTINGS)
             .await
@@ -2666,14 +2829,14 @@ mod tests {
         let plan = plan.join("\n");
         assert!(
             plan.contains("Anti Join") && !plan.contains("Nested Loop"),
-            "the delete must plan as a set-based anti-join:\n{plan}"
+            "the anti-join must plan as a set-based one:\n{plan}"
         );
         let mut deleted: Vec<(Option<i32>, Option<i32>)> = txn
             .query(&sql, &[])
             .await
-            .expect("delete")
+            .expect("select the stale groups")
             .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
+            .map(|row| (row.get(1), row.get(2)))
             .collect();
         deleted.sort();
         let mut expected: Vec<(Option<i32>, Option<i32>)> = (1..=200)
@@ -2685,6 +2848,208 @@ mod tests {
         assert_eq!(
             deleted, expected,
             "every group the ledger lost, and only those"
+        );
+    }
+
+    /// A same-crate pool plus a raw connection onto `db`, on Trellis's
+    /// schema.
+    async fn connect_pool(db: &testkit::TestDatabase) -> (Pool, tokio_postgres::Client) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("set search_path");
+        (pool, raw)
+    }
+
+    /// The aggregates [`lose_groups`] builds: one a relationship endpoint,
+    /// one a `live` definition reads.
+    const LOST_GROUP_TARGETS: [&str; 2] = ["items_by_g", "items_sum_by_g"];
+
+    /// Builds [`LOST_GROUP_TARGETS`] over 24 items in 12 groups and a `NULL`
+    /// one, makes the first a relationship's from-side (so the seam feeds
+    /// it CDC-shaped rows, re-reading new images) and has a `live`
+    /// definition read the second (so it stages `Recompute`s), and then
+    /// takes every live ledger entry out of groups 2 to 11 and the `NULL`
+    /// group, as a rebuilt ledger that lost them would.
+    async fn lose_groups(db: &testkit::TestDatabase) -> tokio_postgres::Client {
+        let (pool, raw) = connect_pool(db).await;
+        raw.batch_execute(
+            "create table public.items (k bigint primary key, g text, a numeric); \
+             insert into public.items select i, (i % 12)::text, i from generate_series(1, 24) i; \
+             insert into public.items values (25, null, 25); \
+             create table public.gs (g text primary key, w numeric)",
+        )
+        .await
+        .expect("seed items");
+        let columns = HashMap::from([
+            ("k".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        for target in LOST_GROUP_TARGETS {
+            crate::defs::catalog::install_definition(
+                &pool,
+                &format!("TRANSFORM {target} FROM items GROUP BY g SELECT sum(a) AS total"),
+                &columns,
+                "public",
+            )
+            .await
+            .expect("register");
+        }
+        crate::intake::markers::settle_builds(&pool).await;
+        crate::defs::catalog::create_relationship(
+            &pool,
+            "RELATIONSHIP lost FROM items_by_g.g TO gs.g",
+        )
+        .await
+        .expect("make items_by_g a relationship endpoint");
+        raw.batch_execute(
+            "insert into source_table_versions (source_table, version) \
+                 values ('public.items_sum_by_g', 1) on conflict do nothing; \
+             insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+             values ('public.sum_reader', 'public.items_sum_by_g', 1, \
+                     'TRANSFORM sum_reader FROM items_sum_by_g SELECT total AS total', 'live')",
+        )
+        .await
+        .expect("read items_sum_by_g");
+        for target in LOST_GROUP_TARGETS {
+            let ledger = super::super::ledger::qualified_ledger_table("public", target);
+            let lost = raw
+                .execute(
+                    &format!("delete from {ledger} where g not in ('0', '1') or g is null"),
+                    &[],
+                )
+                .await
+                .expect("lose groups from the ledger");
+            assert_eq!(
+                lost,
+                2 * 10 + 1,
+                "two items in each of 10 groups, and one NULL"
+            );
+        }
+        raw
+    }
+
+    /// Deletes the groups [`lose_groups`]' ledgers lost from each of
+    /// [`LOST_GROUP_TARGETS`], `batch` at a time, in one transaction, and
+    /// returns what each delete reported and every ring row the transaction
+    /// staged, sorted, with the write token reduced to whether it is set.
+    async fn delete_lost_groups(
+        db: &testkit::TestDatabase,
+        batch: usize,
+    ) -> (Vec<StaleGroupsDeleted>, Vec<Vec<Option<String>>>) {
+        let (_, mut client) = connect_pool(db).await;
+        let txn = client.transaction().await.expect("begin");
+        let mut deleted = Vec::new();
+        for target in LOST_GROUP_TARGETS {
+            deleted.push(
+                delete_stale_groups(
+                    &txn,
+                    &format!("public.{target}"),
+                    &format!("public.{}", quote_ident(target)),
+                    &super::super::ledger::qualified_ledger_table("public", target),
+                    &[quote_ident("g")],
+                    batch,
+                )
+                .await
+                .expect("delete the lost groups"),
+            );
+        }
+        let ring = (0..4)
+            .map(|slot| format!("select xmin as x, * from seg_{slot}"))
+            .collect::<Vec<_>>()
+            .join(" union all ");
+        let staged = txn
+            .query(
+                &format!(
+                    "select src_table, key, op::text, (lsn is not null)::text, \
+                            old_image::text, new_image::text, origin_lsn::text, \
+                            src_changed::text, hop_gen::text, group_key::text \
+                     from ({ring}) r \
+                     where x::text::bigint = pg_current_xact_id()::text::bigint % 4294967296 \
+                     order by 1, 2"
+                ),
+                &[],
+            )
+            .await
+            .expect("read the staged rows")
+            .into_iter()
+            .map(|row| (0..10).map(|i| row.get(i)).collect())
+            .collect();
+        txn.commit().await.expect("commit");
+        (deleted, staged)
+    }
+
+    /// Issue #926: the build's delete of the groups its ledger lost deletes
+    /// them in batches, and the seam spills them, so no statement binds more
+    /// than a batch of groups and memory holds under two, while it stages
+    /// exactly the rows one unbatched delete does. Each target loses 11
+    /// groups: with a batch of 2, that's six deletes.
+    #[tokio::test]
+    async fn a_batched_delete_of_lost_groups_stages_what_one_delete_does() {
+        let cluster = testkit::TestCluster::start();
+        let control_db = cluster.create_isolated_database().await;
+        let batched_db = cluster.create_isolated_database().await;
+        let _control_raw = lose_groups(&control_db).await;
+        let _batched_raw = lose_groups(&batched_db).await;
+
+        let (control, control_rows) = delete_lost_groups(&control_db, STALE_GROUPS_BATCH).await;
+        let (batched, batched_rows) = delete_lost_groups(&batched_db, 2).await;
+
+        for (control, batched) in control.iter().zip(&batched) {
+            assert_eq!(control.deleted, 11, "every lost group, NULL included");
+            assert_eq!(batched.deleted, control.deleted);
+            assert_eq!(
+                control.largest_batch, 11,
+                "the control deletes in one batch"
+            );
+            assert!(
+                !control.seam.spilled,
+                "the control holds its keys in memory"
+            );
+            assert_eq!(control.seam.most_held, 11);
+            assert_eq!(
+                batched.largest_batch, 2,
+                "every delete binds at most a batch of groups"
+            );
+            assert!(batched.seam.spilled, "a batch of 2 spills");
+            assert!(
+                batched.seam.most_held < 2 * 2,
+                "the batched delete holds under two batches of keys, not {}",
+                batched.seam.most_held
+            );
+            assert!(
+                batched.seam.largest_statement <= 2,
+                "every seam statement binds at most a batch, not {}",
+                batched.seam.largest_statement
+            );
+        }
+        assert_eq!(control_rows.len(), 2 * 11, "a row per deleted group");
+        assert!(
+            control_rows.iter().all(|row| row[4].is_some()),
+            "every staged row carries its prior image"
+        );
+        assert!(
+            control_rows
+                .iter()
+                .any(|row| row[0].as_deref() == Some("public.items_by_g")
+                    && row[2].as_deref() == Some("delete")),
+            "the endpoint target stages CDC-shaped deletes: {control_rows:?}"
+        );
+        assert_eq!(
+            batched_rows, control_rows,
+            "the batched delete stages exactly what one delete does"
         );
     }
 

@@ -134,8 +134,10 @@
 //! The accumulator keeps its touched set in memory, which is what a drain
 //! page needs: a page's keys are capped (ADR-0002 I8), and it stages them
 //! through [`TargetMutations::into_staged`] into one `Vec`. A rebuild's
-//! orphan sweep (`intake::resume_orphans`) is not capped: it can delete tens
-//! of millions of rows in one transaction, and holding each key with its
+//! orphan sweep (`intake::resume_orphans`) and a direct aggregate build's
+//! delete of the groups its rebuilt ledger lost (`defs::backfill`, #926) are
+//! not capped: either can delete tens of millions of rows in one
+//! transaction, and holding each key with its
 //! prior image until the flush would hold them all in memory, and re-reading
 //! an endpoint target's new images would bind them all in one statement,
 //! past PostgreSQL's 1 GB message limit.
@@ -157,7 +159,10 @@
 //! at a time, in key order, appending each batch's rows before it reads the
 //! next. Each batch is staged as `into_staged` stages its keys, new-image
 //! re-read included, so a spilled flush appends the same rows an in-memory
-//! one would. Only `flush` stages a spilled accumulator.
+//! one would. Only `flush` stages a spilled accumulator:
+//! [`TargetMutations::into_staged`] stages only the keys held in memory, so
+//! it refuses one (`ApplyError::SpilledMutationsNotFlushed`) rather than drop
+//! the keys in the table.
 //!
 //! # Standing in for a relationship endpoint's CDC (issues #402, #403)
 //!
@@ -524,6 +529,10 @@ impl TargetMutations {
     /// and
     /// `intake::resume_orphans` at the start of a discharge that then writes
     /// the ring and catalog (no target) before it commits.
+    ///
+    /// An accumulator [`Self::spill_over`] has spilled is refused with
+    /// [`ApplyError::SpilledMutationsNotFlushed`]: the keys in its spill
+    /// table aren't held here, and only [`Self::flush`] stages them.
     pub(crate) async fn into_staged(
         mut self,
         txn: &Transaction<'_>,
@@ -533,13 +542,13 @@ impl TargetMutations {
 
     /// [`Self::into_staged`]'s work, leaving the accumulator's stats behind.
     async fn stage_held(&mut self, txn: &Transaction<'_>) -> Result<Propagation, ApplyError> {
-        // Only the sweep spills, and it stages through `flush`: a drain
-        // page's touched set is capped (ADR-0002 I8), and it never calls
-        // `spill_over`.
-        debug_assert!(
-            self.spill_batch.is_none(),
-            "a spilled TargetMutations stages through flush"
-        );
+        // Only the batched writers spill, and they stage through `flush`: a
+        // drain page's touched set is capped (ADR-0002 I8), and it never
+        // calls `spill_over`. The keys already in the spill table never
+        // reach `touched`, so staging only what is held would drop them.
+        if self.spill_batch.is_some() {
+            return Err(ApplyError::SpilledMutationsNotFlushed);
+        }
         let mut propagation = Propagation {
             changes: Vec::new(),
             hop_bound_tables: Vec::new(),
@@ -629,7 +638,7 @@ impl TargetMutations {
     /// Under `batch` keys it does nothing, so a transaction that never
     /// reaches a batch never creates the table. The drain doesn't call it:
     /// a page's keys are capped (ADR-0002 I8), and it stages through
-    /// [`Self::into_staged`], which a spilled accumulator can't.
+    /// [`Self::into_staged`], which refuses a spilled accumulator.
     pub(crate) async fn spill_over(
         &mut self,
         txn: &Transaction<'_>,
@@ -1450,6 +1459,36 @@ mod tests {
         let untouched = TargetMutations::assuming_read();
         let propagation = untouched.into_staged(&txn).await.expect("stage untouched");
         assert_eq!(propagation.write_token, None, "no key changed, no token");
+    }
+
+    /// Issue #926: `into_staged` refuses an accumulator that has spilled,
+    /// rather than stage the keys it holds and drop the ones in the spill
+    /// table, whether or not the spill kept any (an unread target's keys
+    /// are dropped at the spill).
+    #[tokio::test]
+    async fn into_staged_refuses_a_spilled_accumulator() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        let txn = client.transaction().await.expect("begin");
+        for mut m in [
+            TargetMutations::assuming_read(),
+            TargetMutations::assuming_unread(),
+        ] {
+            m.record("public.t", "1".into(), None, 0, None, None);
+            m.record("public.t", "2".into(), None, 0, None, None);
+            m.spill_over(&txn, 2).await.expect("spill a batch");
+            assert!(m.stats.spilled);
+            m.record("public.t", "3".into(), None, 0, None, None);
+            match m.into_staged(&txn).await {
+                Err(ApplyError::SpilledMutationsNotFlushed) => {}
+                Err(other) => panic!("expected the spilled refusal, got {other:?}"),
+                Ok(propagation) => panic!(
+                    "a spilled accumulator staged {} of its keys in memory",
+                    propagation.changes.len()
+                ),
+            }
+        }
     }
 
     /// `read_new_images` over a composite, mixed-type row identity (a text
