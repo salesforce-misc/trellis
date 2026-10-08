@@ -4273,8 +4273,13 @@ pub(crate) async fn reject_inaccessible_table(
     else {
         return Ok(());
     };
-    let has_schema_usage: bool = row.get(3);
-    let has_table_privilege: bool = row.get(4);
+    // The privilege functions return null for a table or schema dropped
+    // since the scan above read it: the caller's not-found stands.
+    let (Some(has_schema_usage), Some(has_table_privilege)) =
+        (row.get::<_, Option<bool>>(3), row.get::<_, Option<bool>>(4))
+    else {
+        return Ok(());
+    };
     if has_schema_usage && has_table_privilege {
         return Ok(());
     }
@@ -4290,9 +4295,11 @@ pub(crate) async fn reject_inaccessible_table(
 
 /// The schemas a `search_path` setting lists, in order, the way Postgres
 /// splits it (`SplitIdentifierString`): comma-separated, a double-quoted
-/// element taken as written (`""` is a quote), an unquoted one lowercased,
-/// and `$user` read as `user`. Schemas that don't exist are kept; the caller
-/// matches them against `pg_namespace`.
+/// element taken as written (`""` is a quote), an unquoted one with its ASCII
+/// letters lowercased, and `$user` read as `user`. Schemas that don't exist
+/// are kept; the caller matches them against `pg_namespace`. Postgres also
+/// truncates a name to 63 bytes, which this doesn't: an over-long name just
+/// matches nothing, so the caller's not-found stands.
 fn search_path_schemas(setting: &str, user: &str) -> Vec<String> {
     let mut schemas = Vec::new();
     let mut chars = setting.chars().peekable();
@@ -4309,8 +4316,9 @@ fn search_path_schemas(setting: &str, user: &str) -> Vec<String> {
                 name.push(c);
             }
         } else {
+            // `downcase_identifier`: ASCII only, in a UTF-8 database.
             while let Some(c) = chars.next_if(|c| *c != ',' && !c.is_whitespace()) {
-                name.extend(c.to_lowercase());
+                name.push(c.to_ascii_lowercase());
             }
         }
         schemas.push(if name == "$user" {
@@ -8594,6 +8602,9 @@ mod table_not_accessible_tests {
             search_path_schemas("App, \"My, \"\"Odd\"\" Schema\", $user", "Who"),
             ["app", "My, \"Odd\" Schema", "Who"]
         );
+        // Postgres lowercases only ASCII letters in a UTF-8 database: an
+        // unquoted `É` names schema `É`, not `é`.
+        assert_eq!(search_path_schemas("Éa, éB", "x"), ["Éa", "éb"]);
         assert_eq!(search_path_schemas("", "x"), Vec::<String>::new());
         assert_eq!(search_path_schemas("  ", "x"), Vec::<String>::new());
     }

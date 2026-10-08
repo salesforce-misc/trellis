@@ -795,17 +795,23 @@ impl Trellis {
     /// isn't current. The running staging worker discharges the marker.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         let mut client = self.pool.get().await?;
-        let schema_rows = client
-            .query(
+        // The first schema on the path with the table, as define resolves a
+        // bare name. A table the role can't use doesn't resolve, and is
+        // refused as such rather than as not found (issue #933).
+        let Some(schema_row) = client
+            .query_opt(
                 "select table_schema from information_schema.tables \
-                 where table_name = $1 and table_schema = any(current_schemas(false))",
+                 where table_name = $1 and table_schema = any(current_schemas(false)) \
+                 order by array_position(current_schemas(false), table_schema) \
+                 limit 1",
                 &[&source_table],
             )
-            .await?;
-        let schema: String = schema_rows
-            .first()
-            .ok_or_else(|| TrellisError::SourceTableNotFound(source_table.to_string()))?
-            .get(0);
+            .await?
+        else {
+            defs::catalog::reject_inaccessible_table(&**client, None, source_table).await?;
+            return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
+        };
+        let schema: String = schema_row.get(0);
         let qualified = format!("{schema}.{source_table}");
 
         let captured = crate::defs::tables_to_capture(&self.pool)

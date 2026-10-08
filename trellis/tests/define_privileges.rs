@@ -264,3 +264,37 @@ async fn the_catalog_entry_points_refuse_it_too() {
         }
     }
 }
+
+/// `request_backfill` resolves a bare name the way define does, and refuses a
+/// table the role can't use the same way, rather than as not found.
+#[tokio::test]
+async fn request_backfill_names_the_missing_privilege_too() {
+    let cluster = TestCluster::start();
+    let (_db, _admin, _pool, trellis) = set_up(&cluster).await;
+    let err = trellis
+        .request_backfill("customers")
+        .await
+        .expect_err("a table the role holds no privilege on");
+    assert!(
+        matches!(
+            &err,
+            trellis::TrellisError::Catalog(CatalogError::TableNotAccessible {
+                table,
+                lacks_table_privilege: true,
+                lacks_schema_usage: false,
+                ..
+            }) if table == "public.customers"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.code(), ErrorCode::Validation, "{err}");
+
+    let err = trellis
+        .request_backfill("nothing")
+        .await
+        .expect_err("a table that doesn't exist");
+    assert!(
+        matches!(&err, trellis::TrellisError::SourceTableNotFound(table) if table == "nothing"),
+        "{err:?}"
+    );
+}
