@@ -1916,6 +1916,16 @@ async fn run_rederive(
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
     .await?;
+    if plan.edits_change_it() && !hold_plan_epoch(&*txn, &fence, chunk.definition_id, epoch).await?
+    {
+        txn.rollback().await?;
+        tracing::debug!(
+            definition_id = chunk.definition_id,
+            chunk_id = chunk.id,
+            "build chunk planned before an edit to its definition; planning it again"
+        );
+        return defer_claim(pool, chunk, claimed_by, Duration::ZERO).await;
+    }
     if !fence.hold(&*txn).await? {
         txn.rollback().await?;
         return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
@@ -1949,15 +1959,6 @@ async fn run_rederive(
         }
         ChunkPlan::Field(FieldPlan::Empty) => (0, 0),
     };
-    if plan.edits_change_it() && plan_epoch(&*txn, chunk.definition_id).await? != epoch {
-        txn.rollback().await?;
-        tracing::debug!(
-            definition_id = chunk.definition_id,
-            chunk_id = chunk.id,
-            "build chunk planned before an edit to its definition; planning it again"
-        );
-        return defer_claim(pool, chunk, claimed_by, Duration::ZERO).await;
-    }
     let commit_started = Instant::now();
     txn.execute(
         "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
@@ -1987,26 +1988,29 @@ enum ChunkPlan {
 impl ChunkPlan {
     /// Whether an edit committed after the plan was made can make it wrong
     /// ([`plan_epoch`]): a 1-1 target's, whose fields `ALTER TRANSFORM`
-    /// changes and whose paused columns a column resume releases.
+    /// changes and whose paused columns a column pause or resume moves.
     fn edits_change_it(&self) -> bool {
         !matches!(self, ChunkPlan::Whole(AnyPlan::Ledger(_)))
     }
 }
 
 /// The version fence of definition `id`'s source (`source_table_versions`),
-/// which a chunk or a sweep batch of a 1-1 target reads before it plans and
-/// again before it commits (#625 F8b). A chunk plans before its
-/// transaction (its fields, and for a relationship-enriched target its
-/// paused columns), so an edit can commit in between: `ALTER TRANSFORM`, a
-/// column resume or a field build's capture release, each of which bumps
-/// the fence. If the chunk then went on, the edit's own field build could
+/// which a chunk or a sweep batch of a 1-1 target reads before it plans,
+/// and takes `for share` as its transaction's first lock
+/// ([`hold_plan_epoch`]) (#625 F8b). A chunk plans before its transaction
+/// (its fields, and for a relationship-enriched target its paused columns),
+/// so an edit can commit in between: `ALTER TRANSFORM`, a column pause or
+/// resume, or a field build's capture release, each of which bumps the
+/// fence. If the chunk then went on, the edit's own field build could
 /// already have written keys the chunk had yet to lock, and the chunk would
 /// put its older plan's values over them, or stamp an entry's `basis` past
-/// a change whose page then can't write the new field. One that finds the
-/// fence moved rolls back and plans again. One that finds it unmoved holds
-/// its keys' entries already, so the edit's build reaches them only after
-/// it commits. A define on the same source bumps the fence too, which costs
-/// such a chunk a retry.
+/// a change whose page then can't write the new field; a chunk planned
+/// before a pause would write the paused column after it (issue #903). One
+/// that finds the fence moved rolls back and plans again. One that finds it
+/// unmoved holds it to its commit, so a bump that comes later waits for the
+/// chunk: the edit's build reaches its keys only after it commits, and a
+/// pause returns only once its write has landed. A define on the same
+/// source bumps the fence too, which costs such a chunk a retry.
 async fn plan_epoch(
     client: &impl GenericClient,
     id: i64,
@@ -2020,6 +2024,37 @@ async fn plan_epoch(
         )
         .await?
         .map(|row| row.get(0)))
+}
+
+/// Takes the version fence of definition `id`'s source `for share` in a
+/// chunk's or sweep batch's `txn`, and returns whether it still reads
+/// `epoch`, the [`plan_epoch`] the plan was made under. It is the
+/// transaction's first lock, before the claim's ([`ClaimFence::hold`]) and
+/// the keys' entries, as a page takes the fence before any other lock: a
+/// bump waits for the transactions holding the fence, and holds nothing
+/// while it does (issue #744), so a writer that holds no other lock when it
+/// queues on a bump can't close a cycle through it. A resume, say, bumps
+/// the fence and then locks every chunk a worker holds.
+///
+/// The claim's idle timeout goes first: from here on, a stalled worker
+/// holds up every bump of the source's fence, not just its chunk.
+async fn hold_plan_epoch(
+    txn: &impl GenericClient,
+    claim: &ClaimFence<'_>,
+    id: i64,
+    epoch: Option<i64>,
+) -> Result<bool, tokio_postgres::Error> {
+    claim.arm(txn).await?;
+    let held: Option<i64> = txn
+        .query_opt(
+            "select v.version from transform_definitions d \
+             join source_table_versions v on v.source_table = d.source_table \
+             where d.id = $1 for share of v",
+            &[&id],
+        )
+        .await?
+        .map(|row| row.get(0));
+    Ok(held == epoch)
 }
 
 /// A field build's chunk (see the module doc's "Field builds").
@@ -2342,6 +2377,17 @@ async fn run_sweep(
             "set local application_name = '{CHUNK_APPLICATION_NAME}'"
         ))
         .await?;
+        // The batches done so far keep their cursor; the rest plan again.
+        if matches!(plan, AnyPlan::OneToOne(_))
+            && !hold_plan_epoch(&*txn, &fence, chunk.definition_id, epoch).await?
+        {
+            txn.rollback().await?;
+            tracing::debug!(
+                definition_id = chunk.definition_id,
+                "re-derive sweep planned before an edit to its definition; planning it again"
+            );
+            return defer_claim(pool, chunk, claimed_by, Duration::ZERO).await;
+        }
         if !fence.hold(&*txn).await? {
             txn.rollback().await?;
             return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
@@ -2356,17 +2402,6 @@ async fn run_sweep(
             }
         }
         .map_err(build_error)?;
-        // The batches done so far keep their cursor; the rest plan again.
-        if matches!(plan, AnyPlan::OneToOne(_))
-            && plan_epoch(&*txn, chunk.definition_id).await? != epoch
-        {
-            txn.rollback().await?;
-            tracing::debug!(
-                definition_id = chunk.definition_id,
-                "re-derive sweep planned before an edit to its definition; planning it again"
-            );
-            return defer_claim(pool, chunk, claimed_by, Duration::ZERO).await;
-        }
         let next = outcome.next.clone().or(cursor.clone());
         txn.execute(
             "update backfill_chunks set lo = $2, done = $3, \

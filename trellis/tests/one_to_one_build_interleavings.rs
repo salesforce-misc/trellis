@@ -622,6 +622,7 @@ async fn a_chunk_feeds_a_reader_of_its_target_through_the_seam() {
 // lock, leaving the entries alone. Each test makes that state from a live
 // `one` and runs the build's chunks by hand.
 
+const W: &str = "select id, w from public.one order by id";
 const W_ACTUAL: &str = "select id, g, dbl, w from public.one order by id";
 const W_EXPECTED: &str = "select id, g, v + v, v + 1 from public.src order by id";
 
@@ -1052,6 +1053,131 @@ async fn a_page_computed_before_a_column_resume_does_not_apply_after_it() {
     assert_oracle(&mut d).await;
 }
 
+// ------------------------------- a column pause against a page in flight (#903)
+
+/// `public.one`'s `id, dbl`, the column the pause tests below pause.
+const DBL: &str = "select id, dbl from public.one order by id";
+
+/// A column pause holds the column out of Apply from the moment it returns
+/// (issue #903). Here a page computed key 1's change with `dbl` live, holds
+/// the version fence `for share`, and stops before its entry lock. The pause
+/// bumps the source's fence, so it waits for that page, and the page's write
+/// of `dbl` lands before the pause returns. Had the pause not waited, the
+/// page would write `dbl` after it, and the column would move once more
+/// after `PAUSE` returned.
+#[tokio::test]
+async fn a_column_pause_waits_for_a_page_that_computed_the_column() {
+    let mut d = Driver::start(
+        &format!("{CREATE} {}", seed(&[(1, 1, 1), (2, 1, 2)])),
+        &columns(),
+        &[ONE],
+        &["public.src"],
+    )
+    .await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 10 where id = 1")
+        .await
+        .expect("update key 1");
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::AfterPlaceholders, TARGET)])
+        .await;
+    let frozen = page.reached(PausePoint::AfterPlaceholders).await;
+    let mut pause = tokio::spawn({
+        let pool = d.pool().clone();
+        async move { trellis::staging::quarantine::pause_column(&pool, "one", "dbl").await }
+    });
+    let waited = tokio::select! {
+        paused = &mut pause => {
+            paused.expect("the pause's task").expect("pause one.dbl");
+            false
+        }
+        () = d.wait_blocked_behind(frozen.backend_pid) => true,
+    };
+    // What `dbl` holds when the pause returns: frozen from there on.
+    let at_pause = if waited {
+        d.release(&mut page, PausePoint::AfterPlaceholders).await;
+        page.finish().await;
+        pause
+            .await
+            .expect("the pause's task")
+            .expect("pause one.dbl");
+        d.rows(DBL).await
+    } else {
+        // The race the fence closes: the page writes after the pause.
+        let at_pause = d.rows(DBL).await;
+        d.release(&mut page, PausePoint::AfterPlaceholders).await;
+        page.finish().await;
+        at_pause
+    };
+    user.batch_execute("update public.src set v = 30 where id = 2")
+        .await
+        .expect("a write after the pause");
+    d.settle().await;
+    assert_eq!(
+        d.rows(DBL).await,
+        at_pause,
+        "dbl moved after the pause returned (the pause waited for the page: {waited})"
+    );
+}
+
+/// The other side of the same fence (issue #903): a page computed key 1's
+/// change with `dbl` live, and the pause commits before the page's Phase 3
+/// takes the fence. The pause bumped the fence, so the page misses it and
+/// computes again, with `dbl` paused. Had it applied what it computed, it
+/// would write `dbl` after `PAUSE` returned.
+#[tokio::test]
+async fn a_page_computed_before_a_column_pause_does_not_apply_after_it() {
+    let mut d = Driver::start(
+        &format!("{CREATE} {}", seed(&[(1, 1, 1), (2, 1, 2)])),
+        &columns(),
+        &[ONE],
+        &["public.src"],
+    )
+    .await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 10 where id = 1")
+        .await
+        .expect("update key 1");
+    let batch = d.seal().await;
+    let plan = compute_page(&d, batch, "page").await;
+    trellis::staging::quarantine::pause_column(d.pool(), "one", "dbl")
+        .await
+        .expect("pause one.dbl");
+    let at_pause = d.rows(DBL).await;
+
+    let mut client = d.pool().get().await.expect("a connection");
+    let txn = client.transaction().await.expect("begin phase 3");
+    let stale = apply::apply_and_mark_drained(
+        &txn,
+        batch,
+        "page",
+        &plan,
+        WAKE,
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    let missed = matches!(stale, Err(apply::ApplyError::VersionFenceMiss { .. }));
+    if missed {
+        txn.rollback().await.expect("roll back the stale page");
+        let folded = fold_page(&d, batch, "page").await;
+        let plan = apply::compute(d.pool(), &folded)
+            .await
+            .expect("compute again");
+        apply_computed_page(&d, batch, "page", &plan).await;
+    } else {
+        stale.expect("apply the stale page");
+        txn.commit().await.expect("commit the stale page");
+    }
+    assert_eq!(
+        d.rows(DBL).await,
+        at_pause,
+        "a page computed before the pause wrote dbl after it (fence miss: {missed})"
+    );
+    d.settle().await;
+    assert_eq!(d.rows(DBL).await, at_pause);
+}
+
 // ------------------ an edit waiting on a page at the fence holds nothing (#744)
 
 /// The edits that bump the version fence of a live 1-1 definition's source
@@ -1198,12 +1324,13 @@ async fn build_step(pool: &trellis::Pool, worker: &str) -> trellis::staging::bui
 
 /// A chunk plans from the definition before its transaction, so an edit can
 /// commit between the two. Here the first field build's chunk has read `w`
-/// as `v + 1` and stops before its entry lock; `ALTER ... ALTER w AS v + 2`
+/// as `v + 1` and stops before its transaction; `ALTER ... ALTER w AS v + 2`
 /// commits, and its own field build runs over every key and writes `v + 2`.
 /// Had the first chunk then gone on, it would have put `v + 1` back over
 /// every row, and with both builds done nothing would have rewritten it. It
-/// checks the source's version fence before it commits, finds the edit's
-/// bump, and gives its claim back to plan again.
+/// takes the source's version fence first thing in its transaction, finds
+/// the edit's bump, and gives its claim back to plan again. (An edit that
+/// comes once the chunk holds the fence waits for it to commit.)
 #[tokio::test]
 async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
     let (mut d, _plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
@@ -1214,11 +1341,11 @@ async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
     );
     let mut stale = d
         .run_frozen(
-            &[(PausePoint::AfterPlaceholders, TARGET)],
+            &[(PausePoint::BeforeChunkTransaction, TARGET)],
             |pool| async move { Ok(build_step(&pool, "stale").await) },
         )
         .await;
-    stale.reached(PausePoint::AfterPlaceholders).await;
+    stale.reached(PausePoint::BeforeChunkTransaction).await;
     let trellis::defs::Statement::AlterTransform(alter) =
         trellis::defs::parse_statement("ALTER TRANSFORM one ALTER w AS v + 2").expect("parse")
     else {
@@ -1241,7 +1368,8 @@ async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
         ["(1,3)", "(2,4)", "(3,5)"],
         "the edit's build wrote v + 2"
     );
-    d.release(&mut stale, PausePoint::AfterPlaceholders).await;
+    d.release(&mut stale, PausePoint::BeforeChunkTransaction)
+        .await;
     stale.finish().await;
     trellis::staging::build::settle_builds(d.pool()).await;
     assert_eq!(
@@ -1253,6 +1381,66 @@ async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
     assert_eq!(
         d.rows("select id, w from public.one order by id").await,
         d.rows("select id, v + 2 from public.src order by id").await,
+    );
+}
+
+// ----------------------------- a column pause against a chunk in flight (#903)
+
+/// A column pause holds the column out of its build's chunks from the
+/// moment it returns (issue #903). Here the field build's chunk has run its
+/// statement, writing `w` from its snapshot, and stops before it commits.
+/// The chunk holds its source's version fence `for share` from the start of
+/// its transaction, and the pause bumps that fence, so the pause waits for
+/// the chunk and the chunk's write lands before the pause returns. Had the
+/// pause not waited, the chunk would commit `w` after `PAUSE` returned.
+#[tokio::test]
+async fn a_column_pause_waits_for_a_field_chunk_that_wrote_the_column() {
+    let (mut d, _plan) = start_field_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    assert_eq!(
+        build_step(d.pool(), "planner").await,
+        trellis::staging::build::Step::Planned
+    );
+    let mut chunk = d
+        .run_frozen(
+            &[(PausePoint::AfterRederiveRead, TARGET)],
+            |pool| async move { Ok(build_step(&pool, "chunk").await) },
+        )
+        .await;
+    let frozen = chunk.reached(PausePoint::AfterRederiveRead).await;
+    let mut pause = tokio::spawn({
+        let pool = d.pool().clone();
+        async move { trellis::staging::quarantine::pause_column(&pool, "one", "w").await }
+    });
+    let waited = tokio::select! {
+        paused = &mut pause => {
+            paused.expect("the pause's task").expect("pause one.w");
+            false
+        }
+        () = d.wait_blocked_behind(frozen.backend_pid) => true,
+    };
+    // What `w` holds when the pause returns: frozen from there on.
+    let at_pause = if waited {
+        d.release(&mut chunk, PausePoint::AfterRederiveRead).await;
+        chunk.finish().await;
+        pause.await.expect("the pause's task").expect("pause one.w");
+        d.rows(W).await
+    } else {
+        // The race the fence closes: the chunk commits after the pause.
+        let at_pause = d.rows(W).await;
+        d.release(&mut chunk, PausePoint::AfterRederiveRead).await;
+        chunk.finish().await;
+        at_pause
+    };
+    trellis::staging::build::settle_builds(d.pool()).await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 30 where id = 2")
+        .await
+        .expect("a write after the pause");
+    d.settle().await;
+    assert_eq!(
+        d.rows(W).await,
+        at_pause,
+        "w moved after the pause returned (the pause waited for the chunk: {waited})"
     );
 }
 
@@ -1439,6 +1627,46 @@ async fn a_field_chunk_does_not_write_a_parent_value_read_before_its_entry_lock(
     );
 }
 
+/// A relationship-enriched field chunk plans its whole-row Re-derive, the
+/// columns paused then left out, before its transaction (issue #903). Here
+/// the chunk of `rk.a`'s field build is planned with `a` live and stops
+/// before its transaction; `kid.a` has moved past capture, so the chunk
+/// would write a new `a`. `PAUSE TRANSFORM rk.a` then commits. The pause
+/// bumped the source's version fence, so the chunk, which checks the fence
+/// first thing in its transaction, finds it moved and plans again, with `a`
+/// left out. Had it gone on, it would write `a` after `PAUSE` returned.
+#[tokio::test]
+async fn a_field_chunk_planned_before_a_column_pause_does_not_write_the_column() {
+    let mut d = start_kid_field_build().await;
+    write_uncaptured_on(
+        &d,
+        "public.kid",
+        "update public.kid set a = 50 where id = 1",
+    )
+    .await;
+    let mut chunk = d
+        .run_frozen(
+            &[(PausePoint::BeforeChunkTransaction, KID_TARGET)],
+            |pool| async move { Ok(build_step(&pool, "chunk").await) },
+        )
+        .await;
+    chunk.reached(PausePoint::BeforeChunkTransaction).await;
+    trellis::staging::quarantine::pause_column(d.pool(), "rk", "a")
+        .await
+        .expect("pause rk.a");
+    let at_pause = d.rows("select id, a from public.rk order by id").await;
+    d.release(&mut chunk, PausePoint::BeforeChunkTransaction)
+        .await;
+    assert_eq!(chunk.finish().await, trellis::staging::build::Step::Chunk);
+    trellis::staging::build::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select id, a from public.rk order by id").await,
+        at_pause,
+        "the chunk planned before the pause wrote rk.a after it"
+    );
+}
+
 // ------------------- a relationship-enriched page Re-derive against a parent
 
 /// Issue #838: a page re-deriving a kid reads its parent only once it holds
@@ -1618,6 +1846,13 @@ async fn a_page_rederive_joining_a_parent_outside_its_generation_bump_is_harmles
 /// transaction until [`apply_computed_page`] runs its Phase 3, so the ring
 /// seals and drains around it.
 async fn compute_page(d: &Driver, batch: i64, worker: &str) -> apply::ApplyPlan {
+    let folded = fold_page(d, batch, worker).await;
+    apply::compute(d.pool(), &folded).await.expect("compute")
+}
+
+/// A page's Phase 1 for `batch` on worker `worker`: the claim and the fold,
+/// committed. A worker that already holds the claim folds it again.
+async fn fold_page(d: &Driver, batch: i64, worker: &str) -> Vec<fold::FoldedChange> {
     let mut client = d.pool().get().await.expect("a connection");
     let txn = client.transaction().await.expect("begin phase 1");
     claim::claim(&txn, batch, worker, 1).await.expect("claim");
@@ -1628,7 +1863,7 @@ async fn compute_page(d: &Driver, batch: i64, worker: &str) -> apply::ApplyPlan 
         .await
         .expect("fold");
     txn.commit().await.expect("commit phase 1");
-    apply::compute(d.pool(), &folded).await.expect("compute")
+    folded
 }
 
 /// The Phase 3 of a page [`compute_page`] computed, committed.

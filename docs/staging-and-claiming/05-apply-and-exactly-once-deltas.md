@@ -583,6 +583,16 @@ The design:
 - **Backstop:** the edit's re-derivation stages its rows at a higher position, so
   they land in a **later** batch than any in-flight drain's and cannot be swallowed
   by a batch already claimed.
+- **Column pauses and releases are definition changes too.** A 1-1 plan leaves a
+  paused column out of its writes, so a column pause, a column resume and a field
+  build's capture release each bump the fence of the definition's source, as their
+  transaction's first lock. In both directions a writer that planned under the old
+  set either commits before the change does (the bump waits for it) or misses the
+  fence and computes again. So a column a resume releases is never left as a stale
+  page wrote it, and a column a pause holds out takes no write after `PAUSE`
+  returns. A 1-1 build chunk plans its columns before its transaction, so it takes
+  the fence `FOR SHARE` first thing in that transaction and plans again if it has
+  moved.
 
 The fence covers definition changes only. The same staleness caused by two
 batches for one key draining out of order is closed separately, by the 1-1

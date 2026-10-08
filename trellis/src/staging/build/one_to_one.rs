@@ -47,7 +47,10 @@
 //! no chunk reaches.
 //!
 //! A paused column (`column_status`) is left out of the chunk's insert and
-//! update, as the page and the old range build leave it.
+//! update, as the page and the old range build leave it. The chunk's caller
+//! holds the source's version fence from the start of its transaction, and
+//! a pause bumps it, so a pause that returns has no write of the column
+//! still to land (issue #903).
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -203,10 +206,19 @@ pub async fn run_chunk(
 /// build's start. A change newer than the snapshot leaves the field newer
 /// too. An older one that I2 still lets through leaves it behind only until
 /// the newer change the snapshot saw applies, which I2 lets through as
-/// well, since the chunk left the entry as it was. A page that read the
-/// field as paused can't come later: the edit, the column resume and the
-/// capture release bump the source's version fence
-/// (`super::bump_version_fence`).
+/// well, since the chunk left the entry as it was.
+///
+/// The source's version fence (`super::bump_version_fence`) orders the
+/// field's pauses and releases against the chunk and the pages, in both
+/// directions. A page that read the field as paused can't come later: the
+/// edit, the column resume and the capture release that make the field
+/// apply bump the fence. Nor can a write of the field planned before a
+/// pause (issue #903): the pause bumps the fence too, so a page that read
+/// the field as live misses it and computes again, and the caller holds the
+/// fence `for share` from the start of `txn` (`super::run_rederive`), so
+/// the pause waits for this chunk to commit, or the chunk, finding the fence
+/// moved, plans again. Either way no write of the field lands after the
+/// pause returns.
 pub async fn run_field_chunk(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,

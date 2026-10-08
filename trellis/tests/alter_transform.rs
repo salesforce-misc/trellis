@@ -1284,6 +1284,14 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
 /// EXCLUSIVE` lock on the edited definition's source table, which blocks the
 /// build's plan job (its walk reads the source) but not the `ALTER`, which
 /// only registers the build and so returns with the source still locked.
+///
+/// The ring is drained before the lock (issue #903). `order_next` reports
+/// `live` once its go-live catch-up has staged a re-derive of every
+/// `order_calc` row, before those pages drain. A page still in flight
+/// re-derives under `order_calc`'s version fence and would wait on the lock
+/// holding it; the pauses bump that fence, and would wait on the page in
+/// turn. Before the pauses bumped the fence, such a page wrote all three new
+/// fields once the lock went, after both pauses had returned.
 #[tokio::test]
 async fn a_pause_landing_mid_field_build_survives_it() {
     let cluster = TestCluster::start();
@@ -1305,6 +1313,11 @@ async fn a_pause_landing_mid_field_build_survives_it() {
         .await
         .expect("define the chained 1-1 target");
     wait_for_live(&raw, "order_next").await;
+    let token = trellis.watermark_token().await.expect("watermark token");
+    trellis
+        .await_converged(token, Duration::from_secs(60))
+        .await
+        .expect("drain the go-live catch-up's pages");
 
     // Freeze the build: `order_calc` is `order_next`'s source.
     let mut locker = connect_raw(db.dsn()).await;

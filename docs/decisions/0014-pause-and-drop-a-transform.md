@@ -61,7 +61,10 @@ An operator pause, an engine auto-pause and the poison fuse all freeze a definit
 the same status gate the fold already honors. There is no second freezing mechanism. A
 freeze is durable until an explicit resume. Column-level quarantine is this same idea at
 column granularity: a paused column holds a deliberately stale value while the rest of
-the target stays live.
+the target stays live. A column pause freezes the column from the moment it returns. It
+bumps its source's version fence, so a drain page or build chunk that planned the column
+as live either commits before the pause does or finds the fence moved and plans again
+without it.
 
 ### Resume reconciles with source, not by catch-up
 
