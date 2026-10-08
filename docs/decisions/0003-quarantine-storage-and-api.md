@@ -229,6 +229,16 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   stays for that pause's walk. A cascade that fails part-way completes
   whether or not anyone retries the `PAUSE`, and a fuse trip has no caller
   to retry it.
+* **Readers defined later** — a field of a 1-1 definition defined, or added or
+  edited by `ALTER TRANSFORM`, while a column it reads is paused is paused at
+  birth, with the `column_status` row and cascade edge the cascade writes, so its
+  build leaves it out rather than writing the frozen value, and the column's
+  resume releases and builds it. Define and edit write them in their own
+  transaction, whose first lock is the fence a pause of the new field bumps. A
+  pause and a define reading its column are ordered by a transaction lock on
+  the paused column's target, taken by every write of a pause and held shared
+  by the define, so either the define reads the pause or the pause's cascade
+  finds the definition.
 * **Sibling readers** — a field of the same 1-1 definition that reads a paused
   field by alias, directly or through other fields, is paused with it (a
   `column_status` row and a cascade edge), so Apply freezes it rather than

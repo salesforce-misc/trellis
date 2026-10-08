@@ -511,7 +511,7 @@ grammar extension.
 
 **Trigger:** a column of a 1-1 target is paused (its column fuse tripped, or an
 upstream column it reads was paused), and an aggregate transform reads that
-column.
+column, whether it was defined before the pause or after it.
 
 **Effect:** the pause cascades to downstream 1-1 readers but not to
 aggregates (`column_dependents` filters to 1-1 definitions, and the aggregate

@@ -72,6 +72,10 @@
 //! after its fence bump, before it checks its upstream column is still
 //! paused (#912). A test runs the pause inside [`with_scope`].
 //!
+//! A define or `ALTER TRANSFORM` fires [`PausePoint::AfterUpstreamPausesRead`]
+//! for its own target after it reads the paused columns its definition
+//! reads (#914). A test runs the define inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -153,6 +157,11 @@ pub enum PausePoint {
     /// it locks its upstream column's `column_status` row, for the reader's
     /// transform (`super::quarantine::cascade_pause`, #912).
     AfterCascadeFenceBump,
+    /// After a define or `ALTER TRANSFORM` reads the paused columns of the
+    /// targets its definition reads, holding their pause locks shared, before
+    /// it pauses its readers of them, for its own (bare) target
+    /// (`defs::catalog`'s `pause_readers_of_paused_columns`, #914).
+    AfterUpstreamPausesRead,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

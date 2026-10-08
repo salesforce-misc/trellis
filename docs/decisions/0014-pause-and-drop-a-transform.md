@@ -67,7 +67,8 @@ as live either commits before the pause does or finds the fence moved and plans 
 without it. The pause then cascades to the column's readers, each fenced the same way in
 a transaction of its own. If a reader's fence bump waits out the lock timeout, the pause
 returns the error and stays marked as owing its cascade, and the staging worker's capture
-pass finishes the cascade.
+pass finishes the cascade. A definition defined, or a field added, while a column it
+reads is paused is paused at birth, and that column's resume releases it.
 
 ### Resume reconciles with source, not by catch-up
 

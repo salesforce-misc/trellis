@@ -1934,62 +1934,23 @@ pub async fn alter_transform(
         }
     }
 
-    // Issue #748: an edited field that now reads a paused field by alias,
-    // directly or through others, is paused with it, as `cascade_pause`
-    // pauses it when the pause comes after the edit: a `column_status` row,
-    // which `status` lists, and an edge, which the paused field's resume
-    // walks to release it into that resume's field build. Apply holds it
-    // out either way, since its paused set closes over alias readers. A
+    // Issue #914: an edited field that now reads another definition's
+    // paused column is paused at birth, as the cascade pauses a reader that
+    // was there when the pause ran. Issue #748: one that now reads a paused
+    // field by alias, directly or through others, is paused with it. A
     // field awaiting its capture gets no edges: the build that releases it
     // writes its readers, whenever they were added
     // (`staging::build::FieldPlan::for_chunk`).
     if builds_fields {
-        let readers = super::eval::AliasReaders::of(&merged);
-        let mut frontier: Vec<String> = txn
-            .query(
-                "select column_name from column_status \
-                 where transform_table = $1 and not awaiting_capture",
-                &[&alter.target],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        while let Some(upstream) = frontier.pop() {
-            for reader in readers.direct(&upstream) {
-                if !build_fields.contains(reader) {
-                    continue;
-                }
-                let edged = txn
-                    .execute(
-                        "insert into column_pause_cascades \
-                             (downstream_transform, downstream_column, \
-                              upstream_transform, upstream_column) \
-                         values ($1, $2, $1, $3) \
-                         on conflict do nothing",
-                        &[&alter.target, reader, &upstream],
-                    )
-                    .await?;
-                txn.execute(
-                    "insert into column_status \
-                         (transform_table, column_name, paused_at, last_error, local_fuse) \
-                     values ($1, $2, now(), $3, false) \
-                     on conflict (transform_table, column_name) do nothing",
-                    &[
-                        &alter.target,
-                        reader,
-                        &format!(
-                            "paused because upstream column '{}.{upstream}' is paused",
-                            alter.target
-                        ),
-                    ],
-                )
-                .await?;
-                if edged > 0 {
-                    frontier.push(reader.clone());
-                }
-            }
-        }
+        pause_readers_of_paused_columns(
+            &*txn,
+            &alter.target,
+            &merged,
+            &build_fields,
+            &current.source_table,
+            &relationships,
+        )
+        .await?;
     }
 
     let new_text = render_definition_text(&merged);
@@ -2020,6 +1981,223 @@ pub async fn alter_transform(
         altered,
     })
 }
+
+/// Pauses each of `fields`, of the 1-1 definition `def` targeting `target`
+/// (bare), that reads a paused column as it is defined or edited (issue
+/// #914), as `staging::quarantine`'s cascade pauses a reader that
+/// was already there when the pause ran (ADR-0003 decision #5): a
+/// `column_status` row, which `status` lists, and a cascade edge, which the
+/// paused column's resume walks to release it into that resume's field
+/// build. Apply and every build leave a paused field out, so the reader
+/// holds no value until then rather than the paused column's frozen one.
+///
+/// Two kinds of read pause a field:
+///
+/// - **Another definition's paused column** ([`column_dependents`]'s match,
+///   inverted): one of the tables `def` reads, its source or a
+///   relationship's to-side, is a definition's target with a column paused
+///   (by its fuse, an operator, or a cascade), and the field's expression
+///   reads that column. A column awaiting its capture widen
+///   (`awaiting_capture`) pauses no reader, as it cascades to none.
+/// - **A paused field of `def` itself**, read by alias, directly or through
+///   other fields (issue #748): the same closure the cascade walks for a
+///   sibling, from every field of `target` paused, including those paused
+///   just above.
+///
+/// Runs in the define or edit's own transaction, whose first lock bumped
+/// the version fence of `def`'s source: the fence `staging::quarantine`'s
+/// pause of one of `def`'s fields bumps, so this takes no fence of its own.
+/// Each upstream target's pause lock is taken shared
+/// ([`lock_column_pauses`]) before its paused columns are read, and each
+/// row read is locked `for key share`:
+///
+/// - A pause of an upstream column that commits first is read here. One
+///   that comes later waits for this commit, and its cascade then reads the
+///   definition as it stands and finds this reader paused already.
+/// - A resume of an upstream column that deletes its row first leaves
+///   nothing to read. One that comes later waits for this commit and then
+///   deletes the edge with the rest, releasing the reader.
+async fn pause_readers_of_paused_columns(
+    txn: &impl GenericClient,
+    target: &str,
+    def: &TransformDef,
+    fields: &[String],
+    qualified_source: &str,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Result<(), CatalogError> {
+    if !matches!(def.key_space, KeySpace::OneToOne) {
+        return Ok(());
+    }
+    let mut read_tables: Vec<String> = std::iter::once(qualified_source.to_string())
+        .chain(relationships.values().map(|r| r.qualified_to_table.clone()))
+        .collect();
+    read_tables.sort();
+    read_tables.dedup();
+    // Each upstream target, bare (as `column_status` keys it) and qualified
+    // (as a field's reads resolve), in a fixed order for the locks.
+    let upstreams: Vec<(String, String)> = txn
+        .query(
+            "select split_part(target_table, '.', 2), target_table \
+             from transform_definitions where target_table = any($1) order by 1",
+            &[&read_tables],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let rel_to_table: HashMap<(String, String), String> = relationships
+        .iter()
+        .map(|(name, r)| {
+            (
+                (qualified_source.to_string(), name.clone()),
+                r.qualified_to_table.clone(),
+            )
+        })
+        .collect();
+    let mut paused: Vec<(&str, &str, String)> = Vec::new();
+    for (upstream, qualified_upstream) in &upstreams {
+        lock_column_pauses(txn, upstream, false).await?;
+        paused.extend(
+            txn.query(
+                "select column_name from column_status \
+                 where transform_table = $1 and not awaiting_capture \
+                 order by column_name for key share",
+                &[upstream],
+            )
+            .await?
+            .into_iter()
+            .map(|row| (upstream.as_str(), qualified_upstream.as_str(), row.get(0))),
+        );
+    }
+    // Test-only pause point (#914). See `staging::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    crate::staging::interleave::pause_at(
+        txn,
+        crate::staging::interleave::PausePoint::AfterUpstreamPausesRead,
+        target,
+    )
+    .await?;
+    for (upstream, qualified_upstream, column) in &paused {
+        for field in def.fields.iter().filter(|f| fields.contains(&f.name)) {
+            if !expr_references_column(
+                &field.expr,
+                qualified_source,
+                qualified_upstream,
+                column,
+                &rel_to_table,
+            ) {
+                continue;
+            }
+            pause_reader_in_txn(txn, (target, &field.name), (upstream, column)).await?;
+            tracing::warn!(
+                transform = %target,
+                column = %field.name,
+                upstream_transform = %upstream,
+                upstream_column = %column,
+                "column paused at birth: it reads a paused upstream column"
+            );
+        }
+    }
+
+    let readers = super::eval::AliasReaders::of(def);
+    let mut frontier: Vec<String> = txn
+        .query(
+            "select column_name from column_status \
+             where transform_table = $1 and not awaiting_capture",
+            &[&target],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    while let Some(upstream) = frontier.pop() {
+        for reader in readers.direct(&upstream) {
+            if !fields.contains(reader) {
+                continue;
+            }
+            if pause_reader_in_txn(txn, (target, reader), (target, &upstream)).await? {
+                frontier.push(reader.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Records the cascade edge from `upstream` to `reader` and pauses
+/// `reader`, as the cascade's pause of one reader does
+/// (`staging::quarantine`'s `pause_dependent`): the edge and a
+/// `column_status` row with no reason of its own (`local_fuse = false`),
+/// each left as it is when there already. Whether the edge is new.
+async fn pause_reader_in_txn(
+    txn: &impl GenericClient,
+    (reader_transform, reader_column): (&str, &str),
+    (upstream_transform, upstream_column): (&str, &str),
+) -> Result<bool, CatalogError> {
+    let edged = txn
+        .execute(
+            "insert into column_pause_cascades \
+                 (downstream_transform, downstream_column, upstream_transform, upstream_column) \
+             values ($1, $2, $3, $4) \
+             on conflict do nothing",
+            &[
+                &reader_transform,
+                &reader_column,
+                &upstream_transform,
+                &upstream_column,
+            ],
+        )
+        .await?;
+    txn.execute(
+        "insert into column_status \
+             (transform_table, column_name, paused_at, last_error, local_fuse) \
+         values ($1, $2, now(), $3, false) \
+         on conflict (transform_table, column_name) do nothing",
+        &[
+            &reader_transform,
+            &reader_column,
+            &format!(
+                "paused because upstream column '{upstream_transform}.{upstream_column}' is paused"
+            ),
+        ],
+    )
+    .await?;
+    Ok(edged > 0)
+}
+
+/// Takes the transaction-scoped lock that orders a column pause of
+/// `transform` (bare) against a reader of its columns being defined or
+/// edited (issue #914): `exclusive` for a transaction that writes a pause
+/// of one of `transform`'s columns (`staging::quarantine`'s operator pause,
+/// fuse trip and cascade, each right after its fence bump), shared for a
+/// define or edit about to read them ([`pause_readers_of_paused_columns`]).
+///
+/// Without it, a define could read no pause, the pause commit, and its
+/// cascade read the dependency graph before the define committed, so
+/// neither would pause the new reader. With it, one of them waits for the
+/// other to commit. Pauses of one target don't wait on each other here
+/// (a 1-1 target's already wait on its source's fence), nor do two
+/// defines. An advisory lock rather than a row lock: nothing else takes
+/// it, so the only transactions it orders are these, and a pause's fence
+/// bump stays its first lock (issue #744).
+pub(crate) async fn lock_column_pauses(
+    client: &impl GenericClient,
+    transform: &str,
+    exclusive: bool,
+) -> Result<(), tokio_postgres::Error> {
+    let sql = if exclusive {
+        "select pg_advisory_xact_lock($1, hashtext($2))"
+    } else {
+        "select pg_advisory_xact_lock_shared($1, hashtext($2))"
+    };
+    client
+        .execute(sql, &[&COLUMN_PAUSE_LOCK_CLASS, &transform])
+        .await?;
+    Ok(())
+}
+
+/// The first key of [`lock_column_pauses`]'s two-key advisory lock: a
+/// namespace of its own, so it shares no key with another advisory lock.
+const COLUMN_PAUSE_LOCK_CLASS: i32 = 914;
 
 /// Whether `edited` reads a source column `original` doesn't (issue #622):
 /// one the source's capture triggers may not image yet. A column `original`
@@ -2691,6 +2869,21 @@ async fn create_definition_inner(
         &qualified_source,
         &rel_refs(&relationships),
         false,
+    )
+    .await?;
+
+    // Issue #914: a field reading a column paused now is paused at birth, so
+    // the build this registration starts leaves it out rather than writing
+    // the column's frozen value. The source's fence above is the one a pause
+    // of this definition's fields bumps, so this takes no second one.
+    let all_fields: Vec<String> = def.fields.iter().map(|f| f.name.clone()).collect();
+    pause_readers_of_paused_columns(
+        &*txn,
+        &def.target,
+        &def,
+        &all_fields,
+        &qualified_source,
+        &relationships,
     )
     .await?;
 

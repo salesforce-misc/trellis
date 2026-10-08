@@ -2454,6 +2454,7 @@ async fn trip_column_fuse(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     bump_pause_fence(&*txn, fence.as_deref()).await?;
+    catalog::lock_column_pauses(&*txn, transform, true).await?;
     let mark: String = txn
         .query_one(
             "insert into column_status \
@@ -2650,7 +2651,11 @@ async fn cascaded_already(
 /// One pair of [`cascade_pause`]: records the edge from `upstream` and
 /// pauses `downstream`, in a transaction whose first lock bumps
 /// `downstream`'s definition's source fence ([`bump_pause_fence`]), so no
-/// transaction holds two sources' fences. False, with nothing written, when
+/// transaction holds two sources' fences. It then takes `downstream`'s pause
+/// lock ([`catalog::lock_column_pauses`]), as every write of a pause does,
+/// so a definition being defined or edited to read `downstream`'s column
+/// either reads this pause or commits before the walk goes on to read the
+/// graph (issue #914). False, with nothing written, when
 /// `upstream` is no longer paused: the key-share lock on its row waits for
 /// a [`resume_column`] deleting it, and a resume that comes later waits for
 /// this commit and then deletes the edge with the rest.
@@ -2675,6 +2680,7 @@ async fn pause_dependent(
         downstream_transform,
     )
     .await?;
+    catalog::lock_column_pauses(&*txn, downstream_transform, true).await?;
     let upstream_paused = txn
         .query_opt(
             "select 1 from column_status \
@@ -2820,6 +2826,14 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// column lands after the call returns, and the call waits for the writers
 /// in flight, as a column resume does.
 ///
+/// **A reader defined after it** (issue #914). Define and `ALTER TRANSFORM`
+/// pause a field that reads a column paused when they run, with the row and
+/// edge [`cascade_pause`] would write. The transaction that writes the
+/// column's row takes the target's pause lock after its fence bump
+/// ([`catalog::lock_column_pauses`]); a define reading the target's paused
+/// columns holds it shared to its commit. So a define either reads this
+/// pause, or commits before it and is in the graph [`cascade_pause`] walks.
+///
 /// **`local_fuse` is set even though no fuse tripped.** That column records
 /// "this pair has a reason of its own to stay paused", as opposed to a pause
 /// merely inherited via [`cascade_pause`] — which is exactly true of an
@@ -2854,6 +2868,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
         bump_pause_fence(&*txn, fence.as_deref()).await?;
+        catalog::lock_column_pauses(&*txn, transform, true).await?;
         let mark: String = txn
             .query_one(
                 "insert into column_status \
