@@ -133,11 +133,11 @@ async fn assert_pending(backend: &ManualBackend) {
     );
 }
 
-/// Quiesces, snapshots, and runs the three-way oracle check
+/// Snapshots a quiesced backend and runs the three-way oracle check
 /// ([`generative::run::check_program`]) — the shared tail of every scenario
-/// below, regardless of which timing mode drove the two critical ops.
+/// below, regardless of which timing mode drove the two critical ops (and
+/// so which quiesce the caller ran first).
 async fn assert_converges(pool: &Pool, program: &Program, backend: &mut ManualBackend) {
-    backend.quiesce().await.expect("quiesce");
     let snapshot = backend.snapshot().await.expect("snapshot");
     let diverged = check_program(pool, program, &snapshot)
         .await
@@ -177,6 +177,7 @@ async fn run_back_to_back(variant: RelInterleavingVariant) {
     apply_checked(&mut backend, &program.ops[scenario.parent_op]).await;
     apply_checked(&mut backend, &program.ops[scenario.from_side_op]).await;
 
+    backend.quiesce().await.expect("quiesce");
     assert_converges(&pool, program, &mut backend).await;
 }
 
@@ -192,44 +193,35 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    // Widened maintenance_interval (mirroring `concurrent_convergence.rs`'s
-    // `a_batch_that_exceeds_the_split_threshold_converges_across_workers`):
-    // the engine's own maintenance loop also seals the active segment on its
-    // normal 300ms cadence, which would otherwise race
-    // `force_seal_active_segment`'s manual calls below often enough to make
-    // which two segments the two critical ops actually land in
-    // nondeterministic. 3s comfortably exceeds how long this test's brief
-    // critical section takes (a handful of round trips plus a couple of
-    // 10ms polls), so usually the harness's own manual seals are the only
-    // ones that fire during it. A tick can still land inside it, because
-    // the tick's phase relative to this section is arbitrary. That extra
-    // seal doesn't hurt the seal-boundary property, but it can leave the
-    // ring full for a moment, and `force_seal_active_segment` retries
-    // through that instead of failing. The interval still stays well inside
-    // `quiesce()`'s 30s timeout, so the maintenance loop's *other* jobs
-    // (recovery, retirement) still run enough to let convergence complete;
-    // widening it further (as that pin does, to 10s) is safe there only
-    // because it never seals anything by hand and just waits the one
-    // natural tick out.
+    // Issue #453: the harness does the sealing, in `force_seal_active_segment`
+    // and `quiesce_forcing_seals`, so no quiesce waits on a maintenance tick
+    // for a drain's staged `Recompute`s to seal. The tick still has to run,
+    // though: the scenario's relationship-reading definition goes live only
+    // on a second reconcile pass, and passes ride on ticks. So the tick
+    // runs every `SEAL_BOUNDARY_TICK`, with a reconcile pass on each.
+    //
+    // A tick seals too, and can land inside the critical section below. That
+    // doesn't break the seal boundary: the parent's change commits before the
+    // parent's forced seal, and the from-side change after it, so they land
+    // in different segments whichever seal takes them. It rarely happens
+    // anyway: the seed quiesce ends just after the tick that took that
+    // definition live, a whole tick before the next one.
     let mut backend =
-        ManualBackend::connect_with_options(db.dsn(), workers, Some(Duration::from_secs(3)))
+        ManualBackend::connect_with_options(db.dsn(), workers, Some(SEAL_BOUNDARY_TICK))
             .await
             .expect("connect manual backend");
+    backend.set_reconcile_interval(SEAL_BOUNDARY_TICK);
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
     backend.install(program).await.expect("install program");
     for op in &program.ops[..scenario.parent_op] {
         apply_checked(&mut backend, op).await;
     }
-    // Widening `maintenance_interval` above means nothing auto-seals the
-    // seed batch either unless this does it by hand first — `quiesce()`
-    // only waits for convergence, it never forces a seal on its own.
     assert_pending(&backend).await;
     backend
-        .force_seal_active_segment()
+        .quiesce_forcing_seals()
         .await
-        .expect("seal the seed batch");
-    backend.quiesce().await.expect("quiesce seeds");
+        .expect("quiesce seeds");
     assert!(
         !backend.has_pending().await.expect("check pending"),
         "seeds must be fully drained before the critical section starts, or the forced seal \
@@ -255,8 +247,15 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
          the parent's own (segment {parent_seg}) for this to actually be a seal-boundary crossing"
     );
 
+    backend.quiesce_forcing_seals().await.expect("quiesce");
     assert_converges(&pool, program, &mut backend).await;
 }
+
+/// How often [`run_across_a_seal_boundary`]'s maintenance tick (and, with
+/// it, a reconcile pass) runs. It bounds how long the seed quiesce waits for
+/// the pass that takes the relationship-reading definition live, and is long enough that a tick rarely lands
+/// in the few round trips of the critical section after it.
+const SEAL_BOUNDARY_TICK: Duration = Duration::from_secs(1);
 
 /// How many application-worker tasks [`run_across_a_seal_boundary`] runs
 /// with — `> 1` is the whole point (#138 item 3: more than one segment

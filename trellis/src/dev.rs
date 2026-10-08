@@ -82,6 +82,9 @@ pub mod staging {
     /// `retire_drained_segments` rides along because a forced seal must
     /// answer `RingFull` the same way the engine's own seal-on-demand does:
     /// retire what's retirable, then retry.
+    /// `seal_if_active_nonempty` is the maintenance tick's own seal step, for
+    /// a harness that runs with that tick disabled and seals on demand
+    /// instead (issue #453): it seals only when there is something to seal.
     /// `converged_through` is the single, non-waiting check behind
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
@@ -91,8 +94,8 @@ pub mod staging {
     /// backend that hasn't freed it yet.
     pub use crate::staging::session::producer_singleton_lock_key;
     pub use crate::staging::{
-        StagingError, await_converged, has_pending, retire_drained_segments, seal_phase1,
-        seal_phase2, watermark_token,
+        StagingError, await_converged, has_pending, retire_drained_segments,
+        seal_if_active_nonempty, seal_phase1, seal_phase2, watermark_token,
     };
 }
 

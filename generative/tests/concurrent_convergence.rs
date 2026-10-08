@@ -229,7 +229,9 @@
 //! why); this file's `HARNESS` is its own, independent `thread_local`, so the
 //! two test binaries never share a cluster or a database.
 
-use generative::backend::{Backend, ConcurrentBackend, ManualBackend, SPLIT_THRESHOLD_ROWS};
+use generative::backend::{
+    Backend, ConcurrentBackend, ManualBackend, SEAL_ON_DEMAND_INTERVAL, SPLIT_THRESHOLD_ROWS,
+};
 use generative::baseline_quarantine;
 use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
@@ -238,7 +240,7 @@ use generative::generate::{
     schedule_scale_out, steady_load_case, trivial_program,
 };
 use generative::run::{
-    RunError, run_convergence, run_convergence_bursty, run_convergence_concurrent,
+    RunError, check_program, run_convergence, run_convergence_bursty, run_convergence_concurrent,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
@@ -640,27 +642,23 @@ async fn a_hand_built_program_converges_under_the_concurrent_backend() {
 /// imported here for the same reason), so more than one worker has real
 /// odds of actually claiming a share.
 ///
-/// **Why `maintenance_interval` is widened for this pin specifically:** the
-/// engine's maintenance loop (which performs the seal that fixes a batch's
-/// `bucket_count`) ticks on its own fixed cadence (300ms by default),
-/// independent of anything this harness does. If 1,000 sequential
-/// raw-DML round trips happened to straddle a maintenance tick, the rows
-/// would split across two (or more) smaller sealed batches instead of
-/// landing in one — each individually below the split threshold, making the
-/// pin flaky rather than deterministic. Widening the interval to comfortably
-/// exceed how long 1,000 sequential inserts over a local connection could
-/// plausibly take (generously budgeted at 10s, well inside `quiesce`'s own
-/// 30s timeout) makes "all 1,000 rows land in the same sealed batch" a
-/// property of the pin's construction, not a race against a fixed timer.
-///
-/// The burst itself is one single un-quiesced application of every op in the
-/// program (`burst_size` equal to the whole op count) followed by exactly one
-/// `quiesce()` — the harness never calls `quiesce()` mid-burst, so nothing
-/// forces an early, partial seal from this side either.
+/// **Why the harness does all the sealing:** the engine's maintenance loop
+/// (which performs the seal that fixes a batch's `bucket_count`) ticks on its
+/// own fixed cadence (300ms by default), independent of anything this
+/// harness does. If 1,000 sequential raw-DML round trips straddled a tick,
+/// the rows would split across two (or more) smaller sealed batches, each
+/// possibly below the split threshold. So the engine runs with
+/// [`SEAL_ON_DEMAND_INTERVAL`] (no tick after its first, issue #453): the
+/// pin waits out that first tick (`quiesce_forcing_seals` before any op),
+/// applies every insert, and seals them itself in one forced seal. "All
+/// 1,000 rows land in the same sealed batch" is then a property of the pin's
+/// construction, not a race against a timer, and the drain audit checks it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
     const ROW_COUNT: i64 = 1_000;
     const WORKERS: usize = 4;
+    // The batch must stay well above the split threshold if it moves.
+    const _: () = assert!(ROW_COUNT as usize >= 2 * SPLIT_THRESHOLD_ROWS);
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -670,13 +668,10 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
     let program = build_program(&seed_values, &[]);
     assert_eq!(program.ops.len(), ROW_COUNT as usize);
 
-    let mut backend = ManualBackend::connect_with_options(
-        db.dsn(),
-        WORKERS,
-        Some(std::time::Duration::from_secs(10)),
-    )
-    .await
-    .expect("connect concurrent backend with widened maintenance interval");
+    let mut backend =
+        ManualBackend::connect_with_options(db.dsn(), WORKERS, Some(SEAL_ON_DEMAND_INTERVAL))
+            .await
+            .expect("connect concurrent backend that seals only on demand");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
     // Issue #557: the drain audit the hot-key tier reports through, checked
     // here against a batch whose split is deterministic.
@@ -685,17 +680,47 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
         .await
         .expect("start the drain audit");
 
-    let outcome = run_convergence_bursty(&mut backend, &pool, &program, program.ops.len())
+    backend.install(&program).await.expect("install program");
+    // The definitions go live in the maintenance loop's first tick, after
+    // its seal step: once they're live, that tick can no longer seal any of
+    // the inserts below.
+    backend
+        .quiesce_forcing_seals()
+        .await
+        .expect("quiesce the empty install");
+    for op in &program.ops {
+        let inserted = backend.apply(op).await.expect("insert a row");
+        assert_eq!(inserted, 1, "op {op:?} must insert exactly one row");
+    }
+    assert!(
+        backend.has_pending().await.expect("check pending"),
+        "a committed insert must be in the ring at commit"
+    );
+    backend
+        .force_seal_active_segment()
+        .await
+        .expect("seal every insert into one batch");
+    backend
+        .quiesce_forcing_seals()
         .await
         .expect("a batch that exceeds the split threshold must still converge");
-    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let snapshot = backend.snapshot().await.expect("snapshot");
+    let diverged = check_program(&pool, &program, &snapshot)
+        .await
+        .expect("oracle check");
+    assert!(
+        diverged.is_empty(),
+        "the split batch diverged: {diverged:?}"
+    );
 
     let audit = backend.drain_audit().await.expect("read the drain audit");
     assert!(
         audit.split >= 1
-            && audit.max_rows_per_batch >= SPLIT_THRESHOLD_ROWS as u64
+            && audit.max_rows_per_batch >= ROW_COUNT as u64
             && audit.max_workers_per_batch >= 1,
-        "the drain audit must see the split batch, its row count and its claims: {audit:?}"
+        "the drain audit must see all {ROW_COUNT} inserts sealed into one split batch, and its \
+         claims: {audit:?}"
     );
 
     let max_bucket_count = backend
@@ -706,9 +731,7 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
         max_bucket_count > 1,
         "a {ROW_COUNT}-row batch (well above the engine's real split threshold) must have been \
          partitioned into more than one bucket at seal — got max bucket_count \
-         {max_bucket_count}, which means either the batch didn't land in one sealed batch as \
-         intended (see this test's doc comment on `maintenance_interval`) or the engine's own \
-         splitting decision regressed"
+         {max_bucket_count}, so the engine's own splitting decision regressed"
     );
 }
 

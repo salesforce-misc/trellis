@@ -49,8 +49,8 @@ use trellis::dev::defs::{
     source_primary_key,
 };
 use trellis::dev::staging::{
-    StagingError, has_pending as staging_has_pending, retire_drained_segments, seal_phase1,
-    seal_phase2,
+    StagingError, has_pending as staging_has_pending, retire_drained_segments,
+    seal_if_active_nonempty, seal_phase1, seal_phase2,
 };
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 
@@ -84,6 +84,25 @@ pub const SERVER_STOP_RECLAIM_TTL: Duration = Duration::from_secs(10);
 // (300 ms by default), and the quiesce needs time left after that to
 // finish the work. A third of the budget leaves twenty seconds.
 const _: () = assert!(SERVER_STOP_RECLAIM_TTL.as_secs() * 3 <= QUIESCE_TIMEOUT.as_secs());
+
+/// A maintenance interval ([`ManualBackend::connect_with_options`]) for a
+/// pin that does all sealing itself, with
+/// [`ManualBackend::force_seal_active_segment`] and
+/// [`ManualBackend::quiesce_forcing_seals`] (issue #453). The loop's first
+/// tick still runs when the engine client starts, and its reconcile pass
+/// takes live the definitions [`Backend::install`](super::Backend::install)
+/// registered before starting it, as long as one pass is enough. The next
+/// tick is an hour away, past any test, so no seal of the engine's own can
+/// land between the pin's.
+///
+/// The tick's other jobs don't run after that first one either: retirement
+/// (both seal helpers retire on `RingFull` themselves), stuck-seal recovery
+/// (every seal here runs both phases at once, so none sticks), reclaiming
+/// stale claims (no worker dies), and further reconcile passes. A pin that
+/// needs any of those keeps a real interval. A definition that reads a
+/// relationship's to-side, for one, may be ready only on a second pass
+/// (`capture::reconcile`'s readiness rules), so it would never go live.
+pub const SEAL_ON_DEMAND_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// [`ManualBackend::restart`]'s bounded retry budget (issue #251) for the
 /// residual `ProducerAlreadyRunning` window `trellis::Client::shutdown`
@@ -667,18 +686,63 @@ impl ManualBackend {
             tokio::time::sleep(backoff.min(QUIESCE_TIMEOUT - waited)).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         };
-        // Issue #271: `seal_phase2` now `pg_notify`s the wake channel the
-        // instant it publishes the fence. Every caller here has always used
-        // `ClientOptions::default()`'s wake channel (never overridden by
-        // this backend), so fall back to that default when no engine client
-        // has started yet to remember its own options.
-        let wake_channel = self
-            .client_options
-            .as_ref()
-            .map(|options| options.wake_channel.clone())
-            .unwrap_or_else(|| ClientOptions::default().wake_channel);
+        let wake_channel = self.wake_channel();
         seal_phase2(&self.raw, outcome.sealed_seg_seq, &wake_channel).await?;
         Ok(outcome.sealed_seg_seq)
+    }
+
+    /// [`Backend::quiesce`](super::Backend::quiesce) that seals what the
+    /// maintenance tick would have, instead of waiting for the tick (issue
+    /// #453): for a backend whose tick is off ([`SEAL_ON_DEMAND_INTERVAL`])
+    /// or widened. Draining stages more rows into the active segment (a
+    /// relationship's `Recompute`s, say), and only a seal makes them
+    /// drainable.
+    ///
+    /// Each pass seals the active segment if it holds anything, with the
+    /// tick's own seal step (`seal_if_active_nonempty`), then checks
+    /// [`sql::settled`]. It backs off only after a pass that found nothing
+    /// to seal. Once settled, a plain quiesce confirms it, so this never
+    /// returns on weaker evidence than [`Backend::quiesce`](super::Backend::quiesce)
+    /// does. The whole call is bounded by [`QUIESCE_TIMEOUT`]; past it, that
+    /// confirming quiesce checks once and reports what is still outstanding.
+    pub async fn quiesce_forcing_seals(&mut self) -> Result<(), ManualBackendError> {
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
+        const MAX_BACKOFF: Duration = Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let wake_channel = self.wake_channel();
+        let mut backoff = INITIAL_BACKOFF;
+        while started.elapsed() < QUIESCE_TIMEOUT {
+            let sealed = match seal_if_active_nonempty(&mut self.raw, &wake_channel).await {
+                Ok(outcome) => outcome.is_some(),
+                // Every slot holds an undrained segment: the workers free one.
+                // Or a tick's seal got there first.
+                Err(StagingError::RingFull { .. } | StagingError::Raced) => false,
+                Err(other) => return Err(other.into()),
+            };
+            if sealed {
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
+            if sql::settled(&self.raw, &self.defs).await? {
+                break;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+        let remaining = QUIESCE_TIMEOUT.saturating_sub(started.elapsed());
+        Ok(sql::quiesce(&self.raw, &self.defs, remaining).await?)
+    }
+
+    /// The channel a seal notifies (issue #271: `seal_phase2` `pg_notify`s it
+    /// the instant it publishes the fence). Every caller here has always used
+    /// `ClientOptions::default()`'s wake channel (never overridden by this
+    /// backend), so this falls back to that default when no engine client has
+    /// started yet to remember its own options.
+    fn wake_channel(&self) -> String {
+        self.client_options
+            .as_ref()
+            .map(|options| options.wake_channel.clone())
+            .unwrap_or_else(|| ClientOptions::default().wake_channel)
     }
 
     /// Delegates to the shared [`sql::create_source_table`] — see that

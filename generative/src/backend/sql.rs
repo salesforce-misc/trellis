@@ -692,6 +692,21 @@ pub(super) async fn quiesce(
     }
 }
 
+/// One pass of [`quiesce`]'s two checks, in its order, without waiting on
+/// either (issue #453): every definition settled, then the ring converged
+/// through a token taken after that. A caller that has to act between
+/// checks (seal by hand, say) polls this and then confirms with [`quiesce`].
+pub(super) async fn settled(
+    raw: &tokio_postgres::Client,
+    defs: &[TransformDef],
+) -> Result<bool, QuiesceError> {
+    if !unsettled_definitions(raw, defs).await?.is_empty() {
+        return Ok(false);
+    }
+    let token = watermark_token(raw).await?;
+    Ok(converged_through(raw, token).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
