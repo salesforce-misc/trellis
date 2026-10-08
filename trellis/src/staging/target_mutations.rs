@@ -1382,6 +1382,54 @@ mod tests {
         assert!(unread.spilled.is_empty(), "and never reach the table");
     }
 
+    /// Issue #924: a spilled flush refuses a key past [`MAX_HOP_GEN`] with
+    /// the same error an in-memory flush gives: the worst next hop, and
+    /// each bounded target once, in name order. The bounded keys are spread
+    /// over two spills and the flush's own, and a target under the bound
+    /// sits between them.
+    #[tokio::test]
+    async fn a_spilled_flush_bounds_hops_like_an_in_memory_one() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        let batches: [&[(&str, &str, i32)]; 3] = [
+            &[("public.z", "1", MAX_HOP_GEN), ("public.m", "1", 0)],
+            &[("public.a", "1", MAX_HOP_GEN - 1), ("public.m", "2", 1)],
+            &[("public.a", "1", MAX_HOP_GEN + 2), ("public.z", "2", 0)],
+        ];
+
+        let mut errors = Vec::new();
+        for spill in [None, Some(2)] {
+            let txn = client.transaction().await.expect("begin");
+            let mut m = TargetMutations::assuming_read();
+            for batch in batches {
+                for &(target, key, hop_gen) in batch {
+                    m.record(target, key.into(), None, hop_gen, None, None);
+                }
+                if let Some(batch) = spill {
+                    m.spill_over(&txn, batch).await.expect("spill");
+                }
+            }
+            assert_eq!(m.stats.spilled, spill.is_some());
+            match m.flush_counted(&txn).await {
+                Err(ApplyError::HopBoundExceeded { hop_gen, tables }) => {
+                    errors.push((hop_gen, tables));
+                }
+                other => panic!("expected the hop bound, got {other:?}"),
+            }
+            txn.rollback().await.expect("rollback");
+        }
+        assert_eq!(
+            errors[0],
+            (
+                MAX_HOP_GEN + 3,
+                vec!["public.a".to_string(), "public.z".to_string()]
+            ),
+            "the in-memory flush"
+        );
+        assert_eq!(errors[1], errors[0], "the spilled flush matches it");
+    }
+
     /// A transaction that stages nothing pays no round trip for a token.
     #[tokio::test]
     async fn a_transaction_that_stages_nothing_reads_no_token() {
