@@ -1528,10 +1528,14 @@ pub(crate) async fn is_definition_target(
 /// **Idempotency, per clause** (ADR-0015's "Edits are idempotent"): re-`ADD`ing
 /// a field that already exists with the exact same formula, re-`ALTER`ing a
 /// field to the formula it already has, and `DROP`ping a field already
-/// absent are each a no-op. If *every* clause in the statement turns out to
-/// be one of these, the whole call is a no-op success — no version bump, no
-/// DDL, nothing written — matching pause/resume/drop's own "a replayed
-/// migration must be safe in both directions" discipline.
+/// absent are each a no-op. The clauses are netted against each other
+/// first ([`plan_alter`], issue #919): a field added and dropped in the same
+/// edit, or altered and altered back, changes nothing, and the refusals
+/// below that look at what the edit adds, alters or drops judge that net
+/// change, not each clause. If the net change is empty, the whole call is a
+/// no-op success — no version bump, no DDL, nothing written — matching
+/// pause/resume/drop's own "a replayed migration must be safe in both
+/// directions" discipline.
 ///
 /// **The field build (#625 F8b, #666).** The call only registers the edit:
 /// the DDL, the catalog row and the version fence below, and, when it adds
@@ -8318,6 +8322,105 @@ mod plan_alter_tests {
         let plan = plan("DROP z, DROP z").expect("plan");
         assert_eq!(plan.real_drops, ["z"]);
         assert_eq!(names(&plan.fields), ["a"]);
+    }
+
+    /// Every sequence of up to four clauses over two names and two formulas,
+    /// from each of a few starting definitions, plans what applying the
+    /// clauses one at a time as separate edits would do to the target's
+    /// columns: a column the definition had survives unless a clause drops
+    /// it, a field whose column didn't survive is added, and a surviving
+    /// column whose formula ends up different is altered.
+    #[test]
+    fn the_plan_matches_the_clauses_applied_one_at_a_time() {
+        let exprs = [Expr::Column("a".into()), Expr::NumberLiteral("1".into())];
+        let field = |name: &str, e: usize| FieldDef {
+            name: name.into(),
+            expr: exprs[e].clone(),
+        };
+        let mut alphabet = Vec::new();
+        for name in ["y", "z"] {
+            for e in 0..exprs.len() {
+                alphabet.push(AlterClause::Add(field(name, e)));
+                alphabet.push(AlterClause::Alter(field(name, e)));
+            }
+            alphabet.push(AlterClause::Drop(name.into()));
+        }
+        let mut sequences: Vec<Vec<AlterClause>> = vec![vec![]];
+        let mut frontier = sequences.clone();
+        for _ in 0..4 {
+            frontier = frontier
+                .iter()
+                .flat_map(|s| {
+                    alphabet.iter().map(move |c| {
+                        let mut s = s.clone();
+                        s.push(c.clone());
+                        s
+                    })
+                })
+                .collect();
+            sequences.extend(frontier.iter().cloned());
+        }
+        let starts = [
+            vec![],
+            vec![field("z", 0)],
+            vec![field("z", 1)],
+            vec![field("y", 0), field("z", 1)],
+        ];
+
+        // The reference: each field carries whether its column is one the
+        // definition had (`true`) or one an earlier clause created.
+        type Model = Vec<(FieldDef, bool)>;
+        let apply = |model: &mut Model, clause: &AlterClause| -> Result<(), &'static str> {
+            match clause {
+                AlterClause::Add(f) => match model.iter().find(|(m, _)| m.name == f.name) {
+                    Some((m, _)) if m.expr == f.expr => {}
+                    Some(_) => return Err("exists"),
+                    None => model.push((f.clone(), false)),
+                },
+                AlterClause::Alter(f) => match model.iter_mut().find(|(m, _)| m.name == f.name) {
+                    Some((m, _)) => m.expr = f.expr.clone(),
+                    None => return Err("not found"),
+                },
+                AlterClause::Drop(name) => model.retain(|(m, _)| &m.name != name),
+            }
+            Ok(())
+        };
+
+        for start in &starts {
+            for clauses in &sequences {
+                let context = format!("start {start:?}, clauses {clauses:?}");
+                let mut model: Model = start.iter().map(|f| (f.clone(), true)).collect();
+                let expected = clauses.iter().try_for_each(|c| apply(&mut model, c));
+                let plan = match (expected, plan_alter("t", start, clauses)) {
+                    (Ok(()), Ok(plan)) => plan,
+                    (Err("exists"), Err(CatalogError::AlterFieldAlreadyExists { .. }))
+                    | (Err("not found"), Err(CatalogError::AlterFieldNotFound { .. })) => continue,
+                    (expected, actual) => panic!("{context}: {expected:?} vs {actual:?}"),
+                };
+                let fields_where = |keep: &dyn Fn(&FieldDef, bool) -> bool| -> Vec<FieldDef> {
+                    model
+                        .iter()
+                        .filter(|(f, had)| keep(f, *had))
+                        .map(|(f, _)| f.clone())
+                        .collect()
+                };
+                assert_eq!(plan.fields, fields_where(&|_, _| true), "{context}");
+                assert_eq!(plan.real_adds, fields_where(&|_, had| !had), "{context}");
+                assert_eq!(
+                    plan.real_alters,
+                    fields_where(&|f, had| had && !start.contains(f)),
+                    "{context}"
+                );
+                let lost: Vec<&str> = start
+                    .iter()
+                    .filter(|s| !model.iter().any(|(m, had)| *had && m.name == s.name))
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let mut drops: Vec<&str> = plan.real_drops.iter().map(String::as_str).collect();
+                drops.sort_unstable();
+                assert_eq!(drops, lost, "{context}");
+            }
+        }
     }
 }
 
