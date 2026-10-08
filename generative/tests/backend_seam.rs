@@ -5,7 +5,7 @@
 //! `tests/` live in this crate's `tests/` directory, matching every other
 //! workspace crate's convention (`trellis/tests/*`).
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, ManualBackend, SEAL_ON_DEMAND_INTERVAL};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use testkit::TestCluster;
 use trellis::dev::defs::ast::{
@@ -182,13 +182,10 @@ async fn forced_seals_lap_the_ring_without_a_maintenance_tick() {
         scale_out_after_ops: Vec::new(),
     };
 
-    let mut backend = ManualBackend::connect_with_options(
-        db.dsn(),
-        1,
-        Some(std::time::Duration::from_secs(3600)),
-    )
-    .await
-    .expect("connect manual backend");
+    let mut backend =
+        ManualBackend::connect_with_options(db.dsn(), 1, Some(SEAL_ON_DEMAND_INTERVAL))
+            .await
+            .expect("connect manual backend");
     backend.install(&program).await.expect("install program");
 
     let mut previous = 0;

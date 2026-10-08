@@ -587,6 +587,47 @@ impl ManualBackend {
         self.reclaim_ttl = Some(ttl);
     }
 
+    /// The highest `seg_seq` the drain audit has seen sealed, or `0` before
+    /// any seal (issue #453): a baseline for
+    /// [`ManualBackend::audited_capture_segments`]. Needs
+    /// [`super::ConcurrentBackend::start_drain_audit`] first.
+    pub async fn latest_audited_seal(&self) -> Result<i64, ManualBackendError> {
+        let row = self
+            .raw
+            .query_one(
+                "select coalesce(max(seg_seq), 0) from generative_audit_sealed",
+                &[],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    /// The segments sealed after `after_seg` whose slot held, when its fence
+    /// was published, a change captured from `table`: a source write's ring
+    /// row, not a drain's `Recompute` (issue #453). The drain audit's seal
+    /// trigger records them, so this reads where a change actually landed
+    /// rather than which seal a caller forced, even once the segment has
+    /// drained and retired. `table` is named as the backend's own connection
+    /// resolves it. Needs [`super::ConcurrentBackend::start_drain_audit`]
+    /// first.
+    pub async fn audited_capture_segments(
+        &self,
+        table: &str,
+        after_seg: i64,
+    ) -> Result<Vec<i64>, ManualBackendError> {
+        let rows = self
+            .raw
+            .query(
+                "select distinct seg_seq from generative_audit_keys \
+                 where seg_seq > $2 and op <> 'recompute' \
+                   and to_regclass(src_table) = to_regclass($1) \
+                 order by seg_seq",
+                &[&table, &after_seg],
+            )
+            .await?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
     /// across every segment sealed so far, straight from
     /// the engine's own `staging::claim` partition decision (`segments.bucket_count`,
@@ -1245,7 +1286,7 @@ impl super::OpApplier for ManualApplier {
 /// created in the instance schema `schema` (already quoted). Two
 /// `AFTER` row triggers on the engine's own staging registry: one on a
 /// segment's fence being published, which records the batch's bucket count
-/// and row count and every `(table, key)` in its slot, and one on each
+/// and row count and every `(table, key, op)` in its slot, and one on each
 /// `seg_claims` insert, which records which worker claimed which bucket. A
 /// retired segment's registry rows are deleted, so the audit keeps its own
 /// copy. The seal decides the bucket count and row count in the statement
@@ -1265,7 +1306,7 @@ fn drain_audit_ddl(schema: &str) -> String {
              bucket_count smallint not null, row_count bigint not null); \
          create table {schema}.generative_audit_keys ( \
              seg_seq bigint not null, burst int not null, \
-             src_table text not null, key text not null); \
+             src_table text not null, key text not null, op text not null); \
          create table {schema}.generative_audit_claims ( \
              seg_seq bigint not null, bucket smallint not null, claimed_by text not null); \
          create function {schema}.generative_audit_on_seal() returns trigger \
@@ -1278,7 +1319,7 @@ fn drain_audit_ddl(schema: &str) -> String {
              insert into {schema}.generative_audit_sealed \
                  values (new.seg_seq, current_burst, new.bucket_count, new.row_count); \
              execute format('insert into {schema}.generative_audit_keys \
-                 select distinct $1, $2, src_table, key from %s', ring) \
+                 select distinct $1, $2, src_table, key, op from %s', ring) \
                  using new.seg_seq, current_burst; \
              return null; \
          end $audit$; \

@@ -90,7 +90,7 @@
 
 use std::time::Duration;
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, ConcurrentBackend, ManualBackend};
 use generative::generate::{
     AggregateFn, DefShape, Mutate, RelAggregateFn, RelFieldKind, RelFieldSpec,
     RelInterleavingVariant, TableSpec, build_program_multi_with_relationships,
@@ -213,6 +213,12 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
             .expect("connect manual backend");
     backend.set_reconcile_interval(SEAL_BOUNDARY_TICK);
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    // The drain audit records, at each seal, the changes in the sealed slot:
+    // what the seal-boundary assertion below reads.
+    backend
+        .start_drain_audit()
+        .await
+        .expect("start the drain audit");
 
     backend.install(program).await.expect("install program");
     for op in &program.ops[..scenario.parent_op] {
@@ -228,6 +234,10 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
         "seeds must be fully drained before the critical section starts, or the forced seal \
          below could seal leftover seed rows instead of the parent's own change"
     );
+    let seeds_sealed_through = backend
+        .latest_audited_seal()
+        .await
+        .expect("read the last seed seal");
 
     apply_checked(&mut backend, &program.ops[scenario.parent_op]).await;
     assert_pending(&backend).await;
@@ -242,14 +252,46 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
         .force_seal_active_segment()
         .await
         .expect("seal the from-side segment");
+    // Where each change actually landed, from the seal-time audit, not from
+    // which seals were forced. Each critical op is the only captured change
+    // to its table since the seeds (a drain's `Recompute`s don't count), so
+    // each must sit in exactly one segment: the parent's at or before its
+    // forced seal, the from-side's after that seal and at or before its own.
+    // A tick sealing either change early still satisfies this; the two
+    // changes sharing a segment can't.
+    let landed = async |op: &Op| {
+        backend
+            .audited_capture_segments(op_table(op), seeds_sealed_through)
+            .await
+            .expect("read the audited segments")
+    };
+    let parent_landed = landed(&program.ops[scenario.parent_op]).await;
+    let from_side_landed = landed(&program.ops[scenario.from_side_op]).await;
     assert!(
-        from_side_seg > parent_seg,
-        "the from-side change (segment {from_side_seg}) must land in a segment strictly after \
-         the parent's own (segment {parent_seg}) for this to actually be a seal-boundary crossing"
+        matches!(
+            (parent_landed.as_slice(), from_side_landed.as_slice()),
+            ([parent], [from_side])
+                if *parent <= parent_seg && parent_seg < *from_side && *from_side <= from_side_seg
+        ),
+        "the parent change must land in one segment at or before the parent's forced seal \
+         (segment {parent_seg}), and the from-side change in one segment after it and at or \
+         before its own (segment {from_side_seg}), for this to be a seal-boundary crossing: \
+         the parent's landed in {parent_landed:?}, the from-side's in {from_side_landed:?}"
     );
 
     backend.quiesce_forcing_seals().await.expect("quiesce");
     assert_converges(&pool, program, &mut backend).await;
+}
+
+/// The table `op` writes.
+fn op_table(op: &Op) -> &str {
+    match op {
+        Op::Insert { table, .. }
+        | Op::Update { table, .. }
+        | Op::Delete { table, .. }
+        | Op::Truncate { table, .. }
+        | Op::BulkInsert { table, .. } => table,
+    }
 }
 
 /// How often [`run_across_a_seal_boundary`]'s maintenance tick (and, with
