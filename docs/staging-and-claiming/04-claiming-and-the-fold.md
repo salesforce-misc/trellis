@@ -201,12 +201,18 @@ The discriminator is therefore *"does this row carry any image at all"*, **not**
 
 ```sql
 -- scope both arg-extremes to image-bearing rows only
-WHERE old_image IS NOT NULL OR new_image IS NOT NULL
+WHERE (old_image IS NOT NULL OR new_image IS NOT NULL) AND op <> 'recompute'
 ```
 
 An insert qualifies via its `new_image`, a delete via its `old_image`, a
 primary-key move-out via its `old_image` — so each still contributes its honest
-NULL on the other side, while a bare trigger is excluded from both. A key whose
+NULL on the other side, while a bare trigger is excluded from both. A
+`recompute` is excluded whatever it carries, because neither of its columns is
+the key's state. Its `old_image`, when set, is a prior-image hint (the row as
+readers last saw it), which the fold returns as the record's prior image. Its
+`new_image`, when set, is one `{to_col: value}` join value that a quarantine
+release names (#944), which only the record's join values
+(`to_col_values`) read. A key whose
 rows are all image-less folds to both images NULL and no `last_change`, which
 is correct: a ledger target re-derives it from live source.
 
