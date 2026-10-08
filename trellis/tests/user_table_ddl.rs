@@ -114,13 +114,9 @@ async fn a_user_table_ddl_retry_never_queues_writers_behind_it() {
     eprintln!("while the DDL retried: {watch}");
     assert!(!create.is_finished(), "the DDL waits for the open write");
     // Each attempt gives up after 50 ms; one that waited out the open write
-    // would block the writer from the hold's start to its end.
-    if let Some((blocker, span)) = watch.longest() {
-        assert!(
-            span < HOLD / 2,
-            "one DDL attempt ({blocker}) blocked the writer for {span:?}: {watch}"
-        );
-    }
+    // would block the writer from the hold's start to its end, and attempts
+    // retried back to back would block it most of the time.
+    watch.assert_brief_blocks(HOLD, "create trigger");
     stop.store(true, Ordering::Relaxed);
     tokio::time::timeout(Duration::from_secs(10), writing)
         .await

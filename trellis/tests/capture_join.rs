@@ -778,12 +778,7 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
         .expect("define: apply never waits on the table");
     let watch = testkit::watch_blocked(&raw, writer_pid, HOLD).await;
     eprintln!("while the join retried: {watch}");
-    if let Some((blocker, span)) = watch.longest() {
-        assert!(
-            span < HOLD / 2,
-            "one transaction ({blocker}) blocked the writer for {span:?} of the join: {watch}"
-        );
-    }
+    watch.assert_brief_blocks(HOLD, "join");
     assert_eq!(
         captured_columns(&raw, "public.u").await,
         None,
@@ -831,12 +826,7 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
     }
     let watch = testkit::watch_blocked(&raw, writer_pid, HOLD).await;
     eprintln!("while the uninstall retried: {watch}");
-    if let Some((blocker, span)) = watch.longest() {
-        assert!(
-            span < HOLD / 2,
-            "one transaction ({blocker}) blocked the writer for {span:?} of the uninstall: {watch}"
-        );
-    }
+    watch.assert_brief_blocks(HOLD, "uninstall");
     assert!(
         captured_columns(&raw, "public.u").await.is_some(),
         "the uninstall waits out the open writer"

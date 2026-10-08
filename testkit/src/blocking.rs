@@ -21,6 +21,14 @@
 //! transaction was seen blocking the writer, and a test bounds it well below
 //! the hold.
 //!
+//! Short attempts alone aren't enough: attempts retried back to back would
+//! each be brief and still keep the writer queued nearly all the time
+//! (issue #911). So a test also bounds [`BlockedWatch::blocked_fraction`],
+//! the share of samples that found the writer blocked, below half. With the
+//! real retry interval that share is about a fifth (a 50 ms `lock_timeout`
+//! per 250 ms cycle); with no interval it is two thirds or more.
+//! [`BlockedWatch::assert_brief_blocks`] checks both.
+//!
 //! The span is a lower bound: from when the first sample that saw the
 //! blocker *returned* to when the last one was *issued*. A slow observer
 //! (fewer samples, late replies) only shortens it, so CPU load can't turn a
@@ -97,15 +105,44 @@ impl BlockedWatch {
             .max_by_key(|(_, span)| **span)
             .map(|(blocker, span)| (blocker, *span))
     }
+
+    /// The share of samples that found the session blocked, from 0 to 1
+    /// (0 if no sample was taken).
+    pub fn blocked_fraction(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        self.blocked_samples as f64 / self.samples as f64
+    }
+
+    /// Asserts that, over a watch of a `hold`, nothing kept the session
+    /// blocked for long: no one transaction blocked it for half the hold or
+    /// more, and it was blocked in fewer than half the samples. `what` names
+    /// the DDL in the failure message.
+    #[track_caller]
+    pub fn assert_brief_blocks(&self, hold: Duration, what: &str) {
+        if let Some((blocker, span)) = self.longest() {
+            assert!(
+                span < hold / 2,
+                "{what}: one transaction ({blocker}) blocked the writer for {span:?} of a \
+                 {hold:?} hold: {self}"
+            );
+        }
+        assert!(
+            self.blocked_fraction() < 0.5,
+            "{what}: the writer was blocked in half the samples or more: {self}"
+        );
+    }
 }
 
 impl fmt::Display for BlockedWatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} of {} samples over {:?} blocked, by {} transactions",
+            "{} of {} samples ({:.1}%) over {:?} blocked, by {} transactions",
             self.blocked_samples,
             self.samples,
+            100.0 * self.blocked_fraction(),
             self.watched,
             self.spans.len()
         )?;

@@ -650,13 +650,9 @@ async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others()
         eprintln!("{step}: while the DDL retried: {watch}");
         assert!(!task.is_finished(), "{step} waits for the open write");
         // Each attempt gives up after 50 ms; one that waited out the open
-        // write would block the writer from the hold's start to its end.
-        if let Some((blocker, span)) = watch.longest() {
-            assert!(
-                span < HOLD / 2,
-                "{step}: one attempt ({blocker}) blocked the writer for {span:?}: {watch}"
-            );
-        }
+        // write would block the writer from the hold's start to its end, and
+        // attempts retried back to back would block it most of the time.
+        watch.assert_brief_blocks(HOLD, step);
         stop.store(true, Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(10), writing)
             .await
