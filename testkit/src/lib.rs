@@ -9,6 +9,8 @@
 //!   on.
 //! - [`lsn`] gives tests a realistic LSN to stage CDC ring rows at.
 //! - [`locale`] finds a locale that makes an unpinned `lc_monetary` show.
+//! - [`blocking`] reads from the server's lock table whether one session
+//!   was stuck behind another's lock, and for how long.
 //!
 //! The crate also builds a `trellis-testkit` binary (`src/bin/`) that holds
 //! one [`TestCluster`] for a test suite written in another language (the
@@ -21,11 +23,13 @@
 //! `Result`s: a broken test fixture should fail loudly and immediately,
 //! not be handled gracefully.
 
+pub mod blocking;
 pub mod cluster;
 pub mod crash;
 pub mod fixtures;
 pub mod locale;
 pub mod lsn;
 
+pub use blocking::{BlockedWatch, Blocker, watch_blocked};
 pub use cluster::{ClusterBackup, StopMode, TestCluster, TestDatabase};
 pub use lsn::wal_insert_lsn;

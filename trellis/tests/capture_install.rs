@@ -51,11 +51,6 @@ const WAKE: &str = "capture_install_wake";
 /// How long the lock tests hold a writer open.
 const HOLD: Duration = Duration::from_secs(2);
 
-/// Well above `USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms) for a loaded box, and
-/// far below `HOLD`, which is what a writer queued behind a DDL waiting out
-/// the whole hold would see (as in `tests/user_table_ddl.rs`).
-const SLACK: Duration = Duration::from_millis(750);
-
 async fn connect(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
     tokio::spawn(async move {
@@ -557,19 +552,16 @@ async fn a_partial_install_is_reported_and_repaired() {
     assert_eq!(ring_rows(&client, "repaired").await.len(), 1);
 }
 
-/// Inserts into `public.t` one row at a time until `stop`, and returns the
-/// longest any one insert took.
+/// Inserts into `public.t` one row at a time until `stop`.
 fn spawn_writer(
     client: Client,
     prefix: &'static str,
     stop: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<Duration> {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut longest = Duration::ZERO;
         let mut id = 0i64;
         while !stop.load(Ordering::Relaxed) {
             id += 1;
-            let started = Instant::now();
             client
                 .execute(
                     "insert into public.t (id) values ($1)",
@@ -577,10 +569,8 @@ fn spawn_writer(
                 )
                 .await
                 .expect("writer insert");
-            longest = longest.max(started.elapsed());
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        longest
     })
 }
 
@@ -588,8 +578,8 @@ fn spawn_writer(
 /// table, so the install's `SHARE ROW EXCLUSIVE` (and the uninstall's
 /// `ACCESS EXCLUSIVE`) waits for it, and every other writer that arrives
 /// meanwhile would queue behind a waiting DDL. Each attempt gives up after
-/// 50 ms, so no writer waits much longer than that, and the DDL lands once
-/// the open transaction ends. With a deadline the DDL gives up instead,
+/// 50 ms, so no one attempt blocks a writer for long (read from `pg_locks`,
+/// `testkit::blocking`), and the DDL lands once the open transaction ends. With a deadline the DDL gives up instead,
 /// having changed nothing.
 #[tokio::test]
 async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others() {
@@ -612,6 +602,7 @@ async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others()
             .expect("an open write");
         let holder_pid = backend_pid(&holder).await;
         let writer = connect(db.dsn()).await;
+        let writer_pid = backend_pid(&writer).await;
         let stop = Arc::new(AtomicBool::new(false));
         let writing = spawn_writer(writer, step, stop.clone());
 
@@ -655,18 +646,22 @@ async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others()
                     .map(|_| ()),
             }
         });
-        tokio::time::sleep(HOLD).await;
+        let watch = testkit::watch_blocked(&observer, writer_pid, HOLD).await;
+        eprintln!("{step}: while the DDL retried: {watch}");
         assert!(!task.is_finished(), "{step} waits for the open write");
+        // Each attempt gives up after 50 ms; one that waited out the open
+        // write would block the writer from the hold's start to its end.
+        if let Some((blocker, span)) = watch.longest() {
+            assert!(
+                span < HOLD / 2,
+                "{step}: one attempt ({blocker}) blocked the writer for {span:?}: {watch}"
+            );
+        }
         stop.store(true, Ordering::Relaxed);
-        let writer_longest = tokio::time::timeout(HOLD, writing)
+        tokio::time::timeout(Duration::from_secs(10), writing)
             .await
             .expect("a writer is stuck behind the DDL")
             .expect("writer");
-        assert!(
-            writer_longest < USER_TABLE_DDL_LOCK_TIMEOUT + SLACK,
-            "{step}: a writer queued behind the DDL for {writer_longest:?}"
-        );
-        eprintln!("{step}: longest writer insert while the DDL retried: {writer_longest:?}");
 
         holder.batch_execute("commit").await.expect("release");
         tokio::time::timeout(Duration::from_secs(10), task)

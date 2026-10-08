@@ -27,10 +27,8 @@ use trellis::{ClientOptions, Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = "trellis";
 
-/// Well above `USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms) for a loaded box, and far
-/// below how long the lock tests hold a table, which is what a writer queued
-/// behind a DDL waiting out the whole hold would see (as in
-/// `tests/capture_install.rs`).
+/// Well above `USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms) for a loaded box: what a
+/// pass's own reads may add to its lock budget.
 const SLACK: Duration = Duration::from_millis(750);
 
 async fn connect(dsn: &str) -> Client {
@@ -713,29 +711,26 @@ fn quick_options() -> ClientOptions {
 }
 
 /// Inserts into `public.u` from a separate connection until `stop`, one
-/// autocommit row at a time, and returns the longest any insert took.
-fn spawn_writer(
+/// autocommit row at a time. Returns the writer's backend pid with the task.
+async fn spawn_writer(
     dsn: &str,
     stop: Arc<AtomicBool>,
     first_id: i32,
-) -> tokio::task::JoinHandle<Duration> {
-    let dsn = dsn.to_string();
-    tokio::spawn(async move {
-        let writer = connect(&dsn).await;
-        let mut longest = Duration::ZERO;
+) -> (i32, tokio::task::JoinHandle<()>) {
+    let writer = connect(dsn).await;
+    let pid = backend_pid(&writer).await;
+    let task = tokio::spawn(async move {
         let mut id = first_id;
         while !stop.load(Ordering::Relaxed) {
-            let started = Instant::now();
             writer
                 .execute("insert into public.u (id, a) values ($1, $1)", &[&id])
                 .await
                 .expect("insert");
-            longest = longest.max(started.elapsed());
             id += 1;
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        longest
-    })
+    });
+    (pid, task)
 }
 
 /// Polls `check` every 50 ms until it holds or `within` runs out. Used only
@@ -753,10 +748,11 @@ where
 }
 
 /// A3 end to end through reconcile: a join, then a drop, each while a
-/// writer transaction on the table stays open. Other writers keep writing
-/// the table meanwhile and none waits more than one attempt's lock timeout
-/// (plus slack for a loaded box). The join lands once the holder ends, and
-/// the definition converges; the drop's uninstall lands the same way.
+/// writer transaction on the table stays open. Another writer keeps writing
+/// the table meanwhile, and no one transaction blocks it for long: each of
+/// the DDL's attempts gives up after its lock timeout (read from `pg_locks`,
+/// `testkit::blocking`). The join lands once the holder ends, and the
+/// definition converges; the drop's uninstall lands the same way.
 #[tokio::test]
 async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers() {
     const HOLD: Duration = Duration::from_secs(3);
@@ -775,12 +771,19 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
     // The join.
     let holder = hold_table(db.dsn(), "public.u").await;
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = spawn_writer(db.dsn(), stop.clone(), 1_000);
+    let (writer_pid, writer) = spawn_writer(db.dsn(), stop.clone(), 1_000).await;
     trellis
         .apply("TRANSFORM tu FROM public.u SELECT a AS a")
         .await
         .expect("define: apply never waits on the table");
-    tokio::time::sleep(HOLD).await;
+    let watch = testkit::watch_blocked(&raw, writer_pid, HOLD).await;
+    eprintln!("while the join retried: {watch}");
+    if let Some((blocker, span)) = watch.longest() {
+        assert!(
+            span < HOLD / 2,
+            "one transaction ({blocker}) blocked the writer for {span:?} of the join: {watch}"
+        );
+    }
     assert_eq!(
         captured_columns(&raw, "public.u").await,
         None,
@@ -798,11 +801,7 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
     })
     .await;
     stop.store(true, Ordering::Relaxed);
-    let longest = writer.await.expect("writer");
-    assert!(
-        longest < SLACK,
-        "a writer queued {longest:?} behind the join's attempts"
-    );
+    writer.await.expect("writer");
     let token = trellis.watermark_token().await.expect("token");
     trellis
         .await_converged(token, Duration::from_secs(30))
@@ -826,11 +825,18 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
     // The drop.
     let holder = hold_table(db.dsn(), "public.u").await;
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = spawn_writer(db.dsn(), stop.clone(), 100_000);
+    let (writer_pid, writer) = spawn_writer(db.dsn(), stop.clone(), 100_000).await;
     for statement in ["PAUSE TRANSFORM tu", "DROP TRANSFORM tu"] {
         trellis.apply(statement).await.expect(statement);
     }
-    tokio::time::sleep(HOLD).await;
+    let watch = testkit::watch_blocked(&raw, writer_pid, HOLD).await;
+    eprintln!("while the uninstall retried: {watch}");
+    if let Some((blocker, span)) = watch.longest() {
+        assert!(
+            span < HOLD / 2,
+            "one transaction ({blocker}) blocked the writer for {span:?} of the uninstall: {watch}"
+        );
+    }
     assert!(
         captured_columns(&raw, "public.u").await.is_some(),
         "the uninstall waits out the open writer"
@@ -849,11 +855,7 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
     )
     .await;
     stop.store(true, Ordering::Relaxed);
-    let longest = writer.await.expect("writer");
-    assert!(
-        longest < SLACK,
-        "a writer queued {longest:?} behind the uninstall's attempts"
-    );
+    writer.await.expect("writer");
 
     client.shutdown().await.expect("shutdown");
 }
