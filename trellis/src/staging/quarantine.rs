@@ -3207,14 +3207,34 @@ pub async fn resume_column(
             )
             .await?;
 
-        if reads_paused_sibling(&**client, pool, transform, column).await? {
-            client
-                .execute(
-                    "update column_status set local_fuse = false \
-                     where transform_table = $1 and column_name = $2",
-                    &[&transform, &column],
-                )
-                .await?;
+        // Whether it stays paused with a sibling, read and acted on under
+        // the column-pause lock (#922): a resume of that sibling running at
+        // the same time reads this column's `local_fuse` to decide whether
+        // to release it. Without the lock, this could read the sibling
+        // paused, that resume read `local_fuse` still set and keep this
+        // column paused, and this then clear it: a pause with no reason
+        // left, which no resume of the sibling would release. It changes
+        // no paused state, so it takes no fence.
+        let mut locked = pool.get().await?;
+        let txn = locked.transaction().await?;
+        crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
+            .await?;
+        if reads_paused_sibling(&*txn, pool, transform, column).await? {
+            // Test-only pause point (#922). See `super::interleave`.
+            #[cfg(any(test, feature = "test-util"))]
+            super::interleave::pause_at(
+                &*txn,
+                super::interleave::PausePoint::BeforeSiblingHeldResume,
+                transform,
+            )
+            .await?;
+            txn.execute(
+                "update column_status set local_fuse = false \
+                 where transform_table = $1 and column_name = $2",
+                &[&transform, &column],
+            )
+            .await?;
+            txn.commit().await?;
             tracing::info!(
                 transform = %transform,
                 column = %column,
@@ -3222,6 +3242,7 @@ pub async fn resume_column(
             );
             return Ok(Vec::new());
         }
+        txn.rollback().await?;
     }
 
     let mut resumed = Vec::new();
@@ -3306,7 +3327,21 @@ pub async fn resume_column(
             txn.rollback().await?;
             continue;
         }
+        // The definition as it stands under the lock and its row's: an
+        // `ALTER TRANSFORM` that dropped or edited a field since the lookup
+        // above has committed (it takes both), and the build below must
+        // cover the fields as they are now.
+        let Some(def) = catalog::definition_by_id_in(&*txn, def.id).await? else {
+            txn.rollback().await?;
+            continue;
+        };
         if !def.def.fields.iter().any(|f| f.name == c) {
+            if t != transform {
+                // A reader's field the cascade reached, dropped by an edit
+                // since: its pause rows went with it.
+                txn.rollback().await?;
+                continue;
+            }
             return Err(ApplyError::ColumnNotPaused {
                 transform: def.def.target.clone(),
                 column: c.to_string(),

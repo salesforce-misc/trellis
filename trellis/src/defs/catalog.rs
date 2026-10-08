@@ -398,16 +398,16 @@ pub enum CatalogError {
     /// accepted by `define`); it's this operation's own, narrower coverage
     /// declining, with a message that says so.
     UnsupportedAlter(String),
+    /// A define, `ALTER TRANSFORM` or `DROP TRANSFORM` waited for the
+    /// column-pause lock ([`crate::locks::lock_column_pauses`]) past its
+    /// transaction's `lock_timeout` (#922). Nothing changed: retry the call.
+    ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
     /// A bare `DROP RELATIONSHIP <from_table>.<name>` address matched a
     /// relationship on more than one same-named from-table — one per entry of
     /// `schemas` (issue #288: `blog.posts.author` and `shop.posts.author` may
     /// both exist). Refused rather than resolved through `search_path`; the
     /// caller qualifies the address to say which one it means. See
     /// [`relationship_at_address`].
-    /// A define, `ALTER TRANSFORM` or `DROP TRANSFORM` waited for the
-    /// column-pause lock ([`crate::locks::lock_column_pauses`]) past its
-    /// transaction's `lock_timeout` (#922). Nothing changed: retry the call.
-    ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
     AmbiguousRelationshipAddress {
         from_table: String,
         name: String,

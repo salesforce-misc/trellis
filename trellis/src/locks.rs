@@ -172,6 +172,12 @@ impl ColumnPauseOp {
 /// `lock_timeout` ran out (`55P03`). The transaction has failed and rolls
 /// back with nothing written; the call is retryable. A fuse trip and the
 /// capture pass's callers retry on their next pass.
+///
+/// A call made of several such transactions can have committed some before
+/// one times out: a `PAUSE` whose own row committed and whose cascade pair
+/// timed out (the walk stays owed, and the capture pass finishes it), or a
+/// `RESUME` that resumed one target before the next timed out. Each is
+/// idempotent, so a retry finishes the rest.
 #[derive(Debug)]
 pub struct ColumnPauseLockTimeout {
     /// Which operation was waiting.
@@ -183,8 +189,8 @@ impl std::fmt::Display for ColumnPauseLockTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "timed out waiting for the column-pause lock for a {} (another pause, resume, \
-             define, alter or drop holds it); nothing changed: retry",
+            "{}: timed out waiting for the column-pause lock, which another pause, resume, \
+             define, alter or drop holds; this step wrote nothing: retry",
             self.op.label()
         )
     }

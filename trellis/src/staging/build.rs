@@ -1112,8 +1112,9 @@ pub async fn qualifies(
 /// [`qualifies`] (#625 F2). `ready` is what the staging worker's capture pass
 /// found dispatchable (`capture::reconcile`): the definitions it would
 /// otherwise park a registration marker for. Returns the ones the old build
-/// path must leave alone: those started, and those waiting on their source's
-/// capture gate.
+/// path must leave alone: those started, those waiting on their source's
+/// capture gate, and those whose start timed out waiting for the
+/// column-pause lock (#922), which the next pass starts.
 ///
 /// The gate is the discharge's (`intake::markers`, Q2(a)): while any change
 /// to the source at or below the gate its capture install or widen recorded
@@ -1155,8 +1156,23 @@ pub async fn start_ready_builds(
             taken.push(id);
             continue;
         }
-        if start(client, &definition).await? {
-            taken.push(id);
+        match start(client, &definition).await {
+            Ok(true) => taken.push(id),
+            Ok(false) => {}
+            // A start waits for the column-pause lock (#922). One that
+            // times out wrote nothing; it stays `waiting_to_backfill` for
+            // the next pass, and gets no registration marker meanwhile,
+            // as one held by its capture gate does. The rest of the pass
+            // goes on.
+            Err(ApplyError::ColumnPauseLockTimeout(err)) => {
+                tracing::warn!(
+                    definition_id = id,
+                    error = %err,
+                    "re-derive build start waited out the column-pause lock; retrying next pass"
+                );
+                taken.push(id);
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(taken)

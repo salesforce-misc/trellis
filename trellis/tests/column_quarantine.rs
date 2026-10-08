@@ -4691,3 +4691,214 @@ async fn a_pause_behind_a_held_column_pause_lock_times_out_retryably() {
         .expect("the retry pauses");
     assert!(column_status_row(&client, "sib", "total").await.is_some());
 }
+
+/// Issue #922: a resume of a column that stays paused with a sibling it reads
+/// clears the column's own reason (`local_fuse`) under the column-pause lock.
+/// A resume of that sibling decides whether to release the column from that
+/// same `local_fuse`, so the two serialize: here the column's resume holds
+/// the lock, frozen before its clear, and the sibling's resume waits for it,
+/// then reads the clear and releases the column with itself. Without the
+/// lock, the sibling's resume would read `local_fuse` still set and keep the
+/// column paused, and the clear would then leave it paused with no reason at
+/// all, which no resume of the sibling would ever release.
+#[tokio::test]
+async fn a_resume_held_by_a_paused_sibling_serializes_with_that_siblings_resume() {
+    const PAUSE_LOCK: i64 = 9220;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total, total + 0 AS cost").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    quarantine::pause_column(&db.pool, "sib", "cost")
+        .await
+        .expect("pause cost too");
+    assert!(cascade_edge_exists(&client, "sib", "cost", "sib", "total").await);
+    assert_eq!(
+        column_status_row(&client, "sib", "cost").await.map(|r| r.0),
+        Some(true)
+    );
+
+    let gate = take_gate(&db, PAUSE_LOCK).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeSiblingHeldResume, "sib", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut held = tokio::spawn(with_scope(scope, async move {
+        quarantine::resume_column(&pool, "sib", "cost").await
+    }));
+    let held_pid = tokio::select! {
+        reached = reached => reached.expect("pause scope dropped").backend_pid,
+        finished = &mut held => panic!("the resume of cost finished without reaching its clear: {finished:?}"),
+    };
+
+    let pool = db.pool.clone();
+    let mut sibling =
+        tokio::spawn(async move { quarantine::resume_column(&pool, "sib", "total").await });
+    let waiting = tokio::select! {
+        waiting = blocked_behind(&client, held_pid) => waiting,
+        finished = &mut sibling => panic!("the resume of total didn't wait for cost's: {finished:?}"),
+    };
+    assert!(!holds_column_pause_lock(&client, waiting).await);
+
+    release_gate(&gate, PAUSE_LOCK).await;
+    assert_eq!(
+        held.await.expect("resume task").expect("cost's resume"),
+        Vec::<(String, String)>::new(),
+        "cost stays paused with total"
+    );
+    assert_eq!(
+        sibling.await.expect("resume task").expect("total's resume"),
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib".to_string(), "cost".to_string()),
+        ],
+        "total's resume releases cost with it"
+    );
+    assert_eq!(column_status_row(&client, "sib", "cost").await, None);
+}
+
+/// Issue #922: an `ALTER TRANSFORM` that only drops a field deletes that
+/// field's pause row and the cascade edges into it, which a resume of the
+/// column it reads deletes too, so it takes the column-pause lock, as `DROP
+/// TRANSFORM` does (#921): it waits for a resume frozen holding it. The
+/// resume reads the reader's definition again under the lock, so the
+/// dropped field, which its cascade queued before the edit committed, is
+/// skipped rather than resumed, and the reader's other field is resumed.
+#[tokio::test]
+async fn a_drop_only_alter_waits_for_a_resume_holding_the_column_pause_lock() {
+    const PAUSE_LOCK: i64 = 9221;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    let trellis = trellis_on(&db).await;
+    trellis
+        .apply("TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1, total + 2 AS t2")
+        .await
+        .expect("define the reader");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib_sum", "t1", "sib", "total").await);
+    assert!(cascade_edge_exists(&client, "sib_sum", "t2", "sib", "total").await);
+
+    let gate = take_gate(&db, PAUSE_LOCK).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterResumedColumnDeleted, "sib", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut resume = tokio::spawn(with_scope(scope, async move {
+        quarantine::resume_column(&pool, "sib", "total").await
+    }));
+    let resume_pid = tokio::select! {
+        reached = reached => reached.expect("pause scope dropped").backend_pid,
+        finished = &mut resume => panic!("the resume finished without reaching its delete: {finished:?}"),
+    };
+
+    let mut alter =
+        tokio::spawn(async move { trellis.apply("ALTER TRANSFORM sib_sum DROP t1").await });
+    let waiting = tokio::select! {
+        waiting = blocked_behind(&client, resume_pid) => waiting,
+        finished = &mut alter => panic!("the drop-only alter didn't wait for the resume: {finished:?}"),
+    };
+    assert!(
+        !holds_column_pause_lock(&client, waiting).await,
+        "the alter waits for the lock the resume holds"
+    );
+
+    release_gate(&gate, PAUSE_LOCK).await;
+    let resumed = resume
+        .await
+        .expect("resume task")
+        .expect("the resume commits");
+    alter.await.expect("alter task").expect("the alter commits");
+    assert!(resumed.contains(&("sib".to_string(), "total".to_string())));
+    assert!(
+        resumed.contains(&("sib_sum".to_string(), "t2".to_string())),
+        "{resumed:?}"
+    );
+    assert!(
+        !resumed.contains(&("sib_sum".to_string(), "t1".to_string())),
+        "the dropped field isn't resumed: {resumed:?}"
+    );
+    let edges: i64 = client
+        .query_one(
+            "select count(*) from column_pause_cascades \
+             where downstream_transform = 'sib_sum' or upstream_transform = 'sib'",
+            &[],
+        )
+        .await
+        .expect("count edges")
+        .get(0);
+    assert_eq!(edges, 0);
+    assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
+    assert_eq!(column_status_row(&client, "sib_sum", "t2").await, None);
+}
+
+/// Issue #922 rule 5, for the capture pass: a Re-derive build's start takes
+/// the column-pause lock. Behind a held lock it times out with nothing
+/// written, and the pass goes on rather than failing: the definition stays
+/// `waiting_to_backfill`, held back from the old build path's registration
+/// marker as a start held by its capture gate is, and the next pass starts
+/// it.
+#[tokio::test]
+async fn a_build_start_behind_a_held_column_pause_lock_waits_for_the_next_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    let defined = install_definition(
+        &db.pool,
+        "TRANSFORM sib_two FROM items SELECT price + 1 AS p1",
+        &numeric_columns(&["id", "price", "tax", "bonus"]),
+        "public",
+    )
+    .await
+    .expect("define");
+    async fn definition_status(client: &Client, id: i64) -> String {
+        client
+            .query_one(
+                "select status from transform_definitions where id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read the status")
+            .get(0)
+    }
+    assert_eq!(
+        definition_status(&client, defined.id).await,
+        "waiting_to_backfill"
+    );
+
+    let mut holder = db.pool.get().await.expect("connect");
+    let hold = holder.transaction().await.expect("begin");
+    trellis::locks::lock_column_pauses(
+        &*hold,
+        trellis::locks::ColumnPauseLock::Exclusive,
+        trellis::locks::ColumnPauseOp::Pause,
+    )
+    .await
+    .expect("take the lock");
+
+    let impatient = impatient_pool(&db);
+    let mut pass = impatient.get().await.expect("connect");
+    let taken = trellis::staging::build::start_ready_builds(&mut pass, &impatient, &[defined.id])
+        .await
+        .expect("the pass goes on past a start that waited out the lock");
+    assert_eq!(taken, vec![defined.id], "held back from the old build path");
+    assert_eq!(
+        definition_status(&client, defined.id).await,
+        "waiting_to_backfill"
+    );
+
+    hold.commit().await.expect("release the lock");
+    let taken = trellis::staging::build::start_ready_builds(&mut pass, &impatient, &[defined.id])
+        .await
+        .expect("the next pass");
+    assert_eq!(taken, vec![defined.id]);
+    assert_eq!(definition_status(&client, defined.id).await, "backfilling");
+}

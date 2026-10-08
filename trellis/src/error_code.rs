@@ -58,7 +58,10 @@ pub enum ErrorCode {
     /// [`crate::Trellis::await_converged`] exhausting its `timeout`, and
     /// [`crate::Trellis::release_key`] waiting out the lock timeout for the
     /// drain pages in flight on the key's table (issue #842), which changes
-    /// nothing and succeeds on a retry once they commit. Kept apart from
+    /// nothing and succeeds on a retry once they commit, and a column pause,
+    /// resume, define, `ALTER` or `DROP TRANSFORM` waiting out the lock
+    /// timeout for the column-pause lock (issue #922), which is the same
+    /// kind of wait. Kept apart from
     /// `Internal` so a host can tell it from a bug (issue #586). Not every
     /// timeout is this: a pool checkout timing out is `Connectivity`, and any
     /// other Postgres statement or lock timeout is classified by its SQLSTATE

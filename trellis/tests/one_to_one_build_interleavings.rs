@@ -2199,3 +2199,87 @@ async fn a_page_apply_does_not_outlive_an_escalated_reverse_for_a_kid_insert() {
 async fn a_page_apply_does_not_outlive_an_escalated_reverse_for_a_kid_repoint() {
     a_page_apply_does_not_outlive_an_escalated_parent_reverse(KidChange::Repoint).await;
 }
+
+// ------------------------------ the column-pause lock against a build (#922)
+
+/// Issue #922 rule 4: a define holds the column-pause lock (shared) for its
+/// catalog transaction only, and the build it starts takes none while it
+/// writes. Here a second definition is registered and its Re-derive build
+/// started, and its chunk stops mid-statement, holding its fence and entry
+/// locks. Nothing holds the column-pause lock then: an exclusive taker (a
+/// pause, resume or drop elsewhere) gets it at once. A define that held it
+/// to the end of its build, or a chunk that took it, would keep every pause
+/// waiting for as long as the backfill ran.
+#[tokio::test]
+async fn a_build_in_flight_holds_no_column_pause_lock() {
+    let (mut d, _plan) = start_build(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    d.settle().await;
+    let columns: std::collections::HashMap<String, ValueType> = columns()
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect();
+    let two = trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM two FROM public.src SELECT v + 1 AS inc",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("define two");
+    trellis::intake::markers::discharge_registrations(d.pool())
+        .await
+        .expect("start two's build");
+    assert_eq!(
+        d.rows(&format!(
+            "select status from transform_definitions where id = {}",
+            two.id
+        ))
+        .await,
+        ["(backfilling)"]
+    );
+    assert_eq!(
+        build_step(d.pool(), "planner").await,
+        trellis::staging::build::Step::Planned
+    );
+    let mut chunk = d
+        .run_frozen(
+            &[(PausePoint::AfterRederiveRead, "public.two")],
+            |pool| async move { Ok(build_step(&pool, "chunk").await) },
+        )
+        .await;
+    chunk.reached(PausePoint::AfterRederiveRead).await;
+
+    let held: i64 = d
+        .ctl
+        .query_one(
+            "select count(*) from pg_locks \
+             where locktype = 'advisory' and classid = 922 and objid = 0 and objsubid = 2",
+            &[],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0);
+    assert_eq!(held, 0, "no one holds or waits for the column-pause lock");
+    let mut taker = d.pool().get().await.expect("connect");
+    let txn = taker.transaction().await.expect("begin");
+    trellis::locks::set_local_lock_timeout(&*txn, std::time::Duration::from_millis(100))
+        .await
+        .expect("set the timeout");
+    trellis::locks::lock_column_pauses(
+        &*txn,
+        trellis::locks::ColumnPauseLock::Exclusive,
+        trellis::locks::ColumnPauseOp::Pause,
+    )
+    .await
+    .expect("an exclusive taker gets the lock while the build runs");
+    txn.rollback().await.expect("release");
+
+    d.release(&mut chunk, PausePoint::AfterRederiveRead).await;
+    assert_eq!(chunk.finish().await, trellis::staging::build::Step::Chunk);
+    trellis::staging::build::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select id, inc from public.two order by id").await,
+        d.rows("select id, v + 1 from public.src order by id").await,
+    );
+}

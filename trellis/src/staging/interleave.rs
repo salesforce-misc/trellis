@@ -79,7 +79,10 @@
 //! Each pair of a column resume (`super::quarantine::resume_column`) fires
 //! [`PausePoint::AfterResumedColumnDeleted`] for its target after it deletes
 //! the resumed column's row, before it releases that column's readers
-//! (#917). A test runs the resume inside [`with_scope`].
+//! (#917). A resume of a column that stays paused with a sibling it reads
+//! fires [`PausePoint::BeforeSiblingHeldResume`] for its target, holding the
+//! column-pause lock, before it clears the column's `local_fuse` (#922). A
+//! test runs the resume inside [`with_scope`].
 //!
 //! A later part that replaces a step moves its hook with it.
 //!
@@ -159,8 +162,9 @@ pub enum PausePoint {
     /// relationship's refresh stamp and projection rows it wrote (#831).
     BeforeReleaseCommit,
     /// After a column pause cascade's pair bumps its reader's fence, before
-    /// it locks its upstream column's `column_status` row, for the reader's
-    /// transform (`super::quarantine::cascade_pause`, #912).
+    /// it takes the column-pause lock and reads its upstream column's
+    /// `column_status` row, for the reader's transform
+    /// (`super::quarantine::cascade_pause`, #912).
     AfterCascadeFenceBump,
     /// After a define or `ALTER TRANSFORM` reads the paused columns of the
     /// targets its definition reads, holding the column-pause lock (shared
@@ -172,6 +176,11 @@ pub enum PausePoint {
     /// it resumes, before it releases that column's readers, for the
     /// column's (bare) target (`super::quarantine::resume_column`, #917).
     AfterResumedColumnDeleted,
+    /// After a column resume finds its column reads a sibling field still
+    /// paused, holding the column-pause lock, before it clears the column's
+    /// own reason (`local_fuse`) and leaves it paused with that sibling, for
+    /// the column's (bare) target (`super::quarantine::resume_column`, #922).
+    BeforeSiblingHeldResume,
 }
 
 /// What a frozen worker reports when it reaches its armed point.
