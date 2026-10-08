@@ -75,8 +75,7 @@ pub struct PlainDefinitionSummary {
     /// [`DefinitionSummary::backfill_failure`].
     pub backfill_failure: Option<PlainBackfillFailure>,
     /// Set while the drain, or its build's merge, has halted on the
-    /// definition; see
-    /// [`DefinitionSummary::halt`].
+    /// definition; see [`DefinitionSummary::halt`].
     pub halt: Option<PlainCaptureFailure>,
 }
 

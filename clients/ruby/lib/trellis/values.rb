@@ -37,9 +37,9 @@ module Trellis
   # Definition's fields, with the time it was registered (a Time) in place
   # of its source columns. backfill_failure is nil unless its build keeps
   # failing. halt is nil unless the drain, or its build's merge, halted on
-  # it: a CaptureFailure of kind :halt, the definition :paused until the cause is fixed and it is
-  # resumed. Listing the definitions and looking for a halt is the health
-  # check for halts.
+  # it: a CaptureFailure of kind :halt, the definition :paused until the
+  # cause is fixed and it is resumed. Listing the definitions and looking for
+  # a halt is the health check for halts.
   DefinitionSummary = Data.define(:id, :target_table, :source_table, :source_version, :status,
                                   :created_at, :backfill_failure, :halt) do
     def self.from_native(hash)
@@ -69,8 +69,8 @@ module Trellis
   #   halted on it. A schema change paused it (resume it once fixed),
   #   installing capture keeps failing (it clears once the cause is fixed),
   #   or, with kind :halt, a failure no retry gets past reached it, so the
-  #   drain (or its build's merge) paused it and what depends on it (resume it once fixed). A
-  #   definition an operator paused has none.
+  #   drain (or its build's merge) paused it and what depends on it (resume
+  #   it once fixed). A definition an operator paused has none.
   # - held_keys: it holds keys in quarantine (a HeldKeys): source keys whose
   #   changes kept failing in its apply, so it leaves them out and their
   #   target rows stay as they were, whatever its status, :live included.
@@ -139,10 +139,10 @@ module Trellis
   end
 
   # Why capture of source_table is broken, or why the drain (or a build's
-  # merge) halted on the definition: kind is :capture or :halt, error is a sentence naming the
-  # cause, columns the columns it is about (empty when it isn't about a
-  # column, and for a halt), and detected_at (a Time) when it was first
-  # found.
+  # merge) halted on the definition: kind is :capture or :halt, error is a
+  # sentence naming the cause, columns the columns it is about (empty when it
+  # isn't about a column, and for a halt), and detected_at (a Time) when it
+  # was first found.
   CaptureFailure = Data.define(:kind, :source_table, :columns, :error, :detected_at) do
     def self.from_native(hash)
       new(**hash.except(:detected_at_micros),

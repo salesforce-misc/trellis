@@ -175,9 +175,10 @@ end
 defmodule Trellis.CaptureFailure do
   @moduledoc """
   Why capture of `source_table` is broken, or why the drain (or a build's
-  merge) halted on the transform: `kind` is `:capture` or `:halt`, `error` is a sentence naming
-  the cause, `columns` the columns it is about (empty when it isn't about a
-  column, and for a halt), and `detected_at` when it was first found.
+  merge) halted on the transform: `kind` is `:capture` or `:halt`, `error`
+  is a sentence naming the cause, `columns` the columns it is about (empty
+  when it isn't about a column, and for a halt), and `detected_at` when it
+  was first found.
   """
 
   @typedoc "Whether capture broke or the drain halted."

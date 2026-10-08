@@ -3397,6 +3397,11 @@ mod tests {
             }
         }
 
+        /// The fixture database's connection string.
+        fn pool_dsn(&self) -> String {
+            self._db.dsn().to_string()
+        }
+
         async fn status(&self, target: &str) -> crate::app::DefinitionStatus {
             self.trellis
                 .status(target)
@@ -3607,5 +3612,172 @@ mod tests {
             Step::Idle,
             "nothing merges for a paused definition"
         );
+    }
+
+    /// #901: a transient failure that outlasts [`merge_retrying`]'s retries
+    /// backs the target off uncharged, and the next step leaves the target
+    /// alone until the backoff ends. A deferred constraint trigger raises a
+    /// serialization failure at the merge's `COMMIT` for its first
+    /// `MERGE_TRANSIENT_RETRIES + 1` firings, counted by a sequence.
+    #[tokio::test]
+    async fn a_transient_failure_that_outlasts_the_retries_backs_off_uncharged() {
+        let cluster = testkit::TestCluster::start();
+        let mut it = MergeFixture::new(&cluster).await;
+        let id = it.define("flaky").await;
+        it.stage().await;
+        let failing = MERGE_TRANSIENT_RETRIES + 1;
+        it.raw
+            .batch_execute(&format!(
+                "create sequence public.commit_attempts; \
+                 create function public.fail_early_commits() returns trigger \
+                   language plpgsql as $$ \
+                   begin \
+                     if nextval('public.commit_attempts') <= {failing} then \
+                       raise exception 'an early commit fails' using errcode = '40001'; \
+                     end if; \
+                     return null; \
+                   end $$; \
+                 create constraint trigger flaky_fail_early_commits \
+                   after insert or update or delete on public.flaky \
+                   deferrable initially deferred \
+                   for each row execute function public.fail_early_commits()"
+            ))
+            .await
+            .expect("a deferred trigger failing the early commits");
+        let fired = async |it: &MergeFixture| -> i64 {
+            it.raw
+                .query_one("select last_value from public.commit_attempts", &[])
+                .await
+                .expect("read the sequence")
+                .get(0)
+        };
+
+        let mut merges = MergeFailures::default();
+        let step = work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+            .await
+            .expect("a failing merge is no failure of the step");
+        assert_ne!(step, Step::Merged);
+        assert_eq!(
+            fired(&it).await,
+            i64::from(failing),
+            "the merge ran once and was retried {MERGE_TRANSIENT_RETRIES} times"
+        );
+        let failure = merges.by_definition[&id];
+        assert_eq!((failure.attempts, failure.charged), (1, 0), "uncharged");
+        assert!(merges.backing_off(id));
+
+        let step = work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+            .await
+            .expect("a build step");
+        assert_ne!(step, Step::Merged);
+        assert_eq!(
+            fired(&it).await,
+            i64::from(failing),
+            "a target backing off isn't merged"
+        );
+
+        merges.expire();
+        for _ in 0..10 {
+            let step = work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+                .await
+                .expect("a build step");
+            if !step.progressed() {
+                break;
+            }
+        }
+        assert!(
+            merges.by_definition.is_empty(),
+            "a merge forgets the failures"
+        );
+        assert_eq!(it.rows("flaky").await, EXPECTED_GROUPS);
+        assert_eq!(it.status("flaky").await.status, TransformStatus::Live);
+    }
+
+    /// #901: a merge Postgres refuses (`42501`, the drain worker's role lacks
+    /// the writes on the target) halts its definition at once, uncharged,
+    /// with the catalog's reason on a kind `halt` `capture_failure`, and
+    /// keeps the deltas. Once the grant is back, a resume rebuilds the
+    /// definition to the source's groups, applying each change once.
+    #[tokio::test]
+    async fn a_refused_merge_halts_at_once_and_a_resume_rebuilds_it() {
+        let cluster = testkit::TestCluster::start();
+        let mut it = MergeFixture::new(&cluster).await;
+        let id = it.define("broken").await;
+        it.stage().await;
+        let schema = crate::config::DEFAULT_SCHEMA;
+        it.raw
+            .batch_execute(&format!(
+                "do $$ begin \
+                   if not exists (select from pg_roles where rolname = 'merge_worker') then \
+                     create role merge_worker login; \
+                   end if; \
+                 end $$; \
+                 grant usage on schema {schema}, public to merge_worker; \
+                 grant all on all tables in schema {schema} to merge_worker; \
+                 grant all on all sequences in schema {schema} to merge_worker; \
+                 grant all on all tables in schema public to merge_worker; \
+                 revoke all on public.broken from merge_worker; \
+                 grant select on public.broken to merge_worker;"
+            ))
+            .await
+            .expect("a drain role that can't write the target");
+        let dsn = it.pool_dsn().replace("user=postgres", "user=merge_worker");
+        assert!(dsn.contains("user=merge_worker"), "{dsn}");
+        let worker = Pool::new(&crate::config::Config::from_dsn(dsn).expect("valid dsn"))
+            .expect("a pool logged in as the drain role");
+
+        let mut merges = MergeFailures::default();
+        work_once(&worker, "worker", &MERGE_OPTIONS, &mut merges)
+            .await
+            .expect("a refused merge is no failure of the step");
+        let status = it.status("broken").await;
+        assert_eq!(status.status, TransformStatus::Paused, "halted at once");
+        let failure = status.capture_failure.expect("the halt's record");
+        assert_eq!(failure.kind, crate::app::CaptureFailureKind::Halt);
+        assert!(failure.source_table.ends_with("broken"), "{failure:?}");
+        assert!(failure.error.contains("was refused"), "{}", failure.error);
+        assert!(
+            failure.error.contains("role merge_worker lacks INSERT"),
+            "{}",
+            failure.error
+        );
+        assert!(!merges.by_definition.contains_key(&id), "nothing charged");
+        assert!(it.deltas("broken").await > 0, "a halt keeps the deltas");
+
+        it.raw
+            .batch_execute("grant all on public.broken to merge_worker")
+            .await
+            .expect("give the grant back");
+        it.trellis
+            .apply("RESUME TRANSFORM broken")
+            .await
+            .expect("resume");
+        crate::client::reconcile_pass(
+            &mut it.raw,
+            &it.pool,
+            schema,
+            "merge_wake",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("start the rebuild");
+        assert_eq!(
+            it.status("broken").await.status,
+            TransformStatus::Backfilling
+        );
+        it.stage().await;
+        for _ in 0..20 {
+            let step = work_once(&worker, "worker", &MERGE_OPTIONS, &mut merges)
+                .await
+                .expect("a build step");
+            if !step.progressed() {
+                break;
+            }
+        }
+        let status = it.status("broken").await;
+        assert_eq!(status.status, TransformStatus::Live);
+        assert_eq!(status.capture_failure, None);
+        assert_eq!(it.rows("broken").await, EXPECTED_GROUPS);
+        assert_eq!(it.deltas("broken").await, 0);
     }
 }

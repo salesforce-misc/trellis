@@ -90,7 +90,7 @@ These are the tools the entries refer to:
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
-| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge and catch-up: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up); build chunk: `backfill_failure` | none |
+| 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
 | 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 |
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #528, test ignored |
@@ -337,9 +337,10 @@ than filtering it. What follows depends on what was refused:
   key.
 * **A build's group-delta merge** halts like a drain: it pauses what the
   refusal reaches with kind `halt`. One the catalog can't pin is retried with
-  backoff, and its fifth charged attempt pauses the definition, and everything
-  downstream of its target, with kind `halt` and the error on
-  `capture_failure`.
+  backoff, and its fifth charge on one drain worker pauses the definition, and
+  everything downstream of its target, with kind `halt` and the error on
+  `capture_failure`. Until then it shows only in that worker's warn log. The
+  charges are held in the worker's memory, so a restart starts them again.
 * **A backfill discharge or go-live catch-up** halts the same way, whether
   the refusal comes while it plans a build, before any chunk exists, or while
   a catch-up re-reads the source. It reads the catalog as the discharge's own
@@ -360,9 +361,11 @@ than filtering it. What follows depends on what was refused:
 definitions and shows in `status()`, except a `42501` the catalog can't pin,
 which pauses nothing: a drain's shows on `drain_failure` and in
 `self_check`, and a discharge's or catch-up's on `backfill_failure`. A build
-chunk's shows on `backfill_failure`, and a build merge's on `capture_failure`. For the ring's owner, the reconcile pass
-pauses the readers and `self_check` reports a `capture` divergence (#745,
-#765). Define and declare refuse policies that already apply
+chunk's shows on `backfill_failure`. A build merge's pauses what it reaches
+too, and one the catalog can't pin shows on `capture_failure` once its fifth
+charge pauses the definition. For the ring's owner, the
+reconcile pass pauses the readers and `self_check` reports a `capture`
+divergence (#745, #765). Define and declare refuse policies that already apply
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
 **Planned work:** none.
