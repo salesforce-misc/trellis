@@ -2749,7 +2749,9 @@ async fn pause_dependent(
 /// the paused column unpaused (decision #5). An operator's `PAUSE` returns
 /// the error and can be re-run, but a column fuse trip has no caller to
 /// retry it, and its column, now paused, stops failing, so no new charge
-/// trips it again.
+/// trips it again. An `ALTER TRANSFORM` that pauses a field at birth
+/// (issue #915) marks it and runs no walk of its own: its transaction holds
+/// its definition's source fence, and each reader's pair bumps its own.
 ///
 /// The staging worker's capture pass calls this each pass, as it releases
 /// the keys an in-place re-type held. That pass runs on the maintenance
@@ -2838,6 +2840,9 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// ([`catalog::lock_column_pauses`]); a define reading the target's paused
 /// columns holds it shared to its commit. So a define either reads this
 /// pause, or commits before it and is in the graph [`cascade_pause`] walks.
+/// An edit that pauses a field which already has readers takes the field's
+/// target's lock exclusive too, and marks the field as owing its cascade
+/// (issue #915), which [`complete_pause_cascades`] runs.
 ///
 /// **`local_fuse` is set even though no fuse tripped.** That column records
 /// "this pair has a reason of its own to stay paused", as opposed to a pause

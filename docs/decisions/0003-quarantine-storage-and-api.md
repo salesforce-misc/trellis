@@ -238,7 +238,12 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   pause and a define reading its column are ordered by a transaction lock on
   the paused column's target, taken by every write of a pause and held shared
   by the define, so either the define reads the pause or the pause's cascade
-  finds the definition.
+  finds the definition. An edit can pause a field that already has readers,
+  in other definitions or as a sibling's alias. So the edit takes its own
+  target's lock exclusive, as a pause does, and marks each field it pauses as
+  owing its cascade. The capture pass then walks the field's readers once the
+  edit commits. The edit doesn't walk them itself, because each reader's
+  pause bumps that reader's own fence and the edit already holds one.
 * **Sibling readers** — a field of the same 1-1 definition that reads a paused
   field by alias, directly or through other fields, is paused with it (a
   `column_status` row and a cascade edge), so Apply freezes it rather than
