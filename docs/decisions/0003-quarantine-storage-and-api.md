@@ -238,7 +238,11 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   pause and a define reading its column are ordered by a transaction lock on
   the paused column's target, taken by every write of a pause and held shared
   by the define, so either the define reads the pause or the pause's cascade
-  finds the definition. An edit can pause a field that already has readers,
+  finds the definition. A column's resume takes the same lock, since it
+  deletes the target's rows one by one, the resumed column's and then each
+  sibling's it releases, in walk order, while a define reads them in name
+  order. So a define reads the target's rows before the resume starts or after
+  it commits, rather than each holding a row the other waits for. An edit can pause a field that already has readers,
   in other definitions or as a sibling's alias. So the edit takes its own
   target's lock exclusive, as a pause does, and marks each field it pauses as
   owing its cascade. Once its transaction commits, the edit walks the field's

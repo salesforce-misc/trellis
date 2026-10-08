@@ -3113,6 +3113,12 @@ pub async fn resume_column(
         if one_to_one {
             super::build::bump_version_fence(&*txn, &def.source_table).await?;
         }
+        // The target's pause lock, exclusive, as every write of a pause
+        // takes it (issue #917): this deletes `t`'s rows one by one, in walk
+        // order, and a define or edit reading them `for key share`, in name
+        // order, holds the lock shared, so it reads either before this
+        // starts or after it commits. See `catalog::lock_column_pauses`.
+        catalog::lock_column_pauses(&*txn, &t, true).await?;
         let row = txn
             .query_one(
                 "select status, build from transform_definitions where id = $1 for update",
@@ -3149,6 +3155,14 @@ pub async fn resume_column(
         txn.execute(
             "delete from column_status where transform_table = $1 and column_name = $2",
             &[&t, &c],
+        )
+        .await?;
+        // Test-only pause point (#917). See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            &*txn,
+            super::interleave::PausePoint::AfterResumedColumnDeleted,
+            &t,
         )
         .await?;
         // Un-cascade from `c`, and from each sibling this releases with it

@@ -4170,3 +4170,104 @@ async fn an_alter_whose_cascade_walk_fails_leaves_it_to_the_capture_pass() {
     assert!(column_status_row(&client, "sib_down", "d1").await.is_some());
     assert_eq!(cascade_pending(&client, "sib_sum", "c1").await, Some(false));
 }
+
+// ---------------------------------------------------------------------
+// Issue #917: a define reading a paused target's rows is ordered against a
+// resume of one of its columns that releases a sibling.
+// ---------------------------------------------------------------------
+
+/// The one backend waiting on `pid`, once there is one. A short wait for a
+/// lock queue to form, not for anything to converge.
+async fn blocked_behind(client: &Client, pid: i32) -> i32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiters: Vec<i32> = client
+            .query(
+                "select pid from pg_stat_activity where $1 = any(pg_blocking_pids(pid))",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if let [waiter] = waiters[..] {
+            return waiter;
+        }
+        assert!(
+            waiters.is_empty(),
+            "one backend waits on {pid}: {waiters:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing queued behind {pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The issue's reproduction, with no stress loop. `sib.cost` reads
+/// `sib.total` by alias, so pausing `total` pauses `cost` too, and `cost`
+/// sorts first. `RESUME sib.total` deletes `total`'s row, then releases
+/// `cost` and deletes its row. A define of a reader of `sib` reads `sib`'s
+/// paused rows in name order, `cost` then `total`. Frozen between its two
+/// deletes, the resume holds `total`'s row; the define then takes `cost`'s
+/// and waits for `total`'s, and the resume's delete of `cost` closes the
+/// cycle (`deadlock detected`). The resume's pause lock on `sib` makes the
+/// define wait for the whole resume instead, so both commit, and the define
+/// finds nothing paused.
+#[tokio::test]
+async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_sorts_first() {
+    const PAUSE_LOCK: i64 = 9170;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total, total + 0 AS cost").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib", "cost", "sib", "total").await);
+
+    let gate = take_gate(&db, PAUSE_LOCK).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterResumedColumnDeleted, "sib", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut resume = tokio::spawn(with_scope(scope, async move {
+        quarantine::resume_column(&pool, "sib", "total").await
+    }));
+    let resume_pid = tokio::select! {
+        reached = reached => reached.expect("pause scope dropped").backend_pid,
+        finished = &mut resume => panic!("the resume finished without reaching its delete: {finished:?}"),
+    };
+
+    let pool = db.pool.clone();
+    let define = tokio::spawn(async move {
+        create_definition(
+            &pool,
+            "TRANSFORM sib_sum FROM sib SELECT total + 1 AS t1",
+            &numeric_columns(&["id", "total", "cost"]),
+        )
+        .await
+    });
+    blocked_behind(&client, resume_pid).await;
+
+    release_gate(&gate, PAUSE_LOCK).await;
+    let resumed = resume
+        .await
+        .expect("resume task")
+        .expect("the resume commits");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib".to_string(), "cost".to_string()),
+        ]
+    );
+    define
+        .await
+        .expect("define task")
+        .expect("the define commits");
+    assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
+    assert_eq!(column_status_row(&client, "sib", "cost").await, None);
+}

@@ -76,6 +76,11 @@
 //! for its own target after it reads the paused columns its definition
 //! reads (#914). A test runs the define inside [`with_scope`].
 //!
+//! Each pair of a column resume (`super::quarantine::resume_column`) fires
+//! [`PausePoint::AfterResumedColumnDeleted`] for its target after it deletes
+//! the resumed column's row, before it releases that column's readers
+//! (#917). A test runs the resume inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -163,6 +168,10 @@ pub enum PausePoint {
     /// readers of them, for its own (bare) target
     /// (`defs::catalog`'s `pause_readers_of_paused_columns`, #914).
     AfterUpstreamPausesRead,
+    /// After a column resume deletes the `column_status` row of the column
+    /// it resumes, before it releases that column's readers, for the
+    /// column's (bare) target (`super::quarantine::resume_column`, #917).
+    AfterResumedColumnDeleted,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

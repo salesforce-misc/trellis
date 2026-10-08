@@ -2114,9 +2114,10 @@ async fn lock_column_pauses_in_order(
 /// - A pause of an upstream column that commits first is read here. One
 ///   that comes later waits for this commit, and its cascade then reads the
 ///   definition as it stands and finds this reader paused already.
-/// - A resume of an upstream column that deletes its row first leaves
-///   nothing to read. One that comes later waits for this commit and then
-///   deletes the edge with the rest, releasing the reader.
+/// - A resume of an upstream column takes the upstream's pause lock
+///   exclusive before it deletes a row (issue #917). One that commits first
+///   leaves nothing to read. One that comes later waits for this commit and
+///   then deletes the edge with the rest, releasing the reader.
 #[allow(clippy::too_many_arguments)]
 async fn pause_readers_of_paused_columns(
     txn: &impl GenericClient,
@@ -2261,26 +2262,35 @@ async fn pause_reader_in_txn(
     Ok(edged > 0)
 }
 
-/// Takes the transaction-scoped lock that orders a column pause of
-/// `transform` (bare) against a reader of its columns being defined or
+/// Takes the transaction-scoped lock that orders a column pause or resume
+/// of `transform` (bare) against a reader of its columns being defined or
 /// edited (issue #914): `exclusive` for a transaction that writes a pause
-/// of one of `transform`'s columns, shared for a define or edit about to
-/// read them ([`pause_readers_of_paused_columns`]).
+/// of one of `transform`'s columns or deletes one, shared for a define or
+/// edit about to read them ([`pause_readers_of_paused_columns`]).
 ///
 /// Without it, a define could read no pause, the pause commit, and its
 /// cascade read the dependency graph before the define committed, so
 /// neither would pause the new reader. With it, one of them waits for the
-/// other to commit. Pauses of one target don't wait on each other here
-/// (a 1-1 target's already wait on its source's fence), nor do two
-/// defines. An advisory lock rather than a row lock: nothing else takes
-/// it, so the only transactions it orders are these.
+/// other to commit. A resume needs it too (issue #917): it deletes the
+/// resumed column's row and then each sibling's it releases, in walk order,
+/// while the define locks the same rows in name order, so without it each
+/// could hold a row the other waits for. Pauses and resumes of one target
+/// don't wait on each other here (a 1-1 target's already wait on its
+/// source's fence), nor do two defines. An advisory lock rather than a row
+/// lock: nothing else takes it, so the only transactions it orders are
+/// these.
 ///
-/// **Lock order.** Each taker's first lock is a version fence, and it takes
-/// these locks only after it:
+/// **Lock order.** Each taker's first lock is a version fence (an aggregate
+/// target's pause or resume has none), and it takes these locks only after
+/// it:
 ///
 /// - `staging::quarantine`'s operator pause, fuse trip and cascade pair
 ///   take one, exclusive, right after their fence bump (issue #744), then
 ///   write their `column_status` rows.
+/// - A column resume (`staging::quarantine::resume_column`) takes its
+///   target's, exclusive, right after its fence bump and before the
+///   definition's row (issue #917), then deletes that target's rows and
+///   the edges out of them, one transaction per target.
 /// - A define takes its upstreams' shared, after its DDL and catalog rows,
 ///   in bare-name order ([`lock_column_pauses_in_order`]), then reads their
 ///   paused columns.
@@ -2289,9 +2299,18 @@ async fn pause_reader_in_txn(
 ///   a `column_status` row of its target, in the same one name order.
 ///
 /// So a transaction waiting for one of these locks holds only those before
-/// it in name order. Once it holds them it waits only on `column_status`
-/// and cascade-edge rows, whose other writers either share its fence or
-/// are a column resume, which takes none of these locks.
+/// it in name order, plus, for a define or edit, its DDL and catalog rows,
+/// which no holder of the lock goes on to wait for. Once it holds them it
+/// waits only on rows:
+///
+/// - `column_status` and cascade-edge rows of a target whose lock it holds.
+///   Every pause, resume and edit above writes those under that lock. The
+///   two other deleters close no cycle: a field build's start deletes only
+///   rows awaiting their capture, which a define doesn't read, and an edit
+///   that only drops fields deletes their rows once its DDL holds the
+///   target's table, which a define waiting on those rows can't hold.
+/// - For a resume or an edit, its own definition's row and its field
+///   build's registration, which only transactions on its own fence write.
 pub(crate) async fn lock_column_pauses(
     client: &impl GenericClient,
     transform: &str,
