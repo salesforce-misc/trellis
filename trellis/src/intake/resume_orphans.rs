@@ -109,8 +109,9 @@
 //! aggregates, each by target name; within a ledger target its entries,
 //! then its groups; and each class of row in key order.
 //! The cursor returns rows in no useful order, and a page of it holds some
-//! of every target's, so [`Sweep::push`] only collects the keys and
-//! [`Sweep::finish`] deletes them all at the end. Deleting each page of the
+//! of every target's, so the read only stages the keys ([`Sweep::push`],
+//! [`Sweep::stage`]) and [`Sweep::finish`] deletes them all at the end.
+//! Deleting each page of the
 //! read as it comes would take a later page's low keys after an earlier
 //! page's high ones, and one target's locks after another's, so a drain
 //! holding the low key, or the other target, would wait on the discharge
@@ -129,12 +130,14 @@
 //! statement can bind: PostgreSQL caps a message at 1 GB, and a marker
 //! whose sweep hit it would fail on every retry. So no statement of
 //! [`Sweep::finish`] binds more than [`SWEEP_BATCH`] keys, and it takes
-//! each class of row in batches that follow one another in key order. It
-//! stages the keys in a temporary table and reads them back through a
-//! cursor sorted by the rows' own key columns ([`StagedKeys`]). Each
-//! batch's lock is sorted, so the batches together lock in key order, as
-//! one statement over every key would. Rust can't sort the keys itself: a
-//! column sorts by its type and its collation.
+//! each class of row in batches that follow one another in key order. The
+//! read stages each page's keys in a temporary table per target as the page
+//! arrives (issue #904), so the sweep holds at most a page of them in
+//! memory, and [`Sweep::finish`] reads them back through a cursor sorted by
+//! the rows' own key columns ([`StagedKeys`]). Each batch's lock is sorted,
+//! so the batches together lock in key order, as one statement over every
+//! key would. Rust can't sort the keys itself: a column sorts by its type
+//! and its collation, and it never holds them all at once.
 //!
 //! A ledger target needs more than that, since its Re-derive locks groups
 //! as well as entries, and a later batch's groups can sort below an
@@ -145,8 +148,8 @@
 //!
 //! 1. every batch's entries, in key order, and nothing else;
 //! 2. every group those entries are live in, read from the ledger once
-//!    they are locked, together with every orphan group the read found, in
-//!    key order;
+//!    each batch of them is locked, together with every orphan group the
+//!    read found, in key order;
 //! 3. then, batch by batch, the Re-derives and the orphan groups' delete,
 //!    on rows it already holds.
 //!
@@ -319,6 +322,9 @@ pub(super) struct Swept {
     pub(super) deleted: usize,
     /// The most keys one of the sweep's statements bound (issue #884).
     pub(super) largest_batch: usize,
+    /// The most unbacked keys the sweep held in memory at once: at most one
+    /// page of the read (issue #904).
+    pub(super) most_buffered: usize,
 }
 
 impl Swept {
@@ -368,17 +374,22 @@ struct SweptTarget {
     /// each entry out of its group, which deleting the group here would
     /// leave counted in the ledger.
     ledger_rederive: Option<crate::staging::ledger::LedgerTargetPlan>,
-    /// The unbacked keys the read has returned for this target so far, by
-    /// column: `unbacked[j]` holds every key's `j`th column, as text.
-    unbacked: Vec<Vec<Option<String>>>,
+    /// The unbacked keys the read has returned for this target in its
+    /// current page, by column: `page[j]` holds each key's `j`th column, as
+    /// text. [`Sweep::stage`] moves them into [`SweptTarget::staged`] once
+    /// the page is fetched (issue #904).
+    page: Vec<Vec<Option<String>>>,
+    /// Every unbacked key staged so far, in a temporary table of its own.
+    staged: StagedKeys,
 }
 
 /// The targets one discharge sweeps, and what it has deleted from them so
 /// far. See the module doc for the protocol: [`Sweep::add`] each set of
 /// definitions, declare the read over [`Sweep::branches`] (with the
 /// enumeration, if any, in the same statement), then pass each unbacked key
-/// it fetches to [`Sweep::push`] and end with [`Sweep::finish`], which
-/// deletes them.
+/// it fetches to [`Sweep::push`], [`Sweep::stage`] each page once it is
+/// fetched, and end with [`Sweep::finish`], which deletes them. All of it
+/// runs in one transaction, which the staged keys' tables live for.
 pub(super) struct Sweep {
     targets: Vec<SweptTarget>,
     mutations: TargetMutations,
@@ -386,6 +397,9 @@ pub(super) struct Sweep {
     /// The most keys one of [`Sweep::finish`]'s statements binds:
     /// [`SWEEP_BATCH`], or a test's smaller cap.
     batch: usize,
+    /// The keys [`Sweep::push`] has buffered since the last
+    /// [`Sweep::stage`], across every target.
+    buffered: usize,
 }
 
 impl Default for Sweep {
@@ -395,6 +409,7 @@ impl Default for Sweep {
             mutations: TargetMutations::default(),
             swept: Swept::default(),
             batch: SWEEP_BATCH,
+            buffered: 0,
         }
     }
 }
@@ -483,6 +498,19 @@ impl Sweep {
                     let source_pk = ddl::identity_key_columns(txn, &source_table).await?;
                     let tag =
                         i32::try_from(self.targets.len()).expect("fewer than 2^31 swept targets");
+                    let ledger = ddl::qualified_target_table_ident(
+                        &crate::defs::ledger::ledger_table_name(&target),
+                    );
+                    // The entry branch selects the entry's one key column.
+                    let staged = StagedKeys::new(
+                        &tag.to_string(),
+                        format!(
+                            "select l.{} as {} from {ledger} l",
+                            quote_ident(crate::defs::ledger::KEY_COLUMN),
+                            keyset_col(0)
+                        ),
+                        vec!["text".to_string()],
+                    );
                     self.targets.push(SweptTarget {
                         id,
                         status,
@@ -507,11 +535,10 @@ impl Sweep {
                             key_cols.clone(),
                             shape,
                         )),
-                        unbacked: Vec::new(),
+                        page: Vec::new(),
+                        staged,
                     });
-                    Some(ddl::qualified_target_table_ident(
-                        &crate::defs::ledger::ledger_table_name(&target),
-                    ))
+                    Some(ledger)
                 }
                 None => None,
             };
@@ -538,6 +565,11 @@ impl Sweep {
             if let Some(expr) = &image_expr {
                 returning.push_str(&format!(", ({expr})::text"));
             }
+            let staged = StagedKeys::new(
+                &tag.to_string(),
+                key_relation(&target_ident, &key_cols),
+                key_types(&key_cols),
+            );
             self.targets.push(SweptTarget {
                 id,
                 status,
@@ -551,7 +583,8 @@ impl Sweep {
                 ledger_guard: ledger,
                 source_guard,
                 ledger_rederive: None,
-                unbacked: Vec::new(),
+                page: Vec::new(),
+                staged,
             });
         }
         Ok(())
@@ -573,19 +606,41 @@ impl Sweep {
     }
 
     /// Records an unbacked key the read returned for the target `tag` names
-    /// (its key columns as text, in key order), for [`Sweep::finish`] to
-    /// delete.
+    /// (its key columns as text, in key order), for [`Sweep::stage`] to
+    /// stage once its page is fetched and [`Sweep::finish`] to delete.
     pub(super) fn push(&mut self, tag: i32, key: Vec<Option<String>>) {
         let target = usize::try_from(tag)
             .ok()
             .and_then(|i| self.targets.get_mut(i))
             .unwrap_or_else(|| panic!("the discharge read returned an unknown sweep tag {tag}"));
-        if target.unbacked.is_empty() {
-            target.unbacked = vec![Vec::new(); key.len()];
+        if target.page.is_empty() {
+            target.page = vec![Vec::new(); key.len()];
         }
-        for (column, part) in target.unbacked.iter_mut().zip(key) {
+        for (column, part) in target.page.iter_mut().zip(key) {
             column.push(part);
         }
+        self.buffered += 1;
+        self.swept.most_buffered = self.swept.most_buffered.max(self.buffered);
+    }
+
+    /// Moves every key [`Sweep::push`] has buffered into its target's
+    /// temporary table ([`StagedKeys`]), at most a batch per statement, so
+    /// the sweep holds no more than one page of the read in memory however
+    /// many keys the read finds (issue #904). The discharge calls it once
+    /// per page it fetches, in the transaction [`Sweep::finish`] runs in.
+    pub(super) async fn stage(&mut self, txn: &Transaction<'_>) -> Result<(), IntakeError> {
+        if self.buffered == 0 {
+            return Ok(());
+        }
+        for target in &mut self.targets {
+            let page = std::mem::take(&mut target.page);
+            target
+                .staged
+                .add(txn, &page, self.batch, &mut self.swept)
+                .await?;
+        }
+        self.buffered = 0;
+        Ok(())
     }
 
     /// Deletes every key [`Sweep::push`] recorded from its target, if the
@@ -606,72 +661,61 @@ impl Sweep {
     /// target its entries, then its groups; and each class of row in key
     /// order, in batches of at most [`SWEEP_BATCH`] keys that Postgres sorts
     /// ([`StagedKeys`]). See the module doc's "Why the delete comes last".
-    pub(super) async fn finish(self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
+    pub(super) async fn finish(mut self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
+        self.stage(txn).await?;
         let Sweep {
             mut targets,
             mut mutations,
             mut swept,
             batch,
+            buffered: _,
         } = self;
         // Stable, so a ledger target's entry sweep stays ahead of its group
         // sweep, which `add` pushed right after it.
         targets.sort_by(|a, b| a.lock_order.cmp(&b.lock_order));
         let mut targets = targets.into_iter();
-        while let Some(mut target) = targets.next() {
+        while let Some(target) = targets.next() {
             if target.ledger_rederive.is_some() {
-                let mut groups = targets
+                let groups = targets
                     .next()
                     .expect("a ledger target's group sweep follows its entry sweep");
                 debug_assert_eq!(groups.id, target.id, "the entry sweep's own group sweep");
-                swept.deleted += sweep_ledger(
-                    txn,
-                    &mut target,
-                    &mut groups,
-                    &mut mutations,
-                    batch,
-                    &mut swept,
-                )
-                .await?;
+                swept.deleted +=
+                    sweep_ledger(txn, target, groups, &mut mutations, batch, &mut swept).await?;
                 continue;
             }
-            let unbacked = std::mem::take(&mut target.unbacked);
-            if unbacked.is_empty() {
+            if target.staged.is_empty() {
                 continue;
             }
-            swept.deleted +=
-                sweep_rows(txn, &target, unbacked, &mut mutations, batch, &mut swept).await?;
+            swept.deleted += sweep_rows(txn, target, &mut mutations, batch, &mut swept).await?;
         }
         mutations.flush(txn).await?;
         Ok(swept)
     }
 }
 
-/// [`Sweep::finish`]'s work on a 1-1 target: deletes the keys `unbacked`
-/// holds (by column, as [`SweptTarget::unbacked`] does) if `target`'s
-/// definition is still in the status the sweep read it in, records each
-/// deleted row in `mutations`, and returns how many rows it deleted.
+/// [`Sweep::finish`]'s work on a 1-1 target: deletes the keys `target`
+/// staged if its definition is still in the status the sweep read it in,
+/// records each deleted row in `mutations`, and returns how many rows it
+/// deleted.
 ///
-/// The keys go through [`StagedKeys`], so each batch of at most `batch` is
-/// locked and then deleted ([`delete_keys`]) in key order, and the batches
-/// come in key order too: every lock is taken in the order a drain page's
-/// pre-lock takes the same rows.
+/// The keys come back through [`StagedKeys`], so each batch of at most
+/// `batch` is locked and then deleted ([`delete_keys`]) in key order, and
+/// the batches come in key order too: every lock is taken in the order a
+/// drain page's pre-lock takes the same rows.
 async fn sweep_rows(
     txn: &Transaction<'_>,
-    target: &SweptTarget,
-    unbacked: Vec<Vec<Option<String>>>,
+    target: SweptTarget,
     mutations: &mut TargetMutations,
     batch: usize,
     swept: &mut Swept,
 ) -> Result<usize, IntakeError> {
-    let keys =
-        StagedKeys::create(txn, ROWS_TABLE, &key_relation(target), &key_types(target)).await?;
-    keys.add(txn, &unbacked, batch, swept).await?;
-    drop(unbacked);
+    let keys = &target.staged;
     keys.open(txn).await?;
     let mut deleted = 0;
     while let Some(arrays) = keys.next(txn, batch).await? {
         swept.bound(arrays[0].len());
-        let rows = delete_keys(txn, target, &arrays).await?;
+        let rows = delete_keys(txn, &target, &arrays).await?;
         for row in &rows {
             let prior = target.has_image.then(|| row.get::<_, String>(1));
             mutations.record(&target.target, row.get(0), prior, 0, None, None);
@@ -679,6 +723,7 @@ async fn sweep_rows(
         deleted += rows.len();
     }
     keys.close(txn).await?;
+    target.staged.drop_table(txn).await?;
     if deleted > 0 {
         tracing::info!(
             target = %target.target,
@@ -701,15 +746,16 @@ async fn sweep_rows(
 ///
 /// 1. **The entries**, in key order, in batches of at most `batch`
 ///    ([`StagedKeys`]), and no other lock
-///    (`staging::ledger::lock_unbacked_entries`).
+///    (`staging::ledger::lock_unbacked_entries`). Once a batch is locked,
+///    the groups its entries are live in are read from the ledger into a
+///    table of group locks to take; no page can move a locked entry since.
 /// 2. **Their groups and the orphan groups together**, in key order, in
-///    batches the same way: every group a locked entry is live in, read
-///    from the ledger once the entries are locked, so no page can move one
-///    since, and every group the read found with no member and no source
-///    row.
-/// 3. **The writes**: the Re-derives, a batch of entries at a time
-///    (`staging::ledger::rederive_unbacked`), and then the orphan groups'
-///    delete, in batches. Every row they write is one step 1 or 2 locked.
+///    batches the same way: the groups step 1 gathered, and every group the
+///    read found with no member and no source row.
+/// 3. **The writes**: the Re-derives, a batch of entries at a time, read
+///    back from the staged entries again (`staging::ledger::rederive_unbacked`),
+///    and then the orphan groups' delete, in batches. Every row they write
+///    is one step 1 or 2 locked.
 ///
 /// A Re-derive only takes an entry out of its group: it re-derives only the
 /// keys its read finds no source row for, so it moves no entry into a group
@@ -723,15 +769,13 @@ async fn sweep_rows(
 /// does one that holds an orphan group and wants a Re-derive's.
 async fn sweep_ledger(
     txn: &Transaction<'_>,
-    entries: &mut SweptTarget,
-    groups: &mut SweptTarget,
+    entries: SweptTarget,
+    groups: SweptTarget,
     mutations: &mut TargetMutations,
     batch: usize,
     swept: &mut Swept,
 ) -> Result<usize, IntakeError> {
-    let entry_keys = std::mem::take(&mut entries.unbacked);
-    let orphans = std::mem::take(&mut groups.unbacked);
-    if entry_keys.is_empty() && orphans.is_empty() {
+    if entries.staged.is_empty() && groups.staged.is_empty() {
         return Ok(0);
     }
     let applying: bool = txn
@@ -743,6 +787,8 @@ async fn sweep_ledger(
         .await?
         .get(0);
     if !applying {
+        entries.staged.drop_table(txn).await?;
+        groups.staged.drop_table(txn).await?;
         return Ok(0);
     }
     let plan = entries
@@ -754,50 +800,45 @@ async fn sweep_ledger(
         .as_deref()
         .expect("a ledger target's group sweep has its ledger");
 
-    // 1. The entries, in the ledger's key order.
-    let mut batches: Vec<Vec<String>> = Vec::new();
-    if !entry_keys.is_empty() {
-        let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-        let staged = StagedKeys::create(
-            txn,
-            ENTRIES_TABLE,
-            &format!("select l.{key} as {} from {ledger} l", keyset_col(0)),
-            &["text".to_string()],
-        )
-        .await?;
-        // The entry branch selects the entry's one key column.
-        staged.add(txn, &entry_keys[..1], batch, swept).await?;
-        drop(entry_keys);
-        staged.open(txn).await?;
-        while let Some(mut arrays) = staged.next(txn, batch).await? {
-            let keys: Vec<String> = arrays.swap_remove(0).into_iter().flatten().collect();
+    // 1. The entries, in the ledger's key order, and the groups each batch
+    //    is live in, read once the batch is locked.
+    let mut locks = StagedKeys::new(
+        "locks",
+        key_relation(&groups.target_ident, &groups.key_cols),
+        key_types(&groups.key_cols),
+    );
+    locks.create(txn).await?;
+    if !entries.staged.is_empty() {
+        let insert_live = live_groups_statement(&locks, &groups, ledger);
+        entries.staged.open(txn).await?;
+        while let Some(keys) = next_entry_keys(txn, &entries.staged, batch).await? {
             let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
             swept.bound(refs.len());
             crate::staging::ledger::lock_unbacked_entries(txn, plan, &refs).await?;
-            batches.push(keys);
+            crate::staging::ledger::query_by_entry_key(txn, &insert_live, &[&keys]).await?;
         }
-        staged.close(txn).await?;
+        entries.staged.close(txn).await?;
     }
 
     // 2. Their groups and the orphan groups, in the target's key order.
-    let staged =
-        StagedKeys::create(txn, GROUPS_TABLE, &key_relation(groups), &key_types(groups)).await?;
-    let insert_live = live_groups_statement(groups, ledger);
-    for keys in &batches {
-        swept.bound(keys.len());
-        crate::staging::ledger::query_by_entry_key(txn, &insert_live, &[keys]).await?;
+    if !groups.staged.is_empty() {
+        txn.batch_execute(&format!(
+            "insert into {} select * from {}",
+            locks.table, groups.staged.table
+        ))
+        .await?;
     }
-    staged.add(txn, &orphans, batch, swept).await?;
-    staged.open(txn).await?;
-    while let Some(arrays) = staged.next(txn, batch).await? {
+    locks.open(txn).await?;
+    while let Some(arrays) = locks.next(txn, batch).await? {
         swept.bound(arrays[0].len());
-        lock_keys(txn, groups, &arrays).await?;
+        lock_keys(txn, &groups, &arrays).await?;
     }
-    staged.close(txn).await?;
+    locks.close(txn).await?;
+    locks.drop_table(txn).await?;
 
     // 3. The writes, every lock held.
     let mut deleted = 0;
-    if !batches.is_empty() {
+    if !entries.staged.is_empty() {
         // A tombstone's `applied_seg`: the ring's latest segment, at or
         // above any a change for these keys can still be pending in.
         let seg_seq: Option<i64> = txn
@@ -805,7 +846,8 @@ async fn sweep_ledger(
             .await?
             .get(0);
         let mut rederived = 0;
-        for keys in &batches {
+        entries.staged.open(txn).await?;
+        while let Some(keys) = next_entry_keys(txn, &entries.staged, batch).await? {
             let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
             let (_, emptied) = crate::staging::ledger::rederive_unbacked(
                 txn,
@@ -818,6 +860,7 @@ async fn sweep_ledger(
             rederived += refs.len();
             deleted += emptied;
         }
+        entries.staged.close(txn).await?;
         tracing::info!(
             target = %entries.target,
             keys = rederived,
@@ -825,21 +868,21 @@ async fn sweep_ledger(
             "re-derived ledger entries the source no longer backs"
         );
     }
+    entries.staged.drop_table(txn).await?;
     let mut orphans_deleted = 0;
-    let count = orphans.first().map_or(0, Vec::len);
-    for start in (0..count).step_by(batch.max(1)) {
-        let end = count.min(start + batch.max(1));
-        let arrays: Vec<Vec<Option<String>>> = orphans
-            .iter()
-            .map(|column| column[start..end].to_vec())
-            .collect();
-        swept.bound(end - start);
-        for row in delete_locked(txn, groups, &arrays).await? {
-            let prior = groups.has_image.then(|| row.get::<_, String>(1));
-            mutations.record(&groups.target, row.get(0), prior, 0, None, None);
-            orphans_deleted += 1;
+    if !groups.staged.is_empty() {
+        groups.staged.open(txn).await?;
+        while let Some(arrays) = groups.staged.next(txn, batch).await? {
+            swept.bound(arrays[0].len());
+            for row in delete_locked(txn, &groups, &arrays).await? {
+                let prior = groups.has_image.then(|| row.get::<_, String>(1));
+                mutations.record(&groups.target, row.get(0), prior, 0, None, None);
+                orphans_deleted += 1;
+            }
         }
+        groups.staged.close(txn).await?;
     }
+    groups.staged.drop_table(txn).await?;
     if orphans_deleted > 0 {
         tracing::info!(
             target = %groups.target,
@@ -850,12 +893,21 @@ async fn sweep_ledger(
     Ok(deleted + orphans_deleted)
 }
 
-/// [`StagedKeys`]' tables, one per class of row a target is swept by. Each
-/// is created, used and dropped within one target's sweep, and only one is
-/// read at a time, through [`STAGED_CURSOR`].
-const ROWS_TABLE: &str = "pg_temp.trellis_sweep_rows";
-const ENTRIES_TABLE: &str = "pg_temp.trellis_sweep_entries";
-const GROUPS_TABLE: &str = "pg_temp.trellis_sweep_groups";
+/// The next at most `batch` of a ledger target's staged entry keys, which
+/// are never `NULL`, from the open cursor of `staged`.
+async fn next_entry_keys(
+    txn: &Transaction<'_>,
+    staged: &StagedKeys,
+    batch: usize,
+) -> Result<Option<Vec<String>>, tokio_postgres::Error> {
+    Ok(staged
+        .next(txn, batch)
+        .await?
+        .map(|mut arrays| arrays.swap_remove(0).into_iter().flatten().collect()))
+}
+
+/// The cursor [`StagedKeys::open`] declares. Only one staged table is read
+/// at a time.
 const STAGED_CURSOR: &str = "trellis_sweep_keys";
 
 /// One class of a swept target's keys (a 1-1 target's rows, a ledger's
@@ -871,40 +923,63 @@ const STAGED_CURSOR: &str = "trellis_sweep_keys";
 /// order, as a drain page takes them (ADR-0002 I5). Rust can't sort them
 /// so: a key column's order is its collation's, and a type's own.
 ///
-/// The keys reach the table a bounded batch at a time, and leave it through
-/// a cursor, so no statement binds or returns more than a batch. The table
-/// is the transaction's, dropped by [`StagedKeys::close`] (or the
-/// transaction's end, whichever comes first).
+/// The keys reach the table a page of the read at a time
+/// ([`Sweep::stage`], issue #904), at most a batch per statement, and leave
+/// it through a cursor, so no statement binds or returns more than a batch
+/// and the sweep never holds more than a page of keys in memory. The table
+/// is created by the first page that has keys for it (a sweep that finds
+/// none creates nothing) and dropped by [`StagedKeys::drop_table`] once its
+/// target is swept, or at the transaction's end, whichever comes first.
+/// The read, the staging and [`Sweep::finish`] all run in the discharge's
+/// one transaction, so `on commit drop` outlives every use of it.
 struct StagedKeys {
-    table: &'static str,
+    /// The table, `pg_temp.trellis_sweep_<name>`.
+    table: String,
+    /// The `select` (with no `where`) of `c0`, `c1`, … over the rows' own
+    /// key columns, which gives each column their type and collation.
+    relation: String,
     /// The key columns' types, in key order.
     types: Vec<String>,
+    /// Whether the table exists yet.
+    created: bool,
 }
 
 impl StagedKeys {
-    /// Creates `table` with the columns `relation` selects (a `select` with
-    /// no `where`, `c0`, `c1`, … over the rows' own key columns, which gives
-    /// each column their type and collation), cast from text as `types`.
-    async fn create(
-        txn: &Transaction<'_>,
-        table: &'static str,
-        relation: &str,
-        types: &[String],
-    ) -> Result<Self, tokio_postgres::Error> {
-        txn.batch_execute(&format!(
-            "create temporary table {table} on commit drop as {relation} limit 0"
-        ))
-        .await?;
-        Ok(Self {
-            table,
-            types: types.to_vec(),
-        })
+    /// Keys staged as `pg_temp.trellis_sweep_<name>`, with the columns
+    /// `relation` selects, cast from text as `types`. Nothing is created
+    /// until the first key is added. A swept target's table is named by its
+    /// tag, and [`sweep_ledger`]'s group locks by `locks`.
+    fn new(name: &str, relation: String, types: Vec<String>) -> Self {
+        Self {
+            table: format!("pg_temp.trellis_sweep_{name}"),
+            relation,
+            types,
+            created: false,
+        }
+    }
+
+    /// Whether no key has been staged.
+    fn is_empty(&self) -> bool {
+        !self.created
+    }
+
+    /// Creates the table, empty, if it doesn't exist yet.
+    async fn create(&mut self, txn: &Transaction<'_>) -> Result<(), tokio_postgres::Error> {
+        if !self.created {
+            txn.batch_execute(&format!(
+                "create temporary table {} on commit drop as {} limit 0",
+                self.table, self.relation
+            ))
+            .await?;
+            self.created = true;
+        }
+        Ok(())
     }
 
     /// Adds `arrays`' keys (column `j`'s values in `arrays[j]`, as text),
     /// at most `batch` per statement.
     async fn add(
-        &self,
+        &mut self,
         txn: &Transaction<'_>,
         arrays: &[Vec<Option<String>>],
         batch: usize,
@@ -912,6 +987,10 @@ impl StagedKeys {
     ) -> Result<(), tokio_postgres::Error> {
         let batch = batch.max(1);
         let count = arrays.first().map_or(0, Vec::len);
+        if count == 0 {
+            return Ok(());
+        }
+        self.create(txn).await?;
         let sql = format!(
             "insert into {} select * from {} as k",
             self.table,
@@ -919,12 +998,10 @@ impl StagedKeys {
         );
         for start in (0..count).step_by(batch) {
             let end = count.min(start + batch);
-            let chunk: Vec<Vec<Option<String>>> = arrays
-                .iter()
-                .map(|column| column[start..end].to_vec())
-                .collect();
+            let params: Vec<&[Option<String>]> =
+                arrays.iter().map(|column| &column[start..end]).collect();
             let params: Vec<&(dyn ToSql + Sync)> =
-                chunk.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+                params.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
             swept.bound(end - start);
             txn.execute(&sql, &params).await?;
         }
@@ -973,43 +1050,43 @@ impl StagedKeys {
         Ok(Some(arrays))
     }
 
-    /// Closes the cursor and drops the table.
-    async fn close(self, txn: &Transaction<'_>) -> Result<(), tokio_postgres::Error> {
-        txn.batch_execute(&format!("close {STAGED_CURSOR}; drop table {}", self.table))
-            .await
+    /// Closes the cursor.
+    async fn close(&self, txn: &Transaction<'_>) -> Result<(), tokio_postgres::Error> {
+        txn.batch_execute(&format!("close {STAGED_CURSOR}")).await
+    }
+
+    /// Drops the table, if it was created.
+    async fn drop_table(&self, txn: &Transaction<'_>) -> Result<(), tokio_postgres::Error> {
+        if self.created {
+            txn.batch_execute(&format!("drop table {}", self.table))
+                .await?;
+        }
+        Ok(())
     }
 }
 
-/// `target`'s key columns as `c0`, `c1`, … (see [`keyset_col`]), over the
-/// target itself: the relation [`StagedKeys::create`] copies their types
-/// and collations from.
-fn key_relation(target: &SweptTarget) -> String {
-    let cols: Vec<String> = target_key_cols(target)
-        .into_iter()
-        .enumerate()
-        .map(|(i, col)| format!("{col} as {}", keyset_col(i)))
-        .collect();
-    format!(
-        "select {} from {} as t",
-        cols.join(", "),
-        target.target_ident
-    )
-}
-
-/// `target`'s key columns' types, in key order.
-fn key_types(target: &SweptTarget) -> Vec<String> {
-    target
-        .key_cols
+/// A target's key columns as `c0`, `c1`, … (see [`keyset_col`]), over the
+/// target itself (`target_ident`): the relation [`StagedKeys::create`]
+/// copies their types and collations from.
+fn key_relation(target_ident: &str, key_cols: &[PrimaryKeyColumn]) -> String {
+    let cols: Vec<String> = key_cols
         .iter()
-        .map(|c| c.data_type.clone())
-        .collect()
+        .enumerate()
+        .map(|(i, col)| format!("t.{} as {}", quote_ident(&col.name), keyset_col(i)))
+        .collect();
+    format!("select {} from {target_ident} as t", cols.join(", "))
 }
 
-/// The insert of the groups a ledger target's entries of the keys `$1`
-/// (`text[]`) are live in into [`GROUPS_TABLE`], for `groups`, the target's
-/// group sweep, over `ledger` (quoted). The ledger names its `GROUP BY`
-/// columns as the target does.
-fn live_groups_statement(groups: &SweptTarget, ledger: &str) -> String {
+/// A target's key columns' types, in key order.
+fn key_types(key_cols: &[PrimaryKeyColumn]) -> Vec<String> {
+    key_cols.iter().map(|c| c.data_type.clone()).collect()
+}
+
+/// The insert into `locks` of the groups a ledger target's entries of the
+/// keys `$1` (`text[]`) are live in, for `groups`, the target's group
+/// sweep, over `ledger` (quoted). The ledger names its `GROUP BY` columns as
+/// the target does.
+fn live_groups_statement(locks: &StagedKeys, groups: &SweptTarget, ledger: &str) -> String {
     use crate::defs::ledger::{KEY_COLUMN, MEMBER_COLUMN, TOMBSTONE_COLUMN};
     let cols: Vec<String> = groups
         .key_cols
@@ -1017,8 +1094,9 @@ fn live_groups_statement(groups: &SweptTarget, ledger: &str) -> String {
         .map(|c| format!("l.{}", quote_ident(&c.name)))
         .collect();
     format!(
-        "insert into {GROUPS_TABLE} select distinct {} from {ledger} as l \
+        "insert into {} select distinct {} from {ledger} as l \
          where l.{} = any($1::text[]) and l.{} and not l.{}",
+        locks.table,
         cols.join(", "),
         quote_ident(KEY_COLUMN),
         quote_ident(MEMBER_COLUMN),
@@ -1407,7 +1485,7 @@ fn keyset(target: &SweptTarget, arrays: &[Vec<Option<String>>]) -> Keyset {
     let patterns = null_patterns(arrays);
     let bound = keyset_bound(&target_cols, &target.key_cols, &patterns);
     Keyset {
-        relation: typed_keys(&key_types(target)),
+        relation: typed_keys(&key_types(&target.key_cols)),
         condition: format!(
             "{}{bound} and exists ( \
                  select 1 from transform_definitions where id = ${} and status = ${} \
@@ -2470,6 +2548,91 @@ mod db_tests {
         assert_eq!(left, 0, "no row, group or live entry is left");
     }
 
+    /// Issue #904: the sweep stages each page of its read's keys as the page
+    /// arrives, so it holds at most one page of them in memory however many
+    /// the read finds. A 1-1 copy and a ledger aggregate (7 groups) over
+    /// 25,000 items lose every row, so the read returns 50,000 unbacked
+    /// keys over 5 pages of 10,000, and the sweep's batch of 1,000 is a
+    /// tenth of a page. Collecting the whole read before staging it held
+    /// all 50,000.
+    #[tokio::test]
+    async fn a_sweep_holds_at_most_a_page_of_keys_in_memory() {
+        const ITEMS: i64 = 25_000;
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        raw.batch_execute(&format!(
+            "create table public.items (k bigint primary key, g bigint, a numeric); \
+             insert into public.items select i, i % 7, i from generate_series(1, {ITEMS}) i"
+        ))
+        .await
+        .expect("seed items");
+        let columns = HashMap::from([
+            ("k".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.items")
+            .await
+            .expect("make items read as another definition's target");
+        for text in [
+            "TRANSFORM items_copy FROM items SELECT a AS a",
+            "TRANSFORM items_by_g FROM items GROUP BY g SELECT sum(a) AS total",
+        ] {
+            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
+                .await
+                .expect("register");
+        }
+        crate::intake::markers::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 2, "both builds finished");
+        raw.batch_execute("delete from public.items")
+            .await
+            .expect("unback every item");
+
+        let (_, mut sweeper) = connect(&db).await;
+        let txn = sweeper.transaction().await.expect("begin");
+        let mut sweep = Sweep::with_batch(1_000);
+        sweep
+            .add(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect("plan the sweep");
+        assert!(
+            super::super::markers::declare_read(&txn, None, &sweep)
+                .await
+                .expect("declare the read")
+        );
+        super::super::markers::fetch_read(&txn, "", &mut sweep)
+            .await
+            .expect("fetch the read");
+        let swept = sweep.finish(&txn).await.expect("flush the sweep");
+        txn.commit().await.expect("commit");
+
+        let page = usize::try_from(super::super::markers::BACKFILL_PAGE_ROWS).expect("a page");
+        assert_eq!(
+            swept.most_buffered, page,
+            "the sweep holds one full page of keys at most"
+        );
+        assert_eq!(swept.largest_batch, 1_000, "every statement binds a batch");
+        assert_eq!(
+            swept.deleted,
+            usize::try_from(ITEMS).expect("items") + 7,
+            "every copy, and every group"
+        );
+        let left: i64 = raw
+            .query_one(
+                "select (select count(*) from public.items_copy) \
+                      + (select count(*) from public.items_by_g) \
+                      + (select count(*) from public.items_by_g__ledger \
+                         where __member and not __tombstone)",
+                &[],
+            )
+            .await
+            .expect("count what is left")
+            .get(0);
+        assert_eq!(left, 0, "no row, group or live entry is left");
+    }
+
     /// Issue #884: the sweep's batches of a target's keys come in the
     /// target's own key order, not the order of the keys' text. A 1-1 copy
     /// keyed by `bigint` loses all 12 rows, in batches of 3: 1-3, 4-6, 7-9
@@ -3500,7 +3663,8 @@ mod db_tests {
                 ledger_guard: None,
                 source_guard: source.map(ddl::qualified_source_table),
                 ledger_rederive: None,
-                unbacked: Vec::new(),
+                page: Vec::new(),
+                staged: StagedKeys::new("unused", String::new(), Vec::new()),
             };
             let columns: Vec<String> = target
                 .key_cols
@@ -3694,7 +3858,8 @@ mod db_tests {
             ledger_guard: Some("public.grouped_ledger".to_string()),
             source_guard: None,
             ledger_rederive: None,
-            unbacked: Vec::new(),
+            page: Vec::new(),
+            staged: StagedKeys::new("unused", String::new(), Vec::new()),
         };
         // Every 50th group, half of which (every 100th) have no live entry;
         // then those and every group with a `NULL`.
@@ -3882,7 +4047,8 @@ mod db_tests {
             ledger_guard: Some("public.g3_ledger".to_string()),
             source_guard: None,
             ledger_rederive: None,
-            unbacked: Vec::new(),
+            page: Vec::new(),
+            staged: StagedKeys::new("unused", String::new(), Vec::new()),
         };
         // Every group, with its key and its columns as text.
         type Group = (String, [Option<String>; 3]);

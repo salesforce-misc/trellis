@@ -670,7 +670,7 @@ pub(crate) async fn park_failed_build(
 /// enumeration path used to `SELECT` an entire source table into one `Vec`. 10k
 /// rows keeps each `FETCH` round-trip cheap while staying a trivial allocation
 /// even for a table with wide keys.
-const BACKFILL_PAGE_ROWS: i64 = 10_000;
+pub(super) const BACKFILL_PAGE_ROWS: i64 = 10_000;
 
 /// The fixed cursor name [`enumerate_and_append`] declares. A literal, not
 /// caller input, so it needs no quoting/escaping of its own — only the
@@ -785,9 +785,10 @@ async fn enumeration_branch(txn: &Transaction<'_>, src_table: &str) -> Result<St
 /// The second half of the discharge's read: pages the cursor
 /// [`declare_read`] opened, appending each enumerated key into the active
 /// ring segment as an image-less `Recompute` for `src_table`, and passing
-/// each swept row's key to `sweep`, whose
-/// [`super::resume_orphans::Sweep::finish`] deletes them. Then closes the
-/// cursor.
+/// each swept row's key to `sweep`, which stages each page's keys
+/// ([`super::resume_orphans::Sweep::stage`]) for its
+/// [`super::resume_orphans::Sweep::finish`] to delete, in the same
+/// transaction. Then closes the cursor.
 pub(super) async fn fetch_read(
     txn: &Transaction<'_>,
     src_table: &str,
@@ -842,6 +843,9 @@ pub(super) async fn fetch_read(
         if !page.is_empty() {
             append::append(txn, &page).await?;
         }
+        // Issue #904: the page's unbacked keys go to the sweep's tables
+        // now, so the sweep holds at most one page of them in memory.
+        sweep.stage(txn).await?;
     }
     txn.batch_execute(&format!("close {BACKFILL_CURSOR}"))
         .await?;
