@@ -67,6 +67,11 @@
 //! [`PausePoint::BeforeReleaseCommit`] for the key's table after its last
 //! write. A test runs it inside [`with_scope`] as it would a drain.
 //!
+//! Each pair of a column pause's cascade (`super::quarantine::cascade_pause`)
+//! fires [`PausePoint::AfterCascadeFenceBump`] for the reader's transform
+//! after its fence bump, before it checks its upstream column is still
+//! paused (#912). A test runs the pause inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -144,6 +149,10 @@ pub enum PausePoint {
     /// release holds the table's fence, the definition's row, and each to-one
     /// relationship's refresh stamp and projection rows it wrote (#831).
     BeforeReleaseCommit,
+    /// After a column pause cascade's pair bumps its reader's fence, before
+    /// it locks its upstream column's `column_status` row, for the reader's
+    /// transform (`super::quarantine::cascade_pause`, #912).
+    AfterCascadeFenceBump,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

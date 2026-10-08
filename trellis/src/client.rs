@@ -790,14 +790,15 @@ async fn release_retyped_keys(pool: &Pool) {
 }
 
 /// Finishes any column pause's cascade that didn't complete (#912,
-/// [`staging::quarantine::complete_pause_cascades`]). A failure is logged,
-/// and the next pass tries again: a pause stays marked until its cascade
-/// reaches every dependent.
+/// [`staging::quarantine::complete_pause_cascades`]). A walk that fails is
+/// logged there, and the next pass tries again: a pause stays marked until
+/// its cascade reaches every dependent. Only a failure to read the marks
+/// reaches here.
 async fn complete_pause_cascades(pool: &Pool) {
     if let Err(err) = staging::quarantine::complete_pause_cascades(pool).await {
         tracing::warn!(
             error = %err,
-            "couldn't finish a column pause's cascade; retrying next pass"
+            "couldn't read the column pauses owing a cascade; retrying next pass"
         );
     }
 }

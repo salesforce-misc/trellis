@@ -223,9 +223,12 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   failed run didn't. The pause marks its own `column_status` row
   (`cascade_pending`) in the transaction that writes it, the walk clears the
   mark once it has reached every reader, and the staging worker's capture pass
-  finishes the walk of any pause still marked. A cascade that fails part-way
-  completes whether or not anyone retries the `PAUSE`, and a fuse trip has no
-  caller to retry it.
+  finishes the walk of any pause still marked, each pair waiting at most a
+  second for its fence so a held fence can't stall sealing. A walk clears
+  only the mark it found: one that a later pause of the same column wrote
+  stays for that pause's walk. A cascade that fails part-way completes
+  whether or not anyone retries the `PAUSE`, and a fuse trip has no caller
+  to retry it.
 * **Sibling readers** — a field of the same 1-1 definition that reads a paused
   field by alias, directly or through other fields, is paused with it (a
   `column_status` row and a cascade edge), so Apply freezes it rather than

@@ -2454,15 +2454,18 @@ async fn trip_column_fuse(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     bump_pause_fence(&*txn, fence.as_deref()).await?;
-    txn.execute(
-        "insert into column_status \
-             (transform_table, column_name, paused_at, last_error, local_fuse, cascade_pending) \
-         values ($1, $2, now(), $3, true, true) \
-         on conflict (transform_table, column_name) do update set \
-             local_fuse = true, last_error = excluded.last_error, cascade_pending = true",
-        &[&transform, &column, &last_error],
-    )
-    .await?;
+    let mark: String = txn
+        .query_one(
+            "insert into column_status \
+                 (transform_table, column_name, paused_at, last_error, local_fuse, cascade_pending) \
+             values ($1, $2, now(), $3, true, true) \
+             on conflict (transform_table, column_name) do update set \
+                 local_fuse = true, last_error = excluded.last_error, cascade_pending = true \
+             returning xmin::text",
+            &[&transform, &column, &last_error],
+        )
+        .await?
+        .get(0);
     txn.execute(
         "delete from column_deaths where transform_table = $1 and column_name = $2",
         &[&transform, &column],
@@ -2470,7 +2473,7 @@ async fn trip_column_fuse(
     .await?;
     txn.commit().await?;
 
-    cascade_pause(pool, transform, column).await
+    cascade_pause(pool, transform, column, &mark, None).await
 }
 
 /// The source whose version fence a `column_status` pause of `transform`
@@ -2550,7 +2553,27 @@ async fn bump_pause_fence(
 /// the transaction that writes its own row, and the walk clears it once it
 /// has reached every dependent. [`complete_pause_cascades`] finishes the
 /// walk of any pause still marked.
-async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(), ApplyError> {
+///
+/// `mark` is the root row's `xmin` as the walk's caller read it: the
+/// pause's own commit, or [`complete_pause_cascades`]'s read of the marked
+/// row. The walk clears the mark only while the row still has that `xmin`.
+/// A pause of the same column that commits while this walk runs writes the
+/// row again, so its mark outlives this walk and stays until a walk started
+/// after it finishes; a walk that started earlier may have read the graph
+/// before a reader only the later one reaches. A row written for any other
+/// reason meanwhile keeps its mark too, and the next capture pass walks it
+/// again, which costs a read per pair.
+///
+/// `lock_timeout`, when set, caps each pair's lock waits below the
+/// session's ([`complete_pause_cascades`] runs on the staging worker's
+/// maintenance loop, which nothing else seals for).
+async fn cascade_pause(
+    pool: &Pool,
+    transform: &str,
+    column: &str,
+    mark: &str,
+    lock_timeout: Option<std::time::Duration>,
+) -> Result<(), ApplyError> {
     let mut visited: HashSet<(String, String)> = HashSet::new();
     let mut queue: VecDeque<(String, String)> = VecDeque::new();
     visited.insert((transform.to_string(), column.to_string()));
@@ -2569,6 +2592,7 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
                     pool,
                     (&downstream_transform, &downstream_column),
                     (&upstream_transform, &upstream_column),
+                    lock_timeout,
                 )
                 .await?
             {
@@ -2586,8 +2610,9 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
         .await?
         .execute(
             "update column_status set cascade_pending = false \
-             where transform_table = $1 and column_name = $2 and cascade_pending",
-            &[&transform, &column],
+             where transform_table = $1 and column_name = $2 and cascade_pending \
+               and xmin::text = $3",
+            &[&transform, &column, &mark],
         )
         .await?;
     Ok(())
@@ -2633,11 +2658,23 @@ async fn pause_dependent(
     pool: &Pool,
     (downstream_transform, downstream_column): (&str, &str),
     (upstream_transform, upstream_column): (&str, &str),
+    lock_timeout: Option<std::time::Duration>,
 ) -> Result<bool, ApplyError> {
     let fence = pause_fence(pool, downstream_transform).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    if let Some(timeout) = lock_timeout {
+        crate::locks::set_local_lock_timeout(&*txn, timeout).await?;
+    }
     bump_pause_fence(&*txn, fence.as_deref()).await?;
+    // Test-only pause point (#912). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        &*txn,
+        super::interleave::PausePoint::AfterCascadeFenceBump,
+        downstream_transform,
+    )
+    .await?;
     let upstream_paused = txn
         .query_opt(
             "select 1 from column_status \
@@ -2704,32 +2741,62 @@ async fn pause_dependent(
 /// trips it again.
 ///
 /// The staging worker's capture pass calls this each pass, as it releases
-/// the keys an in-place re-type held. A walk that fails again stops this
-/// call at that pause and is retried next pass; the marks stay until their
-/// walks finish. Returns how many walks finished.
+/// the keys an in-place re-type held. That pass runs on the maintenance
+/// loop, which nothing else seals for, so each pair's lock waits here are
+/// capped at [`CASCADE_COMPLETION_LOCK_TIMEOUT`] rather than the session's
+/// 30 s: a writer that still holds a reader's fence fails that pause's walk
+/// after a second, and the walk is tried again next pass. A walk that
+/// fails is logged, and the rest still run; its mark stays until a walk
+/// finishes. Returns how many walks finished. Only reading the marks
+/// fails the call.
 pub async fn complete_pause_cascades(pool: &Pool) -> Result<usize, ApplyError> {
-    let pending: Vec<(String, String)> = pool
+    let pending: Vec<(String, String, String)> = pool
         .get()
         .await?
         .query(
-            "select transform_table, column_name from column_status \
+            "select transform_table, column_name, xmin::text from column_status \
              where cascade_pending order by transform_table, column_name",
             &[],
         )
         .await?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
         .collect();
-    for (transform, column) in &pending {
+    let mut finished = 0;
+    for (transform, column, mark) in &pending {
         tracing::info!(
             transform = %transform,
             column = %column,
             "finishing a column pause's cascade that didn't complete"
         );
-        cascade_pause(pool, transform, column).await?;
+        match cascade_pause(
+            pool,
+            transform,
+            column,
+            mark,
+            Some(CASCADE_COMPLETION_LOCK_TIMEOUT),
+        )
+        .await
+        {
+            Ok(()) => finished += 1,
+            Err(err) => tracing::warn!(
+                transform = %transform,
+                column = %column,
+                error = %err,
+                "couldn't finish a column pause's cascade; retrying next pass"
+            ),
+        }
     }
-    Ok(pending.len())
+    Ok(finished)
 }
+
+/// How long each pair of a walk [`complete_pause_cascades`] runs waits for a
+/// lock (its fence bump, behind the writers in flight) before the walk gives
+/// up until the next pass. The same order as `RETYPE_LOCK_TIMEOUT`, the
+/// staging worker's other wait on a writer: long enough for a page or a
+/// build chunk to finish, short enough that a writer holding a fence for
+/// the whole session lock timeout can't stall sealing for as long.
+pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Pauses one calculated column deliberately — the operator-driven trigger
 /// for the same column-pause state [`trip_column_fuse`] reaches automatically,
@@ -2782,28 +2849,32 @@ pub async fn complete_pause_cascades(pool: &Pool) -> Result<usize, ApplyError> {
     fields(transform = %transform, column = %column)
 )]
 pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<(), ApplyError> {
-    {
+    let mark = {
         let fence = pause_fence(pool, transform).await?;
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
         bump_pause_fence(&*txn, fence.as_deref()).await?;
-        txn.execute(
-            "insert into column_status \
-                 (transform_table, column_name, paused_at, local_fuse, cascade_pending) \
-             values ($1, $2, now(), true, true) \
-             on conflict (transform_table, column_name) do update set \
-                 local_fuse = true, cascade_pending = true",
-            &[&transform, &column],
-        )
-        .await?;
+        let mark: String = txn
+            .query_one(
+                "insert into column_status \
+                     (transform_table, column_name, paused_at, local_fuse, cascade_pending) \
+                 values ($1, $2, now(), true, true) \
+                 on conflict (transform_table, column_name) do update set \
+                     local_fuse = true, cascade_pending = true \
+                 returning xmin::text",
+                &[&transform, &column],
+            )
+            .await?
+            .get(0);
         txn.commit().await?;
-    }
+        mark
+    };
     tracing::info!(
         transform = %transform,
         column = %column,
         "column paused by request; cascading the pause to its dependents"
     );
-    cascade_pause(pool, transform, column).await
+    cascade_pause(pool, transform, column, &mark, None).await
 }
 
 /// Resumes a paused column: clears its counter and its `column_status` row
