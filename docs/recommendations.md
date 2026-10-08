@@ -135,8 +135,11 @@ The role needs:
 * `CREATE` on the database, even when a DBA created the instance schema
   first: attaching runs `create schema if not exists`, which PostgreSQL
   authorizes before it checks whether the schema exists.
-* `CREATE` on the schema each target goes in, and `USAGE` on the schema of
-  every source.
+* `CONNECT` and `TEMPORARY` on the database. Every role has both through
+  `PUBLIC` unless someone revoked them; the migrations and the drain use
+  temporary tables.
+* `CREATE` and `USAGE` on the schema each target goes in (owning the schema
+  gives both), and `USAGE` on the schema of every source.
 * Ownership of each source table and each relationship to-side table, or
   membership in the role that owns it, with `INHERIT`.
 * `BYPASSRLS` if row-level security applies to it on any table it reads or
@@ -153,6 +156,8 @@ and `app_reader` reading targets:
 ```sql
 create role trellis login;
 grant create on database mydb to trellis;
+-- only if CONNECT or TEMPORARY was revoked from PUBLIC:
+grant connect, temporary on database mydb to trellis;
 grant app_owner to trellis;                     -- owns the sources, inherited
 create schema trellis_targets authorization trellis;
 
@@ -164,6 +169,10 @@ alter default privileges for role trellis in schema trellis_targets
 Only Trellis creates tables in `trellis_targets`. Default privileges apply only
 to tables the named role creates, so declare them for each role that applies
 transforms.
+
+`trellis/tests/least_privilege.rs` runs the whole lifecycle as a role holding
+only these privileges, in a database that revoked `PUBLIC`'s, with no
+row-level security and so no `BYPASSRLS`.
 
 ### Application roles read targets, and nothing else
 

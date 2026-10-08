@@ -1570,3 +1570,71 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
         .get(0);
     assert_eq!(skus, 5);
 }
+
+/// Without ownership of a source (here `SELECT` and `TRIGGER` on it, which a
+/// DBA might grant thinking it's enough), the staging worker can't install
+/// capture, and `status` reports why in Postgres's own words. It used to
+/// report only "capture DDL or catalog read failed: db error" (issue #833).
+/// Stepped by hand: one capture pass.
+#[tokio::test]
+async fn a_source_the_role_does_not_own_reports_why_capture_failed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let admin = connect(db.dsn()).await;
+    admin
+        .batch_execute(&format!(
+            "create role app_owner nologin; \
+             create role trellis login; \
+             grant create on database \"{}\" to trellis; \
+             grant create on schema public to trellis; \
+             create table public.orders (id int primary key, amount int); \
+             alter table public.orders owner to app_owner; \
+             grant select, trigger on public.orders to trellis;",
+            db.name()
+        ))
+        .await
+        .expect("a source the Trellis role can read but doesn't own");
+    let config = trellis::Config::from_dsn(db.dsn().replace("user=postgres", "user=trellis"))
+        .expect("valid config");
+    let pool = trellis::Pool::new(&config).expect("pool");
+    trellis::migrate(&pool, &config).await.expect("migrate");
+    let trellis = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect");
+    trellis
+        .apply("TRANSFORM order_copy FROM public.orders SELECT amount AS amount")
+        .await
+        .expect("define");
+
+    let mut raw = connect(&db.dsn().replace("user=postgres", "user=trellis")).await;
+    let desired = trellis::defs::tables_to_capture(&pool)
+        .await
+        .expect("read the tables to capture");
+    trellis::capture::reconcile::reconcile(
+        &mut raw,
+        DEFAULT_SCHEMA,
+        &desired,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .expect("capture pass");
+
+    let failure = trellis
+        .status("order_copy")
+        .await
+        .expect("status")
+        .expect("order_copy is registered")
+        .capture_failure
+        .expect("the capture failure is reported");
+    assert_eq!(failure.source_table, "public.orders");
+    // Postgres refuses the install's table lock, or the trigger DDL, on a
+    // table the role doesn't own; either way its message names the table.
+    assert!(
+        failure.error.contains("ERROR:")
+            && failure.error.contains("orders")
+            && (failure.error.contains("permission denied")
+                || failure.error.contains("must be owner")),
+        "{}",
+        failure.error
+    );
+}

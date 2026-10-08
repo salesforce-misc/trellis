@@ -108,7 +108,10 @@ impl fmt::Display for CaptureError {
             }
             CaptureError::Catalog(e) => write!(f, "reading the catalog for capture: {e}"),
             CaptureError::Marker(e) => write!(f, "parking the capture's backfill marker: {e}"),
-            CaptureError::Db(e) => write!(f, "capture DDL or catalog read failed: {e}"),
+            CaptureError::Db(e) => {
+                write!(f, "capture DDL or catalog read failed: ")?;
+                crate::error::write_pg_error(f, e)
+            }
         }
     }
 }
