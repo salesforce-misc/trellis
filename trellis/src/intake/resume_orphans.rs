@@ -139,6 +139,14 @@
 //! key would. Rust can't sort the keys itself: a column sorts by its type
 //! and its collation, and it never holds them all at once.
 //!
+//! The rows the sweep changes reach the target-mutation seam the same way:
+//! after each batch, the seam moves the keys it holds into a temporary table
+//! of its own once they reach a batch (issue #924,
+//! `staging::target_mutations`, "Spilling a large write"), and the flush at
+//! the end of [`Sweep::finish`] stages them from it a batch at a time. So
+//! neither the deleted keys nor their prior images pile up in memory, and no
+//! re-read of an endpoint target's new images binds more than a batch.
+//!
 //! A ledger target needs more than that, since its Re-derive locks groups
 //! as well as entries, and a later batch's groups can sort below an
 //! earlier one's. Re-deriving each batch as a page does, entries then
@@ -287,7 +295,7 @@ use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
 use crate::defs::{TransformStatus, parse};
 use crate::pool::quote_ident;
 use crate::staging::apply::bounds_keyset_by_array;
-use crate::staging::target_mutations::TargetMutations;
+use crate::staging::target_mutations::{SeamStats, TargetMutations};
 
 use super::IntakeError;
 
@@ -325,6 +333,10 @@ pub(super) struct Swept {
     /// The most unbacked keys the sweep held in memory at once: at most one
     /// page of the read (issue #904).
     pub(super) most_buffered: usize,
+    /// What the target-mutation seam held and bound for the rows the sweep
+    /// changed (issue #924): it spills to a temporary table once it holds a
+    /// batch of them ([`TargetMutations::spill_over`]).
+    pub(super) seam: SeamStats,
 }
 
 impl Swept {
@@ -689,7 +701,7 @@ impl Sweep {
             }
             swept.deleted += sweep_rows(txn, target, &mut mutations, batch, &mut swept).await?;
         }
-        mutations.flush(txn).await?;
+        swept.seam = mutations.flush_counted(txn).await?;
         Ok(swept)
     }
 }
@@ -720,6 +732,7 @@ async fn sweep_rows(
             let prior = target.has_image.then(|| row.get::<_, String>(1));
             mutations.record(&target.target, row.get(0), prior, 0, None, None);
         }
+        mutations.spill_over(txn, batch).await?;
         deleted += rows.len();
     }
     keys.close(txn).await?;
@@ -857,6 +870,7 @@ async fn sweep_ledger(
                 mutations,
             )
             .await?;
+            mutations.spill_over(txn, batch).await?;
             rederived += refs.len();
             deleted += emptied;
         }
@@ -879,6 +893,7 @@ async fn sweep_ledger(
                 mutations.record(&groups.target, row.get(0), prior, 0, None, None);
                 orphans_deleted += 1;
             }
+            mutations.spill_over(txn, batch).await?;
         }
         groups.staged.close(txn).await?;
     }
@@ -2631,6 +2646,162 @@ mod db_tests {
             .expect("count what is left")
             .get(0);
         assert_eq!(left, 0, "no row, group or live entry is left");
+    }
+
+    /// Issue #924's setup: a 1-1 copy and a ledger aggregate (by `k % 3`)
+    /// over `items` rows `1..=count`, both read: the copy as a
+    /// relationship's to-side, so the seam stages CDC-shaped rows for it
+    /// and re-reads their new images, and the aggregate by a `live`
+    /// definition, so it stages `Recompute`s with prior images. Then every
+    /// item is deleted. Returns a raw connection and the definitions.
+    async fn read_items_all_unbacked(
+        db: &testkit::TestDatabase,
+        count: i64,
+    ) -> (tokio_postgres::Client, Vec<i64>) {
+        let (pool, raw) = connect(db).await;
+        raw.batch_execute(&format!(
+            "create table public.items (k bigint primary key, g bigint, a numeric); \
+             insert into public.items select i, i % 3, i from generate_series(1, {count}) i; \
+             create table public.reports (id bigint primary key, oid bigint)"
+        ))
+        .await
+        .expect("seed items");
+        let columns = HashMap::from([
+            ("k".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::intake::markers::feed_from_a_test_definition(&raw, "public.items")
+            .await
+            .expect("make items read as another definition's target");
+        for text in [
+            "TRANSFORM items_copy FROM items SELECT a AS a",
+            "TRANSFORM items_by_g FROM items GROUP BY g SELECT sum(a) AS total",
+        ] {
+            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
+                .await
+                .expect("register");
+        }
+        crate::intake::markers::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 2, "both builds finished");
+        crate::defs::catalog::create_relationship(
+            &pool,
+            "RELATIONSHIP rollup FROM reports.oid TO items_copy.k",
+        )
+        .await
+        .expect("make the copy a relationship endpoint");
+        raw.batch_execute(&format!(
+            "insert into source_table_versions (source_table, version) \
+                 values ('public.items_by_g', 1) on conflict do nothing; \
+             insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+             values ('public.by_g_reader', 'public.items_by_g', 1, \
+                     'TRANSFORM by_g_reader FROM items_by_g SELECT total AS total', '{}'); \
+             delete from public.items",
+            TransformStatus::Live.as_str()
+        ))
+        .await
+        .expect("read the aggregate, and unback every item");
+        (raw, ids)
+    }
+
+    /// Sweeps `ids` with a batch of `batch` keys, and returns what it swept
+    /// and every ring row its transaction staged for the swept targets,
+    /// sorted, with the write token reduced to whether it is set.
+    async fn sweep_and_stage(
+        db: &testkit::TestDatabase,
+        ids: &[i64],
+        batch: usize,
+    ) -> (Swept, Vec<Vec<Option<String>>>) {
+        let (_, mut sweeper) = connect(db).await;
+        let txn = sweeper.transaction().await.expect("begin");
+        let mut sweep = Sweep::with_batch(batch);
+        sweep
+            .add(&txn, ids, TransformStatus::CatchingUp)
+            .await
+            .expect("plan the sweep");
+        assert!(
+            super::super::markers::declare_read(&txn, None, &sweep)
+                .await
+                .expect("declare the read")
+        );
+        super::super::markers::fetch_read(&txn, "", &mut sweep)
+            .await
+            .expect("fetch the read");
+        let swept = sweep.finish(&txn).await.expect("flush the sweep");
+        let ring = (0..4)
+            .map(|slot| format!("select xmin as x, * from seg_{slot}"))
+            .collect::<Vec<_>>()
+            .join(" union all ");
+        let staged = txn
+            .query(
+                &format!(
+                    "select src_table, key, op::text, (lsn is not null)::text, \
+                            old_image::text, new_image::text, origin_lsn::text, \
+                            src_changed::text, hop_gen::text, group_key::text \
+                     from ({ring}) r \
+                     where x::text::bigint = pg_current_xact_id()::text::bigint % 4294967296 \
+                     order by 1, 2"
+                ),
+                &[],
+            )
+            .await
+            .expect("read the staged rows")
+            .into_iter()
+            .map(|row| (0..10).map(|i| row.get(i)).collect())
+            .collect();
+        txn.commit().await.expect("commit");
+        (swept, staged)
+    }
+
+    /// Issue #924: a sweep whose seam spills to its temporary table stages
+    /// exactly the rows one in-memory flush stages, while holding and
+    /// binding at most about a batch of changed keys. Both runs sweep 12
+    /// unbacked items out of a read copy (12 CDC-shaped deletes, each
+    /// re-read for its new image) and a read aggregate over 3 groups (one
+    /// `Recompute` per group). With a batch of 2, the Re-derive writes each
+    /// group across several batches, and a spill lands between them, so a
+    /// group's first prior image (its sum before the sweep) has to survive
+    /// the merge in the table: a later batch's image is a smaller sum.
+    #[tokio::test]
+    async fn a_spilled_sweep_stages_what_an_in_memory_one_does() {
+        const ITEMS: i64 = 12;
+        let cluster = testkit::TestCluster::start();
+        let control_db = cluster.create_isolated_database().await;
+        let spilled_db = cluster.create_isolated_database().await;
+        let (_control_raw, control_ids) = read_items_all_unbacked(&control_db, ITEMS).await;
+        let (_spilled_raw, spilled_ids) = read_items_all_unbacked(&spilled_db, ITEMS).await;
+
+        let (control, control_rows) = sweep_and_stage(&control_db, &control_ids, SWEEP_BATCH).await;
+        let (spilled, spilled_rows) = sweep_and_stage(&spilled_db, &spilled_ids, 2).await;
+
+        assert_eq!(control.deleted, 12 + 3, "every copy, and every group");
+        assert_eq!(spilled.deleted, control.deleted);
+        assert!(
+            !control.seam.spilled,
+            "the control holds its keys in memory"
+        );
+        assert_eq!(control.seam.most_held, 12 + 3, "every changed key at once");
+        assert_eq!(control_rows.len(), 12 + 3, "a row per changed key");
+        assert!(
+            control_rows.iter().all(|row| row[4].is_some()),
+            "every staged row carries its prior image"
+        );
+        assert!(spilled.seam.spilled, "a batch of 2 spills");
+        assert!(
+            spilled.seam.most_held < 2 * 2,
+            "the spilled sweep holds under two batches of keys, not {}",
+            spilled.seam.most_held
+        );
+        assert_eq!(
+            spilled.seam.largest_statement, 2,
+            "every seam statement binds at most a batch"
+        );
+        assert_eq!(
+            spilled_rows, control_rows,
+            "the spilled sweep stages exactly what the in-memory one does"
+        );
     }
 
     /// Issue #884: the sweep's batches of a target's keys come in the
