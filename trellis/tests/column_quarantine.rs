@@ -357,6 +357,105 @@ async fn column_fuse_trips_only_once_the_threshold_is_crossed() {
     );
 }
 
+/// A column fuse trip bumps its source's version fence as the first lock of
+/// the transaction that writes the pause (issue #903), so it can wait out the
+/// lock timeout behind a writer holding the fence. The charge that reached
+/// the threshold has committed by then and the trip has not, so the count is
+/// left at the threshold with the column live. The next failure of a row
+/// already charged then trips the fuse; without that, only another row's
+/// first failure would. Here the drain's sessions run with a 100 ms
+/// `lock_timeout` (a setting shorter than Trellis's 30 s cap is kept) while a
+/// raw transaction holds `orders`' fence `for share`, as a page does.
+#[tokio::test]
+async fn a_column_fuse_trip_that_waits_out_the_lock_timeout_trips_on_the_next_failure() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+    let below_threshold: Vec<i64> = (1..DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders(&mut client, &db.pool, &below_threshold).await;
+
+    let impatient = trellis::Pool::new(
+        &Config::from_dsn(format!("{} options='-c lock_timeout=100'", db.dsn()))
+            .expect("valid dsn"),
+    )
+    .expect("pool");
+    let mut page = connect_raw(db.dsn()).await;
+    let holder = page.transaction().await.expect("begin the fence holder");
+    holder
+        .execute(
+            "select v.version from source_table_versions v \
+             join transform_definitions d on d.source_table = v.source_table \
+             where split_part(d.target_table, '.', 2) = 'order_totals' for share of v",
+            &[],
+        )
+        .await
+        .expect("hold orders' fence");
+
+    let threshold_key = DEFAULT_COLUMN_DEATH_THRESHOLD as i64;
+    let table = active_segment_table(&client).await;
+    insert_cdc_row(
+        &client,
+        &table,
+        "orders",
+        &threshold_key.to_string(),
+        "insert",
+        None,
+        Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    let result = apply::drain_once(
+        &impatient,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    assert!(
+        !matches!(result, Err(ApplyError::Eval(_)) | Ok(_)),
+        "the trip's bump must wait out the lock timeout, got {result:?}"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None,
+        "the trip that timed out paused nothing"
+    );
+    assert_eq!(
+        column_deaths_count(&client, "order_totals", "total").await,
+        Some(DEFAULT_COLUMN_DEATH_THRESHOLD),
+        "the threshold row's charge committed before the trip"
+    );
+    holder.rollback().await.expect("end the fence holder");
+
+    // The same row fails again. It's charged already, so only the count
+    // left at the threshold can trip the fuse.
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ApplyError::Eval(_))),
+        "the row still fails, got {result:?}"
+    );
+    let status = column_status_row(&client, "order_totals", "total")
+        .await
+        .expect("the row's next failure trips the fuse the timeout lost");
+    assert!(status.0, "a threshold trip is a local fuse");
+    assert_eq!(
+        column_deaths_count(&client, "order_totals", "total").await,
+        None,
+        "the counter resets once the fuse trips"
+    );
+}
+
 // ---------------------------------------------------------------------
 // (b) A paused column's value freezes across subsequent CDC deltas.
 // ---------------------------------------------------------------------

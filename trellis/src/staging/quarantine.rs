@@ -2361,7 +2361,9 @@ pub(super) async fn paused_columns_for(
 /// probed, so it can never cross this fuse's threshold alone — only a real
 /// *breadth* of distinct failing rows can. Trips the fuse
 /// ([`trip_column_fuse`]) once the count reaches
-/// [`DEFAULT_COLUMN_DEATH_THRESHOLD`].
+/// [`DEFAULT_COLUMN_DEATH_THRESHOLD`], and again on a row charged already
+/// while the count is still there, since only a trip that failed leaves it
+/// there.
 async fn charge_column_failure(
     pool: &Pool,
     transform: &str,
@@ -2380,6 +2382,23 @@ async fn charge_column_failure(
         )
         .await?;
     if inserted == 0 {
+        // This row was charged already. If its charge reached the threshold
+        // and the trip then failed, the count is still at or past it: the
+        // trip resets it in the transaction that writes the pause, and that
+        // transaction's first lock is a fence bump that can wait out the
+        // lock timeout behind a writer in flight (issue #903). Trip now,
+        // rather than wait for another row's failure.
+        let deaths: Option<i32> = client
+            .query_opt(
+                "select deaths from column_deaths \
+                 where transform_table = $1 and column_name = $2",
+                &[&transform, &column],
+            )
+            .await?
+            .map(|row| row.get(0));
+        if deaths.is_some_and(|deaths| deaths >= DEFAULT_COLUMN_DEATH_THRESHOLD) {
+            trip_column_fuse(pool, transform, column, error).await?;
+        }
         return Ok(());
     }
 

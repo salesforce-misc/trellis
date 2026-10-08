@@ -1525,7 +1525,8 @@ async fn capture_release(
 /// Bumps `source_table`'s version fence (`source_table_versions`) in `txn`,
 /// as `ALTER TRANSFORM` does, for a commit that releases a 1-1 field's
 /// `column_status` pause into a field build: a column resume, or the field
-/// build's capture release (#625 F8b).
+/// build's capture release (#625 F8b). A column pause bumps it too, for the
+/// opposite direction (`quarantine::bump_pause_fence`, issue #903).
 ///
 /// A page reads the paused columns in Phase 2 and leaves them out of its
 /// writes. One that read them before the release must not apply after it:
