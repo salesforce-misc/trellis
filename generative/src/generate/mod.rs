@@ -4540,27 +4540,16 @@ mod strategy {
                         tables.push(cooling.table.clone());
                         match &backfill {
                             Some(backfill) => {
-                                let at = defs.len();
-                                defs.insert(
-                                    at,
-                                    (
-                                        cooling_table,
-                                        DefShape::Aggregate {
-                                            functions: backfill.functions.clone(),
-                                        },
-                                    ),
-                                );
-                                derived.insert(at, None);
-                                rel_fields.insert(at, None);
+                                let functions = backfill.functions.clone();
+                                defs.push((cooling_table, DefShape::Aggregate { functions }));
+                                derived.push(None);
                             }
                             None => {
                                 defs.push((cooling_table, DefShape::OneToOne));
                                 derived.push(Some(cooling.derived.clone()));
                             }
                         }
-                        if backfill.is_none() {
-                            rel_fields.push(None);
-                        }
+                        rel_fields.push(None);
                     }
                     let program = build_program_multi_with_relationships(
                         &tables,

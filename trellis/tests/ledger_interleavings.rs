@@ -1278,6 +1278,10 @@ async fn a_chained_reader_follows_groups_emptied_and_refilled_in_one_page() {
 /// which a Re-derive leaves alone, so it applies and puts key 1 back to 15.
 /// C2 never applies on its own (its Re-derive counted it), so nothing
 /// repairs it.
+///
+/// This is the plant's only gate: the engine's own ordering keeps every
+/// generative tier from draining C1 after the Re-derive, so each lists the
+/// plant as `not_gated` and points here (#734).
 #[tokio::test]
 async fn a_change_the_rederive_read_is_not_applied_again_aggregate() {
     let flavour = Flavour::Aggregate;

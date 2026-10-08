@@ -110,13 +110,13 @@
 //! from each burst's start (`SteadyLoad::pace_from_start`), so the
 //! backfill's catch-up lands among writes still coming in. It is a sweep tier
 //! only, like the steady-load one. It was built for `lsn_only_skip`, which it
-//! doesn't gate (see above), and it gates the plants a backfill under load
-//! reaches.
+//! doesn't gate (see "Planted ordering bugs" below), and it gates the plants
+//! a backfill under load reaches.
 //!
-//! The stall is process-wide, so the tier has no property test: it runs
-//! only in [`planted_bugs_are_caught`]'s sweep processes, one case at a time
-//! with nothing else in the process, and `run_concurrent_case` refuses a
-//! steady-load case anywhere else.
+//! The stall is process-wide, so neither of these two tiers has a property
+//! test: they run only in [`planted_bugs_are_caught`]'s sweep processes, one
+//! case at a time with nothing else in the process, and `run_concurrent_case`
+//! refuses a case with a steady load anywhere else.
 //!
 //! # Planted ordering bugs
 //!
@@ -1485,8 +1485,9 @@ struct SweepTier {
     /// them, but doesn't fail when they go uncaught; it says so when one is
     /// caught, so the entry can go.
     known_misses: &'static [&'static str],
-    /// Plants the tier doesn't gate, each with why: another tier runs the
-    /// shape it needs on purpose, and this one reaches it rarely or never.
+    /// Plants the tier doesn't gate, each with why: another tier (or, for
+    /// `lsn_only_skip`, a deterministic pin) runs the shape it needs on
+    /// purpose, and this one reaches it rarely or never.
     /// `GENERATIVE_PLANTS=all` leaves them out; named, they run and are
     /// reported, and the sweep never fails on them.
     not_gated: &'static [(&'static str, &'static str)],
@@ -1586,9 +1587,9 @@ const MID_BURST_NOT_GATED: &[(&str, &str)] = &[
 ];
 
 /// The cooling-backfill tier's programs are the hot table and the cooling
-/// table, each read by a `GROUP BY` definition, and install nothing
-/// mid-burst (#734). It gates the plants a `request_backfill` under load
-/// reaches, and not these two.
+/// table, each read by a `GROUP BY` definition, and install or resume
+/// nothing mid-burst (#734). It gates the plants a `request_backfill` under
+/// load reaches, and not the 1-1 or build plants, nor `lsn_only_skip`.
 const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
     (
         "stale_one_to_one_write",
@@ -1598,13 +1599,18 @@ const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
     (
         "chunk_without_entry_lock",
         "it needs a build chunk reading an entry while a page holds it, and the \
-         tier installs nothing mid-burst, so only a backfill's catch-up builds \
-         (it fired in 1 of 48 cases, caught in 0); the steady-load tier gates it",
+         tier installs and resumes nothing mid-burst, so the only builds are the \
+         up-front definitions' at the start of the run (a `request_backfill`'s \
+         catch-up stages Recomputes for pages, not chunks); it fired in 1 of 48 \
+         cases and was caught in 0; the steady-load tier gates it",
     ),
     (
         "merge_without_delete",
-        "it needs a mid-burst install or resume, which the tier has none of (0 \
-         of 48 cases fired it); the mid-burst and steady-load tiers gate it",
+        "it needs a build with group deltas to merge, and the tier installs and \
+         resumes nothing mid-burst, so the only builds are the up-front \
+         definitions' at the start of the run (a `request_backfill`'s catch-up \
+         is no build); it fired in 0 of 48 cases; the mid-burst and steady-load \
+         tiers gate it",
     ),
     LSN_ONLY_SKIP_PIN,
 ];
@@ -1667,6 +1673,40 @@ fn every_tier_the_quarantine_list_can_name_is_a_sweep_tier() {
     for name in baseline_quarantine::TIERS {
         let tier = sweep_tier_named(name).expect("a sweep tier");
         assert_eq!(tier.name, *name);
+    }
+}
+
+/// Every tier's `known_misses` and `not_gated` name real plants, each at
+/// most once, and `lsn_only_skip` is in every tier's `not_gated`: its pin
+/// gates it, not a sweep (#734).
+#[test]
+fn every_tier_lists_real_plants_and_leaves_lsn_only_skip_to_its_pin() {
+    use trellis::dev::plant::Plant;
+    for name in baseline_quarantine::TIERS {
+        let tier = sweep_tier_named(name).expect("a sweep tier");
+        let listed: Vec<&str> = tier
+            .known_misses
+            .iter()
+            .copied()
+            .chain(tier.not_gated.iter().map(|(plant, _)| *plant))
+            .collect();
+        for plant in &listed {
+            assert!(
+                Plant::from_name(plant).is_some(),
+                "the {name} tier lists {plant:?}, which names no plant"
+            );
+            assert_eq!(
+                listed.iter().filter(|p| *p == plant).count(),
+                1,
+                "the {name} tier lists {plant} more than once"
+            );
+        }
+        assert!(
+            tier.not_gated
+                .iter()
+                .any(|(plant, _)| *plant == Plant::LsnOnlySkip.name()),
+            "the {name} tier must leave lsn_only_skip to its pin (#734)"
+        );
     }
 }
 
