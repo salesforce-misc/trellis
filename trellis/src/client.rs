@@ -1516,6 +1516,8 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     // life of the worker, not just once at startup.
     let mut next_worker_heartbeat = Instant::now();
     let mut drain_failures = DrainFailures::default();
+    // The group-delta merges that failed on this worker, backing off (#901).
+    let mut merge_failures = staging::build::MergeFailures::default();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1595,6 +1597,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     chunk_heartbeat_interval,
                     reclaim_ttl,
                     &build_options,
+                    &mut merge_failures,
                 )
                 .await;
                 if !build_progress
@@ -1673,6 +1676,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                 chunk_heartbeat_interval,
                 reclaim_ttl,
                 &build_options,
+                &mut merge_failures,
             )
             .await;
         let made_progress = drained || build_progress;
@@ -1693,23 +1697,26 @@ async fn build_step(
     chunk_heartbeat_interval: Duration,
     reclaim_ttl: Duration,
     build_options: &staging::build::WorkerOptions,
+    merge_failures: &mut staging::build::MergeFailures,
 ) -> bool {
     let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
-    let rederive = rederive_build_step(pool, claimed_by, build_options).await;
+    let rederive = rederive_build_step(pool, claimed_by, build_options, merge_failures).await;
     old || rederive
 }
 
 /// One step of the running Re-derive builds' work
 /// ([`staging::build::work_once`], #625 F2), after this worker's segments.
 /// Returns whether it did work. A failure of the step itself (not of a chunk,
-/// which `chunk_queue::fail_chunk` records and logs) is logged at warn and
-/// retried on the next pass.
+/// which `chunk_queue::fail_chunk` records and logs, nor of a merge, which
+/// `merge_failures` backs off and `staging::build` classifies) is logged at
+/// warn and retried on the next pass.
 async fn rederive_build_step(
     pool: &Pool,
     claimed_by: &str,
     options: &staging::build::WorkerOptions,
+    merge_failures: &mut staging::build::MergeFailures,
 ) -> bool {
-    match staging::build::work_once(pool, claimed_by, options).await {
+    match staging::build::work_once(pool, claimed_by, options, merge_failures).await {
         Ok(step) => step.progressed(),
         Err(error) => {
             tracing::warn!(

@@ -1580,9 +1580,16 @@ pub struct DefinitionStatus {
     ///   bound, an aggregate off the ledger) reached it, so the drain paused
     ///   it, everything else reading what it reads, and everything
     ///   downstream of them, and drained the rest. Fix the cause and resume
-    ///   the definition, which rebuilds it and clears this.
+    ///   the definition, which rebuilds it and clears this;
+    /// - or its Re-derive build's group-delta merge halted on it (issue
+    ///   #901), also with [`CaptureFailureKind::Halt`]: the merge into its
+    ///   target was refused, or kept failing in a way no retry gets past (a
+    ///   check or deferred constraint on the target that a merged group
+    ///   breaks), so it paused, with everything downstream of its target.
+    ///   `source_table` names the target. Fix the cause and resume it, which
+    ///   rebuilds it and clears this.
     ///
-    /// Every case but the halt has [`CaptureFailureKind::Capture`]. A
+    /// Every case but the halts has [`CaptureFailureKind::Capture`]. A
     /// definition an operator paused has none.
     pub capture_failure: Option<CaptureFailure>,
     /// Set while the definition holds keys in quarantine (#759): source keys
@@ -1617,7 +1624,7 @@ pub struct CaptureFailure {
     pub kind: CaptureFailureKind,
     /// The qualified captured table. For a halt, the table (or tables,
     /// joined with `", "`) the halting failure named, or the target, for an
-    /// aggregate off the ledger.
+    /// aggregate off the ledger or a build's merge that kept failing.
     pub source_table: String,
     /// The columns the failure is about: the renamed or dropped ones the
     /// definition reads (every missing column of the table when a
@@ -1639,9 +1646,10 @@ pub enum CaptureFailureKind {
     /// Capture of a table the definition reads is broken: a schema change,
     /// row-level security, a subscription, or a failing install or widen.
     Capture,
-    /// The drain halted on the definition: a failure no retry or quarantine
-    /// gets past reached it, so the drain paused it with the rest of the
-    /// failure's closure (`staging::halt`).
+    /// The drain, or a Re-derive build's group-delta merge, halted on the
+    /// definition: a failure no retry or quarantine gets past reached it, so
+    /// it was paused with the rest of the failure's closure
+    /// (`staging::halt`).
     Halt,
 }
 

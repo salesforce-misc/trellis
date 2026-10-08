@@ -20,8 +20,8 @@ defmodule Trellis.Status do
       or the drain halted on it: a schema change paused it (resume it once
       fixed), installing capture keeps failing (it clears once the cause is
       fixed), or, with `kind` `:halt`, a failure no retry gets past reached
-      it, so the drain paused it and what depends on it (resume it once
-      fixed). A transform an operator paused has none.
+      it, so the drain (or its build's merge) paused it and what depends on
+      it (resume it once fixed). A transform an operator paused has none.
     * `held_keys` is set while it holds keys in quarantine: source keys
       whose changes kept failing in its apply, so it leaves them out and
       their target rows stay as they were, whatever its status, `:live`
@@ -174,8 +174,8 @@ end
 
 defmodule Trellis.CaptureFailure do
   @moduledoc """
-  Why capture of `source_table` is broken, or why the drain halted on the
-  transform: `kind` is `:capture` or `:halt`, `error` is a sentence naming
+  Why capture of `source_table` is broken, or why the drain (or a build's
+  merge) halted on the transform: `kind` is `:capture` or `:halt`, `error` is a sentence naming
   the cause, `columns` the columns it is about (empty when it isn't about a
   column, and for a halt), and `detected_at` when it was first found.
   """

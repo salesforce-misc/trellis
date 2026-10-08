@@ -334,6 +334,12 @@ probe of the key that breaks it. Trellis's own tables declare no deferrable cons
 A failure that is structural rather than one key's fault, so that every key reproduces
 it, is not charged to any key: it pauses the definitions it reaches
 ([ADR-0014](0014-pause-and-drop-a-transform.md)).
+A Re-derive build's group-delta merge applies whole groups, so it has no key to charge
+either. Its transient failures, `COMMIT` included, are retried and then backed off; a
+refused write halts like a page's; and any other failure backs the target off and is
+charged to the merge, whose fifth charge on a worker halts the definition and everything
+downstream of its target. A target backing off never holds up another target's merge or
+the build's chunks.
 
 A failure that is charged to no key and pauses nothing is a *drain holdup*: a refused
 read or write the catalog can't pin on a table (so the halt pauses nothing), isolation

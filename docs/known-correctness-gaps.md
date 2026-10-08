@@ -335,6 +335,11 @@ than filtering it. What follows depends on what was refused:
 * **A build chunk** is retried, and its fifth charged attempt pauses its
   definition, with the error on `backfill_failure`. It's never narrowed to a
   key.
+* **A build's group-delta merge** halts like a drain: it pauses what the
+  refusal reaches with kind `halt`. One the catalog can't pin is retried with
+  backoff, and its fifth charged attempt pauses the definition, and everything
+  downstream of its target, with kind `halt` and the error on
+  `capture_failure`.
 * **A backfill discharge or go-live catch-up** halts the same way, whether
   the refusal comes while it plans a build, before any chunk exists, or while
   a catch-up re-reads the source. It reads the catalog as the discharge's own
@@ -355,7 +360,7 @@ than filtering it. What follows depends on what was refused:
 definitions and shows in `status()`, except a `42501` the catalog can't pin,
 which pauses nothing: a drain's shows on `drain_failure` and in
 `self_check`, and a discharge's or catch-up's on `backfill_failure`. A build
-chunk's shows on `backfill_failure`. For the ring's owner, the reconcile pass
+chunk's shows on `backfill_failure`, and a build merge's on `capture_failure`. For the ring's owner, the reconcile pass
 pauses the readers and `self_check` reports a `capture` divergence (#745,
 #765). Define and declare refuse policies that already apply
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).

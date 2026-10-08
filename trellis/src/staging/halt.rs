@@ -49,6 +49,12 @@
 //! surfaces the error, charging no key either way, as a drain holdup
 //! ([`super::holdup`]).
 //!
+//! A Re-derive build's group-delta merge (issue #901) halts the same way
+//! ([`halt_failed_merge`]): a refused one through the same attribution, and
+//! one that keeps failing otherwise (its charged attempts ran out) from the
+//! definition writing its target, as for an aggregate off the ledger. A
+//! merge applies whole groups, so neither has a key to charge.
+//!
 //! A backfill marker's discharge that Postgres refuses the same way (a
 //! build's planning, or a go-live catch-up's re-read, issue #813) halts
 //! through the same attribution, on the discharge's own connection
@@ -155,6 +161,40 @@ pub(crate) async fn halt_refused_discharge(
     let txn = client.transaction().await?;
     let halted = format!("the backfill discharge of {table} was refused");
     let paused = pause_closure(&txn, &schema, None, &halted, err).await?;
+    txn.commit().await?;
+    Ok(paused)
+}
+
+/// [`halt_closure`] for a Re-derive build's group-delta merge into `target`
+/// (issue #901, `staging::build`), which applies whole groups and so has no
+/// key to charge. A merge Postgres `refused` (`42501`) runs the same
+/// attribution as a drain's ([`refusals`]), on a connection of `pool`, the
+/// merge's own. Any other failure is the merge's charged failure that ran out
+/// of attempts, and pauses the definition writing `target` and everything
+/// downstream of it. Either pauses with kind `halt` and records the halting
+/// stop if it paused any, in one transaction, and returns the bare targets
+/// it paused: empty when every definition it reaches was already frozen, or
+/// the catalog pins a refusal on no table. `err` is the failure's text.
+pub(crate) async fn halt_failed_merge(
+    pool: &Pool,
+    target: &str,
+    refused: bool,
+    err: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let (seed, halted) = if refused {
+        (
+            None,
+            format!("the re-derive build's merge into {target} was refused"),
+        )
+    } else {
+        (
+            Some(Seed::Target(target.to_string())),
+            format!("the re-derive build's merge into {target} kept failing"),
+        )
+    };
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let paused = pause_closure(&txn, pool.schema(), seed, &halted, err).await?;
     txn.commit().await?;
     Ok(paused)
 }

@@ -1191,9 +1191,14 @@ async fn build_step(pool: &trellis::Pool, worker: &str) -> trellis::staging::bui
         heartbeat_interval: std::time::Duration::from_secs(1),
         reclaim_ttl: std::time::Duration::from_secs(60),
     };
-    trellis::staging::build::work_once(pool, worker, &options)
-        .await
-        .expect("a build step")
+    trellis::staging::build::work_once(
+        pool,
+        worker,
+        &options,
+        &mut trellis::staging::build::MergeFailures::default(),
+    )
+    .await
+    .expect("a build step")
 }
 
 /// A chunk plans from the definition before its transaction, so an edit can

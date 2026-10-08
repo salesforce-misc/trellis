@@ -139,6 +139,20 @@
 //! [`VACUUM_EVERY`] rows it merges, so the walk past dead index entries
 //! stays bounded by that, not by the build's length.
 //!
+//! **A failing merge (#901).** A merge applies whole groups, so its failure
+//! names no key to charge, and it's classified by target instead
+//! ([`fail_merge`]). A transient failure (a lost connection, a lock or
+//! serialization conflict) is retried at once a few times, then backs the
+//! target off, uncharged. A refused write (`42501`) halts like a drain's
+//! (`super::halt`). Any other failure, such as an application's check or
+//! deferred constraint that a merged group breaks, backs the target off and
+//! is charged, and its [`chunk_queue::MAX_CHARGED_ATTEMPTS`]th charge halts
+//! the definition's closure with kind `halt`, the target and the error on
+//! `capture_failure`. The backoff and the charges are the drain worker's own
+//! ([`MergeFailures`]). A target set aside this way doesn't hold up the
+//! worker: [`work_once`] goes on to the next target's merge and to the
+//! chunk claims.
+//!
 //! While a target is being built its groups have two channels, Apply and the
 //! merger, so a group can be transiently partial or even negative. B5 (a
 //! group is deleted only when every accumulator is 0) keeps such a group's
@@ -1664,22 +1678,36 @@ impl Step {
 ///
 /// A definition that is frozen gets nothing: neither its deltas merged nor
 /// its work claimed. Its deltas stay (#625 B4).
+///
+/// A merge that fails is given up through [`fail_merge`], and the step goes
+/// on to the next target and the claims (#901). A target backing off after
+/// a failed merge in `merges` is skipped until its backoff ends.
 pub async fn work_once(
     pool: &Pool,
     claimed_by: &str,
     options: &WorkerOptions,
+    merges: &mut MergeFailures,
 ) -> Result<Step, ChunkQueueError> {
     let building = building(pool).await?;
+    merges.retain(|id| building.iter().any(|(building, ..)| *building == id));
     if building.is_empty() {
         return Ok(Step::Idle);
     }
-    for (id, target, merges) in &building {
+    for (id, target, has_delta_table) in &building {
         // A target whose every partition with rows another worker is
         // merging is skipped (#625 F2b, #717): a pass that claims none falls
         // through to the next target, then to a chunk. A 1-1 target has no
         // delta table, so nothing merges for it (#625 F8a).
-        if *merges && has_deltas(pool, target).await? && merge_once(pool, *id).await? > 0 {
-            return Ok(Step::Merged);
+        if !*has_delta_table || merges.backing_off(*id) || !has_deltas(pool, target).await? {
+            continue;
+        }
+        match merge_retrying(pool, *id).await {
+            Ok(0) => {}
+            Ok(_) => {
+                merges.succeeded(*id);
+                return Ok(Step::Merged);
+            }
+            Err(err) => fail_merge(pool, *id, target, &err, merges).await,
         }
     }
 
@@ -2461,6 +2489,176 @@ async fn merge_once(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
     Ok(outcome.claimed)
 }
 
+/// How many times [`merge_retrying`] retries a merge at once after a
+/// transient failure before it gives the merge up to [`fail_merge`].
+const MERGE_TRANSIENT_RETRIES: u32 = 3;
+
+/// The wait before [`merge_retrying`]'s first retry, doubled for each one
+/// after it.
+const MERGE_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+
+/// [`merge_once`], retried at once after a transient failure (a lost
+/// connection, a lock or serialization conflict, at any statement or at
+/// `COMMIT`) up to [`MERGE_TRANSIENT_RETRIES`] times, as a drain page is
+/// (#901). A failed merge rolled back whole, so a retry claims the same
+/// delta rows again.
+async fn merge_retrying(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
+    let mut delay = MERGE_RETRY_INITIAL_DELAY;
+    let mut retries = 0;
+    loop {
+        match merge_once(pool, id).await {
+            Err(err)
+                if retries < MERGE_TRANSIENT_RETRIES
+                    && super::quarantine::is_transient_error(&err) =>
+            {
+                tracing::debug!(
+                    definition_id = id, error = %err, retry = retries + 1,
+                    "group-delta merge failed transiently; retrying it"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                retries += 1;
+            }
+            merged => return merged,
+        }
+    }
+}
+
+/// A drain worker's record of the group-delta merges that failed on it
+/// (#901), by definition: how many times in a row each failed, how many of
+/// those were charged, and when it may be merged again. [`work_once`] skips
+/// a target until then, and forgets a definition once its merge succeeds or
+/// it stops building. A drain worker keeps one for its life; a test makes
+/// its own.
+#[derive(Debug, Default)]
+pub struct MergeFailures {
+    by_definition: HashMap<i64, MergeFailure>,
+}
+
+/// One definition's entry in [`MergeFailures`].
+#[derive(Debug, Clone, Copy)]
+struct MergeFailure {
+    attempts: i32,
+    charged: i32,
+    retry_at: Instant,
+}
+
+impl MergeFailures {
+    /// Whether definition `id`'s merge is waiting out a backoff.
+    fn backing_off(&self, id: i64) -> bool {
+        self.by_definition
+            .get(&id)
+            .is_some_and(|failure| Instant::now() < failure.retry_at)
+    }
+
+    /// Records a failure of definition `id`'s merge, `charged` or not, and
+    /// backs it off by the chunk queue's schedule for a Re-derive build's
+    /// work. Returns the entry as it now stands, with how long it waits.
+    fn failed(&mut self, id: i64, charged: bool) -> (MergeFailure, Duration) {
+        let failure = self.by_definition.entry(id).or_insert(MergeFailure {
+            attempts: 0,
+            charged: 0,
+            retry_at: Instant::now(),
+        });
+        failure.attempts += 1;
+        failure.charged += i32::from(charged);
+        let delay = chunk_queue::retry_delay(failure.attempts, chunk_queue::REDERIVE_RETRY_CAP);
+        failure.retry_at = Instant::now() + delay;
+        (*failure, delay)
+    }
+
+    /// Forgets definition `id`'s failures: its merge succeeded, or it was
+    /// paused.
+    fn succeeded(&mut self, id: i64) {
+        self.by_definition.remove(&id);
+    }
+
+    /// Keeps only the definitions `keep` says are still building.
+    fn retain(&mut self, keep: impl Fn(i64) -> bool) {
+        self.by_definition.retain(|id, _| keep(*id));
+    }
+
+    /// Ends every backoff, so a test's next [`work_once`] merges at once.
+    #[cfg(test)]
+    fn expire(&mut self) {
+        let now = Instant::now();
+        for failure in self.by_definition.values_mut() {
+            failure.retry_at = now;
+        }
+    }
+}
+
+/// Gives up a merge into definition `id`'s `target` that failed with `err`
+/// after [`merge_retrying`]'s retries (#901), and logs at warn what it did.
+/// A merge applies whole groups, so no key is charged:
+///
+/// - a **transient** failure backs the target off, uncharged;
+/// - a **refused** read or write (`42501`) halts what the refusal reaches
+///   (`super::halt::halt_failed_merge`), as it does a drain's. One the
+///   catalog pins on no table is charged like any other failure;
+/// - **anything else** (an application's check, foreign key or deferred
+///   constraint a merged group breaks, a missing column) backs the target
+///   off and is charged, and its [`chunk_queue::MAX_CHARGED_ATTEMPTS`]th
+///   charge halts the definition, and everything downstream of its target,
+///   with kind `halt`: `Trellis::status` reports the target and the error
+///   as its `capture_failure`, and a resume rebuilds it.
+///
+/// It never fails itself: a failure to halt is logged, and the target backs
+/// off as before.
+async fn fail_merge(
+    pool: &Pool,
+    id: i64,
+    target: &str,
+    err: &ChunkQueueError,
+    failures: &mut MergeFailures,
+) {
+    let transient = super::quarantine::is_transient_error(err);
+    if !transient && super::quarantine::is_insufficient_privilege(err) {
+        match super::halt::halt_failed_merge(pool, target, true, &err.to_string()).await {
+            Ok(paused) if !paused.is_empty() => {
+                failures.succeeded(id);
+                tracing::warn!(
+                    definition_id = id, target = %target, paused = ?paused, error = %err,
+                    "group-delta merge was refused; paused the definitions the refusal reaches \
+                     (resume them once the cause is fixed)"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(halt_err) => tracing::warn!(
+                definition_id = id, target = %target, error = %err, halt_error = %halt_err,
+                "group-delta merge was refused, and halting on it failed"
+            ),
+        }
+    }
+    let (failure, delay) = failures.failed(id, !transient);
+    if !transient && failure.charged >= chunk_queue::MAX_CHARGED_ATTEMPTS {
+        match super::halt::halt_failed_merge(pool, target, false, &err.to_string()).await {
+            Ok(paused) => {
+                failures.succeeded(id);
+                tracing::warn!(
+                    definition_id = id, target = %target, attempt = failure.attempts,
+                    max_charged = chunk_queue::MAX_CHARGED_ATTEMPTS, paused = ?paused,
+                    error = %err,
+                    "group-delta merge kept failing; paused its definition and everything \
+                     downstream of its target (resume it once the cause is fixed)"
+                );
+                return;
+            }
+            Err(halt_err) => tracing::warn!(
+                definition_id = id, target = %target, error = %err, halt_error = %halt_err,
+                "group-delta merge kept failing, and pausing its definition failed"
+            ),
+        }
+    }
+    tracing::warn!(
+        definition_id = id, target = %target, transient, attempt = failure.attempts,
+        charged = failure.charged, max_charged = chunk_queue::MAX_CHARGED_ATTEMPTS,
+        next_attempt_in_secs = delay.as_secs_f64(), error = %err,
+        "group-delta merge failed; retrying it after a backoff"
+    );
+}
+
 /// The delta rows one process merges into a target between its vacuums of
 /// the target's delta table (#625 F2b).
 ///
@@ -2871,7 +3069,7 @@ mod tests {
         };
         let mut failure = None;
         for _ in 0..200 {
-            let step = work_once(&pool, "worker", &options)
+            let step = work_once(&pool, "worker", &options, &mut MergeFailures::default())
                 .await
                 .expect("a build step");
             if failure.is_none() {
@@ -3008,7 +3206,7 @@ mod tests {
         };
         let mut failure = None;
         for _ in 0..200 {
-            let step = work_once(&pool, "worker", &options)
+            let step = work_once(&pool, "worker", &options, &mut MergeFailures::default())
                 .await
                 .expect("a build step");
             if failure.is_none() {
@@ -3086,5 +3284,328 @@ mod tests {
             .expect("read the table's row count")
             .get(0);
         assert_eq!(reltuples, 100.0, "the vacuum counted the live rows");
+    }
+
+    /// A database with Re-derive builds to merge (#901): `define` defines a
+    /// `GROUP BY` transform over a fresh source of 30 rows in 3 groups and
+    /// starts its build, and `stage` runs a definition's plan job and chunks
+    /// by hand, so its group deltas wait for a merge.
+    struct MergeFixture {
+        _db: testkit::TestDatabase,
+        pool: Pool,
+        trellis: crate::app::Trellis,
+        raw: tokio_postgres::Client,
+    }
+
+    const MERGE_OPTIONS: WorkerOptions = WorkerOptions {
+        chunk_rows: 100,
+        drain_batch_cap: 100_000,
+        heartbeat_interval: Duration::from_secs(1),
+        reclaim_ttl: Duration::from_secs(30),
+    };
+
+    impl MergeFixture {
+        async fn new(cluster: &testkit::TestCluster) -> Self {
+            let db = cluster.create_isolated_database().await;
+            let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+            let pool = Pool::new(&config).expect("build a same-crate pool");
+            let trellis =
+                crate::app::Trellis::connect(config, crate::app::TrellisOptions::default())
+                    .await
+                    .expect("connect");
+            let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            raw.batch_execute(&format!(
+                "set search_path to {}, public",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("set the search path");
+            Self {
+                _db: db,
+                pool,
+                trellis,
+                raw,
+            }
+        }
+
+        async fn define(&mut self, target: &str) -> i64 {
+            use crate::defs::ast::ValueType;
+            use crate::integer::IntWidth;
+            self.raw
+                .batch_execute(&format!(
+                    "create table public.{target}_src (id bigint primary key, g integer, x integer); \
+                     insert into public.{target}_src select i, i % 3, i from generate_series(1, 30) i"
+                ))
+                .await
+                .expect("seed the source");
+            let columns = HashMap::from([
+                ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+                ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
+                ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ]);
+            let def = crate::defs::install_definition(
+                &self.pool,
+                &format!(
+                    "TRANSFORM {target} FROM {target}_src GROUP BY g \
+                     SELECT SUM(x) AS total, COUNT(*) AS n"
+                ),
+                &columns,
+                "public",
+            )
+            .await
+            .expect("install_definition");
+            crate::client::reconcile_pass(
+                &mut self.raw,
+                &self.pool,
+                crate::config::DEFAULT_SCHEMA,
+                "merge_wake",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("start the build");
+            assert_eq!(
+                self.status(target).await.status,
+                TransformStatus::Backfilling
+            );
+            def.id
+        }
+
+        /// Runs every claimable plan job and chunk by hand, so every
+        /// building target's deltas wait for a merge.
+        async fn stage(&self) {
+            for kinds in [
+                &[chunk_queue::KIND_PLAN][..],
+                &[chunk_queue::KIND_REDERIVE, chunk_queue::KIND_SWEEP][..],
+            ] {
+                loop {
+                    let claimed = {
+                        let client = self.pool.get().await.expect("pool");
+                        chunk_queue::claim_chunks_of(&**client, "stager", 1, kinds)
+                            .await
+                            .expect("claim")
+                    };
+                    let Some(chunk) = claimed.into_iter().next() else {
+                        break;
+                    };
+                    run_claimed(&self.pool, &chunk, "stager", &MERGE_OPTIONS).await;
+                }
+            }
+        }
+
+        async fn status(&self, target: &str) -> crate::app::DefinitionStatus {
+            self.trellis
+                .status(target)
+                .await
+                .expect("status")
+                .expect("the definition exists")
+        }
+
+        async fn deltas(&self, target: &str) -> i64 {
+            self.raw
+                .query_one(
+                    &format!("select count(*) from public.{target}__deltas"),
+                    &[],
+                )
+                .await
+                .expect("count the deltas")
+                .get(0)
+        }
+
+        async fn rows(&self, target: &str) -> Vec<String> {
+            self.raw
+                .query(
+                    &format!("select (g, total, n)::text from public.{target} order by g"),
+                    &[],
+                )
+                .await
+                .expect("read the target")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+    }
+
+    /// The source's groups, as the target should hold them.
+    const EXPECTED_GROUPS: [&str; 3] = ["(0,165,10)", "(1,145,10)", "(2,155,10)"];
+
+    /// #901: a target whose merge fails deterministically (a check
+    /// constraint every merged group breaks) is set aside, and the same
+    /// `work_once` goes on to the next building definition's work: its plan
+    /// job, its chunk and its merge, until it goes `live`, while the failing
+    /// target keeps its deltas and stays `backfilling`.
+    #[tokio::test]
+    async fn a_failing_merge_does_not_stop_another_targets_claims_or_merge() {
+        let cluster = testkit::TestCluster::start();
+        let mut it = MergeFixture::new(&cluster).await;
+        it.define("broken").await;
+        it.stage().await;
+        assert!(it.deltas("broken").await > 0, "broken's deltas wait");
+        it.raw
+            .batch_execute(
+                "alter table public.broken add constraint broken_never check (total < 0)",
+            )
+            .await
+            .expect("a check constraint every merged group breaks");
+        it.define("healthy").await;
+
+        let mut merges = MergeFailures::default();
+        let first = work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+            .await
+            .expect("a failing merge is no failure of the step");
+        assert_eq!(
+            first,
+            Step::Planned,
+            "the step went on past the failing merge to the next build's plan job"
+        );
+        let mut steps = vec![first];
+        for _ in 0..20 {
+            if it.status("healthy").await.status == TransformStatus::Live {
+                break;
+            }
+            steps.push(
+                work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+                    .await
+                    .expect("a failing merge is no failure of the step"),
+            );
+        }
+        assert_eq!(
+            it.status("healthy").await.status,
+            TransformStatus::Live,
+            "{steps:?}"
+        );
+        assert!(steps.contains(&Step::Chunk), "{steps:?}");
+        assert!(steps.contains(&Step::Merged), "{steps:?}");
+        assert_eq!(it.rows("healthy").await, EXPECTED_GROUPS);
+        assert_eq!(
+            it.status("broken").await.status,
+            TransformStatus::Backfilling
+        );
+        assert!(it.deltas("broken").await > 0, "broken's deltas still wait");
+        assert!(it.rows("broken").await.is_empty());
+    }
+
+    /// #901: a transient failure at the merge's `COMMIT` is retried. A
+    /// deferred constraint trigger on the target raises a serialization
+    /// failure the first time it fires, counted by a sequence, which a
+    /// rollback doesn't take back. One `work_once` retries the merge, and it
+    /// commits.
+    #[tokio::test]
+    async fn a_transient_failure_at_the_merges_commit_is_retried() {
+        let cluster = testkit::TestCluster::start();
+        let mut it = MergeFixture::new(&cluster).await;
+        it.define("flaky").await;
+        it.stage().await;
+        it.raw
+            .batch_execute(
+                "create sequence public.commit_attempts; \
+                 create function public.fail_first_commit() returns trigger \
+                   language plpgsql as $$ \
+                   begin \
+                     if nextval('public.commit_attempts') = 1 then \
+                       raise exception 'the first commit fails' using errcode = '40001'; \
+                     end if; \
+                     return null; \
+                   end $$; \
+                 create constraint trigger flaky_fail_first_commit \
+                   after insert or update or delete on public.flaky \
+                   deferrable initially deferred \
+                   for each row execute function public.fail_first_commit()",
+            )
+            .await
+            .expect("a deferred trigger failing the first commit");
+
+        let mut merges = MergeFailures::default();
+        let step = work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+            .await
+            .expect("the merge is retried past the failed commit");
+        assert_eq!(step, Step::Merged);
+        let fired: i64 = it
+            .raw
+            .query_one("select last_value from public.commit_attempts", &[])
+            .await
+            .expect("read the sequence")
+            .get(0);
+        assert!(
+            fired >= 2,
+            "the first commit failed and a retry fired it again"
+        );
+        assert!(merges.by_definition.is_empty(), "nothing was charged");
+        // A merge pass takes one merge partition; the rest follow.
+        for _ in 0..10 {
+            let step = work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+                .await
+                .expect("a build step");
+            if !step.progressed() {
+                break;
+            }
+        }
+        assert_eq!(it.rows("flaky").await, EXPECTED_GROUPS);
+        assert_eq!(it.deltas("flaky").await, 0);
+        let status = it.status("flaky").await;
+        assert_eq!(status.status, TransformStatus::Live);
+        assert_eq!(status.capture_failure, None);
+    }
+
+    /// #901: a merge that keeps failing deterministically is charged once
+    /// per failure, and its `MAX_CHARGED_ATTEMPTS`th charge halts the
+    /// definition with kind `halt`, naming the target and the error on its
+    /// `capture_failure`, where it waits for a resume.
+    #[tokio::test]
+    async fn a_merge_that_keeps_failing_pauses_its_definition_with_the_error() {
+        let cluster = testkit::TestCluster::start();
+        let mut it = MergeFixture::new(&cluster).await;
+        let id = it.define("broken").await;
+        it.stage().await;
+        it.raw
+            .batch_execute(
+                "alter table public.broken add constraint broken_never check (total < 0)",
+            )
+            .await
+            .expect("a check constraint every merged group breaks");
+
+        let mut merges = MergeFailures::default();
+        for attempt in 1..=chunk_queue::MAX_CHARGED_ATTEMPTS {
+            assert_eq!(
+                it.status("broken").await.status,
+                TransformStatus::Backfilling,
+                "still building before attempt {attempt}"
+            );
+            work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+                .await
+                .expect("a failing merge is no failure of the step");
+            if attempt < chunk_queue::MAX_CHARGED_ATTEMPTS {
+                assert!(
+                    merges.backing_off(id),
+                    "backing off after attempt {attempt}"
+                );
+                assert_eq!(merges.by_definition[&id].charged, attempt);
+            }
+            merges.expire();
+        }
+
+        let status = it.status("broken").await;
+        assert_eq!(status.status, TransformStatus::Paused);
+        let failure = status.capture_failure.expect("the halt's record");
+        assert_eq!(failure.kind, crate::app::CaptureFailureKind::Halt);
+        assert!(failure.source_table.ends_with("broken"), "{failure:?}");
+        assert!(failure.error.contains("merge into"), "{}", failure.error);
+        assert!(failure.error.contains("broken_never"), "{}", failure.error);
+        assert!(
+            merges.by_definition.is_empty(),
+            "the pause forgets the failures"
+        );
+        assert!(it.deltas("broken").await > 0, "a pause keeps the deltas");
+        assert_eq!(
+            work_once(&it.pool, "worker", &MERGE_OPTIONS, &mut merges)
+                .await
+                .expect("a step"),
+            Step::Idle,
+            "nothing merges for a paused definition"
+        );
     }
 }

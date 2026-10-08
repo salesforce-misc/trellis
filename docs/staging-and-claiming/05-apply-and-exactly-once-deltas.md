@@ -462,6 +462,19 @@ statement runs with nested loops and sequential scans off, and a merger
 vacuums the table every 100,000 rows it merges. The delta rows are discarded
 only with the ledger: by a truncate, a drop, or the one-pass build.
 
+**A failing merge (#901).** A merge applies whole groups, so its failure
+names no key to charge, and the merger classifies it by target. A transient
+failure, at any statement or at `COMMIT`, is retried at once a few times as a
+page's is, then the worker backs the target off, uncharged. A refused write
+(`42501`) halts what it reaches, as a page's does. Any other failure, such as
+an application's check, foreign key or deferred constraint that a merged
+group breaks, backs the target off and is charged, and the fifth charge on a
+worker halts the definition and everything downstream of its target with
+kind `halt`, naming the target and the error. The backoff and the charges
+are each drain worker's own. A target backing off is skipped, and the worker
+goes on to the next target's merge and to the build's chunks, so one failing
+target never holds up another build.
+
 **Truncate.** A source `TRUNCATE` empties the ledger and the group deltas,
 deletes every group row, and raises the target's truncate floor
 (`ledger_truncate_floor`) to the truncate's `lsn` (#623 Q6). A 1-1 target

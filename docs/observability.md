@@ -418,6 +418,14 @@ without them:
   `waiting_to_backfill` or `catching_up`. A refusal the catalog can't pin on a
   table pauses nothing: the marker backs off and retries like any failed
   backfill, with the error on `backfill_failure`.
+* **A failing build merge.** A Re-derive build's group-delta merge that
+  Postgres refuses halts the same way, as the drain worker's role (#901). One
+  that keeps failing otherwise (an application's check or deferred
+  constraint on the target that a merged group breaks) is retried with
+  backoff and charged, logging a warning each time, and its fifth charge on a
+  worker halts the definition and everything downstream of its target, with
+  `kind` `halt`, the target as the table, and the error. Transient failures
+  are retried and never charged.
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. A resume re-validates the definition as define would, so

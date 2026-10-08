@@ -6,8 +6,8 @@ defmodule Trellis.DefinitionSummary do
 
   `target_table` and `source_table` are fully qualified (`schema.table`).
   `backfill_failure` is set while its build keeps failing, as in
-  `Trellis.Status`. `halt` is set while the drain has halted on it: a
-  `Trellis.CaptureFailure` of kind `:halt`, the definition `:paused` until
+  `Trellis.Status`. `halt` is set while the drain, or its build's
+  merge, has halted on it: a `Trellis.CaptureFailure` of kind `:halt`, the definition `:paused` until
   the cause is fixed and it is resumed. Listing the definitions and looking
   for a `halt` is the health check for halts.
   """

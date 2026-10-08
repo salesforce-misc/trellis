@@ -125,9 +125,14 @@ impl Fixture {
 
     /// One drain worker's build step.
     async fn step(&self, options: &WorkerOptions) -> Step {
-        build::work_once(&self.db.pool, "worker", options)
-            .await
-            .expect("build step")
+        build::work_once(
+            &self.db.pool,
+            "worker",
+            options,
+            &mut build::MergeFailures::default(),
+        )
+        .await
+        .expect("build step")
     }
 
     /// Claims and runs up to `max` plan jobs and chunks by hand, with no

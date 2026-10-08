@@ -165,9 +165,14 @@ impl Fixture {
     async fn finish(&mut self) {
         for _ in 0..MAX_STEPS {
             self.drain().await;
-            let step = build::work_once(&self.db.pool, "worker", &OPTIONS)
-                .await
-                .expect("build step");
+            let step = build::work_once(
+                &self.db.pool,
+                "worker",
+                &OPTIONS,
+                &mut build::MergeFailures::default(),
+            )
+            .await
+            .expect("build step");
             if !step.progressed() {
                 return;
             }

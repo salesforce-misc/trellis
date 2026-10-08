@@ -756,12 +756,12 @@ const RETRY_CAP: Duration = Duration::from_secs(300);
 /// The longest a failed Re-derive chunk or plan job waits before it is
 /// claimed again (#625 F2). Its usual failure is its entry lock's short
 /// timeout behind a drain page, which says nothing about the chunk.
-const REDERIVE_RETRY_CAP: Duration = Duration::from_secs(5);
+pub(crate) const REDERIVE_RETRY_CAP: Duration = Duration::from_secs(5);
 
 /// How long a chunk waits after its `attempts`th failure before it is
 /// claimed again: [`RETRY_BASE`], doubled per further failure, capped at
 /// [`RETRY_CAP`].
-fn retry_delay(attempts: i32, cap: Duration) -> Duration {
+pub(crate) fn retry_delay(attempts: i32, cap: Duration) -> Duration {
     let doublings = u32::try_from(attempts.saturating_sub(1))
         .unwrap_or(0)
         .min(31);
