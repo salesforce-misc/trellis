@@ -88,19 +88,23 @@ const _: () = assert!(SERVER_STOP_RECLAIM_TTL.as_secs() * 3 <= QUIESCE_TIMEOUT.a
 /// A maintenance interval ([`ManualBackend::connect_with_options`]) for a
 /// pin that does all sealing itself, with
 /// [`ManualBackend::force_seal_active_segment`] and
-/// [`ManualBackend::quiesce_forcing_seals`] (issue #453). The loop's first
-/// tick still runs when the engine client starts, and its reconcile pass
-/// takes live the definitions [`Backend::install`](super::Backend::install)
-/// registered before starting it, as long as one pass is enough. The next
-/// tick is an hour away, past any test, so no seal of the engine's own can
-/// land between the pin's.
+/// [`ManualBackend::quiesce_forcing_seals`] (issue #453). The engine's
+/// start-up capture pass, and the loop's first tick right after it, still
+/// run when the engine client starts, so the definitions
+/// [`Backend::install`](super::Backend::install) registered before starting
+/// it go live as long as those two passes are enough. The next tick is an
+/// hour away, past any test. Nothing orders that first tick's seal step
+/// against what the caller does after `install`, though (it usually runs
+/// within a millisecond of start-up), so a pin that must have no engine seal
+/// between two of its own checks that the two sealed segments are
+/// consecutive.
 ///
 /// The tick's other jobs don't run after that first one either: retirement
 /// (both seal helpers retire on `RingFull` themselves), stuck-seal recovery
 /// (every seal here runs both phases at once, so none sticks), reclaiming
 /// stale claims (no worker dies), and further reconcile passes. A pin that
 /// needs any of those keeps a real interval. A definition that reads a
-/// relationship's to-side, for one, may be ready only on a second pass
+/// relationship's to-side, for one, may be ready only on a later pass
 /// (`capture::reconcile`'s readiness rules), so it would never go live.
 pub const SEAL_ON_DEMAND_INTERVAL: Duration = Duration::from_secs(3600);
 

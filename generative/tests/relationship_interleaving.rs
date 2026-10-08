@@ -197,8 +197,9 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
     // and `quiesce_forcing_seals`, so no quiesce waits on a maintenance tick
     // for a drain's staged `Recompute`s to seal. The tick still has to run,
     // though: the scenario's relationship-reading definition goes live only
-    // on a second reconcile pass, and passes ride on ticks. So the tick
-    // runs every `SEAL_BOUNDARY_TICK`, with a reconcile pass on each.
+    // on a later reconcile pass (the second tick's, as measured), and passes
+    // ride on ticks. So the tick runs every `SEAL_BOUNDARY_TICK`, with a
+    // reconcile pass on each.
     //
     // A tick seals too, and can land inside the critical section below. That
     // doesn't break the seal boundary: the parent's change commits before the
@@ -253,8 +254,9 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
 
 /// How often [`run_across_a_seal_boundary`]'s maintenance tick (and, with
 /// it, a reconcile pass) runs. It bounds how long the seed quiesce waits for
-/// the pass that takes the relationship-reading definition live, and is long enough that a tick rarely lands
-/// in the few round trips of the critical section after it.
+/// the pass that takes the relationship-reading definition live, and is long
+/// enough that a tick rarely lands in the few round trips of the critical
+/// section after it.
 const SEAL_BOUNDARY_TICK: Duration = Duration::from_secs(1);
 
 /// How many application-worker tasks [`run_across_a_seal_boundary`] runs

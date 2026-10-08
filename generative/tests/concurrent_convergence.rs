@@ -648,11 +648,12 @@ async fn a_hand_built_program_converges_under_the_concurrent_backend() {
 /// harness does. If 1,000 sequential raw-DML round trips straddled a tick,
 /// the rows would split across two (or more) smaller sealed batches, each
 /// possibly below the split threshold. So the engine runs with
-/// [`SEAL_ON_DEMAND_INTERVAL`] (no tick after its first, issue #453): the
-/// pin waits out that first tick (`quiesce_forcing_seals` before any op),
-/// applies every insert, and seals them itself in one forced seal. "All
-/// 1,000 rows land in the same sealed batch" is then a property of the pin's
-/// construction, not a race against a timer, and the drain audit checks it.
+/// [`SEAL_ON_DEMAND_INTERVAL`] (no tick after its first, issue #453), and the
+/// pin brackets the inserts between two forced seals of its own. The two
+/// sealed segments must be consecutive: no other seal (the first tick's, say)
+/// landed between them, so every insert, committed after the first and
+/// before the second, is in the second's batch. "All 1,000 rows land in the
+/// same sealed batch" is then asserted, not just likely.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
     const ROW_COUNT: i64 = 1_000;
@@ -681,13 +682,14 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
         .expect("start the drain audit");
 
     backend.install(&program).await.expect("install program");
-    // The definitions go live in the maintenance loop's first tick, after
-    // its seal step: once they're live, that tick can no longer seal any of
-    // the inserts below.
     backend
         .quiesce_forcing_seals()
         .await
         .expect("quiesce the empty install");
+    let before_inserts = backend
+        .force_seal_active_segment()
+        .await
+        .expect("seal whatever precedes the inserts");
     for op in &program.ops {
         let inserted = backend.apply(op).await.expect("insert a row");
         assert_eq!(inserted, 1, "op {op:?} must insert exactly one row");
@@ -696,10 +698,21 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
         backend.has_pending().await.expect("check pending"),
         "a committed insert must be in the ring at commit"
     );
-    backend
+    let inserts_seg = backend
         .force_seal_active_segment()
         .await
         .expect("seal every insert into one batch");
+    // The definition goes live off the start-up capture pass (its build
+    // starts there and the drain workers flip it), not off the maintenance
+    // loop's first tick, so nothing orders that tick's one seal before the
+    // quiesce above returns. In practice it runs well before, but this is
+    // what shows no seal split the inserts.
+    assert_eq!(
+        inserts_seg,
+        before_inserts + 1,
+        "another seal landed while the inserts were applied (segments {before_inserts} and \
+         {inserts_seg} aren't consecutive), so they may not share one batch"
+    );
     backend
         .quiesce_forcing_seals()
         .await
@@ -719,8 +732,7 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
         audit.split >= 1
             && audit.max_rows_per_batch >= ROW_COUNT as u64
             && audit.max_workers_per_batch >= 1,
-        "the drain audit must see all {ROW_COUNT} inserts sealed into one split batch, and its \
-         claims: {audit:?}"
+        "the drain audit must see the {ROW_COUNT}-insert batch, split, and its claims: {audit:?}"
     );
 
     let max_bucket_count = backend
