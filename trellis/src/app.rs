@@ -1518,8 +1518,9 @@ pub enum BuildWait {
     /// (`pg_current_xact_id()`): the wait ends once the oldest running
     /// transaction in the cluster, `pg_snapshot_xmin(pg_current_snapshot())`,
     /// is past it, so the transaction to look for in `pg_stat_activity` is
-    /// one with a `backend_xid` or `backend_xmin` at or below `xid`. It
-    /// clears on its own when that transaction ends.
+    /// one with a `backend_xid` at or below `xid` (a transaction gets one
+    /// when it first writes or locks a row; a read-only one holds no fence).
+    /// It clears on its own when that transaction ends.
     Fence {
         /// The fence's transaction id.
         xid: i64,

@@ -2517,13 +2517,14 @@ enum FenceState {
 /// the module doc's "Seam-fed sources").
 ///
 /// The fence is a statement's own transaction id, assigned here in a
-/// transaction of its own, begun after the start commit: every transaction
-/// that wrote before this statement began already has an id, ids are
+/// transaction of its own, begun after the start commit: every seam writer
+/// that checked for readers before the start committed already has an id
+/// (the check takes one first, `super::target_mutations`), ids are
 /// assigned in order, and so each is below the fence (`intake::markers`'
-/// `confirm_fence`). The snapshot's `xmin` is the oldest transaction still
-/// open, so it passes the fence exactly when they have all ended. A fence
-/// already on the row is kept: an earlier attempt took it after the start
-/// commit too, and a later one would only wait longer.
+/// `confirm_fence`). The snapshot's `xmin` is the oldest transaction id
+/// still running, so it passes the fence exactly when they have all ended.
+/// A fence already on the row is kept: an earlier attempt took it after the
+/// start commit too, and a later one would only wait longer.
 async fn fence_settled(
     pool: &Pool,
     chunk: &ClaimedChunk,

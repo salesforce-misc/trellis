@@ -67,6 +67,17 @@
 //! after the reader is visibly applying, so it waits out every writer that
 //! checked before then.
 //!
+//! A reader built by the Re-derive build parks no catch-up. Its build waits
+//! on a fence instead, a transaction id taken after the build's start
+//! commits, until every transaction with a lower id has ended
+//! (`staging::build`'s "Seam-fed sources", #625 F6). That covers a writer
+//! that checked before the start only if the writer had its id when it
+//! checked, so the check takes the transaction's id first, in a statement
+//! of its own, so that the check's snapshot is taken after it. A writer that
+//! checks before its first write (the discharge's orphan sweep checks, then
+//! reads, then deletes) would otherwise take its id after the fence, and
+//! the build would read the target before the writer's write commits.
+//!
 //! # What gets staged
 //!
 //! One `StagedChange::Recompute` per changed key, for every target at least
@@ -411,6 +422,12 @@ impl TargetMutations {
                 });
         }
         if !self.targets.contains_key(target) {
+            // The transaction's id before the first check, in a statement
+            // of its own (#625 F6): see the module doc on a reader's
+            // Re-derive build. A no-op once it has one.
+            if self.targets.is_empty() {
+                txn.execute("select pg_current_xact_id()", &[]).await?;
+            }
             // Mirrors `catalog::dependents_of`'s own status filter: a reader
             // apply doesn't maintain yet is excluded from applies anyway, and
             // catches up from its own backfill or catch-up marker.

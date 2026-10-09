@@ -535,7 +535,9 @@ applying.
   the ring carries its write. The plan job's first act is a fence, the id of
   a transaction begun after the start commit (the marker fence's rule,
   #431), and it plans no chunk until the oldest running transaction began
-  after it. Only a seam-fed build waits, and only on older transactions;
+  after it. That covers a writer only if it held its transaction id when it
+  checked, so the seam's check takes the id first, in a statement of its
+  own. Only a seam-fed build waits, and only on older transactions;
   `status` names the fence (`BuildWait::Fence`). The seam stays
   ([#807](https://github.com/salesforce-misc/trellis/issues/807)), so this
   fence stays. *Evidence:* `tests/target_mutation_seam.rs` freezes an upstream

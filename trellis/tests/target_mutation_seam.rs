@@ -2594,3 +2594,61 @@ async fn the_sweep_reads_a_nullable_keyed_source_by_its_whole_key() {
         );
     }
 }
+
+/// #625 F6: a seam writer's check for readers comes after its transaction
+/// has an id, so a build fenced after the check waits for the writer.
+///
+/// The fence holds a build until every transaction with an id below it has
+/// ended, and a writer that checked before the build's start committed
+/// stages nothing for it. A writer whose first write comes after its check
+/// (the discharge's orphan sweep, which checks first and then reads before
+/// it deletes) would otherwise take its id after the fence, and the build
+/// would run past it. Here the writer has written nothing when it checks,
+/// and nothing reads `t` yet; `tot` is then registered and started, and its
+/// plan job must wait for the writer.
+#[tokio::test]
+async fn a_writer_that_checked_for_readers_before_a_seam_fed_build_holds_its_fence() {
+    let mut d = fenced_upstream().await;
+    let (_, t_columns) = fenced_columns();
+
+    let mut writer = d.pool().get().await.expect("pool");
+    let txn = writer.transaction().await.expect("begin the writer");
+    let mut mutations = trellis::staging::TargetMutations::new();
+    let image = mutations
+        .image_sql(&txn, "public.t", "t")
+        .await
+        .expect("check for readers");
+    assert!(image.is_none(), "nothing reads t yet");
+
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM tot FROM public.t GROUP BY g SELECT SUM(dbl) AS total, COUNT(*) AS n",
+        &t_columns,
+        "public",
+    )
+    .await
+    .expect("register the downstream");
+    let id = definition_id(&d.ctl, "tot").await;
+    let pool = d.pool().clone();
+    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the downstream's build");
+    assert_eq!(taken, vec![id]);
+    assert_eq!(
+        build::work_once(
+            &pool,
+            "worker",
+            &BUILD_OPTIONS,
+            &mut build::MergeFailures::default()
+        )
+        .await
+        .expect("the plan job's first step"),
+        Step::Planned
+    );
+    assert_eq!(
+        planned_chunks(&d.ctl, id).await,
+        0,
+        "the plan job waits for the writer that checked before the build started"
+    );
+    txn.rollback().await.expect("end the writer");
+}

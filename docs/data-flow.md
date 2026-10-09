@@ -127,7 +127,9 @@ writer reads the list of applying definitions inside its own transaction. A
 writer that read it before the build started can commit after a chunk's
 snapshot, with its rows staged for no one, so the plan job first takes a
 fence, a transaction id assigned after the start commit, and enqueues no
-chunk until the oldest running transaction in the cluster began after it.
+chunk until the oldest running transaction in the cluster began after it. The
+seam's check takes the writer's transaction id before it reads the list, so
+every writer that read it too early has an id below the fence.
 While it waits, the definition's `status().build_wait` reads
 `BuildWait::Fence { xid }`, naming the id to look for in `pg_stat_activity`.
 Only these builds wait, and only on transactions older than the fence. A

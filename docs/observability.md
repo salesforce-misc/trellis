@@ -310,9 +310,10 @@ of its chunks reads under its own short snapshot after locking the ledger
 entries it rewrites, so a long transaction elsewhere doesn't hold it, and it holds no
 long snapshot of its own. The one exception is a Re-derive build whose source is
 another transform's target, which takes one fence, after it starts, before its
-first chunk: a transaction open then holds it, and `status().build_wait` names
-the fence (`BuildWait::Fence { xid }`) until every transaction that was open at
-it has ended
+first chunk: a transaction that held a transaction id then (one that had
+written or locked a row) holds it, and `status().build_wait` names the fence
+(`BuildWait::Fence { xid }`, a `backend_xid` at or below it in
+`pg_stat_activity`) until every such transaction has ended
 ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)). Because `xmin` is
 **cluster-global**, any unrelated long-running transaction *anywhere in the
 cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
