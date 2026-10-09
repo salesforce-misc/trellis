@@ -257,7 +257,8 @@ pause are arcs of one lifecycle:
   converted, the repair is `DROP TRANSFORM` and define it again, which builds the
   target from empty. A re-type of a target pauses the transforms chained off it whose
   own columns were typed from the old type: their `capture_failure` names the upstream
-  resume, and they're resumed once the upstream is `live` again. The resume reconciles the target with current source
+  resume, and the staging worker resumes them once the upstream is `live` again. The
+  resume reconciles the target with current source
   data rather than replaying what was skipped while paused (the change stream is
   drained for the transform's siblings meanwhile), so the cost of a resume scales with
   the data, not with the length of the pause.

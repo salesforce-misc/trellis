@@ -749,12 +749,21 @@ actions isn't a safe form: it's wrong before 15.6 and 16.2.
   saying it's resuming, until the staging worker has re-typed the copies and
   started the rebuild. A rebuild follows every
   widening of a copied column.
-* **A resume that re-types a target pauses the definitions chained off it.**
-  A definition reading the target whose own columns were typed from the old
-  type pauses, its `capture_failure` naming the upstream resume. Resume it
-  once the upstream is live again. Its resume re-types its own target, which
-  pauses the next definition down the same way, so a chain of depth k takes
-  k resumes, each a full rebuild.
+* **A resume that re-types a target pauses the definitions chained off it,
+  and they rebuild one after another.** A definition reading the target
+  whose own columns were typed from the old type pauses, its
+  `capture_failure` naming the upstream resume. The capture pass resumes it
+  once the upstream is `live` again, so one `RESUME` of the head carries the
+  chain. Its resume re-types its own target, which pauses the next
+  definition down the same way. Each rebuild starts only after the one above
+  it has finished, and each is a full rebuild, so a chain of depth k stays
+  paused below the head for k rebuilds in a row. A definition waiting on an
+  upstream that doesn't go live (paused, quarantined, refused its own
+  resume) keeps waiting. A `RESUME` by hand of a waiting definition resumes
+  it at once, whether or not the upstream is live. One whose automatic
+  resume is refused, because the schema changed after the pause, stays
+  paused with the refusal, and isn't tried again; resume it by hand once
+  that is fixed, or drop it and define it again.
 * **Quarantined keys stay held until they're released.** A key that's
   quarantined after repeated apply failures is held for the definition whose
   apply failed, with its parked work and its poison row, and that

@@ -203,14 +203,29 @@ has the type define would give it. The re-type's transaction records which defin
 resume re-typed each target column (`retype_causes`). When the capture pass pauses a
 chained definition only for columns that resume re-typed, the pause records the upstream
 definition as its cause (`capture_failures.caused_by`), and the `capture_failure` names
-the upstream resume rather than a column the operator never altered. It says to resume
-the chained definition once the upstream is live again, since its rebuild reads the
-upstream's target. That resume re-types the chained definition's own target in turn, and
-the next definition down records it as its cause. Following the causes down from a
-definition finds every definition its resume paused, one level per resume. A chained
-definition the re-type leaves refused, failing its own re-validation (a relationship's join
-columns no longer match), keeps its own error and records no cause. So does one already
-paused for another reason, by the operator or by quarantine.
+the upstream resume rather than a column the operator never altered. It says the chained
+definition resumes on its own once the upstream is live again, since its rebuild reads the
+upstream's target.
+
+At the start of each capture pass, before it finishes the requested resumes, the pass
+resumes each definition paused with a cause whose upstream is `live`, with no resume
+request: its rebuild has finished (#476), so each downstream rebuild starts only after
+the one above it, and one `RESUME` of the head carries the chain. It takes the path an
+operator's `RESUME` takes, in one transaction, under the definition's lock, after
+re-reading that the definition is still frozen with the same cause: a `RESUME` by hand
+that commits first wins. With no copy to re-type the definition resumes. With copies to
+re-type the request is recorded and the cause cleared, and the same pass re-types them
+and completes the resume. That re-type pauses the next definition down with this one as
+its cause, so the chain goes on one level per upstream rebuild. A definition whose
+resume is refused, because the schema changed after the pause, stays paused with the
+refusal on its `capture_failure` (the text of a refused request) and no cause, so the
+next pass doesn't try it again. Nothing below it was paused, since its target was never
+re-typed. The queue is durable without a table of its own: the cause and the resume
+request are the two states a definition passes through, each move is one transaction,
+and a crash leaves one of them for the next pass to go on from. A chained definition the
+re-type leaves refused, failing its own re-validation (a relationship's join columns no
+longer match), keeps its own error and records no cause. So does one already paused for
+another reason, by the operator or by quarantine, and the pass leaves it alone.
 
 Outside a resume, Trellis re-types a column on its own in one case: when every column
 of a table it created that the source widened widened by changing only the catalog.

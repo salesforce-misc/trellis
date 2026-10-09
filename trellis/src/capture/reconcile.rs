@@ -41,9 +41,12 @@
 //! catalog (a longer `varchar`, say) is re-typed in place instead, with no
 //! pause. That check runs on the seam-fed tables too.
 //!
-//! Before any of that, the pass finishes every resume left waiting on it to
-//! re-type Trellis's copies (#767,
-//! [`crate::staging::quarantine::finish_requested_resumes`]).
+//! Before any of that, the pass resumes each definition an upstream's resume
+//! paused, once that upstream is `live` (#828, #970,
+//! [`crate::staging::quarantine::resume_caused_definitions`]), and finishes
+//! every resume left waiting on it to re-type Trellis's copies (#767,
+//! [`crate::staging::quarantine::finish_requested_resumes`]), so a re-type
+//! the first step requests is done in the same pass.
 //!
 //! # Never waiting on `apply`'s path
 //!
@@ -136,8 +139,11 @@ pub async fn reconcile(
     desired: &[String],
     deadline: Instant,
 ) -> Result<PassOutcome, CaptureError> {
+    // #970: a definition paused by its upstream's re-type resumes once that
+    // upstream is live; a re-type that asks for is done by the next call.
     // #767: a resume left waiting on re-typed copies is finished first, so
     // this pass's snapshot sees the ones it completes as waiting.
+    crate::staging::quarantine::resume_caused_definitions(client, schema).await?;
     crate::staging::quarantine::finish_requested_resumes(client, schema).await?;
     let snapshot = read_snapshot(client, schema).await?;
     let installed = installed_tables(&*client, schema).await?;

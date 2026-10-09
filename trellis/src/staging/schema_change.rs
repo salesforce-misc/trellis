@@ -460,7 +460,9 @@ pub(crate) async fn pause_readers_in_hierarchy(
 /// names that resume instead, and records the upstream definition as the
 /// pause's cause (`capture_failures.caused_by`), unless the definition was
 /// already frozen for another reason or a resume would refuse it
-/// ([`Pause::cause`]). Only a deliberate resume clears it (or a drop). A resume re-validates the
+/// ([`Pause::cause`]). The pass resumes it once that definition is live
+/// (`staging::quarantine::resume_caused_definitions`, #970), or an operator's
+/// resume clears it first. A resume re-validates the
 /// definition as define would, and refuses while the first two hold;
 /// otherwise it re-records the key types, brings every column it created to
 /// the type define would give it now, and rebuilds
@@ -912,8 +914,9 @@ async fn retype_causes(
 /// The `capture_failure` of a definition `pause` that `cause`'s resume
 /// paused (#828), by re-typing columns of its target `table` the
 /// definition reads. It names that resume, not the columns as if the
-/// operator had altered them, and says to resume this definition once the
-/// upstream is live again: its rebuild reads the upstream's target.
+/// operator had altered them, and says the definition resumes on its own once
+/// the upstream is live again (`staging::quarantine::resume_caused_definitions`,
+/// #970): its rebuild reads the upstream's target.
 fn caused_error(table: &str, cause: &RetypeCause, pause: &Pause) -> String {
     let retyped: Vec<String> = cause
         .columns
@@ -943,8 +946,8 @@ fn caused_error(table: &str, cause: &RetypeCause, pause: &Pause) -> String {
     }
     format!(
         "the resume of transform {name} re-typed {retyped}, which this definition reads, so \
-         {effects}. It waits on that resume: once {name} is live again, resume this definition \
-         to bring its columns to the new types and rebuild it, or drop the definition and \
+         {effects}. This definition resumes on its own once {name} is live again, \
+         bringing its columns to the new types and rebuilding it. Or drop the definition and \
          define it again",
         name = cause.name,
         retyped = retyped.join(", "),
@@ -1488,7 +1491,8 @@ mod tests {
     }
 
     /// #828: the message of a pause an upstream resume caused names that
-    /// resume, and says to resume this definition once the upstream is live.
+    /// resume, and says the definition resumes on its own once the upstream is
+    /// live.
     #[test]
     fn a_caused_pause_names_the_upstream_resume() {
         let causes: HashMap<String, RetypeCause> = [cause(3, "id")].into();
@@ -1499,9 +1503,9 @@ mod tests {
             "the resume of transform up re-typed public.up.id from integer to bigint, which \
              this definition reads, so the columns Trellis created for this definition from it \
              can't hold every value of the types define would give them now: public.mix.id \
-             (integer, now bigint). It waits on that resume: once up is live again, resume this \
-             definition to bring its columns to the new types and rebuild it, or drop the \
-             definition and define it again"
+             (integer, now bigint). This definition resumes on its own once up is live again, \
+             bringing its columns to the new types and rebuilding it. Or drop the definition \
+             and define it again"
         );
     }
 

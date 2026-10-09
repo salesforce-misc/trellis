@@ -4042,8 +4042,10 @@ enum ResumeStep {
 /// A resume of frozen definition `id` (bare target `target`, qualified
 /// source `source_table`), in `txn`, which [`lock_frozen`] has locked it
 /// in. Every resume goes through here: the operator's
-/// ([`resume_transform`]) and the staging worker's completion of one that
-/// had copies to re-type ([`finish_requested_resumes`]).
+/// ([`resume_transform`]), the capture pass's of a definition whose upstream
+/// went live ([`resume_caused_definitions`]), and the staging worker's
+/// completion of one that had copies to re-type
+/// ([`finish_requested_resumes`]).
 ///
 /// 1. **It re-validates the definition against the live schema**
 ///    ([`catalog::revalidate`], #708, #760), before it changes anything, and
@@ -4364,6 +4366,164 @@ async fn complete_resume(
 /// it re-types before it leaves the re-type for its next pass: a resume's,
 /// or one it makes in place (`staging::schema_change`, #824).
 pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The staging worker's resume of every definition a resume's re-type of
+/// its upstream's target paused (#828, #970): run at the start of each
+/// capture pass, before [`finish_requested_resumes`], so a re-type it
+/// requests is done in the same pass. One `RESUME` of the head of a chain
+/// carries the whole chain.
+///
+/// A definition paused with a cause (`capture_failures.caused_by`,
+/// recorded by `staging::schema_change::pause_readers_of_retyped`) waits
+/// until that upstream definition is `live`: its rebuild has finished
+/// (#476), so the rebuild of this one reads a target that is whole, and each
+/// downstream rebuild starts only after the one above it. Then it takes the
+/// path an operator's `RESUME` takes ([`lock_frozen`], [`resume_locked`]),
+/// in one transaction:
+///
+/// - **No copy drifted:** the definition is resumed, `waiting_to_backfill`.
+/// - **Copies to re-type:** a resume request is recorded and the cause
+///   cleared ([`request_retype`]). The [`finish_requested_resumes`] that
+///   follows re-types them and completes the resume, and its
+///   [`record_retype_causes`] makes the next definition down record this
+///   one as its cause: the chain goes on one level per upstream rebuild.
+/// - **Refused:** the schema changed after the pause and define would now
+///   refuse the definition ([`ApplyError::ResumeRefused`]). Its
+///   `capture_failure` takes the refusal ([`refused_resume_text`], the text
+///   of a refused request), which clears the cause, so the next pass doesn't
+///   try again. It stays paused. Nothing below it was paused, since its
+///   target was never re-typed.
+///
+/// **The durable queue is `caused_by` plus `resume_requests`.** Each
+/// transition is one transaction that moves a definition from the first to
+/// the second (or out of both), so a crash leaves one of them and the next
+/// pass goes on from it. Under the definition's lock, the step re-reads that
+/// it is still frozen, still has no request and still has the same cause,
+/// with the upstream still `live`: a concurrent operator `RESUME` (which
+/// deletes the record) or a change of the record wins. Any other pause
+/// reason replaces the record without a cause (`set_capture_failure`), so it
+/// is never resumed here.
+///
+/// A definition's own failure is logged and doesn't stop the others. Errs
+/// only when the candidates can't be read.
+pub(crate) async fn resume_caused_definitions(
+    client: &mut tokio_postgres::Client,
+    schema: &str,
+) -> Result<(), tokio_postgres::Error> {
+    let candidates: Vec<(i64, i64)> = client
+        .query(&caused_candidates_sql(), &[&TransformStatus::Live.as_str()])
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    for (id, upstream) in candidates {
+        if let Err(err) = resume_caused_definition(client, schema, id, upstream).await {
+            tracing::warn!(
+                transform_id = id,
+                upstream_id = upstream,
+                error = %err,
+                "a definition waiting on its upstream's resume couldn't be resumed; \
+                 retrying next pass"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The frozen definitions with a cause and no resume request, as `(id,
+/// cause)` in id order, whose cause has the status `$1`.
+fn caused_candidates_sql() -> String {
+    let frozen = [TransformStatus::Paused, TransformStatus::Quarantined]
+        .map(|status| format!("'{}'", status.as_str()))
+        .join(", ");
+    format!(
+        "select d.id, f.caused_by \
+         from capture_failures f \
+         join transform_definitions d on d.id = f.transform_id \
+         join transform_definitions u on u.id = f.caused_by \
+         where d.status in ({frozen}) and u.status = $1 \
+           and not exists (select 1 from resume_requests r where r.transform_id = d.id) \
+         order by d.id"
+    )
+}
+
+/// [`resume_caused_definitions`] for definition `id`, paused with `upstream`
+/// as its cause.
+async fn resume_caused_definition(
+    client: &mut tokio_postgres::Client,
+    schema: &str,
+    id: i64,
+    upstream: i64,
+) -> Result<(), ApplyError> {
+    let txn = client.transaction().await?;
+    let row = txn
+        .query_opt(
+            "select source_table, split_part(target_table, '.', 2) \
+             from transform_definitions where id = $1",
+            &[&id],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let source_table: String = row.get(0);
+    let target: String = row.get(1);
+    let Some((_, status)) = lock_frozen(&txn, "id", &id, &source_table).await? else {
+        return Ok(());
+    };
+    // Re-read under the lock: an operator's `RESUME` that committed first
+    // has deleted the record, a re-pause or a refusal has replaced it.
+    let still_waiting: bool = txn
+        .query_one(
+            "select exists (select 1 from capture_failures f \
+                            join transform_definitions u on u.id = f.caused_by \
+                            where f.transform_id = $1 and f.caused_by = $2 and u.status = $3) \
+                    and not exists (select 1 from resume_requests where transform_id = $1)",
+            &[&id, &upstream, &TransformStatus::Live.as_str()],
+        )
+        .await?
+        .get(0);
+    if !status.is_frozen() || !still_waiting {
+        return Ok(());
+    }
+    match resume_locked(&txn, schema, &target, id, &source_table, status, false).await {
+        Ok(ResumeStep::Resumed) => {
+            txn.commit().await?;
+            tracing::info!(
+                transform = %target,
+                upstream_id = upstream,
+                to = %TransformStatus::WaitingToBackfill.as_str(),
+                "transform resumed once its upstream was live; re-parked for a fresh backfill"
+            );
+        }
+        Ok(ResumeStep::Retyping(copies)) => {
+            txn.commit().await?;
+            tracing::info!(
+                transform = %target,
+                upstream_id = upstream,
+                copies = ?copies,
+                "transform resume requested once its upstream was live; the staging worker \
+                 re-types its copies, then rebuilds it"
+            );
+        }
+        Err(ApplyError::ResumeRefused { reason, .. }) => {
+            // `resume_locked` refuses before it writes anything, so the
+            // transaction, and the lock it holds, are still good for the
+            // record that ends the wait.
+            let columns: Vec<String> = Vec::new();
+            let error = refused_resume_text(&reason);
+            set_capture_failure(&txn, id, &source_table, &columns, &error).await?;
+            txn.commit().await?;
+            tracing::warn!(
+                transform_id = id,
+                upstream_id = upstream,
+                "a definition waiting on its upstream's resume was refused its own: {error}"
+            );
+        }
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
 
 /// The staging worker's half of every resume [`resume_transform`] left
 /// waiting on re-typed copies (`resume_requests`, #767): run at the start of

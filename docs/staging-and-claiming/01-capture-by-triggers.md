@@ -346,7 +346,11 @@ definition's target records which resume re-typed each column
 (`retype_causes`), so when the pass then pauses a definition chained off
 that target for those columns alone, its pause records the upstream as its
 cause (`capture_failures.caused_by`) and its `capture_failure` names the
-upstream resume.
+upstream resume. At the start of each pass, the pass resumes a definition
+with such a cause once that upstream is `live` and the definition has no
+resume request, the way an operator's `RESUME` would, so one `RESUME` of the
+head of a chain carries the chain, each rebuild after the one above it. One
+whose resume is refused stays paused with the refusal and no cause.
 
 The pause doesn't stop a drain that reads a source key whose type is off the
 key allowlist: `staging::apply::compute` introspects every staged table's key
