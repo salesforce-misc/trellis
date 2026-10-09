@@ -637,6 +637,11 @@ impl Trellis {
                             exists (select 1 from column_status cs \
                                     where cs.transform_table = $1 and cs.awaiting_capture) \
                               as awaiting_capture, \
+                            (select bc.fence_xid::text::bigint from backfill_chunks bc \
+                             where bc.definition_id = d.id and bc.kind = 'plan' \
+                               and not bc.done and bc.fence_xid is not null \
+                               and pg_snapshot_xmin(pg_current_snapshot()) <= bc.fence_xid \
+                             limit 1) as build_fence, \
                             (select count(*) from poison p where p.transform_id = d.id) \
                               as held_count, \
                             (select min(p.poisoned_at) from poison p \
@@ -691,6 +696,9 @@ impl Trellis {
             capture_failure: capture_failure(&row).or(stalled),
             held_keys: quarantine::held_keys_from(row.get("held_count"), row.get("held_since")),
             drain_failure,
+            build_wait: row
+                .get::<_, Option<i64>>("build_fence")
+                .map(|xid| BuildWait::Fence { xid }),
         }))
     }
 
@@ -1497,6 +1505,27 @@ fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
         })
 }
 
+/// What a Re-derive build waits on, as [`DefinitionStatus::build_wait`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BuildWait {
+    /// The build's source is another definition's target, fed by the
+    /// target-mutation seam, and no chunk of the build runs until every
+    /// transaction that was open when its fence was taken has ended: a
+    /// writer of that target could otherwise commit after a chunk's snapshot
+    /// without the build seeing its rows. `xid` is the fence's transaction id
+    /// (`pg_current_xact_id()`): the wait ends once the oldest running
+    /// transaction in the cluster, `pg_snapshot_xmin(pg_current_snapshot())`,
+    /// is past it, so the transaction to look for in `pg_stat_activity` is
+    /// one with a `backend_xid` or `backend_xmin` at or below `xid`. It
+    /// clears on its own when that transaction ends.
+    Fence {
+        /// The fence's transaction id.
+        xid: i64,
+    },
+}
+
 /// The [`CaptureFailure`] in a row of [`Trellis::status`]'s or
 /// [`Trellis::definitions`]' query: `capture_failures`' `kind`,
 /// `source_table`, `columns`, `error` and `detected_at`, selected as
@@ -1634,6 +1663,10 @@ pub struct DefinitionStatus {
     /// first, and cleared when the page commits. Separate from
     /// `capture_failure`: it pauses nothing.
     pub drain_failure: Option<DrainFailure>,
+    /// Set while the definition's Re-derive build waits on something other
+    /// than its own work (#625 F6): see [`BuildWait`]. Cleared once the
+    /// wait is over.
+    pub build_wait: Option<BuildWait>,
 }
 
 /// Why capture of a table a definition reads is broken (issue #622 C6,

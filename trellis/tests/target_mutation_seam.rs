@@ -9,6 +9,9 @@
 //! through a live client, so each hop lands in its own batch and nothing
 //! waits on convergence timing.
 
+#[path = "support/drain_driver.rs"]
+mod drain_driver;
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
@@ -22,6 +25,8 @@ use trellis::defs::{
 };
 use trellis::intake::markers;
 use trellis::integer::IntWidth;
+use trellis::staging::build::{self, Step, WorkerOptions};
+use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine;
 use trellis::staging::{
     StagedChange, StagedWatermark, append, apply, has_pending, retire_drained_segments,
@@ -1960,4 +1965,569 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
         ]),
         "the consumer no longer reads the deleted target row"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #625 F6: a Re-derive build over a seam-fed source takes a fence.
+// ---------------------------------------------------------------------------
+
+/// One chunk per ten rows, as `rederive_build.rs` runs them.
+const BUILD_OPTIONS: WorkerOptions = WorkerOptions {
+    chunk_rows: 10,
+    drain_batch_cap: 100_000,
+    heartbeat_interval: Duration::from_secs(1),
+    reclaim_ttl: Duration::from_secs(30),
+};
+
+fn fenced_columns() -> (Vec<(&'static str, ValueType)>, HashMap<String, ValueType>) {
+    let src = vec![
+        ("id", ValueType::Integer(IntWidth::Int4)),
+        ("g", ValueType::Integer(IntWidth::Int4)),
+        ("v", ValueType::Numeric),
+    ];
+    let t = [
+        ("id", ValueType::Integer(IntWidth::Int4)),
+        ("g", ValueType::Integer(IntWidth::Int4)),
+        ("dbl", ValueType::Numeric),
+    ]
+    .into_iter()
+    .map(|(name, ty)| (name.to_string(), ty))
+    .collect();
+    (src, t)
+}
+
+/// The upstream `t` over a captured `src`, `live` and settled, with `src`
+/// holding rows 1 to 3.
+async fn fenced_upstream() -> drain_driver::Driver {
+    let (src_columns, _) = fenced_columns();
+    drain_driver::Driver::start(
+        "create table public.src (id integer primary key, g integer, v numeric); \
+         insert into public.src values (1, 1, 1), (2, 1, 2), (3, 2, 3)",
+        &src_columns,
+        &["TRANSFORM t FROM public.src SELECT g AS g, v + v AS dbl"],
+        &["public.src"],
+    )
+    .await
+}
+
+/// `ids` of the definitions of `target` (a bare name).
+async fn definition_id(raw: &Client, target: &str) -> i64 {
+    raw.query_one(
+        "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read the definition")
+    .get(0)
+}
+
+/// How many `rederive` chunks the plan job of definition `id` has enqueued.
+async fn planned_chunks(raw: &Client, id: i64) -> i64 {
+    raw.query_one(
+        "select count(*) from backfill_chunks where definition_id = $1 and kind = 'rederive'",
+        &[&id],
+    )
+    .await
+    .expect("count the chunks")
+    .get(0)
+}
+
+/// `(g, sum(dbl), count)` of `public.t` as a downstream aggregate over it
+/// must read them, and as `public.tot` holds them.
+async fn tot_and_its_oracle(raw: &Client) -> (Vec<String>, Vec<String>) {
+    let read = |sql: &'static str| async move {
+        raw.query(sql, &[])
+            .await
+            .expect("read the rows")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+    };
+    (
+        read("select (g, total, n)::text from public.tot order by g").await,
+        read("select (g, sum(dbl), count(*))::text from public.t group by g order by g").await,
+    )
+}
+
+/// #625 F6: a Re-derive build whose source is another definition's target
+/// takes a fence, and no chunk of it is planned until the oldest running
+/// transaction began after the fence.
+///
+/// The upstream's writer is frozen just before its commit, after it decided
+/// (reading the list of applying definitions) that no definition reads `t`:
+/// it stages nothing for `tot`, and it commits after any chunk's snapshot.
+/// `tot` is then registered and started. Without the fence a chunk would run
+/// now, read `t` without the writer's row, and the row would reach `tot`
+/// never. With it the plan job takes a fence, names it in the status, and
+/// plans nothing until the writer ends; the build then reads the row.
+#[tokio::test]
+async fn a_seam_fed_build_plans_no_chunk_until_the_writer_open_at_its_fence_ends() {
+    let mut d = fenced_upstream().await;
+    let (_, t_columns) = fenced_columns();
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+
+    // The writer: a source row whose page has written `t`'s row and is
+    // frozen before it commits.
+    d.ctl
+        .execute("insert into public.src values (4, 1, 10)", &[])
+        .await
+        .expect("insert the source row");
+    let batch = d.seal().await;
+    let mut writer = d
+        .drain_frozen(batch, "writer", &[(PausePoint::BeforeCommit, "public.t")])
+        .await;
+    writer.reached(PausePoint::BeforeCommit).await;
+
+    // `tot` is registered and started with the writer still open.
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM tot FROM public.t GROUP BY g SELECT SUM(dbl) AS total, COUNT(*) AS n",
+        &t_columns,
+        "public",
+    )
+    .await
+    .expect("register the downstream");
+    let id = definition_id(&d.ctl, "tot").await;
+    let pool = d.pool().clone();
+    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the downstream's build");
+    assert_eq!(
+        taken,
+        vec![id],
+        "the Re-derive build takes a seam-fed source"
+    );
+    assert_eq!(stored(&d.ctl, "tot").await, "backfilling");
+
+    // The plan job takes its fence, and plans nothing while the writer is
+    // open. Its claim is given back, so nothing is claimable either.
+    let mut merges = build::MergeFailures::default();
+    assert_eq!(
+        build::work_once(&pool, "worker", &BUILD_OPTIONS, &mut merges)
+            .await
+            .expect("the plan job's first step"),
+        Step::Planned
+    );
+    let fence: i64 = d
+        .ctl
+        .query_one(
+            "select fence_xid::text::bigint from backfill_chunks \
+             where definition_id = $1 and kind = 'plan'",
+            &[&id],
+        )
+        .await
+        .expect("read the plan row")
+        .get::<_, Option<i64>>(0)
+        .expect("the plan job took a fence");
+    assert_eq!(planned_chunks(&d.ctl, id).await, 0);
+    assert_eq!(
+        trellis
+            .status("tot")
+            .await
+            .expect("read the status")
+            .expect("tot is defined")
+            .build_wait,
+        Some(trellis::BuildWait::Fence { xid: fence }),
+        "the status names the fence"
+    );
+    assert_eq!(
+        build::work_once(&pool, "worker", &BUILD_OPTIONS, &mut merges)
+            .await
+            .expect("a step while the fence is pending"),
+        Step::Idle,
+        "no chunk is claimable"
+    );
+    assert_eq!(planned_chunks(&d.ctl, id).await, 0);
+
+    // The writer commits. The plan job tries again as soon as it may.
+    d.release(&mut writer, PausePoint::BeforeCommit).await;
+    writer.finish().await;
+    d.ctl
+        .execute(
+            "update backfill_chunks set next_attempt_at = null where kind = 'plan'",
+            &[],
+        )
+        .await
+        .expect("make the plan job claimable");
+    build::settle_builds(&pool).await;
+    assert_eq!(stored(&d.ctl, "tot").await, "live");
+    assert!(
+        trellis
+            .status("tot")
+            .await
+            .expect("read the status")
+            .expect("tot is defined")
+            .build_wait
+            .is_none()
+    );
+
+    d.settle().await;
+    let (actual, expected) = tot_and_its_oracle(&d.ctl).await;
+    assert_eq!(
+        expected,
+        vec!["(1,26,3)".to_string(), "(2,6,1)".to_string()],
+        "the oracle counts the writer's row"
+    );
+    assert_eq!(actual, expected, "tot holds what t holds");
+}
+
+/// The upstream aggregate `u` over `src (id, a, b, x)`, its target keyed by
+/// the nullable grouping columns `(a, b)`, and the columns of `u` a
+/// downstream reads.
+async fn nullable_keyed_upstream(rows: &str) -> (drain_driver::Driver, HashMap<String, ValueType>) {
+    let src_columns = vec![
+        ("id", ValueType::Integer(IntWidth::Int4)),
+        ("a", ValueType::Integer(IntWidth::Int4)),
+        ("b", ValueType::Integer(IntWidth::Int4)),
+        ("x", ValueType::Integer(IntWidth::Int4)),
+    ];
+    let d = drain_driver::Driver::start(
+        &format!(
+            "create table public.src (id integer primary key, a integer, b integer, x integer); \
+             {rows}"
+        ),
+        &src_columns,
+        &["TRANSFORM u FROM public.src GROUP BY a, b SELECT MAX(x) AS x"],
+        &["public.src"],
+    )
+    .await;
+    let u_columns = [
+        ("a", ValueType::Integer(IntWidth::Int4)),
+        ("b", ValueType::Integer(IntWidth::Int4)),
+        ("x", ValueType::Integer(IntWidth::Int4)),
+    ]
+    .into_iter()
+    .map(|(name, ty)| (name.to_string(), ty))
+    .collect();
+    (d, u_columns)
+}
+
+/// Starts the Re-derive build of the definition `text` over `u`, runs it to
+/// its end and drains what it staged.
+async fn build_over_u(
+    d: &mut drain_driver::Driver,
+    columns: &HashMap<String, ValueType>,
+    text: &str,
+    target: &str,
+) {
+    trellis::defs::install_definition(d.pool(), text, columns, "public")
+        .await
+        .expect("register the downstream");
+    let id = definition_id(&d.ctl, target).await;
+    let pool = d.pool().clone();
+    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the build");
+    assert_eq!(
+        taken,
+        vec![id],
+        "the Re-derive build takes a seam-fed source"
+    );
+    build::settle_builds(&pool).await;
+    settle_through_failures(d).await;
+    assert_eq!(stored(&d.ctl, target).await, "live");
+}
+
+/// [`drain_driver::Driver::settle`], for a ring holding a page that fails on
+/// a key until the key's deaths reach the quarantine threshold: each drain
+/// that charges a key without quarantining it ends in its error, and the
+/// next one, of the same batch, charges again. Bounded, not polled: the
+/// threshold is a constant. Stops once no segment is undrained and the
+/// active one is empty, which a quarantined key's held rows don't stop
+/// (`has_pending` counts them).
+async fn settle_through_failures(d: &mut drain_driver::Driver) {
+    let mut batch = d.seal().await;
+    for _ in 0..32 {
+        if d.drain_frozen(batch, "settle", &[])
+            .await
+            .finish_result()
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        d.retire().await;
+        let arms: Vec<String> = (0..4)
+            .map(|slot| {
+                format!(
+                    "select 1 from seg_{slot} where exists ( \
+                         select 1 from segments s \
+                         where s.ring_slot = {slot} and s.state <> 'drained')"
+                )
+            })
+            .collect();
+        let pending: bool = d
+            .ctl
+            .query_one(
+                &format!("select exists ({})", arms.join(" union all ")),
+                &[],
+            )
+            .await
+            .expect("read the ring")
+            .get(0);
+        if !pending {
+            return;
+        }
+        batch = d.seal().await;
+    }
+    panic!("the ring did not quiesce within 32 drains");
+}
+
+async fn text_rows(raw: &Client, sql: &str) -> Vec<String> {
+    raw.query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
+/// #625 F6: a key with a `NULL` part of a seam-fed aggregate source is a row
+/// like any other to a downstream aggregate, whose `NULL` group counts. No
+/// chunk's range reaches one that no part decides, so the plan job stages
+/// them. The oracle is the downstream's own `GROUP BY` over the upstream.
+#[tokio::test]
+async fn a_build_over_a_seam_fed_aggregate_counts_its_null_keyed_groups() {
+    let (mut d, u_columns) = nullable_keyed_upstream(
+        "insert into public.src values \
+         (1, 1, 1, 1), (2, 2, 1, 2), (3, null, 1, 4), (4, null, 2, 8), \
+         (5, 3, null, 16), (6, null, null, 32)",
+    )
+    .await;
+    build_over_u(
+        &mut d,
+        &u_columns,
+        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x) AS total, COUNT(*) AS n",
+        "w",
+    )
+    .await;
+    let expected = text_rows(
+        &d.ctl,
+        "select (b, sum(x), count(*))::text from public.u group by b order by b",
+    )
+    .await;
+    assert_eq!(
+        expected,
+        ["(1,7,3)", "(2,8,1)", "(,48,2)"],
+        "the oracle counts the NULL-keyed rows"
+    );
+    assert_eq!(
+        text_rows(
+            &d.ctl,
+            "select (b, total, n)::text from public.w order by b"
+        )
+        .await,
+        expected
+    );
+}
+
+/// #625 F6, F3: a rebuild (a resume) of a downstream aggregate over a seam-fed
+/// aggregate with `NULL`-keyed groups. Its sweep re-derives every ledger
+/// entry the chunks didn't, reading the source by the entry's key: a `NULL`
+/// part must match the source's `NULL`, or the group's entry would become a
+/// tombstone and its rows leave the downstream. Changes while it is paused:
+/// a `NULL`-keyed group's value, one that disappears, and a new one.
+#[tokio::test]
+async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
+    let (mut d, u_columns) = nullable_keyed_upstream(
+        "insert into public.src values \
+         (1, 1, 1, 1), (2, 2, 1, 2), (3, null, 1, 4), (4, null, 2, 8), \
+         (5, 3, null, 16), (6, null, null, 32)",
+    )
+    .await;
+    build_over_u(
+        &mut d,
+        &u_columns,
+        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x) AS total, COUNT(*) AS n",
+        "w",
+    )
+    .await;
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    trellis.apply("PAUSE TRANSFORM w").await.expect("pause w");
+    d.ctl
+        .batch_execute(
+            "update public.src set x = 100 where id = 6; \
+             delete from public.src where id = 4; \
+             insert into public.src values (7, null, 1, 1), (8, 9, null, 64)",
+        )
+        .await
+        .expect("change the source while w is paused");
+    settle_through_failures(&mut d).await;
+    trellis.apply("RESUME TRANSFORM w").await.expect("resume w");
+    let id = definition_id(&d.ctl, "w").await;
+    let pool = d.pool().clone();
+    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the rebuild");
+    assert_eq!(taken, vec![id]);
+    build::settle_builds(&pool).await;
+    settle_through_failures(&mut d).await;
+    assert_eq!(stored(&d.ctl, "w").await, "live");
+    let expected = text_rows(
+        &d.ctl,
+        "select (b, sum(x), count(*))::text from public.u group by b order by b",
+    )
+    .await;
+    assert_eq!(
+        expected,
+        ["(1,7,3)", "(,180,3)"],
+        "the oracle: b = NULL holds (3, NULL) 16, (NULL, NULL) 100 and (9, NULL) 64; group 2 is gone"
+    );
+    assert_eq!(
+        text_rows(
+            &d.ctl,
+            "select (b, total, n)::text from public.w order by b"
+        )
+        .await,
+        expected
+    );
+}
+
+/// #625 F6 with F-A5: a chunk of a build over a seam-fed aggregate source
+/// that fails on its data narrows to the key that fails, whatever
+/// `NULL`-keyed rows lie in its range. The source's `a` is even, so
+/// `(121, NULL)` lies strictly between two keys' first parts, in every range
+/// that holds `(122, 2)`, say, as its one key: a chunk that read it would
+/// fail on it, the narrowing (which counts no `NULL`-keyed row) would pin the
+/// failure on `(122, 2)`, and the chunk would go on failing. Here `(300, 0)`
+/// overflows `x + x`, and `(121, NULL)` does too. The chunk leaves the latter
+/// out, as the narrowing counts it out, so the failure is pinned on
+/// `(300, 0)`, and the staged page that re-derives `(121, NULL)` quarantines
+/// that key in turn. The build finishes without them and the target is the
+/// oracle over everything else.
+#[tokio::test]
+async fn a_failing_chunk_over_a_seam_fed_source_is_narrowed_past_its_null_keyed_rows() {
+    let (mut d, u_columns) = nullable_keyed_upstream(
+        "insert into public.src select i, 2 * i, i % 3, i from generate_series(1, 300) i; \
+         update public.src set x = 2147483647 where id = 150; \
+         insert into public.src values (301, null, 1, 5), (302, 121, null, 2147483647), \
+                                       (303, 123, null, 7)",
+    )
+    .await;
+    build_over_u(
+        &mut d,
+        &u_columns,
+        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x + x) AS doubled, COUNT(*) AS n",
+        "w",
+    )
+    .await;
+    let quarantined: Vec<String> = text_rows(
+        &d.ctl,
+        "select key from poison p join transform_definitions t on t.id = p.transform_id \
+         where split_part(t.target_table, '.', 2) = 'w' order by key",
+    )
+    .await;
+    assert_eq!(
+        quarantined.len(),
+        2,
+        "the two overflowing keys, and no other: {quarantined:?}"
+    );
+    assert_eq!(
+        quarantined,
+        ["121\u{1f}\u{1}", "300\u{1f}0"],
+        "the NULL-parted key and the one the chunk narrowed to"
+    );
+    assert_eq!(
+        text_rows(
+            &d.ctl,
+            "select (b, doubled, n)::text from public.w order by b"
+        )
+        .await,
+        text_rows(
+            &d.ctl,
+            "select (b, sum(x + x::bigint), count(*))::text from public.u \
+             where x <> 2147483647 group by b order by b"
+        )
+        .await,
+        "w is the oracle over every key the build didn't quarantine"
+    );
+}
+
+/// #625 F6: only a seam-fed source's build is fenced. A captured source has
+/// no writer that can commit unseen by the build (its page reads the
+/// definition list after the seal fence), so its plan job takes no fence and
+/// plans past a transaction that is open, whatever its age.
+#[tokio::test]
+async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() {
+    let mut d = fenced_upstream().await;
+    let (src_columns, _) = fenced_columns();
+    let columns: HashMap<String, ValueType> = src_columns
+        .into_iter()
+        .map(|(n, t)| (n.to_string(), t))
+        .collect();
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+
+    // A transaction with an id, open before the build starts and for its
+    // whole run.
+    let mut old = d.user().await;
+    let open = old.transaction().await.expect("begin");
+    open.query_one("select pg_current_xact_id()", &[])
+        .await
+        .expect("take an id");
+
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("register the aggregate");
+    let id = definition_id(&d.ctl, "agg").await;
+    let pool = d.pool().clone();
+    let taken = build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the build");
+    assert_eq!(taken, vec![id]);
+    assert_eq!(
+        build::work_once(
+            &pool,
+            "worker",
+            &BUILD_OPTIONS,
+            &mut build::MergeFailures::default()
+        )
+        .await
+        .expect("the plan job"),
+        Step::Planned
+    );
+    assert!(
+        planned_chunks(&d.ctl, id).await > 0,
+        "it planned its chunks"
+    );
+    let fence: Option<i64> = d
+        .ctl
+        .query_one(
+            "select fence_xid::text::bigint from backfill_chunks \
+             where definition_id = $1 and kind = 'plan'",
+            &[&id],
+        )
+        .await
+        .expect("read the plan row")
+        .get(0);
+    assert_eq!(fence, None, "no fence");
+    assert_eq!(
+        trellis
+            .status("agg")
+            .await
+            .expect("read the status")
+            .expect("agg is defined")
+            .build_wait,
+        None
+    );
+    open.rollback().await.expect("end the old transaction");
 }

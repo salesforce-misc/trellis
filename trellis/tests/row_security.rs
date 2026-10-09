@@ -1865,6 +1865,10 @@ async fn a_discharge_refused_while_planning_pauses_what_the_refusal_reaches() {
         status(&it.trellis, "c_copy").await.status,
         TransformStatus::Live
     );
+    // The old build's discharge is what this test pins (#625 F6).
+    markers::hold_out_of_the_rederive_build(&it.admin, "public.c_copy")
+        .await
+        .expect("hold c_copy's readers out of the Re-derive build");
     it.admin
         .batch_execute(
             "alter role rls_trellis bypassrls; \
@@ -1986,6 +1990,10 @@ async fn a_catch_up_refused_for_row_security_pauses_its_definition() {
         .expect("define");
     capture_pass(&mut it.raw, &it.pool).await;
     markers::settle_registrations(&it.pool).await;
+    // The old build's go-live catch-up is what this test pins (#625 F6).
+    markers::hold_out_of_the_rederive_build(&it.admin, "public.c_copy")
+        .await
+        .expect("hold c_copy's readers out of the Re-derive build");
     it.trellis
         .apply("TRANSFORM c_copy_2 FROM public.c_copy SELECT amount AS amount")
         .await

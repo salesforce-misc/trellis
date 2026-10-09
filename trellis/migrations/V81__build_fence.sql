@@ -1,0 +1,14 @@
+-- #625 F6: the fence of a Re-derive build whose source is another
+-- definition's target (`staging::build`'s plan job), on its plan row.
+--
+-- Such a source is fed by the target-mutation seam, not by capture. A seam
+-- writer decides inside its own apply transaction whether a definition is
+-- applying, so one that decided before the build's start committed can still
+-- commit after a chunk's snapshot, and neither the chunk nor the writer's
+-- staged rows would carry its write. The plan job takes a fence, the id of a
+-- transaction that began after the start commit (#431's rule), and enqueues
+-- no chunk until the oldest running transaction began after it
+-- (`pg_snapshot_xmin(pg_current_snapshot()) > fence_xid`). Null on every
+-- other row, and on the plan row of a build whose source is captured, or
+-- until the plan job has taken it.
+alter table backfill_chunks add column fence_xid xid8;

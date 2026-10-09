@@ -2425,6 +2425,11 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     // `resume_column_refuses_a_column_on_a_not_yet_live_definition` (above)
     // and `trellis/tests/defs_backfill_chunk_queue.rs` rely on.
     let order_totals_columns = numeric_columns(&["id", "total"]);
+    // The old chunked build, which isn't applying, is what this test pins:
+    // a Re-derive build applies, and a resume resumes it (#625 F6).
+    trellis::intake::markers::hold_out_of_the_rederive_build(&client, "public.order_totals")
+        .await
+        .expect("hold order_totals' readers out of the Re-derive build");
     let summary_def = install_definition(
         &db.pool,
         "TRANSFORM order_summaries FROM order_totals SELECT total + total AS grand_total",

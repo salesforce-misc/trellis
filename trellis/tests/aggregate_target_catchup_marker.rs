@@ -209,6 +209,12 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
     create_schema(&client).await;
 
     install_sku_totals(&db.pool, &mut client).await;
+    // These tests pin the old build's catch-up marker, which a definition
+    // over a target no longer gets unless it is held out of the Re-derive
+    // build (#625 F6).
+    markers::hold_out_of_the_rederive_build(&client, "public.sku_totals")
+        .await
+        .expect("hold sku_totals' readers out of the Re-derive build");
     install_definition(
         &db.pool,
         "TRANSFORM sku_totals_echo FROM sku_totals SELECT total AS echo_total",
@@ -276,6 +282,12 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
     create_schema(&client).await;
 
     install_sku_totals(&db.pool, &mut client).await;
+    // These tests pin the old build's catch-up marker, which a definition
+    // over a target no longer gets unless it is held out of the Re-derive
+    // build (#625 F6).
+    markers::hold_out_of_the_rederive_build(&client, "public.sku_totals")
+        .await
+        .expect("hold sku_totals' readers out of the Re-derive build");
     install_definition(
         &db.pool,
         "TRANSFORM sku_totals_v2 FROM sku_totals GROUP BY sku SELECT sum(total) AS total2",

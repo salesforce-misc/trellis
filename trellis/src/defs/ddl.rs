@@ -1982,30 +1982,11 @@ pub(crate) async fn aggregate_target_table_ddl(
         .collect();
     // #723: without its `GROUP BY` index when the Re-derive build takes it
     // and nothing it reads needs one (`ledger_indexes_groups`).
-    let source_is_definition_target = {
-        use super::catalog::{self, CatalogError};
-        match catalog::resolve_source_for_install(pool, def).await {
-            Ok(source) => catalog::is_definition_target(&**pool.get().await?, &source)
-                .await
-                .map_err(map_resolve_error)?,
-            // A test fixture rendering DDL before creating its source.
-            Err(CatalogError::SourceTableNotFound(_)) => false,
-            Err(CatalogError::Db(err)) => return Err(DdlError::Db(err)),
-            Err(CatalogError::Pool(err)) => return Err(DdlError::Pool(err)),
-            // Install has resolved the source already, so this isn't
-            // reached there. Keeping the index is right whatever the build.
-            Err(_) => true,
-        }
-    };
     sql.push_str(&super::ledger::aggregate_ledger_ddl(
         &super::ledger::qualified_ledger_table(target_schema, &def.target),
         &group_columns,
         &contribution_columns,
-        crate::staging::build::ledger_indexes_groups(
-            def,
-            source_columns,
-            source_is_definition_target,
-        ),
+        crate::staging::build::ledger_indexes_groups(def, source_columns),
     ));
     // #625 F1: a target Apply maintains on the ledger also gets its group
     // deltas, which a Re-derive build's chunks write instead of the groups.

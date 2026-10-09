@@ -93,10 +93,12 @@ uninstalls the triggers of a table nothing reads any more.
 
 ### The Re-derive build
 
-A plain aggregate or plain 1-1 definition (no relationship in any field) on a
-captured source (not another definition's target) is built by the **Re-derive
-build** (`staging::build`). It needs no marker, no fence wait and no go-live
-catch-up, because the definition **applies from its first chunk**:
+A plain aggregate or plain 1-1 definition (no relationship in any field) is
+built by the **Re-derive build** (`staging::build`), whether its source is a
+captured table or another definition's target. It needs no marker and no
+go-live catch-up, because the definition **applies from its first chunk**. A
+captured source needs no fence wait either; a source that is another
+definition's target takes one fence per build (see below):
 
 1. **Start.** Once the reconcile pass finds the definition ready (its source
    captured with the columns it reads), one transaction moves it
@@ -119,6 +121,22 @@ catch-up, because the definition **applies from its first chunk**:
 4. **Live.** The transaction that leaves the plan done, every chunk done and
    the delta table empty moves the definition to `live`.
 
+**A source that is another definition's target.** Such a source is never
+captured: its writes reach Apply through the target-mutation seam, whose
+writer reads the list of applying definitions inside its own transaction. A
+writer that read it before the build started can commit after a chunk's
+snapshot, with its rows staged for no one, so the plan job first takes a
+fence, a transaction id assigned after the start commit, and enqueues no
+chunk until the oldest running transaction in the cluster began after it.
+While it waits, the definition's `status().build_wait` reads
+`BuildWait::Fence { xid }`, naming the id to look for in `pg_stat_activity`.
+Only these builds wait, and only on transactions older than the fence. A
+source keyed by nullable `GROUP BY` columns has keys that no chunk's range
+reaches (a key with a `NULL` part, which a row comparison excludes), so an
+aggregate's plan job stages an image-less `Recompute` for each such key when
+its walk ends, for a drain page to re-derive; a 1-1 target leaves them out, as
+it can hold no row for one.
+
 A chunk that fails on its data splits until the key fails alone, and the key
 is quarantined as a drain eviction would quarantine it. Drain threads take
 build work only after their segments, and only while the ring's undrained
@@ -135,9 +153,8 @@ that rewrite just those columns from one snapshot.
 
 ### Builds that still use a marker and a go-live catch-up
 
-A definition that reads a relationship, or whose source is another
-definition's target, doesn't yet take the Re-derive build (milestone F,
-#625, moves it). Its build is dispatched by a **marker** on the source table
+A definition that reads a relationship doesn't yet take the Re-derive build
+(milestone F, #625, moves it). Its build is dispatched by a **marker** on the source table
 (`intake::markers`):
 
 1. **Join.** The staging worker's reconcile pass installs the source's

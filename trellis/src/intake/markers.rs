@@ -1897,15 +1897,16 @@ pub async fn settle_builds(pool: &crate::pool::Pool) {
     }
 }
 
-/// Test harness (#625 F8a): records a `live` definition whose target is
+/// Test harness (#625 F8a, F6): records a `live` definition whose target is
 /// `table` (a schema-qualified identity, as `transform_definitions` holds
 /// it), feeding it from a table named `<table>__feed` that doesn't exist.
-/// Nothing runs that definition; it only makes `table` read as another
-/// definition's target, which is what a build's shape choice reads
-/// (`staging::build::qualifies`). A plain 1-1 definition over `table` is
-/// then built by the old chunked build (`backfill_chunks` ranges and the
-/// go-live catch-up), which survives for a seam-fed source until #625 F6:
-/// over a captured table it is the Re-derive build's. For a test of the old
+/// Nothing runs that definition; it makes `table` read as another
+/// definition's target, and the Re-derive build leaves every definition over
+/// it to the old build ([`is_held_out_of_the_rederive_build`]). A definition
+/// over `table` is then built by the old build (a plain 1-1's
+/// `backfill_chunks` ranges and go-live catch-up, an aggregate's direct
+/// build), which survives until #625 F10: over a captured table, or a real
+/// definition's target, it is the Re-derive build's. For a test of the old
 /// build's machinery with no staging worker running (a running one would
 /// treat `table` as a target, and never capture it). Idempotent.
 #[cfg(any(test, feature = "internals"))]
@@ -1936,6 +1937,55 @@ pub async fn feed_from_a_test_definition(
         )
         .await?;
     Ok(())
+}
+
+/// The comment [`hold_out_of_the_rederive_build`] puts on a table.
+#[cfg(any(test, feature = "internals"))]
+const OLD_BUILD_COMMENT: &str = "trellis test: the old build builds definitions over this table";
+
+/// Test harness (#625 F6): holds every definition over `table` (a
+/// schema-qualified identity of a table that exists) out of the Re-derive
+/// build, so that it is built by the old build (a plain 1-1's chunked build
+/// and go-live catch-up, an aggregate's direct build), which survives until
+/// #625 F10. For a test of the old build's machinery over a real definition's
+/// target; [`feed_from_a_test_definition`] does the same for a table that
+/// isn't one. Idempotent.
+#[cfg(any(test, feature = "internals"))]
+pub async fn hold_out_of_the_rederive_build(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<(), IntakeError> {
+    let (schema, name) = split_qualified(table)?;
+    client
+        .batch_execute(&format!(
+            "comment on table {}.{} is '{OLD_BUILD_COMMENT}'",
+            quote_ident(schema),
+            quote_ident(name)
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Whether `table` is held out of the Re-derive build, so that
+/// `staging::build::qualifies` leaves the definitions over it to the old
+/// build (a test of its machinery, until #625 F10 deletes it): the target a
+/// test planted with [`feed_from_a_test_definition`], or a table
+/// [`hold_out_of_the_rederive_build`] marked. A real definition's target is
+/// not otherwise: its readers take the Re-derive build, fenced (#625 F6).
+#[cfg(any(test, feature = "internals"))]
+pub(crate) async fn is_held_out_of_the_rederive_build(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(client
+        .query_one(
+            "select exists (select 1 from transform_definitions \
+                            where target_table = $1 and source_table = $1 || '__feed') \
+                 or coalesce(obj_description(to_regclass($1), 'pg_class') = $2, false)",
+            &[&table, &OLD_BUILD_COMMENT],
+        )
+        .await?
+        .get(0))
 }
 
 /// Test stand-in for the staging worker's maintenance pass over newly
@@ -2494,9 +2544,9 @@ mod catch_up_tests {
             .await
             .expect("seed a deferred definition")
             .get(0);
-        // Another definition's target, so the plain 1-1 `d` is still the
-        // old chunked build's, whose planning reads the key (#625 F8a: over
-        // a captured table it would be the Re-derive build's).
+        // Another definition's target, held out of the Re-derive build, so
+        // the plain 1-1 `d` is the old chunked build's, whose planning reads
+        // the key (#625 F8a, F6).
         client
             .batch_execute(
                 "insert into source_table_versions (source_table, version) \
@@ -2508,6 +2558,9 @@ mod catch_up_tests {
             )
             .await
             .expect("make the source another definition's target");
+        hold_out_of_the_rederive_build(&client, "public.nokey")
+            .await
+            .expect("hold the source out of the Re-derive build");
         async fn status(client: &tokio_postgres::Client, id: i64) -> String {
             client
                 .query_one(
@@ -4609,9 +4662,13 @@ mod dispatch_tests {
     }
 
     /// Makes `public.orders` another definition's target, as a seam-fed
-    /// source is: a plain 1-1 definition over it is still the old chunked
-    /// build's (#625 F8a leaves seam-fed sources to F6).
+    /// source is, and holds it out of the Re-derive build (#625 F6): a plain
+    /// 1-1 definition over it is the old chunked build's, which these tests
+    /// pin.
     async fn feed_orders_from_another_definition(client: &tokio_postgres::Client) {
+        hold_out_of_the_rederive_build(client, "public.orders")
+            .await
+            .expect("hold orders' readers out of the Re-derive build");
         client
             .batch_execute(
                 "insert into source_table_versions (source_table, version) \

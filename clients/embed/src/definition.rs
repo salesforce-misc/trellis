@@ -423,6 +423,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            build_wait: None,
         };
 
         assert_eq!(
@@ -450,6 +451,7 @@ mod tests {
                 oldest_poisoned_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
             }),
             drain_failure: None,
+            build_wait: None,
         };
 
         assert_eq!(
@@ -479,6 +481,7 @@ mod tests {
                 last_seen: at(1_727_222_400_654_321),
                 attempts: 5,
             }),
+            build_wait: None,
         };
 
         assert_eq!(
@@ -509,6 +512,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            build_wait: None,
         };
 
         assert_eq!(
@@ -552,6 +556,7 @@ mod tests {
             }),
             held_keys: None,
             drain_failure: None,
+            build_wait: None,
         };
 
         let plain = PlainDefinitionStatus::from(&status);

@@ -959,7 +959,7 @@ fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
 /// drain skips the key (issue #205). Writing it would fail the chunk with a
 /// not-null violation that [`narrow_one_to_one_chunk`], which never counts
 /// such a row, would pin on an innocent key beside it.
-fn key_not_null(pk_idents: &[String]) -> String {
+pub(crate) fn key_not_null(pk_idents: &[String]) -> String {
     pk_idents
         .iter()
         .map(|c| format!("{c} is not null"))
@@ -981,10 +981,11 @@ pub(crate) enum ChunkNarrowing {
     Empty,
 }
 
-/// Narrows a failed [`execute_one_to_one_chunk`] range `(lo, hi]` of
-/// `source_table` (#616): counts the keys it would write, leaving out the
-/// quarantined ones as the write does, and either names the one key or the
-/// key that splits them in half. The split point is found the way
+/// Narrows a failed chunk's range `(lo, hi]` of `source_table` (#616): counts
+/// the keys the chunk would write, leaving out the quarantined ones and any
+/// with a `NULL` part as the write does (a 1-1 range's, and a Re-derive
+/// chunk's since #625 F6, [`key_not_null`]), and either names the one key or
+/// the key that splits them in half. The split point is found the way
 /// [`discover_pk_ranges`] finds a chunk's upper bound: the largest key of the
 /// first half, in the primary key's own order. `key_collations` are the ones
 /// the chunk's build planned its ranges under (`backfill_chunks.key_collations`,
@@ -1870,20 +1871,13 @@ async fn backfill_aggregate(
     // one's load, over whatever the latest load left. The `GROUP BY` index
     // is among them only where the ledger's DDL puts it
     // (`staging::build::ledger_indexes_groups`, #723).
-    let source_is_definition_target = super::catalog::is_definition_target(&**client, source_table)
-        .await
-        .map_err(map_rel_lookup_err)?;
     let rebuild = format!(
         "alter table {ledger} add primary key ({}){}",
         quote_ident(super::ledger::KEY_COLUMN),
         super::ledger::aggregate_ledger_index_ddl(
             &ledger,
             &group_idents,
-            crate::staging::build::ledger_indexes_groups(
-                def,
-                source_columns,
-                source_is_definition_target,
-            ),
+            crate::staging::build::ledger_indexes_groups(def, source_columns),
         ),
     );
     {

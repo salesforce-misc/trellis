@@ -1357,16 +1357,25 @@ pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: 
 /// primary-key column holding that column of each key, in key order
 /// ([`sweep_key_params`]).
 ///
-/// A key with a `NULL` part matches no row, so its entry becomes a
-/// tombstone. Only a source keyed by a nullable unique index (another
-/// aggregate's target) has such keys, and the Re-derive build doesn't take
-/// those (#625 F6).
+/// A key's `NULL` part matches the source's `NULL` (#625 F6): only a source
+/// keyed by a nullable unique index (another aggregate's target) has such
+/// keys, and a ledger target counts their rows like any other. A column that
+/// can't hold one is matched by `=`, which the source's index serves.
 pub(super) fn sweep_statement(plan: &LedgerTargetPlan) -> String {
     let on: Vec<String> = plan
         .source_pk
         .iter()
         .enumerate()
-        .map(|(i, column)| format!("s.{} = u.__trellis_p{i}", quote_ident(&column.name)))
+        .map(|(i, column)| {
+            let c = quote_ident(&column.name);
+            if column.nullable {
+                format!(
+                    "(s.{c} = u.__trellis_p{i} or (s.{c} is null and u.__trellis_p{i} is null))"
+                )
+            } else {
+                format!("s.{c} = u.__trellis_p{i}")
+            }
+        })
         .collect();
     let arrays: Vec<String> = plan
         .source_pk

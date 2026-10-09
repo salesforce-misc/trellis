@@ -169,9 +169,36 @@
 //! arguments plain columns or expressions (#625 F5). An expression argument
 //! is the SQL `defs::oracle` renders, which a chunk computes over the source
 //! table and a page over its change's image cast to the source's row type.
-//! A source that is another definition's target waits for #625 F6, and a
-//! relationship-fed aggregate for F9. [`BuildPlan::load`] returns `None` for
-//! anything else.
+//! A relationship-fed aggregate waits for F9. [`BuildPlan::load`] returns
+//! `None` for anything else.
+//!
+//! # Seam-fed sources (F6)
+//!
+//! A source that is another definition's target is never captured: its
+//! writes reach Apply through the target-mutation seam
+//! (`super::target_mutations`), whose writer reads the list of applying
+//! definitions inside its own apply transaction. A writer that read it before
+//! this build's start committed doesn't stage its rows for the definition, and
+//! it can commit after a chunk's snapshot, so neither the chunk nor the ring
+//! would carry its write. (A captured source has no such writer: a page's
+//! definition list is read after its segment's seal fence, which is before
+//! the start commit, so every change a page holds without the definition was
+//! committed before the start and is in every chunk's snapshot.)
+//!
+//! So the build of a seam-fed source is fenced, once per build. The plan
+//! job's first act is to take a fence: the id of a transaction that began
+//! after the start commit (`intake::markers`' `confirm_fence`, #431's rule),
+//! recorded on the plan row (`backfill_chunks.fence_xid`). It enqueues no
+//! chunk until the oldest running transaction began after the fence
+//! ([`fence_settled`]), so every writer that could have missed the build has
+//! ended, and every chunk's snapshot sees its rows. While it waits it gives
+//! its claim back and tries again ([`FENCE_RETRY`]), and
+//! `Trellis::status` names the fence (`DefinitionStatus::build_wait`). Only a
+//! seam-fed build waits, and only on transactions older than its fence: a
+//! long transaction elsewhere delays seam-fed builds, as the `xmin` caveat
+//! (the marker fence's) does today. The merger's writes to a Re-derive-built
+//! upstream go through the seam as any writer's do, so a rebuild of an
+//! upstream parks no catch-up for its readers.
 //!
 //! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target with no
 //! relationship path, on a captured source, takes the same scheduled build:
@@ -257,6 +284,9 @@ use super::target_mutations::TargetMutations;
 
 pub mod one_to_one;
 
+/// How long a plan job waits before it looks at its fence again (F6).
+const FENCE_RETRY: Duration = Duration::from_millis(500);
+
 /// How long a chunk waits for its entry lock before giving up (#625 Q4).
 /// A drain page waits up to `locks::LOCK_TIMEOUT` for the same locks, so a
 /// page never queues for long behind a chunk, and a chunk never holds up a
@@ -338,9 +368,12 @@ pub struct ChunkOutcome {
 /// Both are transient (`crate::staging::quarantine::classify`).
 ///
 /// The range predicate is the 1-1 build's row comparison, which admits a key
-/// with a `NULL` part when an earlier part decides it. Only a source keyed
-/// by a nullable unique index (another aggregate's target) has such keys,
-/// and the Re-derive build doesn't take seam-fed sources before #625 F6.
+/// with a `NULL` part when an earlier part decides it, and never one that no
+/// part decides. Only a source keyed by a nullable unique index (another
+/// aggregate's target) has such keys. The chunk leaves them all out
+/// (`key_not_null`, as the 1-1 chunk does and as the narrowing of a failing
+/// chunk counts), and the plan job stages them instead ([`stage_null_keys`],
+/// F6).
 pub async fn run_chunk(
     txn: &Transaction<'_>,
     plan: &BuildPlan,
@@ -366,13 +399,16 @@ pub async fn run_chunk(
     let keys: Vec<String> = txn
         .query(
             &format!(
-                "select {k} from {} s where {range_where} \
+                "select {k} from {} s where {range_where} and {not_null} \
                  and not exists (select 1 from poison p \
                                  join transform_definitions d on d.id = p.transform_id \
                                  where p.src_table = {source_param} and p.key = {k} \
                                    and d.target_table = {target_param})",
                 ddl::qualified_source_table(source_table),
                 k = ddl::pk_key_sql_expr(pk, Some("s")),
+                not_null = crate::defs::backfill::key_not_null(
+                    &pk.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>()
+                ),
             ),
             &key_params,
         )
@@ -1061,16 +1097,16 @@ fn shape_of(
 
 /// Whether the ledger of aggregate `def` carries its partial `GROUP BY`
 /// index (`defs::ledger::aggregate_ledger_index_ddl`, #723). It does unless
-/// the Re-derive build takes `def` ([`qualifies`], whose test this repeats:
-/// `source_is_definition_target` is its source check) and its target has
-/// no recomputed field. On that path nothing reads the ledger by group:
-/// pages, chunks, the sweep, the merger and the tombstone GC read entries
-/// by key, and only a recomputed field's statement reads a group's entries
-/// (`super::ledger`'s `recompute_statement`). The old build and the resume's
-/// orphan sweep read by group, and they run only for a definition this
-/// path doesn't take. Leaving the index out spares every entry write its
-/// maintenance, which at 100M entries cost most of the build's WAL as
-/// full-page images of its leaves.
+/// the Re-derive build takes `def` ([`qualifies`], whose shape test this
+/// repeats) and its target has no recomputed field. On that path nothing
+/// reads the ledger by group: pages, chunks, the sweep, the merger and the
+/// tombstone GC read entries by key, and only a recomputed field's
+/// statement reads a group's entries (`super::ledger`'s
+/// `recompute_statement`). The old build and the resume's orphan sweep read
+/// by group, and they run only for a definition this path doesn't take.
+/// Leaving the index out spares every entry write its maintenance, which at
+/// 100M entries cost most of the build's WAL as full-page images of its
+/// leaves.
 ///
 /// Decided once, when the ledger is created (`defs::ddl`), and again by the
 /// old build, which drops and rebuilds the ledger's indexes
@@ -1083,22 +1119,30 @@ fn shape_of(
 pub(crate) fn ledger_indexes_groups(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-    source_is_definition_target: bool,
 ) -> bool {
     match shape_of(def, source_columns) {
-        Some(shape) if !source_is_definition_target => shape.recomputes(),
-        _ => true,
+        Some(shape) => shape.recomputes(),
+        None => true,
     }
 }
 
-/// Whether a Re-derive build may take `definition` (#625 F2, F5, F8a): a
+/// Whether a Re-derive build may take `definition` (#625 F2, F5, F6, F8a): a
 /// target the ledger maintains ([`buildable_shape`]) or a plain 1-1 target
-/// ([`one_to_one::buildable`]), on a captured source. A
-/// source that is another definition's target is fed by the target-mutation
-/// seam, whose writer can commit after a chunk's snapshot; it needs a fence
-/// first (#625 F6). Taking one also changes what a failing chunk's
-/// narrowing must count: see `defs::chunk_queue::fail_chunk`'s Re-derive
-/// arm.
+/// ([`one_to_one::buildable`]). Its source may be captured or another
+/// definition's target.
+///
+/// A source that is another definition's target is fed by the
+/// target-mutation seam, whose writer decides inside its own apply
+/// transaction whether this definition applies and can commit after a
+/// chunk's snapshot. The build is fenced for it (F6, see the module doc's
+/// "Seam-fed sources"), and takes the same start as any other.
+///
+/// Taking one also changes what a failing chunk's narrowing must count: see
+/// `defs::chunk_queue::fail_chunk`'s Re-derive arm.
+#[cfg_attr(
+    not(any(test, feature = "internals")),
+    allow(unused_variables, clippy::unused_async)
+)]
 pub async fn qualifies(
     client: &impl GenericClient,
     definition: &Definition,
@@ -1106,7 +1150,13 @@ pub async fn qualifies(
     if buildable_shape(definition).is_none() && !one_to_one::buildable(definition) {
         return Ok(false);
     }
-    Ok(!catalog::is_definition_target(client, &definition.source_table).await?)
+    #[cfg(any(test, feature = "internals"))]
+    if crate::intake::markers::is_held_out_of_the_rederive_build(client, &definition.source_table)
+        .await?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Starts a Re-derive build for every definition in `ready` that
@@ -2370,6 +2420,141 @@ impl AnyPlan {
     }
 }
 
+/// The cursor [`stage_null_keys`] reads.
+const NULL_KEYS_CURSOR: &str = "trellis_null_keys_cursor";
+
+/// Rows per page of [`stage_null_keys`]' cursor.
+const NULL_KEYS_PAGE: i64 = 10_000;
+
+/// Stages an image-less `Recompute` for every key of `source_table` with a
+/// `NULL` part, for a ledger target's build (F6). Only a source keyed by a
+/// nullable unique index has such keys: another aggregate's target, whose
+/// `GROUP BY` columns may be `NULL`, and a ledger target counts its `NULL`
+/// groups like any other. No chunk reaches them. A chunk's range is a row
+/// comparison, which is `NULL` (so the row is out) wherever a `NULL` part
+/// decides it, and a plan's boundaries are keys without one. The oracle of a
+/// 1-1 target leaves them out (no target row can hold one), so only a
+/// ledger target's plan stages them.
+///
+/// A page re-derives a staged key as it does a chunk's: under the key's
+/// entry lock, from the source's live row, so it needs no more than the
+/// chunk does. The keys are staged in the transaction that ends the plan,
+/// after the fence, so every writer that could have missed the build has
+/// ended. It does what a chunk can't for these keys, and what the old
+/// build's ring enumeration did: staged rows drain after the build has
+/// flipped `live` (their `origin_lsn` is unknown, so they hold every
+/// convergence token until they drain, as a catch-up's do).
+///
+/// Streamed through a cursor, a page at a time, so a source with many such
+/// keys holds one page in memory.
+async fn stage_null_keys(
+    txn: &Transaction<'_>,
+    source_table: &str,
+    pk: &[ddl::PrimaryKeyColumn],
+) -> Result<(), ApplyError> {
+    use crate::staging::append::{self, StagedChange};
+
+    let nullable: Vec<String> = pk
+        .iter()
+        .filter(|c| c.nullable)
+        .map(|c| format!("{} is null", quote_ident(&c.name)))
+        .collect();
+    if nullable.is_empty() {
+        return Ok(());
+    }
+    txn.batch_execute(&format!(
+        "declare {NULL_KEYS_CURSOR} cursor for \
+         select {} from {} where {}",
+        ddl::pk_key_sql_expr(pk, None),
+        ddl::qualified_source_table(source_table),
+        nullable.join(" or "),
+    ))
+    .await?;
+    loop {
+        let rows = txn
+            .query(
+                &format!("fetch forward {NULL_KEYS_PAGE} from {NULL_KEYS_CURSOR}"),
+                &[],
+            )
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let page: Vec<StagedChange> = rows
+            .iter()
+            .map(|row| StagedChange::Recompute {
+                src_table: source_table.to_string(),
+                key: row.get(0),
+                hop_gen: 0,
+                group_key: None,
+                src_changed: None,
+                prior_image: None,
+                origin_lsn: None,
+            })
+            .collect();
+        append::append(txn, &page).await?;
+    }
+    txn.batch_execute(&format!("close {NULL_KEYS_CURSOR}"))
+        .await?;
+    Ok(())
+}
+
+/// Where a seam-fed build's fence stands ([`fence_settled`]).
+enum FenceState {
+    /// Every transaction open when the fence was taken has ended.
+    Settled,
+    /// One hasn't: the fence's transaction id.
+    Pending(i64),
+    /// The plan job's claim was reclaimed meanwhile.
+    Superseded,
+}
+
+/// Takes the fence of the claimed plan job `chunk` if it has none, and
+/// reports whether the oldest running transaction began after it (F6, see
+/// the module doc's "Seam-fed sources").
+///
+/// The fence is a statement's own transaction id, assigned here in a
+/// transaction of its own, begun after the start commit: every transaction
+/// that wrote before this statement began already has an id, ids are
+/// assigned in order, and so each is below the fence (`intake::markers`'
+/// `confirm_fence`). The snapshot's `xmin` is the oldest transaction still
+/// open, so it passes the fence exactly when they have all ended. A fence
+/// already on the row is kept: an earlier attempt took it after the start
+/// commit too, and a later one would only wait longer.
+async fn fence_settled(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+) -> Result<FenceState, ChunkQueueError> {
+    let client = pool.get().await?;
+    let Some(row) = client
+        .query_opt(
+            "update backfill_chunks \
+             set fence_xid = coalesce(fence_xid, pg_current_xact_id()) \
+             where id = $1 and claimed_by = $2 \
+             returning fence_xid::text::bigint",
+            &[&chunk.id, &claimed_by],
+        )
+        .await?
+    else {
+        return Ok(FenceState::Superseded);
+    };
+    let fence: i64 = row.get(0);
+    let settled: bool = client
+        .query_one(
+            "select pg_snapshot_xmin(pg_current_snapshot()) > \
+                    (select fence_xid from backfill_chunks where id = $1)",
+            &[&chunk.id],
+        )
+        .await?
+        .get(0);
+    Ok(if settled {
+        FenceState::Settled
+    } else {
+        FenceState::Pending(fence)
+    })
+}
+
 /// Runs a claimed plan job (#625 F2, Q13): walks the source's primary key
 /// from the job's cursor, [`PLAN_BATCH`] boundaries at a time, each batch
 /// committed as `rederive` chunks together with the cursor's advance, so
@@ -2419,6 +2604,27 @@ async fn run_plan(
             }
         }
     }
+    // A seam-fed source's build waits for its fence before the walk, so
+    // before any chunk (F6).
+    if chunk.fields.is_none()
+        && cursor.is_none()
+        && catalog::is_definition_target(&**pool.get().await?, &definition.source_table).await?
+    {
+        match fence_settled(pool, chunk, claimed_by).await? {
+            FenceState::Settled => {}
+            FenceState::Pending(fence) => {
+                tracing::debug!(
+                    definition_id = chunk.definition_id,
+                    fence_xid = fence,
+                    "re-derive build waits for its fence before planning a chunk"
+                );
+                return defer_claim(pool, chunk, claimed_by, FENCE_RETRY).await;
+            }
+            FenceState::Superseded => {
+                return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+            }
+        }
+    }
     let mut client = pool.get().await?;
     loop {
         let started = Instant::now();
@@ -2461,6 +2667,13 @@ async fn run_plan(
         )
         .await?;
         if finished {
+            // The keys no range reaches (F6), in the transaction that ends
+            // the plan, so a plan that is done has staged them.
+            if chunk.fields.is_none() && buildable_shape(&definition).is_some() {
+                stage_null_keys(&txn, &definition.source_table, &pk)
+                    .await
+                    .map_err(build_error)?;
+            }
             txn.execute(
                 "update backfill_chunks set lo = $2, done = true, claimed_by = null, \
                      claimed_at = null, key_collations = $3 \
@@ -3058,8 +3271,9 @@ pub async fn settle_builds(pool: &Pool) {
     }
 }
 
-/// Whether `chunk`, just run, gave its claim back to wait on capture
-/// ([`defer_claim`]), which [`settle_builds`] doesn't count as progress.
+/// Whether `chunk`, just run, gave its claim back to wait on capture or on
+/// its fence ([`defer_claim`]), which [`settle_builds`] doesn't count as
+/// progress.
 #[cfg(any(test, feature = "internals"))]
 async fn deferred(pool: &Pool, chunk: &ClaimedChunk) -> bool {
     let client = pool.get().await.expect("acquire a connection");
@@ -3067,7 +3281,8 @@ async fn deferred(pool: &Pool, chunk: &ClaimedChunk) -> bool {
         .query_one(
             "select exists (select 1 from backfill_chunks \
              where id = $1 and not done and claimed_by is null and lo is null \
-               and fields is not null and next_attempt_at > now())",
+               and (fields is not null or fence_xid is not null) \
+               and next_attempt_at > now())",
             &[&chunk.id],
         )
         .await
@@ -3109,9 +3324,8 @@ mod tests {
     use super::*;
 
     /// Whether `text`'s ledger gets its `GROUP BY` index over a source of
-    /// `(id, g, v numeric, x float8)`, `source_is_target` saying whether
-    /// that source is another definition's target.
-    fn indexes_groups(text: &str, source_is_target: bool) -> bool {
+    /// `(id, g, v numeric, x float8)`.
+    fn indexes_groups(text: &str) -> bool {
         let def = crate::defs::parse(text).expect("parse");
         let columns: HashMap<String, ValueType> = [
             ("id", ValueType::Numeric),
@@ -3122,41 +3336,29 @@ mod tests {
         .into_iter()
         .map(|(c, t)| (c.to_string(), t))
         .collect();
-        ledger_indexes_groups(&def, &columns, source_is_target)
+        ledger_indexes_groups(&def, &columns)
     }
 
     /// #723: a target the Re-derive build takes, with only maintained
     /// fields, gets no `GROUP BY` index on its ledger. One with a recomputed
     /// field gets it, and so does one the Re-derive build doesn't take: a
-    /// source that is another definition's target, or a relationship-fed
-    /// target ([`buildable_shape`] has no relationships to route it with).
+    /// relationship-fed target ([`buildable_shape`] has no relationships to
+    /// route it with). A source that is another definition's target changes
+    /// nothing (#625 F6).
     #[test]
     fn only_an_invertible_re_derive_built_ledger_goes_without_its_group_index() {
         let invertible = "TRANSFORM t FROM src GROUP BY g \
                           SELECT SUM(v) AS total, AVG(v) AS mean, COUNT(v) AS nv, COUNT(*) AS n";
-        assert!(
-            !indexes_groups(invertible, false),
-            "invertible, Re-derive built"
-        );
+        assert!(!indexes_groups(invertible), "invertible, Re-derive built");
         for recomputed in [
             "TRANSFORM t FROM src GROUP BY g SELECT MAX(v) AS hi, COUNT(*) AS n",
             "TRANSFORM t FROM src GROUP BY g SELECT SUM(x) AS total",
             "TRANSFORM t FROM src GROUP BY g SELECT SUM(v) + COUNT(v) AS both",
         ] {
-            assert!(
-                indexes_groups(recomputed, false),
-                "recomputed: {recomputed}"
-            );
+            assert!(indexes_groups(recomputed), "recomputed: {recomputed}");
         }
         assert!(
-            indexes_groups(invertible, true),
-            "a seam-fed source: !qualifies"
-        );
-        assert!(
-            indexes_groups(
-                "TRANSFORM t FROM src GROUP BY g SELECT SUM(parent.w) AS total",
-                false
-            ),
+            indexes_groups("TRANSFORM t FROM src GROUP BY g SELECT SUM(parent.w) AS total"),
             "a relationship-fed target: !qualifies"
         );
     }
