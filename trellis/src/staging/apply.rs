@@ -1286,7 +1286,7 @@ async fn from_side_keys(
             }
             let client = pool.get().await?;
             let read = from_side_keys_read(&**client, from_table, from_pk, from_col).await?;
-            let rows = ReadConn::Pool(&**client)
+            let rows = ReadConn::Pool(&client)
                 .query(&read.sql, &[join_keys], read.indexed)
                 .await?;
             Ok(rows
@@ -1544,7 +1544,7 @@ pub(crate) async fn build_relationship_context(
     let evaluated: Vec<&Row> = rows.iter().chain(old_rows.iter()).flatten().collect();
     let ctx = {
         let client = pool.get().await?;
-        reads.fetch(&**client, &evaluated).await?
+        reads.fetch(&client, &evaluated).await?
     };
 
     let mut gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
