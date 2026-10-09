@@ -224,6 +224,12 @@ pub fn default_wake_channel(schema: &str) -> String {
 pub(crate) fn build_runtime(
     worker_threads: Option<usize>,
 ) -> std::io::Result<tokio::runtime::Runtime> {
+    runtime_builder(worker_threads)?.build()
+}
+
+/// [`build_runtime`]'s builder, before it builds, for a caller that adds
+/// hooks of its own ([`client_runtime`]).
+fn runtime_builder(worker_threads: Option<usize>) -> std::io::Result<tokio::runtime::Builder> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     if let Some(worker_threads) = worker_threads {
         if worker_threads == 0 {
@@ -235,7 +241,8 @@ pub(crate) fn build_runtime(
         }
         builder.worker_threads(worker_threads);
     }
-    builder.enable_all().build()
+    builder.enable_all();
+    Ok(builder)
 }
 
 /// The runtime [`Client::start_with_config`]'s background thread runs on,
@@ -246,8 +253,16 @@ pub(crate) fn build_runtime(
 /// is built on a plain OS thread and blocks until setup finishes, so it has
 /// to work with no ambient runtime, and its tasks stay off the caller's
 /// workers (a blocking wrapper's runtime services every call to the handle).
-fn client_runtime(options: &ClientOptions) -> std::io::Result<tokio::runtime::Runtime> {
-    build_runtime(options.worker_threads)
+///
+/// Each of its worker and blocking-pool threads logs under `instance` for its
+/// whole life (`crate::instance_log`), so every task spawned onto it does.
+fn client_runtime(
+    options: &ClientOptions,
+    instance: std::sync::Arc<str>,
+) -> std::io::Result<tokio::runtime::Runtime> {
+    runtime_builder(options.worker_threads)?
+        .on_thread_start(move || crate::instance_log::enter_thread(&instance))
+        .build()
 }
 
 /// The option checks [`Client::start_with_config`] runs before spawning
@@ -490,10 +505,15 @@ impl Client {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ClientError>>();
 
+        // Every thread of the client's runtime, and the one that drives it,
+        // logs under this instance (`crate::instance_log`), so each task
+        // spawned onto the runtime does too.
+        let instance = crate::instance_log::name_of(config.schema());
         let thread = std::thread::Builder::new()
             .name("trellis-client".to_string())
             .spawn(move || {
-                let runtime = match client_runtime(&options) {
+                crate::instance_log::enter_thread(&instance);
+                let runtime = match client_runtime(&options, instance) {
                     Ok(rt) => rt,
                     Err(err) => {
                         let _ = ready_tx.send(Err(ClientError::Spawn(err)));
@@ -868,7 +888,7 @@ async fn first_capture_pass(
 /// released.
 async fn release_retyped_keys(pool: &Pool) {
     if let Err(err) = staging::quarantine::release_retyped_keys(pool).await {
-        tracing::warn!(
+        crate::instance_log::warn!(
             error = %err,
             "couldn't release the keys held before an in-place re-type; retrying next pass"
         );
@@ -882,7 +902,7 @@ async fn release_retyped_keys(pool: &Pool) {
 /// reaches here.
 async fn complete_pause_cascades(pool: &Pool) {
     if let Err(err) = staging::quarantine::complete_pause_cascades(pool).await {
-        tracing::warn!(
+        crate::instance_log::warn!(
             error = %err,
             "couldn't read the column pauses owing a cascade; retrying next pass"
         );
@@ -1229,20 +1249,20 @@ impl StepFailures {
             || now.duration_since(entry.last_warned) >= STEP_FAILURE_WARN_INTERVAL
         {
             entry.last_warned = now;
-            tracing::warn!(
+            crate::instance_log::warn!(
                 step,
                 error = %error,
                 failures = entry.failures,
                 "maintenance step failed; retrying"
             );
         } else {
-            tracing::debug!(step, error = %error, failures = entry.failures, "maintenance step failed again");
+            crate::instance_log::debug!(step, error = %error, failures = entry.failures, "maintenance step failed again");
         }
     }
 
     fn succeeded(&mut self, step: &'static str) {
         if let Some(failing) = self.failing.remove(step) {
-            tracing::info!(
+            crate::instance_log::info!(
                 step,
                 failures = failing.failures,
                 "maintenance step recovered"
@@ -1328,7 +1348,7 @@ impl DrainFailures {
         };
         recent.last_seen = now;
         if first || now.duration_since(recent.last_warned) >= DRAIN_FAILURE_WARN_INTERVAL {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 error = %text,
                 class = ?class,
                 segments = ?seg_seqs,
@@ -1341,7 +1361,7 @@ impl DrainFailures {
             recent.last_warned = now;
         } else {
             recent.collapsed += 1;
-            tracing::debug!(
+            crate::instance_log::debug!(
                 error = %text,
                 class = ?class,
                 segments = ?seg_seqs,
@@ -1821,7 +1841,7 @@ async fn rederive_build_step(
     match staging::build::work_once(pool, claimed_by, options, merge_failures).await {
         Ok(step) => step.progressed(),
         Err(error) => {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 worker = %claimed_by,
                 error = %error,
                 "re-derive build step failed; retrying on the next pass"
@@ -1933,7 +1953,7 @@ async fn drain_backfill_chunks(
         // `fail_chunk` logs the failure and what it did about it (#616).
         Err(err) => {
             if let Err(fail_err) = chunk_queue::fail_chunk(pool, &chunk, claimed_by, &err).await {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     definition_id = chunk.definition_id,
                     chunk_id = chunk.id,
                     error = %err,
@@ -2050,14 +2070,14 @@ async fn keep_listening<Open, OpenFut, Session, E>(
                 delay = base;
                 let _ = tx.send(());
                 session.await;
-                tracing::warn!(
+                crate::instance_log::warn!(
                     retry_in = ?delay,
                     "wake listener's LISTEN connection closed; polling until it reopens"
                 );
                 tokio::time::sleep(delay).await;
             }
             Err(err) => {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     error = %err,
                     retry_in = ?delay,
                     "wake listener could not open its LISTEN connection; polling until it does"
@@ -2356,7 +2376,7 @@ pub(crate) mod log_capture {
     #[test]
     fn a_callsite_first_hit_on_an_uncaptured_thread_still_reaches_the_capture() {
         fn log() {
-            tracing::error!("callsite shared with an uncaptured thread");
+            crate::instance_log::error!("callsite shared with an uncaptured thread");
         }
 
         let (_guard, captured) = install_capture();
@@ -4035,7 +4055,7 @@ mod runtime_tests {
                 worker_threads: Some(n),
                 ..ClientOptions::default()
             };
-            let runtime = client_runtime(&options).expect("build runtime");
+            let runtime = client_runtime(&options, std::sync::Arc::from("app/t")).expect("build runtime");
             assert_eq!(runtime.handle().metrics().num_workers(), n);
         }
     }
@@ -4048,7 +4068,8 @@ mod runtime_tests {
             worker_threads: Some(0),
             ..ClientOptions::default()
         };
-        let err = client_runtime(&options).expect_err("zero workers must not build");
+        let err = client_runtime(&options, std::sync::Arc::from("app/t"))
+            .expect_err("zero workers must not build");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

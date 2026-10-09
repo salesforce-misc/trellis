@@ -192,6 +192,9 @@ pub struct Trellis {
     /// `Some` iff `options.staging || options.drain_threads > 0` — the live
     /// pipeline this connection started.
     client: Option<Client>,
+    /// The name this handle's log events carry as `trellis_instance`: its
+    /// catalog schema (see [`crate::instance_log`]).
+    instance: std::sync::Arc<str>,
 }
 
 impl Trellis {
@@ -212,6 +215,7 @@ impl Trellis {
             None
         };
         Ok(Self {
+            instance: crate::instance_log::name_of(config.schema()),
             config,
             pool,
             client,
@@ -257,9 +261,12 @@ impl Trellis {
     /// Applies Trellis's schema migrations. Idempotent — safe to call on
     /// every startup.
     pub async fn migrate(&self) -> Result<(), TrellisError> {
-        crate::migrate(&self.pool, &self.config)
-            .await
-            .map_err(TrellisError::Engine)
+        crate::instance_log::scoped(self.instance.clone(), async {
+            crate::migrate(&self.pool, &self.config)
+                .await
+                .map_err(TrellisError::Engine)
+        })
+        .await
     }
 
     /// **The** entrypoint for every definition-changing operation: parse one
@@ -366,37 +373,40 @@ impl Trellis {
     /// calculated field is an `ALTER TRANSFORM ... DROP <field>`, tracked
     /// separately (issues #241/#242), not a `DROP`.
     pub async fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
-        match defs::parse_statement(statement_text)? {
-            defs::Statement::DefineTransform(parsed) => {
-                let source_columns = self
-                    .source_columns(&parsed.source, parsed.explicit_source_schema.as_deref())
-                    .await?;
-                // Hands the *text* on rather than the `TransformDef` just
-                // parsed: `install_definition` persists `definition_text` as
-                // the definition's own record of itself (every later re-parse
-                // reads it back), so the text is the input it needs, not a
-                // redundant re-derivation of it.
-                let definition = defs::install_definition(
-                    &self.pool,
-                    statement_text,
-                    &source_columns,
-                    self.config.target_schema(),
-                )
-                .await
-                .map_err(TrellisError::Catalog)?;
-                Ok(Applied::TransformDefined(definition))
-            }
-            defs::Statement::DefineRelationship(_) => {
-                let relationship = defs::create_relationship(&self.pool, statement_text)
+        crate::instance_log::scoped(self.instance.clone(), async {
+            match defs::parse_statement(statement_text)? {
+                defs::Statement::DefineTransform(parsed) => {
+                    let source_columns = self
+                        .source_columns(&parsed.source, parsed.explicit_source_schema.as_deref())
+                        .await?;
+                    // Hands the *text* on rather than the `TransformDef` just
+                    // parsed: `install_definition` persists `definition_text` as
+                    // the definition's own record of itself (every later re-parse
+                    // reads it back), so the text is the input it needs, not a
+                    // redundant re-derivation of it.
+                    let definition = defs::install_definition(
+                        &self.pool,
+                        statement_text,
+                        &source_columns,
+                        self.config.target_schema(),
+                    )
                     .await
                     .map_err(TrellisError::Catalog)?;
-                Ok(Applied::RelationshipDefined(relationship))
+                    Ok(Applied::TransformDefined(definition))
+                }
+                defs::Statement::DefineRelationship(_) => {
+                    let relationship = defs::create_relationship(&self.pool, statement_text)
+                        .await
+                        .map_err(TrellisError::Catalog)?;
+                    Ok(Applied::RelationshipDefined(relationship))
+                }
+                defs::Statement::Pause(reference) => self.apply_pause(reference).await,
+                defs::Statement::Resume(reference) => self.apply_resume(reference).await,
+                defs::Statement::Drop(reference) => self.apply_drop(reference).await,
+                defs::Statement::AlterTransform(alter) => self.apply_alter(&alter).await,
             }
-            defs::Statement::Pause(reference) => self.apply_pause(reference).await,
-            defs::Statement::Resume(reference) => self.apply_resume(reference).await,
-            defs::Statement::Drop(reference) => self.apply_drop(reference).await,
-            defs::Statement::AlterTransform(alter) => self.apply_alter(&alter).await,
-        }
+        })
+        .await
     }
 
     /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
@@ -538,6 +548,7 @@ impl Trellis {
     /// and finds a [`DefinitionSummary::halt`] has a definition stopped until
     /// an operator fixes the cause and resumes it.
     pub async fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
+        crate::instance_log::scoped(self.instance.clone(), async {
         let mut client = self.pool.get().await?;
         // One repeatable-read transaction, so the reported statuses are
         // derived from the same catalog state the rows come from.
@@ -591,6 +602,8 @@ impl Trellis {
                 }
             })
             .collect())
+        })
+        .await
     }
 
     /// One registered transform definition's current [`TransformStatus`]
@@ -623,26 +636,27 @@ impl Trellis {
         &self,
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
-        let mut client = self.pool.get().await?;
-        // Issue #73: `transform_definitions.target_table` is persisted
-        // fully-qualified, but every caller here only ever has the bare name
-        // their `TRANSFORM <name> FROM ...` text declared — even once issue
-        // #76 taught the grammar an explicit `schema.table` spelling,
-        // `def.target` itself still always holds just the bare table name
-        // (see `defs::ast::TransformDef`'s own doc comment for why), so this
-        // API's callers never have anything but the bare name to poll with —
-        // match against `target_table`'s bare table-name suffix rather than
-        // the qualified column directly.
-        let txn = client
-            .build_transaction()
-            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
-        let row = txn
-            .query_opt(
-                &format!(
-                    "select d.status, d.id, d.source_table, d.definition_text, \
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let mut client = self.pool.get().await?;
+            // Issue #73: `transform_definitions.target_table` is persisted
+            // fully-qualified, but every caller here only ever has the bare name
+            // their `TRANSFORM <name> FROM ...` text declared — even once issue
+            // #76 taught the grammar an explicit `schema.table` spelling,
+            // `def.target` itself still always holds just the bare table name
+            // (see `defs::ast::TransformDef`'s own doc comment for why), so this
+            // API's callers never have anything but the bare name to poll with —
+            // match against `target_table`'s bare table-name suffix rather than
+            // the qualified column directly.
+            let txn = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()
+                .await?;
+            let row = txn
+                .query_opt(
+                    &format!(
+                        "select d.status, d.id, d.source_table, d.definition_text, \
                             pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                             pb.last_error as backfill_last_error, \
                             pb.next_attempt_at as backfill_next_attempt_at, \
@@ -668,61 +682,64 @@ impl Trellis {
                      {CHUNK_FAILURE_JOIN} \
                      left join capture_failures cf on cf.transform_id = d.id \
                      where split_part(d.target_table, '.', 2) = $1"
-                ),
-                &[&target_table],
-            )
-            .await?;
-        let mut status = None;
-        let mut holdup = (None, None);
-        let mut drain_failure = None;
-        let mut unindexed = Vec::new();
-        if let Some(row) = &row {
-            let status_text: String = row.get(0);
-            let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-                panic!("transform_definitions.status held unrecognized value '{status_text}'")
-            });
-            status = Some(reported_status(&*txn, row.get(1), stored).await?);
-            // #687: an edit whose new field awaits a widen is stuck on
-            // capture as much as a registration is. Not one a schema change
-            // paused (#705): capture stops widening for it, and its field
-            // waits for the resume its `capture_failure` asks for, not on
-            // the table's lock or install failure.
-            let capture_failed = row.get::<_, Option<String>>("capture_table").is_some();
-            if !capture_failed
-                && (stored == TransformStatus::WaitingToBackfill || row.get("awaiting_capture"))
-            {
-                holdup = self.capture_holdup(&*txn, row.get(2)).await?;
-            }
-            // #817: a page the drain keeps failing on, charged to no one,
-            // holds back every definition still applying what it reads.
-            if !stored.is_frozen() {
-                drain_failure = crate::staging::holdup::for_definition(
-                    &*txn,
-                    row.get("source_table"),
-                    row.get("definition_text"),
+                    ),
+                    &[&target_table],
                 )
                 .await?;
+            let mut status = None;
+            let mut holdup = (None, None);
+            let mut drain_failure = None;
+            let mut unindexed = Vec::new();
+            if let Some(row) = &row {
+                let status_text: String = row.get(0);
+                let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                    panic!("transform_definitions.status held unrecognized value '{status_text}'")
+                });
+                status = Some(reported_status(&*txn, row.get(1), stored).await?);
+                // #687: an edit whose new field awaits a widen is stuck on
+                // capture as much as a registration is. Not one a schema change
+                // paused (#705): capture stops widening for it, and its field
+                // waits for the resume its `capture_failure` asks for, not on
+                // the table's lock or install failure.
+                let capture_failed = row.get::<_, Option<String>>("capture_table").is_some();
+                if !capture_failed
+                    && (stored == TransformStatus::WaitingToBackfill || row.get("awaiting_capture"))
+                {
+                    holdup = self.capture_holdup(&*txn, row.get(2)).await?;
+                }
+                // #817: a page the drain keeps failing on, charged to no one,
+                // holds back every definition still applying what it reads.
+                if !stored.is_frozen() {
+                    drain_failure = crate::staging::holdup::for_definition(
+                        &*txn,
+                        row.get("source_table"),
+                        row.get("definition_text"),
+                    )
+                    .await?;
+                }
+                // #973: a stored definition always parses.
+                if let Ok(def) = crate::defs::parse(row.get("definition_text")) {
+                    unindexed =
+                        unindexed_joins::for_definition(&*txn, row.get("source_table"), &def)
+                            .await?;
+                }
             }
-            // #973: a stored definition always parses.
-            if let Ok(def) = crate::defs::parse(row.get("definition_text")) {
-                unindexed =
-                    unindexed_joins::for_definition(&*txn, row.get("source_table"), &def).await?;
-            }
-        }
-        txn.commit().await?;
-        let (capture_wait, stalled) = holdup;
-        Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
-            status,
-            backfill_failure: backfill_failure(&row),
-            capture_wait,
-            capture_failure: capture_failure(&row).or(stalled),
-            held_keys: quarantine::held_keys_from(row.get("held_count"), row.get("held_since")),
-            drain_failure,
-            unindexed_joins: unindexed,
-            build_wait: row
-                .get::<_, Option<i64>>("build_fence")
-                .map(|xid| BuildWait::Fence { xid }),
-        }))
+            txn.commit().await?;
+            let (capture_wait, stalled) = holdup;
+            Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
+                status,
+                backfill_failure: backfill_failure(&row),
+                capture_wait,
+                capture_failure: capture_failure(&row).or(stalled),
+                held_keys: quarantine::held_keys_from(row.get("held_count"), row.get("held_since")),
+                drain_failure,
+                unindexed_joins: unindexed,
+                build_wait: row
+                    .get::<_, Option<i64>>("build_fence")
+                    .map(|xid| BuildWait::Fence { xid }),
+            }))
+        })
+        .await
     }
 
     /// What holds up the capture a definition sourced from `source_table`
@@ -775,30 +792,33 @@ impl Trellis {
 
     /// Every registered relationship declaration, oldest first.
     pub async fn relationships(&self) -> Result<Vec<RelationshipSummary>, TrellisError> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                "select id, name, from_schema, from_table, from_col, to_schema, to_table, \
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let client = self.pool.get().await?;
+            let rows = client
+                .query(
+                    "select id, name, from_schema, from_table, from_col, to_schema, to_table, \
                  to_col, cardinality, created_at \
                  from relationship_definitions order by id",
-                &[],
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| RelationshipSummary {
-                id: row.get(0),
-                name: row.get(1),
-                from_schema: row.get(2),
-                from_table: row.get(3),
-                from_col: row.get(4),
-                to_schema: row.get(5),
-                to_table: row.get(6),
-                to_col: row.get(7),
-                cardinality: row.get(8),
-                created_at: row.get(9),
-            })
-            .collect())
+                    &[],
+                )
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| RelationshipSummary {
+                    id: row.get(0),
+                    name: row.get(1),
+                    from_schema: row.get(2),
+                    from_table: row.get(3),
+                    from_col: row.get(4),
+                    to_schema: row.get(5),
+                    to_table: row.get(6),
+                    to_col: row.get(7),
+                    cardinality: row.get(8),
+                    created_at: row.get(9),
+                })
+                .collect())
+        })
+        .await
     }
 
     /// Re-reads `source_table` for every applying definition that reads it,
@@ -833,46 +853,51 @@ impl Trellis {
     /// reader yet and the discharge dispatches no definition whose capture
     /// isn't current. The running staging worker discharges the marker.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
-        let mut client = self.pool.get().await?;
-        // The first schema on the path with the table, as define resolves a
-        // bare name. A table the role can't use doesn't resolve, and is
-        // refused as such rather than as not found (issue #933).
-        let Some(schema_row) = client
-            .query_opt(
-                "select table_schema from information_schema.tables \
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let mut client = self.pool.get().await?;
+            // The first schema on the path with the table, as define resolves a
+            // bare name. A table the role can't use doesn't resolve, and is
+            // refused as such rather than as not found (issue #933).
+            let Some(schema_row) = client
+                .query_opt(
+                    "select table_schema from information_schema.tables \
                  where table_name = $1 and table_schema = any(current_schemas(false)) \
                  order by array_position(current_schemas(false), table_schema) \
                  limit 1",
-                &[&source_table],
+                    &[&source_table],
+                )
+                .await?
+            else {
+                defs::catalog::reject_inaccessible_table(&**client, None, source_table).await?;
+                return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
+            };
+            let schema: String = schema_row.get(0);
+            let qualified = format!("{schema}.{source_table}");
+
+            let captured = crate::defs::tables_to_capture(&self.pool)
+                .await?
+                .contains(&qualified);
+            if !captured {
+                return Err(TrellisError::TableNotCaptured { table: qualified });
+            }
+
+            // A failure to park is a plain `Db` error.
+            let txn = client.transaction().await?;
+            let rebuilt = crate::intake::markers::park_table_catch_ups(
+                &*txn,
+                std::slice::from_ref(&qualified),
             )
-            .await?
-        else {
-            defs::catalog::reject_inaccessible_table(&**client, None, source_table).await?;
-            return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
-        };
-        let schema: String = schema_row.get(0);
-        let qualified = format!("{schema}.{source_table}");
-
-        let captured = crate::defs::tables_to_capture(&self.pool)
-            .await?
-            .contains(&qualified);
-        if !captured {
-            return Err(TrellisError::TableNotCaptured { table: qualified });
-        }
-
-        // A failure to park is a plain `Db` error.
-        let txn = client.transaction().await?;
-        let rebuilt =
-            crate::intake::markers::park_table_catch_ups(&*txn, std::slice::from_ref(&qualified))
-                .await
-                .map_err(|err| match err {
-                    IntakeError::Db(err) => TrellisError::Db(err),
-                    IntakeError::Catalog(err) => TrellisError::Catalog(*err),
-                    err => TrellisError::Client(ClientError::Intake(err)),
-                })?;
-        crate::staging::build::stamp_rebuild_seg(&*txn, &rebuilt).await?;
-        txn.commit().await?;
-        Ok(())
+            .await
+            .map_err(|err| match err {
+                IntakeError::Db(err) => TrellisError::Db(err),
+                IntakeError::Catalog(err) => TrellisError::Catalog(*err),
+                err => TrellisError::Client(ClientError::Intake(err)),
+            })?;
+            crate::staging::build::stamp_rebuild_seg(&*txn, &rebuilt).await?;
+            txn.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Poison-quarantine entries recorded since `watermark`, oldest first —
@@ -884,26 +909,29 @@ impl Trellis {
         &self,
         watermark: SystemTime,
     ) -> Result<Vec<PoisonEntry>, TrellisError> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                "select split_part(d.target_table, '.', 2), p.src_table, p.key, p.last_error, \
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let client = self.pool.get().await?;
+            let rows = client
+                .query(
+                    "select split_part(d.target_table, '.', 2), p.src_table, p.key, p.last_error, \
                         p.poisoned_at \
                  from poison p join transform_definitions d on d.id = p.transform_id \
                  where p.poisoned_at > $1 order by p.poisoned_at, d.id",
-                &[&watermark],
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| PoisonEntry {
-                transform: row.get(0),
-                src_table: row.get(1),
-                key: row.get(2),
-                last_error: row.get(3),
-                poisoned_at: row.get(4),
-            })
-            .collect())
+                    &[&watermark],
+                )
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| PoisonEntry {
+                    transform: row.get(0),
+                    src_table: row.get(1),
+                    key: row.get(2),
+                    last_error: row.get(3),
+                    poisoned_at: row.get(4),
+                })
+                .collect())
+        })
+        .await
     }
 
     /// Every currently paused/quarantined target, across every transform —
@@ -913,51 +941,54 @@ impl Trellis {
     /// join against poisoned-row detail. The read a dashboard/health-check
     /// polls.
     pub async fn quarantined(&self) -> Result<Vec<QuarantineEntry>, TrellisError> {
-        let client = self.pool.get().await?;
-        let mut entries = Vec::new();
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let client = self.pool.get().await?;
+            let mut entries = Vec::new();
 
-        // Issue #73: read back the bare table-name suffix, not the persisted
-        // fully-qualified `target_table` — `QuarantineTarget::Transform`
-        // round-trips through `docs/decisions/0003`'s `transform.column`
-        // addressing scheme elsewhere in this API (`quarantine_status`,
-        // `resume_column`, `sample_quarantined`, all keyed on the bare name
-        // the grammar accepts back), which parses an address on its first
-        // `.` — handing it a qualified `"schema.table"` spelling here would
-        // make every entry in this list misparse as a column address the
-        // moment a target table lived outside the default schema.
-        let quarantined_transforms = client
-            .query(
-                "select split_part(target_table, '.', 2) from transform_definitions \
+            // Issue #73: read back the bare table-name suffix, not the persisted
+            // fully-qualified `target_table` — `QuarantineTarget::Transform`
+            // round-trips through `docs/decisions/0003`'s `transform.column`
+            // addressing scheme elsewhere in this API (`quarantine_status`,
+            // `resume_column`, `sample_quarantined`, all keyed on the bare name
+            // the grammar accepts back), which parses an address on its first
+            // `.` — handing it a qualified `"schema.table"` spelling here would
+            // make every entry in this list misparse as a column address the
+            // moment a target table lived outside the default schema.
+            let quarantined_transforms = client
+                .query(
+                    "select split_part(target_table, '.', 2) from transform_definitions \
                  where status = 'quarantined' order by target_table",
-                &[],
-            )
-            .await?;
-        entries.extend(
-            quarantined_transforms
-                .into_iter()
-                .map(|row| QuarantineEntry {
-                    target: QuarantineTarget::Transform(row.get(0)),
-                    state: QuarantineState::Quarantined,
-                    paused_at: None,
-                    last_error: None,
-                }),
-        );
+                    &[],
+                )
+                .await?;
+            entries.extend(
+                quarantined_transforms
+                    .into_iter()
+                    .map(|row| QuarantineEntry {
+                        target: QuarantineTarget::Transform(row.get(0)),
+                        state: QuarantineState::Quarantined,
+                        paused_at: None,
+                        last_error: None,
+                    }),
+            );
 
-        let paused_columns = client
-            .query(
-                "select transform_table, column_name, paused_at, last_error from column_status \
+            let paused_columns = client
+                .query(
+                    "select transform_table, column_name, paused_at, last_error from column_status \
                  order by transform_table, column_name",
-                &[],
-            )
-            .await?;
-        entries.extend(paused_columns.into_iter().map(|row| QuarantineEntry {
-            target: QuarantineTarget::Column(row.get(0), row.get(1)),
-            state: QuarantineState::Paused,
-            paused_at: Some(row.get(2)),
-            last_error: row.get(3),
-        }));
+                    &[],
+                )
+                .await?;
+            entries.extend(paused_columns.into_iter().map(|row| QuarantineEntry {
+                target: QuarantineTarget::Column(row.get(0), row.get(1)),
+                state: QuarantineState::Paused,
+                paused_at: Some(row.get(2)),
+                last_error: row.get(3),
+            }));
 
-        Ok(entries)
+            Ok(entries)
+        })
+        .await
     }
 
     /// The current state of one target (`transform` or `transform.column`,
@@ -971,73 +1002,76 @@ impl Trellis {
     /// whether the name is real, matching "no rows here means live" for
     /// every column not individually tracked).
     pub async fn quarantine_status(&self, target: &str) -> Result<QuarantineEntry, TrellisError> {
-        let target = QuarantineTarget::parse(target);
-        let client = self.pool.get().await?;
-        match &target {
-            QuarantineTarget::Transform(t) => {
-                // Issue #73: `t` is the bare name `QuarantineTarget::parse`
-                // extracted from the caller's address — match against
-                // `target_table`'s bare table-name suffix, not the persisted
-                // qualified column (see `status`'s own call site for the
-                // same reasoning).
-                let row = client
-                    .query_opt(
-                        "select status, id from transform_definitions \
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let target = QuarantineTarget::parse(target);
+            let client = self.pool.get().await?;
+            match &target {
+                QuarantineTarget::Transform(t) => {
+                    // Issue #73: `t` is the bare name `QuarantineTarget::parse`
+                    // extracted from the caller's address — match against
+                    // `target_table`'s bare table-name suffix, not the persisted
+                    // qualified column (see `status`'s own call site for the
+                    // same reasoning).
+                    let row = client
+                        .query_opt(
+                            "select status, id from transform_definitions \
                          where split_part(target_table, '.', 2) = $1",
-                        &[t],
-                    )
-                    .await?
-                    .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
-                let status_text: String = row.get(0);
-                let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                            &[t],
+                        )
+                        .await?
+                        .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
+                    let status_text: String = row.get(0);
+                    let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                     panic!("transform_definitions.status held unrecognized value '{status_text}'")
                 });
-                // The status `Trellis::status` reports (issue #497).
-                let status = reported_status(&**client, row.get(1), stored).await?;
-                Ok(QuarantineEntry {
-                    target,
-                    state: QuarantineState::from(status),
-                    paused_at: None,
-                    last_error: None,
-                })
-            }
-            QuarantineTarget::Column(t, c) => {
-                // Issue #73: same bare-suffix match as the `Transform` arm
-                // above — `t` is bare, `target_table` is qualified.
-                let transform_exists: bool = client
-                    .query_one(
-                        "select exists(select 1 from transform_definitions \
-                         where split_part(target_table, '.', 2) = $1)",
-                        &[t],
-                    )
-                    .await?
-                    .get(0);
-                if !transform_exists {
-                    return Err(TrellisError::TransformNotFound(t.clone()));
-                }
-                let row = client
-                    .query_opt(
-                        "select paused_at, last_error from column_status \
-                         where transform_table = $1 and column_name = $2",
-                        &[t, c],
-                    )
-                    .await?;
-                Ok(match row {
-                    Some(row) => QuarantineEntry {
+                    // The status `Trellis::status` reports (issue #497).
+                    let status = reported_status(&**client, row.get(1), stored).await?;
+                    Ok(QuarantineEntry {
                         target,
-                        state: QuarantineState::Paused,
-                        paused_at: Some(row.get(0)),
-                        last_error: row.get(1),
-                    },
-                    None => QuarantineEntry {
-                        target,
-                        state: QuarantineState::Live,
+                        state: QuarantineState::from(status),
                         paused_at: None,
                         last_error: None,
-                    },
-                })
+                    })
+                }
+                QuarantineTarget::Column(t, c) => {
+                    // Issue #73: same bare-suffix match as the `Transform` arm
+                    // above — `t` is bare, `target_table` is qualified.
+                    let transform_exists: bool = client
+                        .query_one(
+                            "select exists(select 1 from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1)",
+                            &[t],
+                        )
+                        .await?
+                        .get(0);
+                    if !transform_exists {
+                        return Err(TrellisError::TransformNotFound(t.clone()));
+                    }
+                    let row = client
+                        .query_opt(
+                            "select paused_at, last_error from column_status \
+                         where transform_table = $1 and column_name = $2",
+                            &[t, c],
+                        )
+                        .await?;
+                    Ok(match row {
+                        Some(row) => QuarantineEntry {
+                            target,
+                            state: QuarantineState::Paused,
+                            paused_at: Some(row.get(0)),
+                            last_error: row.get(1),
+                        },
+                        None => QuarantineEntry {
+                            target,
+                            state: QuarantineState::Live,
+                            paused_at: None,
+                            last_error: None,
+                        },
+                    })
+                }
             }
-        }
+        })
+        .await
     }
 
     /// A paginated batch of `(src_table, key, error_message)` triples for
@@ -1060,78 +1094,81 @@ impl Trellis {
         after: Option<(String, String)>,
         limit: i64,
     ) -> Result<Vec<PoisonSample>, TrellisError> {
-        let target = QuarantineTarget::parse(target);
-        let client = self.pool.get().await?;
-        let rows = match &target {
-            QuarantineTarget::Column(t, c) => match &after {
-                Some((after_src, after_key)) => {
-                    client
-                        .query(
-                            "select src_table, key, error from column_failures \
-                             where transform_table = $1 and column_name = $2 \
-                               and (src_table, key) > ($3, $4) \
-                             order by src_table, key limit $5",
-                            &[t, c, after_src, after_key, &limit],
-                        )
-                        .await?
-                }
-                None => {
-                    client
-                        .query(
-                            "select src_table, key, error from column_failures \
-                             where transform_table = $1 and column_name = $2 \
-                             order by src_table, key limit $3",
-                            &[t, c, &limit],
-                        )
-                        .await?
-                }
-            },
-            QuarantineTarget::Transform(t) => {
-                // Issue #73: `t` is bare — same `split_part` match as
-                // `status`/`quarantine_status`. Whole-key poison is per
-                // transform (#799), so the sample is this definition's own
-                // rows, whatever spelling of its source they carry.
-                let id: i64 = client
-                    .query_opt(
-                        "select id from transform_definitions \
-                         where split_part(target_table, '.', 2) = $1",
-                        &[t],
-                    )
-                    .await?
-                    .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?
-                    .get(0);
-                match &after {
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let target = QuarantineTarget::parse(target);
+            let client = self.pool.get().await?;
+            let rows = match &target {
+                QuarantineTarget::Column(t, c) => match &after {
                     Some((after_src, after_key)) => {
                         client
                             .query(
-                                "select src_table, key, last_error from poison \
-                                 where transform_id = $1 and (src_table, key) > ($2, $3) \
-                                 order by src_table, key limit $4",
-                                &[&id, after_src, after_key, &limit],
+                                "select src_table, key, error from column_failures \
+                             where transform_table = $1 and column_name = $2 \
+                               and (src_table, key) > ($3, $4) \
+                             order by src_table, key limit $5",
+                                &[t, c, after_src, after_key, &limit],
                             )
                             .await?
                     }
                     None => {
                         client
                             .query(
-                                "select src_table, key, last_error from poison \
-                                 where transform_id = $1 \
-                                 order by src_table, key limit $2",
-                                &[&id, &limit],
+                                "select src_table, key, error from column_failures \
+                             where transform_table = $1 and column_name = $2 \
+                             order by src_table, key limit $3",
+                                &[t, c, &limit],
                             )
                             .await?
                     }
+                },
+                QuarantineTarget::Transform(t) => {
+                    // Issue #73: `t` is bare — same `split_part` match as
+                    // `status`/`quarantine_status`. Whole-key poison is per
+                    // transform (#799), so the sample is this definition's own
+                    // rows, whatever spelling of its source they carry.
+                    let id: i64 = client
+                        .query_opt(
+                            "select id from transform_definitions \
+                         where split_part(target_table, '.', 2) = $1",
+                            &[t],
+                        )
+                        .await?
+                        .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?
+                        .get(0);
+                    match &after {
+                        Some((after_src, after_key)) => {
+                            client
+                                .query(
+                                    "select src_table, key, last_error from poison \
+                                 where transform_id = $1 and (src_table, key) > ($2, $3) \
+                                 order by src_table, key limit $4",
+                                    &[&id, after_src, after_key, &limit],
+                                )
+                                .await?
+                        }
+                        None => {
+                            client
+                                .query(
+                                    "select src_table, key, last_error from poison \
+                                 where transform_id = $1 \
+                                 order by src_table, key limit $2",
+                                    &[&id, &limit],
+                                )
+                                .await?
+                        }
+                    }
                 }
-            }
-        };
-        Ok(rows
-            .into_iter()
-            .map(|row| PoisonSample {
-                src_table: row.get(0),
-                key: row.get(1),
-                error_message: row.get(2),
-            })
-            .collect())
+            };
+            Ok(rows
+                .into_iter()
+                .map(|row| PoisonSample {
+                    src_table: row.get(0),
+                    key: row.get(1),
+                    error_message: row.get(2),
+                })
+                .collect())
+        })
+        .await
     }
 
     /// Releases one key `transform` holds in quarantine
@@ -1174,23 +1211,29 @@ impl Trellis {
         source_table: &str,
         key: &str,
     ) -> Result<(), TrellisError> {
-        match quarantine::release_key(&self.pool, transform, source_table, key).await {
-            Ok(_) => Ok(()),
-            Err(ApplyError::TransformNotFound { transform }) => {
-                Err(TrellisError::TransformNotFound(transform))
+        crate::instance_log::scoped(self.instance.clone(), async {
+            match quarantine::release_key(&self.pool, transform, source_table, key).await {
+                Ok(_) => Ok(()),
+                Err(ApplyError::TransformNotFound { transform }) => {
+                    Err(TrellisError::TransformNotFound(transform))
+                }
+                Err(err) => Err(TrellisError::Apply(err)),
             }
-            Err(err) => Err(TrellisError::Apply(err)),
-        }
+        })
+        .await
     }
 
     /// Stops any background work this connection started (staging worker and
     /// drain workers) and waits for it to exit cleanly. A no-op for a
     /// connection that started none.
     pub async fn shutdown(self) -> Result<(), TrellisError> {
-        if let Some(client) = self.client {
-            client.shutdown().await.map_err(TrellisError::Client)?;
-        }
-        Ok(())
+        crate::instance_log::scoped(self.instance, async move {
+            if let Some(client) = self.client {
+                client.shutdown().await.map_err(TrellisError::Client)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Whether at least one live drain worker (a connection running with
@@ -1229,8 +1272,11 @@ impl Trellis {
     /// the all-`drain_threads: 0` fleet this method exists to catch, since
     /// nothing in such a fleet would ever run one.
     pub async fn has_live_drain_workers(&self) -> Result<bool, TrellisError> {
-        let client = self.pool.get().await?;
-        Ok(worker_registry::has_live_workers(&**client, DEFAULT_RECLAIM_TTL).await?)
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let client = self.pool.get().await?;
+            Ok(worker_registry::has_live_workers(&**client, DEFAULT_RECLAIM_TTL).await?)
+        })
+        .await
     }
 
     /// Whether this instance's staging worker (a connection running with
@@ -1258,8 +1304,14 @@ impl Trellis {
     /// triggers in the application's own transactions meanwhile (issue #622),
     /// but nothing seals or dispatches a backfill.
     pub async fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
-        let client = self.pool.get().await?;
-        Ok(crate::staging::session::producer_is_running(&**client, self.config.schema()).await?)
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let client = self.pool.get().await?;
+            Ok(
+                crate::staging::session::producer_is_running(&**client, self.config.schema())
+                    .await?,
+            )
+        })
+        .await
     }
 
     /// A read-your-writes watermark (issue #192): `pg_current_wal_insert_lsn()`,
@@ -1296,8 +1348,11 @@ impl Trellis {
     /// # }
     /// ```
     pub async fn watermark_token(&self) -> Result<PgLsn, TrellisError> {
-        let client = self.pool.get().await?;
-        Ok(converge::watermark_token(&**client).await?)
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let client = self.pool.get().await?;
+            Ok(converge::watermark_token(&**client).await?)
+        })
+        .await
     }
 
     /// Blocks until every effect committed at or before `token` (see
@@ -1342,8 +1397,11 @@ impl Trellis {
         token: PgLsn,
         timeout: Duration,
     ) -> Result<(), TrellisError> {
-        let client = self.pool.get().await?;
-        Ok(converge::await_converged(&client, token, timeout).await?)
+        crate::instance_log::scoped(self.instance.clone(), async {
+            let client = self.pool.get().await?;
+            Ok(converge::await_converged(&client, token, timeout).await?)
+        })
+        .await
     }
 
     /// Audits one target's persisted rows against an independently-rendered
@@ -1395,9 +1453,12 @@ impl Trellis {
         mode: SelfCheckMode,
         timeout: Duration,
     ) -> Result<SelfCheckReport, TrellisError> {
-        crate::staging::self_check::self_check(&self.pool, target_table, scope, mode, timeout)
-            .await
-            .map_err(TrellisError::SelfCheck)
+        crate::instance_log::scoped(self.instance.clone(), async {
+            crate::staging::self_check::self_check(&self.pool, target_table, scope, mode, timeout)
+                .await
+                .map_err(TrellisError::SelfCheck)
+        })
+        .await
     }
 
     /// The [`ClientOptions`] a connection's background [`Client`] runs with:

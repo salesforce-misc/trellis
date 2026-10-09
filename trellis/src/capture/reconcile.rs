@@ -244,7 +244,7 @@ pub async fn reconcile(
         match install::reconcile(client, schema, &spec, Some(deadline)).await {
             Ok(Progress::Done(action)) => {
                 if action != CaptureAction::Unchanged {
-                    tracing::info!(table = %table, action = ?action, "capture reconciled");
+                    crate::instance_log::info!(table = %table, action = ?action, "capture reconciled");
                 }
                 forget_report(instance, table);
                 outcome.captured.insert(table.clone());
@@ -252,7 +252,7 @@ pub async fn reconcile(
             Ok(Progress::Waiting(wait)) => {
                 let wait = remember_wait(&*client, *wait).await?;
                 report(instance, table, wait.operation.as_str(), || {
-                    tracing::info!(table = %table, "{wait}; retrying next pass");
+                    crate::instance_log::info!(table = %table, "{wait}; retrying next pass");
                 });
                 outcome.waiting.push(wait);
             }
@@ -325,14 +325,14 @@ pub async fn reconcile(
         match install::uninstall(client, schema, table, Some(deadline)).await {
             Ok(Progress::Done(removed)) => {
                 if removed {
-                    tracing::info!(table = %table, "capture uninstalled: nothing reads the table");
+                    crate::instance_log::info!(table = %table, "capture uninstalled: nothing reads the table");
                 }
                 forget_report(instance, table);
             }
             Ok(Progress::Waiting(wait)) => {
                 let wait = remember_wait(&*client, *wait).await?;
                 report(instance, table, wait.operation.as_str(), || {
-                    tracing::info!(table = %table, "{wait}; retrying next pass");
+                    crate::instance_log::info!(table = %table, "{wait}; retrying next pass");
                 });
                 outcome.waiting.push(wait);
             }
@@ -351,7 +351,7 @@ pub async fn reconcile(
         remember_failure(&*client, table, err).await?;
         let text = err.to_string();
         report(instance, table, &text, || {
-            tracing::warn!(table = %table, error = %err, "capture of a source table failed; retrying next pass");
+            crate::instance_log::warn!(table = %table, error = %err, "capture of a source table failed; retrying next pass");
         });
     }
 
@@ -635,7 +635,7 @@ fn report(instance: &str, table: &str, what: &str, log: impl FnOnce()) {
     if due {
         log();
     } else {
-        tracing::debug!(table = %table, "{what}; still retrying");
+        crate::instance_log::debug!(table = %table, "{what}; still retrying");
     }
 }
 

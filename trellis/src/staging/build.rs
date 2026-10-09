@@ -518,7 +518,7 @@ pub async fn run_chunk(
         &ledger.target,
     )
     .await?;
-    tracing::debug!(
+    crate::instance_log::debug!(
         target_table = %ledger.target,
         keys = keys.len(),
         delta_rows,
@@ -712,7 +712,7 @@ pub async fn sweep_batch(
         metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
         delta_rows += row.get::<_, i64>(1);
     }
-    tracing::debug!(
+    crate::instance_log::debug!(
         target_table = %ledger.target,
         scanned,
         rederived = keys.len(),
@@ -1212,7 +1212,7 @@ pub async fn start_ready_builds(
             continue;
         }
         if capture_gate_holds(&*client, &definition.source_table).await? {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 definition_id = id,
                 table = %definition.source_table,
                 "re-derive build held by its source's capture gate"
@@ -1221,7 +1221,7 @@ pub async fn start_ready_builds(
             continue;
         }
         if awaits_capture(&*client, &definition).await? {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 definition_id = id,
                 table = %definition.source_table,
                 "re-derive build held until its source's capture images an edited field's column"
@@ -1243,7 +1243,7 @@ pub async fn start_ready_builds(
             // as one held by its capture gate does. The rest of the pass
             // goes on.
             Err(ApplyError::ColumnPauseLockTimeout(err)) => {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     definition_id = id,
                     error = %err,
                     "re-derive build start waited out the column-pause lock; retrying next pass"
@@ -1370,12 +1370,12 @@ pub(crate) async fn resume_released_dependents(
         return;
     }
     match quarantine::resume_pairs(pool, target, dependents.clone().into()).await {
-        Ok(resumed) => tracing::info!(
+        Ok(resumed) => crate::instance_log::info!(
             target,
             ?resumed,
             "readers of a field released from its pause resumed"
         ),
-        Err(err) => tracing::warn!(
+        Err(err) => crate::instance_log::warn!(
             target,
             ?dependents,
             error = %err,
@@ -1529,7 +1529,7 @@ async fn start(
     )
     .await?;
     txn.commit().await?;
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id = definition.id,
         target = %definition.target_table,
         from = %TransformStatus::WaitingToBackfill.as_str(),
@@ -1661,7 +1661,7 @@ pub(crate) async fn start_rebuilds(
     )
     .await?;
     if !moved.is_empty() {
-        tracing::info!(
+        crate::instance_log::info!(
             ids = ?moved,
             from = %TransformStatus::Live.as_str(),
             to = %TransformStatus::Backfilling.as_str(),
@@ -1739,7 +1739,7 @@ pub(crate) async fn start_field_build(
     } else {
         status
     };
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id = id,
         from = %status.as_str(),
         to = %to.as_str(),
@@ -1839,7 +1839,7 @@ async fn field_build_ready(
     let dependents = release_awaiting_capture(&*txn, &definition.def.target, Some(fields)).await?;
     txn.commit().await?;
     resume_released_dependents(pool, &definition.def.target, dependents).await;
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id = definition.id,
         ?fields,
         "field build's capture is ready; its fields apply from here"
@@ -2229,7 +2229,7 @@ pub async fn run_claimed(
         metrics::increment_build_chunk_lock_timeouts();
     }
     if let Err(fail_err) = chunk_queue::fail_chunk(pool, chunk, claimed_by, &err).await {
-        tracing::warn!(
+        crate::instance_log::warn!(
             definition_id = chunk.definition_id,
             chunk_id = chunk.id,
             error = %err,
@@ -2307,7 +2307,7 @@ async fn run_rederive(
     if plan.edits_change_it() && !hold_plan_epoch(&*txn, &fence, chunk.definition_id, epoch).await?
     {
         txn.rollback().await?;
-        tracing::debug!(
+        crate::instance_log::debug!(
             definition_id = chunk.definition_id,
             chunk_id = chunk.id,
             "build chunk planned before an edit to its definition; planning it again"
@@ -2792,7 +2792,7 @@ async fn run_plan(
         match fence_settled(pool, chunk, claimed_by).await? {
             FenceState::Settled => {}
             FenceState::Pending(fence) => {
-                tracing::debug!(
+                crate::instance_log::debug!(
                     definition_id = chunk.definition_id,
                     fence_xid = fence,
                     "re-derive build waits for its fence before planning a chunk"
@@ -2870,7 +2870,7 @@ async fn run_plan(
         txn.commit().await?;
         metrics::record_build_statement(BuildStatement::Plan, started.elapsed());
         if finished {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 definition_id = chunk.definition_id,
                 "re-derive build planned its last chunk"
             );
@@ -2934,7 +2934,7 @@ async fn run_sweep(
             && !hold_plan_epoch(&*txn, &fence, chunk.definition_id, epoch).await?
         {
             txn.rollback().await?;
-            tracing::debug!(
+            crate::instance_log::debug!(
                 definition_id = chunk.definition_id,
                 "re-derive sweep planned before an edit to its definition; planning it again"
             );
@@ -2970,7 +2970,7 @@ async fn run_sweep(
             u64::try_from(outcome.delta_rows).unwrap_or(0),
         );
         if outcome.finished {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 definition_id = chunk.definition_id,
                 "re-derive build swept the last of its ledger"
             );
@@ -3038,7 +3038,7 @@ async fn merge_once(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
         let started = Instant::now();
         let deltas = &plan.ledger.deltas_ident;
         if let Err(err) = vacuum_deltas(&**client, deltas).await {
-            tracing::debug!(table = %deltas, error = %err, "vacuuming a group-delta table failed");
+            crate::instance_log::debug!(table = %deltas, error = %err, "vacuuming a group-delta table failed");
         }
         metrics::record_build_statement(BuildStatement::MergeVacuum, started.elapsed());
     }
@@ -3070,7 +3070,7 @@ async fn merge_retrying(pool: &Pool, id: i64) -> Result<i64, ChunkQueueError> {
                 if retries < MERGE_TRANSIENT_RETRIES
                     && super::quarantine::is_transient_error(&err) =>
             {
-                tracing::debug!(
+                crate::instance_log::debug!(
                     definition_id = id, error = %err, retry = retries + 1,
                     "group-delta merge failed transiently; retrying it"
                 );
@@ -3176,7 +3176,7 @@ async fn fail_merge(
         match super::halt::halt_failed_merge(pool, target, true, &err.to_string()).await {
             Ok(paused) if !paused.is_empty() => {
                 failures.succeeded(id);
-                tracing::warn!(
+                crate::instance_log::warn!(
                     definition_id = id, target = %target, paused = ?paused, error = %err,
                     "group-delta merge was refused; paused the definitions the refusal reaches \
                      (resume them once the cause is fixed)"
@@ -3184,7 +3184,7 @@ async fn fail_merge(
                 return;
             }
             Ok(_) => {}
-            Err(halt_err) => tracing::warn!(
+            Err(halt_err) => crate::instance_log::warn!(
                 definition_id = id, target = %target, error = %err, halt_error = %halt_err,
                 "group-delta merge was refused, and halting on it failed"
             ),
@@ -3195,7 +3195,7 @@ async fn fail_merge(
         match super::halt::halt_failed_merge(pool, target, false, &err.to_string()).await {
             Ok(paused) => {
                 failures.succeeded(id);
-                tracing::warn!(
+                crate::instance_log::warn!(
                     definition_id = id, target = %target, attempt = failure.attempts,
                     max_charged = chunk_queue::MAX_CHARGED_ATTEMPTS, paused = ?paused,
                     error = %err,
@@ -3204,13 +3204,13 @@ async fn fail_merge(
                 );
                 return;
             }
-            Err(halt_err) => tracing::warn!(
+            Err(halt_err) => crate::instance_log::warn!(
                 definition_id = id, target = %target, error = %err, halt_error = %halt_err,
                 "group-delta merge kept failing, and pausing its definition failed"
             ),
         }
     }
-    tracing::warn!(
+    crate::instance_log::warn!(
         definition_id = id, target = %target, transient, attempt = failure.attempts,
         charged = failure.charged, max_charged = chunk_queue::MAX_CHARGED_ATTEMPTS,
         next_attempt_in_secs = delay.as_secs_f64(), error = %err,
@@ -3299,7 +3299,7 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
     )
     .await?;
     txn.commit().await?;
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id = id,
         from = %TransformStatus::Backfilling.as_str(),
         to = %TransformStatus::Live.as_str(),

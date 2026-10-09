@@ -26,7 +26,8 @@
 //! - **Events only.** Spans are disabled. The engine opens a span per drained
 //!   batch (`staging.drain_once`), and recording those for a logger that
 //!   never prints them would put a registry allocation on the drain hot
-//!   path. An event's own fields carry its context.
+//!   path. An event's own fields carry its context: every engine event names
+//!   its instance in a `trellis_instance` field.
 //! - **Filtered at the callsite.** [`LogBridge::set_max_level`] sets the most
 //!   verbose level forwarded and rebuilds `tracing`'s interest cache, so an
 //!   event above that level costs what it costs with no subscriber at all.
@@ -370,6 +371,25 @@ mod tests {
                     message: "fine detail".into(),
                 },
             ]
+        );
+    }
+
+    /// The engine's `trellis_instance` field (issue #874) is a displayed
+    /// value, so it crosses as plain `name=value` text, with no quotes.
+    #[test]
+    fn the_engines_instance_field_crosses_as_plain_text() {
+        let bridge = with_bridge("info", || {
+            tracing::info!(trellis_instance = %"tenant_a", table = %"public.t", "capture reconciled");
+        });
+        let messages: Vec<_> = bridge
+            .take(10)
+            .records
+            .into_iter()
+            .map(|r| r.message)
+            .collect();
+        assert_eq!(
+            messages,
+            ["capture reconciled trellis_instance=tenant_a table=public.t"]
         );
     }
 

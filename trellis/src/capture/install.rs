@@ -1034,7 +1034,7 @@ impl BlockerLog {
         }
         match lock_wait(client, op, started).await {
             Ok(wait) => self.log(&wait, "retrying"),
-            Err(error) => tracing::debug!(
+            Err(error) => crate::instance_log::debug!(
                 what = self.operation.what(),
                 table = op.table(),
                 %error,
@@ -1047,7 +1047,7 @@ impl BlockerLog {
     fn at_deadline(&mut self, wait: &LockWait) {
         // The reconcile pass reports a wait that outlasts its passes at
         // `info`, rate-limited across passes (`super::reconcile`).
-        tracing::debug!(
+        crate::instance_log::debug!(
             what = self.operation.what(),
             table = %wait.table,
             "{wait}; leaving it for the next pass"
@@ -1055,7 +1055,7 @@ impl BlockerLog {
     }
 
     fn log(&self, wait: &LockWait, next: &str) {
-        tracing::info!(what = self.operation.what(), table = %wait.table, "{wait}; {next}");
+        crate::instance_log::info!(what = self.operation.what(), table = %wait.table, "{wait}; {next}");
     }
 }
 

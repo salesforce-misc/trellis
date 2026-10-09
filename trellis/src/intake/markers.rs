@@ -370,7 +370,7 @@ pub(crate) async fn park_catch_up(
             .map(|row| row.get(0))
             .collect();
         if !moved.is_empty() {
-            tracing::info!(
+            crate::instance_log::info!(
                 ids = ?moved,
                 from = %TransformStatus::Live.as_str(),
                 to = %TransformStatus::CatchingUp.as_str(),
@@ -1159,7 +1159,7 @@ pub(crate) async fn run_pending_backfills_for(
     let mut rederive = None;
     for marker in pending {
         if !marker.due {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 table = %marker.table,
                 attempts = marker.attempts,
                 "backfill marker backing off after a failed discharge; not due yet"
@@ -1167,7 +1167,7 @@ pub(crate) async fn run_pending_backfills_for(
             continue;
         }
         let Some(fence) = marker.fence else {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 table = %marker.table,
                 "backfill marker re-parked before its fence was taken; fencing it next pass"
             );
@@ -1179,7 +1179,7 @@ pub(crate) async fn run_pending_backfills_for(
             // safe, not a fault, per that section's explicit "we do not
             // emit a stall metric, a periodic warning log" decision. `debug`
             // only, for someone tracing this loop's own behavior.
-            tracing::debug!(
+            crate::instance_log::debug!(
                 table = %marker.table,
                 "backfill marker not yet settled; still waiting on the xmin fence"
             );
@@ -1198,7 +1198,7 @@ pub(crate) async fn run_pending_backfills_for(
             // staged lacks the columns it may read. Those rows drain on their
             // own, through the definitions already applying, so this only
             // waits; see `capture::install`, "Widening and the capture gate".
-            tracing::debug!(
+            crate::instance_log::debug!(
                 table = %marker.table,
                 gate = %gate,
                 "backfill marker held by its capture gate: changes staged before the \
@@ -1237,7 +1237,7 @@ pub(crate) async fn run_pending_backfills_for(
         match outcome {
             Ok(Discharge::Committed) => {}
             Ok(Discharge::Deferred { horizon }) => {
-                tracing::debug!(
+                crate::instance_log::debug!(
                     table = %marker.table,
                     horizon = %horizon,
                     staged_through = %watermark.get(),
@@ -1251,7 +1251,7 @@ pub(crate) async fn run_pending_backfills_for(
                 // marker row carries it to `Trellis::status`.
                 let attempts = u32::try_from(marker.attempts).unwrap_or(0) + 1;
                 let retry_in = discharge_retry_delay(attempts);
-                tracing::warn!(
+                crate::instance_log::warn!(
                     table = %marker.table,
                     error = %error,
                     attempts,
@@ -1287,7 +1287,7 @@ async fn halt_refused(
     match crate::staging::halt::halt_refused_discharge(client, table, &error.to_string()).await {
         Ok(paused) if paused.is_empty() => false,
         Ok(paused) => {
-            tracing::error!(
+            crate::instance_log::error!(
                 table = %table,
                 paused = ?paused,
                 error = %error,
@@ -1297,7 +1297,7 @@ async fn halt_refused(
             true
         }
         Err(halt_error) => {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 table = %table,
                 error = %error,
                 halt_error = %halt_error,
@@ -1431,7 +1431,7 @@ async fn plan_waiting_builds(
         let build = match planned {
             Ok(build) => build,
             Err(BackfillError::Unsupported(what)) => {
-                tracing::debug!(
+                crate::instance_log::debug!(
                     definition_id = id,
                     table = %table,
                     unsupported = %what,
@@ -1597,7 +1597,7 @@ async fn discharge_marker(
             crate::defs::catalog::refresh_relationship_projections_in_txn(&txn, &marker.table)
                 .await?;
         if refreshed > 0 {
-            tracing::info!(
+            crate::instance_log::info!(
                 table = %marker.table,
                 rows = refreshed,
                 "refreshed relationship projections from a target's catch-up"
@@ -1734,7 +1734,7 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
         .map(|row| (row.get(0), row.get(1)))
         .collect();
     for (id, status) in &flipped {
-        tracing::info!(
+        crate::instance_log::info!(
             definition_id = id,
             from = %TransformStatus::WaitingToBackfill.as_str(),
             to = %status,
@@ -1748,7 +1748,7 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
             .filter(|id| !flipped.contains(id))
             .copied()
             .collect();
-        tracing::info!(
+        crate::instance_log::info!(
             ids = ?skipped,
             "backfill enumeration staged, but these definitions left `waiting_to_backfill` \
              meanwhile; leaving their status as it is"
@@ -1852,7 +1852,7 @@ async fn go_live_caught_up(
             .await?;
         match moved.map(|row| row.get::<_, bool>(0)) {
             Some(false) => flipped.push(id),
-            Some(true) => tracing::info!(
+            Some(true) => crate::instance_log::info!(
                 definition_id = id,
                 table = %table,
                 from = %TransformStatus::CatchingUp.as_str(),
@@ -1863,7 +1863,7 @@ async fn go_live_caught_up(
         }
     }
     if !flipped.is_empty() {
-        tracing::info!(
+        crate::instance_log::info!(
             ids = ?flipped,
             table = %table,
             from = %TransformStatus::CatchingUp.as_str(),

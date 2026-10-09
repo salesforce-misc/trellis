@@ -2074,7 +2074,7 @@ async fn delete_groups_without_entries(
     .await?;
     txn.commit().await?;
     if deleted.deleted > 0 {
-        tracing::info!(
+        crate::instance_log::info!(
             target = %target_table,
             deleted = deleted.deleted,
             "dropped groups the rebuilt ledger has no entry for"

@@ -787,7 +787,7 @@ async fn evict_key(
     contribution: Option<&FoldedChange>,
 ) -> Result<(), ApplyError> {
     let culprit = &probe.culprit;
-    tracing::warn!(
+    crate::instance_log::warn!(
         transform = %culprit.target,
         src_table = %probe.canonical_src_table,
         key = %probe.key,
@@ -953,7 +953,7 @@ async fn still_charged_to_threshold(
         .map(|row| row.get(0));
     let charged = deaths.is_some_and(|deaths| crosses_threshold(probe, deaths, threshold));
     if !charged {
-        tracing::debug!(
+        crate::instance_log::debug!(
             transform = %probe.culprit.target,
             src_table = %probe.canonical_src_table,
             key = %probe.key,
@@ -1455,7 +1455,7 @@ pub async fn isolate_and_evict(
         return Ok(IsolationOutcome::FuseDisabled);
     }
     let started = std::time::Instant::now();
-    tracing::info!(
+    crate::instance_log::info!(
         seg_seq,
         records = folded.len(),
         "isolating a failed batch: probing its records for the keys that fail alone"
@@ -1530,7 +1530,7 @@ fn log_isolation_finished(
             };
             let outcome = outcome.label();
             if stats.stopped.is_some() {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     seg_seq,
                     records,
                     probes,
@@ -1542,7 +1542,7 @@ fn log_isolation_finished(
                      are not charged this drain"
                 );
             } else {
-                tracing::info!(
+                crate::instance_log::info!(
                     seg_seq,
                     records,
                     probes,
@@ -1554,7 +1554,7 @@ fn log_isolation_finished(
                 );
             }
         }
-        Err(err) => tracing::warn!(
+        Err(err) => crate::instance_log::warn!(
             seg_seq,
             records,
             probes,
@@ -1683,7 +1683,7 @@ async fn isolate_and_evict_probing(
         let canonical = canonical_srcs.get(pool, &change.src_table).await?;
         let culprits = attribute(pool, at, change, &canonical, &err, stats).await?;
         if culprits.is_empty() {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 seg_seq,
                 src_table = %canonical,
                 key = %change.key,
@@ -2121,7 +2121,7 @@ async fn evict_for(
         )
         .await?;
     if current.is_none() {
-        tracing::debug!(
+        crate::instance_log::debug!(
             transform_id,
             "not poisoning a key for a definition frozen or resumed while isolation probed it"
         );
@@ -2468,7 +2468,7 @@ async fn quarantine_if_crossed(
     };
     let target: String = row.get(0);
     let poisoned_count: i64 = row.get(1);
-    tracing::warn!(
+    crate::instance_log::warn!(
         transform = %target,
         poisoned_count,
         "whole-transform fuse tripped; quarantining"
@@ -2709,7 +2709,7 @@ async fn trip_column_fuse(
     column: &str,
     last_error: &str,
 ) -> Result<(), ApplyError> {
-    tracing::warn!(
+    crate::instance_log::warn!(
         transform = %transform,
         column = %column,
         last_error = %last_error,
@@ -3023,7 +3023,7 @@ async fn pause_dependent(
         .await?;
     txn.commit().await?;
     if newly_paused > 0 {
-        tracing::warn!(
+        crate::instance_log::warn!(
             transform = %downstream_transform,
             column = %downstream_column,
             upstream_transform = %upstream_transform,
@@ -3104,14 +3104,14 @@ async fn walk_marked_pauses(
         .collect();
     let mut finished = 0;
     for (transform, column, mark) in &pending {
-        tracing::info!(
+        crate::instance_log::info!(
             transform = %transform,
             column = %column,
             "walking a column pause's owed cascade"
         );
         match cascade_pause(pool, transform, column, mark, lock_timeout).await {
             Ok(()) => finished += 1,
-            Err(err) => tracing::warn!(
+            Err(err) => crate::instance_log::warn!(
                 transform = %transform,
                 column = %column,
                 error = %err,
@@ -3214,7 +3214,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
         txn.commit().await?;
         mark
     };
-    tracing::info!(
+    crate::instance_log::info!(
         transform = %transform,
         column = %column,
         "column paused by request; cascading the pause to its dependents"
@@ -3386,7 +3386,7 @@ pub async fn resume_column(
             )
             .await?;
             txn.commit().await?;
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %transform,
                 column = %column,
                 "column reads a field still paused; it stays paused with it"
@@ -3400,7 +3400,7 @@ pub async fn resume_column(
     let resumed = resume_pairs(pool, transform, queue).await?;
 
     tracing::Span::current().record("resumed", resumed.len());
-    tracing::info!(resumed = ?resumed, "resumed paused column(s)");
+    crate::instance_log::info!(resumed = ?resumed, "resumed paused column(s)");
     Ok(resumed)
 }
 
@@ -3649,7 +3649,7 @@ pub(crate) async fn resume_pairs(
             // with the column held out can't be told to write it now, and a
             // field build waits on the definition applying.
             txn.rollback().await?;
-            tracing::warn!(
+            crate::instance_log::warn!(
                 transform = %t,
                 column = %c,
                 status = %status_text,
@@ -3699,7 +3699,7 @@ pub(crate) async fn resume_pairs(
                 Ok(()) => {}
                 Err(ApplyError::ResumeRefused { reason, .. }) => {
                     txn.rollback().await?;
-                    tracing::warn!(
+                    crate::instance_log::warn!(
                         transform = %t,
                         column = %c,
                         error = %reason,
@@ -3810,7 +3810,7 @@ async fn hold_orphaned_pause(
         .await?;
     txn.commit().await?;
     if held > 0 {
-        tracing::warn!(
+        crate::instance_log::warn!(
             transform = %transform,
             column = %column,
             "column held paused on its own: its upstream was resumed and it could not be released"
@@ -3999,7 +3999,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     {
         ResumeStep::Resumed => {
             txn.commit().await?;
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %target,
                 from = %status.as_str(),
                 to = %TransformStatus::WaitingToBackfill.as_str(),
@@ -4008,7 +4008,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         }
         ResumeStep::Retyping(copies) => {
             txn.commit().await?;
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %target,
                 copies = ?copies,
                 "transform resume accepted; the staging worker re-types its copies, then rebuilds it"
@@ -4395,7 +4395,7 @@ async fn complete_resume(
         &[&id],
     )
     .await?;
-    tracing::debug!(transform_id = id, from = %status.as_str(), "resume completed");
+    crate::instance_log::debug!(transform_id = id, from = %status.as_str(), "resume completed");
     Ok(())
 }
 
@@ -4455,7 +4455,7 @@ pub(crate) async fn resume_caused_definitions(
         .collect();
     for (id, upstream) in candidates {
         if let Err(err) = resume_caused_definition(client, schema, id, upstream).await {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 transform_id = id,
                 upstream_id = upstream,
                 error = %err,
@@ -4526,7 +4526,7 @@ async fn resume_caused_definition(
     match resume_locked(&txn, schema, &target, id, &source_table, status, false).await {
         Ok(ResumeStep::Resumed) => {
             txn.commit().await?;
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %target,
                 upstream_id = upstream,
                 to = %TransformStatus::WaitingToBackfill.as_str(),
@@ -4535,7 +4535,7 @@ async fn resume_caused_definition(
         }
         Ok(ResumeStep::Retyping(copies)) => {
             txn.commit().await?;
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %target,
                 upstream_id = upstream,
                 copies = ?copies,
@@ -4551,7 +4551,7 @@ async fn resume_caused_definition(
             let error = refused_resume_text(&reason);
             set_capture_failure(&txn, id, &source_table, &columns, &error).await?;
             txn.commit().await?;
-            tracing::warn!(
+            crate::instance_log::warn!(
                 transform_id = id,
                 upstream_id = upstream,
                 "a definition waiting on its upstream's resume was refused its own: {error}"
@@ -4618,7 +4618,7 @@ pub(crate) async fn finish_requested_resumes(
         .collect();
     for id in ids {
         if let Err(err) = finish_requested_resume(client, schema, id).await {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 transform_id = id,
                 error = %err,
                 "a requested resume couldn't be finished; retrying next pass"
@@ -4732,12 +4732,12 @@ async fn finish_requested_resume(
             Ok(()) => {
                 record_retype_causes(&txn, id, &columns).await?;
                 txn.commit().await?;
-                tracing::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
+                crate::instance_log::info!(transform_id = id, copies = ?labels, "re-typed copies for a resume");
                 retyped.extend(labels);
             }
             Err(err) if is_transient_error(&err) => {
                 drop(txn);
-                tracing::info!(
+                crate::instance_log::info!(
                     transform_id = id,
                     copies = ?labels,
                     error = %err,
@@ -4796,7 +4796,7 @@ async fn finish_requested_resume(
     match resume_locked(&txn, schema, &target, id, &source_table, status, true).await {
         Ok(ResumeStep::Resumed) => {
             txn.commit().await?;
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %target,
                 to = %TransformStatus::WaitingToBackfill.as_str(),
                 "transform resumed once its copies were re-typed; re-parked for a fresh backfill"
@@ -4988,7 +4988,7 @@ async fn record_transient_retry(
         let ended = retype_cancelled_error(retry);
         set_capture_failure(&txn, id, source_table, &[], &ended).await?;
         txn.commit().await?;
-        tracing::warn!(transform_id = id, "a requested resume ended: {ended}");
+        crate::instance_log::warn!(transform_id = id, "a requested resume ended: {ended}");
         return Ok(());
     }
     let attempt = if retry.timeout_cancel {
@@ -5071,7 +5071,7 @@ async fn end_request(
     let columns: Vec<String> = Vec::new();
     set_capture_failure(&txn, id, source_table, &columns, error).await?;
     txn.commit().await?;
-    tracing::warn!(transform_id = id, "a requested resume ended: {error}");
+    crate::instance_log::warn!(transform_id = id, "a requested resume ended: {error}");
     Ok(())
 }
 
@@ -5320,7 +5320,7 @@ pub async fn release_key(
     )
     .await?;
     txn.commit().await?;
-    tracing::info!(
+    crate::instance_log::info!(
         transform,
         src_table = %names[0],
         key,
@@ -5395,7 +5395,7 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
                 Err(ApplyError::KeyNotHeld { .. } | ApplyError::TransformNotFound { .. }) => {}
                 Err(err) => {
                     done = false;
-                    tracing::warn!(
+                    crate::instance_log::warn!(
                         transform = %transform,
                         src_table = %src_table,
                         key = %key,
@@ -5407,7 +5407,7 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
             }
         }
         if released > 0 {
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %transform,
                 sqlstate = %sqlstate,
                 released,

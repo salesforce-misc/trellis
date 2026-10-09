@@ -143,7 +143,7 @@ pub(crate) async fn pause_transform(
         // Commit rather than roll back: nothing was written, and committing
         // releases the `for update` lock the same way the mutating arm does.
         txn.commit().await?;
-        tracing::info!(
+        crate::instance_log::info!(
             transform = %target,
             status = %status.as_str(),
             "pause is a no-op; transform was already frozen"
@@ -158,7 +158,7 @@ pub(crate) async fn pause_transform(
     .await?;
     txn.commit().await?;
 
-    tracing::info!(
+    crate::instance_log::info!(
         transform = %target,
         from = %status.as_str(),
         to = %TransformStatus::Paused.as_str(),
@@ -315,7 +315,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // otherwise unfreeze the row between a pre-check and this commit. Losing
     // that race must not silently drop a live definition.
     let Some(locked) = locked_definition(&txn, target).await? else {
-        tracing::info!(transform = %target, "drop is a no-op; no such definition");
+        crate::instance_log::info!(transform = %target, "drop is a no-op; no such definition");
         return Ok(DropOutcome::Absent);
     };
     let (id, status, qualified) = (locked.id, locked.status, locked.target_table);
@@ -446,7 +446,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     .await?;
 
     txn.commit().await?;
-    tracing::info!(
+    crate::instance_log::info!(
         transform = %target,
         target_table = %qualified,
         "transform dropped"
@@ -498,7 +498,7 @@ pub(crate) async fn drop_relationship(
     name: &str,
 ) -> Result<DropOutcome, CatalogError> {
     let Some(reldef) = relationship_at_address(pool, schema, from_table, name).await? else {
-        tracing::info!(
+        crate::instance_log::info!(
             relationship = %name,
             from_table = %from_table,
             "drop is a no-op; no such relationship"
@@ -577,7 +577,7 @@ pub(crate) async fn drop_relationship(
     }
 
     txn.commit().await?;
-    tracing::info!(
+    crate::instance_log::info!(
         relationship = %name,
         from_table = %from_table,
         "relationship dropped"

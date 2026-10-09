@@ -168,7 +168,7 @@ pub fn armed() -> Option<Plant> {
     *ARMED.get_or_init(|| {
         let plant = parse(std::env::var(PLANT_ENV).ok().as_deref());
         if let Some(plant) = plant {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 plant = plant.name(),
                 "{PLANT_ENV} armed a planted ordering bug: this engine is deliberately wrong \
                  (test-only, issue #557)"

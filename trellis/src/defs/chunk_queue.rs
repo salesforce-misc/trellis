@@ -318,7 +318,7 @@ pub(crate) async fn dispatch_one_to_one(
         &[&definition_id, &los, &his, &planned.key_collations],
     )
     .await?;
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id,
         chunks = ranges.len(),
         from = %TransformStatus::WaitingToBackfill.as_str(),
@@ -393,7 +393,7 @@ pub(crate) async fn dispatch_direct_build(
         &[&definition_id, &prior_attempts],
     )
     .await?;
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id,
         from = %TransformStatus::WaitingToBackfill.as_str(),
         to = %TransformStatus::Backfilling.as_str(),
@@ -1007,38 +1007,38 @@ fn log_failure(
     let chunk_id = chunk.id;
     let kind = format!("{kind:?}").to_lowercase();
     match outcome {
-        ChunkFailure::NotHeld => tracing::warn!(
+        ChunkFailure::NotHeld => crate::instance_log::warn!(
             definition_id, chunk_id, chunk = %location, failure = %kind, error = %error,
             "backfill chunk failed after its claim was reclaimed; its new holder retries it"
         ),
-        ChunkFailure::Discarded => tracing::warn!(
+        ChunkFailure::Discarded => crate::instance_log::warn!(
             definition_id, chunk_id, chunk = %location, failure = %kind, error = %error,
             "backfill chunk failed after its definition was frozen or resumed; discarded it"
         ),
-        ChunkFailure::Retrying { charged, delay } => tracing::warn!(
+        ChunkFailure::Retrying { charged, delay } => crate::instance_log::warn!(
             definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
             charged, max_charged = MAX_CHARGED_ATTEMPTS,
             next_attempt_in_secs = delay.as_secs_f64(), error = %error,
             "backfill chunk failed; retrying it after a backoff"
         ),
-        ChunkFailure::Split { mid } => tracing::warn!(
+        ChunkFailure::Split { mid } => crate::instance_log::warn!(
             definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
             split_at = %mid, next_attempt_in_secs = 0.0, error = %error,
             "backfill chunk failed on its data; split it in two to narrow the failure to a key"
         ),
-        ChunkFailure::Quarantined { key, fuse_tripped } => tracing::warn!(
+        ChunkFailure::Quarantined { key, fuse_tripped } => crate::instance_log::warn!(
             definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
             key = %key, fuse_tripped, next_attempt_in_secs = 0.0, error = %error,
             "backfill chunk failure narrowed to one key; quarantined the key, and the build \
              goes on without it"
         ),
-        ChunkFailure::Paused => tracing::warn!(
+        ChunkFailure::Paused => crate::instance_log::warn!(
             definition_id, chunk_id, chunk = %location, failure = %kind, attempt,
             max_charged = MAX_CHARGED_ATTEMPTS, error = %error,
             "backfill chunk kept failing without narrowing to a key; paused the definition \
              (resume it once the cause is fixed)"
         ),
-        ChunkFailure::HandedBack { attempts } => tracing::warn!(
+        ChunkFailure::HandedBack { attempts } => crate::instance_log::warn!(
             definition_id, chunk_id, chunk = %location, failure = %kind, attempt = *attempts,
             max_charged = MAX_CHARGED_ATTEMPTS, error = %error,
             "direct build failed; handing it back to the backfill discharge, which retries it \
@@ -1087,7 +1087,7 @@ async fn pause_for_build_failure(
         )
         .await?;
     if paused == 1 {
-        tracing::warn!(
+        crate::instance_log::warn!(
             definition_id = id,
             to = %TransformStatus::Paused.as_str(),
             "transform status transition: its build kept failing; paused"
@@ -1323,7 +1323,7 @@ async fn fail_direct_build(
     .await?;
     let source_table: String = row.get(2);
     crate::intake::markers::park_failed_build(&*txn, &source_table, attempts, error).await?;
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id = chunk.definition_id,
         from = %TransformStatus::Backfilling.as_str(),
         to = %TransformStatus::WaitingToBackfill.as_str(),
@@ -1473,7 +1473,7 @@ pub async fn run_claimed_chunk(
         // `finish_chunk` then discards a chunk held across a resume, and
         // leaves one reclaimed from this worker to its new holder.
         Err(ChunkQueueError::Backfill(BackfillError::Superseded)) => {
-            tracing::info!(
+            crate::instance_log::info!(
                 chunk_id = chunk.id,
                 definition_id = chunk.definition_id,
                 "backfill chunk superseded before its write; wrote nothing further"
@@ -1550,14 +1550,14 @@ pub(crate) struct ChunkHeartbeat {
 
 impl ChunkHeartbeat {
     pub(crate) fn spawn(pool: Pool, id: i64, claimed_by: String, interval: Duration) -> Self {
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(crate::instance_log::in_current_instance(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
                 touch_chunk_claim(&pool, id, &claimed_by).await;
             }
-        });
+        }));
         ChunkHeartbeat { task }
     }
 }

@@ -90,7 +90,7 @@ pub(crate) async fn record(
     err: &ApplyError,
 ) {
     if let Err(write_err) = try_record(pool, steps, claimed_by, folded, err).await {
-        tracing::warn!(
+        crate::instance_log::warn!(
             seg_seq = steps.first().map(|step| step.seg_seq),
             error = %err,
             write_error = %write_err,

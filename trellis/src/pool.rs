@@ -144,11 +144,19 @@ impl Pool {
     /// borrower of a pooled connection can inherit it.
     pub(crate) async fn connect_unpooled(&self) -> Result<tokio_postgres::Client, Error> {
         let (mut client, connection) = self.pg_config.connect(NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                tracing::debug!(error = %err, "unpooled connection ended with an error");
-            }
-        });
+        // The driver may run on a thread of the host's runtime, so it names
+        // its own instance.
+        tokio::spawn(crate::instance_log::scoped(
+            crate::instance_log::name_of(&self.schema),
+            async move {
+                if let Err(err) = connection.await {
+                    crate::instance_log::debug!(
+                        error = %err,
+                        "unpooled connection ended with an error"
+                    );
+                }
+            },
+        ));
         session_bootstrap(&mut client, &self.schema, &self.target_schema).await?;
         Ok(client)
     }

@@ -1681,7 +1681,7 @@ impl RelationshipReads {
                             // degrades to "nothing resolves" (an empty
                             // to-side, same as a genuinely dangling join key)
                             // rather than panicking.
-                            tracing::error!(
+                            crate::instance_log::error!(
                                 relationship = %rel_name,
                                 from_table = %qualified_source,
                                 "to-one relationship has no settled parent projection; \
@@ -2154,7 +2154,7 @@ async fn build_reverse_relationship_shape(
     let (qualified_projection, projection_schema, projection_table_bare) = match projection {
         Some(p) => (p.qualified_table(), p.projection_schema, p.projection_table),
         None => {
-            tracing::error!(
+            crate::instance_log::error!(
                 relationship = %rel.def.name,
                 to_table = %rel.qualified_to_table(),
                 "to-one relationship has no settled parent projection; every \
@@ -7232,7 +7232,7 @@ async fn source_key_for_apply(
     if !no_unfrozen_reader(pool, source_key, versions).await? {
         return Err(err.into());
     }
-    tracing::warn!(
+    crate::instance_log::warn!(
         src_table = %qualified_source,
         error = %err,
         "every definition reading this table is frozen and its key can't be used; \
@@ -7322,7 +7322,7 @@ async fn from_side_key(
     if skip_frozen {
         read_fence(pool, qualified_from_table, versions).await?;
         if no_unfrozen_reader(pool, qualified_from_table, versions).await? {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 from_table = %qualified_from_table,
                 "every definition reading this relationship from-side is frozen, and the drain \
                  was refused a read or write; staging no recompute of its rows"
@@ -7341,7 +7341,7 @@ async fn from_side_key(
     if !no_unfrozen_reader(pool, qualified_from_table, versions).await? {
         return Err(err.into());
     }
-    tracing::warn!(
+    crate::instance_log::warn!(
         from_table = %qualified_from_table,
         error = %err,
         "every definition reading this relationship from-side is frozen and its key \
@@ -7564,7 +7564,7 @@ pub(super) async fn relationship_readers_by_rel(
 ///
 /// Issue #56/ADR-0009 decision 3: this span is the "hop" half of the
 /// source-commit → hop → hop → apply tree — one span per compute pass over
-/// a folded batch, with a per-source-table [`tracing::debug!`] event inside
+/// a folded batch, with a per-source-table `tracing::debug!` event inside
 /// the loop below (not a nested span: the loop body's accumulators
 /// (`targets`, `versions`, `end_to_end_origins`, ...) are threaded through
 /// by mutable reference across many `.await` points, and a held span guard
@@ -7836,7 +7836,7 @@ pub(super) async fn compute_page(
     > = std::collections::BTreeMap::new();
 
     for (source_key, mut changes) in by_source {
-        tracing::debug!(
+        crate::instance_log::debug!(
             src_table = %source_key,
             changes = changes.len(),
             "evaluating a source table's folded changes"
@@ -7856,7 +7856,7 @@ pub(super) async fn compute_page(
         let qualified_source = changes[0].src_table.as_str();
 
         if skip_frozen && no_unfrozen_reader(pool, &source_key, &mut versions).await? {
-            tracing::warn!(
+            crate::instance_log::warn!(
                 src_table = %qualified_source,
                 "every definition reading this table is frozen, and the drain was refused a \
                  read or write; skipping its changes"
@@ -8577,7 +8577,7 @@ pub(super) async fn compute_page(
                     // the whole batch: a dropped relationship's own
                     // catalog-side cleanup is responsible for anything else
                     // that implies, not this drain.
-                    tracing::warn!(
+                    crate::instance_log::warn!(
                         relationship_id = rel_id,
                         "a deferred relationship reverse's relationship no longer exists; \
                          dropping the retry"
@@ -8661,7 +8661,7 @@ pub(super) async fn compute_page(
     }
 
     if !poisoned_park.is_empty() {
-        tracing::warn!(
+        crate::instance_log::warn!(
             parked = poisoned_park.len(),
             "batch leaves already-poisoned keys out of the definitions they're poisoned for, \
              parking this batch's own contribution for each"
@@ -10333,7 +10333,7 @@ pub(crate) async fn apply_page(
             .await?;
         let current: Option<i64> = row.map(|r| r.get(0));
         if current != *loaded_version {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 src_table = %source_key,
                 "version fence miss: source table's definitions changed mid-drain"
             );
@@ -10612,7 +10612,7 @@ pub(crate) async fn apply_page(
             {
                 *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
                 fairness_escalations += 1;
-                tracing::warn!(
+                crate::instance_log::warn!(
                     relationship_projection = %shape.qualified_projection,
                     guard = %failure,
                     retry_count = record.retry_count + 1,
@@ -10684,7 +10684,7 @@ pub(crate) async fn apply_page(
             // Buffered into `deferral_counts`, not recorded straight into
             // the metrics registry here — see that variable's own comment.
             *deferral_counts.entry(failure.metric_label()).or_insert(0) += 1;
-            tracing::warn!(
+            crate::instance_log::warn!(
                 relationship_projection = %shape.qualified_projection,
                 guard = %failure,
                 retry_count = record.retry_count + 1,
@@ -10836,7 +10836,7 @@ pub(crate) async fn apply_page(
         hop_bound_tables.sort();
         hop_bound_tables.dedup();
         // Debug: the drain's halt (#663) logs the closure it pauses for it.
-        tracing::debug!(
+        crate::instance_log::debug!(
             hop_gen = worst_hop_gen,
             tables = ?hop_bound_tables,
             "downstream propagation exceeded the hop bound; a wave may have run away"
@@ -10848,7 +10848,7 @@ pub(crate) async fn apply_page(
     }
 
     if !recompute_changes.is_empty() {
-        tracing::debug!(
+        crate::instance_log::debug!(
             count = recompute_changes.len(),
             "staged downstream recomputes from this batch's physically-changed keys"
         );
@@ -10864,7 +10864,7 @@ pub(crate) async fn apply_page(
     // property every other Phase-3 producer already relies on (doc 05
     // property 1) — this reuses that exact mechanism, not a new one.
     if !relationship_reverse_deferrals.is_empty() {
-        tracing::debug!(
+        crate::instance_log::debug!(
             count = relationship_reverse_deferrals.len(),
             "staged deferred relationship reverse retries (issue #134)"
         );
@@ -10968,7 +10968,7 @@ async fn end_segment_step(
 ) -> Result<bool, ApplyError> {
     let seg_seq = step.seg_seq;
     let claim_lost = |detail: &str| {
-        tracing::warn!(
+        crate::instance_log::warn!(
             seg_seq,
             claimed_by = %claimed_by,
             detail,
@@ -11131,7 +11131,7 @@ async fn pause_before_commit_for_tests() {
     if !std::path::Path::new(&trigger_path).exists() {
         return;
     }
-    tracing::warn!(
+    crate::instance_log::warn!(
         trigger_path,
         "TRELLIS_TEST_PAUSE_TRIGGER fired: pausing Phase 3 indefinitely before commit \
          (test-only hook, issue #166)"
@@ -11139,7 +11139,7 @@ async fn pause_before_commit_for_tests() {
     if let Ok(marker_path) = std::env::var("TRELLIS_TEST_PAUSE_MARKER")
         && let Err(err) = std::fs::write(&marker_path, b"paused")
     {
-        tracing::warn!(?err, marker_path, "failed to write Phase 3 pause marker");
+        crate::instance_log::warn!(?err, marker_path, "failed to write Phase 3 pause marker");
     }
     // Never resolves on its own: the only way out is an external kill (the
     // intended path) or the process exiting some other way (e.g. the test
@@ -11624,7 +11624,7 @@ async fn drain_segments(
             .await?;
             return Ok(Some(outcome));
         }
-        tracing::debug!(
+        crate::instance_log::debug!(
             seg_seq = held[0].seg_seq,
             cap,
             "direct fold's guard tripped: the share holds more than the cap; paging instead"
@@ -11718,7 +11718,7 @@ async fn drain_segments(
         }
         still_held.retain(|bucket| !buckets.contains(bucket));
     }
-    tracing::info!(
+    crate::instance_log::info!(
         seg_seq = share.seg_seq,
         pages = total.pages,
         records,
@@ -11816,7 +11816,7 @@ async fn drain_batch(
                 // with it excluded. Not counted against
                 // `MAX_APPLY_ATTEMPTS` — this corrects `folded` itself
                 // rather than retrying the same input.
-                tracing::warn!(
+                crate::instance_log::warn!(
                     seg_seq = representative_seg_seq,
                     source_table = %source_table,
                     "source table no longer exists; purging its staged rows and retrying \
@@ -12052,7 +12052,7 @@ async fn retry_or_surface(
         // machine, reused as-is.
         quarantine::FailureClass::VersionFenceMiss => {
             if attempt >= MAX_APPLY_ATTEMPTS {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     seg_seq,
                     attempt,
                     error = %err,
@@ -12060,7 +12060,7 @@ async fn retry_or_surface(
                 );
                 return Err(Surface::Plain(err));
             }
-            tracing::debug!(seg_seq, attempt, error = %err, "version fence miss; retrying");
+            crate::instance_log::debug!(seg_seq, attempt, error = %err, "version fence miss; retrying");
             let delay = backoff.next_delay();
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
@@ -12077,7 +12077,7 @@ async fn retry_or_surface(
         quarantine::FailureClass::Transient if crate::locks::is_lock_not_available(&err) => {
             let waited = transient.lock_waited();
             if waited >= LOCK_RETRY_BUDGET {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     seg_seq,
                     waited_ms = waited.as_millis() as u64,
                     error = %err,
@@ -12086,7 +12086,7 @@ async fn retry_or_surface(
                 return Err(Surface::Plain(err));
             }
             let delay = transient.next_delay();
-            tracing::warn!(
+            crate::instance_log::warn!(
                 seg_seq,
                 delay_ms = delay.as_millis() as u64,
                 "drain page waited out its lock_timeout; rolled back, retrying outside the \
@@ -12104,7 +12104,7 @@ async fn retry_or_surface(
         // own, so a fence miss between two doesn't reset it.
         quarantine::FailureClass::Transient => {
             if attempt >= MAX_APPLY_ATTEMPTS {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     seg_seq,
                     attempt,
                     error = %err,
@@ -12113,7 +12113,7 @@ async fn retry_or_surface(
                 return Err(Surface::Plain(err));
             }
             let delay = transient.next_delay();
-            tracing::debug!(
+            crate::instance_log::debug!(
                 seg_seq,
                 attempt,
                 delay_ms = delay.as_millis() as u64,
@@ -12137,7 +12137,7 @@ async fn retry_or_surface(
         // too (the next drain cycle charges them again).
         quarantine::FailureClass::Isolate => {
             if attempt >= MAX_APPLY_ATTEMPTS {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     seg_seq,
                     attempt,
                     error = %err,
@@ -12172,14 +12172,14 @@ async fn retry_or_surface(
                 // the key out of that definition's apply alone.
                 quarantine::IsolationOutcome::Evicted { evicted, charged } => {
                     if charged.is_empty() {
-                        tracing::warn!(
+                        crate::instance_log::warn!(
                             seg_seq,
                             evicted,
                             "isolated a key and poisoned it for the definition it fails in; \
                              retrying without it there"
                         );
                     } else {
-                        tracing::warn!(
+                        crate::instance_log::warn!(
                             seg_seq,
                             evicted,
                             threshold = quarantine::DEFAULT_DEATH_THRESHOLD,
@@ -12204,7 +12204,7 @@ async fn retry_or_surface(
                 // fails intermittently can start over, but then each line
                 // still stands for a real failed drain.
                 quarantine::IsolationOutcome::ChargedBelowThreshold { charged } => {
-                    tracing::warn!(
+                    crate::instance_log::warn!(
                         seg_seq,
                         threshold = quarantine::DEFAULT_DEATH_THRESHOLD,
                         charged = %quarantine::describe_charged_keys(
@@ -12218,7 +12218,7 @@ async fn retry_or_surface(
                     Err(Surface::Plain(err))
                 }
                 quarantine::IsolationOutcome::NothingReproduced => {
-                    tracing::debug!(
+                    crate::instance_log::debug!(
                         seg_seq,
                         error = %err,
                         "isolation reproduced nothing; surfacing the original failure"
@@ -12228,7 +12228,7 @@ async fn retry_or_surface(
                 // Warn: unlike `NothingReproduced`, part of the batch went
                 // unprobed, so a failing key may still be in it (issue #655).
                 quarantine::IsolationOutcome::ProbeLimitReached { probes } => {
-                    tracing::warn!(
+                    crate::instance_log::warn!(
                         seg_seq,
                         probes,
                         error = %err,
@@ -12245,7 +12245,7 @@ async fn retry_or_surface(
                 // `MAX_APPLY_ATTEMPTS` more storms, each as long as
                 // `MAX_CONSECUTIVE_TRANSIENT_PROBES` lock timeouts.
                 quarantine::IsolationOutcome::TransientStorm { probes } => {
-                    tracing::warn!(
+                    crate::instance_log::warn!(
                         seg_seq,
                         probes,
                         consecutive_transient = quarantine::MAX_CONSECUTIVE_TRANSIENT_PROBES,
@@ -12256,7 +12256,7 @@ async fn retry_or_surface(
                     Err(Surface::Plain(err))
                 }
                 quarantine::IsolationOutcome::FuseDisabled => {
-                    tracing::debug!(
+                    crate::instance_log::debug!(
                         seg_seq,
                         error = %err,
                         "row-level death fuse disabled; surfacing the original failure unisolated"
@@ -12293,7 +12293,7 @@ async fn halt(
         halt_retry.skip_frozen = true;
     }
     if !paused.is_empty() {
-        tracing::error!(
+        crate::instance_log::error!(
             seg_seq,
             paused = ?paused,
             error = %err,
@@ -12305,7 +12305,7 @@ async fn halt(
     }
     if !halt_retry.retried {
         halt_retry.retried = true;
-        tracing::debug!(
+        crate::instance_log::debug!(
             seg_seq,
             error = %err,
             "halting failure whose closure is already paused; retrying the page once"

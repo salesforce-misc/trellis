@@ -1126,7 +1126,7 @@ async fn catch_up_if_backfilling(
         )
         .await?;
     if moved == 1 {
-        tracing::info!(
+        crate::instance_log::info!(
             definition_id = id,
             from = %TransformStatus::Backfilling.as_str(),
             to = %TransformStatus::CatchingUp.as_str(),
@@ -1144,7 +1144,7 @@ async fn catch_up_if_backfilling(
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    tracing::info!(
+    crate::instance_log::info!(
         definition_id = id,
         status = %status.as_str(),
         "backfill finished, but the definition is no longer backfilling; \
@@ -2130,7 +2130,7 @@ pub async fn alter_transform(
     if builds_fields
         && let Err(err) = crate::staging::quarantine::cascade_edit_pauses(pool, &alter.target).await
     {
-        tracing::warn!(
+        crate::instance_log::warn!(
             transform = %alter.target,
             error = %err,
             "couldn't read the column pauses this edit owes a cascade; the capture pass walks them"
@@ -2370,7 +2370,7 @@ async fn pause_readers_of_paused_columns(
             }
             pause_reader_in_txn(txn, (target, &field.name), (upstream, column), owes_cascade)
                 .await?;
-            tracing::warn!(
+            crate::instance_log::warn!(
                 transform = %target,
                 column = %field.name,
                 upstream_transform = %upstream,
@@ -2486,7 +2486,7 @@ async fn delete_stale_cascade_edges(
                 &[&target, &field.name, &upstream_transform, &upstream_column],
             )
             .await?;
-            tracing::info!(
+            crate::instance_log::info!(
                 transform = %target,
                 column = %field.name,
                 upstream_transform = %upstream_transform,

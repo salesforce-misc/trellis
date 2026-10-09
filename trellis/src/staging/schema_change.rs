@@ -119,7 +119,7 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
     for (table, missing) in &by_table {
         let readers = readers_of(&catalog, table, &missing.columns, missing.whole_table());
         if readers.is_empty() {
-            tracing::info!(
+            crate::instance_log::info!(
                 table = %table,
                 columns = ?missing.columns,
                 "a captured column was renamed or dropped, but no definition reads it"
@@ -166,7 +166,7 @@ async fn pause(
         if crate::defs::lifecycle::pause_for_capture_failure(txn, id, table, &columns, &error, None)
             .await?
         {
-            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }
     Ok(())
@@ -367,7 +367,7 @@ pub(crate) async fn pause_readers_of_unsupported(
         if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
             .await?
         {
-            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }
     txn.commit().await?;
@@ -412,7 +412,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
         if crate::defs::lifecycle::pause_for_capture_failure(&txn, id, table, &[], &error, None)
             .await?
         {
-            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }
     txn.commit().await?;
@@ -795,7 +795,7 @@ pub(crate) async fn pause_readers_of_retyped(
         )
         .await?
         {
-            tracing::warn!(transform_id = pause.id, table = %table, "definition paused: {error}");
+            crate::instance_log::warn!(transform_id = pause.id, table = %table, "definition paused: {error}");
         }
     }
     txn.commit().await?;
@@ -1070,7 +1070,7 @@ async fn retype_in_place(
         let failed_before = with_failed_retypes(|failed| failed.get(&key) == Some(&retype));
         attempted.push((key.2.clone(), retype.clone()));
         if failed_before {
-            tracing::debug!(
+            crate::instance_log::debug!(
                 table = %checked_table,
                 copies = ?labels,
                 "not re-typing Trellis's columns in place: the same re-type failed before"
@@ -1091,7 +1091,7 @@ async fn retype_in_place(
                 )
                 .await?;
                 txn.commit().await?;
-                tracing::info!(
+                crate::instance_log::info!(
                     table = %checked_table,
                     copies = ?labels,
                     "re-typed Trellis's columns in place: the source widened them without a rewrite"
@@ -1100,7 +1100,7 @@ async fn retype_in_place(
             }
             Err(err) if crate::staging::quarantine::is_transient_error(&err) => {
                 drop(txn);
-                tracing::info!(
+                crate::instance_log::info!(
                     table = %checked_table,
                     copies = ?labels,
                     error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),
@@ -1115,7 +1115,7 @@ async fn retype_in_place(
                 } else {
                     "leaving them as they are, since they still hold every value"
                 };
-                tracing::warn!(
+                crate::instance_log::warn!(
                     table = %checked_table,
                     copies = ?labels,
                     error = %err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string()),

@@ -297,7 +297,7 @@ async fn run_range(
         &plan.target,
     )
     .await?;
-    tracing::debug!(
+    crate::instance_log::debug!(
         target_table = %plan.target,
         keys = outcome.keys,
         written = outcome.written,
@@ -510,7 +510,7 @@ pub async fn sweep_batch(
         keys: "$1".to_string(),
     };
     let outcome = rederive(txn, plan, None, &pick, &params, keys.len()).await?;
-    tracing::debug!(
+    crate::instance_log::debug!(
         target_table = %plan.target,
         scanned,
         rederived = keys.len(),

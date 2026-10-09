@@ -488,7 +488,7 @@ impl Sweep {
             if key_cols.is_empty() {
                 // Only a target dropped since the catalog read above: every
                 // target Trellis creates has a key.
-                tracing::debug!(target = %target, "swept target is gone; nothing to sweep");
+                crate::instance_log::debug!(target = %target, "swept target is gone; nothing to sweep");
                 continue;
             }
             // #623 D3: a target on the ledger is swept twice over. Its live
@@ -738,7 +738,7 @@ async fn sweep_rows(
     keys.close(txn).await?;
     target.staged.drop_table(txn).await?;
     if deleted > 0 {
-        tracing::info!(
+        crate::instance_log::info!(
             target = %target.target,
             deleted,
             "dropped target rows the source no longer backs"
@@ -875,7 +875,7 @@ async fn sweep_ledger(
             deleted += emptied;
         }
         entries.staged.close(txn).await?;
-        tracing::info!(
+        crate::instance_log::info!(
             target = %entries.target,
             keys = rederived,
             groups_deleted = deleted,
@@ -899,7 +899,7 @@ async fn sweep_ledger(
     }
     groups.staged.drop_table(txn).await?;
     if orphans_deleted > 0 {
-        tracing::info!(
+        crate::instance_log::info!(
             target = %groups.target,
             deleted = orphans_deleted,
             "dropped target rows the source no longer backs"

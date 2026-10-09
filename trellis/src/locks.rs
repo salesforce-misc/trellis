@@ -347,7 +347,7 @@ impl DdlRetry {
         let now = Instant::now();
         let next_ends = now + USER_TABLE_DDL_RETRY_INTERVAL + self.lock_timeout;
         if self.deadline.is_some_and(|deadline| next_ends > deadline) {
-            tracing::info!(
+            crate::instance_log::info!(
                 what = self.what,
                 attempts = self.attempts,
                 "user-table DDL still waiting for a lock at its deadline; leaving it for the \
@@ -361,7 +361,7 @@ impl DdlRetry {
             .is_none_or(|logged| now.duration_since(logged) >= DDL_RETRY_LOG_INTERVAL)
         {
             self.last_logged = Some(now);
-            tracing::info!(
+            crate::instance_log::info!(
                 what = self.what,
                 attempts = self.attempts,
                 waited_ms = now.duration_since(self.started).as_millis() as u64,

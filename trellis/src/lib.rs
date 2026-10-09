@@ -80,6 +80,7 @@ pub mod error;
 pub mod error_code;
 pub mod float;
 pub mod identity;
+pub(crate) mod instance_log;
 pub mod integer;
 pub mod metrics;
 pub mod migrate;
