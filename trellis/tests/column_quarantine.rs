@@ -4607,6 +4607,22 @@ async fn cascade_edge_count(client: &Client) -> i64 {
         .get(0)
 }
 
+/// When `sib_sum.c1` and `sib_down.d1` were paused, in that order.
+async fn paused_at_of_c1_and_d1(client: &Client) -> Vec<std::time::SystemTime> {
+    client
+        .query(
+            "select paused_at from column_status \
+             where (transform_table, column_name) in (('sib_sum', 'c1'), ('sib_down', 'd1')) \
+             order by transform_table desc",
+            &[],
+        )
+        .await
+        .expect("read paused_at")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
 async fn d1_text(client: &Client) -> Option<String> {
     client
         .query_one("select d1::text from public.sib_down where id = 1", &[])
@@ -4682,6 +4698,7 @@ async fn an_alter_to_another_paused_column_moves_the_readers_pause_to_it() {
     quarantine::pause_column(&db.pool, "sib", "total")
         .await
         .expect("pause total");
+    let paused_since = paused_at_of_c1_and_d1(&client).await;
 
     trellis
         .apply("ALTER TRANSFORM sib_sum ALTER c1 AS total + 2")
@@ -4689,8 +4706,20 @@ async fn an_alter_to_another_paused_column_moves_the_readers_pause_to_it() {
         .expect("edit c1 to read total");
     assert!(!cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
     assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "total").await);
-    assert!(column_status_row(&client, "sib_sum", "c1").await.is_some());
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "c1").await,
+        Some((
+            false,
+            Some("paused because upstream column 'sib.total' is paused".to_string())
+        )),
+        "c1's reason names the column it is still paused through"
+    );
     assert!(column_status_row(&client, "sib_down", "d1").await.is_some());
+    // The edit's own pauses are written before it releases what lost an
+    // edge, so c1 never left its pause, nor d1 with it: their rows are the
+    // ones the pause of `cost` wrote, not ones written again after a
+    // release and a resume of d1 over c1's frozen value.
+    assert_eq!(paused_at_of_c1_and_d1(&client).await, paused_since);
 
     quarantine::resume_column(&db.pool, "sib", "total")
         .await
@@ -4700,6 +4729,36 @@ async fn an_alter_to_another_paused_column_moves_the_readers_pause_to_it() {
     assert_eq!(column_status_row(&client, "sib_down", "d1").await, None);
     assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["17"]));
     assert_eq!(d1_text(&client).await.as_deref(), Some("18"));
+}
+
+/// A reader paused through two upstream columns that one's resume leaves
+/// paused through the other names the other as its reason, not the resumed
+/// one.
+#[tokio::test]
+async fn a_reader_still_paused_through_another_edge_names_that_upstream() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (client, trellis) = seed_reader_chain_with_cost_paused(&db).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS cost + total")
+        .await
+        .expect("edit c1 to read both");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "total").await);
+
+    quarantine::resume_column(&db.pool, "sib", "cost")
+        .await
+        .expect("resume cost");
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "c1").await,
+        Some((
+            false,
+            Some("paused because upstream column 'sib.total' is paused".to_string())
+        ))
+    );
 }
 
 /// A reader paused by an operator as well keeps that pause when its edit
@@ -4845,16 +4904,20 @@ async fn an_alter_that_stops_a_paused_field_reading_its_upstream_holds_it_for_it
         .await
         .expect("edit cost to read a new source column");
     assert!(!cascade_edge_exists(&client, "sib", "cost", "sib", "total").await);
-    let awaiting: Option<bool> = client
+    let awaiting: Option<(bool, Option<String>)> = client
         .query_opt(
-            "select awaiting_capture from column_status \
+            "select awaiting_capture, last_error from column_status \
              where transform_table = 'sib' and column_name = 'cost'",
             &[],
         )
         .await
         .expect("read cost's row")
-        .map(|row| row.get(0));
-    assert_eq!(awaiting, Some(true), "cost waits for its capture widen");
+        .map(|row| (row.get(0), row.get(1)));
+    assert_eq!(
+        awaiting,
+        Some((true, None)),
+        "cost waits for its capture widen, and no longer names total as its reason"
+    );
     assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
 
     settle_and_drain(&mut client, &db).await;

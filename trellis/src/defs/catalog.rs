@@ -2451,6 +2451,10 @@ async fn delete_stale_cascade_edges(
 /// another reason when the edit's capture widen skipped it, is held with
 /// `awaiting_capture` instead: the build's plan job releases it, and its
 /// readers, once capture is ready.
+///
+/// A candidate that stays paused through another edge gets its reason
+/// restated ([`crate::staging::quarantine::restate_cascade_reason`]), so
+/// `status` doesn't name the upstream column it stopped reading.
 async fn release_readers_left_without_a_pause(
     txn: &impl GenericClient,
     target: &str,
@@ -2473,12 +2477,19 @@ async fn release_readers_left_without_a_pause(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
+    // A candidate that stays paused through an edge left, old or just
+    // written, names that edge's upstream rather than the one it lost.
+    for field in candidates.iter().filter(|field| !free.contains(field)) {
+        crate::staging::quarantine::restate_cascade_reason(txn, target, field).await?;
+    }
     if free.is_empty() {
         return Ok(Vec::new());
     }
     if holds_for_capture {
+        // Its reason is now its capture's wait, which gives none, as the
+        // edit's capture widen's own rows give none.
         txn.execute(
-            "update column_status set awaiting_capture = true \
+            "update column_status set awaiting_capture = true, last_error = null \
              where transform_table = $1 and column_name = any($2)",
             &[&target, &free],
         )
@@ -2540,9 +2551,7 @@ async fn pause_reader_in_txn(
         &[
             &reader_transform,
             &reader_column,
-            &format!(
-                "paused because upstream column '{upstream_transform}.{upstream_column}' is paused"
-            ),
+            &crate::staging::quarantine::cascade_reason(upstream_transform, upstream_column),
         ],
     )
     .await?;

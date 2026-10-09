@@ -2910,10 +2910,7 @@ async fn pause_dependent(
             &[
                 &downstream_transform,
                 &downstream_column,
-                &format!(
-                    "paused because upstream column '{upstream_transform}.{upstream_column}' \
-                     is paused"
-                ),
+                &cascade_reason(upstream_transform, upstream_column),
             ],
         )
         .await?;
@@ -3300,6 +3297,56 @@ pub async fn resume_column(
     Ok(resumed)
 }
 
+/// The reason (`column_status.last_error`) a column paused by the cascade
+/// from `upstream_transform.upstream_column` gives.
+pub(crate) fn cascade_reason(upstream_transform: &str, upstream_column: &str) -> String {
+    format!("paused because upstream column '{upstream_transform}.{upstream_column}' is paused")
+}
+
+/// Restates the reason `transform.column` gives for its pause once one of
+/// the edges into it is gone and others are left (issue #950): if its
+/// `last_error` names an upstream column it no longer has an edge from, it
+/// names the first one it still has. A row with a reason of its own
+/// (`local_fuse`), one awaiting its capture, and one with no edge left are
+/// left as they are. The caller holds the column-pause lock.
+pub(crate) async fn restate_cascade_reason(
+    txn: &impl GenericClient,
+    transform: &str,
+    column: &str,
+) -> Result<(), tokio_postgres::Error> {
+    let rows = txn
+        .query(
+            "select s.last_error, c.upstream_transform, c.upstream_column \
+             from column_status s \
+             join column_pause_cascades c \
+               on c.downstream_transform = s.transform_table \
+              and c.downstream_column = s.column_name \
+             where s.transform_table = $1 and s.column_name = $2 \
+               and not s.local_fuse and not s.awaiting_capture \
+             order by c.upstream_transform, c.upstream_column",
+            &[&transform, &column],
+        )
+        .await?;
+    let reasons: Vec<String> = rows
+        .iter()
+        .map(|row| cascade_reason(row.get(1), row.get(2)))
+        .collect();
+    let Some(first) = reasons.first() else {
+        return Ok(());
+    };
+    let current: Option<String> = rows[0].get(0);
+    if current.is_some_and(|current| reasons.contains(&current)) {
+        return Ok(());
+    }
+    txn.execute(
+        "update column_status set last_error = $3 \
+         where transform_table = $1 and column_name = $2",
+        &[&transform, &column, first],
+    )
+    .await?;
+    Ok(())
+}
+
 /// What [`uncascade`] released.
 pub(crate) struct Uncascaded {
     /// The columns of the walked definition no longer paused: the seeds,
@@ -3317,7 +3364,9 @@ pub(crate) struct Uncascaded {
 /// `local_fuse`, no other edge into it, and not awaiting its capture,
 /// which its own field build's start releases, #687). A reader in `target`
 /// is released in `txn` and walked from in turn (issue #748); one in
-/// another definition is returned in [`Uncascaded::dependents`].
+/// another definition is returned in [`Uncascaded::dependents`]. A reader
+/// still paused through another edge has its reason restated
+/// ([`restate_cascade_reason`]).
 ///
 /// Two paths end a column's pause this way, and both must: a resume
 /// ([`resume_column`]), and the release of a field that awaited its capture
@@ -3371,6 +3420,8 @@ pub(crate) async fn uncascade(
                 .await?
                 .get(0);
             if remaining > 0 {
+                // Still paused through another edge: its reason names one.
+                restate_cascade_reason(txn, &downstream_transform, &downstream_column).await?;
                 continue;
             }
             if downstream_transform == target {
