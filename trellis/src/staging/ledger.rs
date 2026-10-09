@@ -94,7 +94,7 @@
 //! table's row type instead. A `json`/`jsonb` column is cast from its text
 //! directly: populating would store the text as a JSON string.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
 use tokio_postgres::Transaction;
@@ -1349,70 +1349,97 @@ pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: 
     rederive_statement(plan, &chunk_source_filter(plan, range_where, keys), keys)
 }
 
-/// A rebuild's sweep batch's one statement (#625 F3; called from
-/// [`super::build`]): [`chunk_statement`] for a set of keys rather than a
-/// range, the keys of live entries the build's chunks didn't re-derive.
-/// The source is read by its typed key columns, so the read is one index
-/// probe per key: `$1` is the keys' `text[]`, and `$2..` one `text[]` per
-/// primary-key column holding that column of each key, in key order
-/// ([`sweep_key_params`]).
+/// A rebuild's sweep batch's statement for one [`SweepGroup`] (#625 F3;
+/// called from [`super::build`]): [`chunk_statement`] for a set of keys
+/// rather than a range, the keys of live entries the build's chunks didn't
+/// re-derive. The source is read by its typed key columns, so the read is
+/// one index probe per key: `$1` is the keys' `text[]`, and `$2..` one
+/// `text[]` per primary-key column that isn't `NULL` in the group's keys,
+/// holding that column of each key, in key order ([`SweepGroup::params`]).
 ///
 /// A key's `NULL` part matches the source's `NULL` (#625 F6): only a source
 /// keyed by a nullable unique index (another aggregate's target) has such
-/// keys, and a ledger target counts their rows like any other. A column that
-/// can't hold one is matched by `=`, which the source's index serves.
-pub(super) fn sweep_statement(plan: &LedgerTargetPlan) -> String {
-    let on: Vec<String> = plan
-        .source_pk
-        .iter()
-        .enumerate()
-        .map(|(i, column)| {
-            let c = quote_ident(&column.name);
-            if column.nullable {
-                format!(
-                    "(s.{c} = u.__trellis_p{i} or (s.{c} is null and u.__trellis_p{i} is null))"
-                )
-            } else {
-                format!("s.{c} = u.__trellis_p{i}")
-            }
-        })
-        .collect();
-    let arrays: Vec<String> = plan
-        .source_pk
-        .iter()
-        .enumerate()
-        .map(|(i, column)| format!("${}::text[]::{}[]", i + 2, column.data_type))
-        .collect();
-    let columns: Vec<String> = (0..plan.source_pk.len())
-        .map(|i| format!("__trellis_p{i}"))
-        .collect();
-    rederive_statement(
-        plan,
-        &format!(
-            "join unnest({}) as u({}) on {}",
-            arrays.join(", "),
-            columns.join(", "),
-            on.join(" and ")
-        ),
-        "$1",
-    )
-}
-
-/// [`sweep_statement`]'s `$2..` parameters for `keys`: per primary-key
-/// column, that column's part of each key, as text (`None` for a `NULL`
-/// part).
-pub(super) fn sweep_key_params(
-    plan: &LedgerTargetPlan,
-    keys: &[&str],
-) -> Result<Vec<Vec<Option<String>>>, ApplyError> {
-    let mut columns = vec![Vec::with_capacity(keys.len()); plan.source_pk.len()];
-    for key in keys {
-        let parts = ddl::split_pk_key(&plan.source_pk, &plan.source_table, key)?;
-        for (column, part) in columns.iter_mut().zip(parts) {
-            column.push(part.map(|p| p.into_owned()));
+/// keys, and a ledger target counts their rows like any other. Every key of
+/// a group is `NULL` in the same columns (`nulls`), which are matched by
+/// `is null`, and the others by `=`, so the index's condition covers every
+/// key column. A `NULL`-safe match in one statement for all keys (an `or`
+/// per column) would leave all but the key's first column out of the
+/// index's condition, reading every source row that shares that column
+/// with the key.
+pub(super) fn sweep_statement(plan: &LedgerTargetPlan, nulls: &[bool]) -> String {
+    let mut on = Vec::with_capacity(plan.source_pk.len());
+    let mut arrays = Vec::new();
+    let mut columns = Vec::new();
+    for (column, null) in plan.source_pk.iter().zip(nulls) {
+        let c = quote_ident(&column.name);
+        if *null {
+            on.push(format!("s.{c} is null"));
+        } else {
+            let p = format!("__trellis_p{}", columns.len());
+            on.push(format!("s.{c} = u.{p}"));
+            arrays.push(format!(
+                "${}::text[]::{}[]",
+                arrays.len() + 2,
+                column.data_type
+            ));
+            columns.push(p);
         }
     }
-    Ok(columns)
+    // A key that is `NULL` in every column (one at most: the source's index
+    // is `NULLS NOT DISTINCT`) binds no column.
+    let keys = if arrays.is_empty() {
+        "(select) as u".to_string()
+    } else {
+        format!("unnest({}) as u({})", arrays.join(", "), columns.join(", "))
+    };
+    rederive_statement(plan, &format!("join {keys} on {}", on.join(" and ")), "$1")
+}
+
+/// The keys of a sweep batch that are `NULL` in the same primary-key
+/// columns, which one [`sweep_statement`] re-derives.
+pub(super) struct SweepGroup<'a> {
+    /// Per primary-key column, whether the keys' part in it is `NULL`.
+    pub(super) nulls: Vec<bool>,
+    /// The keys, in the batch's order.
+    keys: Vec<&'a str>,
+    /// Per primary-key column that isn't `NULL` in `nulls`, that column's
+    /// part of each key, as text.
+    parts: Vec<Vec<String>>,
+}
+
+impl SweepGroup<'_> {
+    /// [`sweep_statement`]'s parameters: the keys, then `parts`.
+    pub(super) fn params(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&self.keys];
+        for part in &self.parts {
+            params.push(part);
+        }
+        params
+    }
+}
+
+/// `keys`, split into [`SweepGroup`]s by the columns their `NULL` parts are
+/// in: one group for a source whose key can't hold a `NULL`, and, over
+/// another aggregate's target, one per pattern of `NULL`s the batch holds.
+pub(super) fn sweep_groups<'a>(
+    plan: &LedgerTargetPlan,
+    keys: &[&'a str],
+) -> Result<Vec<SweepGroup<'a>>, ApplyError> {
+    let mut groups: BTreeMap<Vec<bool>, SweepGroup<'a>> = BTreeMap::new();
+    for key in keys {
+        let parts = ddl::split_pk_key(&plan.source_pk, &plan.source_table, key)?;
+        let nulls: Vec<bool> = parts.iter().map(Option::is_none).collect();
+        let group = groups.entry(nulls.clone()).or_insert_with(|| SweepGroup {
+            parts: vec![Vec::new(); nulls.iter().filter(|null| !**null).count()],
+            nulls,
+            keys: Vec::new(),
+        });
+        group.keys.push(key);
+        for (column, part) in group.parts.iter_mut().zip(parts.into_iter().flatten()) {
+            column.push(part.into_owned());
+        }
+    }
+    Ok(groups.into_values().collect())
 }
 
 /// [`chunk_statement`] and [`sweep_statement`]'s shared body. `src_from` is

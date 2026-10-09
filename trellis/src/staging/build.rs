@@ -617,12 +617,14 @@ pub struct SweepOutcome {
 /// snapshot's `xmax` is at or before it). A key quarantined for the
 /// definition (`poison`) is left as it is, as a chunk leaves it (#625 F-A5).
 /// Then it locks them ([`lock_sweep_entries`]) and re-derives them in one
-/// statement
-/// ([`ledger::sweep_statement`]), which reads the source by each key: a key
-/// with no row any more (deleted while the definition was frozen) becomes a
-/// tombstone, and its group sheds it through the group deltas. The pick is
-/// read before the lock and nothing relies on it after: a picked entry that
-/// changed meanwhile is re-derived all the same, which is idempotent.
+/// statement ([`ledger::sweep_statement`]), or, over a source keyed by
+/// nullable columns, one per pattern of `NULL` parts among them
+/// ([`ledger::sweep_groups`], #625 F6), which reads the source by each key:
+/// a key with no row any more (deleted while the definition was frozen)
+/// becomes a tombstone, and its group sheds it through the group deltas.
+/// The pick is read before the lock and nothing relies on it after: a
+/// picked entry that changed meanwhile is re-derived all the same, which is
+/// idempotent.
 ///
 /// Reading a bounded window of entries rather than a bounded number of
 /// picks keeps each statement short whatever the ledger holds (F-A8).
@@ -685,16 +687,18 @@ pub async fn sweep_batch(
     }
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
     lock_sweep_entries(txn, ledger, &key_refs).await?;
-    let parts = ledger::sweep_key_params(ledger, &key_refs)?;
-    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&key_refs];
-    for part in &parts {
-        params.push(part);
+    let mut delta_rows = 0;
+    for group in ledger::sweep_groups(ledger, &key_refs)? {
+        let started = Instant::now();
+        let row = ledger::query_one_by_entry_key(
+            txn,
+            &ledger::sweep_statement(ledger, &group.nulls),
+            &group.params(),
+        )
+        .await?;
+        metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
+        delta_rows += row.get::<_, i64>(1);
     }
-    let started = Instant::now();
-    let row =
-        ledger::query_one_by_entry_key(txn, &ledger::sweep_statement(ledger), &params).await?;
-    metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
-    let delta_rows: i64 = row.get(1);
     tracing::debug!(
         target_table = %ledger.target,
         scanned,
@@ -809,12 +813,12 @@ pub async fn explain_merge(
         .join("\n"))
 }
 
-/// The plans of a build's two Re-derive statements over `keys` (encoded,
-/// as a chunk's key read returns them), as `explain`'s text, each labelled,
+/// The plans of a build's Re-derive statements over `keys` (encoded, as a
+/// chunk's key read returns them), as `explain`'s text, each labelled,
 /// under the settings a chunk and a sweep batch run them with (#778): the
 /// chunk's over `(lo, hi]` ([`run_chunk`]) and the sweep batch's
-/// ([`sweep_batch`]). For tests of the plans' shape. It locks and writes
-/// nothing.
+/// ([`sweep_batch`]), one per pattern of `NULL` parts among `keys`. For
+/// tests of the plans' shape. It locks and writes nothing.
 #[cfg(any(test, feature = "internals"))]
 pub async fn explain_rederive(
     txn: &Transaction<'_>,
@@ -846,20 +850,19 @@ pub async fn explain_rederive(
         )
         .await?,
     );
-    let parts = ledger::sweep_key_params(ledger, &keys)?;
-    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&keys];
-    for part in &parts {
-        params.push(part);
+    let mut plans = vec![("chunk statement", chunk)];
+    for group in ledger::sweep_groups(ledger, &keys)? {
+        let sweep = explain(
+            ledger::query_by_entry_key(
+                txn,
+                &format!("explain {}", ledger::sweep_statement(ledger, &group.nulls)),
+                &group.params(),
+            )
+            .await?,
+        );
+        plans.push(("sweep statement", sweep));
     }
-    let sweep = explain(
-        ledger::query_by_entry_key(
-            txn,
-            &format!("explain {}", ledger::sweep_statement(ledger)),
-            &params,
-        )
-        .await?,
-    );
-    Ok(vec![("chunk statement", chunk), ("sweep statement", sweep)])
+    Ok(plans)
 }
 
 /// One statement: the merge partitions of the delta table `deltas` (quoted,

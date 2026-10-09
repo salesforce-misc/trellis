@@ -2531,3 +2531,66 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
     );
     open.rollback().await.expect("end the old transaction");
 }
+
+/// #625 F6: a rebuild's sweep reads a nullable-keyed source (another
+/// aggregate's target) by every column of each key, a `NULL` part
+/// included. Its keys go in one statement per pattern of `NULL` parts, each
+/// matching its `NULL` columns by `is null` and the rest by `=`: a
+/// `NULL`-safe `or` per column in one statement for every key left the
+/// source's index condition without the key's columns, and read the source
+/// whole per batch.
+#[tokio::test]
+async fn the_sweep_reads_a_nullable_keyed_source_by_its_whole_key() {
+    let (d, u_columns) = nullable_keyed_upstream(
+        "insert into public.src select i, i % 4, i, i from generate_series(1, 20000) i; \
+         insert into public.src values (20001, null, 5, 1), (20002, 3, null, 1), \
+                                       (20003, null, null, 1)",
+    )
+    .await;
+    install_definition(
+        d.pool(),
+        "TRANSFORM w FROM public.u GROUP BY b SELECT SUM(x) AS total, COUNT(*) AS n",
+        &u_columns,
+        "public",
+    )
+    .await
+    .expect("register the downstream");
+    d.ctl
+        .batch_execute("analyze public.u")
+        .await
+        .expect("analyze the source");
+    let plan = d.build_plan("w").await;
+    // `\u{1f}` separates a key's parts, and `\u{1}` is a `NULL` part.
+    let keys = [
+        "1\u{1f}5",
+        "2\u{1f}6",
+        "\u{1}\u{1f}5",
+        "3\u{1f}\u{1}",
+        "\u{1}\u{1f}\u{1}",
+    ];
+    let mut client = d.db.pool.get().await.expect("pool");
+    let txn = client.transaction().await.expect("begin");
+    let plans = build::explain_rederive(&txn, &plan, Some("0\u{1f}0"), "3\u{1f}20000", &keys)
+        .await
+        .expect("explain the Re-derive statements");
+    txn.rollback().await.expect("roll back");
+    let sweeps: Vec<&String> = plans
+        .iter()
+        .filter(|(statement, _)| *statement == "sweep statement")
+        .map(|(_, explained)| explained)
+        .collect();
+    assert_eq!(
+        sweeps.len(),
+        4,
+        "one statement per pattern of NULL parts: {plans:#?}"
+    );
+    for explained in sweeps {
+        let reads_u_by_its_key = explained.lines().any(|line| {
+            line.contains("Index Cond") && line.contains("(a ") && line.contains("(b ")
+        });
+        assert!(
+            reads_u_by_its_key && !explained.contains("Seq Scan on u"),
+            "the sweep reads u by both key columns:\n{explained}"
+        );
+    }
+}
