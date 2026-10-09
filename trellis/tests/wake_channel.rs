@@ -63,12 +63,14 @@ async fn a_seal_in_one_instance_does_not_wake_the_other_instances_channel() {
         .await
         .expect("listen on both channels");
 
-    // Instance A's staging worker, on its default options: it seals the
-    // active segment once a row lands in it and notifies its wake channel.
+    // Instance A's staging worker and one app worker, on default options:
+    // the staging worker seals the active segment once a row lands in it and
+    // notifies its wake channel; the app worker then drains that segment and
+    // notifies the channel it `LISTEN`s on. Both must be A's channel.
     let config_a = Config::with_schema(db.dsn(), SCHEMA_A).expect("valid schema");
     let options = trellis::ClientOptions {
         staging_worker: true,
-        application_threads: 0,
+        application_threads: 1,
         maintenance_interval: Duration::from_millis(50),
         ..Default::default()
     };
@@ -87,15 +89,21 @@ async fn a_seal_in_one_instance_does_not_wake_the_other_instances_channel() {
         .await
         .expect("stage a row in A's active segment");
 
-    let (first, _) = tokio::time::timeout(RECV_TIMEOUT, notifications.recv())
-        .await
-        .expect("A's seal must notify")
-        .expect("listener open");
-    assert_eq!(first, channel_a, "A's seal notifies A's channel");
+    // The seal's notify, then the drain's. The drain can't start before the
+    // seal publishes, so they arrive in that order; the second one pins the
+    // app worker to the same resolved name as the staging worker (the drain
+    // notifies the channel the worker's `LISTEN` is on).
+    for step in ["A's seal", "A's drain"] {
+        let (channel, _) = tokio::time::timeout(RECV_TIMEOUT, notifications.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{step} must notify"))
+            .expect("listener open");
+        assert_eq!(channel, channel_a, "{step} notifies A's channel");
+    }
 
-    // Synchronization point: a marker on B's channel, sent after A's seal
-    // committed. Everything A sent before it has been delivered by the time
-    // the marker is.
+    // Synchronization point: a marker on B's channel, sent after A's seal and
+    // drain committed. Everything A sent before it has been delivered by the
+    // time the marker is.
     let (observer, _) = connect(db.dsn(), "public").await;
     observer
         .execute("select pg_notify($1, 'marker')", &[&channel_b])

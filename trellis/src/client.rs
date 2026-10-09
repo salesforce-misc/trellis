@@ -3878,4 +3878,41 @@ mod wake_channel_tests {
         };
         assert_eq!(explicit.wake_channel_for("inst_a"), "custom");
     }
+
+    /// `pg_notify` takes the channel as a plain string, while `LISTEN` takes
+    /// an identifier that Postgres case-folds unless it is quoted. A worker's
+    /// `LISTEN` on the derived channel of a mixed-case schema, or one with a
+    /// space or a double quote, must still hear a `pg_notify` of that name.
+    #[tokio::test]
+    async fn the_listener_hears_a_notify_on_a_mixed_case_schemas_channel() {
+        use crate::config::DEFAULT_SCHEMA;
+
+        let hang_guard = Duration::from_secs(30);
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let notifier = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("connect");
+        for schema in ["InstA", "Inst \"B\" é"] {
+            let channel = default_wake_channel(schema);
+            let mut wake = WakeListener::spawn(
+                db.dsn().to_string(),
+                DEFAULT_SCHEMA.to_string(),
+                channel.clone(),
+            );
+            let mut next_wake = async || {
+                tokio::time::timeout(hang_guard, wake.rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("a wake on {channel:?} before the hang guard"))
+                    .expect("the wake channel stays open")
+            };
+            // The catch-up wake, sent once the `LISTEN` has committed.
+            next_wake().await;
+            notifier
+                .execute("select pg_notify($1, '')", &[&channel])
+                .await
+                .expect("notify");
+            next_wake().await;
+        }
+    }
 }
