@@ -81,7 +81,9 @@ bindings default it to 2; Rust's `TrellisOptions` leaves it at one thread per
 core unless you set it. The cap is per runtime and per handle, and no budget is
 shared between handles: a handle that runs a client holds up to `2 * worker_threads`
 worker threads, and a process with H such handles holds up to `2 * worker_threads * H`.
-Size it for the handles you open.
+Size it for the handles you open. It caps worker threads only, not every
+thread a handle starts: each runtime also has a thread driving it and a
+blocking pool Tokio grows on demand (for DNS lookups, for one).
 
 ### What the staging worker needs from the database
 

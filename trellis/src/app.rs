@@ -157,7 +157,11 @@ pub struct TrellisOptions {
     /// handles. A [`BlockingTrellis`](crate::BlockingTrellis) that runs a
     /// client holds up to two runtimes, so up to `2 * n` worker threads; a
     /// process with H such handles holds up to `2 * n * H`. Size `n` for the
-    /// handle count you open.
+    /// handle count you open. The cap counts worker threads only: the thread
+    /// driving each runtime and each runtime's on-demand blocking pool are
+    /// outside it. The client's staging and drain workers are tasks on its
+    /// runtime, so `n` also bounds how many of them compute at once, however
+    /// large `drain_threads` is.
     ///
     /// Matters chiefly when Trellis is embedded inside a host VM that
     /// already sized its own scheduler pool to core count — a BEAM node, or
@@ -167,10 +171,12 @@ pub struct TrellisOptions {
     /// own work is I/O, not compute-bound, a small explicit count (2, say)
     /// is enough; see issue #141.
     ///
-    /// Must be at least 1 when set: `Some(0)` fails the connect with
-    /// [`TrellisError::BlockingSpawn`] (blocking) or [`TrellisError::Client`]
-    /// (a client to start), since a runtime with no worker threads couldn't
-    /// run anything anyway.
+    /// Must be at least 1 when set, since a runtime with no worker threads
+    /// couldn't run anything: `Some(0)` fails a connect that builds a runtime,
+    /// with [`TrellisError::BlockingSpawn`] from `BlockingTrellis::connect` or
+    /// [`TrellisError::Client`] from a [`Trellis::connect`] that starts a
+    /// client. A `Trellis::connect` that starts no client builds no runtime,
+    /// so it never reads the cap.
     pub worker_threads: Option<usize>,
 }
 
@@ -2375,6 +2381,29 @@ mod client_options_tests {
             Trellis::client_options(&TrellisOptions::default()).worker_threads,
             None
         );
+    }
+
+    /// Issue #876: the cap reaches the runtime the client thread actually
+    /// builds, not just the options struct. A zero cap fails that build
+    /// before the client opens any connection, so this needs no database;
+    /// a client thread that built its runtime any other way would get past
+    /// it and fail on the unreachable DSN instead.
+    #[tokio::test]
+    async fn connect_builds_the_client_runtime_with_worker_threads() {
+        let config =
+            Config::with_schema("postgres://trellis@127.0.0.1:1/none", "trellis").expect("config");
+        let options = TrellisOptions {
+            staging: true,
+            drain_threads: 0,
+            worker_threads: Some(0),
+        };
+        match Trellis::connect(config, options).await {
+            Err(TrellisError::Client(ClientError::Spawn(err))) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            Err(err) => panic!("expected the client runtime build to fail, got: {err}"),
+            Ok(_) => panic!("a zero worker_threads cap must not start a client"),
+        }
     }
 }
 

@@ -229,7 +229,7 @@ pub(crate) fn build_runtime(
         if worker_threads == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "TrellisOptions::worker_threads must be at least 1 when set; \
+                "worker_threads must be at least 1 when set; \
                  leave it as None for tokio's own per-core default",
             ));
         }
