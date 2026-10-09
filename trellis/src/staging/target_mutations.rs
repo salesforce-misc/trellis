@@ -201,7 +201,7 @@
 //! **One feed per target.** A seam row and a CDC row for the same write
 //! would be two deltas, applied twice when they land in different batches,
 //! which is why the seam only took this over once endpoint targets were no
-//! longer captured (#403). G (#626) captures targets and deletes this seam.
+//! longer captured (#403). Targets are not trigger-captured (#807).
 //!
 //! **A target becoming an endpoint.** [`TargetInfo`] is resolved once per
 //! transaction, so a writer that resolved it before a `create_relationship`

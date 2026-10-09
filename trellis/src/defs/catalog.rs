@@ -7626,7 +7626,7 @@ async fn readers_exist(
 /// shape for an endpoint target (`staging::target_mutations`, "Standing in
 /// for a relationship endpoint's CDC"), so the seam is the one change feed
 /// for every target this instance owns. Another instance's target is just a
-/// table here, and is captured like one. G (#626) captures targets too.
+/// table here, and is captured like one.
 pub async fn tables_to_capture(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let tables = all_source_tables(pool).await?;
     let client = pool.get().await?;

@@ -705,10 +705,21 @@ the same way, so a rebuilt upstream needs no catch-up for its readers. A
 worker propagating downstream appends to the active segment, never the batch
 it is draining.
 
-Whether targets should instead be captured like sources, deleting the seam,
-with cycle handling under trigger capture and cascading truncates on
-captured targets, is open:
-[#807](https://github.com/salesforce-misc/trellis/issues/807).
+Targets are not trigger-captured, though the writer stages their changes in
+the same ring row shape the triggers write for a source, so intake and the
+drain path are shared and only the producer differs. Trellis is a target's
+only writer and already knows each change as it makes it; a trigger would
+re-derive what the writer has in hand
+([#807](https://github.com/salesforce-misc/trellis/issues/807)).
+
+- A trigger adds per-row cost to every target write; the seam adds none
+  beyond the staging insert itself.
+- `hop_gen` and cycle detection stay in process. A session setting could
+  carry `hop_gen` to a trigger, but that rebuilds in SQL what the writer
+  already has.
+- Cascading truncates on a captured target would need their own handling.
+- Capturing targets interacts with demand-driven sealing (#272).
+- One propagation path serves multi-hop (#354).
 
 ## Rejected alternatives
 
