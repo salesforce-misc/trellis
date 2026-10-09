@@ -72,6 +72,10 @@
 //! after its fence bump, before it checks its upstream column is still
 //! paused (#912). A test runs the pause inside [`with_scope`].
 //!
+//! The walk also fires [`PausePoint::AfterCascadeDependentsRead`] for an
+//! upstream's transform after it reads that column's dependents, holding
+//! nothing, before the first of their pairs (#955).
+//!
 //! A define or `ALTER TRANSFORM` fires [`PausePoint::AfterUpstreamPausesRead`]
 //! for its own target after it reads the paused columns its definition
 //! reads (#914). A test runs the define inside [`with_scope`].
@@ -171,6 +175,12 @@ pub enum PausePoint {
     /// `column_status` row, for the reader's transform
     /// (`super::quarantine::cascade_pause`, #912).
     AfterCascadeFenceBump,
+    /// After a column pause cascade's walk reads the dependents of an
+    /// upstream column, before it goes to the first of their pairs, for the
+    /// upstream's transform (`super::quarantine::cascade_pause`, #955). The
+    /// walk holds no lock and no transaction, so an `ALTER TRANSFORM` of a
+    /// reader it just listed can commit here.
+    AfterCascadeDependentsRead,
     /// After a define or `ALTER TRANSFORM` reads the paused columns of the
     /// targets its definition reads, holding the column-pause lock (shared
     /// for a define, exclusive for an edit, #922), before it pauses its

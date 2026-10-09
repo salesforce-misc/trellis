@@ -2815,6 +2815,10 @@ async fn bump_pause_fence(
 ///   under the column-pause lock, taken after the fence bump, so a walk
 ///   racing that column's [`resume_column`] can't pause a reader the resume
 ///   already released. The walk goes no further down that branch.
+/// - The same read, under the same lock, checks the reader's definition
+///   still has the field and the field still reads the upstream column, as
+///   the walk listed it before any lock and an edit may have committed
+///   since (issue #955). A pair that fails it is skipped the same way.
 ///
 /// A pause records the walk as owed (`column_status.cascade_pending`) in
 /// the transaction that writes its own row, and the walk clears it once it
@@ -2848,6 +2852,23 @@ async fn cascade_pause(
 
     while let Some((upstream_transform, upstream_column)) = queue.pop_front() {
         let deps = catalog::column_dependents(pool, &upstream_transform, &upstream_column).await?;
+        // Test-only pause point (#955). See `super::interleave`. The walk
+        // holds nothing here, and nothing but the pair's own lock waits
+        // keeps an edit of a reader it listed from committing.
+        #[cfg(any(test, feature = "test-util"))]
+        if !deps.is_empty() {
+            // In a transaction of its own: the hook lifts the session's
+            // lock timeout for the pause with `set_config(..., true)`.
+            let mut client = pool.get().await?;
+            let txn = client.transaction().await?;
+            super::interleave::pause_at(
+                &*txn,
+                super::interleave::PausePoint::AfterCascadeDependentsRead,
+                &upstream_transform,
+            )
+            .await?;
+            txn.commit().await?;
+        }
         for (downstream_transform, downstream_column) in deps {
             if !cascaded_already(
                 pool,
@@ -2925,7 +2946,10 @@ async fn cascaded_already(
 /// when `upstream` is no longer paused: the read of its row is made under
 /// the lock, so a [`resume_column`] deleting it has committed already, and
 /// one that comes later waits for this commit and then deletes the edge with
-/// the rest.
+/// the rest. Also false when `downstream` no longer reads `upstream`
+/// ([`catalog::reads_column`]): the walk listed it before it took any lock,
+/// and an `ALTER TRANSFORM` of its definition may have dropped the field or
+/// its read since (issue #955).
 async fn pause_dependent(
     pool: &Pool,
     (downstream_transform, downstream_column): (&str, &str),
@@ -2957,7 +2981,18 @@ async fn pause_dependent(
         )
         .await?
         .is_some();
-    if !upstream_paused {
+    // The walk listed this reader before it took any lock, so an edit of
+    // the reader's definition may have committed since (#955). Every edit
+    // holds the lock exclusive, so what is committed now stays so until this
+    // pair commits.
+    if !upstream_paused
+        || !catalog::reads_column(
+            &*txn,
+            (downstream_transform, downstream_column),
+            (upstream_transform, upstream_column),
+        )
+        .await?
+    {
         txn.rollback().await?;
         return Ok(false);
     }

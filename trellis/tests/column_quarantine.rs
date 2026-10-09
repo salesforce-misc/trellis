@@ -5645,3 +5645,139 @@ async fn a_build_start_behind_a_held_column_pause_lock_waits_for_the_next_pass()
     assert_eq!(taken, vec![defined.id]);
     assert_eq!(definition_status(&client, defined.id).await, "backfilling");
 }
+
+// ---------------------------------------------------------------------
+// Issue #955: a cascade pair re-checks, under the column-pause lock, that
+// its reader still reads the paused column.
+// ---------------------------------------------------------------------
+
+/// `sib (total, cost)` over `items`, row 1 drained, and `sib_sum` reading
+/// `cost` (`c1`) and `total` (`c2`), built and live. Returns the client and
+/// a `Trellis` on `db`.
+async fn seed_two_column_reader(db: &TestDatabase) -> (Client, Trellis) {
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(db, &client, "price + tax AS total, price + 0 AS cost").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    let trellis = trellis_on(db).await;
+    trellis
+        .apply("TRANSFORM sib_sum FROM sib SELECT cost + 1 AS c1, total + 1 AS c2")
+        .await
+        .expect("define sib_sum");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    (client, trellis)
+}
+
+/// Starts `PAUSE sib.cost` and freezes its walk after it read `cost`'s
+/// dependents (`sib_sum.c1`), holding no lock and no transaction. Returns
+/// the walk's task, the gate to release it with and the gate's key.
+async fn pause_cost_frozen_after_dependents_read(
+    db: &TestDatabase,
+    gate_key: i64,
+) -> (tokio::task::JoinHandle<Result<(), ApplyError>>, Client, i64) {
+    let gate = take_gate(db, gate_key).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterCascadeDependentsRead, "sib", gate_key);
+    let pool = db.pool.clone();
+    let mut pause = tokio::spawn(with_scope(scope, async move {
+        quarantine::pause_column(&pool, "sib", "cost").await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut pause => panic!("the pause finished without reaching its walk: {finished:?}"),
+    }
+    (pause, gate, gate_key)
+}
+
+/// The race's first outcome: `c1` is edited to read `total` instead of
+/// `cost` after the walk listed it as `cost`'s reader and before its pair.
+/// The pair writes nothing: `c1` isn't paused on a column it doesn't read,
+/// and has no edge for a later `DROP cost` to strand it on (#950).
+#[tokio::test]
+async fn a_cascade_pair_skips_a_reader_edited_to_stop_reading_the_column_after_the_walk_listed_it()
+{
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_two_column_reader(&db).await;
+
+    let (pause, gate, key) = pause_cost_frozen_after_dependents_read(&db, 955).await;
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS total + 2")
+        .await
+        .expect("the edit doesn't wait on the frozen walk");
+    release_gate(&gate, key).await;
+    pause.await.expect("pause task").expect("the walk finishes");
+
+    assert!(column_status_row(&client, "sib", "cost").await.is_some());
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "c1").await,
+        None,
+        "c1 no longer reads cost"
+    );
+    assert_eq!(cascade_edge_count(&client).await, 0);
+    assert_eq!(cascade_pending(&client, "sib", "cost").await, Some(false));
+
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["17"]));
+}
+
+/// The race's second outcome: `c1` is dropped after the walk listed it and
+/// before its pair. The pair writes no `column_status` row and no edge for
+/// a field that no longer exists, so a field of the same name added later
+/// isn't born paused (#309).
+#[tokio::test]
+async fn a_cascade_pair_skips_a_reader_dropped_after_the_walk_listed_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_two_column_reader(&db).await;
+
+    let (pause, gate, key) = pause_cost_frozen_after_dependents_read(&db, 9550).await;
+    trellis
+        .apply("ALTER TRANSFORM sib_sum DROP c1")
+        .await
+        .expect("the drop doesn't wait on the frozen walk");
+    release_gate(&gate, key).await;
+    pause.await.expect("pause task").expect("the walk finishes");
+
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "c1").await,
+        None,
+        "c1 no longer exists"
+    );
+    assert_eq!(cascade_edge_count(&client).await, 0);
+    assert_eq!(cascade_pending(&client, "sib", "cost").await, Some(false));
+
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ADD total + 3 AS c1")
+        .await
+        .expect("add a field of the dropped name");
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "c1").await,
+        None,
+        "the new c1 reads a live column, so it isn't born paused"
+    );
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["18"]));
+}
+
+/// The pair still pauses a reader the race left alone: an edit of another
+/// field of its definition, committed while the walk is frozen, doesn't make
+/// the pair skip `c1`, which still reads `cost`.
+#[tokio::test]
+async fn a_cascade_pair_still_pauses_a_reader_when_an_edit_of_a_sibling_field_raced_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (client, trellis) = seed_two_column_reader(&db).await;
+
+    let (pause, gate, key) = pause_cost_frozen_after_dependents_read(&db, 9551).await;
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c2 AS total + 2")
+        .await
+        .expect("the edit doesn't wait on the frozen walk");
+    release_gate(&gate, key).await;
+    pause.await.expect("pause task").expect("the walk finishes");
+
+    assert!(column_status_row(&client, "sib_sum", "c1").await.is_some());
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert_eq!(column_status_row(&client, "sib_sum", "c2").await, None);
+}

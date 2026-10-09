@@ -7945,6 +7945,48 @@ pub(crate) async fn column_dependents(
     Ok(deps)
 }
 
+/// Whether `reader` (a `(transform, field)` pair) is, as the committed
+/// catalog stands, a dependent [`column_dependents`] would list for
+/// `upstream`: its definition still has the field, is 1-1, and the field
+/// still reads the upstream column, directly, by alias or through a
+/// relationship. The cascade walk lists a column's readers outside any lock
+/// and re-asks this for each pair under the column-pause lock, which every
+/// edit of a definition holds exclusive, so the answer can't change before
+/// the pair commits (issue #955).
+pub(crate) async fn reads_column(
+    client: &impl GenericClient,
+    (reader_transform, reader_field): (&str, &str),
+    (upstream_table, upstream_column): (&str, &str),
+) -> Result<bool, CatalogError> {
+    if reader_transform == upstream_table {
+        let text: Option<String> = client
+            .query_opt(
+                "select definition_text from transform_definitions \
+                 where split_part(target_table, '.', 2) = $1",
+                &[&upstream_table],
+            )
+            .await?
+            .map(|row| row.get(0));
+        if let Some(text) = text {
+            let def = parse(&text)?;
+            if matches!(def.key_space, KeySpace::OneToOne)
+                && super::eval::AliasReaders::of(&def)
+                    .direct(upstream_column)
+                    .iter()
+                    .any(|reader| reader == reader_field)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(
+        column_dependents_via(client, upstream_table, upstream_column, true)
+            .await?
+            .iter()
+            .any(|(transform, field)| transform == reader_transform && field == reader_field),
+    )
+}
+
 /// [`column_dependents`], generalized to *every* downstream key-space (not
 /// just [`KeySpace::OneToOne`]) and to any `impl GenericClient` (a plain
 /// pooled connection, or a transaction) rather than just a fresh pooled one —

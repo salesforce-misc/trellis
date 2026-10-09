@@ -241,7 +241,11 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   only the mark it found: one that a later pause of the same column wrote
   stays for that pause's walk. A cascade that fails part-way completes
   whether or not anyone retries the `PAUSE`, and a fuse trip has no caller
-  to retry it.
+  to retry it. The walk lists a column's readers before it takes any lock, so
+  each pair checks, under the column-pause lock every edit holds exclusive,
+  that the reader's definition still has the field and the field still reads
+  the paused column, and writes nothing otherwise, the same as for an
+  upstream resumed since.
 * **Readers defined later** — a field of a 1-1 definition defined, or added or
   edited by `ALTER TRANSFORM`, while a column it reads is paused is paused at
   birth, with the `column_status` row and cascade edge the cascade writes, so its
