@@ -615,9 +615,9 @@ to another type family as it was.
 every column the definition created to the type define would give it now,
 releases its held keys and rebuilds the target. An aggregate whose group-delta
 table has different `__dc`, `__ds` or `__out` columns than define would create
-now is the exception: a `SUM` argument that moved between `numeric` and
-floating point keeps the running-sum column define gave the old `SUM`. The
-resume refuses, naming `DROP TRANSFORM`, and the definition stays paused. Drop
+now is the exception: a `SUM` or `AVG` argument that moved between
+`numeric` and floating point keeps the running-sum column define gave the
+old `SUM`. The resume refuses, naming `DROP TRANSFORM`, and the definition stays paused. Drop
 it and define it again (#857).
 
 ## 23. A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy

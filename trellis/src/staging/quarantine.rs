@@ -4055,6 +4055,18 @@ async fn resume_locked(
             });
         }
     };
+    match catalog::check_deltas_shape(txn, &definition, &revalidated).await {
+        Ok(()) => {}
+        Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
+            return Err(err.into());
+        }
+        Err(reason) => {
+            return Err(ApplyError::ResumeRefused {
+                transform: target.to_string(),
+                reason: Box::new(reason),
+            });
+        }
+    }
     let rels = catalog::relationships_read_by(txn, &definition.def, source_table).await?;
     let rel_refs: Vec<&crate::defs::model::RelationshipDefinition> = rels.iter().collect();
     let copies = crate::defs::copies::typed_copies(

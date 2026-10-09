@@ -5171,9 +5171,6 @@ pub(crate) async fn revalidate(
             });
         }
     }
-    if let KeySpace::Aggregate { .. } = definition.def.key_space {
-        check_deltas_shape(txn, definition, &source_columns, &relationships).await?;
-    }
     reject_row_security(
         txn,
         schema,
@@ -5189,19 +5186,27 @@ pub(crate) async fn revalidate(
     })
 }
 
-/// Refuses a resume of an aggregate whose group-delta table doesn't have the
+/// Refuses a whole-transform resume of an aggregate whose group-delta table
+/// doesn't have the
 /// `__dc`, `__ds` and `__out` columns define would create now (#857). A
 /// field's classification follows its argument's type, so a `SUM` argument
 /// that moved between `numeric` and floating point leaves the table with a
 /// running-sum column the rebuild can't fill. Any difference is refused
 /// ([`CatalogError::AggregateDeltasShapeChanged`]) rather than judged. A
 /// definition without a group-delta table has nothing to compare.
-async fn check_deltas_shape(
+///
+/// Only a whole-transform resume calls it ([`Revalidated`] is its input): a
+/// column resume of an aggregate field builds nothing and never reads the
+/// table.
+pub(crate) async fn check_deltas_shape(
     txn: &tokio_postgres::Transaction<'_>,
     definition: &Definition,
-    source_columns: &HashMap<String, ValueType>,
-    relationships: &HashMap<String, ResolvedRelationship>,
+    revalidated: &Revalidated,
 ) -> Result<(), CatalogError> {
+    if !matches!(definition.def.key_space, KeySpace::Aggregate { .. }) {
+        return Ok(());
+    }
+    let (source_columns, relationships) = (&revalidated.source_columns, &revalidated.relationships);
     let (target_schema, target_bare) = definition
         .target_table
         .split_once('.')
