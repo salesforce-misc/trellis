@@ -176,7 +176,15 @@ them, one table per transaction, then runs the resume itself. A crash between th
 leaves the request, and the next pass (or the next `RESUME`) finishes the work. So does
 a table whose re-type fails transiently (a lock it can't get in time, a deadlock, a
 serialization failure, a cancelled statement, a lost connection): the request stays,
-and the next pass tries again. A column whose re-type fails otherwise (a value its new
+and the next pass tries again, each retry updating the `capture_failure`'s
+"resuming: …" text with the last error. Trellis sets no `statement_timeout` of its own
+and honours the operator's, so a rewrite that outlasts it is cancelled (`57014`),
+rolled back and retried on the next pass, with the table locked `ACCESS EXCLUSIVE` up to
+the timeout each time. The request counts those cancellations (`resume_requests.timeout_cancels`,
+reset by every `RESUME`) and ends after 3, with an error that names the timeout and both
+remedies: raise `statement_timeout` for Trellis's role or database and `RESUME` again, or
+`DROP TRANSFORM` and define it again, which isn't subject to the re-type rewrite. A lock
+timeout or a lost connection isn't counted. A column whose re-type fails otherwise (a value its new
 type can't hold) ends the request with the error on the definition's
 `capture_failure`, and leaves that table's columns as they were; another table's,
 re-typed before it, keep their new types, and the next resume finds them current. The target keeps its rows. When its values can't be converted (a key

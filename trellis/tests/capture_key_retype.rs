@@ -3237,3 +3237,261 @@ async fn a_key_re_typed_in_place_is_measured_from_its_new_type() {
         "{error}"
     );
 }
+
+// ---- #894: a re-type cancelled by a statement_timeout ends the request ----
+
+/// Gives `public.item_names` an expression index whose function reads
+/// `public.retype_gate`: while its `mode` is `cancel`, rebuilding the index
+/// (which the `integer` to `bigint` rewrite of `id` does) cancels the
+/// session's own statement (`57014`, "user request"); while `sleep`, it
+/// sleeps for 30 s, which a `statement_timeout` cancels. No `mode` row, no
+/// effect. The cancel is as deterministic as a lock held by hand: no timer.
+async fn gate_item_names_retype(raw: &Client) {
+    raw.batch_execute(
+        "create table public.retype_gate (mode text); \
+         create function public.retype_gate_fn(v bigint) returns bigint \
+             language plpgsql immutable as $$ \
+         declare m text; \
+         begin \
+             select mode into m from public.retype_gate limit 1; \
+             if m = 'cancel' then \
+                 perform pg_cancel_backend(pg_backend_pid()); \
+                 perform pg_sleep(30); \
+             elsif m = 'sleep' then \
+                 perform pg_sleep(30); \
+             end if; \
+             return v; \
+         end $$; \
+         create index item_names_gate on public.item_names (public.retype_gate_fn(id));",
+    )
+    .await
+    .expect("gate the re-type");
+}
+
+async fn set_gate(raw: &Client, mode: Option<&str>) {
+    raw.batch_execute("delete from public.retype_gate")
+        .await
+        .expect("clear the gate");
+    if let Some(mode) = mode {
+        raw.execute("insert into public.retype_gate values ($1)", &[&mode])
+            .await
+            .expect("arm the gate");
+    }
+}
+
+/// `item_names`'s request count, or `None` once the request has ended.
+async fn timeout_cancels(raw: &Client, target: &str) -> Option<i32> {
+    raw.query_opt(
+        "select r.timeout_cancels from resume_requests r join transform_definitions d \
+         on d.id = r.transform_id where split_part(d.target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read the count")
+    .map(|row| row.get(0))
+}
+
+/// `item_names` paused for a widened key, its re-type gated, and resumed:
+/// the request waits for the staging worker's next pass.
+async fn gated_resume(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+    let trellis = items(dsn, raw, pool).await;
+    gate_item_names_retype(raw).await;
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(raw, pool).await;
+    paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    resume(&trellis, "item_names").await;
+    assert_retyping(&trellis, raw, "item_names").await;
+    trellis
+}
+
+/// #894: a re-type cancelled by a `statement_timeout` is retried on the
+/// next pass, each time telling the operator why in the `resuming:` message;
+/// the third cancellation ends the request, naming the timeout and both
+/// remedies. The definition stays paused, the copy keeps its type and the
+/// target its rows. A `RESUME` while the request is still there starts the
+/// count over; one after it ended starts at 0 and, with the cause gone (the
+/// timeout raised), finishes the re-type.
+#[tokio::test]
+async fn a_re_type_cancelled_three_times_ends_the_request_and_a_resume_after_raising_the_timeout_finishes()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+    let before = rows(
+        &raw,
+        "select id::text, name from public.item_names order by id",
+    )
+    .await;
+    set_gate(&raw, Some("cancel")).await;
+
+    for attempt in 1..=2 {
+        capture_pass(&mut raw, &db.pool).await;
+        let error = assert_retyping(&trellis, &raw, "item_names").await;
+        assert!(
+            error.contains("public.item_names.id from integer to bigint")
+                && error.contains(&format!(
+                    "attempt {attempt} of 3, last error: canceling statement due to user request"
+                )),
+            "{error}"
+        );
+        assert_eq!(timeout_cancels(&raw, "item_names").await, Some(attempt));
+    }
+
+    // A new RESUME while the request waits starts the count over.
+    resume(&trellis, "item_names").await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(0));
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(!error.contains("attempt"), "{error}");
+
+    for attempt in 1..=2 {
+        capture_pass(&mut raw, &db.pool).await;
+        assert_retyping(&trellis, &raw, "item_names").await;
+        assert_eq!(timeout_cancels(&raw, "item_names").await, Some(attempt));
+    }
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None, "ended");
+    let reported = trellis
+        .status("item_names")
+        .await
+        .expect("status")
+        .expect("item_names");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let error = reported.capture_failure.expect("reason").error;
+    assert!(
+        error.contains("public.item_names.id")
+            && error.contains("target table item_names")
+            && error.contains("statement_timeout cancelled the re-type 3 times")
+            && error.contains("Raise statement_timeout for Trellis's role or database")
+            && error.contains("resume the definition again")
+            && error.contains("DROP TRANSFORM item_names and define it again")
+            && !error.starts_with("resuming:"),
+        "{error}"
+    );
+    assert_eq!(
+        column_type(&raw, "public.item_names", "id").await,
+        "integer"
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.item_names order by id"
+        )
+        .await,
+        before
+    );
+    // Ended, so a further pass leaves it alone.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None);
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
+
+    // The remedy: with the cause gone, a new RESUME starts at 0 and finishes.
+    set_gate(&raw, None).await;
+    resume(&trellis, "item_names").await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(0));
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None);
+}
+
+/// #894: the other remedy the ending message names. `DROP TRANSFORM` and
+/// define again works after a request ended this way, and builds the target
+/// with the widened key.
+#[tokio::test]
+async fn drop_transform_and_define_again_works_after_a_re_type_request_ended_on_timeouts() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+    set_gate(&raw, Some("cancel")).await;
+    for _ in 0..3 {
+        capture_pass(&mut raw, &db.pool).await;
+    }
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None, "ended");
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
+
+    set_gate(&raw, None).await;
+    trellis
+        .apply("DROP TRANSFORM item_names")
+        .await
+        .expect("drop");
+    trellis
+        .apply("TRANSFORM item_names FROM public.items SELECT name AS name, qty + 1 AS next")
+        .await
+        .expect("define again");
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
+        .await
+        .expect("a key above 2^31");
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_item_names_match(&raw).await;
+}
+
+/// #894 rule 2: a lock timeout never held the lock, so it isn't counted: the
+/// request stays however many passes fail on it, and the message carries the
+/// last error without an attempt number. Here a reader of the target holds
+/// `ACCESS SHARE`, so the re-type's `ACCESS EXCLUSIVE` times out after
+/// `RETYPE_LOCK_TIMEOUT`; once it lets go the next pass re-types.
+#[tokio::test]
+async fn a_lock_timeout_on_the_re_type_is_retried_without_counting() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+
+    let mut reader = connect(db.dsn()).await;
+    let held = reader.transaction().await.expect("begin");
+    held.batch_execute("lock table public.item_names in access share mode")
+        .await
+        .expect("hold a read lock on the target");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(
+        error.contains("last error: canceling statement due to lock timeout")
+            && !error.contains(" of 3"),
+        "{error}"
+    );
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(0));
+    held.rollback().await.expect("release");
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+}
+
+/// #894: the cancel is the operator's own `statement_timeout`, not only a
+/// cancel by request: a re-type that outlasts it is counted the same way.
+#[tokio::test]
+async fn a_re_type_outlasting_the_statement_timeout_is_counted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+    set_gate(&raw, Some("sleep")).await;
+
+    raw.batch_execute("set statement_timeout = '1s'")
+        .await
+        .expect("set the timeout");
+    capture_pass(&mut raw, &db.pool).await;
+    raw.batch_execute("reset statement_timeout")
+        .await
+        .expect("reset the timeout");
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(
+        error.contains("attempt 1 of 3, last error: canceling statement due to statement timeout"),
+        "{error}"
+    );
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(1));
+}

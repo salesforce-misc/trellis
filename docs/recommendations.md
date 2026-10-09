@@ -117,6 +117,27 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
   ([#808](https://github.com/salesforce-misc/trellis/issues/808),
   [ADR-0002 — Consequences](decisions/0002-async-data-flow.md#consequences-and-costs)).
 
+## `statement_timeout`
+
+Trellis sets no `statement_timeout` of its own and honours the one on its role
+or database. Set it on the Trellis role only if you want it to bound the
+staging worker's statements: it applies to every one of them, including a
+resume's re-type of a column (`integer` to `bigint` rewrites the whole
+target under `ACCESS EXCLUSIVE`). A value shorter than that rewrite cancels
+it every time. The staging worker retries on its next pass, with readers of
+the target blocked for up to the timeout each time, and ends the resume after
+three cancellations. The transform stays `paused`, and its `capture_failure`
+names the two ways out:
+
+* raise `statement_timeout` for the Trellis role or database (for example
+  `alter role trellis set statement_timeout = 0`, or a value longer than the
+  rewrite takes) and `RESUME` the transform again; or
+* `DROP TRANSFORM` and define it again, which builds the target from empty and
+  isn't subject to the re-type rewrite.
+
+A `statement_timeout` meant for application queries belongs on the
+application's roles.
+
 ## Roles and permissions
 
 ### One Trellis role

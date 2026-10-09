@@ -4145,18 +4145,32 @@ async fn request_retype(
 ) -> Result<(), ApplyError> {
     txn.execute(
         "insert into resume_requests (transform_id) values ($1) \
-         on conflict (transform_id) do update set requested_at = now()",
+         on conflict (transform_id) do update set requested_at = now(), timeout_cancels = 0",
         &[&id],
     )
     .await?;
+    let (columns, error) = retyping_failure(source_table, drifted.iter());
+    set_capture_failure(txn, id, source_table, &columns, &error).await
+}
+
+/// The columns of `source_table` and the `capture_failure` text that report
+/// a resume waiting on the staging worker to re-type `drifted`
+/// ([`request_retype`]). The staging worker rewrites it on a transient
+/// retry ([`record_transient_retry`]).
+fn retyping_failure<'a>(
+    source_table: &str,
+    drifted: impl Iterator<Item = &'a crate::defs::copies::CopyState> + Clone,
+) -> (Vec<String>, String) {
     let mut columns: Vec<String> = Vec::new();
-    for column in drifted.iter().flat_map(|s| s.copy.columns_of(source_table)) {
+    for column in drifted
+        .clone()
+        .flat_map(|s| s.copy.columns_of(source_table))
+    {
         if !columns.iter().any(|c| c == column) {
             columns.push(column.to_string());
         }
     }
     let changes: Vec<String> = drifted
-        .iter()
         .map(|s| {
             format!(
                 "{} from {} to {}",
@@ -4172,7 +4186,7 @@ async fn request_retype(
          until then",
         changes.join(", ")
     );
-    set_capture_failure(txn, id, source_table, &columns, &error).await
+    (columns, error)
 }
 
 /// Sets definition `id`'s `capture_failure` (kind `capture`), replacing any
@@ -4369,7 +4383,13 @@ pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration:
 ///   reader of the target waits behind while it is queued. So is one whose
 ///   re-type fails any other transient way ([`is_transient_error`]: a
 ///   deadlock, a serialization failure, a cancelled statement, a lost
-///   connection), which says nothing about whether its values convert.
+///   connection), which says nothing about whether its values convert. Each
+///   such retry rewrites the `resuming: ...` text with the last error
+///   ([`record_transient_retry`], #894). A statement cancelled by a
+///   `statement_timeout` (57014) is also counted, and the
+///   [`RETYPE_TIMEOUT_CANCEL_LIMIT`]th ends the request
+///   ([`retype_cancelled_error`]): Trellis honours the operator's timeout
+///   and doesn't retry a rewrite it can't finish forever.
 /// - A re-validation that now fails, or a re-type that fails (a value the
 ///   new type can't hold, a view on the column), ends the request: the
 ///   definition stays paused, its `capture_failure` says why, and the next
@@ -4418,7 +4438,7 @@ async fn finish_requested_resume(
     id: i64,
 ) -> Result<(), ApplyError> {
     // What to re-type, read with the re-validation in one snapshot.
-    let (source_table, target, statements) = {
+    let (source_table, target, statements, retrying) = {
         let txn = client.transaction().await?;
         let row = txn
             .query_opt(
@@ -4475,6 +4495,7 @@ async fn finish_requested_resume(
         )
         .await?;
         let states = crate::defs::copies::inspect(&txn, copies).await?;
+        let retrying = retyping_failure(&source_table, states.iter().filter(|s| s.drifted()));
         // Each table's statements, with the columns of the definition's
         // target they re-type: what a definition chained off the target
         // reads (#828).
@@ -4503,7 +4524,7 @@ async fn finish_requested_resume(
             }
         }
         txn.commit().await?;
-        (source_table, target, statements)
+        (source_table, target, statements, retrying)
     };
 
     let mut retyped: Vec<String> = Vec::new();
@@ -4526,6 +4547,18 @@ async fn finish_requested_resume(
                     "re-typing copies for a resume failed transiently (its table's lock, say); \
                      retrying next pass"
                 );
+                let retry = TransientRetry {
+                    target: &target,
+                    labels: &labels,
+                    retyped: &retyped,
+                    retrying: &retrying,
+                    error: &err
+                        .as_db_error()
+                        .map(|db| db.message().to_string())
+                        .unwrap_or_else(|| err.to_string()),
+                    timeout_cancel: is_timeout_cancel(err.code()),
+                };
+                record_transient_retry(client, id, &source_table, &retry).await?;
                 return Ok(());
             }
             Err(err) => {
@@ -4673,6 +4706,132 @@ fn retype_failed_error(target: &str, labels: &[String], error: &str, retyped: &[
          and define it again, which builds the target from empty: Trellis doesn't empty a \
          target on its own, since the application reads it",
         labels.join(", "),
+    )
+}
+
+/// How many times one resume request's re-type may be cancelled by a
+/// `statement_timeout` (SQLSTATE 57014) before the request ends (#894).
+/// Trellis honours the operator's `statement_timeout` and sets none of its
+/// own, so a rewrite that outlasts it is cancelled and retried on the next
+/// capture pass, blocking the target's readers for up to the timeout each
+/// time; the request ends after this many cancellations
+/// (`resume_requests.timeout_cancels`).
+pub(crate) const RETYPE_TIMEOUT_CANCEL_LIMIT: i32 = 3;
+
+/// Whether a re-type that failed with `code` was cancelled by a
+/// `statement_timeout`: `QUERY_CANCELED` (57014) alone counts toward
+/// [`RETYPE_TIMEOUT_CANCEL_LIMIT`]. The other transient errors keep their
+/// retry on the next pass without a count: a lock timeout (`55P03`) never
+/// held the lock, and a lost connection says nothing about the rewrite.
+fn is_timeout_cancel(code: Option<&tokio_postgres::error::SqlState>) -> bool {
+    code == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
+}
+
+/// One transient failure of a resume's re-type of `labels`
+/// ([`finish_requested_resume`]), for [`record_transient_retry`].
+struct TransientRetry<'a> {
+    /// The definition's bare target.
+    target: &'a str,
+    /// The copies the failed statement re-types.
+    labels: &'a [String],
+    /// The copies of earlier tables, already re-typed.
+    retyped: &'a [String],
+    /// The `resuming: ...` columns and text, as the request recorded them.
+    retrying: &'a (Vec<String>, String),
+    /// Postgres's message for the failure.
+    error: &'a str,
+    /// Whether it was a cancelled statement ([`is_timeout_cancel`]).
+    timeout_cancel: bool,
+}
+
+/// Records a transient failure of definition `id`'s re-type (#894), in one
+/// transaction locked as [`end_request`] locks: the definition's
+/// `capture_failure` gets the last error, and, for a cancelled statement,
+/// the attempt count, with `resume_requests.timeout_cancels` counting it. The
+/// [`RETYPE_TIMEOUT_CANCEL_LIMIT`]th cancellation ends the request instead
+/// ([`retype_cancelled_error`]). Does nothing if the request is gone by
+/// then: a `RESUME` completed it, or the definition was dropped, and must
+/// not get a stale record or a count.
+async fn record_transient_retry(
+    client: &mut tokio_postgres::Client,
+    id: i64,
+    source_table: &str,
+    retry: &TransientRetry<'_>,
+) -> Result<(), ApplyError> {
+    let txn = client.transaction().await?;
+    if lock_frozen(&txn, "id", &id, source_table).await?.is_none() {
+        return Ok(());
+    }
+    let cancels: Option<i32> = if retry.timeout_cancel {
+        txn.query_opt(
+            "update resume_requests set timeout_cancels = timeout_cancels + 1 \
+             where transform_id = $1 returning timeout_cancels",
+            &[&id],
+        )
+        .await?
+        .map(|row| row.get(0))
+    } else {
+        txn.query_opt(
+            "select timeout_cancels from resume_requests where transform_id = $1",
+            &[&id],
+        )
+        .await?
+        .map(|row| row.get(0))
+    };
+    let Some(cancels) = cancels else {
+        return Ok(());
+    };
+    let (columns, resuming) = retry.retrying;
+    if retry.timeout_cancel && cancels >= RETYPE_TIMEOUT_CANCEL_LIMIT {
+        txn.execute(
+            "delete from resume_requests where transform_id = $1",
+            &[&id],
+        )
+        .await?;
+        let ended = retype_cancelled_error(retry);
+        set_capture_failure(&txn, id, source_table, &[], &ended).await?;
+        txn.commit().await?;
+        tracing::warn!(transform_id = id, "a requested resume ended: {ended}");
+        return Ok(());
+    }
+    let attempt = if retry.timeout_cancel {
+        format!("attempt {cancels} of {RETYPE_TIMEOUT_CANCEL_LIMIT}, last error")
+    } else {
+        "last error".to_string()
+    };
+    let text = format!(
+        "{resuming}. The last re-type failed ({attempt}: {}); the staging worker \
+         tries again on its next pass",
+        retry.error
+    );
+    set_capture_failure(&txn, id, source_table, columns, &text).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// The `capture_failure` of a definition whose resume's re-type of
+/// `retry.labels` was cancelled [`RETYPE_TIMEOUT_CANCEL_LIMIT`] times by a
+/// `statement_timeout` (#894). The definition stays paused, the copies keep
+/// their types and the target its rows. Both remedies are named: raise the
+/// timeout and resume again, or drop the definition and define it again,
+/// which isn't subject to the re-type rewrite.
+fn retype_cancelled_error(retry: &TransientRetry<'_>) -> String {
+    let kept = if retry.retyped.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} were re-typed already)", retry.retyped.join(", "))
+    };
+    let target = retry.target;
+    format!(
+        "the resume couldn't re-type Trellis's columns {} of the target table {target}: a \
+         statement_timeout cancelled the re-type {RETYPE_TIMEOUT_CANCEL_LIMIT} times ({}). \
+         Trellis honours the timeout. They keep their types{kept}, the target keeps its rows, \
+         and the definition stays paused. Raise statement_timeout for Trellis's role or \
+         database and resume the definition again, and the re-type can finish. Or DROP \
+         TRANSFORM {target} and define it again, which builds the target from empty and isn't \
+         subject to the re-type rewrite",
+        retry.labels.join(", "),
+        retry.error,
     )
 }
 
@@ -7610,5 +7769,213 @@ mod unit_tests {
             "an unknown origin holds back every token"
         );
         assert_eq!(read_count(&raw, "1").await, 1);
+    }
+
+    #[test]
+    fn only_a_cancelled_statement_counts_toward_the_retype_limit() {
+        use tokio_postgres::error::SqlState;
+        assert!(is_timeout_cancel(Some(&SqlState::QUERY_CANCELED)));
+        for other in [
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::ADMIN_SHUTDOWN,
+        ] {
+            assert!(!is_timeout_cancel(Some(&other)), "{other:?}");
+        }
+        assert!(!is_timeout_cancel(None), "a lost connection has no code");
+    }
+
+    /// A paused `order_totals` with a resume request (`timeout_cancels` 0),
+    /// as `request_retype` leaves it, and the failure it records.
+    async fn paused_with_request(raw: &tokio_postgres::Client) -> i64 {
+        let id: i64 = raw
+            .query_one(
+                "update transform_definitions set status = 'paused' \
+                 where target_table like '%.order_totals' returning id",
+                &[],
+            )
+            .await
+            .expect("pause")
+            .get(0);
+        raw.execute(
+            "insert into resume_requests (transform_id) values ($1)",
+            &[&id],
+        )
+        .await
+        .expect("request");
+        raw.execute(
+            "insert into capture_failures (transform_id, source_table, columns, error, kind) \
+             values ($1, 'public.orders', '{}', 'resuming: re-typing', 'capture')",
+            &[&id],
+        )
+        .await
+        .expect("failure");
+        id
+    }
+
+    async fn failure_of(raw: &tokio_postgres::Client, id: i64) -> Option<String> {
+        raw.query_opt(
+            "select error from capture_failures where transform_id = $1",
+            &[&id],
+        )
+        .await
+        .expect("read failure")
+        .map(|row| row.get(0))
+    }
+
+    async fn cancels_of(raw: &tokio_postgres::Client, id: i64) -> Option<i32> {
+        raw.query_opt(
+            "select timeout_cancels from resume_requests where transform_id = $1",
+            &[&id],
+        )
+        .await
+        .expect("read count")
+        .map(|row| row.get(0))
+    }
+
+    fn retry<'a>(
+        retrying: &'a (Vec<String>, String),
+        labels: &'a [String],
+        timeout_cancel: bool,
+    ) -> TransientRetry<'a> {
+        TransientRetry {
+            target: "order_totals",
+            labels,
+            retyped: &[],
+            retrying,
+            error: "canceling statement due to statement timeout",
+            timeout_cancel,
+        }
+    }
+
+    /// #894 rules 3 and 5: each cancelled statement counts and rewrites the
+    /// `resuming:` message with the attempt number; the third ends the
+    /// request, naming the timeout and both remedies, the definition still
+    /// paused.
+    #[tokio::test]
+    async fn the_limit_th_cancelled_retype_ends_the_request() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_pool, mut raw, _src) = fuse_ready(&db).await;
+        let id = paused_with_request(&raw).await;
+        let retrying = (
+            vec!["id".to_string()],
+            "resuming: re-typing order_totals".to_string(),
+        );
+        let labels = vec!["public.order_totals.id".to_string()];
+        for attempt in 1..RETYPE_TIMEOUT_CANCEL_LIMIT {
+            record_transient_retry(
+                &mut raw,
+                id,
+                "public.orders",
+                &retry(&retrying, &labels, true),
+            )
+            .await
+            .expect("record");
+            assert_eq!(cancels_of(&raw, id).await, Some(attempt));
+            let error = failure_of(&raw, id).await.expect("failure");
+            assert!(
+                error.starts_with("resuming: re-typing order_totals")
+                    && error.contains(&format!(
+                        "attempt {attempt} of {RETYPE_TIMEOUT_CANCEL_LIMIT}, last error: \
+                         canceling statement due to statement timeout"
+                    )),
+                "{error}"
+            );
+        }
+        record_transient_retry(
+            &mut raw,
+            id,
+            "public.orders",
+            &retry(&retrying, &labels, true),
+        )
+        .await
+        .expect("record");
+        assert_eq!(cancels_of(&raw, id).await, None, "the request ended");
+        let error = failure_of(&raw, id).await.expect("failure");
+        assert!(
+            error.contains("public.order_totals.id")
+                && error.contains("target table order_totals")
+                && error.contains("statement_timeout")
+                && error.contains("Raise statement_timeout for Trellis's role or database")
+                && error.contains("resume the definition again")
+                && error.contains("DROP TRANSFORM order_totals and define it again")
+                && !error.starts_with("resuming:"),
+            "{error}"
+        );
+        assert_eq!(status_of(&raw).await, "paused");
+    }
+
+    /// #894 rule 2: a transient failure that isn't a cancelled statement is
+    /// recorded with its error but never counted, however often it repeats.
+    #[tokio::test]
+    async fn a_transient_failure_that_is_not_a_cancel_is_recorded_but_never_counted() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_pool, mut raw, _src) = fuse_ready(&db).await;
+        let id = paused_with_request(&raw).await;
+        let retrying = (vec![], "resuming: re-typing order_totals".to_string());
+        let labels = vec!["public.order_totals.id".to_string()];
+        for _ in 0..=RETYPE_TIMEOUT_CANCEL_LIMIT {
+            let mut lock_timeout = retry(&retrying, &labels, false);
+            lock_timeout.error = "canceling statement due to lock timeout";
+            record_transient_retry(&mut raw, id, "public.orders", &lock_timeout)
+                .await
+                .expect("record");
+        }
+        assert_eq!(cancels_of(&raw, id).await, Some(0));
+        let error = failure_of(&raw, id).await.expect("failure");
+        assert!(
+            error.starts_with("resuming:")
+                && error.contains("last error: canceling statement due to lock timeout")
+                && !error.contains(" of "),
+            "{error}"
+        );
+    }
+
+    /// #894 rule 5: a `RESUME` that completes between the re-type's failure
+    /// and the record's write has deleted the request and the definition's
+    /// `capture_failure`; the record must neither bring the failure back nor
+    /// count against a request that is gone. (A drop in between cascades the
+    /// request away, which reads the same.)
+    #[tokio::test]
+    async fn a_resume_completing_before_the_record_leaves_no_stale_failure() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_pool, mut raw, _src) = fuse_ready(&db).await;
+        let id = paused_with_request(&raw).await;
+        // What `complete_resume` does.
+        raw.batch_execute(
+            "delete from resume_requests; delete from capture_failures; \
+             update transform_definitions set status = 'waiting_to_backfill'",
+        )
+        .await
+        .expect("complete the resume");
+        let retrying = (vec![], "resuming: re-typing order_totals".to_string());
+        let labels = vec!["public.order_totals.id".to_string()];
+        // The call that would end the request, were there one.
+        raw.execute(
+            "insert into resume_requests (transform_id, timeout_cancels) values ($1, $2)",
+            &[&id, &(RETYPE_TIMEOUT_CANCEL_LIMIT - 1)],
+        )
+        .await
+        .expect("request");
+        raw.execute("delete from resume_requests", &[])
+            .await
+            .expect("completed again");
+        for timeout_cancel in [true, false] {
+            record_transient_retry(
+                &mut raw,
+                id,
+                "public.orders",
+                &retry(&retrying, &labels, timeout_cancel),
+            )
+            .await
+            .expect("record");
+            assert_eq!(failure_of(&raw, id).await, None, "{timeout_cancel}");
+            assert_eq!(cancels_of(&raw, id).await, None, "{timeout_cancel}");
+        }
+        assert_eq!(status_of(&raw).await, "waiting_to_backfill");
     }
 }

@@ -737,7 +737,13 @@ actions isn't a safe form: it's wrong before 15.6 and 16.2.
   its columns before the re-type gets `cached plan must not change result
   type` the next time it runs it, once per prepared statement. `integer` to
   `bigint` rewrites the table, so at a billion rows reads of the target
-  block for minutes, and the capture pass waits with it. The `RESUME` itself
+  block for minutes, and the capture pass waits with it. Trellis sets no
+  `statement_timeout` and honours the one on its role or database: a rewrite
+  that outlasts it is cancelled, rolled back and retried on the next pass,
+  blocking readers up to the timeout each time, and the third cancellation
+  ends the request. The definition stays `paused`, its `capture_failure`
+  naming both remedies: raise the timeout for Trellis's role and `RESUME`
+  again, or `DROP TRANSFORM` and define it again. The `RESUME` itself
   returns at once; the definition stays `paused`, its `capture_failure`
   saying it's resuming, until the staging worker has re-typed the copies and
   started the rebuild. A rebuild follows every

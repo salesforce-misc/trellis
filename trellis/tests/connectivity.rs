@@ -139,10 +139,11 @@ async fn migrate_up_is_idempotent() {
         // #828 V76 (`retype_causes`, `capture_failures.caused_by`), #912 V77
         // (`column_status.cascade_pending`), #803 V78 (one `poison_held` row
         // per held key), #944 V79 (a `recompute` row's released join value),
-        // #938 V80 (`transform_definitions.build_marker_generation`), and
-        // #625 F6 V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence).
+        // #938 V80 (`transform_definitions.build_marker_generation`), #625
+        // F6 V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence), and
+        // #894 V82 (`resume_requests.timeout_cancels`).
         // V73 is unused.
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V81 to be applied"
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V82 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

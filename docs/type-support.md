@@ -98,6 +98,9 @@ worker, with no pause and no rebuild. Any other widening a column can't hold
 that own the column, and `RESUME` re-types every column to the type define
 would give it from the live schema before it rebuilds
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+The re-type honours the operator's `statement_timeout`: a rewrite it cancels three times
+ends the resume, and the transform stays paused with the remedies in its
+`capture_failure` ([recommendations](recommendations.md#statement_timeout)).
 
 ## Text rendering
 
