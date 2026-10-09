@@ -1289,7 +1289,11 @@ async fn release_awaiting_capture(
 /// capture pass its other definitions) for another definition's trouble. The
 /// readers stay paused, with their edge gone, as after a resume that fails
 /// partway, and their own `RESUME` recovers them.
-async fn resume_released_dependents(pool: &Pool, target: &str, dependents: Vec<(String, String)>) {
+pub(crate) async fn resume_released_dependents(
+    pool: &Pool,
+    target: &str,
+    dependents: Vec<(String, String)>,
+) {
     if dependents.is_empty() {
         return;
     }
@@ -1297,13 +1301,13 @@ async fn resume_released_dependents(pool: &Pool, target: &str, dependents: Vec<(
         Ok(resumed) => tracing::info!(
             target,
             ?resumed,
-            "readers of a field released from its capture wait resumed"
+            "readers of a field released from its pause resumed"
         ),
         Err(err) => tracing::warn!(
             target,
             ?dependents,
             error = %err,
-            "readers of a field released from its capture wait stay paused; RESUME them"
+            "readers of a field released from its pause stay paused; RESUME them"
         ),
     }
 }

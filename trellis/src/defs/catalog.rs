@@ -1934,12 +1934,12 @@ pub async fn alter_transform(
         // since that `ADD`'s own pause below only ever undoes a pause it
         // created itself (issue #309). Edges *into* it are cleared so
         // resuming the upstream column never tries to recompute a column
-        // that is gone. Edges *out of* it can still exist even though the
-        // dependents check above passed: a pause cascaded onto a reader
-        // whose formula was later `ALTER`ed to stop reading this column
-        // keeps its edge. Clearing it leaves that reader paused with no
-        // recorded reason, and its own `RESUME` recovers it. That is still
-        // better than an edge from a column that no longer exists.
+        // that is gone. Edges *out of* it are cleared too, though the
+        // dependents check above passed, so no live reader reads it: an
+        // `ALTER` that stops a reader reading a column deletes the reader's
+        // edge from it (issue #950), and releases the reader if that was its
+        // last reason to be paused, so a drop strands no one. This only
+        // makes sure no edge from a column that no longer exists remains.
         for table in ["column_status", "column_deaths", "column_failures"] {
             txn.execute(
                 &format!("delete from {table} where transform_table = $1 and column_name = $2"),
@@ -1956,6 +1956,25 @@ pub async fn alter_transform(
         .await?;
     }
 
+    // Issue #950: an altered field that stopped reading an upstream column
+    // it was paused through is no longer held by it. The edges go here; the
+    // fields left with no reason are released below, once the edit's own
+    // pauses are written.
+    let edge_losers = if real_alters.is_empty() {
+        Vec::new()
+    } else {
+        delete_stale_cascade_edges(
+            &*txn,
+            &alter.target,
+            &merged,
+            &real_alters,
+            &current.source_table,
+            &relationships,
+            &upstreams,
+        )
+        .await?
+    };
+
     // The capture widen (issue #622): a field reading a source column the
     // old formula didn't read can't apply until the source's capture images
     // it, so it is held out of Apply, marked `awaiting_capture`, and the
@@ -1964,10 +1983,10 @@ pub async fn alter_transform(
     // nothing`: a field already paused for some other reason (an operator
     // pause, a tripped column fuse, a cascade from a paused upstream column)
     // stays paused through this edit, and its own resume rebuilds it.
-    if builds_fields
+    let holds_for_capture = builds_fields
         && reads_new_source_columns(&current.def, &merged)
-        && !is_definition_target(&*txn, &current.source_table).await?
-    {
+        && !is_definition_target(&*txn, &current.source_table).await?;
+    if holds_for_capture {
         // Every field the build rewrites, so a sibling reading an edited
         // field by alias is held out (and listed as paused) with it, rather
         // than evaluated over its absence and written NULL (issue #748).
@@ -2007,6 +2026,16 @@ pub async fn alter_transform(
         .await?;
     }
 
+    // Issue #950: the altered fields that lost an edge and have no reason
+    // left to be paused are released into the edit's own field build, and
+    // their readers in other definitions are resumed once this commits.
+    let released_readers = if edge_losers.is_empty() {
+        Vec::new()
+    } else {
+        release_readers_left_without_a_pause(&*txn, &alter.target, edge_losers, holds_for_capture)
+            .await?
+    };
+
     let new_text = render_definition_text(&merged);
     txn.execute(
         "update transform_definitions \
@@ -2024,6 +2053,10 @@ pub async fn alter_transform(
     }
 
     txn.commit().await?;
+
+    // Issue #950: the readers in other definitions that the released fields
+    // left with no reason, resumed now that the edit's lock is gone.
+    crate::staging::build::resume_released_dependents(pool, &alter.target, released_readers).await;
 
     // Issue #915: walk the cascade each field this paused owes, now that
     // nothing is held. See `staging::quarantine::cascade_edit_pauses`.
@@ -2234,15 +2267,7 @@ async fn pause_readers_of_paused_columns(
     upstreams: &[(String, String)],
     owes_cascade: bool,
 ) -> Result<(), CatalogError> {
-    let rel_to_table: HashMap<(String, String), String> = relationships
-        .iter()
-        .map(|(name, r)| {
-            (
-                (qualified_source.to_string(), name.clone()),
-                r.qualified_to_table.clone(),
-            )
-        })
-        .collect();
+    let rel_to_table = relationship_to_tables(qualified_source, relationships);
     let mut paused: Vec<(&str, &str, String)> = Vec::new();
     for (upstream, qualified_upstream) in upstreams {
         paused.extend(
@@ -2311,6 +2336,163 @@ async fn pause_readers_of_paused_columns(
         }
     }
     Ok(())
+}
+
+/// `expr_references_column`'s relationship lookup: each relationship of a
+/// definition over `qualified_source`, keyed `(source, name)`, to the
+/// qualified table it reads.
+fn relationship_to_tables(
+    qualified_source: &str,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> HashMap<(String, String), String> {
+    relationships
+        .iter()
+        .map(|(name, r)| {
+            (
+                (qualified_source.to_string(), name.clone()),
+                r.qualified_to_table.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Deletes the cascade edges into each of `altered` (fields of the 1-1
+/// definition `def` targeting `target`, bare, whose formula this edit
+/// changed) from an upstream column the new formula doesn't read (issue
+/// #950). An edge records that its reader is paused because the upstream
+/// column is; a reader edited to stop reading the column is no longer held
+/// by it, and left in place the edge would keep the reader paused until
+/// that column's resume (or leave it with no reason at all once a `DROP`
+/// deleted the column's edges). The edges the new formula still has, and
+/// those [`pause_readers_of_paused_columns`] writes for a paused column it
+/// now reads, are untouched or written afterwards.
+///
+/// Returns the fields that lost an edge: the candidates for
+/// [`release_readers_left_without_a_pause`], which runs once the edit's
+/// own pauses are written. The caller holds the column-pause lock.
+async fn delete_stale_cascade_edges(
+    txn: &impl GenericClient,
+    target: &str,
+    def: &TransformDef,
+    altered: &[FieldDef],
+    qualified_source: &str,
+    relationships: &HashMap<String, ResolvedRelationship>,
+    upstreams: &[(String, String)],
+) -> Result<Vec<String>, CatalogError> {
+    let rel_to_table = relationship_to_tables(qualified_source, relationships);
+    let alias_readers = super::eval::AliasReaders::of(def);
+    let mut stale: Vec<String> = Vec::new();
+    for field in altered {
+        let edges = txn
+            .query(
+                "select upstream_transform, upstream_column from column_pause_cascades \
+                 where downstream_transform = $1 and downstream_column = $2",
+                &[&target, &field.name],
+            )
+            .await?;
+        for edge in edges {
+            let upstream_transform: String = edge.get(0);
+            let upstream_column: String = edge.get(1);
+            let still_read = if upstream_transform == target {
+                alias_readers.direct(&upstream_column).contains(&field.name)
+            } else {
+                upstreams
+                    .iter()
+                    .filter(|(bare, _)| *bare == upstream_transform)
+                    .any(|(_, qualified)| {
+                        expr_references_column(
+                            &field.expr,
+                            qualified_source,
+                            qualified,
+                            &upstream_column,
+                            &rel_to_table,
+                        )
+                    })
+            };
+            if still_read {
+                continue;
+            }
+            txn.execute(
+                "delete from column_pause_cascades \
+                 where downstream_transform = $1 and downstream_column = $2 \
+                   and upstream_transform = $3 and upstream_column = $4",
+                &[&target, &field.name, &upstream_transform, &upstream_column],
+            )
+            .await?;
+            tracing::info!(
+                transform = %target,
+                column = %field.name,
+                upstream_transform = %upstream_transform,
+                upstream_column = %upstream_column,
+                "edit stopped a paused field reading an upstream column; its cascade edge is gone"
+            );
+            if !stale.contains(&field.name) {
+                stale.push(field.name.clone());
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// Releases each of `candidates`, fields of `target` that
+/// [`delete_stale_cascade_edges`] took an edge from, that is left with no
+/// reason to stay paused (issue #950): no `local_fuse`, no edge into it
+/// (including those the edit's own pauses just wrote) and not awaiting its
+/// capture. The edit's field build rewrites it (a candidate is an altered
+/// field), as a resume's would. Its readers are un-cascaded as a resume's
+/// ([`crate::staging::quarantine::uncascade`]): those in `target` go with
+/// it, into the same build (the edit's build lists every field reading an
+/// edited one by alias), and those in other definitions come back for the
+/// caller to resume once this commits
+/// ([`crate::staging::build::resume_released_dependents`]).
+///
+/// With `holds_for_capture`, the edit's new formula reads a source column
+/// the capture may not image yet (issue #622), and the field, paused for
+/// another reason when the edit's capture widen skipped it, is held with
+/// `awaiting_capture` instead: the build's plan job releases it, and its
+/// readers, once capture is ready.
+async fn release_readers_left_without_a_pause(
+    txn: &impl GenericClient,
+    target: &str,
+    candidates: Vec<String>,
+    holds_for_capture: bool,
+) -> Result<Vec<(String, String)>, CatalogError> {
+    let free: Vec<String> = txn
+        .query(
+            "select s.column_name from column_status s \
+             where s.transform_table = $1 and s.column_name = any($2) \
+               and not s.local_fuse and not s.awaiting_capture \
+               and not exists ( \
+                   select 1 from column_pause_cascades c \
+                   where c.downstream_transform = s.transform_table \
+                     and c.downstream_column = s.column_name) \
+             order by s.column_name",
+            &[&target, &candidates],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if free.is_empty() {
+        return Ok(Vec::new());
+    }
+    if holds_for_capture {
+        txn.execute(
+            "update column_status set awaiting_capture = true \
+             where transform_table = $1 and column_name = any($2)",
+            &[&target, &free],
+        )
+        .await?;
+        return Ok(Vec::new());
+    }
+    txn.execute(
+        "delete from column_status where transform_table = $1 and column_name = any($2)",
+        &[&target, &free],
+    )
+    .await?;
+    Ok(crate::staging::quarantine::uncascade(txn, target, free)
+        .await?
+        .dependents)
 }
 
 /// Records the cascade edge from `upstream` to `reader` and pauses

@@ -4569,6 +4569,303 @@ async fn an_alter_whose_cascade_walk_fails_leaves_it_to_the_capture_pass() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #950: an `ALTER TRANSFORM` that stops a paused reader reading the
+// column it was paused through ends that pause.
+// ---------------------------------------------------------------------
+
+/// `seed_reader_chain_with_total_paused`, then `RESUME sib.total` (built and
+/// drained) and `PAUSE sib.cost`, which cascades to `sib_sum.c1` (edge
+/// `sib.cost -> sib_sum.c1`) and on to `sib_down.d1`.
+async fn seed_reader_chain_with_cost_paused(db: &TestDatabase) -> (Client, Trellis) {
+    let (mut client, trellis) = seed_reader_chain_with_total_paused(db).await;
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    quarantine::pause_column(&db.pool, "sib", "cost")
+        .await
+        .expect("pause cost");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert!(cascade_edge_exists(&client, "sib_down", "d1", "sib_sum", "c1").await);
+    (client, trellis)
+}
+
+/// Settles the builds the edits started and drains what they staged.
+async fn settle_and_drain(client: &mut Client, db: &TestDatabase) {
+    for _ in 0..2 {
+        trellis::staging::build::settle_builds(&db.pool).await;
+        drain_staged(client, &db.pool).await;
+    }
+}
+
+async fn cascade_edge_count(client: &Client) -> i64 {
+    client
+        .query_one("select count(*) from column_pause_cascades", &[])
+        .await
+        .expect("count edges")
+        .get(0)
+}
+
+async fn d1_text(client: &Client) -> Option<String> {
+    client
+        .query_one("select d1::text from public.sib_down where id = 1", &[])
+        .await
+        .expect("read sib_down")
+        .get(0)
+}
+
+/// The state between the issue's steps 3 and 4: `c1` was edited to read
+/// `total + 2`, so it no longer reads the paused `sib.cost`. The edit
+/// deletes the edge from `cost`; `c1` has no reason left, so it is released
+/// and rebuilt, and so is `d1`, which was paused behind it. Before the fix
+/// `c1` stayed paused on a column it doesn't read.
+#[tokio::test]
+async fn an_alter_that_stops_a_paused_reader_reading_its_upstream_releases_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_cost_paused(&db).await;
+
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS total + 2")
+        .await
+        .expect("edit c1 to stop reading cost");
+    assert!(!cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert_eq!(column_status_row(&client, "sib_sum", "c1").await, None);
+    assert_eq!(column_status_row(&client, "sib_down", "d1").await, None);
+    assert_eq!(cascade_edge_count(&client).await, 0);
+    assert!(
+        column_status_row(&client, "sib", "cost").await.is_some(),
+        "the upstream column stays paused"
+    );
+
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["17"]));
+    assert_eq!(d1_text(&client).await.as_deref(), Some("18"));
+}
+
+/// The issue's reproduction, steps 1 to 5: after the edit and a `DROP` of
+/// the column it stopped reading, the reader and its own reader are live and
+/// rebuilt, not paused on a column that no longer exists.
+#[tokio::test]
+async fn dropping_a_column_a_reader_was_edited_to_stop_reading_strands_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_cost_paused(&db).await;
+
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS total + 2")
+        .await
+        .expect("edit c1 to stop reading cost");
+    trellis
+        .apply("ALTER TRANSFORM sib DROP cost")
+        .await
+        .expect("drop cost");
+    settle_and_drain(&mut client, &db).await;
+
+    assert_eq!(column_status_row(&client, "sib", "cost").await, None);
+    assert_eq!(column_status_row(&client, "sib_sum", "c1").await, None);
+    assert_eq!(column_status_row(&client, "sib_down", "d1").await, None);
+    assert_eq!(cascade_edge_count(&client).await, 0);
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["17"]));
+    assert_eq!(d1_text(&client).await.as_deref(), Some("18"));
+}
+
+/// A reader that stops reading one paused column and starts reading another
+/// stays paused, through the new one: its edge from `cost` goes, the one
+/// from `total` stays, and `total`'s resume releases it and its reader.
+#[tokio::test]
+async fn an_alter_to_another_paused_column_moves_the_readers_pause_to_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_cost_paused(&db).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS total + 2")
+        .await
+        .expect("edit c1 to read total");
+    assert!(!cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "total").await);
+    assert!(column_status_row(&client, "sib_sum", "c1").await.is_some());
+    assert!(column_status_row(&client, "sib_down", "d1").await.is_some());
+
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(column_status_row(&client, "sib_sum", "c1").await, None);
+    assert_eq!(column_status_row(&client, "sib_down", "d1").await, None);
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["17"]));
+    assert_eq!(d1_text(&client).await.as_deref(), Some("18"));
+}
+
+/// A reader paused by an operator as well keeps that pause when its edit
+/// drops the cascade edge: the edge goes, `c1` and `d1` stay paused, and
+/// `c1`'s own resume releases them.
+#[tokio::test]
+async fn an_alter_keeps_a_readers_own_pause_when_it_drops_the_edge() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_cost_paused(&db).await;
+    quarantine::pause_column(&db.pool, "sib_sum", "c1")
+        .await
+        .expect("pause c1 itself");
+
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS total + 2")
+        .await
+        .expect("edit c1 to stop reading cost");
+    assert!(!cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "c1")
+            .await
+            .map(|(local_fuse, _)| local_fuse),
+        Some(true)
+    );
+    assert!(column_status_row(&client, "sib_down", "d1").await.is_some());
+    assert!(cascade_edge_exists(&client, "sib_down", "d1", "sib_sum", "c1").await);
+
+    quarantine::resume_column(&db.pool, "sib_sum", "c1")
+        .await
+        .expect("resume c1");
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(column_status_row(&client, "sib_down", "d1").await, None);
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["17"]));
+    assert_eq!(d1_text(&client).await.as_deref(), Some("18"));
+}
+
+/// An edit that keeps reading the paused column leaves the reader paused,
+/// with its edge.
+#[tokio::test]
+async fn an_alter_that_still_reads_the_paused_column_keeps_the_readers_pause() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (client, trellis) = seed_reader_chain_with_cost_paused(&db).await;
+
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS cost + 2")
+        .await
+        .expect("edit c1");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert!(column_status_row(&client, "sib_sum", "c1").await.is_some());
+    assert!(column_status_row(&client, "sib_down", "d1").await.is_some());
+}
+
+/// An edit that still reads a column awaiting its capture keeps the edge
+/// from it, which the edit's own pause pass doesn't rewrite (a column that
+/// awaits its capture pauses no reader there): the reader stays paused.
+#[tokio::test]
+async fn an_alter_that_still_reads_a_column_awaiting_its_capture_keeps_the_edge() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (client, trellis) = seed_reader_chain_with_total_paused(&db).await;
+    trellis
+        .apply(ALTER_COST_AWAITING_CAPTURE)
+        .await
+        .expect("edit cost");
+    quarantine::complete_pause_cascades(&db.pool)
+        .await
+        .expect("finish the walks");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+
+    trellis
+        .apply("ALTER TRANSFORM sib_sum ALTER c1 AS cost + 5")
+        .await
+        .expect("edit c1 to keep reading cost");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    assert!(column_status_row(&client, "sib_sum", "c1").await.is_some());
+    assert!(column_status_row(&client, "sib_down", "d1").await.is_some());
+}
+
+/// `sib (total = price + tax, cost = total + 0)` over `items`, row 1 drained,
+/// `sib_sum.c1 = cost + 1` live, and `sib.total` paused: the pause reaches
+/// `cost` through an alias edge and `c1` through `cost`.
+async fn seed_alias_chain_with_total_paused(db: &TestDatabase) -> (Client, Trellis) {
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(db, &client, "price + tax AS total, total + 0 AS cost").await;
+    change_item(&mut client, &db.pool, 1, None, (10, 5, 0)).await;
+    let trellis = trellis_on(db).await;
+    trellis
+        .apply("TRANSFORM sib_sum FROM sib SELECT cost + 1 AS c1")
+        .await
+        .expect("define sib_sum");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib", "cost", "sib", "total").await);
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    (client, trellis)
+}
+
+/// The same through a sibling edge: `cost` is edited to stop reading the
+/// paused `total` by alias, so it is released in the edit's own field build,
+/// and `sib_sum.c1`, paused behind it, is resumed.
+#[tokio::test]
+async fn an_alter_that_stops_a_field_reading_a_paused_sibling_releases_it_and_its_readers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_alias_chain_with_total_paused(&db).await;
+
+    trellis
+        .apply("ALTER TRANSFORM sib ALTER cost AS price + 0")
+        .await
+        .expect("edit cost to stop reading total");
+    assert!(!cascade_edge_exists(&client, "sib", "cost", "sib", "total").await);
+    assert_eq!(column_status_row(&client, "sib", "cost").await, None);
+    assert_eq!(column_status_row(&client, "sib_sum", "c1").await, None);
+    assert_eq!(cascade_edge_count(&client).await, 0);
+    assert!(
+        column_status_row(&client, "sib", "total").await.is_some(),
+        "total stays paused"
+    );
+
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(sib_row(&client, 1, &["cost"]).await, some(&["10"]));
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["11"]));
+}
+
+/// An edit that stops a paused field reading its upstream and starts reading
+/// a source column the capture may not image yet holds it for that capture
+/// instead of releasing it, as a fresh edit does: its edge is gone, it
+/// awaits its capture, and its reader stays paused behind it until the
+/// build's plan job releases both.
+#[tokio::test]
+async fn an_alter_that_stops_a_paused_field_reading_its_upstream_holds_it_for_its_capture() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_alias_chain_with_total_paused(&db).await;
+
+    trellis
+        .apply("ALTER TRANSFORM sib ALTER cost AS bonus + 0")
+        .await
+        .expect("edit cost to read a new source column");
+    assert!(!cascade_edge_exists(&client, "sib", "cost", "sib", "total").await);
+    let awaiting: Option<bool> = client
+        .query_opt(
+            "select awaiting_capture from column_status \
+             where transform_table = 'sib' and column_name = 'cost'",
+            &[],
+        )
+        .await
+        .expect("read cost's row")
+        .map(|row| row.get(0));
+    assert_eq!(awaiting, Some(true), "cost waits for its capture widen");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(column_status_row(&client, "sib", "cost").await, None);
+    assert_eq!(column_status_row(&client, "sib_sum", "c1").await, None);
+    assert_eq!(cascade_edge_count(&client).await, 0);
+    assert_eq!(sib_row(&client, 1, &["cost"]).await, some(&["0"]));
+    assert_eq!(sib_sum_row(&client, 1, &["c1"]).await, some(&["1"]));
+}
+
+// ---------------------------------------------------------------------
 // Issue #917: a define reading a paused target's rows is ordered against a
 // resume of one of its columns that releases a sibling.
 // ---------------------------------------------------------------------
