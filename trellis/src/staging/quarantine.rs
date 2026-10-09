@@ -3167,11 +3167,18 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// doesn't apply (`super::build::takes_field_build`, a field build's
 /// precondition: `live`, `catching_up`, or under a Re-derive build). A
 /// definition still behind an old-path build is the concrete case: its rows
-/// are still being written by a build that skips the paused column. The same check applies per-pair inside the cascade queue below;
-/// a downstream pair blocked on its own definition is simply left paused
-/// (not resumed, not an abort of the whole call) — by the time a downstream
-/// pair is reached, any upstream pairs earlier in the queue have already
-/// been fully resumed and committed, so there is nothing left to roll back.
+/// are still being written by a build that skips the paused column. The same
+/// check applies per-pair inside the cascade queue below, and a downstream
+/// pair is not an abort of the whole call — by the time it is reached, any
+/// upstream pairs earlier in the queue have already been fully resumed and
+/// committed, so there is nothing left to roll back. A pair whose definition
+/// has not started building (`waiting_to_backfill`) is released by deleting
+/// its row: its build reads the paused set when its chunks run, so it writes
+/// the column without a field build (issue #916). One whose definition is
+/// mid-build on the old path, or frozen, can't be released, and the walk has
+/// deleted its edge: it is held as a pause of its own with a reason that says
+/// so ([`hold_orphaned_pause`]), for its `RESUME` once the definition
+/// applies, and logged.
 #[tracing::instrument(
     name = "quarantine.resume_column",
     skip(pool),
@@ -3390,7 +3397,9 @@ pub(crate) async fn uncascade(
 /// each releases, in a transaction apiece ([`resume_column`]'s walk past
 /// its first column). `transform` is the definition the walk began in. A
 /// pair stays paused, as the walk goes on, when its definition can't take a
-/// field build or no longer validates. Returns the pairs resumed, in order.
+/// field build (one that hasn't started building needs none, and is
+/// released) or no longer validates; it is then held as a pause of its own
+/// ([`hold_orphaned_pause`]). Returns the pairs resumed, in order.
 pub(crate) async fn resume_pairs(
     pool: &Pool,
     transform: &str,
@@ -3408,12 +3417,19 @@ pub(crate) async fn resume_pairs(
             match refuse_unless_valid(pool, &t, &def).await {
                 Ok(()) => {}
                 Err(ApplyError::ResumeRefused { reason, .. }) => {
-                    tracing::info!(
+                    tracing::warn!(
                         transform = %t,
                         column = %c,
                         error = %reason,
                         "dependent column stays paused: its definition no longer validates"
                     );
+                    hold_orphaned_pause(
+                        pool,
+                        &t,
+                        &c,
+                        &format!("its definition no longer validates ({reason})"),
+                    )
+                    .await?;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -3460,7 +3476,13 @@ pub(crate) async fn resume_pairs(
             panic!("transform_definitions.status held unrecognized value '{status_text}'")
         });
         let build: Option<String> = row.get(1);
-        if !super::build::takes_field_build(status, build.as_deref()) {
+        // A definition that has not started building has built nothing the
+        // column's pause held out: every build of it, the Re-derive build
+        // and the old path alike, reads the paused set when its chunks run,
+        // after this commit. Releasing the pair is deleting its row; there
+        // is no field build to start and none to wait for (issue #916).
+        let unbuilt = status == TransformStatus::WaitingToBackfill;
+        if !unbuilt && !super::build::takes_field_build(status, build.as_deref()) {
             // Reached via cascade (the initial pair was already gated above
             // before any side effects ran, and a definition that left the
             // state since is caught the same way): a downstream dependent
@@ -3470,9 +3492,26 @@ pub(crate) async fn resume_pairs(
             // Aborting the whole call here would misrepresent what already
             // happened, since earlier pairs in this queue may already be
             // fully resumed and committed — instead this pair alone is left
-            // exactly as it was, still paused, to be resumed on a later
-            // call.
+            // paused, to be resumed on a later call. The walk that reached
+            // it deleted its edge, so it is held as a pause of its own
+            // (`hold_orphaned_pause`) rather than left with a reason that
+            // no longer holds. A build that had already run its chunks
+            // with the column held out can't be told to write it now, and a
+            // field build waits on the definition applying.
             txn.rollback().await?;
+            tracing::warn!(
+                transform = %t,
+                column = %c,
+                status = %status_text,
+                "dependent column stays paused: its definition can't take a field build"
+            );
+            hold_orphaned_pause(
+                pool,
+                &t,
+                &c,
+                &format!("its definition is {status_text} and can't take a field build yet"),
+            )
+            .await?;
             continue;
         }
         // The definition as it stands under the lock and its row's: an
@@ -3523,7 +3562,7 @@ pub(crate) async fn resume_pairs(
         // whether or not it had a cascade edge: one still held out by
         // another paused field it reads is left out of the build's chunks
         // (`paused_columns_for`), and that field's own resume builds it.
-        if one_to_one {
+        if one_to_one && !unbuilt {
             let mut fields: HashSet<String> = released.iter().cloned().collect();
             AliasReaders::of(&def.def).close(&mut fields);
             let fields: Vec<String> = def
@@ -3540,6 +3579,59 @@ pub(crate) async fn resume_pairs(
     }
 
     Ok(resumed)
+}
+
+/// Holds `(transform, column)` as a pause of its own when a walk that
+/// resumed its upstream column has deleted its last edge and then can't
+/// release it (issue #916): its definition can't take a field build, or no
+/// longer validates. Its row is there, with no `local_fuse`, no edge and not
+/// awaiting a capture, and `last_error` still says it waits on the upstream,
+/// which no longer holds; nothing would release it, and its definition would
+/// go live with the field held out. Setting `local_fuse` makes the pause
+/// its own, as an operator's, and the reason says why, so `RESUME` of the
+/// column is the way out once the definition applies. The row's readers, if
+/// any, keep their edges from it.
+///
+/// A row that has a reason after all (another pause took it over meanwhile,
+/// or it was released) is left as it is.
+async fn hold_orphaned_pause(
+    pool: &Pool,
+    transform: &str,
+    column: &str,
+    why: &str,
+) -> Result<(), ApplyError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
+        .await?;
+    let held = txn
+        .execute(
+            "update column_status s set local_fuse = true, last_error = $3 \
+             where s.transform_table = $1 and s.column_name = $2 \
+               and not s.local_fuse and not s.awaiting_capture \
+               and not exists ( \
+                   select 1 from column_pause_cascades c \
+                   where c.downstream_transform = s.transform_table \
+                     and c.downstream_column = s.column_name)",
+            &[
+                &transform,
+                &column,
+                &format!(
+                    "paused: the upstream column it read was resumed, but {why}; \
+                     RESUME it once the definition applies"
+                ),
+            ],
+        )
+        .await?;
+    txn.commit().await?;
+    if held > 0 {
+        tracing::warn!(
+            transform = %transform,
+            column = %column,
+            "column held paused on its own: its upstream was resumed and it could not be released"
+        );
+    }
+    Ok(())
 }
 
 /// Re-runs define-time validation for `definition` against the live schema
