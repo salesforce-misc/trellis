@@ -3556,7 +3556,8 @@ pub(crate) async fn uncascade(
 /// its first column). `transform` is the definition the walk began in. A
 /// pair stays paused, as the walk goes on, when its definition can't take a
 /// field build (one that hasn't started building needs none, and is
-/// released) or no longer validates; it is then held as a pause of its own
+/// released) or no longer validates, judged on the definition read under
+/// the column-pause lock (#965); it is then held as a pause of its own
 /// ([`hold_orphaned_pause`]). Returns the pairs resumed, in order.
 pub(crate) async fn resume_pairs(
     pool: &Pool,
@@ -3568,33 +3569,21 @@ pub(crate) async fn resume_pairs(
         let Some(def) = catalog::definition_by_target(pool, &t).await? else {
             continue;
         };
-        // #708: a dependent the cascade reaches is re-validated as the
-        // resumed field's definition was at the gate above. One define would
-        // refuse now stays paused, as a dependent still mid-build does below.
-        if t != transform {
-            match refuse_unless_valid(pool, &t, &def).await {
-                Ok(()) => {}
-                Err(ApplyError::ResumeRefused { reason, .. }) => {
-                    tracing::warn!(
-                        transform = %t,
-                        column = %c,
-                        error = %reason,
-                        "dependent column stays paused: its definition no longer validates"
-                    );
-                    hold_orphaned_pause(
-                        pool,
-                        &t,
-                        &c,
-                        &format!(
-                            "its definition no longer validates ({reason}); \
-                             RESUME it once the definition validates again"
-                        ),
-                    )
-                    .await?;
-                    continue;
-                }
-                Err(err) => return Err(err),
-            }
+        // Test-only pause point (#965). See `super::interleave`. The walk
+        // holds nothing here: an edit of `t`'s definition can commit.
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            // In a transaction of its own: the hook lifts the session's
+            // lock timeout for the pause with `set_config(..., true)`.
+            let mut client = pool.get().await?;
+            let txn = client.transaction().await?;
+            super::interleave::pause_at(
+                &*txn,
+                super::interleave::PausePoint::AfterResumePairDefinitionRead,
+                &t,
+            )
+            .await?;
+            txn.commit().await?;
         }
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
@@ -3697,6 +3686,39 @@ pub(crate) async fn resume_pairs(
                 transform: def.def.target.clone(),
                 column: c.to_string(),
             });
+        }
+        // #708, #965: a dependent the cascade reaches is re-validated as the
+        // resumed field's definition was at the gate in `resume_column`, on
+        // the definition just read: an edit committed before the lock is
+        // what the answer is about, and none can commit after it. One
+        // define would refuse now stays paused, as a dependent still
+        // mid-build does above. Nothing is written yet, so it rolls back
+        // before it is held.
+        if t != transform {
+            match refuse_unless_valid_in(&txn, pool.schema(), &t, &def).await {
+                Ok(()) => {}
+                Err(ApplyError::ResumeRefused { reason, .. }) => {
+                    txn.rollback().await?;
+                    tracing::warn!(
+                        transform = %t,
+                        column = %c,
+                        error = %reason,
+                        "dependent column stays paused: its definition no longer validates"
+                    );
+                    hold_orphaned_pause(
+                        pool,
+                        &t,
+                        &c,
+                        &format!(
+                            "its definition no longer validates ({reason}); \
+                             RESUME it once the definition validates again"
+                        ),
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         txn.execute(
@@ -3806,7 +3828,18 @@ async fn refuse_unless_valid(
 ) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    match catalog::revalidate(&txn, pool.schema(), definition).await {
+    refuse_unless_valid_in(&txn, pool.schema(), transform, definition).await
+}
+
+/// [`refuse_unless_valid`] on a transaction the caller holds, which it
+/// changes nothing in.
+async fn refuse_unless_valid_in(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    transform: &str,
+    definition: &crate::defs::model::Definition,
+) -> Result<(), ApplyError> {
+    match catalog::revalidate(txn, schema, definition).await {
         Ok(_) => Ok(()),
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
             Err(err.into())

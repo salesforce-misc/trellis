@@ -252,18 +252,21 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   build leaves it out rather than writing the frozen value, and the column's
   resume releases and builds it. Define and edit write them in their own
   transaction, whose first lock is the fence a pause of the new field bumps. A
-  pause and a define reading its column are ordered by a transaction lock on
-  the paused column's target, taken by every write of a pause and held shared
-  by the define, so either the define reads the pause or the pause's cascade
-  finds the definition. A column's resume takes the same lock, since it
-  deletes the target's rows one by one, the resumed column's and then each
-  sibling's it releases, in walk order, while a define reads them in name
-  order. So a define reads the target's rows before the resume starts or after
-  it commits, rather than each holding a row the other waits for. An edit can pause a field that already has readers,
-  in other definitions or as a sibling's alias. So the edit takes its own
-  target's lock exclusive, as a pause does, and marks each field it pauses as
-  owing its cascade. Once its transaction commits, the edit walks the field's
-  readers, as a pause does, so they're paused by the time the edit returns.
+  pause and a define reading its column are ordered by the one global
+  column-pause lock ([ADR-0014](0014-pause-and-drop-a-transform.md), "Order"),
+  taken exclusive by every write of a pause and shared by the define, so
+  either the define reads the pause or the pause's cascade finds the
+  definition. A column's resume takes the lock exclusive too, since it deletes
+  the target's rows one by one, the resumed column's and then each sibling's it
+  releases, in walk order, while a define reads them in name order. So a
+  define reads the target's rows before the resume starts or after it
+  commits, rather than each holding a row the other waits for. An edit can
+  pause a field that already has readers, in other definitions or as a
+  sibling's alias. So the edit takes the lock exclusive, as a pause does, after
+  the source's fence and before the fuse gate and the definition rows, and
+  marks each field it pauses as owing its cascade. Once its transaction
+  commits, the edit walks the field's readers, as a pause does, so they're
+  paused by the time the edit returns.
   The walk runs outside the edit's transaction, because each reader's pause
   bumps that reader's own fence and the edit's transaction holds one. If the
   walk fails, the edit still succeeds, since it has committed, and the

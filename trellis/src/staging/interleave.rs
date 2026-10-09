@@ -85,8 +85,10 @@
 //! the resumed column's row, before it releases that column's readers
 //! (#917). A resume of a column that stays paused with a sibling it reads
 //! fires [`PausePoint::BeforeSiblingHeldResume`] for its target, holding the
-//! column-pause lock, before it clears the column's `local_fuse` (#922). A
-//! test runs the resume inside [`with_scope`].
+//! column-pause lock, before it clears the column's `local_fuse` (#922). The
+//! walk fires [`PausePoint::AfterResumePairDefinitionRead`] for a pair's
+//! target after it reads the pair's definition, holding nothing (#965).
+//! A test runs the resume inside [`with_scope`].
 //!
 //! A drain's eviction (`super::quarantine::isolate_and_evict`) fires
 //! [`PausePoint::BeforeEvictionLocks`] for each definition's bare target
@@ -194,6 +196,12 @@ pub enum PausePoint {
     /// charged the keys and committed; the eviction holds no lock of this
     /// definition's yet (it may hold a lower-id definition's).
     BeforeEvictionLocks,
+    /// After a column resume's walk reads the definition of a pair's target,
+    /// before it opens the pair's transaction, for the pair's (bare) target
+    /// (`super::quarantine::resume_pairs`, #965). The walk holds no lock and
+    /// no transaction, so an `ALTER TRANSFORM` of that definition can commit
+    /// here.
+    AfterResumePairDefinitionRead,
     /// After a column resume deletes the `column_status` row of the column
     /// it resumes, before it releases that column's readers, for the
     /// column's (bare) target (`super::quarantine::resume_column`, #917).

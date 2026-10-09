@@ -5781,3 +5781,68 @@ async fn a_cascade_pair_still_pauses_a_reader_when_an_edit_of_a_sibling_field_ra
     assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
     assert_eq!(column_status_row(&client, "sib_sum", "c2").await, None);
 }
+
+// ---------------------------------------------------------------------
+// Issue #965: a resume's walk validates a reader's definition under the
+// column-pause lock, not before it.
+// ---------------------------------------------------------------------
+
+/// A reader whose definition does not validate when the resume's walk reads
+/// it (a source column named like its field `c1` shadows the field), and an
+/// `ALTER TRANSFORM` that drops that field and commits before the pair's
+/// transaction. The pair validates the definition it reads under the lock,
+/// which is the edited one and validates, so it resumes `c2`. Validating the
+/// definition read before the lock refused the reader on the old answer and
+/// held `c2` as a pause of its own, with a reason that no longer held.
+#[tokio::test]
+async fn a_resume_validates_a_readers_definition_under_the_lock_an_edit_committed_before() {
+    const GATE: i64 = 965;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_two_column_reader(&db).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c2", "sib", "total").await);
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+    // A column of `sib_sum`'s source named like its calculated field `c1`
+    // shadows it, so define would refuse `sib_sum` now.
+    client
+        .batch_execute("alter table public.sib add column c1 numeric")
+        .await
+        .expect("add a column named like the reader's field");
+
+    let gate = take_gate(&db, GATE).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterResumePairDefinitionRead, "sib_sum", GATE);
+    let pool = db.pool.clone();
+    let mut resume = tokio::spawn(with_scope(scope, async move {
+        quarantine::resume_column(&pool, "sib", "total").await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut resume => panic!("the resume finished without reaching sib_sum's pair: {finished:?}"),
+    }
+    trellis
+        .apply("ALTER TRANSFORM sib_sum DROP c1")
+        .await
+        .expect("the edit doesn't wait on the frozen walk, and validates");
+    release_gate(&gate, GATE).await;
+
+    let resumed = resume.await.expect("resume task").expect("the resume");
+    assert_eq!(
+        resumed,
+        vec![
+            ("sib".to_string(), "total".to_string()),
+            ("sib_sum".to_string(), "c2".to_string()),
+        ],
+        "the edited definition validates, so c2 is resumed rather than held"
+    );
+    assert_eq!(
+        column_status_row(&client, "sib_sum", "c2").await,
+        None,
+        "c2 is not left paused with a reason that no longer holds"
+    );
+    settle_and_drain(&mut client, &db).await;
+    assert_eq!(sib_sum_row(&client, 1, &["c2"]).await, some(&["26"]));
+}
