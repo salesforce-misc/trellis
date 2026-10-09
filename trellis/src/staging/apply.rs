@@ -1005,9 +1005,55 @@ async fn key_column_pg_type_in(
     table: &str,
     column: &str,
 ) -> Result<Option<String>, ApplyError> {
+    Ok(key_column_in(client, table, column)
+        .await?
+        .map(|column| column.pg_type))
+}
+
+/// A relationship join column, as [`key_column_in`] introspects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyColumn {
+    /// The column's exact type, as `format_type` renders it
+    /// ([`key_column_pg_type`]).
+    pg_type: String,
+    /// Whether a lookup of the column by a batch of keys has an index to
+    /// use: it is the leading column of a plain btree index on its table
+    /// that is valid, ready and live, and not partial. A read of an indexed
+    /// column runs under `super::ledger::ENTRY_PLAN_SETTINGS` (#972); one of
+    /// an unindexed column runs as the planner would have it, since the
+    /// setting could only take its parallel sequential scan away.
+    indexed: bool,
+}
+
+/// `column` of `table`, as [`KeyColumn`] describes it, in one round trip, or
+/// `None` if the column doesn't exist ([`key_column_pg_type`]'s convention).
+///
+/// Counted as an index: a btree whose first key is the column itself (an
+/// expression has no column, `indkey[0] = 0`), with `indisvalid` (a
+/// `create index concurrently` that failed leaves one that isn't),
+/// `indisready` and `indislive` (one being dropped isn't), and no predicate
+/// (a partial index serves only the rows its predicate admits, which an
+/// `= any(…)` filter doesn't imply). Read when a relationship resolves, or
+/// on each call where nothing resolves (the reverse path), so an index
+/// created or dropped later is picked up by the next one. That affects speed
+/// only.
+async fn key_column_in(
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+) -> Result<Option<KeyColumn>, ApplyError> {
     let row = client
         .query_opt(
-            "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                    exists (select 1 \
+                            from pg_index i \
+                            join pg_class c on c.oid = i.indexrelid \
+                            join pg_am am on am.oid = c.relam \
+                            where i.indrelid = a.attrelid \
+                              and i.indkey[0] = a.attnum \
+                              and am.amname = 'btree' \
+                              and i.indisvalid and i.indisready and i.indislive \
+                              and i.indpred is null) \
              from pg_attribute a \
              where a.attrelid = pg_catalog.to_regclass($1) \
                and a.attname = $2 \
@@ -1016,7 +1062,10 @@ async fn key_column_pg_type_in(
             &[&ddl::regclass_arg(table), &column],
         )
         .await?;
-    Ok(row.map(|r| r.get(0)))
+    Ok(row.map(|r| KeyColumn {
+        pg_type: r.get(0),
+        indexed: r.get(1),
+    }))
 }
 
 /// Renders a key-array equality filter against `col_ident` (an already
@@ -1203,7 +1252,10 @@ pub(crate) enum ReverseTrigger<'a> {
 /// the column can't be introspected; the relationship join-key convention is
 /// otherwise shared with the evaluator — exact for the integer/uuid/text
 /// keys relationships allow, numeric keys being rejected at definition
-/// time), while [`ReverseTrigger::WholeKeyspace`] instead selects every
+/// time), under `super::ledger::ENTRY_PLAN_SETTINGS` in a short transaction
+/// when `from_col` has an index to read by and as the planner would have it
+/// when it doesn't ([`from_side_keys_read`], issue #972), while
+/// [`ReverseTrigger::WholeKeyspace`] instead selects every
 /// currently non-`NULL` `from_col` row, matching nothing about a specific
 /// value at all (see that variant's own doc comment for why). Returns
 /// `(from_pk_text, matched_join_text)`: `matched_join_text` is `Some` for a
@@ -1233,17 +1285,10 @@ async fn from_side_keys(
                 return Ok(Vec::new());
             }
             let client = pool.get().await?;
-            let col_ident = quote_ident(from_col);
-            let pg_type = key_column_pg_type(pool, from_table, from_col).await?;
-            let filter = key_array_filter(&col_ident, pg_type.as_deref());
-            let sql = format!(
-                "select {pk}, {col_ident}::text \
-                 from {tbl} \
-                 where {filter}",
-                pk = ddl::pk_key_sql_expr(from_pk, None),
-                tbl = ddl::qualified_source_table(from_table),
-            );
-            let rows = client.query(&sql, &[join_keys]).await?;
+            let read = from_side_keys_read(&**client, from_table, from_pk, from_col).await?;
+            let rows = ReadConn::Pool(&**client)
+                .query(&read.sql, &[join_keys], read.indexed)
+                .await?;
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), Some(r.get::<_, String>(1))))
@@ -1264,6 +1309,31 @@ async fn from_side_keys(
                 .collect())
         }
     }
+}
+
+/// [`from_side_keys`]'s [`ReverseTrigger::Keys`] read of `from_table`, as
+/// `from_col` is introspected now ([`key_column_in`]): an indexed `from_col`
+/// is read through its index, under the entry plan settings (issue #972), an
+/// unindexed one as the planner would have it.
+async fn from_side_keys_read(
+    client: &impl GenericClient,
+    from_table: &str,
+    from_pk: &[PrimaryKeyColumn],
+    from_col: &str,
+) -> Result<KeyBatchRead, ApplyError> {
+    let col_ident = quote_ident(from_col);
+    let key_column = key_column_in(client, from_table, from_col).await?;
+    let filter = key_array_filter(&col_ident, key_column.as_ref().map(|c| c.pg_type.as_str()));
+    Ok(KeyBatchRead {
+        sql: format!(
+            "select {pk}, {col_ident}::text \
+             from {tbl} \
+             where {filter}",
+            pk = ddl::pk_key_sql_expr(from_pk, None),
+            tbl = ddl::qualified_source_table(from_table),
+        ),
+        indexed: key_column.is_some_and(|c| c.indexed),
+    })
 }
 
 /// Resolves a batch's touched to-side join keys (`key_hops`'s keys, each
@@ -1559,7 +1629,21 @@ enum ReadKind {
     /// A to-many relationship's live to-side ([`to_side_rows_sql`]'s
     /// statement): Phase 1 of epic #127 is to-one relationship *values*
     /// only (#94's shape).
-    ToMany(String),
+    ToMany(KeyBatchRead),
+}
+
+/// A read of the rows a batch of keys reaches through a relationship's
+/// join column, and whether that column has an index to read them by: a
+/// to-many to-side's ([`ReadKind::ToMany`]), or a from-side's
+/// ([`from_side_keys_read`]).
+struct KeyBatchRead {
+    /// The statement, taking the keys as `$1`.
+    sql: String,
+    /// Whether the join column has an index to read by
+    /// ([`KeyColumn::indexed`]), as of the introspection. If it does, the
+    /// read runs under `super::ledger::ENTRY_PLAN_SETTINGS`
+    /// ([`ReadConn::query`]).
+    indexed: bool,
 }
 
 /// A to-one relationship's projection read ([`ReadKind::ToOne`]).
@@ -1670,40 +1754,45 @@ impl RelationshipReads {
         Ok(Self { reads })
     }
 
-    /// The related rows of `rows`, read on `client`, as the evaluator's
-    /// context: for each relationship, the to-side rows keyed by their
-    /// `to_col` text that `rows`' join keys reach.
+    /// The related rows of `rows`, read on the pool client `client` (outside
+    /// any transaction), as the evaluator's context: for each relationship,
+    /// the to-side rows keyed by their `to_col` text that `rows`' join keys
+    /// reach.
+    ///
+    /// A to-one relationship's projection is read by its primary key, and a
+    /// to-many relationship's to-side by `to_col` when that column has an
+    /// index ([`KeyColumn::indexed`]), each in a short transaction under
+    /// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan, issue
+    /// #972). Without a usable index the setting could only cost the read
+    /// its parallel sequential scan (and, on PostgreSQL 16 and 17, a JIT
+    /// compile), so a to-many read of such a column runs as the planner
+    /// would have it.
     pub(crate) async fn fetch(
         &self,
-        client: &impl GenericClient,
+        client: &tokio_postgres::Client,
         rows: &[&Row],
     ) -> Result<RelationshipContext, ApplyError> {
-        self.fetch_with(client, None, rows).await
+        self.fetch_with(ReadConn::Pool(client), rows).await
     }
 
     /// [`Self::fetch`] in a 1-1 Re-derive's transaction `txn`, under its
-    /// entry lock (issues #832 and #838). A to-one relationship's projection is read
-    /// by its primary key under `super::ledger::ENTRY_PLAN_SETTINGS` (no
-    /// sequential scan, issue #835), so a projection whose statistics lag
-    /// its size isn't read in full while the entries stay locked. A to-many
-    /// relationship's to-side is read as [`Self::fetch`] reads it: its join
-    /// column may be non-unique or unindexed, where a forced index scan can
-    /// cost more than the sequential scan it replaces.
+    /// entry lock (issues #832 and #838). The reads that run under the
+    /// entry plan settings in [`Self::fetch`] (the projection by its primary
+    /// key, issue #835, and an indexed to-many `to_col`, issue #972) run
+    /// under them in `txn`, so a table whose statistics lag its size isn't
+    /// read in full while the entries stay locked.
     pub(crate) async fn fetch_under_lock(
         &self,
         txn: &Transaction<'_>,
         rows: &[&Row],
     ) -> Result<RelationshipContext, ApplyError> {
-        self.fetch_with(txn, Some(txn), rows).await
+        self.fetch_with(ReadConn::Txn(txn), rows).await
     }
 
-    /// [`Self::fetch`], reading the projections under the entry plan
-    /// settings in `by_entry_key` when given
-    /// ([`fetch_relationship_projection_rows`]).
+    /// [`Self::fetch`] on `conn`.
     async fn fetch_with(
         &self,
-        client: &impl GenericClient,
-        by_entry_key: Option<&Transaction<'_>>,
+        conn: ReadConn<'_, '_>,
         rows: &[&Row],
     ) -> Result<RelationshipContext, ApplyError> {
         let mut by_name: HashMap<String, ToOneRelationship> = HashMap::new();
@@ -1714,13 +1803,8 @@ impl RelationshipReads {
                 ReadKind::ToOne(projection) => {
                     let to_rows_by_key = match projection {
                         Some(projection) => {
-                            fetch_relationship_projection_rows(
-                                client,
-                                by_entry_key,
-                                &projection.sql,
-                                &join_keys,
-                            )
-                            .await?
+                            fetch_relationship_projection_rows(conn, &projection.sql, &join_keys)
+                                .await?
                         }
                         None => HashMap::new(),
                     };
@@ -1734,8 +1818,8 @@ impl RelationshipReads {
                         },
                     );
                 }
-                ReadKind::ToMany(sql) => {
-                    let to_rows_by_key = fetch_to_side_rows(client, sql, &join_keys).await?;
+                ReadKind::ToMany(to_side) => {
+                    let to_rows_by_key = fetch_to_side_rows(conn, to_side, &join_keys).await?;
                     to_many_by_name.insert(
                         read.name.clone(),
                         ToManyRelationship {
@@ -1748,6 +1832,38 @@ impl RelationshipReads {
             }
         }
         Ok(RelationshipContext::new(by_name).with_to_many(to_many_by_name))
+    }
+}
+
+/// Where a relationship read runs ([`RelationshipReads::fetch_with`]).
+#[derive(Clone, Copy)]
+enum ReadConn<'a, 'b> {
+    /// A pool client, outside any transaction.
+    Pool(&'a tokio_postgres::Client),
+    /// A Re-derive's transaction, under its entry lock.
+    Txn(&'a Transaction<'b>),
+}
+
+impl ReadConn<'_, '_> {
+    /// Runs the key-batch read `sql`. With `by_index`, under
+    /// `super::ledger::ENTRY_PLAN_SETTINGS`: in a short transaction of its
+    /// own on a pool client, or inside the transaction it is already in.
+    /// Without, as the planner would have it, outside any transaction of its
+    /// own.
+    async fn query(
+        self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+        by_index: bool,
+    ) -> Result<Vec<tokio_postgres::Row>, ApplyError> {
+        Ok(match (self, by_index) {
+            (Self::Pool(client), true) => {
+                super::ledger::query_on_pool_by_entry_key(client, sql, params).await?
+            }
+            (Self::Txn(txn), true) => super::ledger::query_by_entry_key(txn, sql, params).await?,
+            (Self::Pool(client), false) => client.query(sql, params).await?,
+            (Self::Txn(txn), false) => txn.query(sql, params).await?,
+        })
     }
 }
 
@@ -3485,37 +3601,45 @@ pub(crate) async fn release_to_one_projections(
 /// Decodes each row's columns via the same in-SQL `jsonb_each_text` unnest
 /// [`read_live_rows_batch`] uses. `to_table` is the to-side's unquoted,
 /// qualified identity (issues #372, #561), quoted here for interpolation.
-async fn to_side_rows_sql(pool: &Pool, to_table: &str, to_col: &str) -> Result<String, ApplyError> {
+async fn to_side_rows_sql(
+    pool: &Pool,
+    to_table: &str,
+    to_col: &str,
+) -> Result<KeyBatchRead, ApplyError> {
     let client = pool.get().await?;
     let col_ident = quote_ident(to_col);
     let tbl_ident = ddl::qualified_source_table(to_table);
-    let pg_type = key_column_pg_type(pool, to_table, to_col).await?;
-    let filter = key_array_filter(&col_ident, pg_type.as_deref());
+    let key_column = key_column_in(&**client, to_table, to_col).await?;
+    let filter = key_array_filter(&col_ident, key_column.as_ref().map(|c| c.pg_type.as_str()));
     // Issue #248: an explicit per-column `jsonb_build_object`, not
     // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
     let row_columns = live_row_columns(&**client, to_table).await?;
     let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
-    Ok(format!(
-        "select m.jk, m.rn, e.key, e.value \
-         from (select {col_ident}::text as jk, \
-                      row_number() over () as rn, \
-                      {doc_expr} as doc \
-               from {tbl_ident} t \
-               where {filter}) m \
-         cross join lateral jsonb_each_text(m.doc) e",
-    ))
+    Ok(KeyBatchRead {
+        sql: format!(
+            "select m.jk, m.rn, e.key, e.value \
+             from (select {col_ident}::text as jk, \
+                          row_number() over () as rn, \
+                          {doc_expr} as doc \
+                   from {tbl_ident} t \
+                   where {filter}) m \
+             cross join lateral jsonb_each_text(m.doc) e",
+        ),
+        indexed: key_column.is_some_and(|c| c.indexed),
+    })
 }
 
-/// Runs [`to_side_rows_sql`]'s statement for `join_keys` on `client`.
+/// Runs [`to_side_rows_sql`]'s statement for `join_keys` on `conn`, under
+/// the entry plan settings if `to_col` is indexed ([`ReadConn::query`]).
 async fn fetch_to_side_rows(
-    client: &impl GenericClient,
-    sql: &str,
+    conn: ReadConn<'_, '_>,
+    read: &KeyBatchRead,
     join_keys: &[String],
 ) -> Result<HashMap<String, Vec<Row>>, ApplyError> {
     if join_keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let db_rows = client.query(sql, &[&join_keys]).await?;
+    let db_rows = conn.query(&read.sql, &[&join_keys], read.indexed).await?;
     // Assemble each row by its stable `rn`, carrying its join key, then group.
     let mut assembled: HashMap<i64, (String, Row)> = HashMap::new();
     for db_row in db_rows {
@@ -3595,24 +3719,21 @@ fn projection_rows_statement(
     )
 }
 
-/// Runs [`projection_rows_sql`]'s statement for `join_keys` on `client`, or,
-/// with `by_entry_key`, on that transaction under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan): a 1-1
-/// Re-derive's read under its entry lock
-/// ([`RelationshipReads::fetch_under_lock`], issue #835).
+/// Runs [`projection_rows_sql`]'s statement for `join_keys` on `conn`, under
+/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan): the
+/// projection's key is its primary key, so the index is always there. In a
+/// 1-1 Re-derive's transaction under its entry lock
+/// ([`RelationshipReads::fetch_under_lock`], issue #835), or, on a pool
+/// client, in a short transaction of its own (issue #972).
 async fn fetch_relationship_projection_rows(
-    client: &impl GenericClient,
-    by_entry_key: Option<&Transaction<'_>>,
+    conn: ReadConn<'_, '_>,
     sql: &str,
     join_keys: &[String],
 ) -> Result<HashMap<String, Row>, ApplyError> {
     if join_keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let db_rows = match by_entry_key {
-        Some(txn) => super::ledger::query_by_entry_key(txn, sql, &[&join_keys]).await?,
-        None => client.query(sql, &[&join_keys]).await?,
-    };
+    let db_rows = conn.query(sql, &[&join_keys], true).await?;
     let mut rows: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
         let jk: String = db_row.get(0);
@@ -5919,6 +6040,497 @@ mod tests {
         for key in &keys {
             let row = read.get(key).expect("the key's row");
             assert_eq!(row.get("name"), Some(&Some(format!("n{key}"))));
+        }
+    }
+
+    /// Issue #972's tables: `join_indexed` and `join_unindexed`, each a
+    /// 400k-row `(id integer primary key, k integer, name text)` with `k`
+    /// unique (so near-unique, the PostgreSQL 16 case that prices 5,000
+    /// `= any` probes above a parallel sequential scan), analyzed at 100
+    /// rows and then grown, with autovacuum off, so statistics lag the size.
+    /// `join_indexed` has a btree on `k`; `join_unindexed` has none. Returns
+    /// a connection, a same-crate pool, and 5,000 of the keys, in key order.
+    async fn stale_join_tables(
+        db: &testkit::TestDatabase,
+    ) -> (tokio_postgres::Client, Pool, Vec<String>) {
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        for (table, index) in [
+            ("join_indexed", "create index on join_indexed (k);"),
+            ("join_unindexed", ""),
+        ] {
+            client
+                .batch_execute(&format!(
+                    "create table {table} (id int primary key, k int, name text) \
+                         with (autovacuum_enabled = false); \
+                     insert into {table} select i, i, 'n' || i from generate_series(1, 100) i; \
+                     analyze {table}; \
+                     {index} \
+                     insert into {table} \
+                         select i, i, 'n' || i from generate_series(101, 400000) i;"
+                ))
+                .await
+                .expect("seed the join table");
+        }
+        let keys: Vec<String> = client
+            .query(
+                "select k::text from join_indexed where k % 79 = 0 order by k limit 5000",
+                &[],
+            )
+            .await
+            .expect("keys")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(keys.len(), 5000);
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        )
+        .expect("build a same-crate pool");
+        (client, pool, keys)
+    }
+
+    /// `read`'s plan for `keys`, explained the way [`ReadConn::query`] runs
+    /// the read itself, on the same connection.
+    async fn plan_of_read(conn: ReadConn<'_, '_>, read: &KeyBatchRead, keys: &[String]) -> String {
+        conn.query(&format!("explain {}", read.sql), &[&keys], read.indexed)
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The plan of an index read: it uses an index or bitmap scan of the
+    /// table, never a sequential scan of it.
+    fn assert_read_through_index(plan: &str, what: &str) {
+        assert!(
+            (plan.contains("Index") || plan.contains("Bitmap")) && !plan.contains("Seq Scan"),
+            "{what} must read through the join column's index, got:\n{plan}"
+        );
+    }
+
+    /// The plan of a read the entry plan settings didn't touch: no
+    /// sequential scan was disabled (an added `disable_cost` on PostgreSQL
+    /// 16 and 17, a `Disabled` node on 18), so a table it can only scan
+    /// keeps its (parallel) sequential scan and isn't priced into JIT.
+    fn assert_read_planned_freely(plan: &str, what: &str) {
+        let costliest = plan
+            .split("cost=")
+            .skip(1)
+            .filter_map(|rest| {
+                rest.split_once("..")?
+                    .1
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            plan.contains("Seq Scan") && costliest < 1e9 && !plan.contains("Disabled"),
+            "{what} must keep its sequential scan, with none disabled, got:\n{plan}"
+        );
+    }
+
+    /// Issue #972: which join columns count as indexed. Only the leading
+    /// column of a plain, valid, ready, live btree index does; a lookup by a
+    /// batch of keys can't use any other, so forcing the planner onto it
+    /// would only cost the read its sequential scan.
+    #[tokio::test]
+    async fn only_the_leading_column_of_a_usable_btree_index_counts_as_indexed() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table detect (id int primary key, \
+                     lead int, second int, invalid int, hashed int, \
+                     partial int, expr int, bare int); \
+                 create index on detect (lead, second); \
+                 create index on detect (invalid); \
+                 create index on detect using hash (hashed); \
+                 create index on detect (partial) where partial > 0; \
+                 create index on detect ((expr + 1)); \
+                 update pg_index set indisvalid = false \
+                     where indexrelid = 'detect_invalid_idx'::regclass;",
+            )
+            .await
+            .expect("seed the detection table");
+        let column = |name: &'static str| {
+            let client = &client;
+            async move {
+                key_column_in(client, "public.detect", name)
+                    .await
+                    .expect("introspect")
+                    .unwrap_or_else(|| panic!("{name} exists"))
+            }
+        };
+        assert_eq!(
+            column("lead").await,
+            KeyColumn {
+                pg_type: "integer".to_string(),
+                indexed: true
+            },
+            "the leading column of a composite index"
+        );
+        assert!(column("id").await.indexed, "a primary key");
+        for (name, why) in [
+            ("second", "a non-leading column of a composite index"),
+            ("invalid", "an invalid index (a failed create concurrently)"),
+            ("hashed", "a non-btree index"),
+            ("partial", "a partial index"),
+            ("expr", "the column under an expression index"),
+            ("bare", "no index"),
+        ] {
+            assert!(!column(name).await.indexed, "{name} is not indexed: {why}");
+        }
+        assert!(
+            key_column_in(&client, "public.detect", "missing")
+                .await
+                .expect("introspect")
+                .is_none(),
+            "a missing column is absent"
+        );
+        // An index that isn't ready or live (being built or dropped) doesn't
+        // count either.
+        for flag in ["indisready", "indislive"] {
+            client
+                .batch_execute(&format!(
+                    "update pg_index set indisvalid = true, {flag} = false \
+                         where indexrelid = 'detect_invalid_idx'::regclass;"
+                ))
+                .await
+                .expect("flag the index");
+            assert!(
+                !column("invalid").await.indexed,
+                "an index that is not {flag} doesn't count"
+            );
+            client
+                .batch_execute(&format!(
+                    "update pg_index set {flag} = true \
+                         where indexrelid = 'detect_invalid_idx'::regclass;"
+                ))
+                .await
+                .expect("restore the index");
+        }
+        assert!(
+            column("invalid").await.indexed,
+            "restored, it counts: the flags above were what decided it"
+        );
+    }
+
+    /// Issue #972: a read resolves whether its join column is indexed when
+    /// it is built, so an index created or dropped afterwards is picked up
+    /// by the next resolve, and the flag it records is the one the read acts
+    /// on.
+    #[tokio::test]
+    async fn a_resolve_picks_up_an_index_created_after_the_last() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, pool, _) = stale_join_tables(&db).await;
+        let indexed = |table: &'static str| {
+            let pool = pool.clone();
+            async move {
+                to_side_rows_sql(&pool, &format!("public.{table}"), "k")
+                    .await
+                    .expect("resolve")
+                    .indexed
+            }
+        };
+        assert!(indexed("join_indexed").await);
+        assert!(!indexed("join_unindexed").await);
+        client
+            .batch_execute("create index on join_unindexed (k); drop index join_indexed_k_idx;")
+            .await
+            .expect("swap the indexes");
+        assert!(!indexed("join_indexed").await);
+        assert!(indexed("join_unindexed").await);
+    }
+
+    /// Issue #972: [`ReadConn::query`] runs a read under the entry plan
+    /// settings only when asked, on a pool client and inside a transaction
+    /// alike, and leaves a pool client outside any transaction and its
+    /// settings as they were.
+    #[tokio::test]
+    async fn a_key_batch_read_runs_under_the_entry_plan_settings_only_when_by_index() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let setting = "select current_setting('enable_seqscan')";
+        let value = |rows: Vec<tokio_postgres::Row>| rows[0].get::<_, String>(0);
+        assert_eq!(
+            value(
+                ReadConn::Pool(&client)
+                    .query(setting, &[], true)
+                    .await
+                    .expect("by index")
+            ),
+            "off"
+        );
+        assert_eq!(
+            value(
+                ReadConn::Pool(&client)
+                    .query(setting, &[], false)
+                    .await
+                    .expect("free")
+            ),
+            "on"
+        );
+        assert_not_in_a_transaction_with_settings_on(&client).await;
+        let txn = client.transaction().await.expect("begin");
+        assert_eq!(
+            value(
+                ReadConn::Txn(&txn)
+                    .query(setting, &[], true)
+                    .await
+                    .expect("by index")
+            ),
+            "off"
+        );
+        assert_eq!(
+            value(
+                ReadConn::Txn(&txn)
+                    .query(setting, &[], false)
+                    .await
+                    .expect("free")
+            ),
+            "on",
+            "the settings are put back after a read inside a transaction"
+        );
+        txn.rollback().await.expect("rollback");
+    }
+
+    /// The settings are `on`, and `client` is in no transaction: a
+    /// transaction already open would have started before the statement
+    /// that asks.
+    async fn assert_not_in_a_transaction_with_settings_on(client: &tokio_postgres::Client) {
+        // The simple protocol, whose one statement starts its transaction
+        // and its own timestamp together.
+        let messages = client
+            .simple_query(
+                "select current_setting('enable_seqscan'), \
+                        transaction_timestamp() = statement_timestamp()",
+            )
+            .await
+            .expect("state");
+        let row = messages
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .expect("a row");
+        assert_eq!(row.get(0), Some("on"), "the settings are back");
+        assert_eq!(row.get(1), Some("t"), "the connection is in no transaction");
+    }
+
+    /// Issue #972: a read on a pool client that fails, or whose future is
+    /// dropped once it has queued its statements, still leaves the
+    /// connection outside its transaction with the settings gone, since
+    /// the pool hands the connection to its next borrower.
+    #[tokio::test]
+    async fn a_pool_read_under_the_settings_never_leaves_its_connection_in_a_transaction() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        // Fails when it runs, after it has been prepared and begun.
+        let failed = crate::staging::ledger::query_on_pool_by_entry_key(
+            &client,
+            "select 1 / ($1::int - 1)",
+            &[&1_i32],
+        )
+        .await;
+        assert!(failed.is_err(), "division by zero");
+        assert_not_in_a_transaction_with_settings_on(&client).await;
+
+        // Dropped while its query runs, after the three statements are
+        // queued: the sleep outlasts the timeout, which outlasts the prepare.
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(250),
+            crate::staging::ledger::query_on_pool_by_entry_key(
+                &client,
+                "select pg_sleep(1)",
+                &params,
+            ),
+        )
+        .await;
+        assert!(dropped.is_err(), "the read was cut short");
+        // The next statement on the connection runs behind the queued ones.
+        assert_not_in_a_transaction_with_settings_on(&client).await;
+    }
+
+    /// The `RelationshipReads` of one to-many relationship `rel` of
+    /// `from_col`, over `to_table`'s `k`.
+    async fn to_many_reads(pool: &Pool, to_table: &str) -> RelationshipReads {
+        RelationshipReads {
+            reads: vec![RelationshipRead {
+                id: 1,
+                name: "rel".to_string(),
+                from_col: "from_k".to_string(),
+                to_columns: HashMap::new(),
+                kind: ReadKind::ToMany(
+                    to_side_rows_sql(pool, to_table, "k")
+                        .await
+                        .expect("resolve"),
+                ),
+            }],
+        }
+    }
+
+    /// `join_indexed` and `join_unindexed`'s `id` as the key a from-side
+    /// read decodes.
+    fn join_table_pk() -> Vec<PrimaryKeyColumn> {
+        vec![PrimaryKeyColumn {
+            name: "id".to_string(),
+            data_type: "integer".to_string(),
+            nullable: false,
+            collation: None,
+        }]
+    }
+
+    /// Issue #972: the key-batch reads of a relationship's join column run
+    /// under the entry plan settings where the column is indexed, and
+    /// as the planner would have them where it isn't. Each is read the way
+    /// production reads it (a to-many's to-side, on a pool client and inside
+    /// a transaction; a reverse lookup's from-side, on a pool client), at
+    /// 5,000 keys of 400k rows with statistics from when the table had 100,
+    /// and its plan is captured on the connection that reads.
+    ///
+    /// PostgreSQL 16 prices 5,000 `= any` probes of a near-unique index
+    /// above a parallel sequential scan, so left to itself it reads the
+    /// whole table: the indexed half of this test fails there without the
+    /// settings. An unindexed column has no index to force, so the settings
+    /// could only cost it its parallel scan (and a JIT compile): the other
+    /// half fails if they are applied.
+    #[tokio::test]
+    async fn a_key_batch_read_is_forced_onto_its_index_only_where_there_is_one() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, pool, keys) = stale_join_tables(&db).await;
+        let pk = join_table_pk();
+        for (table, indexed) in [("join_indexed", true), ("join_unindexed", false)] {
+            let qualified = format!("public.{table}");
+            let reads = [
+                (
+                    "the to-many read",
+                    to_side_rows_sql(&pool, &qualified, "k")
+                        .await
+                        .expect("resolve"),
+                ),
+                (
+                    "the reverse lookup",
+                    from_side_keys_read(&client, &qualified, &pk, "k")
+                        .await
+                        .expect("resolve"),
+                ),
+            ];
+            for (what, read) in &reads {
+                let what = format!("{what} of {table}");
+                assert_eq!(read.indexed, indexed, "{what} resolves its index");
+                let plan = plan_of_read(ReadConn::Pool(&client), read, &keys).await;
+                if indexed {
+                    assert_read_through_index(&plan, &format!("{what}, on a pool client"));
+                } else {
+                    assert_read_planned_freely(&plan, &format!("{what}, on a pool client"));
+                }
+            }
+            // Inside a transaction (the to-many read under the entry lock).
+            let read = &reads[0].1;
+            let txn = client.transaction().await.expect("begin");
+            let plan = plan_of_read(ReadConn::Txn(&txn), read, &keys).await;
+            txn.rollback().await.expect("rollback");
+            let what = format!("the to-many read of {table}, in a transaction");
+            if indexed {
+                assert_read_through_index(&plan, &what);
+            } else {
+                assert_read_planned_freely(&plan, &what);
+            }
+        }
+    }
+
+    /// Issue #972: the reads return the same rows indexed or not, on a pool
+    /// client and under the entry lock, and the indexed ones really read
+    /// the table through its index: the to-many read inside a transaction
+    /// starts no sequential scan of `join_indexed`.
+    #[tokio::test]
+    async fn the_key_batch_reads_return_the_same_rows_indexed_or_not() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, pool, keys) = stale_join_tables(&db).await;
+        let pk = join_table_pk();
+        // A key with no row, and a key the batch repeats.
+        let mut asked = keys.clone();
+        asked.push("-1".to_string());
+        let from_rows: Vec<Row> = asked
+            .iter()
+            .map(|key| Row::from([("from_k".to_string(), Some(key.clone()))]))
+            .collect();
+        let from_rows: Vec<&Row> = from_rows.iter().collect();
+        for table in ["join_indexed", "join_unindexed"] {
+            let qualified = format!("public.{table}");
+            let reads = to_many_reads(&pool, &qualified).await;
+            let on_pool = reads.fetch(&client, &from_rows).await.expect("fetch");
+            let txn = client.transaction().await.expect("begin");
+            let seq_scans = format!(
+                "select seq_scan from pg_stat_xact_user_tables where relid = 'public.{table}'::regclass"
+            );
+            let before: i64 = txn.query_one(&seq_scans, &[]).await.expect("scans").get(0);
+            let under_lock = reads
+                .fetch_under_lock(&txn, &from_rows)
+                .await
+                .expect("fetch under lock");
+            let scans: i64 = txn.query_one(&seq_scans, &[]).await.expect("scans").get(0);
+            txn.rollback().await.expect("rollback");
+            if table == "join_indexed" {
+                assert_eq!(scans, before, "the read under the lock scans no table");
+            } else {
+                assert!(scans > before, "an unindexed table has only a scan to read");
+            }
+            for (where_, ctx) in [
+                ("on a pool client", &on_pool),
+                ("under the lock", &under_lock),
+            ] {
+                let read = ctx.to_many_rows("rel").expect("the relationship is read");
+                assert_eq!(read.len(), keys.len(), "{table} {where_}: every key's rows");
+                for key in &keys {
+                    let rows = read.get(key).expect("the key's rows");
+                    assert_eq!(rows.len(), 1, "{table} {where_}: k is unique");
+                    assert_eq!(rows[0].get("name"), Some(&Some(format!("n{key}"))));
+                }
+            }
+            let from_side = ReverseTrigger::Keys(&keys[..3]);
+            let mut matched = from_side_keys(&pool, &qualified, &pk, "k", &from_side)
+                .await
+                .expect("from_side_keys");
+            matched.sort();
+            let mut expected: Vec<(String, Option<String>)> = keys[..3]
+                .iter()
+                .map(|key| (key.clone(), Some(key.clone())))
+                .collect();
+            expected.sort();
+            assert_eq!(matched, expected, "{table}: the reverse lookup");
         }
     }
 

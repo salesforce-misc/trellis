@@ -142,6 +142,35 @@ the two ways out:
 A `statement_timeout` meant for application queries belongs on the
 application's roles.
 
+## Index relationship join columns
+
+Index the column each relationship joins by, on the table that holds it:
+
+* `from_col`, on the from-side table. A change to a related row finds the
+  from-side rows to re-derive by looking up `from_col`.
+* `to_col` of a to-many relationship, on the to-side table. A definition
+  that aggregates the related rows reads them by `to_col`. (A to-one's
+  `to_col` is unique, so it has an index already.)
+
+```sql
+CREATE INDEX ON orders (customer_id);
+```
+
+Trellis doesn't create indexes on your tables, so without one each of those
+reads scans the table, and the scan grows with the table, not with the batch
+of keys it looks up. With one, a batch reads only its keys' rows.
+
+Trellis checks for the index each time it prepares a batch's relationship
+reads. A column counts as indexed if it is the leading column of a plain btree
+index that is valid and not partial. For an indexed column, Trellis plans the
+read to use the index, which matters most on PostgreSQL 16: it prices
+thousands of probes of a near-unique index above a parallel sequential scan,
+and reads the whole table unless told otherwise. For an unindexed column, it
+leaves the plan to PostgreSQL, since forcing the index there would only cost
+the read its parallel scan. An index you create or drop takes effect on a
+later batch, with no restart or redefine. It changes speed only, never
+results.
+
 ## Roles and permissions
 
 ### One Trellis role

@@ -2157,6 +2157,39 @@ pub(crate) async fn query_by_entry_key(
     Ok(rows)
 }
 
+/// [`query_by_entry_key`] for a connection outside any transaction (a pool
+/// client): runs `sql` in a short transaction of its own, under
+/// [`ENTRY_PLAN_SETTINGS`] folded into the `begin` batch (#972).
+///
+/// The statement is prepared first (a round trip, as `Client::query` makes
+/// for a text statement), then `begin; set local …`, the query and `commit`
+/// go out back to back, so the read costs two round trips, not three. They
+/// are all queued before any is awaited, which also makes the read safe to
+/// cancel: dropping this future after the queue never leaves the pooled
+/// connection inside an open transaction, because the `commit` is already
+/// on its way. An error in the query aborts the transaction, and the
+/// `commit` then ends it as a rollback, so the settings never outlive the
+/// call either way.
+///
+/// `client` must not be in a transaction: use [`query_by_entry_key`] there.
+pub(crate) async fn query_on_pool_by_entry_key(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    let statement = client.prepare(sql).await?;
+    let begin = format!("begin; {ENTRY_PLAN_SETTINGS}");
+    let (begun, rows, committed) = tokio::join!(
+        client.batch_execute(&begin),
+        client.query(&statement, params),
+        client.batch_execute("commit"),
+    );
+    let rows = rows?;
+    begun?;
+    committed?;
+    Ok(rows)
+}
+
 /// [`query_by_entry_key`] for a statement that returns exactly one row.
 pub(super) async fn query_one_by_entry_key(
     txn: &Transaction<'_>,
