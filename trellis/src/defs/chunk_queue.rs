@@ -2469,6 +2469,25 @@ mod tests {
         super::super::ddl::join_pk_key(parts)
     }
 
+    /// The tables [`seed_waiting_aggregate`]'s definition builds into: its
+    /// target, ledger and group deltas.
+    async fn create_rollup_target(pool: &Pool) {
+        let text = "TRANSFORM rollup FROM orders GROUP BY g SELECT g AS g, sum(a) AS total";
+        let columns: std::collections::HashMap<String, super::super::ast::ValueType> =
+            ["id", "g", "a"]
+                .into_iter()
+                .map(|c| (c.to_string(), super::super::ast::ValueType::Numeric))
+                .collect();
+        super::super::ddl::create_aggregate_target_table(
+            pool,
+            &parse(text).expect("parse"),
+            "public",
+            &columns,
+        )
+        .await
+        .expect("create the target");
+    }
+
     /// Seeds `public.orders` (three rows over two groups) and a
     /// `waiting_to_backfill` aggregate definition `rollup` over it, creating
     /// its target table unless `with_target` is `false`.
@@ -2487,19 +2506,7 @@ mod tests {
         .await
         .expect("seed source");
         if with_target {
-            let columns: std::collections::HashMap<String, super::super::ast::ValueType> =
-                ["id", "g", "a"]
-                    .into_iter()
-                    .map(|c| (c.to_string(), super::super::ast::ValueType::Numeric))
-                    .collect();
-            super::super::ddl::create_aggregate_target_table(
-                pool,
-                &parse(text).expect("parse"),
-                "public",
-                &columns,
-            )
-            .await
-            .expect("create the target");
+            create_rollup_target(pool).await;
         }
         raw.query_one(
             "insert into transform_definitions \
@@ -2703,6 +2710,9 @@ mod tests {
         assert_eq!(record.get::<_, Option<String>>(1), Some(error.to_string()));
         assert_eq!(record.get::<_, Option<String>>(2), None);
 
+        // A definition's tables exist, and a resume refuses without its
+        // group-delta table (#967): create the ones the build lacked.
+        create_rollup_target(&pool).await;
         resume_transform(&pool, "rollup").await.expect("resume");
         assert_eq!(
             chunk_count(&raw, id).await,
