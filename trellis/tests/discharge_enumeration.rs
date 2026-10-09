@@ -1,6 +1,8 @@
 //! Which marker discharges enumerate the table into the ring: every one on a
-//! table something reads (issue #417). A direct build's go-live catch-up
-//! always does, even for a table that hasn't changed since the build read it
+//! table an applying definition reads (issue #417), except for one whose
+//! Re-derive build will read it, is reading it, or started after the marker
+//! was parked (issues #732, #938). A direct build's go-live catch-up always
+//! does, even for a table that hasn't changed since the build read it
 //! (issues #468, #485).
 
 use std::collections::HashMap;

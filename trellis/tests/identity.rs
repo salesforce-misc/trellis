@@ -330,8 +330,9 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // transform), #760 V72 (`definition_key_types`), #824 V74
     // (`poison.sqlstate`, `retype_releases`), #817 V75 (`drain_holdups`),
     // #828 V76 (`retype_causes`, `capture_failures.caused_by`), #912 V77
-    // (`column_status.cascade_pending`), and #803 V78 (one `poison_held` row
-    // per held key), and #938 V80 (`transform_definitions.build_marker_generation`).
+    // (`column_status.cascade_pending`), #803 V78 (one `poison_held` row
+    // per held key), #944 V79 (a `recompute` row's released join value), and
+    // #938 V80 (`transform_definitions.build_marker_generation`).
     // V73 is unused.
     assert_eq!(
         applied,

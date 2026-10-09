@@ -7329,8 +7329,9 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
 /// table this says `false` for, since nothing would consume the `Recompute`
 /// rows (issues #417, #732, #938).
 ///
-/// Any other definition reading the table doesn't count, because the drain
-/// drops its share of the rows and something else covers it:
+/// Any other definition reading the table doesn't count: either the drain
+/// would drop its share of the rows, or a build already read them, and
+/// something else covers it:
 ///
 /// - **A definition whose Re-derive build is running** (#625 F2) reads the
 ///   table in its chunks, and applies the changes after its start.

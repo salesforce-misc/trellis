@@ -136,10 +136,12 @@ async fn migrate_up_is_idempotent() {
         // (`capture_failures.kind`), #799 V71 (whole-key poison per
         // transform), #760 V72 (`definition_key_types`), #824 V74
         // (`poison.sqlstate`, `retype_releases`), #817 V75 (`drain_holdups`),
-        // #828 V76 (`retype_causes`, `capture_failures.caused_by`), and #912 V77
-        // (`column_status.cascade_pending`).
+        // #828 V76 (`retype_causes`, `capture_failures.caused_by`), #912 V77
+        // (`column_status.cascade_pending`), #803 V78 (one `poison_held` row
+        // per held key), #944 V79 (a `recompute` row's released join value),
+        // and #938 V80 (`transform_definitions.build_marker_generation`).
         // V73 is unused.
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V77 to be applied"
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, V42 through V51, V53 through V60, V63 through V65, V67 through V72, V74 through V80 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.
