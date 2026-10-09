@@ -1622,6 +1622,70 @@ async fn widening_a_summed_column_pauses_and_resume_re_types_its_contribution_an
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
 }
 
+/// #857: a `SUM` whose argument moved from `numeric` to a float type is
+/// recompute-only now, but its group-delta table keeps the running-sum column
+/// define gave the old `SUM`. A resume refuses rather than rebuild into it,
+/// names `DROP TRANSFORM`, and leaves the definition paused and the table as
+/// it was.
+#[tokio::test]
+async fn a_resume_refuses_an_aggregate_whose_sum_argument_moved_between_numeric_and_float() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount numeric); \
+         insert into public.orders values (1, 'a', 10.5), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    let delta_columns = async |raw: &Client| -> Vec<String> {
+        raw.query(
+            "select attname::text from pg_attribute \
+             where attrelid = 'public.per_shop__deltas'::regclass \
+               and attnum > 0 and not attisdropped and attname like '\\_\\_d%' \
+             order by attnum",
+            &[],
+        )
+        .await
+        .expect("read the delta columns")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+    };
+    let before = delta_columns(&raw).await;
+    assert!(before.iter().any(|c| c == "__ds0"), "{before:?}");
+
+    trellis
+        .apply("PAUSE TRANSFORM per_shop")
+        .await
+        .expect("pause per_shop");
+    raw.batch_execute("alter table public.orders alter column amount type double precision")
+        .await
+        .expect("move the summed column to a float");
+    match trellis.apply("RESUME TRANSFORM per_shop").await {
+        Err(TrellisError::Apply(trellis::staging::apply::ApplyError::ResumeRefused {
+            reason,
+            ..
+        })) => {
+            let reason = reason.to_string();
+            assert!(reason.contains("DROP TRANSFORM"), "{reason}");
+            assert!(reason.contains("__ds0"), "{reason}");
+        }
+        other => panic!("expected the resume to be refused, got {other:?}"),
+    }
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Paused);
+    assert_eq!(delta_columns(&raw).await, before);
+}
+
 /// #824: widening a column a 1-1 calculated field reads (`qty + 1`, with
 /// `qty` `integer` to `bigint`) outgrows the field's column: the pass
 /// pauses the definition, and a resume re-types that column, leaving the

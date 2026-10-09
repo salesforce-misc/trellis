@@ -176,6 +176,21 @@ pub enum CatalogError {
         /// The source's key columns now.
         source_key: Vec<String>,
     },
+    /// An aggregate's group-delta table has the columns define chose when it
+    /// created it, and define would choose different ones now: a field's
+    /// classification (incremental or recompute-only) moved with its
+    /// argument's type, as a `SUM` over `numeric` that became `double
+    /// precision` did (#857). Its rebuild would write NULL into the sum column
+    /// the table keeps and poison every key it touches. [`revalidate`] refuses
+    /// it, and any difference in those columns, rather than decide which are
+    /// safe; the repair is to drop the definition and define it again.
+    AggregateDeltasShapeChanged {
+        target: String,
+        /// The table's `__dc`/`__ds`/`__out` columns.
+        have: Vec<String>,
+        /// The ones define would create now.
+        want: Vec<String>,
+    },
     /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
     /// shares a bare table-name suffix with a *different* qualified target
     /// some other still-persisted definition already uses — e.g.
@@ -439,6 +454,7 @@ impl CatalogError {
             // `RowSecurityApplies`: the fix is a grant.
             CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
+            CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
             // Collides with existing state (another live definition's
             // persisted target), not a structural/semantic rejection of this
             // definition's own text — the same category
@@ -538,6 +554,14 @@ impl fmt::Display for CatalogError {
                  is keyed by ({}). Restore the key, or drop the definition and define it again",
                 source_key.join(", "),
                 target_key.join(", ")
+            ),
+            CatalogError::AggregateDeltasShapeChanged { target, have, want } => write!(
+                f,
+                "the group-delta table of {target} has columns ({}), but define would now \
+                 create ({}), because an aggregate field's argument changed type. Trellis \
+                 doesn't re-shape it: `DROP TRANSFORM` and define it again",
+                have.join(", "),
+                want.join(", ")
             ),
             CatalogError::TargetTableSuffixCollision {
                 target,
@@ -683,6 +707,7 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceTableNotFound(_) => None,
             CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
+            CatalogError::AggregateDeltasShapeChanged { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
@@ -5146,6 +5171,9 @@ pub(crate) async fn revalidate(
             });
         }
     }
+    if let KeySpace::Aggregate { .. } = definition.def.key_space {
+        check_deltas_shape(txn, definition, &source_columns, &relationships).await?;
+    }
     reject_row_security(
         txn,
         schema,
@@ -5158,6 +5186,59 @@ pub(crate) async fn revalidate(
     Ok(Revalidated {
         source_columns,
         relationships,
+    })
+}
+
+/// Refuses a resume of an aggregate whose group-delta table doesn't have the
+/// `__dc`, `__ds` and `__out` columns define would create now (#857). A
+/// field's classification follows its argument's type, so a `SUM` argument
+/// that moved between `numeric` and floating point leaves the table with a
+/// running-sum column the rebuild can't fill. Any difference is refused
+/// ([`CatalogError::AggregateDeltasShapeChanged`]) rather than judged. A
+/// definition without a group-delta table has nothing to compare.
+async fn check_deltas_shape(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition: &Definition,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Result<(), CatalogError> {
+    let (target_schema, target_bare) = definition
+        .target_table
+        .split_once('.')
+        .unwrap_or(("", definition.target_table.as_str()));
+    let deltas = format!(
+        "{target_schema}.{}",
+        super::ledger::deltas_table_name(target_bare)
+    );
+    let columns: Vec<String> = txn
+        .query(
+            "select attname::text from pg_catalog.pg_attribute \
+             where attrelid = pg_catalog.to_regclass($1) \
+               and attnum > 0 and not attisdropped",
+            &[&ddl::regclass_arg(&deltas)],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let have: std::collections::BTreeSet<String> = columns
+        .into_iter()
+        .filter(|c| super::ledger::is_delta_shape_column(c))
+        .collect();
+    let want = match crate::staging::ledger::route(&definition.def, source_columns, relationships) {
+        Some(shape) => super::ledger::delta_shape_columns(&shape.summed(), shape.recomputes()),
+        None => std::collections::BTreeSet::new(),
+    };
+    if have == want {
+        return Ok(());
+    }
+    Err(CatalogError::AggregateDeltasShapeChanged {
+        target: definition.target_table.clone(),
+        have: have.into_iter().collect(),
+        want: want.into_iter().collect(),
     })
 }
 

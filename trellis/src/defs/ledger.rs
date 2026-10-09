@@ -235,6 +235,38 @@ pub(crate) fn delta_sum_column(i: usize) -> String {
     format!("__ds{i}")
 }
 
+/// The columns of a group-delta table that follow its fields'
+/// classification: per contribution `i` its count, its sum when `summed[i]`,
+/// and the recompute flag when `recomputes` (see [`aggregate_deltas_ddl`]).
+/// What a resume compares with the live table (#857).
+pub(crate) fn delta_shape_columns(
+    summed: &[bool],
+    recomputes: bool,
+) -> std::collections::BTreeSet<String> {
+    let mut columns = std::collections::BTreeSet::new();
+    for (i, summed) in summed.iter().enumerate() {
+        columns.insert(delta_count_column(i));
+        if *summed {
+            columns.insert(delta_sum_column(i));
+        }
+    }
+    if recomputes {
+        columns.insert(DELTA_OUT_COLUMN.to_string());
+    }
+    columns
+}
+
+/// Whether `column` of a group-delta table is one of
+/// [`delta_shape_columns`]'s kind: a count, a sum or the recompute flag.
+pub(crate) fn is_delta_shape_column(column: &str) -> bool {
+    column == DELTA_OUT_COLUMN
+        || ["__dc", "__ds"].iter().any(|prefix| {
+            column
+                .strip_prefix(prefix)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 /// A recomputing target's delta row's flag (#625 F5): some entry the chunk
 /// changed counted in the group before it, so a value may have left the
 /// group and the merger recomputes it from all of its entries.
@@ -601,6 +633,28 @@ pub(crate) fn one_to_one_ledger_ddl(qualified_ledger: &str) -> String {
 mod tests {
     use super::*;
     use crate::defs::parser::parse;
+
+    #[test]
+    fn delta_shape_columns_follow_the_summed_flags_and_the_recompute_flag() {
+        let shape = |summed: &[bool], recomputes| {
+            delta_shape_columns(summed, recomputes)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&[true, false], false), ["__dc0", "__dc1", "__ds0"]);
+        assert_eq!(shape(&[false], true), ["__dc0", "__out"]);
+        assert!(shape(&[], false).is_empty());
+    }
+
+    #[test]
+    fn only_the_shape_columns_of_a_delta_table_are_compared() {
+        for column in ["__dc0", "__ds12", "__out"] {
+            assert!(is_delta_shape_column(column), "{column}");
+        }
+        for column in ["__dm", "__dc", "__dsx", "__part", "__seq", "__keys", "shop"] {
+            assert!(!is_delta_shape_column(column), "{column}");
+        }
+    }
 
     fn plan(text: &str) -> (Vec<Contribution>, HashMap<String, Expr>, Vec<GroupByKey>) {
         let def = parse(text).expect("parse");
