@@ -31,7 +31,8 @@
 //! Changes are staged by the triggers in the writers' own transactions;
 //! nothing reads the WAL.
 //!
-//! **Wake channel**: [`ClientOptions::wake_channel`] is the one Postgres
+//! **Wake channel**: [`ClientOptions::wake_channel`], by default
+//! [`default_wake_channel`] of the catalog schema, is the one Postgres
 //! `LISTEN/NOTIFY` channel the backfill discharge (`run_pending_backfills`),
 //! a seal actually completing
 //! (`staging::seal_if_active_nonempty`/`staging::recover_stuck_seals`, issue
@@ -40,7 +41,8 @@
 //! segment), and [`super::staging::apply::drain_once`]'s own
 //! downstream-propagation `pg_notify` all wake — and the same name every
 //! app-worker task `LISTEN`s on while idle. One name, one channel, shared
-//! by construction rather than by convention.
+//! by construction rather than by convention. Each instance in a database
+//! has its own default channel, so it never wakes another instance's workers.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -79,8 +81,11 @@ pub struct ClientOptions {
     pub application_threads: usize,
     /// The `LISTEN/NOTIFY` channel shared by the backfill discharge, seals,
     /// apply's downstream propagation, and every idle app-worker task's
-    /// `LISTEN`.
-    pub wake_channel: String,
+    /// `LISTEN`. `None` (the default) uses [`default_wake_channel`] of the
+    /// client's catalog schema, so each instance in a database wakes only
+    /// its own workers; `Some` overrides it. Read the channel a client uses
+    /// with [`Self::wake_channel_for`].
+    pub wake_channel: Option<String>,
     /// How long a claim may sit unrefreshed before it's taken back: ring
     /// segment claims by [`staging::reclaim_stale`] (the maintenance loop,
     /// only when `staging_worker` is set), and backfill-chunk claims by
@@ -151,7 +156,7 @@ impl Default for ClientOptions {
         Self {
             staging_worker: false,
             application_threads: 0,
-            wake_channel: "trellis_wake".to_string(),
+            wake_channel: None,
             reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,
             maintenance_interval: Duration::from_millis(300),
             reconcile_interval: Duration::from_secs(5),
@@ -162,6 +167,37 @@ impl Default for ClientOptions {
             build_chunk_rows: staging::build::DEFAULT_CHUNK_ROWS,
         }
     }
+}
+
+impl ClientOptions {
+    /// The wake channel a client of catalog schema `schema` uses: the
+    /// explicit [`Self::wake_channel`], else [`default_wake_channel`].
+    pub fn wake_channel_for(&self, schema: &str) -> String {
+        self.wake_channel
+            .clone()
+            .unwrap_or_else(|| default_wake_channel(schema))
+    }
+}
+
+/// The longest a `LISTEN/NOTIFY` channel name may be: Postgres's 63-byte
+/// identifier limit, which `pg_notify` rejects an overlong name against.
+const MAX_CHANNEL_BYTES: usize = 63;
+
+/// The default wake channel for catalog schema `schema`: `<schema>_wake`, so
+/// the default instance's channel is `trellis_wake`. A schema too long for
+/// that to fit keeps a prefix of its name plus a hash of the whole name, the
+/// way [`capture::sql::trigger_name`] does. Distinct schemas get distinct
+/// channels, so a seal, drain or backfill in one instance never wakes
+/// another instance's idle workers in the same database.
+pub fn default_wake_channel(schema: &str) -> String {
+    let suffix = "_wake";
+    if schema.len() + suffix.len() <= MAX_CHANNEL_BYTES {
+        return format!("{schema}{suffix}");
+    }
+    let hash = format!("{:016x}", capture::sql::fnv1a64(schema.as_bytes()));
+    let prefix =
+        capture::sql::truncate_to(schema, MAX_CHANNEL_BYTES - suffix.len() - 1 - hash.len());
+    format!("{prefix}_{hash}{suffix}")
 }
 
 /// The option checks [`Client::start_with_config`] runs before spawning
@@ -497,6 +533,9 @@ async fn run(
     };
 
     let mut staging_session = None;
+    // One resolved name for every notify and every idle worker's `LISTEN`.
+    let wake_channel = options.wake_channel_for(config.schema());
+
     if options.staging_worker {
         match setup_staging(&dsn, &config, &pool).await {
             Ok(session) => staging_session = Some(session),
@@ -520,7 +559,7 @@ async fn run(
             schema: config.schema().to_string(),
             pool: pool.clone(),
             session,
-            wake_channel: options.wake_channel.clone(),
+            wake_channel: wake_channel.clone(),
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
             drainer_window: options.drainer_window,
@@ -562,7 +601,7 @@ async fn run(
             schema: config.schema().to_string(),
             claimed_by,
             worker_id: client_id.clone(),
-            wake_channel: options.wake_channel.clone(),
+            wake_channel: wake_channel.clone(),
             drainer_window: options.drainer_window,
             heartbeat_config: options.heartbeat.clone(),
             poll_interval: options.poll_interval,
@@ -3784,5 +3823,59 @@ mod reconcile_tests {
             "the registration is captured: dispatched, or its join marker is still parked \
              (status {status})"
         );
+    }
+}
+
+#[cfg(test)]
+mod wake_channel_tests {
+    //! Issue #875: the default wake channel is derived from the catalog
+    //! schema. No Postgres.
+
+    use super::*;
+
+    #[test]
+    fn the_default_instance_keeps_the_trellis_wake_name() {
+        assert_eq!(default_wake_channel("trellis"), "trellis_wake");
+    }
+
+    #[test]
+    fn distinct_schemas_get_distinct_stable_channels() {
+        assert_ne!(default_wake_channel("a"), default_wake_channel("b"));
+        // `a` and `a_wake` must not collide through the suffix.
+        assert_ne!(default_wake_channel("a"), default_wake_channel("a_wake"));
+        assert_eq!(default_wake_channel("a"), default_wake_channel("a"));
+    }
+
+    #[test]
+    fn a_channel_never_exceeds_postgres_limit_and_long_schemas_keep_a_hash() {
+        // Longest schema whose plain name fits, one past it, the validator's
+        // 63-byte maximum, and multi-byte names cut on a char boundary.
+        for schema in [
+            "s".repeat(MAX_CHANNEL_BYTES - "_wake".len()),
+            "s".repeat(MAX_CHANNEL_BYTES - "_wake".len() + 1),
+            "s".repeat(63),
+            "é".repeat(31),
+            "😀".repeat(15),
+        ] {
+            let channel = default_wake_channel(&schema);
+            assert!(channel.len() <= MAX_CHANNEL_BYTES, "{channel}");
+            assert!(channel.ends_with("_wake"), "{channel}");
+        }
+        let fits = "s".repeat(MAX_CHANNEL_BYTES - "_wake".len());
+        assert_eq!(default_wake_channel(&fits), format!("{fits}_wake"));
+        // Two long schemas sharing a long prefix stay apart through the hash.
+        let (x, y) = ("p".repeat(62) + "x", "p".repeat(62) + "y");
+        assert_ne!(default_wake_channel(&x), default_wake_channel(&y));
+    }
+
+    #[test]
+    fn an_explicit_wake_channel_overrides_the_derived_one() {
+        let derived = ClientOptions::default();
+        assert_eq!(derived.wake_channel_for("inst_a"), "inst_a_wake");
+        let explicit = ClientOptions {
+            wake_channel: Some("custom".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(explicit.wake_channel_for("inst_a"), "custom");
     }
 }

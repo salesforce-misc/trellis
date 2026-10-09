@@ -43,7 +43,7 @@ sequenceDiagram
     W->>DB: 3. aggregate ledgers (sorted entry lock, I2 test, group increments),<br/>relationship projections
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
-    W->>DB: 6. pg_notify
+    W->>DB: 6. pg_notify (the instance's wake channel)
     W->>DB: COMMIT
     end
 ```

@@ -100,6 +100,16 @@ Capture triggers are named after the instance schema
 (`capture::sql::trigger_name`), and their functions live in it, so two
 instances can capture one table without replacing each other's triggers.
 
+The wake channel is named after it too. `LISTEN/NOTIFY` channels are
+per database, so a shared channel name would make every seal, drain and
+backfill in one instance wake the idle workers of every other. By default an
+instance's channel is `<schema>_wake` (`client::default_wake_channel`), so the
+default instance listens on `trellis_wake`. A schema too long for that to fit in
+63 bytes keeps a prefix of its name plus a hash of the whole name, the way
+trigger names do. `ClientOptions::wake_channel` overrides the default; every
+`pg_notify` and the workers' `LISTEN` use the one resolved name
+(`ClientOptions::wake_channel_for`).
+
 One thing remains the operator's responsibility, not the engine's:
 
 * **Distinct transform target schemas** (`Config::target_schema`) if the two

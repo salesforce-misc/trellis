@@ -1303,7 +1303,7 @@ pub(crate) fn quoted_table(table: &str) -> Result<String, CaptureError> {
 
 /// The longest prefix of `s` of at most `max` bytes that ends on a character
 /// boundary.
-fn truncate_to(s: &str, max: usize) -> &str {
+pub(crate) fn truncate_to(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -1315,7 +1315,7 @@ fn truncate_to(s: &str, max: usize) -> &str {
 }
 
 /// 64-bit FNV-1a: a stable hash for generated names, with no dependency.
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
         hash ^= u64::from(*byte);

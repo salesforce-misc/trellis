@@ -779,15 +779,15 @@ impl ManualBackend {
     }
 
     /// The channel a seal notifies (issue #271: `seal_phase2` `pg_notify`s it
-    /// the instant it publishes the fence). Every caller here has always used
-    /// `ClientOptions::default()`'s wake channel (never overridden by this
-    /// backend), so this falls back to that default when no engine client has
+    /// the instant it publishes the fence). This backend never overrides the
+    /// wake channel, so it is the schema's default channel (what an engine
+    /// client started with these options listens on) when no engine client has
     /// started yet to remember its own options.
     fn wake_channel(&self) -> String {
         self.client_options
-            .as_ref()
-            .map(|options| options.wake_channel.clone())
-            .unwrap_or_else(|| ClientOptions::default().wake_channel)
+            .clone()
+            .unwrap_or_default()
+            .wake_channel_for(self.config.schema())
     }
 
     /// Delegates to the shared [`sql::create_source_table`] — see that
