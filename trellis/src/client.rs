@@ -149,6 +149,13 @@ pub struct ClientOptions {
     /// worker that runs a build's plan job. Defaults to
     /// [`staging::build::DEFAULT_CHUNK_ROWS`]. Zero is treated as one.
     pub build_chunk_rows: i64,
+    /// Caps the worker threads of the `tokio` runtime this client's
+    /// background thread builds. `None` (the default) leaves `tokio`'s own
+    /// default of one worker thread per core; `Some(0)` is an error
+    /// ([`ClientError::Spawn`]), since a runtime with no workers couldn't run
+    /// anything. The cap is per client: two clients in one process each build
+    /// a runtime of this size, and no budget is shared between them.
+    pub worker_threads: Option<usize>,
 }
 
 impl Default for ClientOptions {
@@ -165,6 +172,7 @@ impl Default for ClientOptions {
             poll_interval: Duration::from_millis(200),
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
             build_chunk_rows: staging::build::DEFAULT_CHUNK_ROWS,
+            worker_threads: None,
         }
     }
 }
@@ -198,6 +206,48 @@ pub fn default_wake_channel(schema: &str) -> String {
     let prefix =
         capture::sql::truncate_to(schema, MAX_CHANNEL_BYTES - suffix.len() - 1 - hash.len());
     format!("{prefix}_{hash}{suffix}")
+}
+
+/// Builds a multi-thread `tokio` runtime, capping its worker-thread count at
+/// `worker_threads` when given and leaving `tokio`'s own default (one worker
+/// thread per core) otherwise. Shared by the client's background runtime
+/// ([`ClientOptions::worker_threads`]) and the blocking wrapper's
+/// ([`crate::TrellisOptions::worker_threads`]), so one option bounds both.
+///
+/// `Some(0)` is rejected here rather than passed through: `tokio`'s
+/// `Builder::worker_threads` *panics* on zero, and that panic would fire on
+/// the background thread we just spawned, leaving the caller to report a
+/// generic thread-exited-before-ready error alongside a stray panic on
+/// stderr. An FFI caller handing us an integer straight from Elixir or Ruby
+/// can easily pass zero, so turn it into an ordinary error the caller can
+/// read instead.
+pub(crate) fn build_runtime(
+    worker_threads: Option<usize>,
+) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(worker_threads) = worker_threads {
+        if worker_threads == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TrellisOptions::worker_threads must be at least 1 when set; \
+                 leave it as None for tokio's own per-core default",
+            ));
+        }
+        builder.worker_threads(worker_threads);
+    }
+    builder.enable_all().build()
+}
+
+/// The runtime [`Client::start_with_config`]'s background thread runs on,
+/// sized by [`ClientOptions::worker_threads`]. Split out so the wiring is
+/// unit-testable without a database.
+///
+/// The client keeps its own runtime rather than borrowing the caller's: it
+/// is built on a plain OS thread and blocks until setup finishes, so it has
+/// to work with no ambient runtime, and its tasks stay off the caller's
+/// workers (a blocking wrapper's runtime services every call to the handle).
+fn client_runtime(options: &ClientOptions) -> std::io::Result<tokio::runtime::Runtime> {
+    build_runtime(options.worker_threads)
 }
 
 /// The option checks [`Client::start_with_config`] runs before spawning
@@ -443,10 +493,7 @@ impl Client {
         let thread = std::thread::Builder::new()
             .name("trellis-client".to_string())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                {
+                let runtime = match client_runtime(&options) {
                     Ok(rt) => rt,
                     Err(err) => {
                         let _ = ready_tx.send(Err(ClientError::Spawn(err)));
@@ -3914,5 +3961,94 @@ mod wake_channel_tests {
                 .expect("notify");
             next_wake().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    /// Issue #141: an explicit `Some(n)` must actually cap the runtime's
+    /// worker-thread count at `n`, not just get accepted and ignored.
+    /// `RuntimeMetrics::num_workers` reports the runtime's real worker-thread
+    /// count, so this exercises the same `Builder::worker_threads` call
+    /// `BlockingTrellis::connect` makes, without needing a real
+    /// database.
+    #[test]
+    fn worker_threads_some_caps_the_runtime_at_that_count() {
+        for n in [1, 2, 3] {
+            let runtime = build_runtime(Some(n)).expect("build runtime");
+            assert_eq!(
+                runtime.handle().metrics().num_workers(),
+                n,
+                "worker_threads(Some({n})) must produce a runtime with exactly {n} workers"
+            );
+        }
+    }
+
+    /// Issue #141: leaving `worker_threads` at `None` (the default) must
+    /// preserve today's behavior untouched — `tokio`'s own per-core default
+    /// — rather than this crate silently substituting some other number.
+    /// `tokio` computes that default from `std::thread::available_parallelism`
+    /// (falling back to 1), so this asserts against that same source rather
+    /// than a hardcoded count.
+    #[test]
+    fn worker_threads_none_preserves_tokios_own_default() {
+        // `tokio` lets `TOKIO_WORKER_THREADS` override its default too; skip
+        // rather than false-fail if this process happens to run with it set.
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_some() {
+            return;
+        }
+        let expected = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let runtime = build_runtime(None).expect("build runtime");
+        assert_eq!(
+            runtime.handle().metrics().num_workers(),
+            expected,
+            "worker_threads(None) must preserve tokio's own default worker count"
+        );
+    }
+
+    /// `tokio`'s own `Builder::worker_threads` panics on zero, which on the
+    /// background thread would surface as the generic
+    /// `BlockingThreadExitedBeforeReady` plus a stray panic on stderr. A
+    /// zero from an FFI caller must come back as an ordinary error instead.
+    #[test]
+    fn worker_threads_some_zero_is_an_error_not_a_panic() {
+        let err = build_runtime(Some(0)).expect_err("Some(0) must not build a runtime");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("worker_threads"),
+            "error should name the offending option, got: {err}"
+        );
+    }
+
+    /// Issue #876: the client's own runtime honors
+    /// [`ClientOptions::worker_threads`]. Before, `Client::start_with_config`
+    /// built it with `tokio`'s per-core default whatever the caller set, so a
+    /// handle's cap bound only the blocking wrapper's runtime and N handles
+    /// took N x cores worker threads. This builds the runtime exactly as the
+    /// client's thread does, without a database.
+    #[test]
+    fn client_runtime_is_built_with_the_configured_worker_threads() {
+        for n in [1, 2, 3] {
+            let options = ClientOptions {
+                worker_threads: Some(n),
+                ..ClientOptions::default()
+            };
+            let runtime = client_runtime(&options).expect("build runtime");
+            assert_eq!(runtime.handle().metrics().num_workers(), n);
+        }
+    }
+
+    /// A zero cap reaches the client thread as an ordinary error, not a
+    /// `tokio` panic on the background thread.
+    #[test]
+    fn client_runtime_rejects_zero_worker_threads() {
+        let options = ClientOptions {
+            worker_threads: Some(0),
+            ..ClientOptions::default()
+        };
+        let err = client_runtime(&options).expect_err("zero workers must not build");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

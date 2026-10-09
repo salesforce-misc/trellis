@@ -136,7 +136,8 @@ defmodule Trellis do
     Default `false`.
   - `:drain_threads`: how many threads apply staged changes to the targets.
     Default `0`.
-  - `:worker_threads`: the Rust runtime's worker threads. Default `2`; the
+  - `:worker_threads`: the worker threads of each Rust runtime a handle owns
+    (its calls', and its background client's). Default `2`; the
     work is IO, so a small count is enough, and the BEAM has already sized
     its own schedulers to the cores.
 

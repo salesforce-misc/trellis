@@ -105,7 +105,8 @@ module Trellis
     #   backfill. Exactly one process in a fleet should.
     # - drain_threads: how many threads apply staged changes to the targets.
     #   Some process must run at least one, or no definition reaches :live.
-    # - worker_threads: the Rust runtime's worker threads, invisible to
+    # - worker_threads: the worker threads of each Rust runtime a handle
+    #   owns (its calls', and its background client's), invisible to
     #   Ruby's own thread sizing, so kept small and explicit.
     #
     # The defaults (staging: false, drain_threads: 0) run nothing in the

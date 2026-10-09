@@ -144,12 +144,20 @@ pub struct TrellisOptions {
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none.
     pub drain_threads: usize,
-    /// Caps the worker-thread count of the `tokio` runtime
-    /// [`BlockingTrellis::connect`](crate::BlockingTrellis::connect) builds
-    /// to own this connection (see its module doc comment) — irrelevant to
-    /// [`Trellis::connect`] itself, which never builds a runtime of its own.
-    /// `None` (the default) preserves today's behavior: `tokio`'s own
-    /// default of one worker thread per core.
+    /// Caps the worker-thread count of each `tokio` runtime this connection
+    /// owns: the background [`Client`]'s (built when `staging` or
+    /// `drain_threads` starts one) and, for
+    /// [`BlockingTrellis::connect`](crate::BlockingTrellis::connect), the
+    /// runtime that services the handle's calls (see its module doc
+    /// comment). [`Trellis::connect`] itself never builds a runtime of its
+    /// own, so a connection that starts no client is unaffected. `None` (the
+    /// default) leaves `tokio`'s own default of one worker thread per core.
+    ///
+    /// The cap is per runtime and per handle, with no budget shared between
+    /// handles. A [`BlockingTrellis`](crate::BlockingTrellis) that runs a
+    /// client holds up to two runtimes, so up to `2 * n` worker threads; a
+    /// process with H such handles holds up to `2 * n * H`. Size `n` for the
+    /// handle count you open.
     ///
     /// Matters chiefly when Trellis is embedded inside a host VM that
     /// already sized its own scheduler pool to core count — a BEAM node, or
@@ -160,8 +168,9 @@ pub struct TrellisOptions {
     /// is enough; see issue #141.
     ///
     /// Must be at least 1 when set: `Some(0)` fails the connect with
-    /// [`TrellisError::BlockingSpawn`], since a runtime with no worker
-    /// threads couldn't run anything anyway.
+    /// [`TrellisError::BlockingSpawn`] (blocking) or [`TrellisError::Client`]
+    /// (a client to start), since a runtime with no worker threads couldn't
+    /// run anything anyway.
     pub worker_threads: Option<usize>,
 }
 
@@ -1377,15 +1386,22 @@ impl Trellis {
             .map_err(TrellisError::SelfCheck)
     }
 
+    /// The [`ClientOptions`] a connection's background [`Client`] runs with:
+    /// the role flags and the runtime's thread cap, everything else default.
+    fn client_options(options: &TrellisOptions) -> ClientOptions {
+        ClientOptions {
+            staging_worker: options.staging,
+            application_threads: options.drain_threads,
+            worker_threads: options.worker_threads,
+            ..Default::default()
+        }
+    }
+
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
     /// connection. The staging worker reads the tables to publish from the
     /// catalog itself (issue #427), so an empty catalog is fine.
     fn start_client(config: &Config, options: &TrellisOptions) -> Result<Client, TrellisError> {
-        let client_options = ClientOptions {
-            staging_worker: options.staging,
-            application_threads: options.drain_threads,
-            ..Default::default()
-        };
+        let client_options = Self::client_options(options);
         // Issue #234: `start_with_config`, not `start(config.dsn(), ..)` —
         // the latter threw this `Config`'s schema away and re-resolved one
         // from the process environment, so a `Trellis` explicitly configured
@@ -2334,6 +2350,31 @@ impl From<StagingError> for TrellisError {
 impl From<SelfCheckError> for TrellisError {
     fn from(err: SelfCheckError) -> Self {
         TrellisError::SelfCheck(err)
+    }
+}
+
+#[cfg(test)]
+mod client_options_tests {
+    use super::*;
+
+    /// Issue #876: a connection's `worker_threads` reaches the background
+    /// client's runtime. It used to stop at the blocking wrapper, so the
+    /// client thread built its own per-core runtime whatever the caller set.
+    #[test]
+    fn worker_threads_reaches_the_client_options() {
+        let options = TrellisOptions {
+            staging: true,
+            drain_threads: 3,
+            worker_threads: Some(2),
+        };
+        let client = Trellis::client_options(&options);
+        assert_eq!(client.worker_threads, Some(2));
+        assert!(client.staging_worker);
+        assert_eq!(client.application_threads, 3);
+        assert_eq!(
+            Trellis::client_options(&TrellisOptions::default()).worker_threads,
+            None
+        );
     }
 }
 

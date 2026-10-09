@@ -73,9 +73,15 @@ migration gets a handle of its own from `Trellis::Migration`, always with
 the defaults (see [Migrations and transactions](#migrations-and-transactions)
 and `clients/ruby/README.md`).
 
-A third option, `worker_threads`, is unrelated to either: it sizes the
-runtime a `BlockingTrellis` or binding handle owns. The bindings default it to
-2; Rust's `TrellisOptions` leaves it at one thread per core unless you set it.
+A third option, `worker_threads`, is unrelated to either: it caps the worker
+threads of each Tokio runtime a handle owns, which is the runtime a
+`BlockingTrellis` or binding handle services its calls on and the runtime of
+the background client a `staging` or `drain_threads` handle starts. The
+bindings default it to 2; Rust's `TrellisOptions` leaves it at one thread per
+core unless you set it. The cap is per runtime and per handle, and no budget is
+shared between handles: a handle that runs a client holds up to `2 * worker_threads`
+worker threads, and a process with H such handles holds up to `2 * worker_threads * H`.
+Size it for the handles you open.
 
 ### What the staging worker needs from the database
 

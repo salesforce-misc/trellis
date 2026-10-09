@@ -102,10 +102,13 @@ round trip — far past what either host VM tolerates on a scheduler thread.
 **Rust's threads stay Rust's, and are bounded.** The host VM does not schedule,
 see, or join the Tokio runtime thread, the pool connections, or the drain
 workers; `shutdown` is the only way to stop them. Because they are invisible to
-the host's sizing, the binding must bound them: `BlockingTrellis` defaults to one
+the host's sizing, the binding must bound them: the Tokio runtimes default to one
 worker per core, which inside a BEAM node already sized to core count doubles the
 thread population. The work is IO, not compute, so the bindings pass a small explicit
-`worker_threads` (2 by default).
+`worker_threads` (2 by default). That one option caps every runtime the handle owns,
+both the `BlockingTrellis` runtime and the background client's. The cap is per
+runtime and per handle, with no budget shared between handles, so a handle that
+runs a client holds up to twice `worker_threads` worker threads.
 
 **A handle does not survive `fork`.** Puma, Unicorn, Passenger, and Resque all
 fork; Rust threads do not cross `fork`, so a child inherits the handle and its

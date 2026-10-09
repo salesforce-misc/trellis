@@ -114,7 +114,7 @@ Trellis.shutdown
 | `target_schema:` | `"public"` | where a bare target table name is created |
 | `staging:` | `false` | run the staging worker (installs change capture, starts backfills) here |
 | `drain_threads:` | `0` | threads applying staged changes to the targets |
-| `worker_threads:` | `2` | the Rust runtime's threads, invisible to Ruby's own sizing |
+| `worker_threads:` | `2` | the threads of each Rust runtime a handle owns (its calls', and its background client's), invisible to Ruby's own sizing |
 
 The defaults run nothing in the background. Exactly one process in a fleet
 should set `staging: true`, and some process must run drain threads, or no
