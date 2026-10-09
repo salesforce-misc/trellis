@@ -31,12 +31,25 @@ use crate::pool::Pool;
 /// [`crate::identity`]), then applies any migrations not yet recorded as
 /// applied. A no-op if everything is already up to date.
 ///
+/// Attaches to one database run one at a time (see
+/// [`identity::AttachLock`]), and a catalog schema that belongs to another
+/// instance sharing the database is refused (issue #877).
+///
 /// Deliberately public — a tier-2 composable primitive under ADR-0012, not a
 /// leaked internal. [`crate::Trellis::migrate`] and
 /// [`crate::BlockingTrellis::migrate`] delegate to it, and an embedder (or a
 /// shared test bootstrap such as `testkit`'s) may call it directly to bring a
 /// schema up to date without standing up a facade.
 pub async fn migrate(pool: &Pool, config: &Config) -> Result<(), Error> {
+    // One attach at a time per database: the instance-conflict check reads
+    // the markers other attaches write. See `identity::AttachLock`.
+    let lock = identity::AttachLock::acquire(pool).await?;
+    let attached = attach(pool, config).await;
+    lock.release().await;
+    attached
+}
+
+async fn attach(pool: &Pool, config: &Config) -> Result<(), Error> {
     let mut client = pool.get().await?;
     let pg_client: &mut tokio_postgres::Client = &mut client;
 
@@ -47,9 +60,8 @@ pub async fn migrate(pool: &Pool, config: &Config) -> Result<(), Error> {
     // Always seed/reconcile the marker, not just on a "fresh attach" — see
     // `identity::seed_marker` for why: it's an idempotent upsert, so a
     // clean re-attach, a resumed crash between the runner creating
-    // `trellis_instance` and this committing, and two processes racing a
-    // first-ever attach are all a no-op here rather than three different
-    // states to track separately.
+    // `trellis_instance` and this committing, and a changed target schema
+    // are all handled by one statement rather than separate states to track.
     identity::seed_marker(pg_client, config).await?;
 
     Ok(())

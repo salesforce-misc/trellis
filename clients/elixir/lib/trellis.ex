@@ -128,6 +128,8 @@ defmodule Trellis do
   - `:url` (required): the database, as a `postgres://` URL or a libpq
     `key=value` string. Nothing is read from the environment.
   - `:schema`: the schema Trellis keeps its own tables in. Default `"trellis"`.
+    Not `"public"`, not `:target_schema`, and not another instance's catalog
+    or target schema; `connect` refuses those.
   - `:target_schema`: the schema a bare target table name is created in.
     Default `"public"`.
   - `:staging`: whether this connection runs the staging worker, which

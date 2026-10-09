@@ -1,0 +1,14 @@
+-- #877: the instance's target schema, on its identity marker.
+--
+-- A database can hold several Trellis instances (epic #806), each with its own
+-- catalog schema (`trellis_instance.schema_name`) and a target schema its
+-- transform targets live in. Attaching refuses a catalog schema that is
+-- another instance's target schema, and a target schema that is another
+-- instance's catalog (`trellis::identity::prepare_attach`). The first needs
+-- every instance's target schema to be readable from the database, so the
+-- marker records it.
+--
+-- The target schema is configuration, and it can change between deploys, so
+-- `identity::seed_marker` rewrites this column on every attach. It is null
+-- until the instance's first attach under this migration records it.
+alter table trellis_instance add column target_schema text;

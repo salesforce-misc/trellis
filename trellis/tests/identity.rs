@@ -14,6 +14,53 @@ fn config_for_schema(dsn: &str, schema: &str) -> Config {
     Config::with_schema(dsn, schema).expect("test schema names are valid")
 }
 
+/// A [`Config`] for catalog schema `schema` and target schema `target`.
+fn config_with_target(dsn: &str, schema: &str, target: &str) -> Config {
+    config_for_schema(dsn, schema)
+        .with_target_schema(target)
+        .expect("test schema names are valid")
+}
+
+/// Whether `schema` exists in the database `db` names.
+async fn schema_exists(db: &testkit::TestDatabase, schema: &str) -> bool {
+    let client = db.pool.get().await.expect("connect");
+    client
+        .query_one(
+            "select exists(select 1 from pg_namespace where nspname = $1)",
+            &[&schema],
+        )
+        .await
+        .expect("look up the schema")
+        .get(0)
+}
+
+/// Attaches `config` through its own pool.
+async fn attach(config: &Config) -> Result<(), Error> {
+    let pool = Pool::new(config).expect("build pool");
+    migrate(&pool, config).await
+}
+
+/// The `IncompatibleInstance` message of a refused attach.
+fn refusal(result: Result<(), Error>) -> String {
+    match result {
+        Err(Error::IncompatibleInstance(message)) => message,
+        other => panic!("expected an IncompatibleInstance refusal, got {other:?}"),
+    }
+}
+
+/// The target schema `schema`'s marker records.
+async fn recorded_target_schema(db: &testkit::TestDatabase, schema: &str) -> Option<String> {
+    let client = db.pool.get().await.expect("connect");
+    client
+        .query_one(
+            &format!("select target_schema from {schema}.trellis_instance"),
+            &[],
+        )
+        .await
+        .expect("read the marker")
+        .get(0)
+}
+
 #[tokio::test]
 async fn two_instances_share_a_database_without_interfering() {
     let cluster = TestCluster::start();
@@ -333,8 +380,9 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // (`column_status.cascade_pending`), #803 V78 (one `poison_held` row
     // per held key), #944 V79 (a `recompute` row's released join value), and
     // #938 V80 (`transform_definitions.build_marker_generation`), #625 F6
-    // V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence), and #894
-    // V82 (`resume_requests.timeout_cancels`).
+    // V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence), #894
+    // V82 (`resume_requests.timeout_cancels`), and #877 V83
+    // (`trellis_instance.target_schema`).
     // V73 is unused.
     assert_eq!(
         applied,
@@ -342,7 +390,207 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
             50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75, 76,
-            77, 78, 79, 80, 81, 82,
+            77, 78, 79, 80, 81, 82, 83,
         ]
     );
+}
+
+// Issue #877 (epic #806): an attach refuses a catalog schema that belongs to
+// another instance sharing the database, without refusing a second client of
+// the same instance.
+
+#[tokio::test]
+async fn catalog_schema_public_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let config = config_with_target(db.dsn(), "public", "app_targets");
+
+    let message = refusal(attach(&config).await);
+
+    assert!(
+        message.contains("\"public\""),
+        "names the schema: {message}"
+    );
+    assert!(
+        !schema_exists(&db, "app_targets").await,
+        "a refused attach creates nothing"
+    );
+    let client = db.pool.get().await.expect("connect");
+    let marker: bool = client
+        .query_one(
+            "select to_regclass('public.trellis_instance') is not null",
+            &[],
+        )
+        .await
+        .expect("look up public's marker")
+        .get(0);
+    assert!(!marker, "a refused attach migrates nothing into `public`");
+}
+
+#[tokio::test]
+async fn catalog_schema_equal_to_its_own_target_schema_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let config = config_with_target(db.dsn(), "instance_same", "instance_same");
+
+    let message = refusal(attach(&config).await);
+
+    assert!(
+        message.contains("\"instance_same\"") && message.contains("target schema"),
+        "names the schema and says it is the target schema: {message}"
+    );
+    assert!(
+        !schema_exists(&db, "instance_same").await,
+        "a refused attach creates nothing"
+    );
+}
+
+#[tokio::test]
+async fn target_schema_holding_another_instances_catalog_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    // Instance B's catalog is `instance_b`; instance A is configured to put
+    // its targets there.
+    attach(&config_with_target(db.dsn(), "instance_b", "app_b"))
+        .await
+        .expect("attach instance b");
+
+    let message = refusal(attach(&config_with_target(db.dsn(), "instance_a", "instance_b")).await);
+
+    assert!(
+        message.contains("\"instance_b\"") && message.contains("\"instance_a\""),
+        "names the target schema, which is the other instance's catalog, and this \
+         instance's catalog: {message}"
+    );
+    assert!(
+        !schema_exists(&db, "instance_a").await,
+        "a refused attach creates nothing"
+    );
+}
+
+#[tokio::test]
+async fn catalog_schema_that_is_another_instances_target_schema_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    attach(&config_with_target(
+        db.dsn(),
+        "instance_a",
+        "instance_a_targets",
+    ))
+    .await
+    .expect("attach instance a");
+
+    let message =
+        refusal(attach(&config_with_target(db.dsn(), "instance_a_targets", "app_b")).await);
+
+    assert!(
+        message.contains("\"instance_a_targets\"") && message.contains("\"instance_a\""),
+        "names the schema and the other instance's catalog schema: {message}"
+    );
+    assert!(
+        !schema_exists(&db, "app_b").await,
+        "a refused attach creates nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_same_instance_attaches_twice_in_sequence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let config = config_with_target(db.dsn(), "instance_twice", "app_twice");
+
+    attach(&config).await.expect("first client");
+    attach(&config).await.expect("second client");
+
+    assert_eq!(
+        recorded_target_schema(&db, "instance_twice")
+            .await
+            .as_deref(),
+        Some("app_twice")
+    );
+}
+
+#[tokio::test]
+async fn two_clients_of_the_same_instance_attach_at_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let config = config_with_target(db.dsn(), "instance_at_once", "app_at_once");
+
+    // Two fresh clients, each with its own pool, both running the first-ever
+    // attach. Whatever order the two interleave in, neither is refused.
+    let (first, second) = tokio::join!(attach(&config), attach(&config));
+
+    first.expect("first client");
+    second.expect("second client");
+    let client = db.pool.get().await.expect("connect");
+    let rows: i64 = client
+        .query_one(
+            "select count(*) from instance_at_once.trellis_instance",
+            &[],
+        )
+        .await
+        .expect("count the markers")
+        .get(0);
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn two_instances_with_conflicting_schemas_attach_at_once_admit_exactly_one() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    // A's target schema is B's catalog schema. Whichever attaches first is
+    // admitted, and the other sees its marker and is refused: A first, and B
+    // is refused by rule 4; B first, and A is refused by rule 3. Neither
+    // order lets both through.
+    let a = config_with_target(db.dsn(), "instance_a", "instance_b");
+    let b = config_with_target(db.dsn(), "instance_b", "app_b");
+
+    let (a, b) = tokio::join!(attach(&a), attach(&b));
+
+    assert_eq!(
+        [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one of two conflicting instances attaches: a={a:?}, b={b:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_instances_target_schema_can_change_between_deploys() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    attach(&config_with_target(db.dsn(), "instance_a", "targets_old"))
+        .await
+        .expect("first deploy");
+
+    attach(&config_with_target(db.dsn(), "instance_a", "targets_new"))
+        .await
+        .expect("a changed target schema updates the marker, it does not refuse");
+
+    assert_eq!(
+        recorded_target_schema(&db, "instance_a").await.as_deref(),
+        Some("targets_new")
+    );
+    // The marker follows the change: the old target schema is free to be
+    // another instance's catalog, and the new one is not.
+    attach(&config_with_target(db.dsn(), "targets_old", "app_b"))
+        .await
+        .expect("the old target schema is no longer instance a's");
+    let message = refusal(attach(&config_with_target(db.dsn(), "targets_new", "app_c")).await);
+    assert!(message.contains("\"targets_new\""), "{message}");
+}
+
+#[tokio::test]
+async fn an_instance_can_target_the_schema_another_instance_targets() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+
+    // The default topology: every instance's targets in `public`. Two
+    // instances sharing a target schema is the operator's call
+    // (docs/instance-identity.md), not an attach refusal.
+    attach(&config_for_schema(db.dsn(), "instance_a"))
+        .await
+        .expect("instance a");
+    attach(&config_for_schema(db.dsn(), "instance_b"))
+        .await
+        .expect("instance b");
 }

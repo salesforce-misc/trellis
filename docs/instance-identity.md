@@ -66,10 +66,51 @@ Before the migration runner touches the schema, `trellis::identity::prepare_atta
   `Error::IncompatibleInstance`.
 
 After the runner ensures `trellis_instance` exists, `trellis::identity::seed_marker`
-always runs an `insert ... on conflict (singleton) do nothing`. That makes
-seeding idempotent across three cases: a clean re-attach (row already matches),
-crash recovery (row absent, so inserted), and two processes racing to migrate
-the same new schema (the loser's insert becomes a no-op, not a unique-violation).
+always runs an `insert ... on conflict (singleton) do update`. That makes
+seeding idempotent across four cases: a clean re-attach (row already matches),
+crash recovery (row absent, so inserted), a second client of the same instance
+(the row exists, so nothing changes), and a changed target schema (see below).
+
+### A catalog schema that belongs to another instance
+
+Several instances can share a database, so an instance's catalog schema must
+not be a schema another instance owns or writes to. Besides the cases above,
+`prepare_attach` refuses, before it creates anything:
+
+1. a catalog schema of `public`, which is the application's schema;
+2. a catalog schema equal to this instance's own target schema
+   (`Config::target_schema`);
+3. a target schema that holds another instance's catalog, that is, one with a
+   `trellis_instance` table;
+4. a catalog schema that is another instance's target schema.
+
+Each refusal is an `Error::IncompatibleInstance` naming the schema and, for 3
+and 4, the other instance's catalog schema. The first two read only the
+`Config`. The others scan the database for `trellis_instance` tables outside
+the instance's own schema. Rule 4 needs the other instance's target schema, so
+the marker records it (`trellis_instance.target_schema`, migration V83) and
+`seed_marker` rewrites it on every attach. The target schema is configuration
+that can change between deploys, so a changed value updates the marker; it
+never refuses. The scan skips the instance's own marker, so a second client of
+the same instance, whose marker matches, attaches as it always has. Whichever
+of two conflicting instances attaches second is the one refused.
+
+The scan sees a marker only if the role attaching can read it, and an
+instance's marker only once that instance has attached at V83 or later. A role
+without `USAGE` on another instance's schema still sees rule 3 (the table
+exists), but not rule 4. Rule 3 and rule 4 compare the catalog schema with
+`Config::target_schema` only; a transform whose target names a different schema
+than `Config::target_schema` isn't covered.
+
+A marker is written at the end of an attach, so the check must not run while
+another attach is between its own check and its marker write. `migrate` holds
+one database-wide advisory lock (`identity::AttachLock`, a session lock on a
+dedicated connection, so it can't outlive the attach) from before the check to
+after the marker write. Attaches to one database therefore run one at a time,
+and a second one waits for the first for up to five minutes. Without it, two
+conflicting instances starting together would each scan before the other wrote
+its marker and both pass, and two clients of one instance starting together
+would both run the migration runner on the same new schema.
 
 `trellis::identity::Identity::resolved` reports the identity (schema + format
 version) this build would attach as, without touching the database.
