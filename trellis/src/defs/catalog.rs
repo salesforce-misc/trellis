@@ -8359,6 +8359,142 @@ mod column_dependents_tests {
             ]
         );
     }
+
+    /// Issue #955: the cascade's per-pair re-check, [`reads_column`], says
+    /// yes for exactly the pairs [`column_dependents`] lists, in every shape
+    /// a reader can take: a sibling reading by alias, a chained field (bare,
+    /// qualified, inside a function call), a relationship path (bare and
+    /// aggregate-wrapped), a field reading the column both directly and
+    /// through a relationship, and an aggregate reader (which neither lists).
+    /// A pair it said no to that the walk lists would leave a genuine reader
+    /// unpaused.
+    #[tokio::test]
+    async fn reads_column_agrees_with_column_dependents_for_every_pair() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        let definitions = [
+            (
+                "public.t",
+                "public.s",
+                "TRANSFORM t FROM s SELECT a + 1 AS x, x + 2 AS y, COALESCE(b, x) AS z, \
+                 s.b AS sb",
+            ),
+            (
+                "public.chained",
+                "public.t",
+                "TRANSFORM chained FROM t SELECT x AS cx, t.y AS cy, COALESCE(z, 0) AS cz, \
+                 x + self_t.y AS both_ways, public.t.z AS qz, 1 AS lit",
+            ),
+            (
+                "public.via_rel",
+                "public.items",
+                "TRANSFORM via_rel FROM items SELECT to_t.x AS rx, SUM(to_t.y) AS ry, \
+                 to_chained.cx AS rcx, qty AS q",
+            ),
+            (
+                "public.agg",
+                "public.t",
+                "TRANSFORM agg FROM t GROUP BY z SELECT SUM(x) AS total",
+            ),
+        ];
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.t', 1), ('public.items', 1); \
+                 insert into relationship_definitions \
+                 (name, from_schema, from_table, from_col, to_schema, to_table, to_col, \
+                  definition_text, cardinality) \
+                 values \
+                 ('self_t', 'public', 't', 'parent_id', 'public', 't', 'id', '', 'one'), \
+                 ('to_t', 'public', 'items', 't_id', 'public', 't', 'id', '', 'many'), \
+                 ('to_chained', 'public', 'items', 'c_id', 'public', 'chained', 'id', '', \
+                  'one')",
+            )
+            .await
+            .expect("seed versions and relationships");
+        let mut readers: Vec<(String, String)> = vec![("chained".into(), "no_such".into())];
+        let mut columns: Vec<(String, String)> = vec![
+            ("s".into(), "a".into()),
+            ("t".into(), "a".into()),
+            ("t".into(), "no_such".into()),
+            ("items".into(), "qty".into()),
+        ];
+        for (target, source, text) in definitions {
+            let def = parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            let bare = target.split_once('.').expect("qualified").1;
+            for field in &def.fields {
+                readers.push((bare.into(), field.name.clone()));
+                columns.push((bare.into(), field.name.clone()));
+            }
+            client
+                .execute(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, $2, 1, $3, 'live')",
+                    &[&target, &source, &text],
+                )
+                .await
+                .expect("seed a definition");
+        }
+
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        )
+        .expect("pool");
+        let mut listed = HashSet::new();
+        for (table, column) in &columns {
+            let deps = column_dependents(&pool, table, column)
+                .await
+                .expect("column dependents");
+            for reader in &readers {
+                let reads = reads_column(
+                    &**client,
+                    (&reader.0, &reader.1),
+                    (table.as_str(), column.as_str()),
+                )
+                .await
+                .expect("reads column");
+                assert_eq!(
+                    reads,
+                    deps.contains(reader),
+                    "{reader:?} reading {table}.{column}: column_dependents lists {deps:?}"
+                );
+                if reads {
+                    listed.insert((
+                        reader.0.clone(),
+                        reader.1.clone(),
+                        table.clone(),
+                        column.clone(),
+                    ));
+                }
+            }
+        }
+        // The shapes the comparison is meant to cover are really there.
+        for (transform, field, table, column) in [
+            ("t", "y", "t", "x"),
+            ("t", "z", "t", "x"),
+            ("chained", "cx", "t", "x"),
+            ("chained", "cy", "t", "y"),
+            ("chained", "cz", "t", "z"),
+            ("chained", "qz", "t", "z"),
+            ("chained", "both_ways", "t", "x"),
+            ("chained", "both_ways", "t", "y"),
+            ("via_rel", "rx", "t", "x"),
+            ("via_rel", "ry", "t", "y"),
+            ("via_rel", "rcx", "chained", "cx"),
+        ] {
+            let expected = (transform.into(), field.into(), table.into(), column.into());
+            assert!(
+                listed.contains(&expected),
+                "{expected:?} not listed: {listed:?}"
+            );
+        }
+        assert!(
+            !listed.iter().any(|(transform, ..)| transform == "agg"),
+            "an aggregate reader is never a cascade dependent: {listed:?}"
+        );
+    }
 }
 
 /// Issue #487: the `ALTER` type-change guard reads a mixed-case target's
