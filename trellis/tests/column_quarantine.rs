@@ -4299,6 +4299,41 @@ async fn a_rebuilds_release_of_a_field_that_passed_a_pause_on_releases_its_reade
     assert_cost_readers_released(&mut client, &db).await;
 }
 
+/// Issue #918's release, one sibling deeper: the edit also adds `z`, which
+/// reads `cost` by alias and `bonus`, so it awaits its capture too, and
+/// `total`'s pause reaches it through `cost`. The release's first delete
+/// can't take `z` (the edge from `cost` is still there); the un-cascade from
+/// `cost` deletes that edge, and the delete runs again for `z`. Without the
+/// second run, `z` would stay paused with no reason left, out of Apply.
+#[tokio::test]
+async fn the_capture_release_releases_a_sibling_awaiting_its_capture_behind_the_released_field() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_total_paused(&db).await;
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    trellis
+        .apply("ALTER TRANSFORM sib ALTER cost AS total + bonus, ADD cost + bonus AS z")
+        .await
+        .expect("edit cost, add z");
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib", "z", "sib", "cost").await);
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(column_status_row(&client, "sib", "z").await, None);
+    assert_cost_readers_released(&mut client, &db).await;
+    assert_eq!(sib_row(&client, 1, &["z"]).await, some(&["15"]));
+}
+
 /// The edit has committed when it walks its cascade, so a walk that fails
 /// doesn't fail the edit: it keeps its mark, and the capture pass finishes
 /// it. Here a page in flight holds `sib_down`'s fence, so the walk's pause

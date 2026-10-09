@@ -1161,17 +1161,8 @@ pub async fn start_ready_builds(
             Ok(Some(dependents)) => {
                 taken.push(id);
                 // The build has started; readers elsewhere that the release
-                // left paused are resumed after it (issue #918). A failure
-                // must not cost the rest of the pass its definitions.
-                if let Err(err) =
-                    resume_released_dependents(pool, &definition.def.target, dependents).await
-                {
-                    tracing::warn!(
-                        definition_id = id,
-                        error = %err,
-                        "readers of a released field stay paused; RESUME them"
-                    );
-                }
+                // left paused are resumed after it (issue #918).
+                resume_released_dependents(pool, &definition.def.target, dependents).await;
             }
             Ok(None) => {}
             // A start waits for the column-pause lock (#922). One that
@@ -1290,23 +1281,31 @@ async fn release_awaiting_capture(
 /// left with no reason to stay paused (issue #918), as a resume of the
 /// column would have: each is released and rebuilt by a field build of its
 /// definition. After the release's commit, which released the column-pause
-/// lock the resume takes. A failure leaves them paused, with their edge
-/// gone, as a failed resume does, and their own `RESUME` recovers them.
-async fn resume_released_dependents(
-    pool: &Pool,
-    target: &str,
-    dependents: Vec<(String, String)>,
-) -> Result<(), ApplyError> {
+/// lock the resume takes.
+///
+/// A failure is logged, not returned. The release has committed, so a
+/// retry of the caller finds nothing to release and wouldn't resume them
+/// either, and failing the caller would charge its own build (or cost the
+/// capture pass its other definitions) for another definition's trouble. The
+/// readers stay paused, with their edge gone, as after a resume that fails
+/// partway, and their own `RESUME` recovers them.
+async fn resume_released_dependents(pool: &Pool, target: &str, dependents: Vec<(String, String)>) {
     if dependents.is_empty() {
-        return Ok(());
+        return;
     }
-    let resumed = quarantine::resume_pairs(pool, target, dependents.into()).await?;
-    tracing::info!(
-        target,
-        ?resumed,
-        "readers of a field released from its capture wait resumed"
-    );
-    Ok(())
+    match quarantine::resume_pairs(pool, target, dependents.clone().into()).await {
+        Ok(resumed) => tracing::info!(
+            target,
+            ?resumed,
+            "readers of a field released from its capture wait resumed"
+        ),
+        Err(err) => tracing::warn!(
+            target,
+            ?dependents,
+            error = %err,
+            "readers of a field released from its capture wait stay paused; RESUME them"
+        ),
+    }
 }
 
 /// Whether `table` has a capture gate a pending change still holds
@@ -1589,9 +1588,7 @@ async fn field_build_ready(
     }
     let dependents = release_awaiting_capture(&*txn, &definition.def.target, Some(fields)).await?;
     txn.commit().await?;
-    resume_released_dependents(pool, &definition.def.target, dependents)
-        .await
-        .map_err(build_error)?;
+    resume_released_dependents(pool, &definition.def.target, dependents).await;
     tracing::info!(
         definition_id = definition.id,
         ?fields,
