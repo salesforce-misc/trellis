@@ -31,7 +31,14 @@ segment with one `INSERT … SELECT`:
   it captures with the same check define runs (`defs::hierarchy`), before
   anything else: it pauses every definition that reads one, with its
   `capture_failure`, and installs or changes no capture on it. A resume
-  refuses until the table is plain again.
+  refuses until the table is plain again. A relationship's to-side that no
+  definition reads through is captured too, so it can be skipped with no
+  reader to pause, and its settled projection stops advancing while it is in
+  the hierarchy. That is safe: the first definition to read through the
+  relationship once the table is plain again refreshes the projection from
+  the to-side before it goes live (`catalog::relationships_to_refresh`,
+  #768), and its catch-up refreshes it again (#522). Pinned by
+  `unread_to_side_hierarchy.rs`.
 - **Images.** `old_image` and `new_image` hold the primary key plus every
   column some reader of the table needs (`capture::columns`), rendered with
   `format('%s', col)` under the same five pinned output settings as every
