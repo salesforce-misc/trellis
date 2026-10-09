@@ -774,25 +774,25 @@ Trellis.await_converged(token, timeout_ms: 30_000)
 
 `await_converged` waits for captured changes only; it doesn't read status. A
 transform that isn't `live` yet, `catching_up` included, can still be missing
-rows after it returns, which is why the poll comes first.
+rows after it returns, which is why the poll comes first. When the timeout
+runs out first, it fails with a `timeout` error, not `internal`: the target is
+behind, not broken, so retry or allow longer. A binding handle runs one call
+at a time, so every other call on it waits behind an `await_converged` for up
+to its timeout; keep the timeout short on a handle that also serves requests.
 
 A repair is visible to the poll too. `request_backfill` (and a capture
 re-install) rebuilds each plain aggregate and plain 1-1 reader of the table
 in its own transaction: they read `backfilling` when the call returns, and
 `live` again once the rebuild is done. So polling for `live` after a repair,
-then taking a token, covers the repair. Any other reader reports
-`catching_up` meanwhile, as before.
+then taking a token, covers the repair. Any other reader of the table reports
+`catching_up` until its catch-up has run.
 
 `self_check` follows the same rule: it compares only a `live` transform. For
 any other it returns the outcome `not_live` (Rust's
 `SelfCheckOutcome::NotLive(status)`, Elixir's and Ruby's `:not_live`) with
 the status in the report's `status`, and compares and waits for nothing. Poll
-for `live`, then check again. The outcome is not a verdict on correctness,
-as `not_caught_up` isn't. When the timeout
-runs out first, it fails with a `timeout` error, not `internal`: the target is
-behind, not broken, so retry or allow longer. A binding handle runs one call
-at a time, so every other call on it waits behind an `await_converged` for up
-to its timeout; keep the timeout short on a handle that also serves requests.
+for `live`, then check again. Like `not_caught_up`, the outcome is not a
+verdict on correctness.
 
 ## What a transform can do
 

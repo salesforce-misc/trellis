@@ -145,7 +145,7 @@
   },
   "live": [
     {
-      "about": "Source tables, and a role that can log in but not create a schema (for the internal error below). parity_scratch shares parity_items with parity_prices: a repair of one definition (ALTER, RESUME, request_backfill) is a rebuild of that definition alone, visible in its status, so it doesn't rewrite the other target under a later step (#625). parity_doubled and parity_gizmo_prices have sources of their own because their steps poison keys.",
+      "about": "Source tables, and a role that can log in but not create a schema (for the internal error below). parity_scratch shares parity_items with parity_prices: its ALTER and RESUME rebuild it alone, visible in its status, so they don't rewrite the other target under a later step (#625). parity_doubled and parity_gizmo_prices have sources of their own because their steps poison keys.",
       "op": "sql",
       "args": [
         "create table parity_owners (id integer primary key, name text)",

@@ -80,7 +80,7 @@ kind: poll the status until it is `live`, then check again.
 A rebuild is a status transition made in the repairing call's own
 transaction ([ADR-0002](0002-async-data-flow.md#convergence-and-status)), so a
 check made right after `request_backfill` returns is told `backfilling`
-instead of being shown a stale target as agreement.
+instead of comparing a target the rebuild is still changing.
 
 ### Postgres is the oracle; the comparison is two-way
 

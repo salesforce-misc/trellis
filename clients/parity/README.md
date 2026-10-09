@@ -153,10 +153,11 @@ token back. The same arrangement runs once more at the end, over live
 definitions, for the `self_check` outcomes that need a write nothing drains
 (`not_caught_up`) and a rebuild nothing can finish (`not_live`).
 
-In phase two, mind what runs after a step returns. A repair of a definition
-(`ALTER`, `RESUME`, `request_backfill`) is a rebuild of that definition alone,
-and its status reads `backfilling` from the call's return, so a step that
-needs the repair done polls for `live`. Definitions may share a source. The
+In phase two, mind what runs after a step returns. `ALTER` and `RESUME`
+rebuild the one definition they name, and `request_backfill` rebuilds each
+plain reader of the table. A rebuilt definition reads `backfilling` from the
+call's return, so a step that needs the repair done polls for `live`.
+Definitions may share a source. The
 `parity_doubled` and `parity_gizmo_prices` steps poison keys, so each reads a
 source of its own, and the overflowing `parity_ledger` rows are fixed before
 the column resume re-reads them. Name a specific status word only where the

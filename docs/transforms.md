@@ -327,7 +327,10 @@ Every defined transform carries an observable **status**:
   ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)).
   A `live` 1-1 transform comes back here while an `ALTER TRANSFORM` that adds
   or changes a field, or a resumed column, is rebuilt in the background
-  ([Changing a definition](#changing-a-definition)).
+  ([Changing a definition](#changing-a-definition)). A `live` transform this
+  build serves also comes back here, from the call's return, while
+  `request_backfill` on its source (or a re-install of its source's capture
+  triggers) rebuilds it.
 * **`catching_up`** — the build is done and live changes are applied, but the
   target may still be missing changes made while it was building. A catch-up
   re-reads the source and takes it `live`.
