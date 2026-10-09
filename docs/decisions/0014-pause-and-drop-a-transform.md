@@ -222,7 +222,10 @@ refusal on its `capture_failure` (the text of a refused request) and no cause, s
 next pass doesn't try it again. Nothing below it was paused, since its target was never
 re-typed. The queue is durable without a table of its own: the cause and the resume
 request are the two states a definition passes through, each move is one transaction,
-and a crash leaves one of them for the next pass to go on from. A chained definition the
+and a crash leaves one of them for the next pass to go on from. A `RESUME` by hand of a
+waiting definition resumes it at once, whether or not its upstream is `live`. A `PAUSE`
+of one changes nothing, since it is already paused, so the pass still resumes it once
+the upstream is `live` (#971). A chained definition the
 re-type leaves refused, failing its own re-validation (a relationship's join columns no
 longer match), keeps its own error and records no cause. So does one already paused for
 another reason, by the operator or by quarantine, and the pass leaves it alone.

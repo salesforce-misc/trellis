@@ -4194,8 +4194,9 @@ fn retyping_failure<'a>(
 /// Sets definition `id`'s `capture_failure` (kind `capture`), replacing any
 /// it has: what a resume in progress, or one the staging worker couldn't
 /// finish, reports. It drops any upstream resume recorded as the pause's
-/// cause (`caused_by`, #828): the operator has resumed the definition, so
-/// what holds it now is its own resume.
+/// cause (`caused_by`, #828): the definition has been resumed, by the
+/// operator or by the capture pass ([`resume_caused_definitions`]), so what
+/// holds it now is its own resume.
 async fn set_capture_failure(
     client: &impl GenericClient,
     id: i64,

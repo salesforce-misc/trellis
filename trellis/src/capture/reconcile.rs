@@ -140,7 +140,7 @@ pub async fn reconcile(
     deadline: Instant,
 ) -> Result<PassOutcome, CaptureError> {
     // #970: a definition paused by its upstream's re-type resumes once that
-    // upstream is live; a re-type that asks for is done by the next call.
+    // upstream is live; a re-type that requests is done by the next call.
     // #767: a resume left waiting on re-typed copies is finished first, so
     // this pass's snapshot sees the ones it completes as waiting.
     crate::staging::quarantine::resume_caused_definitions(client, schema).await?;

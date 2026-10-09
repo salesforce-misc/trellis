@@ -2391,6 +2391,33 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     assert_eq!(status(&raw, "c_owners").await, TransformStatus::Live);
 }
 
+/// #970: a `RESUME` by hand of a definition waiting on its upstream resumes
+/// it at once, though the upstream isn't live yet: the request replaces the
+/// cause, and the next pass re-types its target and pauses the definition
+/// below it with it as the cause.
+#[tokio::test]
+async fn a_resume_by_hand_of_a_waiting_definition_resumes_it_before_its_upstream_is_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    assert_waiting_on(&trellis, &raw, "b_names", "item_names").await;
+    resume(&trellis, "b_names").await;
+    assert_eq!(caused_by(&raw, "b_names").await, None);
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_ne!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "b_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_waiting_on(&trellis, &raw, "c_names", "b_names").await;
+    assert_chain_converges(&trellis, &mut raw, &db.pool).await;
+}
+
 /// #828: a definition the operator paused before the upstream's resume
 /// re-typed the target it reads was paused for another reason first. It
 /// gets the pause record, as before, but no cause: its message is the

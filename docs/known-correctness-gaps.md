@@ -760,7 +760,11 @@ actions isn't a safe form: it's wrong before 15.6 and 16.2.
   paused below the head for k rebuilds in a row. A definition waiting on an
   upstream that doesn't go live (paused, quarantined, refused its own
   resume) keeps waiting. A `RESUME` by hand of a waiting definition resumes
-  it at once, whether or not the upstream is live. One whose automatic
+  it at once, whether or not the upstream is live. A `PAUSE` of a waiting
+  definition doesn't take it out of the chain: it is already paused, so the
+  `PAUSE` changes nothing, and the pass still resumes it once the upstream
+  is live (#971). Dropping it is the only way to keep it from resuming. One
+  whose automatic
   resume is refused, because the schema changed after the pause, stays
   paused with the refusal, and isn't tried again; resume it by hand once
   that is fixed, or drop it and define it again.
