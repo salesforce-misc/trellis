@@ -79,10 +79,10 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 - `Trellis.LogBridge`: started with the `:trellis_pg` application, it forwards
   the engine's log lines to `Logger` (`domain: [:trellis]`, the Rust module
   as `:target` metadata). Every line names its instance in the text, as
-  `trellis_instance=<catalog schema>`, so handles in one VM stay apart. Set
-  `config :trellis_pg, log_level: :info` to choose the most verbose level
-  forwarded (default: `Logger.level()`, read once at
-  start), or `config :trellis_pg, log_bridge: false` to forward nothing. A
+  `trellis_instance=<database>/<catalog schema>`, so handles in one VM stay
+  apart. Set `config :trellis_pg, log_level: :info` to choose the most
+  verbose level forwarded (default: `Logger.level()`, read once at start),
+  or `config :trellis_pg, log_bridge: false` to forward nothing. A
   `tracing` subscriber installed by another NIF never sees the engine's
   lines, since each native library links its own `tracing`; see
   `Trellis.LogBridge`. A line can be dropped if the bridge falls behind,

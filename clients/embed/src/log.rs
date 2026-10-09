@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn the_engines_instance_field_crosses_as_plain_text() {
         let bridge = with_bridge("info", || {
-            tracing::info!(trellis_instance = %"tenant_a", table = %"public.t", "capture reconciled");
+            tracing::info!(trellis_instance = %"mydb/tenant_a", table = %"public.t", "capture reconciled");
         });
         let messages: Vec<_> = bridge
             .take(10)
@@ -389,7 +389,7 @@ mod tests {
             .collect();
         assert_eq!(
             messages,
-            ["capture reconciled trellis_instance=tenant_a table=public.t"]
+            ["capture reconciled trellis_instance=mydb/tenant_a table=public.t"]
         );
     }
 

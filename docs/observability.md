@@ -146,12 +146,12 @@ pipeline's shape observable and carries per-hop latency for free — the
 per-transform latency histogram is *derived from* span durations captured during
 apply, not instrumented independently.
 
-Every event the engine emits carries a `trellis_instance` field: the catalog
-schema name of the instance that logged it. Several instances can share a
-process and a database, and the field is what separates their lines in one
-stream. It is an event field
-rather than a span, so it reaches every subscriber, including ones that record
-events only (Elixir's `Logger`), and it adds no span to an OpenTelemetry trace.
+Every event the engine emits carries a `trellis_instance` field naming the
+instance that logged it: its database and catalog schema, as `mydb/trellis`.
+Several instances can share a process and a database, and the field is what
+separates their lines in one stream. It is an event field rather than a span,
+so it reaches every subscriber, including ones that record events only
+(Elixir's `Logger`), and it adds no span to an OpenTelemetry trace.
 
 The crate never installs a subscriber; the embedder does. The Elixir binding
 does it on the host's behalf: `Trellis.LogBridge` installs one at application

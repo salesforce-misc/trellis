@@ -2,7 +2,7 @@
 //! emitted it, in a `trellis_instance` field.
 //!
 //! Two instances share one process and one database, each with its own
-//! catalog schema. One runs as an async [`Trellis`] on the test's runtime,
+//! catalog schema, so each logs as `<database>/<schema>`. One runs as an async [`Trellis`] on the test's runtime,
 //! the other as a [`BlockingTrellis`] with a runtime of its own, and both run
 //! a staging worker. A single global subscriber captures what the whole
 //! process logs, and the assertion is about *every* event from the engine,
@@ -100,6 +100,14 @@ async fn every_engine_event_names_its_own_instance() {
     )
     .await
     .expect("create the sources");
+    // Each instance logs as its database and catalog schema.
+    let database: String = raw
+        .query_one("select current_database()::text", &[])
+        .await
+        .expect("database name")
+        .get(0);
+    let name_a = format!("{database}/{DEFAULT_SCHEMA}");
+    let name_b = format!("{database}/{INSTANCE_B}");
 
     // Define one transform per instance, each reading its own source, with no
     // background work yet.
@@ -172,9 +180,9 @@ async fn every_engine_event_names_its_own_instance() {
             let subject = subject.trim_matches('"');
             let subject = subject.strip_prefix("public.").unwrap_or(subject);
             let expected = if about_a.contains(&subject) {
-                DEFAULT_SCHEMA
+                name_a.as_str()
             } else if about_b.contains(&subject) {
-                INSTANCE_B
+                name_b.as_str()
             } else {
                 continue;
             };
@@ -191,7 +199,7 @@ async fn every_engine_event_names_its_own_instance() {
 
     // Both instances logged from both kinds of path: the capture pass logs a
     // `table`, `apply` a `transform`.
-    for instance in [DEFAULT_SCHEMA, INSTANCE_B] {
+    for instance in [name_a.as_str(), name_b.as_str()] {
         let fields = seen.get(instance).map(Vec::as_slice).unwrap_or(&[]);
         assert!(
             fields.contains(&"table"),

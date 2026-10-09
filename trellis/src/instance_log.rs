@@ -3,8 +3,9 @@
 //! Several handles can share one process and one database, each with its own
 //! catalog schema, and they all log through the one `tracing` facade. Every
 //! event the engine emits therefore carries a `trellis_instance` field: the
-//! instance's catalog schema name. A host that routes, filters or counts log
-//! lines can tell which handle a line came from.
+//! instance's database and catalog schema, as `mydb/trellis` ([`name_of`]).
+//! A host that routes, filters or counts log lines can tell which handle a
+//! line came from.
 //!
 //! # How the field is attached
 //!
@@ -13,15 +14,16 @@
 //! passed down as an argument. Each handle instead *scopes* the code it
 //! runs, and the event macros in this module read the scope:
 //!
-//! - **Threads the handle owns.** [`Client`](crate::client::Client)'s and
-//!   [`BlockingTrellis`](crate::blocking::BlockingTrellis)'s runtime threads
-//!   (the thread that calls `block_on`, the workers and the blocking pool)
-//!   carry the name for their whole life, so every task spawned onto those
-//!   runtimes logs under it.
+//! - **Threads the handle owns.** [`Client`](crate::client::Client)'s runtime
+//!   threads (the thread that calls `block_on`, the workers and the blocking
+//!   pool) carry the name for their whole life, so every task spawned onto
+//!   that runtime logs under it.
 //! - **Calls on the host's runtime.** Each [`Trellis`](crate::app::Trellis)
 //!   method runs inside [`scoped`], which sets the name around every poll of
 //!   its future, so it holds wherever the host's scheduler moves the task.
-//!   A task such a method spawns is wrapped with [`in_current_instance`].
+//!   [`BlockingTrellis`](crate::blocking::BlockingTrellis) runs its calls
+//!   through those methods. A task such a method spawns is wrapped with
+//!   [`in_current_instance`], or names its instance itself.
 //!
 //! The scope is a thread-local rather than a `tracing` span on purpose. A
 //! span would sit open for the handle's whole life, and an OpenTelemetry
@@ -44,6 +46,8 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::config::Config;
+
 /// What [`Current`] prints on a thread no handle has scoped.
 pub(crate) const UNSCOPED: &str = "unknown";
 
@@ -51,9 +55,26 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
 }
 
-/// The name an instance logs under: its catalog schema.
-pub(crate) fn name_of(schema: &str) -> Arc<str> {
-    Arc::from(schema)
+/// The name an instance logs under: its database and catalog schema, as
+/// `<database>/<schema>` (`mydb/trellis`). Two instances in one process can
+/// share a schema name in different databases, so the schema alone does not
+/// tell them apart.
+pub(crate) fn name_of(config: &Config) -> Arc<str> {
+    Arc::from(format!("{}/{}", database_of(config.dsn()), config.schema()))
+}
+
+/// The database `dsn` connects to, as `tokio_postgres` resolves it: its
+/// `dbname`, else the user name (Postgres's default database), else the OS
+/// user `tokio_postgres` connects as. A DSN that does not parse never
+/// connects, and reads [`UNSCOPED`].
+fn database_of(dsn: &str) -> String {
+    let Ok(parsed) = crate::config::parse_dsn(dsn) else {
+        return UNSCOPED.to_string();
+    };
+    match parsed.get_dbname().or(parsed.get_user()) {
+        Some(database) => database.to_string(),
+        None => whoami::username().unwrap_or_else(|_| UNSCOPED.to_string()),
+    }
 }
 
 /// The current thread's instance name, as a `tracing` field value. The
@@ -295,6 +316,35 @@ mod tests {
         assert_eq!(Current.to_string(), "outer");
     }
 
+    /// The name is the database and the schema, with the database resolved
+    /// as `tokio_postgres` connects: two instances that share a schema name
+    /// in different databases log apart.
+    #[test]
+    fn the_name_is_the_database_and_the_catalog_schema() {
+        let name = |dsn: &str, schema: &str| {
+            name_of(&Config::with_schema(dsn, schema).expect("config")).to_string()
+        };
+        assert_eq!(
+            name("postgres://app@db.local/tenant_a", "trellis"),
+            "tenant_a/trellis"
+        );
+        assert_eq!(
+            name("postgres://app@db.local/tenant_b", "trellis"),
+            "tenant_b/trellis"
+        );
+        assert_eq!(
+            name("host=db.local user=app dbname='my db'", "ops"),
+            "my db/ops"
+        );
+        // No dbname: Postgres connects to the user's database.
+        assert_eq!(name("host=db.local user=app", "trellis"), "app/trellis");
+        // No user either: `tokio_postgres` connects as the OS user.
+        assert_eq!(
+            name("host=db.local", "trellis"),
+            format!("{}/trellis", whoami::username().expect("OS user"))
+        );
+    }
+
     fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -327,7 +377,9 @@ mod tests {
                     && code
                         .split(|c: char| !c.is_alphanumeric() && c != '_')
                         .any(|word| LEVELS.contains(&word));
-                if direct || imported {
+                // `use tracing as t;` would let `t::warn!` through.
+                let renamed = code.contains("tracing as ");
+                if direct || imported || renamed {
                     offenders.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
                 }
             }

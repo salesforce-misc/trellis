@@ -508,7 +508,7 @@ impl Client {
         // Every thread of the client's runtime, and the one that drives it,
         // logs under this instance (`crate::instance_log`), so each task
         // spawned onto the runtime does too.
-        let instance = crate::instance_log::name_of(config.schema());
+        let instance = crate::instance_log::name_of(&config);
         let thread = std::thread::Builder::new()
             .name("trellis-client".to_string())
             .spawn(move || {
@@ -570,6 +570,36 @@ impl Drop for Client {
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod client_runtime_tests {
+    use super::{ClientOptions, client_runtime};
+    use crate::instance_log::Current;
+
+    /// Issue #874: the maintenance loop, the drain workers, the heartbeat
+    /// and the wake listener are tasks on the client's runtime, and they log
+    /// under its instance from whichever worker or blocking thread runs them.
+    #[test]
+    fn every_thread_of_the_client_runtime_logs_under_its_instance() {
+        // Built as `Client::start_with_config` builds it, down to a capped
+        // worker count, so the hook is on every thread of that runtime.
+        let options = ClientOptions {
+            worker_threads: Some(2),
+            ..ClientOptions::default()
+        };
+        let runtime =
+            client_runtime(&options, std::sync::Arc::from("app/tenant_a")).expect("runtime");
+        let (worker, blocking) = runtime.block_on(async {
+            // A multi-thread runtime runs a spawned task on a worker, never
+            // on the thread in `block_on` (this test's own, which is unnamed).
+            let worker = tokio::spawn(async { Current.to_string() }).await;
+            let blocking = tokio::task::spawn_blocking(|| Current.to_string()).await;
+            (worker.expect("worker"), blocking.expect("blocking"))
+        });
+        assert_eq!(worker, "app/tenant_a");
+        assert_eq!(blocking, "app/tenant_a");
     }
 }
 
@@ -4055,7 +4085,8 @@ mod runtime_tests {
                 worker_threads: Some(n),
                 ..ClientOptions::default()
             };
-            let runtime = client_runtime(&options, std::sync::Arc::from("app/t")).expect("build runtime");
+            let runtime =
+                client_runtime(&options, std::sync::Arc::from("app/t")).expect("build runtime");
             assert_eq!(runtime.handle().metrics().num_workers(), n);
         }
     }

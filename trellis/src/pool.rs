@@ -62,6 +62,9 @@ pub struct Pool {
     /// see [`Pool::target_schema`]. [`Pool::connect_unpooled`] bootstraps
     /// its connection's `search_path` with it.
     target_schema: String,
+    /// The name this pool's instance logs under ([`crate::instance_log`]),
+    /// for the drivers [`Pool::connect_unpooled`] spawns.
+    instance: std::sync::Arc<str>,
 }
 
 impl Pool {
@@ -119,6 +122,7 @@ impl Pool {
             pg_config,
             schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
+            instance: crate::instance_log::name_of(config),
         })
     }
 
@@ -147,7 +151,7 @@ impl Pool {
         // The driver may run on a thread of the host's runtime, so it names
         // its own instance.
         tokio::spawn(crate::instance_log::scoped(
-            crate::instance_log::name_of(&self.schema),
+            self.instance.clone(),
             async move {
                 if let Err(err) = connection.await {
                     crate::instance_log::debug!(

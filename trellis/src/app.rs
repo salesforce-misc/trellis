@@ -193,7 +193,7 @@ pub struct Trellis {
     /// pipeline this connection started.
     client: Option<Client>,
     /// The name this handle's log events carry as `trellis_instance`: its
-    /// catalog schema (see [`crate::instance_log`]).
+    /// database and catalog schema (see [`crate::instance_log::name_of`]).
     instance: std::sync::Arc<str>,
 }
 
@@ -215,7 +215,7 @@ impl Trellis {
             None
         };
         Ok(Self {
-            instance: crate::instance_log::name_of(config.schema()),
+            instance: crate::instance_log::name_of(&config),
             config,
             pool,
             client,

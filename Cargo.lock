@@ -2209,6 +2209,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "trellis",
+ "whoami",
 ]
 
 [[package]]
