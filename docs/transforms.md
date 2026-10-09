@@ -44,8 +44,11 @@ A refusal after define is a pause, not a loss: `RESUME` rebuilds the target from
 source once the condition is fixed ([Status](#status)). `status()`'s
 `capture_failure` carries the reason. Every `RESUME`, of a transform or of one
 field, first runs define's validation against the live schema, and refuses,
-leaving the transform paused, while define would refuse it; the error names
-the column and what to change. When a resume has copies to re-type it returns
+leaving the transform paused, while define would refuse it or while the target's
+own tables are no longer what define would create (a 1-1 target whose source key
+was redefined, an aggregate whose group-delta table is missing or has other
+columns; [The repair tools](known-correctness-gaps.md#the-repair-tools)); the
+error names the column and what to change. When a resume has copies to re-type it returns
 at once, the transform still `paused` with a `capture_failure` that says so,
 and the staging worker re-types them and starts the rebuild. The re-type honours
 the `statement_timeout` of Trellis's role or database: one cancelled three times ends
@@ -354,7 +357,8 @@ Every defined transform carries an observable **status**:
   ([stage 01](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column),
   [Supported sources and targets](#supported-sources-and-targets)). Every
   resume first re-validates the transform as define would, and refuses while
-  define would refuse it.
+  define would refuse it, or while its target's tables are no longer what define
+  would create ([The repair tools](known-correctness-gaps.md#the-repair-tools)).
 
 A transform can also hold single source keys in quarantine whatever its status,
 `live` included: a key whose change kept failing in this transform's apply (a

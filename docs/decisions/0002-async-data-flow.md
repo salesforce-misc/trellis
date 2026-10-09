@@ -468,7 +468,8 @@ entry lock and in the same statement as the child's own read (I1).
   parent while the parent's reverse page is uncommitted, after that page
   found the parent's children: the child reads the old value, and the
   reverse's recompute doesn't reach it (#892,
-  [known correctness gaps](../known-correctness-gaps.md) entry 21). A
+  [known correctness gaps: a to-one relationship field keeps a superseded
+  parent value under concurrent writes](../known-correctness-gaps.md#21-a-to-one-relationship-field-keeps-a-superseded-parent-value-under-concurrent-writes)). A
   Re-derive whose row joins a parent outside the set the page's Phase 2
   bumps the generation of is harmless: guard (b) only defers a parent's
   reverse, and the reverse's recomputes come from a live read of the

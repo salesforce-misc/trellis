@@ -28,7 +28,9 @@ them gets broken without Trellis noticing.
 * No row-level security policy applies to a role Trellis logs in as, or to
   the role that owns its ring (entry 11).
 * No application trigger re-keys a relationship's join column within the
-  statement that wrote it (entry 9).
+  statement that wrote it ([an application trigger re-keying a parent's
+  join column within the
+  statement](#9-an-application-trigger-re-keying-a-parents-join-column-within-the-statement)).
 * No trigger or constraint refuses a change only when several of the
   definitions reading it apply it together, in combinations no one of them is
   in every one of, such as two separate pairs (entry 24).
@@ -51,12 +53,14 @@ These are the tools the entries refer to:
   target from the source. Run it through `Trellis::apply` or
   `trellis apply '<statement>'`. A resume first re-runs define's validation
   against the live schema, and refuses, leaving the definition paused, while
-  define would refuse it, or while an aggregate's group-delta table lacks
-  columns define would create now (entry 22). It then brings every column Trellis created for
-  the definition with a type from the source (its key, passthrough and GROUP
-  BY copies, its calculated, aggregate and ledger contribution columns, and
-  its relationship projections' columns) to the type define would give it
-  now, re-reads every current source row and deletes target rows the source
+  define would refuse it. It makes two refusals define doesn't: a 1-1 target's
+  source key was redefined, and an aggregate's group-delta table is missing
+  (entry 8) or has different running-sum or recompute columns from the ones
+  define would create now (entry 22). It then brings every column Trellis
+  created for the definition with a type from the source (its key,
+  passthrough and GROUP BY copies, its calculated, aggregate and ledger
+  contribution columns, and its relationship projections' columns) to the
+  type define would give it now, re-reads every current source row and deletes target rows the source
   no longer backs
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). It doesn't replay
   buffered changes, so it repairs anything that's wrong because a change was
@@ -68,13 +72,14 @@ These are the tools the entries refer to:
 * **`DROP TRANSFORM <target>`, then define it again** is the repair when you
   keep a schema change the definition can't be rebuilt over: a resume refuses
   while define would, naming the column and what to change, and a 1-1
-  definition whose source key was redefined, or an aggregate whose `SUM` or
+  definition whose source key was redefined, an aggregate whose `SUM` or
   `AVG` argument moved between an exact type and floating point (entry 22),
-  can only be defined again. It's
-  also the repair when a resume can't convert the values of a column Trellis
-  created to its new type (a key moved from `text` to `uuid` by a `USING`
-  that isn't a cast). The definition stays paused and its target keeps its
-  rows: Trellis doesn't empty a target the application reads on its own.
+  or whose group-delta table was dropped (entry 8), can only be defined again.
+  It's also the repair when a resume can't convert the values of a column
+  Trellis created to its new type (a key moved from `text` to `uuid` by a
+  `USING` that isn't a cast). The definition stays paused and its target
+  keeps its rows: Trellis doesn't empty a target the application reads on its
+  own.
 * **`self_check(target, …)`** detects divergence but never repairs it. It
   audits the target's capture triggers, then compares the target with a
   recompute of it in Postgres
@@ -264,7 +269,9 @@ aggregate or relationship-enriched targets.
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
 
 **Repair:** `PAUSE`/`RESUME` the transform. If its columns or constraints
-were changed, `DROP TRANSFORM` and define it again.
+were changed, `DROP TRANSFORM` and define it again. So is an aggregate whose
+group-delta table was dropped: its resume refuses, naming the table, and the
+definition stays paused (#967).
 
 ## 9. An application trigger re-keying a parent's join column within the statement
 
@@ -629,8 +636,9 @@ to another type family as it was.
 every column the definition created to the type define would give it now,
 releases its held keys and rebuilds the target. An aggregate with a `SUM` or
 `AVG` whose argument moved between an exact type (`integer`, `numeric`) and
-floating point is the exception: its group-delta table doesn't have the
-running-sum columns define would create now. The resume refuses, naming
+floating point is the exception: its group-delta table has different
+running-sum or recompute columns from the ones define would create now. The
+resume refuses, naming
 `DROP TRANSFORM`, and the definition stays paused. Drop it and define it again
 (#857).
 
@@ -840,13 +848,15 @@ refusing them up front:
   passthrough or calculated field, a GROUP BY key, a `SUM` or `MIN` and its
   ledger contribution, or a relationship projection's key or column;
   `bigint` to `numeric` under a `MIN`). A resume refuses until define would
-  accept the definition again (entry 22 has the one other refusal); otherwise it re-types those columns and
-  rebuilds
+  accept the definition again (and for the refusals only a resume makes, see
+  [The repair tools](#the-repair-tools)); otherwise it re-types those
+  columns and rebuilds
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and
   the resume releases it. A change between deterministic collations needs
-  nothing (but see entry 3). A field's move to another type family pauses
-  nothing (entry 22).
+  nothing (but see [a source key re-collated while a `self_check` sweep
+  runs](#3-a-source-key-re-collated-while-a-self_check-sweep-runs)). A
+  field's move to another type family pauses nothing (entry 22).
 * **A widening that changes only the catalog of a column Trellis copies with
   its type.** `varchar(n)` to a longer `varchar`, to `text` or to
   `varchar`, and `numeric(p,s)` to a larger precision at the same scale,

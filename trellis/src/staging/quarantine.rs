@@ -4086,9 +4086,10 @@ enum ResumeStep {
 ///    it: a key, join or `GROUP BY` column of a type or collation define
 ///    refuses, a relationship whose join columns no longer match (#590), a
 ///    redefined source key. A whole-transform resume also refuses an
-///    aggregate whose group-delta table lacks columns define would create now
-///    ([`catalog::check_deltas_shape`], #857); a column resume doesn't make
-///    that check.
+///    aggregate whose group-delta table has different running-sum or
+///    recompute columns from the ones define would create now, or doesn't
+///    exist ([`catalog::check_deltas_shape`], #857, #967); a column resume
+///    doesn't make that check.
 /// 2. **It compares each column Trellis created with a type from the
 ///    source (typed copies, and calculated, aggregate and contribution
 ///    columns) with the type define would give it now**

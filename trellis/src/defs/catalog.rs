@@ -176,20 +176,34 @@ pub enum CatalogError {
         /// The source's key columns now.
         source_key: Vec<String>,
     },
-    /// An aggregate's group-delta table has the columns define chose when it
-    /// created it, and define would choose different ones now: a field's
-    /// classification (incremental or recompute-only) moved with its
-    /// argument's type, as a `SUM` over `numeric` that became `double
-    /// precision` did (#857). Its rebuild would write NULL into the sum column
-    /// the table keeps and poison every key it touches. [`revalidate`] refuses
-    /// it, and any difference in those columns, rather than decide which are
-    /// safe; the repair is to drop the definition and define it again.
+    /// An aggregate's group-delta table has columns other than the
+    /// `__dc`/`__ds`/`__out` ones define would create now. Define chose them
+    /// when it created the table, and a field's classification (incremental
+    /// or recompute-only) has since moved with its argument's type: a `SUM`
+    /// or `AVG` over `numeric` that became `double precision` (or back, or
+    /// over `integer`) did (#857). Its rebuild would write NULL into the sum
+    /// column the table keeps, or find none to fill, and poison every key it
+    /// touches. [`check_deltas_shape`] refuses any difference in those
+    /// columns, rather than decide which are safe; the repair is to drop
+    /// the definition and define it again. [`CatalogError::AggregateDeltasTableMissing`]
+    /// is the table's absence.
     AggregateDeltasShapeChanged {
         target: String,
         /// The table's `__dc`/`__ds`/`__out` columns.
         have: Vec<String>,
         /// The ones define would create now.
         want: Vec<String>,
+    },
+    /// An aggregate's group-delta table doesn't exist, though define creates
+    /// one for the definition (#967). Only Trellis writes its tables, so an
+    /// operator dropped it; a rebuild would write its chunks into a table
+    /// that isn't there. [`check_deltas_shape`] refuses it, and Trellis
+    /// doesn't re-create the table: the repair is to drop the definition and
+    /// define it again.
+    AggregateDeltasTableMissing {
+        target: String,
+        /// The table, schema-qualified.
+        deltas_table: String,
     },
     /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
     /// shares a bare table-name suffix with a *different* qualified target
@@ -455,6 +469,7 @@ impl CatalogError {
             CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
+            CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
             // Collides with existing state (another live definition's
             // persisted target), not a structural/semantic rejection of this
             // definition's own text — the same category
@@ -493,7 +508,8 @@ impl CatalogError {
 impl CatalogError {
     /// Whether this is define's own refusal of the schema as it stands, as
     /// opposed to a refusal only a resume makes ([`CatalogError::SourceKeyChanged`],
-    /// [`CatalogError::AggregateDeltasShapeChanged`]), where define would
+    /// [`CatalogError::AggregateDeltasShapeChanged`],
+    /// [`CatalogError::AggregateDeltasTableMissing`]), where define would
     /// accept the definition and the repair is to drop it and define it again.
     /// A resume's message says which it is.
     pub(crate) fn is_define_refusal(&self) -> bool {
@@ -501,6 +517,7 @@ impl CatalogError {
             self,
             CatalogError::SourceKeyChanged { .. }
                 | CatalogError::AggregateDeltasShapeChanged { .. }
+                | CatalogError::AggregateDeltasTableMissing { .. }
         )
     }
 }
@@ -577,6 +594,15 @@ impl fmt::Display for CatalogError {
                  doesn't re-shape it: `DROP TRANSFORM` and define it again",
                 have.join(", "),
                 want.join(", ")
+            ),
+            CatalogError::AggregateDeltasTableMissing {
+                target,
+                deltas_table,
+            } => write!(
+                f,
+                "the group-delta table of {target}, {deltas_table}, doesn't exist, but define \
+                 would create one. Trellis doesn't re-create it: `DROP TRANSFORM` and define it \
+                 again"
             ),
             CatalogError::TargetTableSuffixCollision {
                 target,
@@ -723,6 +749,7 @@ impl std::error::Error for CatalogError {
             CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::AggregateDeltasShapeChanged { .. } => None,
+            CatalogError::AggregateDeltasTableMissing { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
@@ -5203,13 +5230,33 @@ pub(crate) async fn revalidate(
 }
 
 /// Refuses a whole-transform resume of an aggregate whose group-delta table
-/// doesn't have the
-/// `__dc`, `__ds` and `__out` columns define would create now (#857). A
-/// field's classification follows its argument's type, so a `SUM` argument
-/// that moved between `numeric` and floating point leaves the table with a
-/// running-sum column the rebuild can't fill. Any difference is refused
-/// ([`CatalogError::AggregateDeltasShapeChanged`]) rather than judged. A
-/// definition without a group-delta table has nothing to compare.
+/// isn't the one define would create now (#857, #967).
+///
+/// - **The table has other `__dc`, `__ds` or `__out` columns.** A field's
+///   classification follows its argument's type, so a `SUM` or `AVG`
+///   argument that moved between an exact type (`integer`, `numeric`) and
+///   floating point leaves the table with a running-sum column the rebuild
+///   can't fill, or without one it needs. Any difference, including the
+///   recompute columns, is refused
+///   ([`CatalogError::AggregateDeltasShapeChanged`]) rather than judged.
+/// - **The table doesn't exist** though [`route`](crate::staging::ledger::route)
+///   takes the definition, so define creates one
+///   ([`CatalogError::AggregateDeltasTableMissing`]). The rebuild writes its
+///   chunks into it.
+///
+/// The missing table is refused here, not by `self_check`: `self_check`
+/// audits 1-1 targets only (it compares no aggregate), and the table is
+/// only a problem to an operation that writes into it, which is this
+/// resume's rebuild. Refusing before the resume changes anything leaves the
+/// definition paused with its target as it was. A definition `route` doesn't
+/// take expects no table, so a missing one is nothing to compare.
+///
+/// `route` returns `None` for a definition [`revalidate`] has just
+/// validated only when its calculated fields' alias expansion is larger than
+/// the build's size budget ([`crate::defs::backfill::substituted_field_exprs`]),
+/// which [`validate`] doesn't bound. Define then creates no group-delta table
+/// and a drain halts on the target (`ApplyError::AggregateOffLedger`), so the
+/// arm is reachable, and wants no table rather than panicking.
 ///
 /// Only a whole-transform resume calls it ([`Revalidated`] is its input): a
 /// column resume of an aggregate field builds nothing and never reads the
@@ -5223,6 +5270,8 @@ pub(crate) async fn check_deltas_shape(
         return Ok(());
     }
     let (source_columns, relationships) = (&revalidated.source_columns, &revalidated.relationships);
+    let want = crate::staging::ledger::route(&definition.def, source_columns, relationships)
+        .map(|shape| super::ledger::delta_shape_columns(&shape.summed(), shape.recomputes()));
     let (target_schema, target_bare) = definition
         .target_table
         .split_once('.')
@@ -5243,16 +5292,19 @@ pub(crate) async fn check_deltas_shape(
         .map(|row| row.get(0))
         .collect();
     if columns.is_empty() {
-        return Ok(());
+        return match want {
+            Some(_) => Err(CatalogError::AggregateDeltasTableMissing {
+                target: definition.target_table.clone(),
+                deltas_table: deltas,
+            }),
+            None => Ok(()),
+        };
     }
     let have: std::collections::BTreeSet<String> = columns
         .into_iter()
         .filter(|c| super::ledger::is_delta_shape_column(c))
         .collect();
-    let want = match crate::staging::ledger::route(&definition.def, source_columns, relationships) {
-        Some(shape) => super::ledger::delta_shape_columns(&shape.summed(), shape.recomputes()),
-        None => std::collections::BTreeSet::new(),
-    };
+    let want = want.unwrap_or_default();
     if have == want {
         return Ok(());
     }
