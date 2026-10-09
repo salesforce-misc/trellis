@@ -370,10 +370,13 @@ count, so an eviction that charged the key before the release finds it gone
 and the release stands, instead of the key being held again with the
 `Recompute` parked behind it. The test is the count reaching the threshold,
 not the row existing: a key that fails again after its release is charged from
-1 again, a death charged after the release is not the one the eviction
-charged, and the key is poisoned once it reaches the threshold again. The
-check is one read inside the eviction's transaction, with no new lock or
-state. A build chunk's eviction charges and poisons in one transaction, so it
+1 again, so one death after the release doesn't pass for the deaths the
+eviction counted, and the key is poisoned once it reaches the threshold again.
+If it reaches it before the earlier eviction takes the row, that eviction
+poisons it, as the later one would. A clean apply clears the count too, and an
+eviction that finds it cleared skips the key the same way. The check is one
+read inside the eviction's transaction, with no new lock or state. A build
+chunk's eviction charges and poisons in one transaction, so it
 has no such window. The threshold is decided in one place
 (`quarantine::crosses_threshold`) so that a key that poisons on its first
 failure is checked against its own.

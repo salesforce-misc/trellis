@@ -181,7 +181,8 @@ pub enum PausePoint {
     /// definition's fuse gate and row lock and writes the poison for its
     /// charged keys, for the definition's bare target
     /// (`super::quarantine::isolate_and_evict`, #880). The isolation has
-    /// charged the keys and committed; nothing of the eviction's is held.
+    /// charged the keys and committed; the eviction holds no lock of this
+    /// definition's yet (it may hold a lower-id definition's).
     BeforeEvictionLocks,
     /// After a column resume deletes the `column_status` row of the column
     /// it resumes, before it releases that column's readers, for the

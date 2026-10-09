@@ -930,7 +930,9 @@ fn crosses_threshold(_probe: &PoisonedProbe, deaths: i32, threshold: i32) -> boo
 /// the release finds the row gone, or counting only the deaths charged after
 /// it, and poisons nothing: the operator's release stands. A key that fails
 /// again after its release is charged from 1 again and crosses the threshold
-/// again on its own deaths. The same canonical `src_table` as the charge and
+/// again on its own deaths. A clean apply that clears the count
+/// ([`clear_key_deaths`]) in the same window skips the key the same way, as
+/// a cleared count means. The same canonical `src_table` as the charge and
 /// the release (#283).
 async fn still_charged_to_threshold(
     txn: &Transaction<'_>,
@@ -956,7 +958,8 @@ async fn still_charged_to_threshold(
             src_table = %probe.canonical_src_table,
             key = %probe.key,
             deaths,
-            "not poisoning a key released while isolation charged it"
+            "not poisoning a key whose death count a release or a clean apply reset \
+             after isolation charged it"
         );
     }
     Ok(charged)
@@ -1785,10 +1788,13 @@ async fn isolate_and_evict_probing(
     txn.commit().await?;
 
     if evicted == 0 {
-        // Every culprit was frozen, resumed or had its key released while
-        // isolation probed it: the retry recomputes without them, so the
-        // original failure is likely gone, and if not the next isolation
-        // attributes it afresh.
+        // Nothing was poisoned: every culprit's definition was frozen or
+        // resumed while isolation probed it, or its key's count was deleted
+        // (a release) or cleared (a clean apply) before the eviction locked
+        // the definition. The retry recomputes without the frozen or resumed
+        // definitions, and with the released keys, which an operator
+        // releases once their cause is fixed, so the original failure is
+        // likely gone; if not, the next isolation charges it afresh.
         return Ok(IsolationOutcome::ChargedBelowThreshold { charged });
     }
     Ok(IsolationOutcome::Evicted { evicted, charged })
