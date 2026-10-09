@@ -490,6 +490,21 @@ impl CatalogError {
     }
 }
 
+impl CatalogError {
+    /// Whether this is define's own refusal of the schema as it stands, as
+    /// opposed to a refusal only a resume makes ([`CatalogError::SourceKeyChanged`],
+    /// [`CatalogError::AggregateDeltasShapeChanged`]), where define would
+    /// accept the definition and the repair is to drop it and define it again.
+    /// A resume's message says which it is.
+    pub(crate) fn is_define_refusal(&self) -> bool {
+        !matches!(
+            self,
+            CatalogError::SourceKeyChanged { .. }
+                | CatalogError::AggregateDeltasShapeChanged { .. }
+        )
+    }
+}
+
 impl fmt::Display for CatalogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -5141,7 +5156,8 @@ pub(crate) struct Revalidated {
 /// One check is a resume's own: a 1-1 target is keyed by the source key
 /// define found, so a source whose key has since been redefined fails with
 /// [`CatalogError::SourceKeyChanged`], whose only repair is to drop and
-/// define again.
+/// define again. [`check_deltas_shape`] is a second, which only a
+/// whole-transform resume makes.
 pub(crate) async fn revalidate(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,

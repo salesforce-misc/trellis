@@ -463,11 +463,16 @@ impl fmt::Display for ApplyError {
                  and the key is still held: retry the release"
             ),
             ApplyError::ColumnPauseLockTimeout(err) => write!(f, "{err}"),
-            ApplyError::ResumeRefused { transform, reason } => write!(
-                f,
-                "'{transform}' can't resume: define would refuse it as the schema stands now: \
+            ApplyError::ResumeRefused { transform, reason } if reason.is_define_refusal() => {
+                write!(
+                    f,
+                    "'{transform}' can't resume: define would refuse it as the schema stands now: \
                  {reason}. It stays paused"
-            ),
+                )
+            }
+            ApplyError::ResumeRefused { transform, reason } => {
+                write!(f, "'{transform}' can't resume: {reason}. It stays paused")
+            }
             ApplyError::ReverseTriggerNotResolvable { from_table } => write!(
                 f,
                 "cannot resolve a whole-keyspace reverse trigger against live full row images \

@@ -144,7 +144,11 @@ through (both join columns still on the allowlist and still the same type, modif
 and collation), row-level security and subscriptions, and, for a 1-1 definition, a
 source key that is still the one its target is keyed by. While define would refuse
 it, the resume refuses with define's error, names the column and what to change, and
-changes nothing: the definition stays paused. A field resume runs the same check on
+changes nothing: the definition stays paused. An aggregate gets one more check, for a
+group-delta table whose running-sum columns differ from the ones define would create now
+(a `SUM` or `AVG` argument that moved between an exact type and floating point). The
+resume refuses that too, names `DROP TRANSFORM`, and changes nothing; a column resume
+doesn't make the check, since it builds nothing. A field resume runs the same check on
 its definition, and leaves a dependent its cascade reaches paused while that
 dependent's check fails.
 

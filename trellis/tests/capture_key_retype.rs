@@ -1671,17 +1671,14 @@ async fn a_resume_refuses_an_aggregate_whose_sum_argument_moved_between_numeric_
     raw.batch_execute("alter table public.orders alter column amount type double precision")
         .await
         .expect("move the summed column to a float");
-    match trellis.apply("RESUME TRANSFORM per_shop").await {
-        Err(TrellisError::Apply(trellis::staging::apply::ApplyError::ResumeRefused {
-            reason,
-            ..
-        })) => {
-            let reason = reason.to_string();
-            assert!(reason.contains("DROP TRANSFORM"), "{reason}");
-            assert!(reason.contains("__ds0"), "{reason}");
-        }
-        other => panic!("expected the resume to be refused, got {other:?}"),
-    }
+    let message = resume_refused(&trellis, "per_shop").await;
+    assert!(
+        message.contains("DROP TRANSFORM") && message.contains("__ds0"),
+        "{message}"
+    );
+    // Define would accept this definition, so the message doesn't say it
+    // would refuse it.
+    assert!(!message.contains("define would refuse"), "{message}");
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Paused);
     assert_eq!(delta_columns(&raw).await, before);
 }
@@ -1717,21 +1714,69 @@ async fn a_resume_refuses_an_aggregate_whose_sum_argument_moved_from_float_to_nu
     raw.batch_execute("alter table public.orders alter column amount type numeric")
         .await
         .expect("move the summed column to numeric");
-    match trellis.apply("RESUME TRANSFORM per_shop").await {
-        Err(TrellisError::Apply(trellis::staging::apply::ApplyError::ResumeRefused {
-            reason,
-            ..
-        })) => {
-            let reason = reason.to_string();
-            assert!(reason.contains("DROP TRANSFORM"), "{reason}");
-            assert!(
-                reason.contains("__out") && reason.contains("__ds0"),
-                "{reason}"
-            );
-        }
-        other => panic!("expected the resume to be refused, got {other:?}"),
-    }
+    let message = resume_refused(&trellis, "per_shop").await;
+    assert!(
+        message.contains("DROP TRANSFORM")
+            && message.contains("__out")
+            && message.contains("__ds0"),
+        "{message}"
+    );
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Paused);
+}
+
+/// #857: the staging worker makes the same check before it re-types
+/// anything. The operator's resume is accepted (a widened `GROUP BY` key is
+/// waiting to be re-typed), then the summed column moves to a float: the
+/// worker's pass refuses the resume, leaves the key's column as it was, and
+/// reports `DROP TRANSFORM`.
+#[tokio::test]
+async fn the_worker_refuses_a_requested_resume_whose_delta_table_s_shape_changed_first() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount numeric); \
+         insert into public.orders values (1, 1, 10.5), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    raw.batch_execute("alter table public.orders alter column shop type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "per_shop").await;
+    assert_retyping(&trellis, &raw, "per_shop").await;
+    raw.batch_execute("alter table public.orders alter column amount type double precision")
+        .await
+        .expect("move the summed column to a float");
+    capture_pass(&mut raw, &db.pool).await;
+
+    let reported = trellis
+        .status("per_shop")
+        .await
+        .expect("status")
+        .expect("per_shop");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let error = reported.capture_failure.expect("reason").error;
+    assert!(
+        error.starts_with("the resume was refused:") && error.contains("DROP TRANSFORM"),
+        "{error}"
+    );
+    assert!(!error.contains("define would refuse"), "{error}");
+    assert_eq!(
+        column_type(&raw, "public.per_shop", "shop").await,
+        "integer"
+    );
 }
 
 /// #857 negative control: a retype that keeps every field's classification
@@ -1752,7 +1797,7 @@ async fn a_resume_goes_ahead_when_a_sum_argument_retype_keeps_the_delta_table_s_
     trellis
         .apply(
             "TRANSFORM per_shop FROM public.orders GROUP BY shop \
-             SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+             SELECT shop AS shop, SUM(amount) AS total, MIN(amount) AS least, COUNT(*) AS n",
         )
         .await
         .expect("define per_shop");

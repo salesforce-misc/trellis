@@ -51,7 +51,8 @@ These are the tools the entries refer to:
   target from the source. Run it through `Trellis::apply` or
   `trellis apply '<statement>'`. A resume first re-runs define's validation
   against the live schema, and refuses, leaving the definition paused, while
-  define would refuse it. It then brings every column Trellis created for
+  define would refuse it, or while an aggregate's group-delta table lacks
+  columns define would create now (entry 22). It then brings every column Trellis created for
   the definition with a type from the source (its key, passthrough and GROUP
   BY copies, its calculated, aggregate and ledger contribution columns, and
   its relationship projections' columns) to the type define would give it
@@ -67,7 +68,9 @@ These are the tools the entries refer to:
 * **`DROP TRANSFORM <target>`, then define it again** is the repair when you
   keep a schema change the definition can't be rebuilt over: a resume refuses
   while define would, naming the column and what to change, and a 1-1
-  definition whose source key was redefined can only be defined again. It's
+  definition whose source key was redefined, or an aggregate whose `SUM` or
+  `AVG` argument moved between an exact type and floating point (entry 22),
+  can only be defined again. It's
   also the repair when a resume can't convert the values of a column Trellis
   created to its new type (a key moved from `text` to `uuid` by a `USING`
   that isn't a cast). The definition stays paused and its target keeps its
@@ -613,12 +616,12 @@ to another type family as it was.
 
 **Repair:** `PAUSE TRANSFORM` then `RESUME TRANSFORM`. The resume brings
 every column the definition created to the type define would give it now,
-releases its held keys and rebuilds the target. An aggregate whose group-delta
-table has different `__dc`, `__ds` or `__out` columns than define would create
-now is the exception: a `SUM` or `AVG` argument that moved between
-`numeric` and floating point keeps the running-sum column define gave the
-old `SUM`. The resume refuses, naming `DROP TRANSFORM`, and the definition stays paused. Drop
-it and define it again (#857).
+releases its held keys and rebuilds the target. An aggregate with a `SUM` or
+`AVG` whose argument moved between an exact type (`integer`, `numeric`) and
+floating point is the exception: its group-delta table doesn't have the
+running-sum columns define would create now. The resume refuses, naming
+`DROP TRANSFORM`, and the definition stays paused. Drop it and define it again
+(#857).
 
 ## 23. A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy
 
@@ -806,7 +809,7 @@ refusing them up front:
   passthrough or calculated field, a GROUP BY key, a `SUM` or `MIN` and its
   ledger contribution, or a relationship projection's key or column;
   `bigint` to `numeric` under a `MIN`). A resume refuses until define would
-  accept the definition again; otherwise it re-types those columns and
+  accept the definition again (entry 22 has the one other refusal); otherwise it re-types those columns and
   rebuilds
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and

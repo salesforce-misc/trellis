@@ -4015,7 +4015,10 @@ enum ResumeStep {
 ///    refuses with [`ApplyError::ResumeRefused`] while define would refuse
 ///    it: a key, join or `GROUP BY` column of a type or collation define
 ///    refuses, a relationship whose join columns no longer match (#590), a
-///    redefined source key.
+///    redefined source key. A whole-transform resume also refuses an
+///    aggregate whose group-delta table lacks columns define would create now
+///    ([`catalog::check_deltas_shape`], #857); a column resume doesn't make
+///    that check.
 /// 2. **It compares each column Trellis created with a type from the
 ///    source (typed copies, and calculated, aggregate and contribution
 ///    columns) with the type define would give it now**
@@ -4407,24 +4410,21 @@ async fn finish_requested_resume(
         let Some(definition) = catalog::definition_by_id_in(&txn, id).await? else {
             return Ok(());
         };
-        match catalog::revalidate(&txn, schema, &definition).await {
-            Ok(_) => {}
+        // The group-delta shape is checked here too, before anything is
+        // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
+        // refuse.
+        let checked = match catalog::revalidate(&txn, schema, &definition).await {
+            Ok(revalidated) => catalog::check_deltas_shape(&txn, &definition, &revalidated).await,
+            Err(err) => Err(err),
+        };
+        match checked {
+            Ok(()) => {}
             Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
                 return Err(err.into());
             }
             Err(reason) => {
                 drop(txn);
-                end_request(
-                    client,
-                    id,
-                    &source_table,
-                    &format!(
-                        "the resume was refused: define would refuse the definition as the \
-                         schema stands now: {reason}. Fix that and resume it again, or drop \
-                         the definition and define it again"
-                    ),
-                )
-                .await?;
+                end_request(client, id, &source_table, &refused_resume_text(&reason)).await?;
                 return Ok(());
             }
         }
@@ -4541,21 +4541,27 @@ async fn finish_requested_resume(
         Ok(ResumeStep::Retyping(_)) => {}
         Err(ApplyError::ResumeRefused { reason, .. }) => {
             drop(txn);
-            end_request(
-                client,
-                id,
-                &source_table,
-                &format!(
-                    "the resume was refused: define would refuse the definition as the schema \
-                     stands now: {reason}. Fix that and resume it again, or drop the definition \
-                     and define it again"
-                ),
-            )
-            .await?;
+            end_request(client, id, &source_table, &refused_resume_text(&reason)).await?;
         }
         Err(err) => return Err(err),
     }
     Ok(())
+}
+
+/// What a resume the staging worker refused records for the operator
+/// ([`end_request`]): define's own refusal is fixed in the schema, a refusal
+/// only a resume makes ([`catalog::CatalogError::is_define_refusal`]) by
+/// dropping the definition and defining it again.
+fn refused_resume_text(reason: &catalog::CatalogError) -> String {
+    if reason.is_define_refusal() {
+        format!(
+            "the resume was refused: define would refuse the definition as the schema stands \
+             now: {reason}. Fix that and resume it again, or drop the definition and define it \
+             again"
+        )
+    } else {
+        format!("the resume was refused: {reason}")
+    }
 }
 
 /// A column of a definition's target that its resume re-types
