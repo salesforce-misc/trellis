@@ -3311,10 +3311,10 @@ async fn gated_resume(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trel
 /// the third cancellation ends the request, naming the timeout and both
 /// remedies. The definition stays paused, the copy keeps its type and the
 /// target its rows. A `RESUME` while the request is still there starts the
-/// count over; one after it ended starts at 0 and, with the cause gone (the
-/// timeout raised), finishes the re-type.
+/// count over; one after it ended starts at 0 and, with the cause gone,
+/// finishes the re-type.
 #[tokio::test]
-async fn a_re_type_cancelled_three_times_ends_the_request_and_a_resume_after_raising_the_timeout_finishes()
+async fn a_re_type_cancelled_three_times_ends_the_request_and_a_resume_once_the_cause_is_gone_finishes()
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -3363,8 +3363,10 @@ async fn a_re_type_cancelled_three_times_ends_the_request_and_a_resume_after_rai
     assert!(
         error.contains("public.item_names.id")
             && error.contains("target table item_names")
-            && error.contains("statement_timeout cancelled the re-type 3 times")
+            && error.contains("re-type was cancelled 3 times, by a statement_timeout")
+            && error.contains("(last: canceling statement due to user request)")
             && error.contains("Raise statement_timeout for Trellis's role or database")
+            && error.contains("restart Trellis")
             && error.contains("resume the definition again")
             && error.contains("DROP TRANSFORM item_names and define it again")
             && !error.starts_with("resuming:"),
@@ -3481,7 +3483,10 @@ async fn a_re_type_outlasting_the_statement_timeout_is_counted() {
     let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
     set_gate(&raw, Some("sleep")).await;
 
-    raw.batch_execute("set statement_timeout = '1s'")
+    // The timeout bounds every statement of the pass, not only the re-type,
+    // so it is set well above what any of the others takes on a loaded box;
+    // the gate's 30 s sleep is still ten times over it.
+    raw.batch_execute("set statement_timeout = '3s'")
         .await
         .expect("set the timeout");
     capture_pass(&mut raw, &db.pool).await;

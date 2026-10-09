@@ -182,8 +182,11 @@ and honours the operator's, so a rewrite that outlasts it is cancelled (`57014`)
 rolled back and retried on the next pass, with the table locked `ACCESS EXCLUSIVE` up to
 the timeout each time. The request counts those cancellations (`resume_requests.timeout_cancels`,
 reset by every `RESUME`) and ends after 3, with an error that names the timeout and both
-remedies: raise `statement_timeout` for Trellis's role or database and `RESUME` again, or
-`DROP TRANSFORM` and define it again, which isn't subject to the re-type rewrite. A lock
+remedies: raise `statement_timeout` for Trellis's role or database, restart Trellis (a role
+or database setting reaches only new connections, and the staging worker keeps its own
+open) and `RESUME` again, or `DROP TRANSFORM` and define it again, which isn't subject to
+the re-type rewrite. A `pg_cancel_backend` of the re-type is a `57014` too, and counts the
+same way. A lock
 timeout or a lost connection isn't counted. A column whose re-type fails otherwise (a value its new
 type can't hold) ends the request with the error on the definition's
 `capture_failure`, and leaves that table's columns as they were; another table's,

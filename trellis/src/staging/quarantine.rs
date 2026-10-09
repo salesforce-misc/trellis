@@ -4813,8 +4813,15 @@ async fn record_transient_retry(
 /// `retry.labels` was cancelled [`RETYPE_TIMEOUT_CANCEL_LIMIT`] times by a
 /// `statement_timeout` (#894). The definition stays paused, the copies keep
 /// their types and the target its rows. Both remedies are named: raise the
-/// timeout and resume again, or drop the definition and define it again,
-/// which isn't subject to the re-type rewrite.
+/// timeout, restart Trellis and resume again, or drop the definition and
+/// define it again, which isn't subject to the re-type rewrite.
+///
+/// The restart is part of the first remedy: a `statement_timeout` set on a
+/// role or database reaches only connections opened after it, and the
+/// staging worker re-types on its long-lived producer session
+/// (`staging::session::ProducerSession`). A `pg_cancel_backend` of the
+/// re-type is a 57014 too, so the message says "cancelled" and quotes
+/// Postgres's reason for the last one.
 fn retype_cancelled_error(retry: &TransientRetry<'_>) -> String {
     let kept = if retry.retyped.is_empty() {
         String::new()
@@ -4823,13 +4830,15 @@ fn retype_cancelled_error(retry: &TransientRetry<'_>) -> String {
     };
     let target = retry.target;
     format!(
-        "the resume couldn't re-type Trellis's columns {} of the target table {target}: a \
-         statement_timeout cancelled the re-type {RETYPE_TIMEOUT_CANCEL_LIMIT} times ({}). \
-         Trellis honours the timeout. They keep their types{kept}, the target keeps its rows, \
-         and the definition stays paused. Raise statement_timeout for Trellis's role or \
-         database and resume the definition again, and the re-type can finish. Or DROP \
-         TRANSFORM {target} and define it again, which builds the target from empty and isn't \
-         subject to the re-type rewrite",
+        "the resume couldn't re-type Trellis's columns {} of the target table {target}: the \
+         re-type was cancelled {RETYPE_TIMEOUT_CANCEL_LIMIT} times, by a statement_timeout \
+         on Trellis's role or database or a cancel request (last: {}). Trellis honours the \
+         timeout. They keep their types{kept}, the target keeps its rows, and the definition \
+         stays paused. Raise statement_timeout for Trellis's role or database, restart \
+         Trellis so its staging worker connects with the new value (a role or database \
+         setting reaches only new connections), and resume the definition again, and the \
+         re-type can finish. Or DROP TRANSFORM {target} and define it again, which builds the \
+         target from empty and isn't subject to the re-type rewrite",
         retry.labels.join(", "),
         retry.error,
     )
@@ -7899,6 +7908,7 @@ mod unit_tests {
                 && error.contains("target table order_totals")
                 && error.contains("statement_timeout")
                 && error.contains("Raise statement_timeout for Trellis's role or database")
+                && error.contains("restart Trellis")
                 && error.contains("resume the definition again")
                 && error.contains("DROP TRANSFORM order_totals and define it again")
                 && !error.starts_with("resuming:"),

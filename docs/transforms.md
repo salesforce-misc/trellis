@@ -50,8 +50,8 @@ at once, the transform still `paused` with a `capture_failure` that says so,
 and the staging worker re-types them and starts the rebuild. The re-type honours
 the `statement_timeout` of Trellis's role or database: one cancelled three times ends
 the request, the transform still `paused`, and the `capture_failure` names the two
-remedies, raising the timeout and resuming again, or `DROP TRANSFORM` and defining
-again ([recommendations](recommendations.md#statement_timeout)). Other ways a
+remedies, raising the timeout, restarting Trellis and resuming again, or `DROP
+TRANSFORM` and defining again ([recommendations](recommendations.md#statement_timeout)). Other ways a
 source can drift after define are in
 [known correctness gaps](known-correctness-gaps.md).
 

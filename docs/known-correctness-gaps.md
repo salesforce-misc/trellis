@@ -742,7 +742,8 @@ actions isn't a safe form: it's wrong before 15.6 and 16.2.
   that outlasts it is cancelled, rolled back and retried on the next pass,
   blocking readers up to the timeout each time, and the third cancellation
   ends the request. The definition stays `paused`, its `capture_failure`
-  naming both remedies: raise the timeout for Trellis's role and `RESUME`
+  naming both remedies: raise the timeout for Trellis's role or database,
+  restart Trellis (the setting reaches only new connections) and `RESUME`
   again, or `DROP TRANSFORM` and define it again. The `RESUME` itself
   returns at once; the definition stays `paused`, its `capture_failure`
   saying it's resuming, until the staging worker has re-typed the copies and
