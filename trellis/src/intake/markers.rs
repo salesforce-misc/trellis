@@ -2400,28 +2400,6 @@ mod catch_up_tests {
         register_reader(&db, "public.b", "b_reader").await;
         capture_for_test(&mut client, &["public.a", "public.b"]).await;
 
-        let dbg = client
-            .query(
-                "select target_table, status, build from transform_definitions",
-                &[],
-            )
-            .await
-            .unwrap();
-        for r in dbg {
-            eprintln!(
-                "DBG {} {} {:?}",
-                r.get::<_, String>(0),
-                r.get::<_, String>(1),
-                r.get::<_, Option<String>>(2)
-            );
-        }
-        let dbg = client
-            .query("select table_name from pending_backfill", &[])
-            .await
-            .unwrap();
-        for r in dbg {
-            eprintln!("DBGM {}", r.get::<_, String>(0));
-        }
         let waits = AtomicUsize::new(0);
         let give_up = || {
             waits.fetch_add(1, Ordering::Relaxed);

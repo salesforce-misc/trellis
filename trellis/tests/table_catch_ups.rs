@@ -302,6 +302,38 @@ async fn rebuild_rows(client: &Client, target: &str) -> (i64, i64, Option<i64>, 
     (row.get(0), row.get(1), row.get(2), row.get(3))
 }
 
+/// Runs every claimable plan job and `rederive` chunk, as a drain worker
+/// would, but no sweep and no merge, so a rebuild is left part way.
+async fn run_plan_and_chunks(pool: &trellis::Pool) {
+    use trellis::defs::chunk_queue;
+    const BY: &str = "table_catch_ups_test_build_worker";
+    let options = trellis::staging::build::WorkerOptions {
+        chunk_rows: trellis::staging::build::DEFAULT_CHUNK_ROWS,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    };
+    loop {
+        let claimed = {
+            let client = pool.get().await.expect("acquire connection");
+            chunk_queue::claim_chunks_of(
+                &**client,
+                BY,
+                1,
+                &[chunk_queue::KIND_PLAN, chunk_queue::KIND_REDERIVE],
+            )
+            .await
+            .expect("claim build work")
+        };
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            trellis::staging::build::run_claimed(pool, chunk, BY, &options).await;
+        }
+    }
+}
+
 async fn active_seq(client: &Client) -> i64 {
     client
         .query_one("select active_seq from segment_pointer", &[])
@@ -477,6 +509,10 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
 /// plan's chunks may have read rows before whatever the second request
 /// repairs, so the call enqueues a plan and a sweep of its own, and the
 /// definition goes `live` when both rebuilds are done.
+///
+/// Here the first rebuild's plan and chunks have run when the rows are
+/// deleted, so their entries' bases postdate the first sweep's start and it
+/// leaves them: only the second request's sweep drops group `b`.
 #[tokio::test]
 async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     let cluster = TestCluster::start();
@@ -495,6 +531,16 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     let trellis = connect_trellis(db.dsn()).await;
 
     trellis.request_backfill("sales").await.expect("request");
+    run_plan_and_chunks(&db.pool).await;
+    assert_eq!(
+        rebuild_rows(&client, "public.sku_totals").await.0,
+        0,
+        "the first rebuild's plan has run"
+    );
+    client
+        .batch_execute("delete from public.sales where id in (3, 4)")
+        .await
+        .expect("delete source rows, their CDC lost");
     trellis
         .request_backfill("sales")
         .await
@@ -502,12 +548,12 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
 
     assert_eq!(status_of(&client, "public.sku_totals").await, "backfilling");
     let (plans, sweeps, ..) = rebuild_rows(&client, "public.sku_totals").await;
-    assert_eq!((plans, sweeps), (2, 2), "each request enqueued its own");
+    assert_eq!(
+        (plans, sweeps),
+        (1, 2),
+        "the second request enqueued a plan and a sweep of its own"
+    );
 
-    client
-        .batch_execute("delete from public.sales where id in (3, 4)")
-        .await
-        .expect("delete source rows, their CDC lost");
     markers::settle_builds(&db.pool).await;
     discharge_markers(&db.pool, &mut client).await;
 
