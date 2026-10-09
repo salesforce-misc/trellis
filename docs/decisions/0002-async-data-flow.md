@@ -543,6 +543,13 @@ applying.
   fence stays. *Evidence:* `tests/target_mutation_seam.rs` freezes an upstream
   writer after its reader check and starts the downstream: without the fence
   the downstream misses the writer's row.
+  A source that is another aggregate's target is keyed by its nullable
+  `GROUP BY` columns, and a key with a `NULL` part is in no chunk's range
+  (the range is a row comparison). An aggregate's plan job stages an
+  image-less `Recompute` for each such key when its walk ends, which a page
+  re-derives under the entry lock. Those rows can still be in the ring when
+  the build flips `live`; their origin is unknown, so a token taken after the
+  flip waits for them, as for any seam row.
 - **Builds that keep the one-pass path.** The Re-derive build serves an
   aggregate or 1-1 definition on a captured source or on another
   definition's target. Two kinds keep the one-pass build: a definition with a
