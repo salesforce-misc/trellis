@@ -88,7 +88,7 @@ These are the tools the entries refer to:
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | #782 |
-| 5 | Capture switched off and back on between two reconcile passes | yes | no | #707, study pending |
+| 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
@@ -196,7 +196,18 @@ COMMIT;
 ```
 
 The same applies to bulk-load tools that disable triggers around a load and
-restore them to `ALWAYS`.
+restore them to `ALWAYS`, and to a table attached to a partition or
+inheritance hierarchy and detached again between two passes, with writes
+routed through the hierarchy's parent in between: those fire the parent's
+triggers, not the table's.
+
+```sql
+BEGIN;
+ALTER TABLE orders_all ATTACH PARTITION orders FOR VALUES FROM (MINVALUE) TO (MAXVALUE);
+UPDATE orders_all SET status = 'archived' WHERE created_at < '2025-01-01';
+ALTER TABLE orders_all DETACH PARTITION orders;
+COMMIT;
+```
 
 **Effect:** the writes made while capture was off never reach Trellis.
 Targets stay wrong until each affected row is written again, with nothing
@@ -863,7 +874,8 @@ refusing them up front:
   a plain table again. Writes made through the hierarchy before the pass sees
   it are missed, or, on an inheritance parent, a child's rows are staged as
   the parent's own; the resume's rebuild re-reads the table and repairs
-  both. Capture's
+  both. A table that joins and leaves a hierarchy between two passes is
+  never seen, which is entry 5. Capture's
   window before the pass sees row-level security is entry 11. Once
   partitioned sources are supported (#897), a `MERGE` that moves a row
   between partitions is entry 25.
