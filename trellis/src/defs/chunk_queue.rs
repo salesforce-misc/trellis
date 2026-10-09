@@ -334,14 +334,16 @@ pub(crate) async fn dispatch_one_to_one(
 ///
 /// Clears `build`: a definition paused during a Re-derive build and resumed
 /// onto this path is no longer under one, so it must not apply while this
-/// build runs (`defs::model::APPLYING_SQL`, #625 F2).
+/// build runs (`defs::model::APPLYING_SQL`, #625 F2), and forgets the marker
+/// generation that build's start read (#938).
 async fn start_backfilling(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
 ) -> Result<bool, CatalogError> {
     let promoted = txn
         .execute(
-            "update transform_definitions set status = $1, build = null \
+            "update transform_definitions \
+             set status = $1, build = null, build_marker_generation = null \
              where id = $2 and status = $3",
             &[
                 &TransformStatus::Backfilling.as_str(),

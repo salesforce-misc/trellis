@@ -1353,6 +1353,18 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// changes committed after the start, drained by pages that read the
 /// definition list after it, so none is dropped.
 ///
+/// **The start's marker (#938).** The start also stores the generation of
+/// its source's `pending_backfill` marker that it read, as
+/// `build_marker_generation` (null if the source has none). Every park draws a
+/// fresh generation, and a capture install or widen parks in the transaction
+/// that changes the capture, so a start that read generation `g` began after
+/// the park that made `g` committed. The discharge of a marker still at
+/// generation `g` then has nothing to enumerate for this definition once it
+/// is applying again: its chunks read every row the capture didn't stage, and
+/// the capture stages every change after. A marker re-parked since has a
+/// newer generation, and the definition counts as a reader of it again
+/// (`defs::catalog::table_has_reader`).
+///
 /// Returns `None`, writing nothing, when the definition left
 /// `waiting_to_backfill` meanwhile, and otherwise the readers in other
 /// definitions its release of `awaiting_capture` pauses left paused
@@ -1421,6 +1433,16 @@ async fn start(
         )
         .await?;
     }
+    // The source marker's generation this start read (#938): see this
+    // function's doc, "The start's marker".
+    txn.execute(
+        "update transform_definitions d set build_marker_generation = \
+             (select pb.generation from pending_backfill pb \
+              where pb.table_name = d.source_table) \
+         where d.id = $1",
+        &[&definition.id],
+    )
+    .await?;
     // The start's segment (#733), last, so the share lock that keeps the
     // active segment from sealing until this commits is held only for the
     // commit. See this function's doc.

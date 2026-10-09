@@ -3962,7 +3962,8 @@ async fn complete_resume(
     // `catalog::table_has_reader` would skip.
     txn.execute(
         "update transform_definitions \
-         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
+         set status = $1, fuse_rearmed_at = now(), build = null, \
+             build_marker_generation = null where id = $2",
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;

@@ -1,0 +1,14 @@
+-- #938: the generation of its source's `pending_backfill` marker that a
+-- definition's latest Re-derive build start (`staging::build`'s start) read
+-- in its own transaction, or null if the source had no marker then or no
+-- Re-derive build has started the definition (a resume, or a dispatch to the
+-- old chunked path, clears it).
+--
+-- A marker's generation is drawn afresh by every park, so a start that read
+-- generation g began after the capture install or widen that parked g
+-- committed (the park is in that transaction). The build's chunks then read
+-- every row that install did not capture, and every later change is captured
+-- into the ring, so a discharge of the marker that still has generation g
+-- needn't enumerate the table for this definition
+-- (`defs::catalog::table_has_reader`).
+alter table transform_definitions add column build_marker_generation bigint;

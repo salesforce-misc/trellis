@@ -423,3 +423,178 @@ async fn a_waiting_rederive_builds_related_table_is_not_enumerated() {
         "waiting_to_backfill"
     );
 }
+
+/// The marker row's generation for `table`, which every park draws afresh.
+async fn marker_generation(client: &Client, table: &str) -> i64 {
+    client
+        .query_one(
+            "select generation from pending_backfill where table_name = $1",
+            &[&table],
+        )
+        .await
+        .expect("read the marker's generation")
+        .get(0)
+}
+
+async fn build_marker_generation(client: &Client, target: &str) -> Option<i64> {
+    client
+        .query_one(
+            "select build_marker_generation from transform_definitions \
+             where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read a definition's build_marker_generation")
+        .get(0)
+}
+
+/// Captures `widgets` (three rows already in it), registers `widget_copy`, a
+/// plain 1-1 target the Re-derive build takes, starts its build and runs it
+/// to `live`, all before the capture's install marker is discharged: the
+/// order the maintenance loop's first reconcile pass can meet when the drain
+/// workers finish a small build before it discharges the marker (#938).
+/// Returns the connection and the definition's id.
+async fn build_finished_before_the_install_marker_is_discharged(
+    db: &testkit::TestDatabase,
+    live_reader_first: bool,
+) -> (Client, i64) {
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key, grp text, n bigint); \
+             insert into widgets (id, grp, n) values (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)",
+        )
+        .await
+        .expect("seed source");
+    let columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("grp".to_string(), ValueType::Text),
+        ("n".to_string(), ValueType::Numeric),
+    ]);
+    if live_reader_first {
+        trellis::defs::create_definition(
+            &db.pool,
+            "TRANSFORM widget_old FROM widgets SELECT id AS id2",
+            &columns,
+        )
+        .await
+        .expect("register a reader that goes live before the capture");
+        assert_eq!(status_of(&client, "widget_old").await, "live");
+    }
+    let definition = install_definition(
+        &db.pool,
+        "TRANSFORM widget_copy FROM widgets SELECT n AS n",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("register a plain 1-1 target");
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    capture(&mut client, std::slice::from_ref(&table)).await;
+    let taken =
+        trellis::staging::build::start_ready_builds(&mut client, &db.pool, &[definition.id])
+            .await
+            .expect("start the Re-derive build");
+    assert_eq!(taken, vec![definition.id], "the build starts");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(status_of(&client, "widget_copy").await, "live");
+    assert_eq!(
+        pending_marker_count(&client).await,
+        1,
+        "the install marker is still waiting for its discharge"
+    );
+    (client, definition.id)
+}
+
+/// Issue #938 (a): a Re-derive build that started after the capture install
+/// parked its marker, and finished before the marker's discharge, read every
+/// row itself and has had every later change staged, so the discharge has
+/// nothing to enumerate for it.
+#[tokio::test]
+async fn a_rederive_build_finished_before_its_install_markers_discharge_is_not_enumerated_for() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, _) = build_finished_before_the_install_marker_is_discharged(&db, false).await;
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    assert_eq!(
+        build_marker_generation(&client, "widget_copy").await,
+        Some(marker_generation(&client, &table).await),
+        "the start read the install's marker"
+    );
+
+    discharge(&mut client).await;
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        0,
+        "no Recompute is staged for the finished build"
+    );
+    assert!(
+        !trellis::staging::has_pending(&client)
+            .await
+            .expect("has_pending"),
+        "the discharge staged nothing"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+    let copied: i64 = client
+        .query_one("select count(*) from public.widget_copy", &[])
+        .await
+        .expect("count the target")
+        .get(0);
+    assert_eq!(copied, 3, "the build itself read every row");
+}
+
+/// Issue #938 (a), the other direction: a park after the build started draws a
+/// newer generation than the one its start read, so the build counts as a
+/// reader of the new marker again. The skip is for a marker the start has
+/// seen, not for every marker on the table.
+#[tokio::test]
+async fn a_marker_parked_after_a_rederive_builds_start_is_still_enumerated() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, _) = build_finished_before_the_install_marker_is_discharged(&db, false).await;
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    let started_at = build_marker_generation(&client, "widget_copy").await;
+    // A park, as `markers::park_marker` makes one.
+    client
+        .execute(
+            "update pending_backfill set generation = default where table_name = $1",
+            &[&table],
+        )
+        .await
+        .expect("re-park the marker");
+    assert_ne!(
+        Some(marker_generation(&client, &table).await),
+        started_at,
+        "the re-park drew a new generation"
+    );
+
+    discharge(&mut client).await;
+
+    assert_eq!(
+        recompute_count(&client, &table).await,
+        3,
+        "every row is enumerated for the live reader"
+    );
+}
+
+/// Issue #938 (a): skipping the finished build doesn't skip another reader.
+/// One that went live before the capture existed (a repair install, say) has
+/// no start that read this marker, and still needs every row.
+#[tokio::test]
+async fn a_reader_the_install_did_not_precede_still_gets_the_enumeration_beside_a_finished_build() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, _) = build_finished_before_the_install_marker_is_discharged(&db, true).await;
+    let table = format!("{DEFAULT_SCHEMA}.widgets");
+    // The live reader's own registration staged rows before the capture.
+    let before = recompute_count(&client, &table).await;
+
+    discharge(&mut client).await;
+
+    assert_eq!(
+        recompute_count(&client, &table).await - before,
+        3,
+        "the older live reader still gets every row"
+    );
+}

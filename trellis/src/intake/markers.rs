@@ -908,13 +908,29 @@ pub(super) async fn fetch_read(
 ///
 /// The enumeration stages one image-less `Recompute` row per source key, for
 /// every applying reader of the table to re-derive. It runs when a
-/// ring-built definition needs it, or when anything other than this pass's
-/// background-built definitions (chunks or a direct-build job, which read the
-/// table themselves) and the waiting definitions the Re-derive build will
-/// start, which do too ([`waiting_rederive_builds`], issue #732), reads the
-/// table (a catch-up for applying readers). A marker on a table only those
-/// read, or nothing reads at all (issue #417), is discharged without
-/// enumerating.
+/// ring-built definition needs it, or when an applying reader needs it
+/// ([`crate::defs::catalog::table_has_reader`], issues #417, #732, #938): a
+/// `live` or `catching_up` definition (a catch-up's reader) with no Re-derive
+/// build running. A marker on a table nothing of that kind reads is discharged
+/// without enumerating. Three kinds of definition that read the table don't
+/// count, because a page would drop their share of the rows or the build
+/// already covers them:
+///
+/// - **One that isn't applying yet**, `waiting_to_backfill` (including one
+///   this pass doesn't dispatch, such as a relationship reader whose to-side
+///   isn't ready) or `backfilling` under a chunked or direct build. The marker
+///   that dispatches a waiting one enumerates for it if it is ring-built;
+///   a chunked or direct build reads the table itself, and its go-live
+///   catch-up enumerates after.
+/// - **One a Re-derive build is running for, or will start** (the waiting
+///   definitions in [`waiting_rederive_builds`]). Its chunks read the table.
+/// - **One anchored on the table whose Re-derive build started after the
+///   marker's last park** (issue #938). The build's start records the
+///   marker's generation it read (`transform_definitions.
+///   build_marker_generation`); equal to the marker's own, the start began
+///   after the capture install or widen that parked it, so its chunks read the
+///   rows the capture didn't stage and the capture staged every change since.
+///   The build may well have finished and gone `live` before this discharge.
 ///
 /// A go-live catch-up always enumerates. An earlier optimization let a
 /// direct build's catch-up skip a table that looked unchanged since the
@@ -1400,11 +1416,12 @@ async fn plan_waiting_builds(
 
 /// Every `waiting_to_backfill` definition, on any source, that the Re-derive
 /// build takes (`staging::build::qualifies`, #625 F3), in id order. The
-/// discharge neither dispatches one ([`plan_waiting_builds`]) nor counts it
-/// as a reader of the marker's table (issue #732): the build's start reads
-/// the source itself, from chunks planned after it commits, and every change
-/// committed before then is re-derived by the page that drains it
-/// (`staging::build::start`'s "The start's segment").
+/// discharge doesn't dispatch one ([`plan_waiting_builds`]) (issue #732): the
+/// build's start reads the source itself, from chunks planned after it
+/// commits, and every change committed before then is re-derived by the page
+/// that drains it (`staging::build::start`'s "The start's segment"). (It
+/// isn't a reader of the marker's table either, but no waiting definition
+/// is, [`crate::defs::catalog::table_has_reader`].)
 ///
 /// Leaving one out can't strand it, whether or not it still qualifies when
 /// the start runs. It isn't applying, so it wouldn't fold the enumeration's
@@ -1416,10 +1433,10 @@ async fn plan_waiting_builds(
 ///
 /// Read on `client` once per pass, before its first discharge's transaction
 /// opens ([`discharge_marker`]). A definition registered after this read is
-/// counted as a reader, which at worst enumerates for nothing, as before
-/// #732. So is one whose text doesn't parse: its own table's discharge meets
-/// the error in [`plan_waiting_builds`] and backs off (issues #407, #518),
-/// and every other table's discharge goes on without it.
+/// dispatched by the pass that finds it, as any waiting definition is. One
+/// whose text doesn't parse is left out: its own table's discharge meets the
+/// error in [`plan_waiting_builds`] and backs off (issues #407, #518), and
+/// every other table's discharge goes on without it.
 async fn waiting_rederive_builds(client: &tokio_postgres::Client) -> Result<Vec<i64>, IntakeError> {
     let ids: Vec<i64> = client
         .query(
@@ -1472,15 +1489,6 @@ async fn discharge_marker(
     let rederive = rederive.as_deref().unwrap_or_default();
     let builds = plan_waiting_builds(client, &marker.table, ready, rederive).await?;
     let waiting: Vec<i64> = builds.iter().map(|(id, _)| *id).collect();
-    // Definitions whose build reads the table itself, in the background:
-    // those this discharge dispatches to chunks or a direct-build job, and
-    // those the Re-derive build will start (issue #732).
-    let background: Vec<i64> = builds
-        .iter()
-        .filter(|(_, build)| !matches!(build, Build::Ring))
-        .map(|(id, _)| *id)
-        .chain(rederive.iter().copied())
-        .collect();
     let ring: Vec<i64> = builds
         .iter()
         .filter(|(_, build)| matches!(build, Build::Ring))
@@ -1519,7 +1527,7 @@ async fn discharge_marker(
         .add(&txn, &catching_up_now, TransformStatus::CatchingUp)
         .await?;
     let enumerate = !ring.is_empty()
-        || crate::defs::catalog::table_has_reader(&txn, &marker.table, &background).await?;
+        || crate::defs::catalog::table_has_reader(&txn, &marker.table, marker.generation).await?;
     let declared = declare_read(&txn, enumerate.then_some(marker.table.as_str()), &sweep).await?;
     if enumerate {
         let horizon: PgLsn = txn
@@ -4859,5 +4867,127 @@ mod dispatch_tests {
             staged(&client).await,
             "the live reader's enumeration is staged"
         );
+    }
+
+    /// Runs one discharge pass that dispatches none of the waiting
+    /// definitions (`ready` empty), as one whose relationship's to-side isn't
+    /// ready yet isn't dispatched.
+    async fn discharge_dispatching_nothing(client: &mut tokio_postgres::Client) {
+        run_pending_backfills_for(
+            client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+            &|| false,
+            Some(&[]),
+        )
+        .await
+        .expect("discharge");
+    }
+
+    /// Issue #938: a `waiting_to_backfill` definition the pass doesn't
+    /// dispatch isn't applying, so a page would drop every row an
+    /// enumeration staged for it; the marker that does dispatch it enumerates
+    /// for it if its build is a ring one, and a chunked or direct build reads
+    /// the table itself. Counting it enumerated the table twice.
+    #[tokio::test]
+    async fn a_waiting_definition_the_pass_does_not_dispatch_is_not_a_reader() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        feed_orders_from_another_definition(&client).await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT a + a AS x",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge_dispatching_nothing(&mut client).await;
+
+        assert!(!staged(&client).await, "nothing applying reads the table");
+        assert!(
+            markers(&client).await.is_empty(),
+            "the marker is discharged"
+        );
+        assert_eq!(status(&client, id).await, "waiting_to_backfill");
+        assert_eq!(chunks(&client, id).await, 0);
+    }
+
+    /// Issue #938: leaving the undispatched waiting definition out doesn't
+    /// leave out an applying reader of the same table.
+    #[tokio::test]
+    async fn a_live_reader_still_gets_the_enumeration_beside_a_waiting_one_the_pass_skips() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        feed_orders_from_another_definition(&client).await;
+        define(
+            &client,
+            "public.orders",
+            "public.old",
+            "TRANSFORM old FROM orders SELECT a AS x",
+            "live",
+        )
+        .await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT a + a AS x",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge_dispatching_nothing(&mut client).await;
+
+        assert!(staged(&client).await, "the live reader's rows are staged");
+        assert_eq!(status(&client, id).await, "waiting_to_backfill");
+    }
+
+    /// Issue #938: a definition mid-build (`backfilling` under a chunked or
+    /// direct build) isn't applying either: its build reads the table, and
+    /// its go-live catch-up, which does enumerate, covers what changes
+    /// meanwhile. A second marker on its table has nothing to stage.
+    #[tokio::test]
+    async fn a_second_marker_on_a_table_only_a_chunked_build_reads_is_not_enumerated() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        feed_orders_from_another_definition(&client).await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT a + a AS x",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "backfilling");
+        assert!(!staged(&client).await, "precondition: nothing staged yet");
+
+        park_marker(&client, "public.orders")
+            .await
+            .expect("park a second marker");
+        discharge(&mut client).await;
+
+        assert!(
+            !staged(&client).await,
+            "the build is not applying, so it would drop the rows"
+        );
+        assert!(
+            markers(&client).await.is_empty(),
+            "the marker is discharged"
+        );
+        assert_eq!(status(&client, id).await, "backfilling");
     }
 }

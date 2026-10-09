@@ -7320,37 +7320,53 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
     )
 }
 
-/// Whether any registered definition other than `excluding` that isn't
-/// frozen reads `qualified_table`: as its anchor source, or through a
-/// relationship path ([`all_source_tables`]'s set). The backfill discharge
-/// ([`crate::intake::markers::run_pending_backfills`]) skips enumerating
-/// a table this says `false` for (issue #417), since nothing would consume the
-/// `Recompute` rows; it excludes the definitions it just dispatched to chunked
-/// builds, which read the table themselves (issue #418), and every
-/// `waiting_to_backfill` definition the Re-derive build will start (issue
-/// #732). This leaves out every definition a Re-derive build is running for,
-/// whose chunks read the table too (#625 F2).
+/// Whether `qualified_table` has a reader that would fold the rows of an
+/// enumeration of it: a definition that applies (`live` or `catching_up`,
+/// [`TransformStatus::is_applying`]) and has no Re-derive build running,
+/// reading the table as its anchor source or through a relationship path
+/// ([`all_source_tables`]'s set). The backfill discharge
+/// ([`crate::intake::markers::run_pending_backfills`]) skips enumerating a
+/// table this says `false` for, since nothing would consume the `Recompute`
+/// rows (issues #417, #732, #938).
 ///
-/// A frozen definition doesn't count (issue #813): the drain drops its share
-/// of every page, and its resume rebuilds it from the source. Counting it
-/// would also have a discharge re-read a table Postgres refuses the role,
-/// for nothing, after the refusal paused every reader of it.
+/// Any other definition reading the table doesn't count, because the drain
+/// drops its share of the rows and something else covers it:
+///
+/// - **A definition whose Re-derive build is running** (#625 F2) reads the
+///   table in its chunks, and applies the changes after its start.
+/// - **A `waiting_to_backfill` or `backfilling` definition** isn't applying,
+///   so a page drops its share of the rows. The marker that dispatches a
+///   waiting one enumerates for it if its build is ring-built; a chunked or
+///   direct build reads the table itself, and its go-live catch-up (a
+///   `catching_up` reader) enumerates for it after.
+/// - **A frozen definition** (issue #813): the drain drops its share of every
+///   page, and its resume rebuilds it from the source. Counting it would also
+///   have a discharge re-read a table Postgres refuses the role, for nothing,
+///   after the refusal paused every reader of it.
+/// - **A definition anchored on the table whose Re-derive build started after
+///   the marker's last park** (#938): `marker_generation` is the generation of
+///   the marker being discharged, and `transform_definitions.
+///   build_marker_generation` is the one its start read. They are equal only
+///   when the start read the marker as it is now, so it began after the
+///   capture install or widen that parked it committed. Its chunks read every
+///   row the capture didn't stage, and the capture stages every later change.
+///   A start that read no marker, or an older generation, still counts.
 pub(crate) async fn table_has_reader(
     client: &impl GenericClient,
     qualified_table: &str,
-    excluding: &[i64],
+    marker_generation: i64,
 ) -> Result<bool, tokio_postgres::Error> {
     readers_exist(
         client,
         qualified_table,
-        excluding,
-        &TransformStatus::dispatchable(),
+        &TransformStatus::applying(),
+        Some(marker_generation),
     )
     .await
 }
 
-/// Whether `qualified_table` has readers ([`table_has_reader`]'s sense) and
-/// every one is frozen (issue #813). A backfill discharge then skips its
+/// Whether `qualified_table` has readers of any non-frozen status and every
+/// one is frozen (issue #813). A backfill discharge then skips its
 /// projection refresh: each frozen reader's resume refreshes the
 /// projections it reads (#768), and the refresh would re-read a to-side
 /// Postgres may refuse the role, after the refusal paused its readers. A
@@ -7364,25 +7380,37 @@ pub(crate) async fn table_readers_all_frozen(
         .filter(|status| status.is_frozen())
         .map(|status| status.as_str())
         .collect();
-    Ok(readers_exist(client, qualified_table, &[], &frozen).await?
-        && !table_has_reader(client, qualified_table, &[]).await?)
+    Ok(readers_exist(client, qualified_table, &frozen, None).await?
+        && !readers_exist(
+            client,
+            qualified_table,
+            &TransformStatus::dispatchable(),
+            None,
+        )
+        .await?)
 }
 
-/// Whether a registered definition other than `excluding`, in one of
-/// `statuses`, with no Re-derive build running, reads `qualified_table`.
+/// Whether a registered definition in one of `statuses`, with no Re-derive
+/// build running, reads `qualified_table`, other than (with
+/// `skip_started_at`) an anchor reader of it whose Re-derive build started at
+/// that marker generation ([`table_has_reader`]).
 async fn readers_exist(
     client: &impl GenericClient,
     qualified_table: &str,
-    excluding: &[i64],
     statuses: &[&str],
+    skip_started_at: Option<i64>,
 ) -> Result<bool, tokio_postgres::Error> {
     Ok(client
         .query_one(
             &format!(
                 "{} select exists (select 1 from reachable where table_name = $1)",
-                reachable_tables_cte("not (id = any($2)) and build is null and status = any($3)")
+                reachable_tables_cte(
+                    "build is null and status = any($2) \
+                     and not (source_table = $1 \
+                              and coalesce(build_marker_generation = $3::bigint, false))"
+                )
             ),
-            &[&qualified_table, &excluding, &statuses],
+            &[&qualified_table, &statuses, &skip_started_at],
         )
         .await?
         .get(0))
