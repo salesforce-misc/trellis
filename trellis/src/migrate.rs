@@ -42,17 +42,15 @@ use crate::pool::Pool;
 /// schema up to date without standing up a facade.
 pub async fn migrate(pool: &Pool, config: &Config) -> Result<(), Error> {
     // One attach at a time per database: the instance-conflict check reads
-    // the markers other attaches write. See `identity::AttachLock`.
-    let lock = identity::AttachLock::acquire(pool).await?;
-    let attached = attach(pool, config).await;
+    // the markers other attaches write. The attach runs on the lock's own
+    // session, so the lock can't end before it. See `identity::AttachLock`.
+    let mut lock = identity::AttachLock::acquire(pool).await?;
+    let attached = attach(lock.client(), config).await;
     lock.release().await;
     attached
 }
 
-async fn attach(pool: &Pool, config: &Config) -> Result<(), Error> {
-    let mut client = pool.get().await?;
-    let pg_client: &mut tokio_postgres::Client = &mut client;
-
+async fn attach(pg_client: &mut tokio_postgres::Client, config: &Config) -> Result<(), Error> {
     identity::prepare_attach(pg_client, config).await?;
 
     embedded::migrations::runner().run_async(pg_client).await?;

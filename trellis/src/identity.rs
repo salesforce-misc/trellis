@@ -325,8 +325,9 @@ async fn other_instances(
     Ok(others)
 }
 
-/// Serializes attaches across a database: held, on a connection of its own,
-/// from before [`prepare_attach`] until after [`seed_marker`].
+/// Serializes attaches across a database: held, on a connection of its own
+/// that the attach then runs on, from before [`prepare_attach`] until after
+/// [`seed_marker`].
 ///
 /// Rules 3 and 4 compare this instance with the markers the others have
 /// written, and a marker is written at the end of an attach. Unserialized,
@@ -339,7 +340,12 @@ async fn other_instances(
 ///
 /// A session-level advisory lock on a dedicated unpooled connection, so no
 /// path (an error, a dropped future) can hand a pooled connection that still
-/// holds it to the next borrower: dropping the connection releases it.
+/// holds it to the next borrower: dropping the connection releases it. The
+/// attach itself runs on that same connection ([`AttachLock::client`]), so
+/// the lock can't end before the attach does: a session that dies (a
+/// network drop, an operator's `pg_terminate_backend`, `idle_session_timeout`
+/// on a lock session left idle) takes its half-done attach with it, and the
+/// next attach never runs beside one.
 pub(crate) struct AttachLock {
     client: tokio_postgres::Client,
 }
@@ -348,7 +354,10 @@ pub(crate) struct AttachLock {
 /// attach runs every migration, and a client starting at the same moment
 /// waits for it. The session's usual `lock_timeout`
 /// ([`crate::locks::LOCK_TIMEOUT`]) guards transactions that hold a snapshot;
-/// this wait holds none.
+/// this wait holds none. It applies to the advisory lock's wait only: the
+/// attach that follows on the same session runs its migrations under the
+/// usual cap, so a migration's DDL never queues the instance's running
+/// workers behind it for longer than that.
 const ATTACH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The advisory-lock key of [`AttachLock`], one per database.
@@ -356,17 +365,21 @@ const ATTACH_LOCK_KEY: i64 = 0x5452_4c53_4154_5448;
 
 impl AttachLock {
     pub(crate) async fn acquire(pool: &crate::pool::Pool) -> Result<Self, Error> {
-        let client = pool.connect_unpooled().await?;
-        client
-            .batch_execute(&format!(
-                "set lock_timeout = {}",
-                ATTACH_LOCK_TIMEOUT.as_millis()
-            ))
+        let mut client = pool.connect_unpooled().await?;
+        // `set local`, so the long wait ends with this transaction. A
+        // session-level advisory lock outlives the transaction it was taken
+        // in.
+        let txn = client.transaction().await?;
+        crate::locks::set_local_lock_timeout(&txn, ATTACH_LOCK_TIMEOUT).await?;
+        txn.execute("select pg_advisory_lock($1)", &[&ATTACH_LOCK_KEY])
             .await?;
-        client
-            .execute("select pg_advisory_lock($1)", &[&ATTACH_LOCK_KEY])
-            .await?;
+        txn.commit().await?;
         Ok(Self { client })
+    }
+
+    /// The lock's own session, which the attach runs on.
+    pub(crate) fn client(&mut self) -> &mut tokio_postgres::Client {
+        &mut self.client
     }
 
     /// Releases the lock. Best effort: the connection closes with `self`
@@ -566,6 +579,37 @@ mod tests {
             .await
             .expect("attach task")
             .expect("attach once the lock is free");
+    }
+
+    /// The attach runs on the lock's own session, and only the lock's wait
+    /// gets [`ATTACH_LOCK_TIMEOUT`]: once the lock is held, the session is
+    /// back under the usual cap, so the migrations that follow can't queue
+    /// the instance's running workers behind a DDL lock for five minutes.
+    #[tokio::test]
+    async fn the_attach_runs_under_the_usual_lock_timeout_once_the_lock_is_held() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let config = Config::with_schema(db.dsn(), "instance_cap").expect("config");
+        let pool = crate::pool::Pool::new(&config).expect("pool");
+
+        let mut lock = AttachLock::acquire(&pool).await.expect("take the lock");
+        let row = lock
+            .client()
+            .query_one(
+                "select current_setting('lock_timeout'), \
+                        exists(select 1 from pg_locks where locktype = 'advisory' \
+                               and pid = pg_backend_pid() and granted)",
+                &[],
+            )
+            .await
+            .expect("read the session");
+        let (lock_timeout, held): (String, bool) = (row.get(0), row.get(1));
+        assert!(held, "the lock is held on the session the attach runs on");
+        assert_eq!(
+            lock_timeout,
+            format!("{}s", crate::locks::LOCK_TIMEOUT.as_secs())
+        );
+        lock.release().await;
     }
 
     #[test]

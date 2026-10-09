@@ -104,10 +104,14 @@ than `Config::target_schema` isn't covered.
 
 A marker is written at the end of an attach, so the check must not run while
 another attach is between its own check and its marker write. `migrate` holds
-one database-wide advisory lock (`identity::AttachLock`, a session lock on a
-dedicated connection, so it can't outlive the attach) from before the check to
-after the marker write. Attaches to one database therefore run one at a time,
-and a second one waits for the first for up to five minutes. Without it, two
+one database-wide advisory lock (`identity::AttachLock`) from before the check
+to after the marker write. It is a session lock on a dedicated connection that
+the attach itself runs on, so the lock can't outlive the attach, and the attach
+can't outlive the lock: a session that ends mid-attach rolls back its open
+migration and frees the lock together. Attaches to one database therefore run
+one at a time, and a second one waits for the first for up to five minutes
+(only that wait is that long; the migrations run under the usual
+`lock_timeout`), then fails with a lock timeout. Without it, two
 conflicting instances starting together would each scan before the other wrote
 its marker and both pass, and two clients of one instance starting together
 would both run the migration runner on the same new schema.

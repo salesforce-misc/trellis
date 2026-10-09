@@ -411,10 +411,6 @@ async fn catalog_schema_public_is_refused() {
         message.contains("\"public\""),
         "names the schema: {message}"
     );
-    assert!(
-        !schema_exists(&db, "app_targets").await,
-        "a refused attach creates nothing"
-    );
     let client = db.pool.get().await.expect("connect");
     let marker: bool = client
         .query_one(
@@ -487,8 +483,10 @@ async fn catalog_schema_that_is_another_instances_target_schema_is_refused() {
         message.contains("\"instance_a_targets\"") && message.contains("\"instance_a\""),
         "names the schema and the other instance's catalog schema: {message}"
     );
+    // Nothing creates a target schema, so `instance_a_targets` exists only if
+    // the refused attach went on to create it as its catalog.
     assert!(
-        !schema_exists(&db, "app_b").await,
+        !schema_exists(&db, "instance_a_targets").await,
         "a refused attach creates nothing"
     );
 }

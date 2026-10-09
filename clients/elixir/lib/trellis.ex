@@ -129,7 +129,7 @@ defmodule Trellis do
     `key=value` string. Nothing is read from the environment.
   - `:schema`: the schema Trellis keeps its own tables in. Default `"trellis"`.
     Not `"public"`, not `:target_schema`, and not another instance's catalog
-    or target schema; `connect` refuses those.
+    or target schema; `migrate/1` refuses those.
   - `:target_schema`: the schema a bare target table name is created in.
     Default `"public"`.
   - `:staging`: whether this connection runs the staging worker, which

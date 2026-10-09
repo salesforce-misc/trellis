@@ -100,7 +100,7 @@ module Trellis
     #   ("host=... dbname=...") or URL. Nothing is read from the environment.
     # - schema: the schema Trellis keeps its own tables in. Not "public", not
     #   target_schema, and not another instance's schema or target_schema;
-    #   connect refuses those.
+    #   migrate refuses those.
     # - target_schema: the schema a bare target table name is created in.
     # - staging: whether this process runs the staging worker, which installs
     #   change capture on the source tables and starts each new transform's
