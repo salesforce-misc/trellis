@@ -66,6 +66,20 @@ async fn register_reader(db: &testkit::TestDatabase) {
     )
     .await
     .expect("register a definition reading widgets");
+    hold_out_of_a_rebuild(db, "public.widgets_reader").await;
+}
+
+/// These tests drive the marker's enumeration for a live reader, so the
+/// definition writing `target` stays with the old build's catch-up instead of
+/// being rebuilt by the capture install (#625 F7).
+async fn hold_out_of_a_rebuild(db: &testkit::TestDatabase, target: &str) {
+    markers::hold_target_out_of_the_rederive_build(
+        &**db.pool.get().await.expect("connect"),
+        &format!("{DEFAULT_SCHEMA}.widgets"),
+        target,
+    )
+    .await
+    .expect("hold the definition out of the Re-derive build");
 }
 
 async fn pending_marker_count(client: &Client) -> i64 {
@@ -346,6 +360,7 @@ async fn a_waiting_rederive_build_beside_a_live_reader_still_enumerates() {
     .await
     .expect("register a live plain 1-1 target");
     assert_eq!(status_of(&client, "widget_copy").await, "live");
+    hold_out_of_a_rebuild(&db, "public.widget_copy").await;
 
     client
         .batch_execute(
@@ -482,6 +497,7 @@ async fn build_finished_before_the_install_marker_is_discharged(
         .await
         .expect("register a reader that goes live before the capture");
         assert_eq!(status_of(&client, "widget_old").await, "live");
+        hold_out_of_a_rebuild(db, "public.widget_old").await;
     }
     let definition = install_definition(
         &db.pool,

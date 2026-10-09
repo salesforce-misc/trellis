@@ -205,12 +205,18 @@ async fn seed_sales(client: &Client) {
 /// A 1-1 target row whose source row was deleted with no CDC reaching the
 /// target is gone once the re-backfill discharges. Before #522 the
 /// definition stayed `live`, the discharge swept nothing, and row 4 stayed.
+/// This is the catch-up flavour, for a source the Re-derive build leaves to
+/// the old build (`held_out`); [`a_requested_backfill_rebuilds_a_stale_one_to_one_row`]
+/// is the Re-derive flavour.
 #[tokio::test]
 async fn a_requested_backfill_sweeps_a_stale_one_to_one_row() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     seed_sales(&client).await;
+    markers::hold_out_of_the_rederive_build(&client, "public.sales")
+        .await
+        .expect("hold sales out of the Re-derive build");
     install_definition(
         &db.pool,
         "TRANSFORM sales_copy FROM sales SELECT amount AS amt",
@@ -246,15 +252,121 @@ async fn a_requested_backfill_sweeps_a_stale_one_to_one_row() {
     discharge_markers(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sales_copy").await, "live");
-    let rows: Vec<(i32, String)> = client
+    assert_eq!(
+        copy_rows(&client).await,
+        vec![
+            (1, "5".to_string()),
+            (2, "7".to_string()),
+            (3, "2".to_string()),
+            (5, "50".to_string()),
+        ],
+        "the row no source row backs is swept, and the rest match the source"
+    );
+}
+
+async fn copy_rows(client: &Client) -> Vec<(i32, String)> {
+    client
         .query("select id, amt::text from sales_copy order by id", &[])
         .await
         .expect("read sales_copy")
         .into_iter()
         .map(|r| (r.get(0), r.get(1)))
-        .collect();
+        .collect()
+}
+
+async fn sku_totals_rows(client: &Client) -> Vec<(String, String)> {
+    client
+        .query("select sku, total::text from sku_totals order by sku", &[])
+        .await
+        .expect("read sku_totals")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+/// The jobs and segment a definition's rebuild left: its plan and sweep
+/// jobs (not yet done), and its `build_seg`.
+async fn rebuild_rows(client: &Client, target: &str) -> (i64, i64, Option<i64>, Option<String>) {
+    let row = client
+        .query_one(
+            "select (select count(*) from backfill_chunks bc \
+                     where bc.definition_id = d.id and bc.kind = 'plan' and not bc.done), \
+                    (select count(*) from backfill_chunks bc \
+                     where bc.definition_id = d.id and bc.kind = 'sweep' and not bc.done), \
+                    d.build_seg, d.build \
+             from transform_definitions d where d.target_table = $1",
+            &[&target],
+        )
+        .await
+        .expect("read the definition's rebuild jobs");
+    (row.get(0), row.get(1), row.get(2), row.get(3))
+}
+
+async fn active_seq(client: &Client) -> i64 {
+    client
+        .query_one("select active_seq from segment_pointer", &[])
+        .await
+        .expect("read the active segment")
+        .get(0)
+}
+
+/// The Re-derive flavour (#625 F7): the call's own transaction moves the
+/// 1-1 definition `live -> backfilling` and enqueues a plan job and a sweep
+/// job, one row each, so it returns with the rebuild already visible. No
+/// marker catch-up is parked for it. The definition keeps applying while the
+/// rebuild runs, and ends `live` with the stale row swept.
+#[tokio::test]
+async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_sales(&client).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM sales_copy FROM sales SELECT amount AS amt",
+        &sales_types(),
+        "public",
+    )
+    .await
+    .expect("install the 1-1");
+    bring_live(&db.pool, &mut client).await;
+
+    client
+        .batch_execute("delete from public.sales where id = 4")
+        .await
+        .expect("delete a source row, its CDC lost");
+    let trellis = connect_trellis(db.dsn()).await;
+    trellis
+        .request_backfill("sales")
+        .await
+        .expect("request a re-backfill");
     assert_eq!(
-        rows,
+        status_of(&client, "public.sales_copy").await,
+        "backfilling",
+        "the call's own transaction started the rebuild"
+    );
+    let (plans, sweeps, build_seg, build) = rebuild_rows(&client, "public.sales_copy").await;
+    assert_eq!((plans, sweeps), (1, 1), "one plan and one sweep, a rebuild");
+    assert_eq!(build.as_deref(), Some("rederive"));
+    assert_eq!(
+        build_seg,
+        Some(active_seq(&client).await),
+        "pages of the segments the rebuild's start closed re-derive their keys"
+    );
+
+    // A change committed while the rebuild is pending still applies.
+    commit_and_stage(
+        &mut client,
+        "insert into public.sales values (5, 'b', 50)",
+        |lsn| sales_insert(lsn, 5, "b", 50),
+    )
+    .await;
+    markers::settle_builds(&db.pool).await;
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.sales_copy").await, "live");
+    assert_eq!(
+        copy_rows(&client).await,
         vec![
             (1, "5".to_string()),
             (2, "7".to_string()),
@@ -267,13 +379,18 @@ async fn a_requested_backfill_sweeps_a_stale_one_to_one_row() {
 
 /// The aggregate case: group `b` lost its only row and group `a` one of its
 /// rows, neither delete reaching the target. The re-read re-derives `a`
-/// from what it still has, and only the sweep can drop `b`.
+/// from what it still has, and only the sweep can drop `b`. This is the
+/// catch-up flavour ([`a_requested_backfill_sweeps_a_stale_one_to_one_row`]'s
+/// held-out source).
 #[tokio::test]
 async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     seed_sales(&client).await;
+    markers::hold_out_of_the_rederive_build(&client, "public.sales")
+        .await
+        .expect("hold sales out of the Re-derive build");
     install_definition(
         &db.pool,
         "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
@@ -298,14 +415,145 @@ async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
     discharge_markers(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
-    let totals: Vec<(String, String)> = client
-        .query("select sku, total::text from sku_totals order by sku", &[])
+    assert_eq!(
+        sku_totals_rows(&client).await,
+        vec![("a".to_string(), "12".to_string())]
+    );
+}
+
+/// The Re-derive flavour of the aggregate case (#625 F7): `request_backfill`
+/// on a `live` aggregate returns with the status already `backfilling`, so a
+/// caller that polls for `live` and then takes its token waits out the
+/// rebuild. The plan re-derives `a` and the sweep drops `b`.
+#[tokio::test]
+async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_sales(&client).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &sales_types(),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+    bring_live(&db.pool, &mut client).await;
+
+    client
+        .batch_execute("delete from public.sales where id in (3, 4)")
         .await
-        .expect("read sku_totals")
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect();
-    assert_eq!(totals, vec![("a".to_string(), "12".to_string())]);
+        .expect("delete source rows, their CDC lost");
+    let trellis = connect_trellis(db.dsn()).await;
+    trellis
+        .request_backfill("sales")
+        .await
+        .expect("request a re-backfill");
+    assert_eq!(status_of(&client, "public.sku_totals").await, "backfilling");
+    let (plans, sweeps, build_seg, _) = rebuild_rows(&client, "public.sku_totals").await;
+    assert_eq!((plans, sweeps), (1, 1), "one plan and one sweep, a rebuild");
+    assert_eq!(build_seg, Some(active_seq(&client).await));
+    assert_eq!(
+        sku_totals_rows(&client).await,
+        vec![
+            ("a".to_string(), "1012".to_string()),
+            ("b".to_string(), "2".to_string())
+        ],
+        "the call itself repairs nothing; the background rebuild does"
+    );
+
+    markers::settle_builds(&db.pool).await;
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
+    assert_eq!(
+        sku_totals_rows(&client).await,
+        vec![("a".to_string(), "12".to_string())]
+    );
+}
+
+/// A request while a rebuild runs rebuilds again (#625 F7): the first
+/// plan's chunks may have read rows before whatever the second request
+/// repairs, so the call enqueues a plan and a sweep of its own, and the
+/// definition goes `live` when both rebuilds are done.
+#[tokio::test]
+async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_sales(&client).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &sales_types(),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+    bring_live(&db.pool, &mut client).await;
+    let trellis = connect_trellis(db.dsn()).await;
+
+    trellis.request_backfill("sales").await.expect("request");
+    trellis
+        .request_backfill("sales")
+        .await
+        .expect("request again");
+
+    assert_eq!(status_of(&client, "public.sku_totals").await, "backfilling");
+    let (plans, sweeps, ..) = rebuild_rows(&client, "public.sku_totals").await;
+    assert_eq!((plans, sweeps), (2, 2), "each request enqueued its own");
+
+    client
+        .batch_execute("delete from public.sales where id in (3, 4)")
+        .await
+        .expect("delete source rows, their CDC lost");
+    markers::settle_builds(&db.pool).await;
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
+    assert_eq!(
+        sku_totals_rows(&client).await,
+        vec![("a".to_string(), "12".to_string())]
+    );
+}
+
+/// Only the readers the Re-derive build takes are rebuilt: a relationship
+/// consumer of the same table keeps the catch-up (#625 F7).
+#[tokio::test]
+async fn a_requested_backfill_rebuilds_only_the_readers_the_build_takes() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_copy FROM orders SELECT id AS oid",
+        &HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("customer_id".to_string(), ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install a plain 1-1 over orders");
+    bring_live(&db.pool, &mut client).await;
+
+    trellis
+        .request_backfill("orders")
+        .await
+        .expect("request a re-backfill");
+
+    assert_eq!(
+        status_of(&client, "public.order_copy").await,
+        "backfilling",
+        "the plain 1-1 is rebuilt"
+    );
+    assert_eq!(
+        status_of(&client, "public.order_names").await,
+        "catching_up",
+        "the relationship consumer keeps the marker's catch-up"
+    );
 }
 
 /// Seeds `customers` (the to-side) and `orders`, declares
@@ -394,13 +642,18 @@ async fn a_requested_backfill_of_a_to_side_catches_up_its_relationship_consumer(
 
 /// A table whose capture an operator dropped while a definition applied from
 /// it is captured again at the next reconcile. Its readers missed everything
-/// written meanwhile, so the install's join marker is their catch-up.
+/// written meanwhile, so the install's join marker is their catch-up. This is
+/// the catch-up flavour, for a source the Re-derive build leaves to the old
+/// build; the Re-derive flavour is [`a_table_whose_capture_is_reinstalled_rebuilds_its_readers`].
 #[tokio::test]
 async fn a_table_whose_capture_is_reinstalled_catches_up_its_readers() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     seed_sales(&client).await;
+    markers::hold_out_of_the_rederive_build(&client, "public.sales")
+        .await
+        .expect("hold sales out of the Re-derive build");
     install_definition(
         &db.pool,
         "TRANSFORM sales_copy FROM sales SELECT amount AS amt",
@@ -431,6 +684,49 @@ async fn a_table_whose_capture_is_reinstalled_catches_up_its_readers() {
         .into_iter()
         .map(|r| r.get(0))
         .collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+/// The Re-derive flavour (#625 F7): the install's own transaction rebuilds
+/// the readers the Re-derive build takes, so they read `backfilling` from the
+/// install's commit, with a plan and a sweep job, and end `live` with the
+/// row deleted while the table wasn't captured gone.
+#[tokio::test]
+async fn a_table_whose_capture_is_reinstalled_rebuilds_its_readers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_sales(&client).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM sales_copy FROM sales SELECT amount AS amt",
+        &sales_types(),
+        "public",
+    )
+    .await
+    .expect("install the 1-1");
+    bring_live(&db.pool, &mut client).await;
+    capture(&mut client, &["public.sales"]).await;
+    markers::settle_builds(&db.pool).await;
+    discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(status_of(&client, "public.sales_copy").await, "live");
+
+    uninstall(&mut client, "public.sales").await;
+    client
+        .batch_execute("delete from public.sales where id = 4")
+        .await
+        .expect("delete a row while sales isn't captured");
+    capture(&mut client, &["public.sales"]).await;
+    assert_eq!(status_of(&client, "public.sales_copy").await, "backfilling");
+    let (plans, sweeps, build_seg, _) = rebuild_rows(&client, "public.sales_copy").await;
+    assert_eq!((plans, sweeps), (1, 1), "one plan and one sweep, a rebuild");
+    assert_eq!(build_seg, Some(active_seq(&client).await));
+
+    markers::settle_builds(&db.pool).await;
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.sales_copy").await, "live");
+    let ids: Vec<i32> = copy_rows(&client).await.into_iter().map(|r| r.0).collect();
     assert_eq!(ids, vec![1, 2, 3]);
 }
 

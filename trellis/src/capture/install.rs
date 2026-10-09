@@ -11,7 +11,7 @@
 //!
 //! | Operation | When ([`plan`]) | Table lock | Marker it parks |
 //! |---|---|---|---|
-//! | [`install`] | nothing, or a partial install, is there | `SHARE ROW EXCLUSIVE` | the join marker, with catch-ups for the table's applying readers ([`park_table_catch_ups`]) |
+//! | [`install`] | nothing, or a partial install, is there | `SHARE ROW EXCLUSIVE` | the join marker, with a rebuild or a catch-up for each of the table's applying readers ([`park_table_catch_ups`]) |
 //! | [`widen`] | the table must image a column, key or group-key column it doesn't yet, or a function body is stale | `SHARE ROW EXCLUSIVE` | a registration marker for the new reader |
 //! | [`narrow`] | the table images columns no reader needs any more | none | none |
 //! | [`uninstall`] | nothing reads the table any more | `ACCESS EXCLUSIVE` (`DROP TRIGGER`'s) | none |
@@ -677,9 +677,13 @@ async fn attempt(
         )
         .await?
         .get(0);
+    // The definitions an install rebuilds (#625 F7), for the build segment
+    // below.
+    let mut rebuilt = Vec::new();
     match op {
         Op::Install(_) => {
-            crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()]).await?
+            rebuilt =
+                crate::intake::markers::park_table_catch_ups(&txn, &[table.to_string()]).await?
         }
         Op::Widen(_) => crate::intake::markers::park_widen_marker(&txn, table).await?,
         Op::Uninstall(_) => {}
@@ -723,6 +727,9 @@ async fn attempt(
         )
         .await?;
     }
+    // Last, so the share lock on the active segment is held only for the
+    // commit, not for the table lock's wait.
+    crate::staging::build::stamp_rebuild_seg(&txn, &rebuilt).await?;
     txn.commit().await?;
     Ok(())
 }

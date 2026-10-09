@@ -188,7 +188,8 @@ pause are arcs of one lifecycle:
   The staging worker starts it with no marker, and it is maintained from the start, so it goes
   from `backfilling` straight to `live` once its last chunk (and, for an aggregate,
   its last group merge) has committed, with no `catching_up`. Its resume rebuilds it
-  the same way, over the ledger the freeze left. A ring enumeration (the fallback
+  the same way, over the ledger the freeze left, and so does a re-read of its
+  source (`Trellis::request_backfill`). A ring enumeration (the fallback
   for a shape neither build can render) never shows this status: it goes from
   `waiting_to_backfill` straight to `live` in the discharge's own transaction (or
   to `catching_up`, when its source is another transform's target).
@@ -205,7 +206,10 @@ pause are arcs of one lifecycle:
   * a resumed column;
   * a rebuild of a transform whose target it reads;
   * a re-read of a table it reads (`Trellis::request_backfill`, or the table's
-    capture triggers put back after someone dropped them).
+    capture triggers put back after someone dropped them), unless the
+    Re-derive build serves it: that definition goes `backfilling` instead,
+    in the call's own transaction, and returns to `live` when the rebuild
+    is done.
 
   A `live` transform that reads an upstream which isn't `live` reports
   `catching_up` too.

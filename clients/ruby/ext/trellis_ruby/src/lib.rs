@@ -226,8 +226,8 @@ impl Handle {
         array(ruby, summaries, relationship_summary_hash)
     }
 
-    /// Parks a go-live catch-up re-read of `source_table` for the staging
-    /// worker.
+    /// Re-reads `source_table` for its applying readers: a rebuild, or a
+    /// go-live catch-up for the staging worker.
     fn request_backfill(ruby: &Ruby, rb_self: &Self, source_table: String) -> Result<(), Error> {
         rb_self.call(ruby, move |trellis| trellis.request_backfill(&source_table))
     }

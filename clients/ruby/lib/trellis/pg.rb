@@ -221,11 +221,12 @@ module Trellis
     # resolved like one in a statement) for every definition that reads it,
     # and returns once that re-read is queued.
     #
-    # Each :live reader reports :catching_up until the re-read has re-derived
-    # every row the table still has and deleted any target row it no longer
-    # backs. A newly defined transform doesn't need this: its backfill is
-    # queued for it. Only a table Trellis already captures can be re-read;
-    # any other raises NotFoundError.
+    # Each :live reader reports :backfilling (a plain aggregate or a plain
+    # 1-1 transform, rebuilt by the call itself) or :catching_up (any other)
+    # until the re-read has re-derived every row the table still has and
+    # deleted any target row it no longer backs. A newly defined transform
+    # doesn't need this: its backfill is queued for it. Only a table Trellis
+    # already captures can be re-read; any other raises NotFoundError.
     def request_backfill(source_table)
       string!("the source table", source_table)
       handle.request_backfill(source_table)

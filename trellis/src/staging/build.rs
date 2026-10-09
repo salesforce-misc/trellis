@@ -29,6 +29,19 @@
 //!   didn't (its `basis` is null or older than the start), which is a key
 //!   deleted while the definition was frozen. A fresh build's ledger is
 //!   empty at its start, so it gets no sweep.
+//! - **Rebuild of an applying definition** (F7). `Trellis::request_backfill`
+//!   and a capture re-install repair a table's `live` readers by rebuilding
+//!   the ones this build serves ([`start_rebuilds`]): the call's own
+//!   transaction moves each `live -> backfilling` and enqueues one plan job
+//!   and one sweep job, two rows per definition, so the call stays fast
+//!   whatever the table's size. The definition applies throughout, the plan
+//!   re-derives every row the table has, and the sweep re-derives every
+//!   entry the plan didn't, so a delete that never reached the target is
+//!   repaired too. The status is `backfilling` when the call returns, which
+//!   is what a caller polling for `live` waits on. A request while a build
+//!   runs enqueues another plan and sweep; the definition is `live` when
+//!   every one is done. Every other reader gets the marker's go-live
+//!   catch-up.
 //! - **Plan** ([`run_plan`]). A drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
 //!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
@@ -1156,6 +1169,12 @@ pub async fn qualifies(
     #[cfg(any(test, feature = "internals"))]
     if crate::intake::markers::is_held_out_of_the_rederive_build(client, &definition.source_table)
         .await?
+        || crate::intake::markers::is_target_held_out_of_the_rederive_build(
+            client,
+            &definition.source_table,
+            &definition.target_table,
+        )
+        .await?
     {
         return Ok(false);
     }
@@ -1519,6 +1538,158 @@ async fn start(
         "transform status transition: re-derive build started"
     );
     Ok(Some(dependents))
+}
+
+/// The definitions reading one of `tables` as their source that a rebuild
+/// could take (#625 F7): applying ones (`live`, and `backfilling` under a
+/// Re-derive build; not `catching_up`, whose catch-up is parked), in id
+/// order. A candidate only: [`rebuildable`] decides, under the row locks.
+pub(crate) async fn rebuild_candidates(
+    client: &impl GenericClient,
+    tables: &[String],
+) -> Result<Vec<i64>, tokio_postgres::Error> {
+    Ok(client
+        .query(
+            "select id from transform_definitions \
+             where source_table = any($1) \
+               and (status = $2 or (status = $3 and build = $4)) \
+             order by id",
+            &[
+                &tables,
+                &TransformStatus::Live.as_str(),
+                &TransformStatus::Backfilling.as_str(),
+                &BUILD_REDERIVE,
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
+}
+
+/// The definitions among `ids` that a rebuild takes (#625 F7): the ones that
+/// still apply (`live`, or `backfilling` under a Re-derive build) and
+/// [`qualifies`] for the Re-derive build. The caller holds their rows `for
+/// update` (`intake::markers::park_table_catch_ups`), so what this reads
+/// holds until it commits.
+pub(crate) async fn rebuildable(
+    client: &impl GenericClient,
+    ids: &[i64],
+) -> Result<Vec<i64>, crate::intake::IntakeError> {
+    let still: Vec<i64> = client
+        .query(
+            "select id from transform_definitions \
+             where id = any($1) and (status = $2 or (status = $3 and build = $4)) \
+             order by id",
+            &[
+                &ids,
+                &TransformStatus::Live.as_str(),
+                &TransformStatus::Backfilling.as_str(),
+                &BUILD_REDERIVE,
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut taken = Vec::new();
+    for id in still {
+        if let Some(definition) = catalog::definition_by_id_in(client, id).await?
+            && qualifies(client, &definition).await?
+        {
+            taken.push(id);
+        }
+    }
+    Ok(taken)
+}
+
+/// Rebuilds the definitions `ids` ([`rebuildable`]) in `txn`, the caller's
+/// transaction (#625 F7): moves a `live` one to `backfilling` with `build =
+/// 'rederive'` (one already building stays as it is), and enqueues a plan
+/// job and a sweep job for each, both whole-definition (`fields` null), as
+/// [`start`] does for a resumed definition: a rebuild re-derives the rows
+/// the table has and sweeps the entries it no longer backs. That is one row
+/// of each per definition, so the call stays fast whatever the table's size.
+///
+/// The definition applies throughout (B1), as it did before the call, so
+/// nothing is parked for it: the caller leaves it out of its catch-up. Its
+/// source's marker, which the caller parks first, has nothing to enumerate
+/// for it (`build_marker_generation`, #938). The caller holds each
+/// definition's row `for update`, and calls [`stamp_rebuild_seg`] as the
+/// last statement before it commits.
+///
+/// From the commit the definition reads `backfilling`, so a caller that
+/// waits for `live` waits for the rebuild (#625 comment 2).
+pub(crate) async fn start_rebuilds(
+    txn: &impl GenericClient,
+    ids: &[i64],
+) -> Result<(), tokio_postgres::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let moved: Vec<i64> = txn
+        .query(
+            "update transform_definitions set status = $2, build = $3 \
+             where id = any($1) and status = $4 returning id",
+            &[
+                &ids,
+                &TransformStatus::Backfilling.as_str(),
+                &BUILD_REDERIVE,
+                &TransformStatus::Live.as_str(),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    for kind in [chunk_queue::KIND_PLAN, chunk_queue::KIND_SWEEP] {
+        txn.execute(
+            "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
+             select id, $2, fuse_rearmed_at, pg_current_xact_id() \
+             from transform_definitions where id = any($1) order by id",
+            &[&ids, &kind],
+        )
+        .await?;
+    }
+    // The source marker's generation this start read (#938), as `start`'s.
+    txn.execute(
+        "update transform_definitions d set build_marker_generation = \
+             (select pb.generation from pending_backfill pb \
+              where pb.table_name = d.source_table) \
+         where d.id = any($1)",
+        &[&ids],
+    )
+    .await?;
+    if !moved.is_empty() {
+        tracing::info!(
+            ids = ?moved,
+            from = %TransformStatus::Live.as_str(),
+            to = %TransformStatus::Backfilling.as_str(),
+            "transform status transition: re-derive rebuild started"
+        );
+    }
+    Ok(())
+}
+
+/// Records the segment active at the commit of the rebuild
+/// [`start_rebuilds`] enqueued for `ids` as their `build_seg` (#733), as
+/// [`start`] does for a build it starts. Last, so the share lock that keeps
+/// the active segment from sealing until the transaction commits is held
+/// only for the commit.
+pub(crate) async fn stamp_rebuild_seg(
+    txn: &impl GenericClient,
+    ids: &[i64],
+) -> Result<(), tokio_postgres::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    txn.execute(
+        "update transform_definitions set build_seg = p.active_seq \
+         from (select active_seq from segment_pointer for share) p where id = any($1)",
+        &[&ids],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Whether a definition read as `status` with `build` can take a field

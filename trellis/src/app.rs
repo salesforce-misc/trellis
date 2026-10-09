@@ -778,14 +778,22 @@ impl Trellis {
             .collect())
     }
 
-    /// Re-reads `source_table` via a `pending_backfill` marker, for every
-    /// applying definition that reads it, directly or through a
-    /// relationship, to re-derive from. A newly registered transform doesn't
-    /// need this: the staging worker parks its marker itself (ADR-0016).
+    /// Re-reads `source_table` for every applying definition that reads it,
+    /// directly or through a relationship, to re-derive from. A newly
+    /// registered transform doesn't need this: the staging worker starts
+    /// its build itself.
     ///
-    /// The marker is a go-live catch-up (issue #522, ADR-0016's "A re-read
-    /// table's readers"): each `live` reader reports `catching_up` from this
-    /// call until the staging worker has discharged it. The discharge
+    /// A reader the Re-derive build serves (a plain aggregate or a plain
+    /// 1-1 transform over this table, #625 F7) is rebuilt: this call's own
+    /// transaction moves it `live -> backfilling` and enqueues its plan and
+    /// sweep jobs, one row each, so the call returns quickly and the status
+    /// already reads `backfilling` when it does. The definition keeps
+    /// applying. Its plan re-derives every row the table has, and its sweep
+    /// deletes what the table no longer backs, and then it is `live` again.
+    ///
+    /// Every other reader gets a go-live catch-up (issue #522, ADR-0016's
+    /// "A re-read table's readers"): it reports `catching_up` from this call
+    /// until the staging worker has discharged the marker. The discharge
     /// re-derives every row the table still has, deletes each reader's
     /// target rows the table no longer backs (a delete that never reached the
     /// target, say), refreshes the settled projections of a relationship
@@ -831,13 +839,15 @@ impl Trellis {
 
         // A failure to park is a plain `Db` error.
         let txn = client.transaction().await?;
-        crate::intake::markers::park_table_catch_ups(&*txn, std::slice::from_ref(&qualified))
-            .await
-            .map_err(|err| match err {
-                IntakeError::Db(err) => TrellisError::Db(err),
-                IntakeError::Catalog(err) => TrellisError::Catalog(*err),
-                err => TrellisError::Client(ClientError::Intake(err)),
-            })?;
+        let rebuilt =
+            crate::intake::markers::park_table_catch_ups(&*txn, std::slice::from_ref(&qualified))
+                .await
+                .map_err(|err| match err {
+                    IntakeError::Db(err) => TrellisError::Db(err),
+                    IntakeError::Catalog(err) => TrellisError::Catalog(*err),
+                    err => TrellisError::Client(ClientError::Intake(err)),
+                })?;
+        crate::staging::build::stamp_rebuild_seg(&*txn, &rebuilt).await?;
         txn.commit().await?;
         Ok(())
     }

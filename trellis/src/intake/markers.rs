@@ -198,10 +198,21 @@ pub(crate) async fn park_target_catchup_if_read(
 /// (`capture::install`), and an explicit re-backfill
 /// ([`crate::Trellis::request_backfill`], issue #522).
 ///
-/// Each marker is a go-live catch-up ([`park_catch_up`]) for every applying
-/// definition that reads its table, directly or through a relationship
-/// ([`crate::defs::catalog::applying_readers`]). Such a reader reports
-/// `catching_up` until the discharge has re-read the table, which
+/// A reader the Re-derive build takes (#625 F7, `staging::build::rebuildable`:
+/// a definition whose source is `tables`' table, of a shape the build serves)
+/// is rebuilt by this transaction: it moves `live -> backfilling` and gets a
+/// plan and a sweep job, one row each, so the call stays fast. It applies
+/// throughout, and the plan's chunks and the sweep re-derive every row the
+/// table has and every entry it no longer backs, which is what the catch-up
+/// below does for the others. Returns the rebuilt definitions' ids; the
+/// caller calls [`crate::staging::build::stamp_rebuild_seg`] with them as the
+/// last statement before it commits, so the share lock on the active segment
+/// is held only for the commit.
+///
+/// Each other marker is a go-live catch-up ([`park_catch_up`]) for every
+/// applying definition that reads its table, directly or through a
+/// relationship ([`crate::defs::catalog::applying_readers`]). Such a reader
+/// reports `catching_up` until the discharge has re-read the table, which
 /// re-derives the rows it still has, and swept the reader's target of rows
 /// the table no longer backs, which no re-read reaches.
 ///
@@ -212,10 +223,13 @@ pub(crate) async fn park_target_catchup_if_read(
 /// without correcting it. With no reader the marker is a plain one, and the
 /// refresh still runs, so a consumer registered later doesn't read a stale
 /// projection.
+///
+/// Locks follow [`park_catch_up`]'s order: every definition this touches
+/// first (in id order), then the markers.
 pub(crate) async fn park_table_catch_ups(
     client: &impl GenericClient,
     tables: &[String],
-) -> Result<(), IntakeError> {
+) -> Result<Vec<i64>, IntakeError> {
     let mut readers = Vec::new();
     let mut to_sides = Vec::new();
     for table in tables {
@@ -224,10 +238,28 @@ pub(crate) async fn park_table_catch_ups(
             to_sides.push(table.clone());
         }
     }
+    let candidates = crate::staging::build::rebuild_candidates(client, tables).await?;
+    let mut locked: Vec<i64> = readers.iter().chain(&candidates).copied().collect();
+    locked.sort_unstable();
+    locked.dedup();
+    if !locked.is_empty() {
+        client
+            .execute(
+                "select 1 from transform_definitions where id = any($1) order by id for update",
+                &[&locked],
+            )
+            .await?;
+    }
+    let rebuilt = crate::staging::build::rebuildable(client, &candidates).await?;
+    readers.retain(|id| !rebuilt.contains(id));
     readers.sort_unstable();
     readers.dedup();
     park_catch_up(client, &readers, tables).await?;
-    request_projection_refresh(client, &to_sides).await
+    // After the markers, so the generation each rebuild records is the one
+    // just parked.
+    crate::staging::build::start_rebuilds(client, &rebuilt).await?;
+    request_projection_refresh(client, &to_sides).await?;
+    Ok(rebuilt)
 }
 
 /// Asks the discharge of each of `tables`' markers, just parked by this
@@ -1966,6 +1998,55 @@ pub async fn hold_out_of_the_rederive_build(
     Ok(())
 }
 
+/// The start of the comment [`hold_target_out_of_the_rederive_build`] puts
+/// on a source table; the held target follows.
+#[cfg(any(test, feature = "internals"))]
+const OLD_BUILD_TARGET_COMMENT: &str =
+    "trellis test: the old build builds and re-reads the definition writing ";
+
+/// Test harness (#625 F7): holds the one definition that reads `source`
+/// (a schema-qualified identity of a table that exists) and writes `target`
+/// out of the Re-derive build and its rebuilds, so that a `request_backfill`
+/// or a capture install parks the old build's go-live catch-up for it, and a
+/// discharge enumerates its table for it. For a test of the marker's
+/// machinery beside a definition the Re-derive build serves;
+/// [`hold_out_of_the_rederive_build`] holds every definition over a source
+/// instead. It marks the source with a comment, as that does, so the two
+/// don't combine on one table, and the target needn't exist. Idempotent.
+#[cfg(any(test, feature = "internals"))]
+pub async fn hold_target_out_of_the_rederive_build(
+    client: &impl GenericClient,
+    source: &str,
+    target: &str,
+) -> Result<(), IntakeError> {
+    let (schema, name) = split_qualified(source)?;
+    client
+        .batch_execute(&format!(
+            "comment on table {}.{} is '{OLD_BUILD_TARGET_COMMENT}{target}'",
+            quote_ident(schema),
+            quote_ident(name)
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Whether the definition reading `source` and writing `target` is held out
+/// by [`hold_target_out_of_the_rederive_build`].
+#[cfg(any(test, feature = "internals"))]
+pub(crate) async fn is_target_held_out_of_the_rederive_build(
+    client: &impl GenericClient,
+    source: &str,
+    target: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(client
+        .query_one(
+            "select coalesce(obj_description(to_regclass($1), 'pg_class') = $2 || $3, false)",
+            &[&source, &OLD_BUILD_TARGET_COMMENT, &target],
+        )
+        .await?
+        .get(0))
+}
+
 /// Whether `table` is held out of the Re-derive build, so that
 /// `staging::build::qualifies` leaves the definitions over it to the old
 /// build (a test of its machinery, until #625 F10 deletes it): the target a
@@ -2319,6 +2400,28 @@ mod catch_up_tests {
         register_reader(&db, "public.b", "b_reader").await;
         capture_for_test(&mut client, &["public.a", "public.b"]).await;
 
+        let dbg = client
+            .query(
+                "select target_table, status, build from transform_definitions",
+                &[],
+            )
+            .await
+            .unwrap();
+        for r in dbg {
+            eprintln!(
+                "DBG {} {} {:?}",
+                r.get::<_, String>(0),
+                r.get::<_, String>(1),
+                r.get::<_, Option<String>>(2)
+            );
+        }
+        let dbg = client
+            .query("select table_name from pending_backfill", &[])
+            .await
+            .unwrap();
+        for r in dbg {
+            eprintln!("DBGM {}", r.get::<_, String>(0));
+        }
         let waits = AtomicUsize::new(0);
         let give_up = || {
             waits.fetch_add(1, Ordering::Relaxed);
@@ -2359,6 +2462,11 @@ mod catch_up_tests {
         )
         .await
         .expect("register a definition reading the table");
+        // These tests drive the marker's catch-up, so the old build keeps
+        // the reader (#625 F7: a Re-derive-eligible reader is rebuilt).
+        hold_out_of_the_rederive_build(&**pool.get().await.expect("connect"), source)
+            .await
+            .expect("hold the source out of the Re-derive build");
     }
 
     async fn connect(db: &testkit::TestDatabase) -> tokio_postgres::Client {

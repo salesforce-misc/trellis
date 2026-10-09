@@ -190,11 +190,24 @@ A definition that reads a relationship doesn't yet take the Re-derive build
 
 When the staging worker reinstalls a table's triggers while definitions
 already apply from it (the triggers were dropped by hand, say), those
-definitions have missed whatever committed meanwhile. The install parks a
-go-live catch-up for each of them, as does an explicit
-`Trellis::request_backfill` on a captured table. They report `catching_up`
-until the discharge has re-read the table and swept their targets for rows
-the source no longer backs.
+definitions have missed whatever committed meanwhile. An explicit
+`Trellis::request_backfill` on a captured table asks for the same re-read.
+Either one is repaired in the transaction that makes the call:
+
+- **A reader the Re-derive build serves** (a plain aggregate or a plain 1-1
+  transform over the captured table, [the Re-derive
+  build](#the-re-derive-build)) is rebuilt. The transaction moves it
+  `live -> backfilling` and enqueues one plan job and one sweep job, two
+  rows per definition, so the call returns quickly whatever the table's size.
+  It keeps applying, the plan re-derives every row the table has, and the
+  sweep re-derives the entries the table no longer backs. The status is
+  `backfilling` when the call returns, so polling for `live` waits out the
+  rebuild. A second request while a rebuild runs enqueues another plan and
+  sweep.
+- **Any other reader** (a relationship consumer, a ring-enumerated shape)
+  gets a go-live catch-up. It reports `catching_up` until the discharge has
+  re-read the table and swept its target for rows the source no longer
+  backs.
 
 ### What it asks of a deployment
 

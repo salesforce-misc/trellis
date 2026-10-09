@@ -638,7 +638,8 @@ fn relationships(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<Relation
         .collect()
 }
 
-/// Parks a go-live catch-up re-read of `source_table` for the staging worker.
+/// Re-reads `source_table` for its applying readers: a rebuild, or a go-live
+/// catch-up for the staging worker.
 #[rustler::nif(schedule = "DirtyIo")]
 fn request_backfill(handle: ResourceArc<Handle>, source_table: String) -> NifReply<Atom> {
     handle.with(|trellis| trellis.request_backfill(&source_table))?;
