@@ -2164,7 +2164,9 @@ pub(crate) async fn query_by_entry_key(
 /// The statement is prepared first (a round trip, as `Client::query` makes
 /// for a text statement), then `begin; set local …`, the query and `commit`
 /// go out back to back, so the read costs two round trips, not three. They
-/// are all queued before any is awaited, which also makes the read safe to
+/// are all queued, in that order, on the first poll of the `join!` (each
+/// `tokio_postgres` call sends its message before its first await), which
+/// also makes the read safe to
 /// cancel: dropping this future after the queue never leaves the pooled
 /// connection inside an open transaction, because the `commit` is already
 /// on its way. An error in the query aborts the transaction, and the
@@ -2179,7 +2181,12 @@ pub(crate) async fn query_on_pool_by_entry_key(
 ) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
     let statement = client.prepare(sql).await?;
     let begin = format!("begin; {ENTRY_PLAN_SETTINGS}");
+    // `biased`: polled in this order, so each queues its message in this
+    // order on the first poll. An unbiased `join!` documents only that it
+    // rotates which future it polls first, and a `commit` queued ahead of
+    // the `begin` would leave the transaction open.
     let (begun, rows, committed) = tokio::join!(
+        biased;
         client.batch_execute(&begin),
         client.query(&statement, params),
         client.batch_execute("commit"),

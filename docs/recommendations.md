@@ -162,14 +162,14 @@ of keys it looks up. With one, a batch reads only its keys' rows.
 
 Trellis checks for the index each time it prepares a batch's relationship
 reads. A column counts as indexed if it is the leading column of a plain btree
-index that is valid and not partial. For an indexed column, Trellis plans the
-read to use the index, which matters most on PostgreSQL 16: it prices
-thousands of probes of a near-unique index above a parallel sequential scan,
-and reads the whole table unless told otherwise. For an unindexed column, it
-leaves the plan to PostgreSQL, since forcing the index there would only cost
-the read its parallel scan. An index you create or drop takes effect on a
-later batch, with no restart or redefine. It changes speed only, never
-results.
+index that is valid, not partial, and under the column's own collation. For an
+indexed column, Trellis plans the read to use the index, which matters most on
+PostgreSQL 16: while a table's statistics lag its size, it can price thousands
+of probes of a near-unique index above a parallel sequential scan, and read
+the whole table. For an unindexed column, it leaves the plan to PostgreSQL,
+since with no index to use, turning sequential scans off would only cost the
+read its parallel scan. An index you create or drop takes effect on a later
+batch, with no restart or redefine. It changes speed only, never results.
 
 ## Roles and permissions
 

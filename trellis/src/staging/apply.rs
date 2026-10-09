@@ -1017,8 +1017,9 @@ struct KeyColumn {
     /// ([`key_column_pg_type`]).
     pg_type: String,
     /// Whether a lookup of the column by a batch of keys has an index to
-    /// use: it is the leading column of a plain btree index on its table
-    /// that is valid, ready and live, and not partial. A read of an indexed
+    /// use: it is the leading column of a plain btree index on its table,
+    /// under the column's own collation, that is valid, ready and live, and
+    /// not partial. A read of an indexed
     /// column runs under `super::ledger::ENTRY_PLAN_SETTINGS` (#972); one of
     /// an unindexed column runs as the planner would have it, since the
     /// setting could only take its parallel sequential scan away.
@@ -1029,7 +1030,11 @@ struct KeyColumn {
 /// `None` if the column doesn't exist ([`key_column_pg_type`]'s convention).
 ///
 /// Counted as an index: a btree whose first key is the column itself (an
-/// expression has no column, `indkey[0] = 0`), with `indisvalid` (a
+/// expression has no column, `indkey[0] = 0`), under the column's own
+/// collation (the filter compares by it, and the planner uses an index only
+/// for a comparison under the index's collation, compared by OID, so a
+/// `collate "C"` index of a default-collation column doesn't serve it, even
+/// in a database whose default is `C`), with `indisvalid` (a
 /// `create index concurrently` that failed leaves one that isn't),
 /// `indisready` and `indislive` (one being dropped isn't), and no predicate
 /// (a partial index serves only the rows its predicate admits, which an
@@ -1052,6 +1057,7 @@ async fn key_column_in(
                             where i.indrelid = a.attrelid \
                               and i.indkey[0] = a.attnum \
                               and am.amname = 'btree' \
+                              and i.indcollation[0] = a.attcollation \
                               and i.indisvalid and i.indisready and i.indislive \
                               and i.indpred is null) \
              from pg_attribute a \
@@ -1286,9 +1292,7 @@ async fn from_side_keys(
             }
             let client = pool.get().await?;
             let read = from_side_keys_read(&**client, from_table, from_pk, from_col).await?;
-            let rows = ReadConn::Pool(&client)
-                .query(&read.sql, &[join_keys], read.indexed)
-                .await?;
+            let rows = read.run(ReadConn::Pool(&client), join_keys).await?;
             Ok(rows
                 .into_iter()
                 .map(|r| (r.get::<_, String>(0), Some(r.get::<_, String>(1))))
@@ -1644,6 +1648,19 @@ struct KeyBatchRead {
     /// read runs under `super::ledger::ENTRY_PLAN_SETTINGS`
     /// ([`ReadConn::query`]).
     indexed: bool,
+}
+
+impl KeyBatchRead {
+    /// Runs the read for `keys` on `conn`, under the entry plan settings if
+    /// the join column is indexed: the one way its callers run it, so none
+    /// can drop the flag.
+    async fn run(
+        &self,
+        conn: ReadConn<'_, '_>,
+        keys: &[String],
+    ) -> Result<Vec<tokio_postgres::Row>, ApplyError> {
+        conn.query(&self.sql, &[&keys], self.indexed).await
+    }
 }
 
 /// A to-one relationship's projection read ([`ReadKind::ToOne`]).
@@ -3630,7 +3647,7 @@ async fn to_side_rows_sql(
 }
 
 /// Runs [`to_side_rows_sql`]'s statement for `join_keys` on `conn`, under
-/// the entry plan settings if `to_col` is indexed ([`ReadConn::query`]).
+/// the entry plan settings if `to_col` is indexed ([`KeyBatchRead::run`]).
 async fn fetch_to_side_rows(
     conn: ReadConn<'_, '_>,
     read: &KeyBatchRead,
@@ -3639,7 +3656,7 @@ async fn fetch_to_side_rows(
     if join_keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let db_rows = conn.query(&read.sql, &[&join_keys], read.indexed).await?;
+    let db_rows = read.run(conn, join_keys).await?;
     // Assemble each row by its stable `rn`, carrying its join key, then group.
     let mut assembled: HashMap<i64, (String, Row)> = HashMap::new();
     for db_row in db_rows {
@@ -6094,10 +6111,15 @@ mod tests {
         (client, pool, keys)
     }
 
-    /// `read`'s plan for `keys`, explained the way [`ReadConn::query`] runs
-    /// the read itself, on the same connection.
+    /// `read`'s plan for `keys`, explained the way [`KeyBatchRead::run`]
+    /// runs the read itself, on the same connection.
     async fn plan_of_read(conn: ReadConn<'_, '_>, read: &KeyBatchRead, keys: &[String]) -> String {
-        conn.query(&format!("explain {}", read.sql), &[&keys], read.indexed)
+        let explain = KeyBatchRead {
+            sql: format!("explain {}", read.sql),
+            indexed: read.indexed,
+        };
+        explain
+            .run(conn, keys)
             .await
             .expect("explain")
             .into_iter()
@@ -6156,8 +6178,12 @@ mod tests {
             .batch_execute(
                 "create table detect (id int primary key, \
                      lead int, second int, invalid int, hashed int, \
-                     partial int, expr int, bare int); \
+                     partial int, expr int, bare int, \
+                     label text, recollated text, c_label text collate \"C\"); \
                  create index on detect (lead, second); \
+                 create index on detect (label); \
+                 create index on detect (recollated collate \"C\"); \
+                 create index on detect (c_label); \
                  create index on detect (invalid); \
                  create index on detect using hash (hashed); \
                  create index on detect (partial) where partial > 0; \
@@ -6185,12 +6211,22 @@ mod tests {
             "the leading column of a composite index"
         );
         assert!(column("id").await.indexed, "a primary key");
+        assert!(column("label").await.indexed, "a text column");
+        assert!(
+            column("c_label").await.indexed,
+            "a text column of its own collation, indexed under it"
+        );
         for (name, why) in [
             ("second", "a non-leading column of a composite index"),
             ("invalid", "an invalid index (a failed create concurrently)"),
             ("hashed", "a non-btree index"),
             ("partial", "a partial index"),
             ("expr", "the column under an expression index"),
+            (
+                "recollated",
+                "an index under another collation than the column's, \
+                 which an equality under the column's can't use",
+            ),
             ("bare", "no index"),
         ] {
             assert!(!column(name).await.indexed, "{name} is not indexed: {why}");
