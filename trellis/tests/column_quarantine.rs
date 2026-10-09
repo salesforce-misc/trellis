@@ -5846,3 +5846,60 @@ async fn a_resume_validates_a_readers_definition_under_the_lock_an_edit_committe
     settle_and_drain(&mut client, &db).await;
     assert_eq!(sib_sum_row(&client, 1, &["c2"]).await, some(&["26"]));
 }
+
+/// The other direction, from host DDL rather than an edit: a reader whose
+/// definition validates when the resume's walk reads it, and a source column
+/// named like its field `c1` added before the pair's transaction. The pair
+/// validates under the lock, sees the shadowing column and holds `c2` as a
+/// pause of its own with the refusal as its reason. Validating before the
+/// lock passed on the old schema and resumed a definition define would
+/// refuse.
+#[tokio::test]
+async fn a_resume_holds_a_reader_whose_source_changed_after_the_walk_read_its_definition() {
+    const GATE: i64 = 9651;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, _trellis) = seed_two_column_reader(&db).await;
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c2", "sib", "total").await);
+    change_item(&mut client, &db.pool, 1, Some((10, 5, 0)), (20, 5, 0)).await;
+
+    let gate = take_gate(&db, GATE).await;
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterResumePairDefinitionRead, "sib_sum", GATE);
+    let pool = db.pool.clone();
+    let mut resume = tokio::spawn(with_scope(scope, async move {
+        quarantine::resume_column(&pool, "sib", "total").await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut resume => panic!("the resume finished without reaching sib_sum's pair: {finished:?}"),
+    }
+    client
+        .batch_execute("alter table public.sib add column c1 numeric")
+        .await
+        .expect("add a column named like the reader's field");
+    release_gate(&gate, GATE).await;
+
+    let resumed = resume.await.expect("resume task").expect("the resume");
+    assert_eq!(
+        resumed,
+        vec![("sib".to_string(), "total".to_string())],
+        "sib_sum no longer validates under the lock, so c2 is not resumed"
+    );
+    let (local_fuse, last_error) = column_status_row(&client, "sib_sum", "c2")
+        .await
+        .expect("c2 stays paused");
+    assert!(
+        local_fuse,
+        "with its edge gone, c2 is held by a pause of its own"
+    );
+    let last_error = last_error.expect("the held column says why");
+    assert!(
+        last_error.contains("no longer validates")
+            && last_error.contains("shares its name with a source column"),
+        "the reason names the refusal seen under the lock, got {last_error:?}"
+    );
+}

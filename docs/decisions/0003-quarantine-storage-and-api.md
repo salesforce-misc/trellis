@@ -263,8 +263,8 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   commits, rather than each holding a row the other waits for. An edit can
   pause a field that already has readers, in other definitions or as a
   sibling's alias. So the edit takes the lock exclusive, as a pause does, after
-  the source's fence and before the fuse gate and the definition rows, and
-  marks each field it pauses as owing its cascade. Once its transaction
+  the source's fence and before the definition row, and marks each field it
+  pauses as owing its cascade. Once its transaction
   commits, the edit walks the field's readers, as a pause does, so they're
   paused by the time the edit returns.
   The walk runs outside the edit's transaction, because each reader's pause

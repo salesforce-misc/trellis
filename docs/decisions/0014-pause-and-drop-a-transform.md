@@ -151,9 +151,10 @@ resume refuses that too, names `DROP TRANSFORM`, and changes nothing; a column r
 doesn't make the check, since it builds nothing. A field resume runs the same check on
 its definition, and leaves a dependent its cascade reaches paused while that
 dependent's check fails. The dependent's check runs on the definition read under the
-column-pause lock, which every `ALTER TRANSFORM` of it takes exclusive, so it is the
-definition the resume then builds. An edit that makes the definition valid again before
-the lock is seen, and the dependent is released.
+column-pause lock, which every `ALTER TRANSFORM` that changes it takes exclusive, so it is
+the definition the resume then builds, checked against the schema as it is then. An edit
+that makes the definition valid again before the lock releases the dependent, and a
+source change before the lock that makes it invalid holds it.
 
 A resume then rebuilds from the schema as it is now. It records the source's live
 column types, which the rebuild casts through, and the type of each column the
