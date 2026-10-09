@@ -3154,7 +3154,9 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// isn't currently paused — resuming a live column is caller error, not a
 /// silent no-op — and with [`ApplyError::ColumnAwaitingCapture`] if it is
 /// an `ALTER TRANSFORM` field still awaiting its capture widen (#687). A
-/// dependent in that state reached through the cascade stays paused too.
+/// dependent in that state reached through the cascade stays paused too,
+/// and so do its own readers, until its field build's start releases it and
+/// un-cascades from it (issue #918, `super::build::release_awaiting_capture`).
 /// A field that reads another field of its definition still paused, by
 /// alias, stays paused (issue #748): the resume drops only its own reason
 /// (`local_fuse`), leaves the cascade's, and resumes nothing. The resume of
@@ -3283,10 +3285,118 @@ pub async fn resume_column(
         txn.rollback().await?;
     }
 
-    let mut resumed = Vec::new();
-    let mut queue: VecDeque<(String, String)> = VecDeque::new();
-    queue.push_back((transform.to_string(), column.to_string()));
+    let queue = VecDeque::from([(transform.to_string(), column.to_string())]);
+    let resumed = resume_pairs(pool, transform, queue).await?;
 
+    tracing::Span::current().record("resumed", resumed.len());
+    tracing::info!(resumed = ?resumed, "resumed paused column(s)");
+    Ok(resumed)
+}
+
+/// What [`uncascade`] released.
+pub(crate) struct Uncascaded {
+    /// The columns of the walked definition no longer paused: the seeds,
+    /// and every sibling released with them.
+    pub released: Vec<String>,
+    /// Readers in other definitions whose last reason to stay paused went
+    /// with the edges deleted. Their rows are still there, for
+    /// [`resume_pairs`].
+    pub dependents: Vec<(String, String)>,
+}
+
+/// Un-cascades from `seeds`, columns of `target` whose pause is gone (the
+/// caller deleted their rows), in `txn`: deletes the edges that leave them,
+/// and releases each reader left with no reason to stay paused (no
+/// `local_fuse`, no other edge into it, and not awaiting its capture,
+/// which its own field build's start releases, #687). A reader in `target`
+/// is released in `txn` and walked from in turn (issue #748); one in
+/// another definition is returned in [`Uncascaded::dependents`].
+///
+/// Two paths end a column's pause this way, and both must: a resume
+/// ([`resume_column`]), and the release of a field that awaited its capture
+/// (`super::build::release_awaiting_capture`, issue #918), which may have
+/// passed a pause on to readers after the resume that took its own edge
+/// away left it in place.
+pub(crate) async fn uncascade(
+    txn: &impl GenericClient,
+    target: &str,
+    seeds: Vec<String>,
+) -> Result<Uncascaded, tokio_postgres::Error> {
+    let mut released = seeds.clone();
+    let mut frontier = seeds;
+    let mut dependents = Vec::new();
+    while let Some(upstream) = frontier.pop() {
+        let affected = txn
+            .query(
+                "delete from column_pause_cascades \
+                 where upstream_transform = $1 and upstream_column = $2 \
+                 returning downstream_transform, downstream_column",
+                &[&target, &upstream],
+            )
+            .await?;
+        for row in affected {
+            let downstream_transform: String = row.get(0);
+            let downstream_column: String = row.get(1);
+            let status = txn
+                .query_opt(
+                    "select local_fuse, awaiting_capture from column_status \
+                     where transform_table = $1 and column_name = $2",
+                    &[&downstream_transform, &downstream_column],
+                )
+                .await?;
+            let Some(status) = status else {
+                // Already resumed by some other path (shouldn't happen
+                // within one walk, but tolerate it rather than panic).
+                continue;
+            };
+            let (local_fuse, awaiting_capture): (bool, bool) = (status.get(0), status.get(1));
+            // #687: a field awaiting its capture widen stays paused; with
+            // this cascade gone, its field build's start unpauses it.
+            if local_fuse || awaiting_capture {
+                continue;
+            }
+            let remaining: i64 = txn
+                .query_one(
+                    "select count(*) from column_pause_cascades \
+                     where downstream_transform = $1 and downstream_column = $2",
+                    &[&downstream_transform, &downstream_column],
+                )
+                .await?
+                .get(0);
+            if remaining > 0 {
+                continue;
+            }
+            if downstream_transform == target {
+                txn.execute(
+                    "delete from column_status \
+                     where transform_table = $1 and column_name = $2",
+                    &[&target, &downstream_column],
+                )
+                .await?;
+                released.push(downstream_column.clone());
+                frontier.push(downstream_column);
+            } else {
+                dependents.push((downstream_transform, downstream_column));
+            }
+        }
+    }
+    Ok(Uncascaded {
+        released,
+        dependents,
+    })
+}
+
+/// Resumes each pair of `queue`, and the dependents in other definitions
+/// each releases, in a transaction apiece ([`resume_column`]'s walk past
+/// its first column). `transform` is the definition the walk began in. A
+/// pair stays paused, as the walk goes on, when its definition can't take a
+/// field build or no longer validates. Returns the pairs resumed, in order.
+pub(crate) async fn resume_pairs(
+    pool: &Pool,
+    transform: &str,
+    mut queue: VecDeque<(String, String)>,
+) -> Result<Vec<(String, String)>, ApplyError> {
+    let mut resumed = Vec::new();
     while let Some((t, c)) = queue.pop_front() {
         let Some(def) = catalog::definition_by_target(pool, &t).await? else {
             continue;
@@ -3404,64 +3514,11 @@ pub async fn resume_column(
         // one by alias, and has no other reason to stay paused, is released
         // in this same transaction and rebuilt by the same field build. A
         // dependent in another definition goes on the queue.
-        let mut released = vec![c.clone()];
-        let mut frontier = vec![c.clone()];
-        while let Some(upstream) = frontier.pop() {
-            let affected = txn
-                .query(
-                    "delete from column_pause_cascades \
-                     where upstream_transform = $1 and upstream_column = $2 \
-                     returning downstream_transform, downstream_column",
-                    &[&t, &upstream],
-                )
-                .await?;
-            for row in affected {
-                let downstream_transform: String = row.get(0);
-                let downstream_column: String = row.get(1);
-                let status = txn
-                    .query_opt(
-                        "select local_fuse, awaiting_capture from column_status \
-                         where transform_table = $1 and column_name = $2",
-                        &[&downstream_transform, &downstream_column],
-                    )
-                    .await?;
-                let Some(status) = status else {
-                    // Already resumed by some other path (shouldn't happen
-                    // within one resume walk, but tolerate it rather than
-                    // panic).
-                    continue;
-                };
-                let (local_fuse, awaiting_capture): (bool, bool) = (status.get(0), status.get(1));
-                // #687: a field awaiting its capture widen stays paused; with
-                // this cascade gone, its field build's start unpauses it.
-                if local_fuse || awaiting_capture {
-                    continue;
-                }
-                let remaining: i64 = txn
-                    .query_one(
-                        "select count(*) from column_pause_cascades \
-                         where downstream_transform = $1 and downstream_column = $2",
-                        &[&downstream_transform, &downstream_column],
-                    )
-                    .await?
-                    .get(0);
-                if remaining > 0 {
-                    continue;
-                }
-                if downstream_transform == t {
-                    txn.execute(
-                        "delete from column_status \
-                         where transform_table = $1 and column_name = $2",
-                        &[&t, &downstream_column],
-                    )
-                    .await?;
-                    released.push(downstream_column.clone());
-                    frontier.push(downstream_column);
-                } else {
-                    queue.push_back((downstream_transform, downstream_column));
-                }
-            }
-        }
+        let Uncascaded {
+            released,
+            dependents,
+        } = uncascade(&*txn, &t, vec![c.clone()]).await?;
+        queue.extend(dependents);
         // The build covers every field reading a released one by alias,
         // whether or not it had a cascade edge: one still held out by
         // another paused field it reads is left out of the build's chunks
@@ -3482,8 +3539,6 @@ pub async fn resume_column(
         resumed.extend(released.into_iter().map(|field| (t.clone(), field)));
     }
 
-    tracing::Span::current().record("resumed", resumed.len());
-    tracing::info!(resumed = ?resumed, "resumed paused column(s)");
     Ok(resumed)
 }
 

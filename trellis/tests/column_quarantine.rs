@@ -4151,6 +4151,154 @@ async fn an_alter_pausing_a_field_awaiting_its_capture_on_a_paused_sibling_casca
     assert_eq!(d1.as_deref(), Some("17"));
 }
 
+/// The ALTER of #918's routes: `cost` reads `bonus`, which `sib` didn't
+/// read, so it waits for its capture widen, and `total`, by alias.
+const ALTER_COST_AWAITING_CAPTURE: &str = "ALTER TRANSFORM sib ALTER cost AS total + bonus";
+
+/// Nothing is left of the pause `sib.cost` passed on: the field has no row
+/// and no edge leaves it, and its readers are released, rebuilt from the
+/// resumed value and live.
+async fn assert_cost_readers_released(client: &mut Client, db: &TestDatabase) {
+    assert_eq!(column_status_row(client, "sib", "cost").await, None);
+    assert_eq!(column_status_row(client, "sib_sum", "c1").await, None);
+    assert_eq!(column_status_row(client, "sib_down", "d1").await, None);
+    let edges: i64 = client
+        .query_one("select count(*) from column_pause_cascades", &[])
+        .await
+        .expect("count edges")
+        .get(0);
+    assert_eq!(edges, 0, "no edge outlives the rows it joined");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(client, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(client, &db.pool).await;
+    assert_eq!(sib_sum_row(client, 1, &["c1"]).await, some(&["16"]));
+    let d1: Option<String> = client
+        .query_one("select d1::text from public.sib_down where id = 1", &[])
+        .await
+        .expect("read sib_down")
+        .get(0);
+    assert_eq!(d1.as_deref(), Some("17"));
+}
+
+/// Issue #918, route 2. `cost` waits for its capture and has passed `total`'s
+/// pause on to `sib_sum.c1` and `sib_down.d1`. `total`'s resume deletes the
+/// edge into `cost` and leaves the row, which is awaiting its capture. The
+/// capture release then deletes that row; it has to release `cost`'s
+/// readers as the resume would have, or they stay paused on a column that
+/// isn't.
+#[tokio::test]
+async fn the_capture_release_of_a_field_that_passed_a_pause_on_releases_its_readers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_total_paused(&db).await;
+    trellis
+        .apply(ALTER_COST_AWAITING_CAPTURE)
+        .await
+        .expect("edit cost");
+    quarantine::complete_pause_cascades(&db.pool)
+        .await
+        .expect("finish the walks");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+
+    let resumed = quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    assert_eq!(resumed, vec![("sib".to_string(), "total".to_string())]);
+    assert!(
+        column_status_row(&client, "sib", "cost").await.is_some(),
+        "the resume leaves the field that awaits its capture"
+    );
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_cost_readers_released(&mut client, &db).await;
+}
+
+/// Issue #918, route 3: `total` is resumed before the edit's cascade walk
+/// runs, so the walk starts from a row that only awaits its capture.
+#[tokio::test]
+async fn a_resume_before_the_cascade_walk_leaves_no_reader_paused_by_the_capture_release() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_total_paused(&db).await;
+    trellis
+        .apply(ALTER_COST_AWAITING_CAPTURE)
+        .await
+        .expect("edit cost");
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    quarantine::complete_pause_cascades(&db.pool)
+        .await
+        .expect("finish the walks");
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_cost_readers_released(&mut client, &db).await;
+}
+
+/// Issue #918, route 1: the edit comes first, and `total`'s pause then
+/// cascades through the field that awaits its capture.
+#[tokio::test]
+async fn a_pause_cascading_through_a_field_awaiting_its_capture_is_released_with_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_total_paused(&db).await;
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain_staged(&mut client, &db.pool).await;
+    trellis
+        .apply(ALTER_COST_AWAITING_CAPTURE)
+        .await
+        .expect("edit cost");
+    quarantine::pause_column(&db.pool, "sib", "total")
+        .await
+        .expect("pause total");
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_cost_readers_released(&mut client, &db).await;
+}
+
+/// Issue #918 through the other release: the definition is frozen and
+/// resumed (`RESUME TRANSFORM`) while `cost` still awaits its capture, so the
+/// resume discards the field build that would have released it, and the
+/// rebuild's start releases it instead.
+#[tokio::test]
+async fn a_rebuilds_release_of_a_field_that_passed_a_pause_on_releases_its_readers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (mut client, trellis) = seed_reader_chain_with_total_paused(&db).await;
+    trellis
+        .apply(ALTER_COST_AWAITING_CAPTURE)
+        .await
+        .expect("edit cost");
+    quarantine::complete_pause_cascades(&db.pool)
+        .await
+        .expect("finish the walks");
+    quarantine::resume_column(&db.pool, "sib", "total")
+        .await
+        .expect("resume total");
+    assert!(column_status_row(&client, "sib", "cost").await.is_some());
+    assert!(cascade_edge_exists(&client, "sib_sum", "c1", "sib", "cost").await);
+
+    trellis
+        .apply("PAUSE TRANSFORM sib")
+        .await
+        .expect("freeze sib");
+    trellis
+        .apply("RESUME TRANSFORM sib")
+        .await
+        .expect("resume sib");
+    assert_eq!(status_named(&client, "sib").await, "waiting_to_backfill");
+    run_capture_pass(&mut client, &db).await;
+    assert_cost_readers_released(&mut client, &db).await;
+}
+
 /// The edit has committed when it walks its cascade, so a walk that fails
 /// doesn't fail the edit: it keeps its mark, and the capture pass finishes
 /// it. Here a page in flight holds `sib_down`'s fence, so the walk's pause

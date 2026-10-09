@@ -252,6 +252,7 @@ use crate::pool::{Pool, quote_ident};
 
 use super::apply::ApplyError;
 use super::ledger::{self, LedgerTargetPlan, WrittenGroup};
+use super::quarantine;
 use super::target_mutations::TargetMutations;
 
 pub mod one_to_one;
@@ -1157,8 +1158,22 @@ pub async fn start_ready_builds(
             continue;
         }
         match start(client, &definition).await {
-            Ok(true) => taken.push(id),
-            Ok(false) => {}
+            Ok(Some(dependents)) => {
+                taken.push(id);
+                // The build has started; readers elsewhere that the release
+                // left paused are resumed after it (issue #918). A failure
+                // must not cost the rest of the pass its definitions.
+                if let Err(err) =
+                    resume_released_dependents(pool, &definition.def.target, dependents).await
+                {
+                    tracing::warn!(
+                        definition_id = id,
+                        error = %err,
+                        "readers of a released field stay paused; RESUME them"
+                    );
+                }
+            }
+            Ok(None) => {}
             // A start waits for the column-pause lock (#922). One that
             // times out wrote nothing; it stays `waiting_to_backfill` for
             // the next pass, and gets no registration marker meanwhile,
@@ -1213,24 +1228,54 @@ async fn awaits_capture(
 /// made them still owns are deleted, and one an operator pause, a fuse trip
 /// or an upstream pause's cascade took over (issue #309) only stops
 /// waiting, and stays paused for its own resume. With `fields`, only those.
+///
+/// A row it deletes is a pause that ends, so it un-cascades from it as a
+/// resume does ([`quarantine::uncascade`], issue #918): the field may have
+/// passed a pause on to its readers (a cascade through it, or one a sibling
+/// path gave it), and the resume that took its own edge away left the row,
+/// since it awaited its capture. The readers it releases in `target` come
+/// back from its caller's build as the fields it covers (an edit's build
+/// lists every sibling reading an edited field by alias, and a Re-derive
+/// build rebuilds all). Those in other definitions are returned: they need
+/// a field build of their own, which the caller starts once it has
+/// committed, with [`resume_released_dependents`].
+///
+/// The delete runs again while it finds rows: one that read the first
+/// pass's rows by alias had an edge into it then, and none now.
 async fn release_awaiting_capture(
     txn: &impl GenericClient,
     target: &str,
     fields: Option<&[String]>,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<Vec<(String, String)>, tokio_postgres::Error> {
     let fields: Option<Vec<String>> = fields.map(<[String]>::to_vec);
-    txn.execute(
-        "delete from column_status s \
-         where s.transform_table = $1 and s.awaiting_capture \
-           and ($2::text[] is null or s.column_name = any($2)) \
-           and not s.local_fuse \
-           and not exists ( \
-               select 1 from column_pause_cascades c \
-               where c.downstream_transform = s.transform_table \
-                 and c.downstream_column = s.column_name)",
-        &[&target, &fields],
-    )
-    .await?;
+    let mut dependents = Vec::new();
+    loop {
+        let deleted: Vec<String> = txn
+            .query(
+                "delete from column_status s \
+                 where s.transform_table = $1 and s.awaiting_capture \
+                   and ($2::text[] is null or s.column_name = any($2)) \
+                   and not s.local_fuse \
+                   and not exists ( \
+                       select 1 from column_pause_cascades c \
+                       where c.downstream_transform = s.transform_table \
+                         and c.downstream_column = s.column_name) \
+                 returning s.column_name",
+                &[&target, &fields],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if deleted.is_empty() {
+            break;
+        }
+        dependents.extend(
+            quarantine::uncascade(txn, target, deleted)
+                .await?
+                .dependents,
+        );
+    }
     txn.execute(
         "update column_status set awaiting_capture = false \
          where transform_table = $1 and awaiting_capture \
@@ -1238,6 +1283,29 @@ async fn release_awaiting_capture(
         &[&target, &fields],
     )
     .await?;
+    Ok(dependents)
+}
+
+/// Resumes the readers in other definitions that [`release_awaiting_capture`]
+/// left with no reason to stay paused (issue #918), as a resume of the
+/// column would have: each is released and rebuilt by a field build of its
+/// definition. After the release's commit, which released the column-pause
+/// lock the resume takes. A failure leaves them paused, with their edge
+/// gone, as a failed resume does, and their own `RESUME` recovers them.
+async fn resume_released_dependents(
+    pool: &Pool,
+    target: &str,
+    dependents: Vec<(String, String)>,
+) -> Result<(), ApplyError> {
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    let resumed = quarantine::resume_pairs(pool, target, dependents.into()).await?;
+    tracing::info!(
+        target,
+        ?resumed,
+        "readers of a field released from its capture wait resumed"
+    );
     Ok(())
 }
 
@@ -1286,12 +1354,15 @@ async fn capture_gate_holds(client: &impl GenericClient, table: &str) -> Result<
 /// changes committed after the start, drained by pages that read the
 /// definition list after it, so none is dropped.
 ///
-/// Returns `false`, writing nothing, when the definition left
-/// `waiting_to_backfill` meanwhile.
+/// Returns `None`, writing nothing, when the definition left
+/// `waiting_to_backfill` meanwhile, and otherwise the readers in other
+/// definitions its release of `awaiting_capture` pauses left paused
+/// ([`release_awaiting_capture`]), for the caller to resume once this has
+/// committed.
 async fn start(
     client: &mut tokio_postgres::Client,
     definition: &Definition,
-) -> Result<bool, ApplyError> {
+) -> Result<Option<Vec<(String, String)>>, ApplyError> {
     let txn = client.transaction().await?;
     // The column-pause lock, exclusive (#922): this start releases the
     // definition's `awaiting_capture` pauses ([`release_awaiting_capture`]),
@@ -1314,7 +1385,7 @@ async fn start(
         .map(|row| row.get(0));
     if status.as_deref() != Some(TransformStatus::WaitingToBackfill.as_str()) {
         txn.rollback().await?;
-        return Ok(false);
+        return Ok(None);
     }
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
@@ -1334,7 +1405,7 @@ async fn start(
     .await?;
     // The caller found any field awaiting capture ready (#625 F8b), so it
     // applies from this commit, and the build's chunks write it.
-    release_awaiting_capture(&txn, &definition.def.target, None).await?;
+    let dependents = release_awaiting_capture(&txn, &definition.def.target, None).await?;
     txn.execute(
         "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
          select id, $2, fuse_rearmed_at, pg_current_xact_id() \
@@ -1369,7 +1440,7 @@ async fn start(
         rebuild = !empty,
         "transform status transition: re-derive build started"
     );
-    Ok(true)
+    Ok(Some(dependents))
 }
 
 /// Whether a definition read as `status` with `build` can take a field
@@ -1516,8 +1587,11 @@ async fn field_build_ready(
         }
         CaptureRelease::Ready => {}
     }
-    release_awaiting_capture(&*txn, &definition.def.target, Some(fields)).await?;
+    let dependents = release_awaiting_capture(&*txn, &definition.def.target, Some(fields)).await?;
     txn.commit().await?;
+    resume_released_dependents(pool, &definition.def.target, dependents)
+        .await
+        .map_err(build_error)?;
     tracing::info!(
         definition_id = definition.id,
         ?fields,
