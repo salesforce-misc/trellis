@@ -3427,7 +3427,10 @@ pub(crate) async fn resume_pairs(
                         pool,
                         &t,
                         &c,
-                        &format!("its definition no longer validates ({reason})"),
+                        &format!(
+                            "its definition no longer validates ({reason}); \
+                             RESUME it once the definition validates again"
+                        ),
                     )
                     .await?;
                     continue;
@@ -3509,7 +3512,10 @@ pub(crate) async fn resume_pairs(
                 pool,
                 &t,
                 &c,
-                &format!("its definition is {status_text} and can't take a field build yet"),
+                &format!(
+                    "its definition is {status_text} and can't take a field build yet; \
+                     RESUME it once the definition is live"
+                ),
             )
             .await?;
             continue;
@@ -3588,9 +3594,9 @@ pub(crate) async fn resume_pairs(
 /// awaiting a capture, and `last_error` still says it waits on the upstream,
 /// which no longer holds; nothing would release it, and its definition would
 /// go live with the field held out. Setting `local_fuse` makes the pause
-/// its own, as an operator's, and the reason says why, so `RESUME` of the
-/// column is the way out once the definition applies. The row's readers, if
-/// any, keep their edges from it.
+/// its own, as an operator's, and the reason (`why`) says why and when its
+/// `RESUME` is the way out: once the definition is live, or validates again.
+/// The row's readers, if any, keep their edges from it.
 ///
 /// A row that has a reason after all (another pause took it over meanwhile,
 /// or it was released) is left as it is.
@@ -3616,10 +3622,7 @@ async fn hold_orphaned_pause(
             &[
                 &transform,
                 &column,
-                &format!(
-                    "paused: the upstream column it read was resumed, but {why}; \
-                     RESUME it once the definition applies"
-                ),
+                &format!("paused: the upstream column it read was resumed, but {why}"),
             ],
         )
         .await?;
