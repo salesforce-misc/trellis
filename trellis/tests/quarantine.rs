@@ -3143,3 +3143,207 @@ async fn a_held_key_does_not_hold_its_tables_capture_gate() {
         "the held change doesn't hold the gate"
     );
 }
+
+// ---------------------------------------------------------------------
+// An eviction that commits after a release (#880)
+// ---------------------------------------------------------------------
+
+/// The advisory lock the interleaving tests below freeze the eviction on.
+const EVICTION_PAUSE_LOCK: i64 = 880;
+
+/// One `isolate_and_evict` of `folded` at `threshold`, run in its own task
+/// and frozen at [`PausePoint::BeforeEvictionLocks`] for `paused_target`:
+/// isolation has charged the keys, the eviction's transaction has begun and
+/// holds nothing. Returns the gate connection (holding the pause lock), the
+/// task and the frozen worker's report.
+async fn eviction_frozen_before_its_locks(
+    db: &TestDatabase,
+    folded: Vec<FoldedChange>,
+    threshold: i32,
+    paused_target: &str,
+) -> (
+    Client,
+    tokio::task::JoinHandle<Result<IsolationOutcome, ApplyError>>,
+) {
+    use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+    let gate = connect_raw(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&EVICTION_PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+    let scope = PauseScope::new();
+    let reached = scope.arm(
+        PausePoint::BeforeEvictionLocks,
+        paused_target,
+        EVICTION_PAUSE_LOCK,
+    );
+    let pool = db.pool.clone();
+    let mut eviction = tokio::spawn(with_scope(scope, async move {
+        isolate_and_evict(
+            &pool,
+            1,
+            "worker",
+            "trellis_quarantine_test",
+            &folded,
+            threshold,
+            false,
+        )
+        .await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut eviction => panic!("the eviction finished without pausing: {finished:?}"),
+    }
+    (gate, eviction)
+}
+
+async fn unfreeze(gate: &Client) {
+    gate.execute("select pg_advisory_unlock($1)", &[&EVICTION_PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+}
+
+/// Issue #880: isolation charges a key, a `release_key` commits, then the
+/// eviction commits. The eviction re-reads the key's deaths under the
+/// definition's row lock, finds the release deleted them and poisons
+/// nothing, so the release stands and the `Recompute` it staged drains
+/// instead of parking behind a new poison row.
+#[tokio::test]
+async fn an_eviction_after_a_release_does_not_poison_the_key_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+    let orders = qualify_fixture_table("orders");
+    let folded = vec![unevaluable_change(&orders, "7")];
+
+    let (gate, eviction) = eviction_frozen_before_its_locks(&db, folded, 1, "order_totals").await;
+    assert_eq!(key_deaths_count(&client, &orders, "7").await, Some(1));
+    // The key is held (another worker's eviction of the same failure got
+    // there first), which is what a release needs.
+    insert_poison_marker(&client, "order_totals", &orders, "7").await;
+    let released = trellis::staging::release_key(&db.pool, "order_totals", &orders, "7")
+        .await
+        .expect("release key 7");
+    assert_eq!(released, 0, "marked poisoned with nothing parked");
+    assert_eq!(key_deaths_count(&client, &orders, "7").await, None);
+
+    unfreeze(&gate).await;
+    let outcome = eviction.await.expect("eviction task").expect("eviction");
+    assert!(
+        matches!(outcome, IsolationOutcome::ChargedBelowThreshold { ref charged } if charged.is_empty()),
+        "the released key is not evicted, got {outcome:?}"
+    );
+    assert!(
+        !poison_marker_exists(&client, &orders, "7").await,
+        "the release stands"
+    );
+    assert_eq!(poison_rows_for(&client, &orders).await, 0);
+    let held: i64 = client
+        .query_one("select count(*) from poison_held", &[])
+        .await
+        .expect("count poison_held")
+        .get(0);
+    assert_eq!(held, 0, "nothing is parked");
+
+    // The release's `Recompute` is not held behind a new poison row.
+    let seg_seq = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg_seq, "worker").await;
+    assert!(segment_state_is_drained(&client, seg_seq).await);
+    assert!(!poison_marker_exists(&client, &orders, "7").await);
+}
+
+/// Issue #880 rule 4: the re-check is "count at the threshold", not "row
+/// exists". A key charged again after its release, below the threshold, is
+/// not poisoned by the eviction that isolation's earlier charge started; and
+/// it is poisoned once it reaches the threshold again.
+#[tokio::test]
+async fn a_key_that_fails_again_after_its_release_is_poisoned_at_the_threshold() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+    let orders = qualify_fixture_table("orders");
+    let folded = vec![unevaluable_change(&orders, "7")];
+    let evict = || {
+        isolate_and_evict(
+            &db.pool,
+            1,
+            "worker",
+            "trellis_quarantine_test",
+            &folded,
+            2,
+            false,
+        )
+    };
+
+    let first = evict().await.expect("first charge");
+    assert!(matches!(
+        first,
+        IsolationOutcome::ChargedBelowThreshold { .. }
+    ));
+    // The second charge reaches the threshold; its eviction is frozen.
+    let (gate, eviction) =
+        eviction_frozen_before_its_locks(&db, folded.clone(), 2, "order_totals").await;
+    assert_eq!(key_deaths_count(&client, &orders, "7").await, Some(2));
+    insert_poison_marker(&client, "order_totals", &orders, "7").await;
+    trellis::staging::release_key(&db.pool, "order_totals", &orders, "7")
+        .await
+        .expect("release key 7");
+
+    // The key fails again: charged from 1, below the threshold.
+    let again = evict().await.expect("a charge after the release");
+    let IsolationOutcome::ChargedBelowThreshold { charged } = again else {
+        panic!("one death after the release is below the threshold, got {again:?}")
+    };
+    assert_eq!(charged.len(), 1);
+    assert_eq!(charged[0].deaths, 1);
+
+    // The frozen eviction wakes to a row that exists but counts one death.
+    unfreeze(&gate).await;
+    let frozen = eviction.await.expect("eviction task").expect("eviction");
+    assert!(
+        matches!(frozen, IsolationOutcome::ChargedBelowThreshold { .. }),
+        "a death charged after the release is not the old one, got {frozen:?}"
+    );
+    assert!(!poison_marker_exists(&client, &orders, "7").await);
+
+    // Its second death after the release reaches the threshold again.
+    let last = evict().await.expect("the threshold charge");
+    let IsolationOutcome::Evicted { evicted, .. } = last else {
+        panic!("the key reaches the threshold again and is poisoned, got {last:?}")
+    };
+    assert_eq!(evicted, 1);
+    assert!(poison_marker_exists(&client, &orders, "7").await);
+}
+
+/// Issue #880 with #799: a release of the key for one definition does not
+/// stop the eviction of the same key for the other definition its failure
+/// was charged to.
+#[tokio::test]
+async fn a_release_for_one_definition_does_not_stop_the_eviction_for_another() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_two_readers(&db, &client).await;
+    let orders = qualify_fixture_table("orders");
+    let folded = vec![unevaluable_change(&orders, "7")];
+
+    let (gate, eviction) = eviction_frozen_before_its_locks(&db, folded, 1, "order_totals").await;
+    assert_eq!(rows_for(&client, "key_deaths", "order_totals").await, 1);
+    assert_eq!(rows_for(&client, "key_deaths", "order_prices").await, 1);
+    insert_poison_marker(&client, "order_totals", &orders, "7").await;
+    trellis::staging::release_key(&db.pool, "order_totals", &orders, "7")
+        .await
+        .expect("release key 7 for order_totals");
+
+    unfreeze(&gate).await;
+    let outcome = eviction.await.expect("eviction task").expect("eviction");
+    assert!(
+        matches!(outcome, IsolationOutcome::Evicted { evicted: 1, .. }),
+        "only order_prices' eviction goes ahead, got {outcome:?}"
+    );
+    assert_eq!(
+        poisoned_for(&client).await,
+        vec![("order_prices".to_string(), orders.clone(), "7".to_string())]
+    );
+}

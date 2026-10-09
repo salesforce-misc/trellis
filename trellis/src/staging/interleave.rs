@@ -84,6 +84,11 @@
 //! column-pause lock, before it clears the column's `local_fuse` (#922). A
 //! test runs the resume inside [`with_scope`].
 //!
+//! A drain's eviction (`super::quarantine::isolate_and_evict`) fires
+//! [`PausePoint::BeforeEvictionLocks`] for each definition's bare target
+//! after its transaction begins, before it takes the definition's fuse gate
+//! and row (#880). A test runs the isolation inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -172,6 +177,12 @@ pub enum PausePoint {
     /// readers of them, for its own (bare) target
     /// (`defs::catalog`'s `pause_readers_of_paused_columns`, #914).
     AfterUpstreamPausesRead,
+    /// After a drain's eviction transaction begins, before it takes a
+    /// definition's fuse gate and row lock and writes the poison for its
+    /// charged keys, for the definition's bare target
+    /// (`super::quarantine::isolate_and_evict`, #880). The isolation has
+    /// charged the keys and committed; nothing of the eviction's is held.
+    BeforeEvictionLocks,
     /// After a column resume deletes the `column_status` row of the column
     /// it resumes, before it releases that column's readers, for the
     /// column's (bare) target (`super::quarantine::resume_column`, #917).

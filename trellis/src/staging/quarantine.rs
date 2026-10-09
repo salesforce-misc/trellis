@@ -912,8 +912,58 @@ pub(crate) fn describe_charged_keys(charged: &[ChargedKey], threshold: i32) -> S
     out
 }
 
+/// Whether `deaths` charged to `probe`'s key poison it, given the drain's
+/// row-level `threshold`: the one place that decision is made. Both the
+/// partition of a page's charges ([`partition_by_threshold`]) and the
+/// eviction's re-check under the definition's row lock
+/// ([`still_charged_to_threshold`], #880) ask it, so a key whose threshold
+/// isn't the global one (#861's retried key, poisoned on its first failure)
+/// changes here and nowhere else.
+fn crosses_threshold(_probe: &PoisonedProbe, deaths: i32, threshold: i32) -> bool {
+    deaths >= threshold
+}
+
+/// Whether `probe`'s key is still charged to its threshold, read under the
+/// definition's row lock ([`evict_for`]) and so after every release that
+/// committed before it (#880). A [`release_key`] deletes the key's
+/// `key_deaths` row, so an eviction whose isolation charged the key before
+/// the release finds the row gone, or counting only the deaths charged after
+/// it, and poisons nothing: the operator's release stands. A key that fails
+/// again after its release is charged from 1 again and crosses the threshold
+/// again on its own deaths. The same canonical `src_table` as the charge and
+/// the release (#283).
+async fn still_charged_to_threshold(
+    txn: &Transaction<'_>,
+    probe: &PoisonedProbe,
+    threshold: i32,
+) -> Result<bool, ApplyError> {
+    let deaths: Option<i32> = txn
+        .query_opt(
+            "select deaths from key_deaths \
+             where transform_id = $1 and src_table = $2 and key = $3",
+            &[
+                &probe.culprit.transform_id,
+                &probe.canonical_src_table,
+                &probe.key,
+            ],
+        )
+        .await?
+        .map(|row| row.get(0));
+    let charged = deaths.is_some_and(|deaths| crosses_threshold(probe, deaths, threshold));
+    if !charged {
+        tracing::debug!(
+            transform = %probe.culprit.target,
+            src_table = %probe.canonical_src_table,
+            key = %probe.key,
+            deaths,
+            "not poisoning a key released while isolation charged it"
+        );
+    }
+    Ok(charged)
+}
+
 /// Splits each charged probe (paired with its post-charge death count) into
-/// "evict now" (`deaths >= threshold`) and "charged, still below threshold".
+/// "evict now" ([`crosses_threshold`]) and "charged, still below threshold".
 fn partition_by_threshold(
     charged: Vec<(PoisonedProbe, i32)>,
     threshold: i32,
@@ -921,7 +971,7 @@ fn partition_by_threshold(
     let mut evict_now = Vec::new();
     let mut below = Vec::new();
     for (probe, deaths) in charged {
-        if deaths >= threshold {
+        if crosses_threshold(&probe, deaths, threshold) {
             evict_now.push(probe);
         } else {
             below.push(ChargedKey {
@@ -1699,6 +1749,14 @@ async fn isolate_and_evict_probing(
     let txn = client.transaction().await?;
     let mut evicted = 0;
     for (transform_id, mut probes) in by_transform {
+        // Test-only pause point (#880). See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            &*txn,
+            super::interleave::PausePoint::BeforeEvictionLocks,
+            &probes[0].culprit.target,
+        )
+        .await?;
         if !evict_for(&txn, transform_id, probes[0].culprit.epoch).await? {
             continue;
         }
@@ -1712,6 +1770,13 @@ async fn isolate_and_evict_probing(
             let contribution = folded.iter().find(|c| {
                 !c.is_truncate && c.src_table == probe.raw_src_table && c.key == probe.key
             });
+            // #880: a release that committed after isolation charged this
+            // key, before `evict_for` locked the definition, deleted the
+            // charge. Read it now, under the lock, or the poison written
+            // below would undo the release.
+            if !still_charged_to_threshold(&txn, probe, threshold).await? {
+                continue;
+            }
             evict_key(&txn, seg_seq, probe, contribution).await?;
             evicted += 1;
         }
@@ -1720,9 +1785,10 @@ async fn isolate_and_evict_probing(
     txn.commit().await?;
 
     if evicted == 0 {
-        // Every culprit was frozen or resumed while isolation probed it: the
-        // retry recomputes without them, so the original failure is likely
-        // gone, and if not the next isolation attributes it afresh.
+        // Every culprit was frozen, resumed or had its key released while
+        // isolation probed it: the retry recomputes without them, so the
+        // original failure is likely gone, and if not the next isolation
+        // attributes it afresh.
         return Ok(IsolationOutcome::ChargedBelowThreshold { charged });
     }
     Ok(IsolationOutcome::Evicted { evicted, charged })
@@ -4668,7 +4734,11 @@ async fn end_request(
 ///   eviction that committed first is released with the rest, and a resume
 ///   or drop that committed first leaves nothing held, so the release
 ///   refuses ([`ApplyError::KeyNotHeld`]) or finds no definition
-///   ([`ApplyError::TransformNotFound`]).
+///   ([`ApplyError::TransformNotFound`]). An eviction whose isolation
+///   charged the key before the release but that locks the definition after
+///   it re-reads the key's death counter, which the release deleted, and
+///   poisons nothing ([`still_charged_to_threshold`], #880). A key that
+///   fails again is charged from 1 again.
 ///
 /// Neither lock is held while a page waits on one of the release's, since a
 /// page takes its fences before any other lock: the release takes the

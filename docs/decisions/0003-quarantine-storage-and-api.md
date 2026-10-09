@@ -360,6 +360,24 @@ keys:
   with the rest; a resume or drop that commits first leaves nothing held, and
   the release is refused.
 
+An eviction charges a key's `key_deaths` in a transaction of its own, before it
+takes the transform's row, so a release can commit between the two. The
+eviction therefore re-reads the key's `key_deaths` count after it takes the
+row, for the same transform and the same canonical source table as the
+release, and writes no `poison` row and parks nothing if the row is gone or
+the count is below the threshold that key poisons at. The release deleted the
+count, so an eviction that charged the key before the release finds it gone
+and the release stands, instead of the key being held again with the
+`Recompute` parked behind it. The test is the count reaching the threshold,
+not the row existing: a key that fails again after its release is charged from
+1 again, a death charged after the release is not the one the eviction
+charged, and the key is poisoned once it reaches the threshold again. The
+check is one read inside the eviction's transaction, with no new lock or
+state. A build chunk's eviction charges and poisons in one transaction, so it
+has no such window. The threshold is decided in one place
+(`quarantine::crosses_threshold`) so that a key that poisons on its first
+failure is checked against its own.
+
 A held key is visible wherever its transform's state is read. `status` reports
 `held_keys` (the count and the oldest `poisoned_at`) whatever the transform's
 status, `live` included, and `self_check` reports the same with every audit,
