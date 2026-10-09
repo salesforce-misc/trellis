@@ -63,6 +63,25 @@ re-checked. The staging worker's reconcile pass reinstalls a missing or
 disabled trigger, so those faults last only while no worker runs or its
 reconcile can't land; the others persist until an operator fixes them.
 
+### Only a `live` definition is compared
+
+The convergence wait never reads a definition's status, and a repair that
+rebuilds a definition (an explicit `request_backfill`, a resume, an `ALTER
+TRANSFORM`, a capture re-install) does its work in background jobs the wait
+knows nothing about. A comparison made while the definition is being built
+would agree or disagree with a state the build is about to change. After the
+capture audit, `self_check` therefore reads the definition's status and
+compares only a `live` one. Any other (`waiting_to_backfill`, `backfilling`,
+`catching_up`, `paused`, `quarantined`) returns the outcome `NotLive`, which
+carries that status. It compares nothing and waits for nothing. Like
+`NotCaughtUp` it is not a verdict on correctness, and the remedy is the same
+kind: poll the status until it is `live`, then check again.
+
+A rebuild is a status transition made in the repairing call's own
+transaction ([ADR-0002](0002-async-data-flow.md#convergence-and-status)), so a
+check made right after `request_backfill` returns is told `backfilling`
+instead of being shown a stale target as agreement.
+
 ### Postgres is the oracle; the comparison is two-way
 
 `self_check` compares the persisted target against an equivalent recompute *query*

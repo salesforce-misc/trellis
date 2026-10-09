@@ -55,8 +55,8 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::hierarchy::Hierarchy;
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{
-    CaptureFault, Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis,
-    TrellisOptions,
+    CaptureFault, Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope,
+    TransformStatus, Trellis, TrellisOptions,
 };
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -261,6 +261,113 @@ async fn converged_target_reports_no_divergence() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// A definition that isn't `live` isn't compared (#625 F7, comment 2): a
+/// rebuild a repair starts is visible from the call's return, so the audit
+/// says so rather than comparing a target the rebuild is about to change, and
+/// once the rebuild is done the same audit compares and converges. Nothing is
+/// awaited for the `NotLive` report, so it needs no drain and no timeout.
+#[tokio::test]
+async fn self_check_reports_a_definition_under_a_rebuild_as_not_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = converged_fixture(
+        &db,
+        "create table widgets (id integer primary key, price integer)",
+        "widgets",
+        "TRANSFORM widget_prices FROM widgets SELECT price AS price",
+        &[
+            ("1", r#"{"id":"1","price":"10"}"#),
+            ("2", r#"{"id":"2","price":"20"}"#),
+        ],
+    )
+    .await;
+    let check = || async {
+        trellis
+            .self_check(
+                "widget_prices",
+                SelfCheckScope {
+                    after: None,
+                    limit: 100,
+                },
+                SelfCheckMode::Standard,
+                GENEROUS_TIMEOUT,
+            )
+            .await
+            .expect("self_check")
+    };
+
+    trellis
+        .request_backfill("widgets")
+        .await
+        .expect("request a rebuild");
+    let report = check().await;
+    assert!(
+        matches!(
+            report.outcome,
+            SelfCheckOutcome::NotLive(TransformStatus::Backfilling)
+        ),
+        "expected NotLive(Backfilling), got {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 0, "nothing was compared");
+    assert_eq!(report.next_after, None);
+
+    trellis::intake::markers::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut { raw }).await;
+    let report = check().await;
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "expected Converged once live, got {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 2);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Likewise a frozen definition: its target is deliberately not maintained.
+#[tokio::test]
+async fn self_check_reports_a_paused_definition_as_not_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = converged_fixture(
+        &db,
+        "create table widgets (id integer primary key, price integer)",
+        "widgets",
+        "TRANSFORM widget_prices FROM widgets SELECT price AS price",
+        &[("1", r#"{"id":"1","price":"10"}"#)],
+    )
+    .await;
+    trellis
+        .apply("PAUSE TRANSFORM widget_prices")
+        .await
+        .expect("pause");
+
+    let report = trellis
+        .self_check(
+            "widget_prices",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+
+    assert!(
+        matches!(
+            report.outcome,
+            SelfCheckOutcome::NotLive(TransformStatus::Paused)
+        ),
+        "expected NotLive(Paused), got {:?}",
+        report.outcome
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// Issue #109's typed literals, through the production audit path.
 ///
 /// `self_check` is the one place a *production* SQL renderer
@@ -446,6 +553,12 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
+    // The definition goes `live` over the empty source before the staging
+    // worker starts: with no drain workers it could never run a build, and a
+    // definition that isn't `live` is not compared (#625 F7).
+    let mut setup = connect_raw(db.dsn()).await;
+    capture(&mut setup, &format!("{DEFAULT_SCHEMA}.widgets")).await;
+    trellis::intake::markers::settle_registrations(&db.pool).await;
 
     // Staging only: capture + ring maintenance, but zero drain workers —
     // nothing will ever apply this row.

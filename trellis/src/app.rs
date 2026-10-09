@@ -1305,7 +1305,10 @@ impl Trellis {
     /// [`TransformStatus::CatchingUp`]) may still be missing rows after this
     /// returns. Check [`Trellis::status`] for that. Once it reports `live`,
     /// a token taken after a commit and awaited here covers that commit
-    /// (ADR-0016, "What `live` promises").
+    /// (ADR-0016, "What `live` promises"). That includes a repair that
+    /// rebuilds a definition ([`Trellis::request_backfill`]): the definition
+    /// reads `backfilling` from the call's return, so polling for `live`
+    /// first waits out the rebuild (#625 F7).
     ///
     /// Holds one pooled connection for the whole call (it polls on it), so a
     /// long `timeout` on a small `pool_max_size` is a real, if bounded, draw
@@ -1341,6 +1344,12 @@ impl Trellis {
     /// doc comment for how to size it; a target that's merely still
     /// catching up reports [`crate::staging::self_check::SelfCheckOutcome::NotCaughtUp`],
     /// never a divergence.
+    ///
+    /// Only a `live` definition is compared: any other reports
+    /// [`crate::staging::self_check::SelfCheckOutcome::NotLive`] with its
+    /// status, and nothing is awaited or compared (#625 F7). A rebuild
+    /// ([`Trellis::request_backfill`]) is `backfilling` from the call's
+    /// return, so "poll `live`, then check" checks after the repair.
     ///
     /// Only a [`crate::defs::ast::KeySpace::OneToOne`] target is supported
     /// this issue (see the module doc comment on

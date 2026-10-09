@@ -406,7 +406,8 @@ struct SamplePageTerm {
 }
 
 /// What `self_check/3` found. `outcome` is one of
-/// [`SELF_CHECK_OUTCOMES`]; `divergences` is empty unless it is `diverged`.
+/// [`SELF_CHECK_OUTCOMES`]; `divergences` is empty unless it is `diverged`,
+/// and `status` is set only when it is `not_live`.
 #[derive(NifMap)]
 struct SelfCheckReportTerm {
     target: String,
@@ -414,6 +415,7 @@ struct SelfCheckReportTerm {
     rows_compared: i64,
     next_after: Option<String>,
     outcome: Atom,
+    status: Option<Atom>,
     divergences: Vec<DivergenceTerm>,
     held_keys: Option<HeldKeysTerm>,
     drain_failures: Vec<DrainFailureTerm>,
@@ -440,6 +442,10 @@ impl SelfCheckReportTerm {
             rows_compared: report.rows_compared,
             next_after: report.next_after,
             outcome: word_atom(env, report.outcome)?,
+            status: report
+                .status
+                .map(|status| word_atom(env, status))
+                .transpose()?,
             divergences: report
                 .divergences
                 .into_iter()

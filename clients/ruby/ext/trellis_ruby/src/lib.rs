@@ -977,7 +977,8 @@ fn poison_entry_hash(ruby: &Ruby, entry: PlainPoisonEntry) -> Result<RHash, Erro
 }
 
 /// What `self_check` found. `outcome` is one of [`SELF_CHECK_OUTCOMES`];
-/// `divergences` is empty unless it is `diverged`.
+/// `divergences` is empty unless it is `diverged`, and `status` is set only
+/// when it is `not_live`.
 fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, Error> {
     let divergences = array(ruby, report.divergences, divergence_hash)?;
     let held_keys = report
@@ -985,6 +986,9 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
         .map(|held| held_keys_hash(ruby, held))
         .transpose()?;
     let drain_failures = array(ruby, report.drain_failures, drain_failure_hash)?;
+    let status = report
+        .status
+        .map(|status| word_symbol(ruby, status).as_value());
     record(
         ruby,
         [
@@ -993,6 +997,7 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
             ("rows_compared", ruby.into_value(report.rows_compared)),
             ("next_after", ruby.into_value(report.next_after)),
             ("outcome", word_symbol(ruby, report.outcome).as_value()),
+            ("status", ruby.into_value(status)),
             ("divergences", divergences.as_value()),
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failures", drain_failures.as_value()),

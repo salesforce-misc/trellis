@@ -146,17 +146,19 @@ fixture only shows parity when both of them pass.
 
 Between the two, a short phase runs the staging worker with no drain threads,
 for steps that need a write captured but never drained (an `await_converged`
-or `self_check` that times out). The staging worker installs capture in a
-first pass that finishes before `connect` returns, so a write made in phase
-one isn't captured at all: the build covers it by reading the source, and it
-holds no token back.
+that times out). The staging worker installs capture in a first pass that
+finishes before `connect` returns, so a write made in phase one isn't
+captured at all: the build covers it by reading the source, and it holds no
+token back. The same arrangement runs once more at the end, over live
+definitions, for the `self_check` outcomes that need a write nothing drains
+(`not_caught_up`) and a rebuild nothing can finish (`not_live`).
 
-In phase two, mind what runs after a step returns. `ALTER`, `RESUME` and
-`request_backfill` park a re-read of the transform's source, which rewrites
-every target that source feeds, some time later, and `await_converged`
-doesn't wait for a parked re-read. So a transform those statements touch
-reads a source table of its own (`parity_scratch_src`), and the overflowing
-`parity_ledger` rows are fixed before the column resume re-reads them.
-Name a specific status word only where the step is about it: the phase-one
-steps take any `transform_status`, since how a new definition starts is
-#556's to change.
+In phase two, mind what runs after a step returns. A repair of a definition
+(`ALTER`, `RESUME`, `request_backfill`) is a rebuild of that definition alone,
+and its status reads `backfilling` from the call's return, so a step that
+needs the repair done polls for `live`. Definitions may share a source. The
+`parity_doubled` and `parity_gizmo_prices` steps poison keys, so each reads a
+source of its own, and the overflowing `parity_ledger` rows are fixed before
+the column resume re-reads them. Name a specific status word only where the
+step is about it: the phase-one steps take any `transform_status`, since how
+a new definition starts is #556's to change.

@@ -12,10 +12,10 @@
 
 use trellis::{Divergence, ErrorCode, SelfCheckMode, SelfCheckOutcome, SelfCheckReport};
 
-use crate::{PlainDrainFailure, PlainError, PlainHeldKeys, encode_watermark};
+use crate::{PlainDrainFailure, PlainError, PlainHeldKeys, encode_watermark, transform_status};
 
 /// Every word [`PlainSelfCheckReport::outcome`] can be.
-pub const SELF_CHECK_OUTCOMES: [&str; 3] = ["converged", "not_caught_up", "diverged"];
+pub const SELF_CHECK_OUTCOMES: [&str; 4] = ["converged", "not_caught_up", "not_live", "diverged"];
 
 /// Every word [`PlainDivergence::kind`] can be.
 pub const DIVERGENCE_KINDS: [&str; 6] = [
@@ -58,6 +58,11 @@ pub struct PlainSelfCheckReport {
     pub next_after: Option<String>,
     /// One of [`SELF_CHECK_OUTCOMES`].
     pub outcome: &'static str,
+    /// The audited definition's status word (one of
+    /// [`crate::transform_status_names`]) when `outcome` is `not_live`:
+    /// nothing was awaited or compared, because it isn't `live`. `None`
+    /// for every other outcome.
+    pub status: Option<&'static str>,
     /// What diverged; empty unless `outcome` is `diverged`.
     pub divergences: Vec<PlainDivergence>,
     /// The keys the audited definition holds in quarantine, whatever the
@@ -97,10 +102,15 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
         let (outcome, divergences) = match &report.outcome {
             SelfCheckOutcome::Converged => ("converged", Vec::new()),
             SelfCheckOutcome::NotCaughtUp => ("not_caught_up", Vec::new()),
+            SelfCheckOutcome::NotLive(_) => ("not_live", Vec::new()),
             SelfCheckOutcome::Diverged(divergences) => (
                 "diverged",
                 divergences.iter().map(PlainDivergence::from).collect(),
             ),
+        };
+        let status = match &report.outcome {
+            SelfCheckOutcome::NotLive(status) => Some(transform_status(*status)),
+            _ => None,
         };
         PlainSelfCheckReport {
             target: report.target.clone(),
@@ -108,6 +118,7 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
             rows_compared: report.rows_compared,
             next_after: report.next_after.clone(),
             outcome,
+            status,
             divergences,
             held_keys: report.held_keys.as_ref().map(PlainHeldKeys::from),
             drain_failures: report
@@ -196,6 +207,7 @@ mod tests {
                 rows_compared: 42,
                 next_after: Some("42".to_string()),
                 outcome: "converged",
+                status: None,
                 divergences: Vec::new(),
                 held_keys: None,
                 drain_failures: Vec::new(),
@@ -280,6 +292,18 @@ mod tests {
         let plain = PlainSelfCheckReport::from(&report(SelfCheckOutcome::NotCaughtUp));
         assert_eq!(plain.outcome, "not_caught_up");
         assert!(plain.divergences.is_empty());
+    }
+
+    #[test]
+    fn not_live_is_its_own_outcome_and_names_the_status() {
+        for status in trellis::TransformStatus::ALL {
+            let plain = PlainSelfCheckReport::from(&report(SelfCheckOutcome::NotLive(status)));
+            assert_eq!(plain.outcome, "not_live");
+            assert_eq!(plain.status, Some(status.as_str()));
+            assert!(plain.divergences.is_empty());
+        }
+        let converged = PlainSelfCheckReport::from(&report(SelfCheckOutcome::Converged));
+        assert_eq!(converged.status, None, "only not_live names a status");
     }
 
     #[test]

@@ -68,6 +68,21 @@
 //! caller that can quiesce (e.g. the generative suite, after
 //! `ManualBackend::quiesce`) should reach for.
 //!
+//! # Only a `live` definition is compared (#625 F7)
+//!
+//! The convergence wait is a predicate over the staging ring
+//! ([`converge::await_converged`]); it never looks at a definition's status,
+//! and a repair that rebuilds a definition (an explicit `request_backfill`, a
+//! resume, an `ALTER TRANSFORM`, a capture re-install) does its work in
+//! background jobs the ring knows nothing about. A comparison made while the
+//! definition is being built would therefore agree or disagree with a state
+//! the build is about to change. So [`self_check`] compares only a `live`
+//! definition, and reports any other as [`SelfCheckOutcome::NotLive`] with
+//! its status, after the capture audit and before the wait. `live` is strict:
+//! every job of a rebuild is done before the definition reads it again, and
+//! a repair's own transaction moves the definition out of it, so a caller
+//! that polls for `live` and then checks is checking after the repair.
+//!
 //! # Scope: 1-1 targets only, this issue
 //!
 //! Aggregate and relationship-enriched targets are out of scope for this
@@ -112,7 +127,7 @@ use tokio_postgres::types::PgLsn;
 use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::model::Definition;
+use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::typed_literal;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -248,6 +263,16 @@ pub enum SelfCheckOutcome {
     /// A stable divergence — present, and (under [`SelfCheckMode::Standard`])
     /// still present after a fresh re-check.
     Diverged(Vec<Divergence>),
+    /// The definition isn't [`TransformStatus::Live`] (#625 F7): it is being
+    /// built or rebuilt, catching up, paused or quarantined, with the
+    /// carried status. Nothing was compared and nothing was awaited.
+    /// **Not a verdict on correctness**, like
+    /// [`SelfCheckOutcome::NotCaughtUp`]; poll the definition's status until
+    /// it is `live` and check again. A rebuild a repair starts
+    /// ([`crate::Trellis::request_backfill`]) is visible here from the call's
+    /// return, so a caller that checks right after one is told so rather
+    /// than shown a comparison the rebuild is still about to change.
+    NotLive(TransformStatus),
 }
 
 /// One divergence [`self_check`] found: ADR-0013's four kinds, plus a
@@ -487,6 +512,25 @@ async fn audit(
             outcome: SelfCheckOutcome::Diverged(
                 faults.into_iter().map(Divergence::Capture).collect(),
             ),
+            held_keys: None,
+            drain_failures: Vec::new(),
+        });
+    }
+
+    // #625 F7: only a `live` definition is compared (see the module doc's
+    // "Only a `live` definition is compared"). After the capture audit, a
+    // fact about the catalog that holds whatever the status, and before the
+    // wait and the comparison, which a definition that is being built would
+    // pass or fail for reasons that have nothing to do with its steady
+    // state.
+    if def.status != TransformStatus::Live {
+        let client = pool.get().await?;
+        return Ok(SelfCheckReport {
+            target: target_table.to_string(),
+            checked_through: converge::watermark_token(&**client).await?,
+            rows_compared: 0,
+            next_after: scope.after.clone(),
+            outcome: SelfCheckOutcome::NotLive(def.status),
             held_keys: None,
             drain_failures: Vec::new(),
         });

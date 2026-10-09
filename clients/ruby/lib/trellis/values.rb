@@ -278,8 +278,13 @@ module Trellis
   #
   # - outcome: :converged (every compared cell, row and column matched),
   #   :not_caught_up (the target didn't catch up within timeout_ms: not a
-  #   verdict on correctness, and nothing was compared), or :diverged (see
-  #   divergences).
+  #   verdict on correctness, and nothing was compared), :not_live (the
+  #   transform isn't :live, so nothing was awaited or compared; see status),
+  #   or :diverged (see divergences).
+  # - status: the transform's status when outcome is :not_live (a rebuild
+  #   Trellis.request_backfill starts reads :backfilling from the call's
+  #   return, so poll status until it is :live, then check again); nil for
+  #   every other outcome.
   # - divergences: the Divergences found; [] unless outcome is :diverged.
   # - rows_compared: the distinct keys compared; 0 when the target didn't
   #   catch up.
@@ -297,8 +302,8 @@ module Trellis
   #   instance, oldest first, whichever definitions read its tables; [] when
   #   there is none. Each holds back the targets of the tables it holds
   #   changes to, and with them the convergence the audit waits on.
-  SelfCheckReport = Data.define(:target, :outcome, :divergences, :rows_compared, :next_after,
-                                :checked_through, :held_keys, :drain_failures) do
+  SelfCheckReport = Data.define(:target, :outcome, :status, :divergences, :rows_compared,
+                                :next_after, :checked_through, :held_keys, :drain_failures) do
     def self.from_native(hash)
       held_keys = hash[:held_keys]
       new(**hash, divergences: hash.fetch(:divergences).map { |d| Divergence.new(**d) },

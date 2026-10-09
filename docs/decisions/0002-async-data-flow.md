@@ -666,9 +666,16 @@ applying.
   while a batch runs, which a build's start waits on: a build chunk's insert
   of a new key's entry needs every tombstone written after its snapshot to
   stay until the insert (#723).
-- Every repair (an explicit `request_backfill`, a resume, a quarantine
-  release) of a definition on the Re-derive build is a rebuild: Re-derive over
-  the key space, which I2 makes safe against any pending change.
+- Every repair of a definition on the Re-derive build is a rebuild:
+  Re-derive over the key space, which I2 makes safe against any pending
+  change. A resume starts one, as does an explicit `request_backfill` and a
+  capture re-install (the call's own transaction moves each `live` reader to
+  `backfilling` and enqueues its plan and sweep jobs, so the status already
+  reads `backfilling` when the call returns). The only repairs that are not
+  rebuilds are a quarantine release (`release_key`), which is a per-key
+  Re-derive (a staged `Recompute`) of the one key, and a relationship
+  projection's refresh. A repair a caller waits on is therefore visible in
+  the status, never parked where only the repair knows it hasn't run.
 
 ### What `live` promises
 
@@ -688,7 +695,12 @@ The two signals stay separate on purpose. `await_converged` is a pure LSN
 wait over captured changes. It never reads definition status, so it can
 return while a definition that isn't `live` yet is still building. Backfill
 is an operator concern, reported by `Trellis::status`. A reader that needs a
-settled target checks both: `live` from status, then its token.
+settled target checks both: `live` from status, then its token. Because a
+rebuild is a status transition made in the repairing call's own transaction,
+"poll `live`, then take a token" also covers a repair made before the poll.
+`self_check` reads the status too: it compares only a `live` definition, and
+reports any other as `NotLive` with its status, instead of comparing a target
+that is still changing.
 
 ## Truncate, DDL, drop
 

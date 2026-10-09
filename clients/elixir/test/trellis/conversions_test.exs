@@ -48,7 +48,7 @@ defmodule Trellis.ConversionsTest do
               ]}
 
     assert Trellis.Native.self_check_outcomes() ==
-             {:ok, [:converged, :not_caught_up, :diverged]}
+             {:ok, [:converged, :not_caught_up, :not_live, :diverged]}
 
     assert Trellis.Native.divergence_kinds() ==
              {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column, :capture]}
@@ -64,6 +64,7 @@ defmodule Trellis.ConversionsTest do
         rows_compared: 2,
         next_after: "2",
         outcome: :diverged,
+        status: nil,
         held_keys: nil,
         drain_failures: [],
         divergences: [
@@ -94,6 +95,7 @@ defmodule Trellis.ConversionsTest do
              rows_compared: 2,
              next_after: "2",
              outcome: :diverged,
+             status: nil,
              divergences: [
                %Trellis.Divergence{
                  kind: :cell,
@@ -119,6 +121,25 @@ defmodule Trellis.ConversionsTest do
            }
   end
 
+  test "a not-live self-check report names the status it found" do
+    report =
+      SelfCheckReport.from_native(%{
+        target: "order_totals",
+        checked_through: "1/16B3748",
+        rows_compared: 0,
+        next_after: nil,
+        outcome: :not_live,
+        status: :backfilling,
+        divergences: [],
+        held_keys: nil,
+        drain_failures: []
+      })
+
+    assert report.outcome == :not_live
+    assert report.status == :backfilling
+    assert report.divergences == []
+  end
+
   test "a self-check report's held keys become a struct with a DateTime" do
     report =
       SelfCheckReport.from_native(%{
@@ -127,6 +148,7 @@ defmodule Trellis.ConversionsTest do
         rows_compared: 0,
         next_after: nil,
         outcome: :not_caught_up,
+        status: nil,
         divergences: [],
         held_keys: %{count: 1, oldest_poisoned_at_micros: 1_727_222_400_654_321},
         drain_failures: []
@@ -146,6 +168,7 @@ defmodule Trellis.ConversionsTest do
         rows_compared: 2,
         next_after: nil,
         outcome: :converged,
+        status: nil,
         divergences: [],
         held_keys: nil,
         drain_failures: [

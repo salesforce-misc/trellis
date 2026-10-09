@@ -5,8 +5,13 @@ defmodule Trellis.SelfCheckReport do
 
   - `outcome` is `:converged` (every compared cell, row and column matched),
     `:not_caught_up` (the target didn't catch up within `:timeout_ms`; not a
-    verdict on correctness, and nothing was compared), or `:diverged` (see
-    `divergences`).
+    verdict on correctness, and nothing was compared), `:not_live` (the
+    transform isn't `:live`, so nothing was awaited or compared; see
+    `status`), or `:diverged` (see `divergences`).
+  - `status` is the transform's status when `outcome` is `:not_live` (a
+    rebuild `Trellis.request_backfill/2` starts reads `:backfilling` from the
+    call's return, so poll the status until it is `:live`, then check
+    again), and `nil` for every other outcome.
   - `divergences` lists what differed; it is `[]` unless `outcome` is
     `:diverged`.
   - `rows_compared` counts the distinct keys compared; `0` when the target
@@ -29,7 +34,7 @@ defmodule Trellis.SelfCheckReport do
   """
 
   @typedoc "The verdict of one `Trellis.self_check/3` page."
-  @type outcome :: :converged | :not_caught_up | :diverged
+  @type outcome :: :converged | :not_caught_up | :not_live | :diverged
 
   @typedoc "An opaque `Trellis.self_check/3` cursor."
   @opaque cursor :: String.t()
@@ -37,6 +42,7 @@ defmodule Trellis.SelfCheckReport do
   @type t :: %__MODULE__{
           target: String.t(),
           outcome: outcome(),
+          status: Trellis.Status.status() | nil,
           divergences: [Trellis.Divergence.t()],
           rows_compared: non_neg_integer(),
           next_after: cursor() | nil,
@@ -48,6 +54,7 @@ defmodule Trellis.SelfCheckReport do
   @enforce_keys [
     :target,
     :outcome,
+    :status,
     :divergences,
     :rows_compared,
     :next_after,
@@ -62,6 +69,7 @@ defmodule Trellis.SelfCheckReport do
     %__MODULE__{
       target: report.target,
       outcome: report.outcome,
+      status: report.status,
       divergences: Enum.map(divergences, &Trellis.Divergence.from_native/1),
       rows_compared: report.rows_compared,
       next_after: report.next_after,

@@ -85,9 +85,19 @@ class ValuesTest < Minitest::Test
     ), status.drain_failure
   end
 
+  def test_a_not_live_self_check_report_names_the_status_it_found
+    report = Trellis::SelfCheckReport.from_native(
+      target: "order_totals", outcome: :not_live, status: :backfilling, divergences: [],
+      rows_compared: 0, next_after: nil, checked_through: "1/16B3748", held_keys: nil,
+      drain_failures: []
+    )
+    assert_equal :not_live, report.outcome
+    assert_equal :backfilling, report.status
+  end
+
   def test_a_self_check_reports_drain_failures_become_values_whatever_the_outcome
     report = Trellis::SelfCheckReport.from_native(
-      target: "order_totals", outcome: :converged, divergences: [], rows_compared: 2,
+      target: "order_totals", outcome: :converged, status: nil, divergences: [], rows_compared: 2,
       next_after: nil, checked_through: "1/16B3748", held_keys: nil,
       drain_failures: [{ seg_seq: 9, tables: ["public.orders"], error: "records fail only together",
                          sqlstate: nil, since_micros: MICROS, last_seen_micros: MICROS, attempts: 1 }]
@@ -178,7 +188,7 @@ class ValuesTest < Minitest::Test
     assert_equal %i[transform_defined relationship_defined paused resumed dropped altered
                     unknown],
                  Trellis::Native.applied_kinds
-    assert_equal %i[converged not_caught_up diverged], Trellis::Native.self_check_outcomes
+    assert_equal %i[converged not_caught_up not_live diverged], Trellis::Native.self_check_outcomes
     assert_equal %i[cell missing_row extra_row missing_column extra_column capture],
                  Trellis::Native.divergence_kinds
     assert_equal %i[capture halt], Trellis::Native.capture_failure_kinds

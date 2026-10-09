@@ -622,7 +622,7 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 | Status | What it means | What your poll does |
 |---|---|---|
 | `waiting_to_backfill` | Defined; the source's existing rows haven't been read yet. | Keep polling. |
-| `backfilling` | The target is being built. | Keep polling. |
+| `backfilling` | The target is being built, or rebuilt after a repair. | Keep polling. |
 | `catching_up` | Built and maintained, but may still be missing changes made while it was building. A plain aggregate (grouped by plain columns of a table rather than of another transform's target, with no relationship and no `MIN`/`MAX` of text) never reports it: its build goes from `backfilling` straight to `live`. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
@@ -774,7 +774,21 @@ Trellis.await_converged(token, timeout_ms: 30_000)
 
 `await_converged` waits for captured changes only; it doesn't read status. A
 transform that isn't `live` yet, `catching_up` included, can still be missing
-rows after it returns, which is why the poll comes first. When the timeout
+rows after it returns, which is why the poll comes first.
+
+A repair is visible to the poll too. `request_backfill` (and a capture
+re-install) rebuilds each plain aggregate and plain 1-1 reader of the table
+in its own transaction: they read `backfilling` when the call returns, and
+`live` again once the rebuild is done. So polling for `live` after a repair,
+then taking a token, covers the repair. Any other reader reports
+`catching_up` meanwhile, as before.
+
+`self_check` follows the same rule: it compares only a `live` transform. For
+any other it returns the outcome `not_live` (Rust's
+`SelfCheckOutcome::NotLive(status)`, Elixir's and Ruby's `:not_live`) with
+the status in the report's `status`, and compares and waits for nothing. Poll
+for `live`, then check again. The outcome is not a verdict on correctness,
+as `not_caught_up` isn't. When the timeout
 runs out first, it fails with a `timeout` error, not `internal`: the target is
 behind, not broken, so retry or allow longer. A binding handle runs one call
 at a time, so every other call on it waits behind an `await_converged` for up
