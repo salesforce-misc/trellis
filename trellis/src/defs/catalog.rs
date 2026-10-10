@@ -3474,7 +3474,7 @@ pub async fn create_relationship(
     // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
     // this resolution used to run *after* this function's own pg_catalog
     // introspection (`column_type_in_txn`/`to_col_cardinality_in_txn`/
-    // `has_usable_fk_index_in_txn`, below), which resolve
+    // `ddl::column_is_indexed_in`, below), which resolve
     // `def.from_table`/`def.to_table` bare via `pg_catalog.to_regclass` — a
     // plain `search_path` walk with no fallback, unlike this call. So a
     // relationship endpoint that bare-names another definition's target
@@ -3704,7 +3704,12 @@ async fn validate_relationship(
 
     let cardinality = to_col_cardinality_in_txn(txn, qualified_to, &def.to_col).await?;
     let mut warnings = Vec::new();
-    if !has_usable_fk_index_in_txn(txn, qualified_from, &def.from_col).await? {
+    // The same definition of "indexed" the planner setting reads
+    // ([`ddl::key_column_in`], #972, #973). It only informs the warning:
+    // Trellis never modifies the source schema (ADR-0005). `qualified_from`
+    // is the endpoint's resolved identity, so a from-side qualified into a
+    // non-default schema resolves too.
+    if !ddl::column_is_indexed_in(txn, qualified_from, &def.from_col).await? {
         warnings.push(RelationshipWarning::MissingFkIndex {
             from_table: def.from_table.clone(),
             from_col: def.from_col.clone(),
@@ -4330,7 +4335,7 @@ async fn resolve_graph_identity_in_txn(
 /// Best-effort counterpart to [`resolve_graph_identity_in_txn`], for
 /// [`create_relationship`]'s own pg_catalog introspection
 /// (`column_type_in_txn`/`to_col_cardinality_in_txn`/
-/// `has_usable_fk_index_in_txn`) — reviewer follow-up to issue #74 (epic #78's
+/// `ddl::column_is_indexed_in`) — reviewer follow-up to issue #74 (epic #78's
 /// own whole-branch review). Those three resolve
 /// `def.from_table`/`def.to_table` via `pg_catalog.to_regclass`, which — like
 /// [`resolve_source_schema_in_txn`]'s own walk — only ever considers *this
@@ -6987,67 +6992,6 @@ pub(crate) async fn relationships_to_refresh(
     }
     ids.sort_unstable();
     Ok(ids)
-}
-
-/// Whether `from_table` has a usable index for looking up rows by
-/// `from_col` (issue #31) — the query reverse propagation runs when a
-/// related `to_table` row changes (ADR-0006). "Usable" means a `btree`
-/// index whose *leading* column is `from_col`: a plain `where from_col =
-/// $1` lookup can use such an index regardless of what other columns
-/// follow it, so — unlike [`to_col_cardinality_in_txn`]'s uniqueness check —
-/// this doesn't require `from_col` to be the index's only column.
-///
-/// Excludes indexes that can't be trusted for this lookup:
-/// * `indisvalid` — a not-yet-validated index (e.g. left behind by a failed
-///   `CREATE INDEX CONCURRENTLY`) isn't usable yet.
-/// * `am.amname = 'btree'` — other access methods (`gin`, `brin`, `hash`)
-///   either don't support this leading-column equality lookup the way
-///   btree does, or aren't worth special-casing for what's only a
-///   performance hint.
-/// * `indexprs is null` — an expression index's leading "column" isn't a
-///   plain column reference, so `indkey[0]` is `0` and never matches a real
-///   `attnum`; this is already excluded by the `indkey[0] = a.attnum` join
-///   condition, called out here since it's not obvious from the SQL alone.
-/// * `indpred is null` — a partial index only covers the rows satisfying
-///   its predicate, so the planner won't use it for an unqualified
-///   `from_col = $1` lookup across all rows; same exclusion
-///   [`to_col_cardinality_in_txn`] applies for uniqueness, for the same
-///   reason.
-///
-/// Never issues DDL — this only informs the caller's decision to emit
-/// [`RelationshipWarning::MissingFkIndex`] (ADR-0005: Trellis never modifies
-/// the source schema).
-///
-/// `from_table` — [`create_relationship`]'s own [`resolve_relationship_endpoint_in_txn`]
-/// result, not `def.from_table` directly (reviewer follow-up to issue #74) —
-/// so a from-side explicitly qualified into a non-default schema resolves
-/// here too; the warning itself, built by the caller from `def.from_table`,
-/// is unaffected either way.
-async fn has_usable_fk_index_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
-    from_table: &str,
-    from_col: &str,
-) -> Result<bool, CatalogError> {
-    let has_index: bool = txn
-        .query_one(
-            "select exists (
-                select 1
-                from pg_index i
-                join pg_attribute a
-                  on a.attrelid = i.indrelid and a.attname = $2
-                join pg_class ic on ic.oid = i.indexrelid
-                join pg_am am on am.oid = ic.relam
-                where i.indrelid = pg_catalog.to_regclass($1)
-                  and i.indisvalid
-                  and i.indpred is null
-                  and am.amname = 'btree'
-                  and i.indkey[0] = a.attnum
-             )",
-            &[&ddl::regclass_arg(from_table), &from_col],
-        )
-        .await?
-        .get(0);
-    Ok(has_index)
 }
 
 /// Resolves `table_name` to its [`SchemaNode`], creating one if this is the

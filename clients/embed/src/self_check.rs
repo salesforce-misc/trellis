@@ -12,7 +12,10 @@
 
 use trellis::{Divergence, ErrorCode, SelfCheckMode, SelfCheckOutcome, SelfCheckReport};
 
-use crate::{PlainDrainFailure, PlainError, PlainHeldKeys, encode_watermark, transform_status};
+use crate::{
+    PlainDrainFailure, PlainError, PlainHeldKeys, PlainUnindexedJoin, encode_watermark,
+    transform_status,
+};
 
 /// Every word [`PlainSelfCheckReport::outcome`] can be.
 pub const SELF_CHECK_OUTCOMES: [&str; 4] = ["converged", "not_caught_up", "not_live", "diverged"];
@@ -72,6 +75,10 @@ pub struct PlainSelfCheckReport {
     /// oldest first, whatever the outcome; see
     /// [`SelfCheckReport::drain_failures`].
     pub drain_failures: Vec<PlainDrainFailure>,
+    /// The join columns of the relationships the audited definition reads
+    /// that have no usable index, whatever the outcome; see
+    /// [`SelfCheckReport::unindexed_joins`].
+    pub unindexed_joins: Vec<PlainUnindexedJoin>,
 }
 
 /// One [`Divergence`] flattened to plain data. `kind` is one of
@@ -125,6 +132,11 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
                 .drain_failures
                 .iter()
                 .map(PlainDrainFailure::from)
+                .collect(),
+            unindexed_joins: report
+                .unindexed_joins
+                .iter()
+                .map(PlainUnindexedJoin::from)
                 .collect(),
         }
     }
@@ -192,6 +204,7 @@ mod tests {
             outcome,
             held_keys: None,
             drain_failures: Vec::new(),
+            unindexed_joins: Vec::new(),
         }
     }
 
@@ -211,6 +224,7 @@ mod tests {
                 divergences: Vec::new(),
                 held_keys: None,
                 drain_failures: Vec::new(),
+                unindexed_joins: Vec::new(),
             }
         );
         // The position is a real watermark token, so a host can wait on it.
@@ -234,6 +248,29 @@ mod tests {
                 count: 2,
                 oldest_poisoned_at_micros: 1_727_222_400_000_001,
             })
+        );
+    }
+
+    #[test]
+    fn unindexed_joins_cross_with_any_outcome() {
+        let mut warned = report(SelfCheckOutcome::Converged);
+        warned.unindexed_joins = vec![trellis::UnindexedJoin {
+            relationship: "orders".to_string(),
+            table: "public.orders".to_string(),
+            column: "customer_id".to_string(),
+        }];
+
+        let plain = PlainSelfCheckReport::from(&warned);
+
+        assert_eq!(plain.outcome, "converged");
+        assert_eq!(
+            plain.unindexed_joins,
+            vec![PlainUnindexedJoin {
+                relationship: "orders".to_string(),
+                table: "public.orders".to_string(),
+                column: "customer_id".to_string(),
+                fix: "create an index on public.orders (customer_id)".to_string(),
+            }]
         );
     }
 

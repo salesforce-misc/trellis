@@ -305,6 +305,20 @@ finding, and the CLI's `trellis status` prints it under each transform it holds 
 The holdup is separate from `capture_failure`: it pauses and charges nothing
 ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
 
+`unindexed_joins` on `DefinitionStatus` lists the join columns of the relationships
+the transform reads that have no usable index (#973): a relationship's `from_col`,
+and a to-many relationship's `to_col` (a to-one's `to_col` is unique, so it is never
+listed). Each entry names the relationship, the table, the column and the fix, an
+index on that table and column, which Trellis doesn't create on your tables
+([Index relationship join columns](recommendations.md#index-relationship-join-columns)
+says what counts as indexed and why it matters). It is a warning: the transform
+reads the column either way, each read scanning the table until the index exists,
+and its status is unaffected. The list is read from the catalog on each call, so an
+index you create shows on the next one, with no restart. `self_check` reports the
+same list with every report, as `unindexed_joins` on `SelfCheckReport`, whatever
+the outcome; it never changes the outcome. The CLI's `trellis status` prints one
+warning line per entry under the transform.
+
 ### Backfill status and the `xmin` caveat
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its

@@ -78,7 +78,9 @@ is one, the column.
 | The new edge closes no table cycle | the pair | Propagation must terminate. | `reject_if_table_cycle` |
 
 A join column with no usable index on the from-side draws a warning
-(`RelationshipWarning::MissingFkIndex`), not a rejection. Columns a transform
+(`RelationshipWarning::MissingFkIndex`), not a rejection; `status` and
+`self_check` keep reporting it while it lasts
+([observability](observability.md#transform-status-lifecycle)). Columns a transform
 reads *through* a relationship (`rel.column`) are checked when that transform
 is defined, not here.
 

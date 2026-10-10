@@ -427,6 +427,35 @@ end
 The CLI's `trellis status` prints each one on an indented line under the
 definition it holds back.
 
+### Unindexed join columns
+
+`status(target)` reports, as `unindexed_joins`, each join column of a
+relationship the definition reads that has no usable index: a relationship's
+`from_col`, and a to-many relationship's `to_col`. An entry names the
+relationship, the table (`schema.table`) and the column; the fix is an index on
+that table and column, which Trellis doesn't create on your tables
+([recommendations — Index relationship join columns](recommendations.md#index-relationship-join-columns)).
+The list is empty for a definition whose join columns are all indexed, and it
+never changes the definition's status, so a health check that wants it reads
+the field:
+
+```rust
+for summary in trellis.definitions().await? {
+    let bare = summary.target_table.split('.').nth(1).unwrap_or_default();
+    if let Some(status) = trellis.status(bare).await? {
+        for join in &status.unindexed_joins {
+            // `join.fix()`: "create an index on public.orders (customer_id)"
+        }
+    }
+}
+```
+
+`self_check` reports the same list with each audit, whatever the outcome. In
+`trellis-embed`, `PlainDefinitionStatus` and `PlainSelfCheckReport` carry it as
+`unindexed_joins`, each entry with `relationship`, `table`, `column` and the
+`fix` sentence. The CLI's `trellis status` prints each entry as a warning line
+under its definition.
+
 ## Migrations and transactions
 
 **Trellis never joins your migration's transaction.** `migrate`, `define` and

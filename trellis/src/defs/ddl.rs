@@ -1465,6 +1465,85 @@ pub(crate) fn regclass_arg(table: &str) -> String {
     quote_qualified_ident(table)
 }
 
+/// A relationship join column, as [`key_column_in`] introspects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyColumn {
+    /// The column's exact type, as `format_type` renders it
+    /// (`staging::apply::key_column_pg_type`).
+    pub(crate) pg_type: String,
+    /// Whether a lookup of the column by a batch of keys has an index to
+    /// use: it is the leading column of a plain btree index on its table,
+    /// under the column's own collation, that is valid, ready and live, and
+    /// not partial. This is Trellis's one definition of "indexed", for the
+    /// plan a read runs under (a read of an indexed column runs under
+    /// `staging::ledger::ENTRY_PLAN_SETTINGS`, #972; one of an unindexed
+    /// column runs as the planner would have it, since the setting could
+    /// only take its parallel sequential scan away) and for the missing-index
+    /// warnings (define time, `status`, `self_check`; #973).
+    pub(crate) indexed: bool,
+}
+
+/// `column` of `table`, as [`KeyColumn`] describes it, in one round trip, or
+/// `None` if the column doesn't exist (`staging::apply::key_column_pg_type`'s
+/// convention).
+///
+/// Counted as an index: a btree whose first key is the column itself (an
+/// expression has no column, `indkey[0] = 0`), under the column's own
+/// collation (the filter compares by it, and the planner uses an index only
+/// for a comparison under the index's collation, compared by OID, so a
+/// `collate "C"` index of a default-collation column doesn't serve it, even
+/// in a database whose default is `C`), with `indisvalid` (a
+/// `create index concurrently` that failed leaves one that isn't),
+/// `indisready` and `indislive` (one being dropped isn't), and no predicate
+/// (a partial index serves only the rows its predicate admits, which an
+/// `= any(…)` filter doesn't imply). Read when a relationship resolves, or
+/// on each call where nothing resolves (the reverse path), so an index
+/// created or dropped later is picked up by the next one; the warnings read
+/// it live on each call. That affects speed only.
+pub(crate) async fn key_column_in(
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+) -> Result<Option<KeyColumn>, tokio_postgres::Error> {
+    let row = client
+        .query_opt(
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                    exists (select 1 \
+                            from pg_index i \
+                            join pg_class c on c.oid = i.indexrelid \
+                            join pg_am am on am.oid = c.relam \
+                            where i.indrelid = a.attrelid \
+                              and i.indkey[0] = a.attnum \
+                              and am.amname = 'btree' \
+                              and i.indcollation[0] = a.attcollation \
+                              and i.indisvalid and i.indisready and i.indislive \
+                              and i.indpred is null) \
+             from pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attname = $2 \
+               and a.attnum > 0 \
+               and not a.attisdropped",
+            &[&regclass_arg(table), &column],
+        )
+        .await?;
+    Ok(row.map(|r| KeyColumn {
+        pg_type: r.get(0),
+        indexed: r.get(1),
+    }))
+}
+
+/// Whether `table`'s `column` is indexed ([`KeyColumn::indexed`]). A column
+/// that doesn't exist is not.
+pub(crate) async fn column_is_indexed_in(
+    client: &impl GenericClient,
+    table: &str,
+    column: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(key_column_in(client, table, column)
+        .await?
+        .is_some_and(|column| column.indexed))
+}
+
 /// Shared quoting logic for [`qualified_source_table`]/
 /// [`qualified_target_table_ident`]: splits an already-qualified
 /// `"schema.table"` string on its first `.` and quotes each component

@@ -1124,6 +1124,65 @@ async fn a_hash_index_on_the_join_column_still_warns() {
     );
 }
 
+/// #973: the warning and the planner setting (#972) share one definition of
+/// "indexed", so an index that is not ready or live, or that is under another
+/// collation than the column's, doesn't suppress the warning any more than
+/// it earns the column the index plan.
+#[tokio::test]
+async fn an_index_that_is_not_ready_or_under_another_collation_still_warns() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table not_ready (id int primary key, ref_id int); \
+             create index on not_ready (ref_id); \
+             update pg_index set indisready = false \
+                 where indexrelid = 'not_ready_ref_id_idx'::regclass; \
+             create table not_live (id int primary key, ref_id int); \
+             create index on not_live (ref_id); \
+             update pg_index set indislive = false \
+                 where indexrelid = 'not_live_ref_id_idx'::regclass; \
+             create table recollated (id int primary key, ref_id text); \
+             create index on recollated (ref_id collate \"C\"); \
+             create table refs (id int primary key); \
+             create table text_refs (id text primary key);",
+        )
+        .await
+        .expect("create the tables and their unusable indexes");
+    drop(client);
+
+    for (statement, from_table, from_col) in [
+        (
+            "RELATIONSHIP ref FROM not_ready.ref_id TO refs.id",
+            "not_ready",
+            "ref_id",
+        ),
+        (
+            "RELATIONSHIP ref FROM not_live.ref_id TO refs.id",
+            "not_live",
+            "ref_id",
+        ),
+        (
+            "RELATIONSHIP ref FROM recollated.ref_id TO text_refs.id",
+            "recollated",
+            "ref_id",
+        ),
+    ] {
+        let created = create_relationship(&db.pool, statement)
+            .await
+            .unwrap_or_else(|err| panic!("{statement}: {err}"));
+        assert_eq!(
+            created.warnings,
+            vec![RelationshipWarning::MissingFkIndex {
+                from_table: from_table.to_string(),
+                from_col: from_col.to_string(),
+            }],
+            "{statement}"
+        );
+    }
+}
+
 /// ADR-0006: relationship edges join the same cross-table dependency graph
 /// transform edges do, and a new edge that would close a cycle is rejected —
 /// generalizing the existing `Source`-edge cycle detector (issue #21) rather
@@ -1346,7 +1405,7 @@ async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join
 
 /// Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
 /// `create_relationship`'s own pg_catalog introspection
-/// (`column_type_in_txn`/`to_col_cardinality_in_txn`/`has_usable_fk_index_in_txn`)
+/// (`column_type_in_txn`/`to_col_cardinality_in_txn`/`ddl::column_is_indexed_in`)
 /// resolved `def.from_table`/
 /// `def.to_table` bare via `pg_catalog.to_regclass`'s own `search_path` walk,
 /// with no fallback — unlike this same function's later
@@ -1762,7 +1821,7 @@ async fn a_relationship_between_mixed_case_tables_is_accepted() {
     assert_eq!(created.def.to_table, "Products");
     // To-one: `to_col_cardinality_in_txn` found `"Products"`' primary key.
     assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
-    // `has_usable_fk_index_in_txn` found `"OrderItems"`' index.
+    // `ddl::column_is_indexed_in` found `"OrderItems"`' index.
     assert_eq!(created.warnings, Vec::new());
 
     // To-many against a mixed-case to-side: cardinality reads `"Products"`,

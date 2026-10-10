@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use trellis::{
     BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, Definition, DefinitionStatus,
-    DefinitionSummary, DrainFailure,
+    DefinitionSummary, DrainFailure, UnindexedJoin,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -118,6 +118,23 @@ pub struct PlainDefinitionStatus {
     /// Set while the drain keeps failing on a page holding changes to a table
     /// the definition reads; see [`DefinitionStatus::drain_failure`].
     pub drain_failure: Option<PlainDrainFailure>,
+    /// The join columns of the relationships the definition reads that have
+    /// no usable index; see [`DefinitionStatus::unindexed_joins`].
+    pub unindexed_joins: Vec<PlainUnindexedJoin>,
+}
+
+/// An [`UnindexedJoin`] flattened to plain data: a join column of a
+/// relationship a definition reads that has no usable index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainUnindexedJoin {
+    /// The relationship's name.
+    pub relationship: String,
+    /// The qualified table that holds the column.
+    pub table: String,
+    /// The column.
+    pub column: String,
+    /// What to do about it: the index to create, as a sentence.
+    pub fix: String,
 }
 
 /// A [`CaptureWait`] flattened to plain data.
@@ -202,6 +219,22 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .map(PlainCaptureFailure::from),
             held_keys: status.held_keys.as_ref().map(PlainHeldKeys::from),
             drain_failure: status.drain_failure.as_ref().map(PlainDrainFailure::from),
+            unindexed_joins: status
+                .unindexed_joins
+                .iter()
+                .map(PlainUnindexedJoin::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&UnindexedJoin> for PlainUnindexedJoin {
+    fn from(join: &UnindexedJoin) -> Self {
+        PlainUnindexedJoin {
+            relationship: join.relationship.clone(),
+            table: join.table.clone(),
+            column: join.column.clone(),
+            fix: join.fix(),
         }
     }
 }
@@ -423,6 +456,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            unindexed_joins: Vec::new(),
             build_wait: None,
         };
 
@@ -435,6 +469,7 @@ mod tests {
                 capture_failure: None,
                 held_keys: None,
                 drain_failure: None,
+                unindexed_joins: Vec::new(),
             }
         );
     }
@@ -451,6 +486,7 @@ mod tests {
                 oldest_poisoned_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
             }),
             drain_failure: None,
+            unindexed_joins: Vec::new(),
             build_wait: None,
         };
 
@@ -460,6 +496,34 @@ mod tests {
                 count: 3,
                 oldest_poisoned_at_micros: 1_727_222_400_654_321,
             })
+        );
+    }
+
+    #[test]
+    fn an_unindexed_join_crosses_with_its_fix() {
+        let status = DefinitionStatus {
+            status: TransformStatus::Live,
+            backfill_failure: None,
+            capture_wait: None,
+            capture_failure: None,
+            held_keys: None,
+            drain_failure: None,
+            unindexed_joins: vec![UnindexedJoin {
+                relationship: "orders".to_string(),
+                table: "public.orders".to_string(),
+                column: "customer_id".to_string(),
+            }],
+            build_wait: None,
+        };
+
+        assert_eq!(
+            PlainDefinitionStatus::from(&status).unindexed_joins,
+            vec![PlainUnindexedJoin {
+                relationship: "orders".to_string(),
+                table: "public.orders".to_string(),
+                column: "customer_id".to_string(),
+                fix: "create an index on public.orders (customer_id)".to_string(),
+            }]
         );
     }
 
@@ -481,6 +545,7 @@ mod tests {
                 last_seen: at(1_727_222_400_654_321),
                 attempts: 5,
             }),
+            unindexed_joins: Vec::new(),
             build_wait: None,
         };
 
@@ -512,6 +577,7 @@ mod tests {
             capture_failure: None,
             held_keys: None,
             drain_failure: None,
+            unindexed_joins: Vec::new(),
             build_wait: None,
         };
 
@@ -529,6 +595,7 @@ mod tests {
                 capture_failure: None,
                 held_keys: None,
                 drain_failure: None,
+                unindexed_joins: Vec::new(),
             }
         );
     }
@@ -556,6 +623,7 @@ mod tests {
             }),
             held_keys: None,
             drain_failure: None,
+            unindexed_joins: Vec::new(),
             build_wait: None,
         };
 

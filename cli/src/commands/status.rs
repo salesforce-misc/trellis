@@ -18,7 +18,9 @@
 //! failing (`backfill_failure`, issue #461), on another why the drain
 //! halted on it, if it did (`halt`, issue #663), and on another the page the
 //! drain keeps failing on with nothing charged or paused, if one holds it
-//! back (`drain_failure` from [`Trellis::status`], issue #817) — and every
+//! back (`drain_failure` from [`Trellis::status`], issue #817), and one per
+//! join column of a relationship it reads that has no usable index
+//! (`unindexed_joins`, issue #973) — and every
 //! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! "Decision 5" and the amendment to
@@ -41,6 +43,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
     Config, DefinitionSummary, DrainFailure, RelationshipSummary, Trellis, TrellisOptions,
+    UnindexedJoin,
 };
 
 use super::release::shell_quote;
@@ -120,16 +123,20 @@ even though the engine tracks it.";
 /// then [`STATUS_NOTE`].
 async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
-    // `definitions()` doesn't carry a drain failure, so each definition's
-    // own status is read for it, by the bare target name `status` takes.
+    // `definitions()` doesn't carry a drain failure or the unindexed join
+    // columns, so each definition's own status is read for them, by the bare
+    // target name `status` takes.
     let mut listed = Vec::with_capacity(definitions.len());
     for def in definitions {
-        let drain_failure = trellis
+        let status = trellis
             .status(bare_target(&def.target_table))
             .await
-            .map_err(|err| err.to_string())?
-            .and_then(|status| status.drain_failure);
-        listed.push((def, drain_failure));
+            .map_err(|err| err.to_string())?;
+        let warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
+            drain_failure: status.drain_failure,
+            unindexed_joins: status.unindexed_joins,
+        });
+        listed.push((def, warnings));
     }
     let relationships = trellis
         .relationships()
@@ -180,16 +187,23 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
     out
 }
 
+/// What a definition's [`Trellis::status`] reports that its summary doesn't.
+#[derive(Debug, Default)]
+struct StatusWarnings {
+    drain_failure: Option<DrainFailure>,
+    unindexed_joins: Vec<UnindexedJoin>,
+}
+
 /// One line per definition, each followed by an indented line per thing
 /// holding it back: a failing backfill, a halt, and the drain failure its
-/// status reports, if any.
-fn format_definitions(definitions: &[(DefinitionSummary, Option<DrainFailure>)]) -> String {
+/// status reports, if any; then one per join column without an index.
+fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> String {
     if definitions.is_empty() {
         return "  no transform definitions registered\n".to_string();
     }
     definitions
         .iter()
-        .map(|(def, drain_failure)| {
+        .map(|(def, warnings)| {
             let mut line = format!(
                 "  id={} source={} target={} status={} created_at={}\n",
                 def.id,
@@ -226,8 +240,14 @@ fn format_definitions(definitions: &[(DefinitionSummary, Option<DrainFailure>)])
             // target back without pausing it, so its status alone can read
             // `live`. Every drain pass retries the page until the cause the
             // error names is fixed.
-            if let Some(failure) = drain_failure {
+            if let Some(failure) = &warnings.drain_failure {
                 line.push_str(&format_drain_failure(failure));
+            }
+            // #973: a warning only. The definition reads the column
+            // regardless; each read of it scans the table until the index
+            // exists. See docs/recommendations.md.
+            for join in &warnings.unindexed_joins {
+                line.push_str(&format_unindexed_join(join));
             }
             line
         })
@@ -240,6 +260,16 @@ fn format_definitions(definitions: &[(DefinitionSummary, Option<DrainFailure>)])
 /// a name holding a `.` of its own.
 fn bare_target(qualified: &str) -> &str {
     qualified.split('.').nth(1).unwrap_or(qualified)
+}
+
+fn format_unindexed_join(join: &UnindexedJoin) -> String {
+    format!(
+        "    warning: relationship {} joins on {}.{}, which has no usable index; {}\n",
+        join.relationship,
+        join.table,
+        join.column,
+        join.fix()
+    )
 }
 
 fn format_drain_failure(failure: &DrainFailure) -> String {
@@ -397,7 +427,7 @@ mod tests {
             backfill_failure: None,
             halt: None,
         };
-        let formatted = format_definitions(&[(def, None)]);
+        let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert!(formatted.contains("id=7"));
         assert!(formatted.contains("source=orders"));
         assert!(formatted.contains("target=order_totals"));
@@ -417,7 +447,7 @@ mod tests {
             backfill_failure: None,
             halt: None,
         };
-        let formatted = format_definitions(&[(def, None)]);
+        let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(formatted.lines().count(), 1, "got {formatted:?}");
         assert!(!formatted.contains("backfill"), "got {formatted:?}");
     }
@@ -441,7 +471,7 @@ mod tests {
             }),
             halt: None,
         };
-        let formatted = format_definitions(&[(def, None)]);
+        let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(
             formatted,
             "  id=7 source=public.orders target=public.order_totals \
@@ -472,7 +502,7 @@ mod tests {
                 detected_at,
             }),
         };
-        let formatted = format_definitions(&[(def, None)]);
+        let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(
             formatted,
             "  id=7 source=public.orders target=public.order_totals \
@@ -505,7 +535,13 @@ mod tests {
             last_seen: since + Duration::from_secs(90),
             attempts: 5,
         };
-        let formatted = format_definitions(&[(def, Some(failure))]);
+        let formatted = format_definitions(&[(
+            def,
+            StatusWarnings {
+                drain_failure: Some(failure),
+                ..StatusWarnings::default()
+            },
+        )]);
         assert_eq!(
             formatted,
             "  id=7 source=public.orders target=public.order_totals \
@@ -513,6 +549,36 @@ mod tests {
              drain failing on segment 17 (public.lines, public.orders): attempts=5 \
              since=2024-01-01 00:00:00 UTC last_seen=2024-01-01 00:01:30 UTC \
              sqlstate=42501 error=\"permission denied for function audit_hook\"\n"
+        );
+    }
+
+    #[test]
+    fn an_unindexed_join_is_shown_under_its_definition_with_its_fix() {
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::Live,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        };
+        let warnings = StatusWarnings {
+            unindexed_joins: vec![UnindexedJoin {
+                relationship: "items".to_string(),
+                table: "public.order_items".to_string(),
+                column: "order_id".to_string(),
+            }],
+            ..StatusWarnings::default()
+        };
+        assert_eq!(
+            format_definitions(&[(def, warnings)]),
+            "  id=7 source=public.orders target=public.order_totals \
+             status=live created_at=1970-01-01 00:00:00 UTC\n    \
+             warning: relationship items joins on public.order_items.order_id, \
+             which has no usable index; \
+             create an index on public.order_items (order_id)\n"
         );
     }
 
@@ -564,7 +630,7 @@ mod tests {
             }),
             halt: None,
         };
-        let formatted = format_definitions(&[(def, None)]);
+        let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(formatted.lines().count(), 2, "got {formatted:?}");
         assert!(
             formatted.contains(r"orders\nDETAIL: role lacks SELECT\nHINT: grant it"),

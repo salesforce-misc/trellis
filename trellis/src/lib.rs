@@ -180,7 +180,7 @@ pub use otel::OtelError;
 pub use pool::Pool;
 pub use staging::{
     CaptureFault, Divergence, DrainFailure, HeldKeys, SelfCheckMode, SelfCheckOutcome,
-    SelfCheckReport, SelfCheckScope,
+    SelfCheckReport, SelfCheckScope, UnindexedJoin,
 };
 
 // --- Tier 2: the error types the public errors wrap -----------------------

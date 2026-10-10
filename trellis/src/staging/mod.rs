@@ -81,6 +81,7 @@ pub mod self_check;
 pub mod session;
 pub mod state;
 pub(crate) mod target_mutations;
+pub(crate) mod unindexed_joins;
 pub mod watermark;
 pub mod worker_registry;
 
@@ -129,6 +130,7 @@ pub use self_check::{
 };
 pub use session::ProducerSession;
 pub use state::segment_state_counts;
+pub use unindexed_joins::UnindexedJoin;
 pub use watermark::StagedWatermark;
 pub use worker_registry::{deregister_worker, reclaim_stale_workers, register_worker};
 

@@ -120,6 +120,7 @@ use crate::staging::apply::ApplyError;
 use crate::staging::holdup::DrainFailure;
 use crate::staging::quarantine::{self, HeldKeys};
 use crate::staging::self_check::{SelfCheckError, SelfCheckMode, SelfCheckReport, SelfCheckScope};
+use crate::staging::unindexed_joins::{self, UnindexedJoin};
 use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registry};
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
@@ -674,6 +675,7 @@ impl Trellis {
         let mut status = None;
         let mut holdup = (None, None);
         let mut drain_failure = None;
+        let mut unindexed = Vec::new();
         if let Some(row) = &row {
             let status_text: String = row.get(0);
             let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
@@ -701,6 +703,11 @@ impl Trellis {
                 )
                 .await?;
             }
+            // #973: a stored definition always parses.
+            if let Ok(def) = crate::defs::parse(row.get("definition_text")) {
+                unindexed =
+                    unindexed_joins::for_definition(&*txn, row.get("source_table"), &def).await?;
+            }
         }
         txn.commit().await?;
         let (capture_wait, stalled) = holdup;
@@ -711,6 +718,7 @@ impl Trellis {
             capture_failure: capture_failure(&row).or(stalled),
             held_keys: quarantine::held_keys_from(row.get("held_count"), row.get("held_since")),
             drain_failure,
+            unindexed_joins: unindexed,
             build_wait: row
                 .get::<_, Option<i64>>("build_fence")
                 .map(|xid| BuildWait::Fence { xid }),
@@ -1705,6 +1713,16 @@ pub struct DefinitionStatus {
     /// first, and cleared when the page commits. Separate from
     /// `capture_failure`: it pauses nothing.
     pub drain_failure: Option<DrainFailure>,
+    /// The join columns of the relationships the definition reads that have
+    /// no usable index (#973): `from_col` on the from-side table, and a
+    /// to-many relationship's `to_col` on the to-side table. Each read of
+    /// one scans its table, growing with the table instead of with the
+    /// batch. A warning only: the definition's status is unaffected. Each
+    /// entry names the relationship, table and column, and [`UnindexedJoin::fix`]
+    /// says what to do: create an index on the column, which Trellis doesn't
+    /// do. Read live on each call, so an index created since shows. Empty
+    /// when there is none; see `docs/recommendations.md`.
+    pub unindexed_joins: Vec<UnindexedJoin>,
     /// Set while the definition's Re-derive build waits on something other
     /// than its own work (#625 F6): see [`BuildWait`]. Cleared once the
     /// wait is over.
