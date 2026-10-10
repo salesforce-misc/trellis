@@ -710,6 +710,13 @@ The pool bounds how many run at once. The Elixir binding's `Trellis.Owner`
 still hands a handle's calls over one at a time, so an Elixir call can wait
 behind the calls ahead of it before its own 30 seconds start.
 
+The Ruby binding waits for each reply on the calling thread with the GVL
+released, so `Timeout.timeout`, `Thread#kill` and Ctrl-C return control at
+once and leave no thread behind; the abandoned call ends at its deadline.
+`shutdown` cancels the calls still in flight instead of waiting for them, so
+a call stuck on a lock doesn't hold it up; what a cancelled call started on
+the server ends at the call's own deadline.
+
 ## Poll to `live`, don't wait
 
 `define` (and `apply` with a `TRANSFORM`) returns once the definition is

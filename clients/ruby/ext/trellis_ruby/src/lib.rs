@@ -6,12 +6,18 @@
 //! `lib/`. The contract here is deliberately narrow:
 //!
 //! - **Every call that can block releases the GVL, and can be interrupted**
-//!   (ADR-0010 decision 3). `BlockingTrellis` waits for its reply with a bare
-//!   blocking receive that nothing can cut short, so this crate never waits
-//!   on it from a Ruby thread. The call runs on a short-lived helper thread,
-//!   and the Ruby thread waits for the helper's reply on a condition variable
-//!   with the GVL released and an unblocking function that wakes it. See
-//!   [`run_without_gvl`].
+//!   (ADR-0010 decision 3). The calling Ruby thread submits the call with
+//!   `BlockingTrellis`'s `start_*` methods, which return at once, and waits
+//!   for the reply itself with the GVL released: it polls the reply as a
+//!   future, and parks on a condition variable that the engine's reply (through
+//!   the future's waker) and Ruby's unblocking function both signal. No thread
+//!   is started for a call. An interrupt (`Thread#kill`, `Thread#raise`, a
+//!   signal) returns control to Ruby at once and drops the reply; the engine
+//!   ends the call by its own 30-second deadline, and the server stops what
+//!   the call started (issue #599). See [`wait_without_gvl`]. The one wait
+//!   with a thread behind it is [`connect`]'s: it runs `BlockingTrellis::connect`
+//!   (a bare blocking wait on the database) on a thread of its own, once per
+//!   connect.
 //! - **A handle refuses to be used from any process but the one that
 //!   connected it.** Rust threads don't cross `fork`, so a handle a child
 //!   inherits has nothing left to answer it. Every call checks the pid first
@@ -41,8 +47,11 @@
 mod engine;
 
 use std::ffi::c_void;
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use engine::{Engine, ForkedWhileRunning};
@@ -51,7 +60,7 @@ use magnus::{
     Error, Exception, ExceptionClass, IntoValue, RArray, RClass, RHash, RModule, Ruby,
     StaticSymbol, Value, function, method,
 };
-use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisError, TrellisOptions};
+use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, SelfCheckScope, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
     PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
@@ -68,17 +77,18 @@ use trellis_embed::{
 type Reply<T> = Result<T, PlainError>;
 
 /// The live instance a [`Handle`] wraps. `shutdown` takes it out, so a call
-/// after shutdown gets an error rather than a hang. The lock is read for
-/// every call and written only by `shutdown`, and only ever taken on a
-/// helper thread, never on a Ruby thread holding the GVL.
+/// after shutdown gets an error rather than a hang. The lock is read to submit
+/// a call and written by `shutdown`, and is never held while waiting for a
+/// reply. Ruby code never runs while it is held (the holder is native code
+/// that releases no GVL), so a thread can't be switched out holding it.
 type Shared = Arc<RwLock<Option<Engine>>>;
 
 /// One connected Trellis instance, owned by Ruby as `Trellis::Native::Handle`
 /// and held by the `Trellis` module's singleton.
 ///
-/// Calls from several Ruby threads don't wait on each other here: each runs
-/// on its own helper thread, and the [`BlockingTrellis`] runs them one at a
-/// time on its own thread.
+/// Calls from several Ruby threads don't wait on each other here: each waits
+/// for its own reply on its own thread, and the [`BlockingTrellis`] runs them
+/// in parallel.
 #[magnus::wrap(class = "Trellis::Native::Handle", free_immediately, size)]
 struct Handle {
     trellis: Shared,
@@ -102,25 +112,36 @@ impl Drop for Handle {
 }
 
 impl Handle {
-    /// Runs `call` against the live instance with the GVL released, or
-    /// raises why it can't.
-    fn call<T: Send + 'static>(
+    /// Submits the call `start` makes against the live instance, waits for
+    /// its reply with the GVL released, or raises why it can't.
+    fn call<R>(
         &self,
         ruby: &Ruby,
-        call: impl FnOnce(&BlockingTrellis) -> Result<T, TrellisError> + Send + 'static,
-    ) -> Result<T, Error> {
+        start: impl FnOnce(&BlockingTrellis) -> PendingCall<R>,
+    ) -> Result<R, Error> {
+        let pending = self.with_engine(ruby, start)?;
+        wait_without_gvl(pending)?.map_err(|err| raise(ruby, err))
+    }
+
+    /// Runs `read` against the live instance without waiting on anything, or
+    /// raises why it can't (including [`Handle::check_pid`]'s refusal, first).
+    fn with_engine<R>(
+        &self,
+        ruby: &Ruby,
+        read: impl FnOnce(&BlockingTrellis) -> R,
+    ) -> Result<R, Error> {
         self.check_pid(ruby)?;
-        let shared = Arc::clone(&self.trellis);
-        blocking(ruby, move || {
-            let guard = shared.read().map_err(|_| poisoned())?;
-            let trellis = guard.as_ref().ok_or_else(|| {
+        let guard = self.trellis.read().map_err(|_| raise(ruby, poisoned()))?;
+        let trellis = guard.as_ref().ok_or_else(|| {
+            raise(
+                ruby,
                 PlainError::new(
                     ErrorCode::Validation,
                     "this Trellis handle has been shut down",
-                )
-            })?;
-            call(trellis).map_err(PlainError::from)
-        })
+                ),
+            )
+        })?;
+        Ok(read(trellis))
     }
 
     /// Raises `Trellis::ForkedHandleError` unless this is the process that
@@ -149,7 +170,7 @@ impl Handle {
     }
 
     fn migrate(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        rb_self.call(ruby, BlockingTrellis::migrate)
+        rb_self.call(ruby, BlockingTrellis::start_migrate)
     }
 
     /// Registers the `TRANSFORM` statement `text`.
@@ -162,10 +183,10 @@ impl Handle {
     fn define(ruby: &Ruby, rb_self: &Self, text: String) -> Result<RHash, Error> {
         rb_self.check_pid(ruby)?;
         require_transform_statement(&text).map_err(|err| raise(ruby, err))?;
-        let definition = rb_self.call(ruby, move |trellis| {
-            let applied = trellis.apply(&text)?;
-            Ok(applied.into_transform().map(|d| PlainDefinition::from(&d)))
-        })?;
+        let definition = rb_self
+            .call(ruby, |trellis| trellis.start_apply(&text))?
+            .into_transform()
+            .map(|d| PlainDefinition::from(&d));
         // Unreachable: the check above is `apply`'s own parser. Kept as
         // defence, so a mistake there is an error rather than a panic.
         let definition = definition.ok_or_else(|| {
@@ -182,11 +203,9 @@ impl Handle {
 
     /// `target_table`'s status, or `nil` when no definition writes it.
     fn status(ruby: &Ruby, rb_self: &Self, target_table: String) -> Result<Option<RHash>, Error> {
-        let status = rb_self.call(ruby, move |trellis| {
-            Ok(trellis
-                .status(&target_table)?
-                .map(|status| PlainDefinitionStatus::from(&status)))
-        })?;
+        let status = rb_self
+            .call(ruby, |trellis| trellis.start_status(&target_table))?
+            .map(|status| PlainDefinitionStatus::from(&status));
         status.map(|status| status_hash(ruby, status)).transpose()
     }
 
@@ -196,28 +215,24 @@ impl Handle {
     /// and each other field is set only for the kinds that carry it (see
     /// [`applied_hash`]).
     fn apply(ruby: &Ruby, rb_self: &Self, text: String) -> Result<RHash, Error> {
-        let applied = rb_self.call(ruby, move |trellis| {
-            Ok(PlainApplied::from(&trellis.apply(&text)?))
-        })?;
-        applied_hash(ruby, applied)
+        let applied = rb_self.call(ruby, |trellis| trellis.start_apply(&text))?;
+        applied_hash(ruby, PlainApplied::from(&applied))
     }
 
     /// Every registered transform definition, oldest first.
     fn definitions(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
-        let summaries = rb_self.call(ruby, |trellis| {
-            Ok(trellis
-                .definitions()?
-                .iter()
-                .map(PlainDefinitionSummary::from)
-                .collect::<Vec<_>>())
-        })?;
+        let summaries = rb_self
+            .call(ruby, BlockingTrellis::start_definitions)?
+            .iter()
+            .map(PlainDefinitionSummary::from)
+            .collect::<Vec<_>>();
         array(ruby, summaries, definition_summary_hash)
     }
 
     /// Every registered relationship, oldest first.
     fn relationships(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
         let summaries = rb_self
-            .call(ruby, BlockingTrellis::relationships)?
+            .call(ruby, BlockingTrellis::start_relationships)?
             .iter()
             .map(|summary| {
                 PlainRelationshipSummary::try_from(summary).map_err(|err| raise(ruby, err))
@@ -229,7 +244,9 @@ impl Handle {
     /// Re-reads `source_table` for its applying readers: a rebuild, or a
     /// go-live catch-up for the staging worker.
     fn request_backfill(ruby: &Ruby, rb_self: &Self, source_table: String) -> Result<(), Error> {
-        rb_self.call(ruby, move |trellis| trellis.request_backfill(&source_table))
+        rb_self.call(ruby, |trellis| {
+            trellis.start_request_backfill(&source_table)
+        })
     }
 
     /// Releases one key `transform` holds in quarantine: `source_table`
@@ -241,8 +258,8 @@ impl Handle {
         source_table: String,
         key: String,
     ) -> Result<(), Error> {
-        rb_self.call(ruby, move |trellis| {
-            trellis.release_key(&transform, &source_table, &key)
+        rb_self.call(ruby, |trellis| {
+            trellis.start_release_key(&transform, &source_table, &key)
         })
     }
 
@@ -252,36 +269,28 @@ impl Handle {
         rb_self.check_pid(ruby)?;
         let watermark =
             system_time_from_epoch_micros(watermark_micros).map_err(|err| raise(ruby, err))?;
-        let entries = rb_self.call(ruby, move |trellis| {
-            Ok(trellis
-                .poisoned_since(watermark)?
-                .iter()
-                .map(PlainPoisonEntry::from)
-                .collect::<Vec<_>>())
-        })?;
+        let entries = rb_self
+            .call(ruby, |trellis| trellis.start_poisoned_since(watermark))?
+            .iter()
+            .map(PlainPoisonEntry::from)
+            .collect::<Vec<_>>();
         array(ruby, entries, poison_entry_hash)
     }
 
     /// Every quarantined transform and paused column.
     fn quarantined(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
-        let entries = rb_self.call(ruby, |trellis| {
-            Ok(trellis
-                .quarantined()?
-                .iter()
-                .map(PlainQuarantineEntry::from)
-                .collect::<Vec<_>>())
-        })?;
+        let entries = rb_self
+            .call(ruby, BlockingTrellis::start_quarantined)?
+            .iter()
+            .map(PlainQuarantineEntry::from)
+            .collect::<Vec<_>>();
         array(ruby, entries, quarantine_entry_hash)
     }
 
     /// One target's state, by its `transform` or `transform.column` address.
     fn quarantine_status(ruby: &Ruby, rb_self: &Self, target: String) -> Result<RHash, Error> {
-        let entry = rb_self.call(ruby, move |trellis| {
-            Ok(PlainQuarantineEntry::from(
-                &trellis.quarantine_status(&target)?,
-            ))
-        })?;
-        quarantine_entry_hash(ruby, entry)
+        let entry = rb_self.call(ruby, |trellis| trellis.start_quarantine_status(&target))?;
+        quarantine_entry_hash(ruby, PlainQuarantineEntry::from(&entry))
     }
 
     /// Up to `limit` of `target`'s quarantined rows, after the opaque
@@ -295,10 +304,10 @@ impl Handle {
     ) -> Result<RHash, Error> {
         rb_self.check_pid(ruby)?;
         let after = decode_cursor(cursor.as_deref()).map_err(|err| raise(ruby, err))?;
-        let page = rb_self.call(ruby, move |trellis| {
-            let samples = trellis.sample_quarantined(&target, after, limit)?;
-            Ok(PlainSamplePage::new(&samples, cursor.as_deref()))
+        let samples = rb_self.call(ruby, |trellis| {
+            trellis.start_sample_quarantined(&target, after, limit)
         })?;
+        let page = PlainSamplePage::new(&samples, cursor.as_deref());
         let samples = array(ruby, page.samples, |ruby, sample| {
             record(
                 ruby,
@@ -320,19 +329,19 @@ impl Handle {
 
     /// Whether any drain worker in the fleet is alive.
     fn has_live_drain_workers(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        rb_self.call(ruby, BlockingTrellis::has_live_drain_workers)
+        rb_self.call(ruby, BlockingTrellis::start_has_live_drain_workers)
     }
 
     /// Whether this instance's staging worker is alive anywhere in the fleet.
     fn has_live_staging_worker(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
-        rb_self.call(ruby, BlockingTrellis::has_live_staging_worker)
+        rb_self.call(ruby, BlockingTrellis::start_has_live_staging_worker)
     }
 
     /// A read-your-writes token, as an opaque string.
     fn watermark_token(ruby: &Ruby, rb_self: &Self) -> Result<String, Error> {
-        rb_self.call(ruby, |trellis| {
-            trellis.watermark_token().map(encode_watermark)
-        })
+        rb_self
+            .call(ruby, BlockingTrellis::start_watermark_token)
+            .map(encode_watermark)
     }
 
     /// Waits up to `timeout_ms` for every change committed at or before
@@ -346,8 +355,8 @@ impl Handle {
     ) -> Result<(), Error> {
         rb_self.check_pid(ruby)?;
         let token = decode_watermark(&token).map_err(|err| raise(ruby, err))?;
-        rb_self.call(ruby, move |trellis| {
-            trellis.await_converged(token, Duration::from_millis(timeout_ms))
+        rb_self.call(ruby, |trellis| {
+            trellis.start_await_converged(token, Duration::from_millis(timeout_ms))
         })
     }
 
@@ -367,22 +376,21 @@ impl Handle {
     ) -> Result<RHash, Error> {
         rb_self.check_pid(ruby)?;
         let mode = self_check_mode(&mode).map_err(|err| raise(ruby, err))?;
-        let report = rb_self.call(ruby, move |trellis| {
-            let report = trellis.self_check(
+        let report = rb_self.call(ruby, |trellis| {
+            trellis.start_self_check(
                 &target_table,
                 SelfCheckScope { after, limit },
                 mode,
                 Duration::from_millis(timeout_ms),
-            )?;
-            Ok(PlainSelfCheckReport::from(&report))
+            )
         })?;
-        self_check_hash(ruby, report)
+        self_check_hash(ruby, PlainSelfCheckReport::from(&report))
     }
 
     /// The configuration the handle connected with, all but the connection
     /// string (see [`PlainConfig`]).
     fn config(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
-        let config = rb_self.call(ruby, |trellis| Ok(PlainConfig::from(trellis.config())))?;
+        let config = rb_self.with_engine(ruby, |trellis| PlainConfig::from(trellis.config()))?;
         record(
             ruby,
             [
@@ -399,16 +407,24 @@ impl Handle {
 
     /// Stops the instance's background work and joins its runtime thread.
     /// Idempotent: shutting down a handle that is already shut down is fine.
+    ///
+    /// Calls in flight on other threads are cancelled, not waited for (see
+    /// `BlockingTrellis::shutdown`), so a call stuck on a lock doesn't hold
+    /// this up. Interrupting the wait doesn't stop the shutdown: it finishes
+    /// on a thread of its own (see [`engine::Stopping`]).
     fn shutdown(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         rb_self.check_pid(ruby)?;
-        let shared = Arc::clone(&rb_self.trellis);
-        blocking(ruby, move || {
-            let trellis = shared.write().map_err(|_| poisoned())?.take();
-            match trellis {
-                Some(trellis) => trellis.shutdown().map_err(PlainError::from),
-                None => Ok(()),
+        let engine = rb_self
+            .trellis
+            .write()
+            .map_err(|_| raise(ruby, poisoned()))?
+            .take();
+        match engine {
+            Some(engine) => {
+                wait_without_gvl(engine.start_shutdown())?.map_err(|err| raise(ruby, err))
             }
-        })
+            None => Ok(()),
+        }
     }
 }
 
@@ -427,20 +443,52 @@ fn connect(
     worker_threads: usize,
 ) -> Result<Handle, Error> {
     engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
-    let trellis = blocking(ruby, move || {
-        let config = Config::with_schema(url, schema)?.with_target_schema(target_schema)?;
-        let options = TrellisOptions {
-            staging,
-            drain_threads,
-            worker_threads: Some(worker_threads),
-            ..Default::default()
-        };
-        // Can't fail after `check` passed (a process's answer never
-        // changes), but if it did, it's still an error rather than a hang.
-        Engine::connect(config, options)
-            .map_err(|err| PlainError::new(ErrorCode::Validation, forked_while_running(&err)))?
-            .map_err(PlainError::from)
-    })?;
+    // Connecting can wait on the database (a staging worker installs its
+    // triggers before it reports ready), and `BlockingTrellis::connect` is a
+    // bare blocking wait, so it runs on a thread of its own while this Ruby
+    // thread waits for the result interruptibly. That is the one thread the
+    // binding starts for a wait, once per connect and never per call. An
+    // interrupted connect finishes there, and the engine it produces is
+    // dropped, which shuts it down (see `engine::Engine`'s `Drop`).
+    let (sender, reply) = handoff();
+    let spawned = std::thread::Builder::new()
+        .name("trellis-ruby-connect".to_string())
+        .spawn(move || {
+            let connected = catch_unwind(AssertUnwindSafe(|| {
+                let config = Config::with_schema(url, schema)?.with_target_schema(target_schema)?;
+                let options = TrellisOptions {
+                    staging,
+                    drain_threads,
+                    worker_threads: Some(worker_threads),
+                    ..Default::default()
+                };
+                // Can't fail after `check` passed (a process's answer never
+                // changes), but if it did, it's still an error rather than a
+                // hang.
+                Engine::connect(config, options)
+                    .map_err(|err| {
+                        PlainError::new(ErrorCode::Validation, forked_while_running(&err))
+                    })?
+                    .map_err(PlainError::from)
+            }))
+            .unwrap_or_else(|_| {
+                Err(PlainError::new(
+                    ErrorCode::Internal,
+                    "connecting a Trellis handle panicked",
+                ))
+            });
+            sender.send(connected);
+        });
+    if let Err(err) = spawned {
+        return Err(raise(
+            ruby,
+            PlainError::new(
+                ErrorCode::Internal,
+                format!("could not start a thread to connect the Trellis handle: {err}"),
+            ),
+        ));
+    }
+    let trellis = wait_without_gvl(reply)?.map_err(|err| raise(ruby, err))?;
     Ok(Handle {
         trellis: Arc::new(RwLock::new(Some(trellis))),
         owner_pid: std::process::id(),
@@ -477,105 +525,106 @@ fn poisoned() -> PlainError {
     )
 }
 
-/// Runs `call` off the GVL (see [`run_without_gvl`]) and raises its error, if
-/// any, as the `Trellis::Error` subclass for its code.
-fn blocking<T: Send + 'static>(
-    ruby: &Ruby,
-    call: impl FnOnce() -> Reply<T> + Send + 'static,
-) -> Result<T, Error> {
-    run_without_gvl(call)?.map_err(|err| raise(ruby, err))
-}
-
-/// Runs `call` on a helper thread and waits for its reply with the GVL
-/// released, so other Ruby threads run meanwhile, and with an unblocking
-/// function, so `Thread#kill`, `Thread#raise` and Ctrl-C reach a thread
-/// that's waiting.
+/// Waits for `future`'s reply on this Ruby thread with the GVL released, so
+/// other Ruby threads run meanwhile, and with an unblocking function, so
+/// `Thread#kill`, `Thread#raise` and Ctrl-C reach a thread that's waiting.
 ///
-/// An interrupt abandons the wait, not the work: the helper thread finishes
-/// the call (a `define` may still register its transform) and its reply is
-/// dropped. That's the only way to honour the interrupt, because
-/// `BlockingTrellis` can't cancel a job it has been sent.
+/// No thread is started for the wait. The Ruby thread polls `future` with a
+/// waker that signals a condition variable, then parks on it; the engine's
+/// reply (through the waker) and Ruby's unblocking function both wake it. The
+/// unblocking function only stops the wait: it never cancels the call, which
+/// ends by its own 30-second deadline, and what it started on the server is
+/// stopped by the server (issue #599). Dropping `future` on an interrupt
+/// discards the reply.
 ///
 /// The outer `Err` is the interrupt's (an exception, or `Thread#kill`'s
 /// jump), for Magnus to resume once this returns; the inner [`Reply`] is the
 /// call's own result.
-fn run_without_gvl<T: Send + 'static>(
-    call: impl FnOnce() -> Reply<T> + Send + 'static,
-) -> Result<Reply<T>, Error> {
-    let pending = Arc::new(Pending::<T>::new());
-    let worker = Arc::clone(&pending);
-    let spawned = std::thread::Builder::new()
-        .name("trellis-ruby-call".to_string())
-        .spawn(move || {
-            // A panic must still produce a reply, or the wait below would
-            // never end.
-            let reply = catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|_| {
-                Err(PlainError::new(
-                    ErrorCode::Internal,
-                    "a Trellis call panicked; the handle may be unusable",
-                ))
-            });
-            worker.finish(reply);
-        });
-    if let Err(err) = spawned {
-        return Ok(Err(PlainError::new(
-            ErrorCode::Internal,
-            format!("could not start a thread for the Trellis call: {err}"),
-        )));
-    }
-
-    let data = Arc::as_ptr(&pending).cast_mut().cast::<c_void>();
+fn wait_without_gvl<F, T, E>(mut future: F) -> Result<Reply<T>, Error>
+where
+    F: Future<Output = Result<T, E>> + Unpin,
+    E: Into<PlainError>,
+{
+    let signal = Arc::new(Signal::new());
     loop {
-        // SAFETY: `wait_for_reply::<T>` and `interrupt::<T>` only read
-        // `data` as the `Pending<T>` it points to, which `pending` keeps
-        // alive for this whole call, and Ruby calls neither once
-        // `rb_thread_call_without_gvl` has returned. Ruby may act on a
-        // pending interrupt (raise, or unwind for `Thread#kill`) before or
-        // after the wait; `protect` catches that jump, so it never unwinds
-        // through this frame, and returns it as an `Error` to resume later.
+        signal.rearm();
+        let mut waiting = Waiting {
+            future: &mut future,
+            signal: &signal,
+            output: None,
+        };
+        let data = std::ptr::from_mut(&mut waiting).cast::<c_void>();
+        let ubf_data = Arc::as_ptr(&signal).cast_mut().cast::<c_void>();
+        // SAFETY: `wait_for_reply::<F>` reads `data` as the `Waiting<F>` it
+        // points to, and `interrupt` reads `ubf_data` as the `Signal` it
+        // points to. `waiting` and `signal` outlive the call, and Ruby calls
+        // neither function once `rb_thread_call_without_gvl` has returned.
+        // Ruby may act on a pending interrupt (raise, or unwind for
+        // `Thread#kill`) before or after the wait; `protect` catches that
+        // jump, so it never unwinds through this frame, and returns it as an
+        // `Error` to resume later.
         magnus::rb_sys::protect(|| unsafe {
             rb_sys::rb_thread_call_without_gvl(
-                Some(wait_for_reply::<T>),
+                Some(wait_for_reply::<F>),
                 data,
-                Some(interrupt::<T>),
-                data,
+                Some(interrupt),
+                ubf_data,
             );
             rb_sys::Qnil as rb_sys::VALUE
         })?;
-        if let Some(reply) = pending.take_reply() {
-            return Ok(reply);
+        match waiting.output {
+            Some(Ok(reply)) => return Ok(reply.map_err(Into::into)),
+            Some(Err(Panicked)) => {
+                return Ok(Err(PlainError::new(
+                    ErrorCode::Internal,
+                    "a Trellis call panicked; the handle may be unusable",
+                )));
+            }
+            None => {}
         }
         // Woken by the unblocking function with no reply yet. Let Ruby act
         // on the interrupt: an exception or a kill leaves through `?`. One
         // that turns out to raise nothing (a signal trap that returns, say)
-        // resumes the wait for the same helper thread's reply.
+        // resumes the wait for the same reply.
         //
         // SAFETY: as above, `protect` keeps the jump out of this frame.
         magnus::rb_sys::protect(|| unsafe {
             rb_sys::rb_thread_check_ints();
             rb_sys::Qnil as rb_sys::VALUE
         })?;
-        pending.rearm();
     }
 }
 
-/// A reply the helper thread hands back to the waiting Ruby thread.
-struct Pending<T> {
-    slot: Mutex<Slot<T>>,
+/// What [`wait_for_reply`] works on, on the waiting Ruby thread's stack.
+struct Waiting<'a, F: Future> {
+    future: &'a mut F,
+    signal: &'a Arc<Signal>,
+    /// Set once the future is ready (or panicked while polled).
+    output: Option<Result<F::Output, Panicked>>,
+}
+
+/// Polling the future panicked.
+struct Panicked;
+
+/// The wake-up state shared by the waiting thread, the future's waker, and
+/// Ruby's unblocking function.
+struct Signal {
+    flags: Mutex<Flags>,
     changed: Condvar,
 }
 
-struct Slot<T> {
-    reply: Option<Reply<T>>,
-    /// Set by [`interrupt`], cleared by [`Pending::rearm`] before each wait.
+struct Flags {
+    /// Set by the waker: the future may be ready.
+    woken: bool,
+    /// Set by [`interrupt`], cleared by [`Signal::rearm`] before each wait.
     interrupted: bool,
 }
 
-impl<T> Pending<T> {
+impl Signal {
     fn new() -> Self {
-        Pending {
-            slot: Mutex::new(Slot {
-                reply: None,
+        Signal {
+            flags: Mutex::new(Flags {
+                woken: false,
                 interrupted: false,
             }),
             changed: Condvar::new(),
@@ -584,36 +633,65 @@ impl<T> Pending<T> {
 
     /// Never panics: the callbacks below run inside Ruby's C frames, where a
     /// panic would abort the process. Nothing panics while holding the lock,
-    /// so a poisoned one still guards a consistent slot.
-    fn lock(&self) -> MutexGuard<'_, Slot<T>> {
-        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn finish(&self, reply: Reply<T>) {
-        self.lock().reply = Some(reply);
-        self.changed.notify_all();
-    }
-
-    fn take_reply(&self) -> Option<Reply<T>> {
-        self.lock().reply.take()
+    /// so a poisoned one still guards consistent flags.
+    fn lock(&self) -> MutexGuard<'_, Flags> {
+        self.flags.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn rearm(&self) {
-        self.lock().interrupted = false;
+        let mut flags = self.lock();
+        flags.interrupted = false;
+        flags.woken = false;
     }
 }
 
-/// The GVL-released half of [`run_without_gvl`]: blocks until the reply
-/// arrives or [`interrupt`] fires. Touches no Ruby object.
-unsafe extern "C" fn wait_for_reply<T>(data: *mut c_void) -> *mut c_void {
-    // SAFETY: see `run_without_gvl`.
-    let pending = unsafe { &*data.cast::<Pending<T>>() };
-    let mut slot = pending.lock();
-    while slot.reply.is_none() && !slot.interrupted {
-        slot = pending
-            .changed
-            .wait(slot)
-            .unwrap_or_else(PoisonError::into_inner);
+impl Wake for Signal {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.lock().woken = true;
+        self.changed.notify_all();
+    }
+}
+
+/// The GVL-released half of [`wait_without_gvl`]: polls the future, and parks
+/// until it is woken or [`interrupt`] fires, until the future is ready.
+/// Touches no Ruby object.
+unsafe extern "C" fn wait_for_reply<F: Future + Unpin>(data: *mut c_void) -> *mut c_void {
+    // SAFETY: see `wait_without_gvl`.
+    let waiting = unsafe { &mut *data.cast::<Waiting<'_, F>>() };
+    let waker = Waker::from(Arc::clone(waiting.signal));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        // A panic must not unwind into Ruby's C frames.
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut *waiting.future).poll(&mut cx)
+        }));
+        match polled {
+            Ok(Poll::Ready(output)) => {
+                waiting.output = Some(Ok(output));
+                break;
+            }
+            Ok(Poll::Pending) => {}
+            Err(_) => {
+                waiting.output = Some(Err(Panicked));
+                break;
+            }
+        }
+        let mut flags = waiting.signal.lock();
+        while !flags.woken && !flags.interrupted {
+            flags = waiting
+                .signal
+                .changed
+                .wait(flags)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if flags.interrupted {
+            break;
+        }
+        flags.woken = false;
     }
     std::ptr::null_mut()
 }
@@ -622,11 +700,88 @@ unsafe extern "C" fn wait_for_reply<T>(data: *mut c_void) -> *mut c_void {
 /// thread in [`wait_for_reply`] that has an interrupt to handle. It takes a
 /// lock, so it isn't async-signal-safe, and it doesn't claim to be
 /// (`RB_NOGVL_UBF_ASYNC_SAFE`), so Ruby never calls it from a signal handler.
-unsafe extern "C" fn interrupt<T>(data: *mut c_void) {
-    // SAFETY: see `run_without_gvl`.
-    let pending = unsafe { &*data.cast::<Pending<T>>() };
-    pending.lock().interrupted = true;
-    pending.changed.notify_all();
+unsafe extern "C" fn interrupt(data: *mut c_void) {
+    // SAFETY: see `wait_without_gvl`.
+    let signal = unsafe { &*data.cast::<Signal>() };
+    signal.lock().interrupted = true;
+    signal.changed.notify_all();
+}
+
+/// A value one thread hands to another, as a future: the reply of the
+/// thread [`connect`] starts.
+struct Handoff<T> {
+    slot: Arc<Mutex<HandoffSlot<T>>>,
+}
+
+struct HandoffSlot<T> {
+    value: Option<Result<T, PlainError>>,
+    /// The sending end is gone.
+    closed: bool,
+    waker: Option<Waker>,
+}
+
+/// The sending end of a [`Handoff`]. Dropped without sending, the receiving
+/// end reads an internal error rather than waiting forever.
+struct HandoffSender<T> {
+    slot: Arc<Mutex<HandoffSlot<T>>>,
+}
+
+fn handoff<T>() -> (HandoffSender<T>, Handoff<T>) {
+    let slot = Arc::new(Mutex::new(HandoffSlot {
+        value: None,
+        closed: false,
+        waker: None,
+    }));
+    (
+        HandoffSender {
+            slot: Arc::clone(&slot),
+        },
+        Handoff { slot },
+    )
+}
+
+impl<T> HandoffSender<T> {
+    fn send(self, value: Result<T, PlainError>) {
+        self.slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .value = Some(value);
+        // The drop closes the slot and wakes the receiver.
+    }
+}
+
+impl<T> Drop for HandoffSender<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+            slot.closed = true;
+            slot.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl<T> Unpin for Handoff<T> {}
+
+impl<T> Future for Handoff<T> {
+    type Output = Result<T, PlainError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(value) = slot.value.take() {
+            Poll::Ready(value)
+        } else if slot.closed {
+            Poll::Ready(Err(PlainError::new(
+                ErrorCode::Internal,
+                "the thread that was connecting a Trellis handle ended without a result",
+            )))
+        } else {
+            slot.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
 }
 
 fn trellis_module(ruby: &Ruby) -> Result<RModule, Error> {

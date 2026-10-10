@@ -160,10 +160,17 @@ default one included.
   the process holds if the app didn't.
 - **Every call releases the GVL** while it waits on the database, so other
   threads (Puma's request threads, say) keep running, and `Thread#kill`,
-  `Thread#raise` and Ctrl-C interrupt a thread waiting in one. An interrupt
-  abandons the wait, not the work: a `define` that was interrupted may still
-  register its transform (`Trellis.status` tells you whether it did), and
-  the handle serves no other call until the abandoned one has finished.
+  `Thread#raise`, `Timeout.timeout` and Ctrl-C interrupt a thread waiting in
+  one. The thread waits for the reply itself, so an interrupt leaves no thread
+  behind. It abandons the wait, not the work: a `define` that was interrupted
+  may still register its transform (`Trellis.status` tells you whether it
+  did). Every call ends within 30 seconds on its own, and the server stops
+  what it started at that deadline, so an abandoned call holds a pooled
+  connection for at most that long. A call that runs out of time raises
+  `Trellis::TimeoutError`. A call stuck on a lock doesn't hold up the others:
+  calls from different threads run in parallel, in no particular order.
+  `shutdown` doesn't wait for a call stuck on a lock either: it cancels the
+  calls in flight, and they raise.
 - **A handle doesn't survive `fork`.** Connect after forking: Puma's
   `before_worker_boot` (`on_worker_boot` before Puma 7), Passenger's
   `starting_worker_process`. A forked child's

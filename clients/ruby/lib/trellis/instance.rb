@@ -74,9 +74,11 @@ module Trellis
   #   await_converged, and the audit self_check.
   #
   # Every call blocks on the database with the GVL released, so other threads
-  # run meanwhile, and Thread#kill, Thread#raise and Ctrl-C interrupt it. An
-  # interrupt abandons the wait, not the work: the call itself still finishes
-  # in the background. Every failure raises a Trellis::Error subclass.
+  # run meanwhile, and Thread#kill, Thread#raise, Timeout.timeout and Ctrl-C
+  # interrupt it, leaving no thread behind. An interrupt abandons the wait, not
+  # the work: the call itself ends within its 30-second deadline, where the
+  # server stops it. Every failure raises a Trellis::Error subclass, a call that
+  # runs out of time a Trellis::TimeoutError.
   #
   # Conventions: times are Times in UTC, at microsecond precision; a
   # quarantine target is an address string, a transform's bare target table

@@ -1,9 +1,12 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "timeout"
 
 # ADR-0010 decision 3: every call releases the GVL, and has an unblocking
-# function so an interrupt reaches a thread blocked in one.
+# function so an interrupt reaches a thread blocked in one. A call waits on
+# the calling thread itself, so an interrupt leaves no thread behind (issue
+# #599).
 #
 # A call is made slow by locking the catalog table `status` reads from
 # another process, so it blocks inside the engine for as long as the lock
@@ -54,7 +57,7 @@ class GvlTest < Minitest::Test
     release.close
     wait_for_child(holder, seconds: 30)
     holder = nil
-    # The handle still works: the abandoned calls finished in the background.
+    # The handle still works: the abandoned calls ended on their own.
     assert_nil Trellis.status("no_such_target")
   ensure
     release&.close
@@ -98,7 +101,121 @@ class GvlTest < Minitest::Test
     wait_for_child(holder, seconds: 30) if holder
   end
 
+  # Issue #599: an interrupted call used to leave a helper thread behind until
+  # the engine answered, so repeated interrupt-and-retry against a stuck
+  # database piled threads up without bound. The wait is on the calling thread
+  # now, so interrupts add none. Each interrupted call leaves its engine-side
+  # work running (and holding a pooled connection) until its deadline, which
+  # can make the engine's own runtime start a few threads, so the bound is
+  # well below the number of interrupts rather than zero.
+  def test_interrupting_calls_leaves_no_thread_behind
+    Trellis.connect(url: TestCluster.dsn)
+    Trellis.status("no_such_target") # the engine's threads are up
+    holder, release = hold_lock(CATALOG)
+    before = os_threads
+
+    interrupts = 24
+    interrupts.times do |i|
+      case i % 3
+      when 0
+        assert_raises(Timeout::Error) { Timeout.timeout(0.05) { Trellis.status("no_such_target") } }
+      when 1
+        thread = Thread.new { Trellis.status("no_such_target") }
+        sleep 0.1 # into the call, which blocks on the lock
+        thread.kill
+        assert thread.join(5), "Thread#kill didn't end a thread blocked in a Trellis call"
+      else
+        thread = Thread.new do
+          Thread.current.report_on_exception = false
+          Trellis.status("no_such_target")
+        end
+        sleep 0.1 # into the call, which blocks on the lock
+        thread.raise(Class.new(StandardError), "stop waiting")
+        assert_raises(StandardError) { thread.join(5) or flunk "Thread#raise didn't end the call" }
+      end
+    end
+
+    grown = os_threads - before
+    assert_operator grown, :<, 8,
+                    "#{interrupts} interrupted calls left #{grown} more OS threads behind (a thread per call would leave #{interrupts})"
+  ensure
+    release&.close
+    wait_for_child(holder, seconds: 30) if holder
+  end
+
+  # Shutdown doesn't wait for a call stuck on a lock, abandoned or not: it
+  # cancels what is in flight, and what the call started on the server ends at
+  # the call's deadline.
+  def test_shutdown_returns_promptly_with_an_abandoned_call_stuck_on_a_lock
+    Trellis.connect(url: TestCluster.dsn)
+    holder, release = hold_lock(CATALOG)
+
+    assert_raises(Timeout::Error) { Timeout.timeout(0.3) { Trellis.status("no_such_target") } }
+    started = monotonic
+    assert_nil Trellis.shutdown
+    elapsed = monotonic - started
+
+    assert_operator elapsed, :<, 10, "shutdown waited #{elapsed.round(1)}s for an abandoned call stuck on a lock"
+    refute Trellis.connected?
+  ensure
+    release&.close
+    wait_for_child(holder, seconds: 30) if holder
+  end
+
+  def test_shutdown_returns_promptly_while_another_thread_is_stuck_in_a_call
+    Trellis.connect(url: TestCluster.dsn)
+    holder, release = hold_lock(CATALOG)
+
+    stuck = Thread.new do
+      Thread.current.report_on_exception = false
+      Trellis.status("no_such_target")
+    end
+    sleep 0.3 # into the call, which blocks on the lock
+    started = monotonic
+    assert_nil Trellis.shutdown
+    elapsed = monotonic - started
+
+    assert_operator elapsed, :<, 10, "shutdown waited #{elapsed.round(1)}s for a call stuck on a lock"
+    assert_raises(Trellis::Error, "the stuck call fails once the handle is shut down") do
+      stuck.join(10) or flunk "the stuck call never ended after the shutdown"
+    end
+  ensure
+    release&.close
+    wait_for_child(holder, seconds: 30) if holder
+  end
+
+  # A call stuck on a lock ends at the engine's 30-second deadline with a
+  # TimeoutError, on the calling thread, without a thread of its own. Not
+  # shortened: the extension has no knob for the deadline, so this one waits it
+  # out.
+  def test_a_call_stuck_on_a_lock_raises_timeout_error_at_the_deadline
+    Trellis.connect(url: TestCluster.dsn)
+    Trellis.status("no_such_target")
+    holder, release = hold_lock(CATALOG)
+    before = os_threads
+
+    started = monotonic
+    error = assert_raises(Trellis::TimeoutError) { Trellis.status("no_such_target") }
+    elapsed = monotonic - started
+
+    assert_operator elapsed, :>=, 29, "the call ended after #{elapsed.round(1)}s, before its deadline: #{error.message}"
+    assert_operator elapsed, :<, 45, "the call took #{elapsed.round(1)}s: #{error.message}"
+    assert_operator os_threads, :<=, before + 2
+    release.close
+    wait_for_child(holder, seconds: 30)
+    holder = nil
+    assert_nil Trellis.status("no_such_target"), "the handle works after a timed-out call"
+  ensure
+    release&.close
+    wait_for_child(holder, seconds: 30) if holder
+  end
+
   private
+
+  # This process's OS threads (Linux).
+  def os_threads
+    Dir.children("/proc/self/task").size
+  end
 
   def assert_lets_other_threads_run(name, call)
     ticks = 0

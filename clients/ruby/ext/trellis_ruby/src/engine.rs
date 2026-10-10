@@ -22,10 +22,13 @@
 //! still connecting on another thread, or still winding down after an
 //! interrupted `shutdown` or a dropped handle, has threads too, and counts.
 
+use std::future::Future;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, ready};
 
-use trellis::{BlockingTrellis, Config, TrellisError, TrellisOptions};
+use trellis::{BlockingTrellis, Config, Shutdown, TrellisError, TrellisOptions};
 
 /// The process whose engines are counted (high 32 bits: its pid) and how many
 /// are running (low 32 bits). One word, so a count and its owner change
@@ -118,24 +121,74 @@ impl Engine {
         })
     }
 
-    /// Stops the engine and waits for its threads.
-    pub(crate) fn shutdown(mut self) -> Result<(), TrellisError> {
+    /// Starts stopping the engine, returning the wait for its threads to end.
+    /// The wait is a future, so the caller can wait interruptibly; if it is
+    /// dropped before it finishes, the shutdown is finished on a thread of
+    /// its own (see [`Stopping`]).
+    pub(crate) fn start_shutdown(mut self) -> Stopping {
         let (trellis, lease) = self
             .running
             .take()
             .expect("an engine is shut down only once");
-        stop(trellis, lease)
+        Stopping {
+            running: Some((trellis.start_shutdown(), lease)),
+        }
+    }
+}
+
+/// An engine's shutdown under way, ready once its threads have exited and
+/// its count is given back.
+pub(crate) struct Stopping {
+    /// `None` once the shutdown has finished.
+    running: Option<(Shutdown, Lease)>,
+}
+
+/// Gives `lease` back once `result` shows the engine's threads are gone.
+/// `BlockingThreadGone` means its background thread panicked, which drops the
+/// engine without joining the threads it started, so that count is kept.
+fn finish(result: &Result<(), TrellisError>, lease: Lease) {
+    if !matches!(result, Err(TrellisError::BlockingThreadGone)) {
+        lease.release();
+    }
+}
+
+impl Future for Stopping {
+    type Output = Result<(), TrellisError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some((shutdown, _)) = self.running.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        let result = ready!(Pin::new(shutdown).poll(cx));
+        if let Some((_, lease)) = self.running.take() {
+            finish(&result, lease);
+        }
+        Poll::Ready(result)
+    }
+}
+
+impl Drop for Stopping {
+    /// A shutdown abandoned before it finished (its waiter was interrupted)
+    /// still runs to its end: a thread of its own waits for it, so the engine
+    /// is joined and its count given back once its threads are gone. This is
+    /// the one thread the binding starts on a caller's behalf, and only for
+    /// an interrupted shutdown, never for a call.
+    fn drop(&mut self) {
+        if let Some((shutdown, lease)) = self.running.take() {
+            // If the thread can't start, the closure (and the lease in it) is
+            // dropped unreleased: the engine winds down unjoined, and its
+            // count stays.
+            let _ = std::thread::Builder::new()
+                .name("trellis-ruby-stop".to_string())
+                .spawn(move || finish(&shutdown.wait(), lease));
+        }
     }
 }
 
 /// Shuts `trellis` down and gives its count back once its threads are gone.
-/// `BlockingThreadGone` means its background thread panicked, which drops
-/// the engine without joining the threads it started, so that count is kept.
 fn stop(trellis: BlockingTrellis, lease: Lease) -> Result<(), TrellisError> {
     let result = trellis.shutdown();
-    if !matches!(result, Err(TrellisError::BlockingThreadGone)) {
-        lease.release();
-    }
+    finish(&result, lease);
     result
 }
 

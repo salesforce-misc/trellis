@@ -21,7 +21,18 @@
 //! order, because it waits for each reply; calls from different threads have no
 //! order. The exceptions are [`BlockingTrellis::self_check`] and
 //! [`BlockingTrellis::shutdown`], which `Trellis` runs outside the deadline
-//! too (see [`Trellis::self_check`] and [`Trellis::shutdown`]).
+//! too (see [`Trellis::self_check`] and [`Trellis::shutdown`]). A shutdown
+//! cancels the calls still in flight rather than waiting for them.
+//!
+//! **Waiting is the caller's to choose.** Each method has a `start_*` twin
+//! (`apply` and [`BlockingTrellis::start_apply`], say) that submits the job and
+//! returns a [`PendingCall`] at once. The plain method is the twin followed by
+//! [`PendingCall::wait`], a bare blocking receive that nothing can cut short.
+//! A binding whose host must be able to interrupt the wait (the Ruby
+//! extension releases the GVL and wakes on `Thread#kill` or a signal) polls
+//! the [`PendingCall`] as a future with a waker of its own, so it needs no
+//! thread per call. Abandoning a [`PendingCall`] abandons the reply, not the
+//! work: the job runs to its end or its deadline.
 //!
 //! **Blocks only on registration, never on backfill.**
 //! [`BlockingTrellis::apply`] is exactly as fast (or slow) as
@@ -38,6 +49,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{mpsc, oneshot};
@@ -200,7 +212,12 @@ impl BlockingTrellis {
 
     /// Applies Trellis's schema migrations. See [`Trellis::migrate`].
     pub fn migrate(&self) -> Result<(), TrellisError> {
-        self.submit(Job::Migrate)
+        self.start_migrate().wait()
+    }
+
+    /// Submits [`BlockingTrellis::migrate`] and returns without waiting for it.
+    pub fn start_migrate(&self) -> PendingCall<()> {
+        self.start(Job::Migrate)
     }
 
     /// A handle onto this process's in-process metrics registry. See
@@ -223,53 +240,96 @@ impl BlockingTrellis {
     /// returns before its backfill finishes; poll
     /// [`BlockingTrellis::status`] for [`TransformStatus::Live`](crate::TransformStatus::Live).
     pub fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
+        self.start_apply(statement_text).wait()
+    }
+
+    /// Submits [`BlockingTrellis::apply`] and returns without waiting for it.
+    pub fn start_apply(&self, statement_text: &str) -> PendingCall<Applied> {
         let statement_text = statement_text.to_string();
-        self.submit(|reply| Job::Apply(statement_text, reply))
+        self.start(|reply| Job::Apply(statement_text, reply))
     }
 
     /// Every registered transform definition, oldest first. See
     /// [`Trellis::definitions`].
     pub fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
-        self.submit(Job::Definitions)
+        self.start_definitions().wait()
+    }
+
+    /// Submits [`BlockingTrellis::definitions`] and returns without waiting for it.
+    pub fn start_definitions(&self) -> PendingCall<Vec<DefinitionSummary>> {
+        self.start(Job::Definitions)
     }
 
     /// Every registered relationship declaration, oldest first. See
     /// [`Trellis::relationships`].
     pub fn relationships(&self) -> Result<Vec<RelationshipSummary>, TrellisError> {
-        self.submit(Job::Relationships)
+        self.start_relationships().wait()
+    }
+
+    /// Submits [`BlockingTrellis::relationships`] and returns without waiting for it.
+    pub fn start_relationships(&self) -> PendingCall<Vec<RelationshipSummary>> {
+        self.start(Job::Relationships)
     }
 
     /// Re-reads `source_table` for every definition applying from it, as a
     /// go-live catch-up. See [`Trellis::request_backfill`].
     pub fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
+        self.start_request_backfill(source_table).wait()
+    }
+
+    /// Submits [`BlockingTrellis::request_backfill`] and returns without
+    /// waiting for it.
+    pub fn start_request_backfill(&self, source_table: &str) -> PendingCall<()> {
         let source_table = source_table.to_string();
-        self.submit(|reply| Job::RequestBackfill(source_table, reply))
+        self.start(|reply| Job::RequestBackfill(source_table, reply))
     }
 
     /// Poison-quarantine entries recorded since `watermark`, oldest first.
     /// See [`Trellis::poisoned_since`].
     pub fn poisoned_since(&self, watermark: SystemTime) -> Result<Vec<PoisonEntry>, TrellisError> {
-        self.submit(|reply| Job::PoisonedSince(watermark, reply))
+        self.start_poisoned_since(watermark).wait()
+    }
+
+    /// Submits [`BlockingTrellis::poisoned_since`] and returns without waiting
+    /// for it.
+    pub fn start_poisoned_since(&self, watermark: SystemTime) -> PendingCall<Vec<PoisonEntry>> {
+        self.start(|reply| Job::PoisonedSince(watermark, reply))
     }
 
     /// One registered transform definition's current [`TransformStatus`](crate::TransformStatus), and
     /// its source's backfill failure if any, by target table name. See
     /// [`Trellis::status`].
     pub fn status(&self, target_table: &str) -> Result<Option<DefinitionStatus>, TrellisError> {
+        self.start_status(target_table).wait()
+    }
+
+    /// Submits [`BlockingTrellis::status`] and returns without waiting for it.
+    pub fn start_status(&self, target_table: &str) -> PendingCall<Option<DefinitionStatus>> {
         let target_table = target_table.to_string();
-        self.submit(|reply| Job::Status(target_table, reply))
+        self.start(|reply| Job::Status(target_table, reply))
     }
 
     /// Every currently paused/quarantined target. See [`Trellis::quarantined`].
     pub fn quarantined(&self) -> Result<Vec<QuarantineEntry>, TrellisError> {
-        self.submit(Job::Quarantined)
+        self.start_quarantined().wait()
+    }
+
+    /// Submits [`BlockingTrellis::quarantined`] and returns without waiting for it.
+    pub fn start_quarantined(&self) -> PendingCall<Vec<QuarantineEntry>> {
+        self.start(Job::Quarantined)
     }
 
     /// The current state of one target (`transform` or `transform.column`).
     /// See [`Trellis::quarantine_status`].
     pub fn quarantine_status(&self, target: &str) -> Result<QuarantineEntry, TrellisError> {
+        self.start_quarantine_status(target).wait()
+    }
+
+    /// Submits [`BlockingTrellis::quarantine_status`] and returns without
+    /// waiting for it.
+    pub fn start_quarantine_status(&self, target: &str) -> PendingCall<QuarantineEntry> {
         let target = target.to_string();
-        self.submit(|reply| Job::QuarantineStatus(target, reply))
+        self.start(|reply| Job::QuarantineStatus(target, reply))
     }
 
     /// A paginated batch of poisoned rows for `target`. See
@@ -280,8 +340,19 @@ impl BlockingTrellis {
         after: Option<(String, String)>,
         limit: i64,
     ) -> Result<Vec<PoisonSample>, TrellisError> {
+        self.start_sample_quarantined(target, after, limit).wait()
+    }
+
+    /// Submits [`BlockingTrellis::sample_quarantined`] and returns without
+    /// waiting for it.
+    pub fn start_sample_quarantined(
+        &self,
+        target: &str,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> PendingCall<Vec<PoisonSample>> {
         let target = target.to_string();
-        self.submit(|reply| Job::SampleQuarantined(target, after, limit, reply))
+        self.start(|reply| Job::SampleQuarantined(target, after, limit, reply))
     }
 
     /// Releases one key `transform` holds in quarantine, re-deriving it from
@@ -292,12 +363,23 @@ impl BlockingTrellis {
         source_table: &str,
         key: &str,
     ) -> Result<(), TrellisError> {
+        self.start_release_key(transform, source_table, key).wait()
+    }
+
+    /// Submits [`BlockingTrellis::release_key`] and returns without waiting
+    /// for it.
+    pub fn start_release_key(
+        &self,
+        transform: &str,
+        source_table: &str,
+        key: &str,
+    ) -> PendingCall<()> {
         let (transform, source_table, key) = (
             transform.to_string(),
             source_table.to_string(),
             key.to_string(),
         );
-        self.submit(|reply| Job::ReleaseKey(transform, source_table, key, reply))
+        self.start(|reply| Job::ReleaseKey(transform, source_table, key, reply))
     }
 
     /// Whether at least one live drain worker is registered anywhere in
@@ -305,19 +387,34 @@ impl BlockingTrellis {
     /// host is meant to poll on a timer. See
     /// [`Trellis::has_live_drain_workers`].
     pub fn has_live_drain_workers(&self) -> Result<bool, TrellisError> {
-        self.submit(Job::HasLiveDrainWorkers)
+        self.start_has_live_drain_workers().wait()
+    }
+
+    /// Submits [`BlockingTrellis::has_live_drain_workers`] and returns without waiting for it.
+    pub fn start_has_live_drain_workers(&self) -> PendingCall<bool> {
+        self.start(Job::HasLiveDrainWorkers)
     }
 
     /// Whether this instance's staging worker is running anywhere in the
     /// fleet right now — the other half of the health check. See
     /// [`Trellis::has_live_staging_worker`].
     pub fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
-        self.submit(Job::HasLiveStagingWorker)
+        self.start_has_live_staging_worker().wait()
+    }
+
+    /// Submits [`BlockingTrellis::has_live_staging_worker`] and returns without waiting for it.
+    pub fn start_has_live_staging_worker(&self) -> PendingCall<bool> {
+        self.start(Job::HasLiveStagingWorker)
     }
 
     /// A read-your-writes watermark token. See [`Trellis::watermark_token`].
     pub fn watermark_token(&self) -> Result<PgLsn, TrellisError> {
-        self.submit(Job::WatermarkToken)
+        self.start_watermark_token().wait()
+    }
+
+    /// Submits [`BlockingTrellis::watermark_token`] and returns without waiting for it.
+    pub fn start_watermark_token(&self) -> PendingCall<PgLsn> {
+        self.start(Job::WatermarkToken)
     }
 
     /// Blocks until every effect committed at or before `token` has been
@@ -329,7 +426,13 @@ impl BlockingTrellis {
     /// to wait longer calls again. It holds one pooled connection while it
     /// waits, and no other call on the handle waits behind it.
     pub fn await_converged(&self, token: PgLsn, timeout: Duration) -> Result<(), TrellisError> {
-        self.submit(|reply| Job::AwaitConverged(token, timeout, reply))
+        self.start_await_converged(token, timeout).wait()
+    }
+
+    /// Submits [`BlockingTrellis::await_converged`] and returns without
+    /// waiting for it.
+    pub fn start_await_converged(&self, token: PgLsn, timeout: Duration) -> PendingCall<()> {
+        self.start(|reply| Job::AwaitConverged(token, timeout, reply))
     }
 
     /// Audits one page of `target_table` against an independent recompute of
@@ -348,15 +451,156 @@ impl BlockingTrellis {
         mode: SelfCheckMode,
         timeout: Duration,
     ) -> Result<SelfCheckReport, TrellisError> {
+        self.start_self_check(target_table, scope, mode, timeout)
+            .wait()
+    }
+
+    /// Submits [`BlockingTrellis::self_check`] and returns without waiting for
+    /// it.
+    pub fn start_self_check(
+        &self,
+        target_table: &str,
+        scope: SelfCheckScope,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> PendingCall<SelfCheckReport> {
         let target_table = target_table.to_string();
-        self.submit(|reply| Job::SelfCheck(target_table, scope, mode, timeout, reply))
+        self.start(|reply| Job::SelfCheck(target_table, scope, mode, timeout, reply))
     }
 
     /// Stops any background work this connection started and waits for the
     /// background thread to exit cleanly. See [`Trellis::shutdown`].
-    pub fn shutdown(mut self) -> Result<(), TrellisError> {
-        let result = self.submit(Job::Shutdown);
-        if let Some(thread) = self.thread.take() {
+    ///
+    /// Calls still in flight are cancelled, not waited for: their callers get
+    /// [`TrellisError::BlockingThreadGone`], and what each had started on the
+    /// server ends at its own deadline (see the module doc). A call stuck on a
+    /// lock therefore doesn't hold the shutdown up.
+    pub fn shutdown(self) -> Result<(), TrellisError> {
+        self.start_shutdown().wait()
+    }
+
+    /// Submits [`BlockingTrellis::shutdown`] and returns without waiting for
+    /// it. The returned [`Shutdown`] is the wait: dropping it before it
+    /// finishes doesn't stop the shutdown, which completes on its own (the
+    /// background thread ends, detached).
+    pub fn start_shutdown(mut self) -> Shutdown {
+        let reply = self.start(Job::Shutdown);
+        Shutdown {
+            reply,
+            thread: self.thread.take(),
+        }
+    }
+
+    /// Sends `make_job(reply)` to the background thread and returns the
+    /// reply's receiving end, without waiting for it. The one primitive every
+    /// method above is built from. A [`TrellisError::BlockingThreadGone`]
+    /// means the background thread panicked (or was never actually running
+    /// the loop below, which can't happen from this module's own `connect`).
+    fn start<T: Send + 'static>(
+        &self,
+        make_job: impl FnOnce(oneshot::Sender<Result<T, TrellisError>>) -> Job,
+    ) -> PendingCall<T> {
+        // Waiting on the reply from a thread that has a tokio runtime entered
+        // panics (not returns an error), so misuse (e.g. a `#[tokio::test]` or
+        // a `tokio::spawn`ed task) surfaces here as a normal `TrellisError`
+        // instead of an opaque tokio panic, before anything is sent.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return PendingCall::failed(TrellisError::CalledFromAsyncContext);
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        // The deadline runs from here: the time a job spends queued on the
+        // channel counts against it (issue #599).
+        match self.job_tx.send((Instant::now(), make_job(reply_tx))) {
+            Ok(()) => PendingCall::waiting(reply_rx),
+            Err(_) => PendingCall::failed(TrellisError::BlockingThreadGone),
+        }
+    }
+}
+
+/// The reply to a call submitted with one of [`BlockingTrellis`]'s `start_*`
+/// methods, which return as soon as the job is on its way.
+///
+/// It is a [`Future`] that never needs a `tokio` runtime: its waker is woken
+/// by the background thread when the reply is sent. A caller that must stay
+/// interruptible while it waits (the Ruby binding, which releases the GVL)
+/// polls it with a waker of its own, so no thread has to be dedicated to the
+/// wait. [`PendingCall::wait`] is the plain blocking wait.
+///
+/// Dropping it abandons the reply, not the call: the job keeps running until
+/// it finishes or reaches its deadline, and its reply is discarded (issue
+/// #599).
+#[must_use = "a dropped PendingCall discards the call's reply"]
+pub struct PendingCall<T> {
+    state: Pending<T>,
+}
+
+enum Pending<T> {
+    Waiting(oneshot::Receiver<Result<T, TrellisError>>),
+    /// The call never started, or its answer was already taken.
+    Failed(Option<TrellisError>),
+}
+
+impl<T> PendingCall<T> {
+    fn waiting(reply: oneshot::Receiver<Result<T, TrellisError>>) -> Self {
+        PendingCall {
+            state: Pending::Waiting(reply),
+        }
+    }
+
+    fn failed(err: TrellisError) -> Self {
+        PendingCall {
+            state: Pending::Failed(Some(err)),
+        }
+    }
+
+    /// Blocks the calling thread until the reply arrives. A thread that has
+    /// no `tokio` runtime entered is the only kind that can call this (see
+    /// [`TrellisError::CalledFromAsyncContext`], which `start` returns for
+    /// the others without sending anything).
+    pub fn wait(self) -> Result<T, TrellisError> {
+        match self.state {
+            Pending::Waiting(reply) => reply
+                .blocking_recv()
+                .map_err(|_| TrellisError::BlockingThreadGone)?,
+            Pending::Failed(err) => Err(err.unwrap_or(TrellisError::BlockingThreadGone)),
+        }
+    }
+}
+
+impl<T> Unpin for PendingCall<T> {}
+
+impl<T> Future for PendingCall<T> {
+    type Output = Result<T, TrellisError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.state {
+            Pending::Waiting(reply) => Pin::new(reply)
+                .poll(cx)
+                .map(|reply| reply.unwrap_or(Err(TrellisError::BlockingThreadGone))),
+            Pending::Failed(err) => {
+                Poll::Ready(Err(err.take().unwrap_or(TrellisError::BlockingThreadGone)))
+            }
+        }
+    }
+}
+
+/// A [`BlockingTrellis::start_shutdown`] under way. Like [`PendingCall`], a
+/// [`Future`] that needs no runtime to be polled; [`Shutdown::wait`] is the
+/// plain blocking wait. It is ready once the background thread has replied
+/// and exited.
+#[must_use = "a dropped Shutdown still completes, but its result is lost"]
+pub struct Shutdown {
+    reply: PendingCall<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Shutdown {
+    /// Blocks until the shutdown has finished and the background thread has
+    /// exited.
+    pub fn wait(self) -> Result<(), TrellisError> {
+        let Shutdown { reply, thread } = self;
+        let result = reply.wait();
+        if let Some(thread) = thread {
             // Unlike `Client::shutdown`'s `tokio::task::spawn_blocking`
             // join, this call has no surrounding runtime of its own to keep
             // free — that's the entire point of this wrapper — so a plain,
@@ -365,33 +609,21 @@ impl BlockingTrellis {
         }
         result
     }
+}
 
-    /// Sends `make_job(reply)` to the background thread and blocks this
-    /// thread on its reply — the one primitive every method above is built
-    /// from. A [`TrellisError::BlockingThreadGone`] means the background
-    /// thread panicked (or was never actually running the loop below,
-    /// which can't happen from this module's own `connect`).
-    fn submit<T: Send + 'static>(
-        &self,
-        make_job: impl FnOnce(oneshot::Sender<Result<T, TrellisError>>) -> Job,
-    ) -> Result<T, TrellisError> {
-        // `reply_rx.blocking_recv()` below panics (not returns an error) if
-        // the calling thread already has a tokio runtime entered — guard it
-        // here so misuse (e.g. calling from `#[tokio::test]` or a
-        // `tokio::spawn`ed task) surfaces as a normal `TrellisError` instead
-        // of an opaque tokio panic.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(TrellisError::CalledFromAsyncContext);
+impl Unpin for Shutdown {}
+
+impl Future for Shutdown {
+    type Output = Result<(), TrellisError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = std::task::ready!(Pin::new(&mut self.reply).poll(cx));
+        if let Some(thread) = self.thread.take() {
+            // The thread replied as its last act and is winding down, so this
+            // join is brief.
+            let _ = thread.join();
         }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        // The deadline runs from here: the time a job spends queued on the
-        // channel counts against it (issue #599).
-        self.job_tx
-            .send((Instant::now(), make_job(reply_tx)))
-            .map_err(|_| TrellisError::BlockingThreadGone)?;
-        reply_rx
-            .blocking_recv()
-            .map_err(|_| TrellisError::BlockingThreadGone)?
+        Poll::Ready(result)
     }
 }
 
@@ -547,10 +779,14 @@ async fn run(
                 })
             }
             Job::Shutdown(reply) => {
-                // The calls still running finish or hit their deadline first:
-                // the `Trellis` can only be shut down once nothing else holds
-                // it.
+                // The calls still running are cancelled: the `Trellis` can
+                // only be shut down once nothing else holds it, and waiting
+                // for a call stuck on a lock would hold the shutdown up for
+                // its whole deadline. What a cancelled call started on the
+                // server ends at the server's own `statement_timeout` for it
+                // (see `crate::deadline`).
                 drop(trellis);
+                tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
                 let Ok(owned) = Arc::try_unwrap(shared) else {
                     unreachable!("every task has finished, so none still holds the Trellis");

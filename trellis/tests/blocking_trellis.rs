@@ -15,6 +15,7 @@
 //! No `.await` appears anywhere in the `BlockingTrellis`-driving portion of
 //! any test below.
 
+use std::pin::Pin;
 use std::time::Duration;
 use testkit::TestCluster;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
@@ -291,4 +292,101 @@ fn a_stuck_call_times_out_and_does_not_hold_up_the_calls_behind_it() {
 
     runtime.block_on(holder.rollback());
     trellis.shutdown().expect("shutdown (sync)");
+}
+
+/// Issue #599, the Ruby binding's half: a call started with `start_*` is a
+/// future that any waker can poll, so a binding can wait for it interruptibly
+/// without a thread per call; and a shutdown cancels the call stuck on a lock
+/// instead of waiting out its deadline.
+///
+/// The only wait is for the stuck call to be queued on the lock, a
+/// precondition the test cannot proceed without (#297's concern is a wait for
+/// convergence).
+#[test]
+fn a_started_call_wakes_its_waker_and_a_shutdown_does_not_wait_for_it() {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Instant;
+    use testkit::crash::OpenTransaction;
+
+    struct Woken(AtomicUsize);
+    impl Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Long enough that the shutdown, not the deadline, ends the call.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    let cluster = TestCluster::start();
+    let runtime = tokio::runtime::Runtime::new().expect("build setup runtime");
+    let db = runtime.block_on(cluster.create_isolated_database());
+    let (observer, connection) = runtime
+        .block_on(tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls))
+        .expect("connect observer");
+    runtime.spawn(async move {
+        let _ = connection.await;
+    });
+    let holder = runtime.block_on(OpenTransaction::begin(db.dsn()));
+    runtime.block_on(holder.execute(&format!(
+        "lock table {DEFAULT_SCHEMA}.transform_definitions in access exclusive mode"
+    )));
+
+    let trellis = BlockingTrellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            call_deadline: Some(DEADLINE),
+            ..Default::default()
+        },
+    )
+    .expect("connect (sync)");
+
+    let woken = Arc::new(Woken(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&woken));
+    let mut cx = Context::from_waker(&waker);
+    let mut stuck = trellis.start_definitions();
+    assert!(Pin::new(&mut stuck).poll(&mut cx).is_pending());
+
+    // The stuck call is on the server, queued on the lock.
+    runtime.block_on(async {
+        let give_up = Instant::now() + Duration::from_secs(30);
+        loop {
+            let waiting: i64 = observer
+                .query_one(
+                    "select count(*) from pg_stat_activity \
+                     where datname = current_database() and wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if waiting > 0 {
+                break;
+            }
+            assert!(Instant::now() < give_up, "the call never reached the lock");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    assert_eq!(woken.0.load(Ordering::SeqCst), 0, "woken with no reply");
+
+    let started = Instant::now();
+    trellis.shutdown().expect("shutdown (sync)");
+    assert!(
+        started.elapsed() < DEADLINE / 3,
+        "a shutdown waited {:?} for a call stuck on a lock",
+        started.elapsed()
+    );
+
+    // The call was cancelled: its waker was woken, and it reports the
+    // background thread gone.
+    assert!(woken.0.load(Ordering::SeqCst) > 0, "the waker never woke");
+    match Pin::new(&mut stuck).poll(&mut cx) {
+        Poll::Ready(Err(TrellisError::BlockingThreadGone)) => {}
+        other => panic!("expected BlockingThreadGone, got {other:?}"),
+    }
+
+    runtime.block_on(holder.rollback());
 }

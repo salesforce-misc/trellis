@@ -113,7 +113,14 @@ round trip — far past what either host VM tolerates on a scheduler thread.
   runs on a normal one.
 * **Ruby:** every call releases the GVL and supplies an unblocking function so
   `Thread#kill` and Ctrl-C are not swallowed — which requires an interruptible
-  reply wait rather than a bare blocking receive.
+  reply wait rather than a bare blocking receive. The calling Ruby thread
+  submits the job and waits for the reply itself, without a helper thread: it
+  polls the reply as a future and parks on a condition variable that the reply
+  and the unblocking function both signal. The unblocking function only stops
+  the wait, never the call: the engine ends every call by its 30-second
+  deadline ([ADR-0008 decision 6](0008-public-api-design.md#6-every-public-call-returns-within-30-seconds)),
+  so an interrupted call leaves no thread behind and holds a pooled connection
+  for at most that long.
 
 **Rust's threads stay Rust's, and are bounded.** The host VM does not schedule,
 see, or join the Tokio runtimes' threads, the pool connections, or the drain

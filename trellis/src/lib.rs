@@ -164,7 +164,7 @@ pub use app::{
     DefinitionStatus, DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry,
     QuarantineState, QuarantineTarget, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
-pub use blocking::BlockingTrellis;
+pub use blocking::{BlockingTrellis, PendingCall, Shutdown};
 pub use client::{Client, ClientError, ClientOptions};
 
 // --- Tier 2: composable primitives ----------------------------------------
