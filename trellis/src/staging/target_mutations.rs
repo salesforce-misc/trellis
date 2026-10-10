@@ -1818,7 +1818,12 @@ mod tests {
                  insert into composite select i, 'k' || i, i, 'j' || i, i \
                      from generate_series(1, 1000000) i; \
                  insert into composite values (null, 'k1', 1, 'j1', 0), (5, null, 5, 'j5', 0); \
-                 analyze composite;",
+                 analyze composite; \
+                 create table pair (g int, h text, total int, primary key (g, h)) \
+                     with (autovacuum_enabled = false); \
+                 insert into pair select i, 'k' || i, i from generate_series(1, 100) i; \
+                 analyze pair; \
+                 insert into pair select i, 'k' || i, i from generate_series(101, 1000000) i;",
             )
             .await
             .expect("seed the targets");
@@ -1831,6 +1836,7 @@ mod tests {
                 3,
                 false,
             ),
+            ("public.pair", "t.total % 79 = 0", 1, false),
         ];
         for (table, batch, patterns, bounded) in cases {
             let key_columns = ddl::identity_key_columns(&txn, table)
@@ -1919,6 +1925,14 @@ mod tests {
                 filtered < keys.len() as u64,
                 "{table}: the target must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
+            );
+            // The estimates lag with the statistics, so the scans' actual
+            // rows say what was read (#791).
+            let read = testkit::plan::rows_read(&plan, target);
+            assert!(
+                read <= 2 * keys.len() as u64,
+                "{table}: the target must be read for the batch's keys alone, \
+                 {read} rows read, got:\n{plan}"
             );
             let before = seq_scans_in_txn(&txn, table).await;
             let got = read_new_images(&txn, table, &columns, &feed, &keys)

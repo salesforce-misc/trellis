@@ -8,6 +8,7 @@
 //!   kill-9 subprocess engine, the straddler/phase-gap tests) build their actual crash-point scenarios
 //!   on.
 //! - [`lsn`] gives tests a realistic LSN to stage CDC ring rows at.
+//! - [`plan`] reads the work an `explain (analyze)` plan says a statement did.
 //! - [`locale`] finds a locale that makes an unpinned `lc_monetary` show.
 //! - [`blocking`] reads from the server's lock table whether one session
 //!   was stuck behind another's lock, and for how long.
@@ -29,6 +30,7 @@ pub mod crash;
 pub mod fixtures;
 pub mod locale;
 pub mod lsn;
+pub mod plan;
 
 pub use blocking::{BlockedWatch, Blocker, watch_blocked};
 pub use cluster::{ClusterBackup, StopMode, TestCluster, TestDatabase};

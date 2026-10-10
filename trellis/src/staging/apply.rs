@@ -5061,12 +5061,21 @@ mod tests {
                  insert into single select i, i from generate_series(101, 400000) i; \
                  insert into composite select i, 'k' || i, i, 'j' || i, i \
                      from generate_series(1, 1000000) i; \
-                 analyze composite;",
+                 analyze composite; \
+                 create table pair (g int, h text, total int, primary key (g, h)) \
+                     with (autovacuum_enabled = false); \
+                 insert into pair select i, 'k' || i, i from generate_series(1, 100) i; \
+                 analyze pair; \
+                 insert into pair select i, 'k' || i, i from generate_series(101, 1000000) i;",
             )
             .await
             .expect("seed the sources");
         // (source, whether its key is a single column: bounded, with lagging statistics)
-        for (table, single) in [("public.single", true), ("public.composite", false)] {
+        for (table, single) in [
+            ("public.single", true),
+            ("public.composite", false),
+            ("public.pair", false),
+        ] {
             let pk = ddl::identity_key_columns(&client, table)
                 .await
                 .expect("identity");
@@ -5135,6 +5144,14 @@ mod tests {
                 filtered < keys.len() as u64,
                 "{table}: the source must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
+            );
+            // The estimates lag with the statistics, so the scans' actual
+            // rows say what was read (#791).
+            let read = testkit::plan::rows_read(&plan, source);
+            assert!(
+                read <= 2 * keys.len() as u64,
+                "{table}: the source must be read for the batch's keys alone, \
+                 {read} rows read, got:\n{plan}"
             );
             let found: std::collections::HashSet<String> = client
                 .query(&query.sql, &query.params())
@@ -5242,6 +5259,14 @@ mod tests {
                 !plan.contains("Seq Scan") && filtered < rows.len() as u64,
                 "{table}: the target must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
+            );
+            // The estimates lag with the statistics, so the scans' actual
+            // rows say what was read (#791).
+            let read = testkit::plan::rows_read(&plan, &table["public.".len()..]);
+            assert!(
+                read <= 2 * rows.len() as u64,
+                "{table}: the target must be read for the keys alone, {read} rows \
+                 read, got:\n{plan}"
             );
             let seq_scans = "select seq_scan from pg_stat_xact_user_tables \
                              where relid = $1::text::regclass";
@@ -9255,7 +9280,13 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// source read, the endpoint feed's re-read, the sweep delete and the
 /// single-column and composite pre-locks ([`lock_single_keys`],
 /// [`lock_composite_keys`]) and the single-column delete
-/// ([`delete_single_keys`]) do.
+/// ([`delete_single_keys`]) do. A composite key is always the full key of
+/// a primary key or unique index (`ddl::identity_key_columns`), so the
+/// settings always have an index to probe, and no detection is needed as for
+/// a relationship's join column (`key_column_in`). A plan test per statement
+/// holds a composite table analyzed at 100 rows and grown to 1M to the
+/// batch's keys by the rows its scans actually read, since the estimates lag
+/// with the statistics (#791).
 ///
 /// The bound alone isn't enough on PostgreSQL 16, which prices an index scan
 /// for thousands of `= any` values far above 17's estimate: it scanned a
