@@ -1225,10 +1225,9 @@ pub(crate) fn split_pk_key<'a>(
 /// [`PrimaryKeyColumn::data_type`] is — it comes from the catalog, not user
 /// input.
 async fn source_column_pg_types(
-    pool: &Pool,
+    client: &impl GenericClient,
     source_table: &str,
 ) -> Result<HashMap<String, String>, DdlError> {
-    let client = pool.get().await?;
     let rows = client
         .query(
             "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod)
@@ -1242,6 +1241,55 @@ async fn source_column_pg_types(
     Ok(rows
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
+/// The Postgres type each of `fields` is created with on a 1-1 target table,
+/// keyed by field name: the one rule `DEFINE TRANSFORM` ([`target_table_ddl`])
+/// and `ALTER TRANSFORM ... ADD` share. A bare source-column passthrough takes
+/// the source column's concrete type, typmod included (issue #45); every
+/// other field takes its inferred [`ValueType`]'s keyword ([`pg_type_name`]).
+/// `def` is the definition the fields belong to (its field list decides
+/// whether a reference names a source column or a sibling field), and
+/// `field_types` its inferred types. The source table's column types are read
+/// only when some field is a passthrough.
+pub(crate) async fn field_column_pg_types(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    fields: &[FieldDef],
+    source_columns: &HashMap<String, ValueType>,
+    field_types: &HashMap<String, ValueType>,
+    source_table: &str,
+) -> Result<HashMap<String, String>, DdlError> {
+    let passthroughs: HashMap<&str, &str> = fields
+        .iter()
+        .filter_map(|f| {
+            passthrough_source_column(f, def, source_columns).map(|col| (f.name.as_str(), col))
+        })
+        .collect();
+    let source_pg_types = if passthroughs.is_empty() {
+        HashMap::new()
+    } else {
+        source_column_pg_types(client, source_table).await?
+    };
+    Ok(fields
+        .iter()
+        .map(|field| {
+            let pg_type = match passthroughs
+                .get(field.name.as_str())
+                .and_then(|col| source_pg_types.get(*col))
+            {
+                Some(concrete) => concrete.clone(),
+                None => pg_type_name(
+                    field_types
+                        .get(&field.name)
+                        .copied()
+                        .unwrap_or(ValueType::Numeric),
+                )
+                .to_string(),
+            };
+            (field.name.clone(), pg_type)
+        })
         .collect())
 }
 
@@ -1635,18 +1683,16 @@ pub(crate) async fn target_table_ddl(
     // column's constraints. If a passthrough field's value could ever diverge
     // from its source column's type/width, this coupling would need
     // revisiting (staging would need to cast to the concrete type too).
-    let passthroughs: HashMap<&str, &str> = def
-        .fields
-        .iter()
-        .filter_map(|f| {
-            passthrough_source_column(f, def, source_columns).map(|col| (f.name.as_str(), col))
-        })
-        .collect();
-    let source_pg_types = if passthroughs.is_empty() {
-        HashMap::new()
-    } else {
-        source_column_pg_types(pool, source_table).await?
-    };
+    let client = pool.get().await?;
+    let field_pg_types = field_column_pg_types(
+        &**client,
+        def,
+        &def.fields,
+        source_columns,
+        &field_types,
+        source_table,
+    )
+    .await?;
 
     let mut sql = format!(
         "create table {} (",
@@ -1672,19 +1718,7 @@ pub(crate) async fn target_table_ddl(
         .collect();
     sql.push_str(&pk_cols.join(", "));
     for field in &def.fields {
-        let pg_type = match passthroughs
-            .get(field.name.as_str())
-            .and_then(|col| source_pg_types.get(*col))
-        {
-            Some(concrete) => concrete.clone(),
-            None => pg_type_name(
-                field_types
-                    .get(&field.name)
-                    .copied()
-                    .unwrap_or(ValueType::Numeric),
-            )
-            .to_string(),
-        };
+        let pg_type = &field_pg_types[&field.name];
         sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
     }
     // A table-level `primary key (...)` constraint, not an inline

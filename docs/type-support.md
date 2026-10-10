@@ -75,7 +75,8 @@ aggregate has no exact inverse, so a group is recomputed by Postgres itself
 ### The types of the columns Trellis creates
 
 A passthrough and a 1-1 target's key columns take their source column's exact
-type at define, modifier included (`varchar(50)`, `timestamp(3)`), so either
+type at define (a passthrough an `ALTER TRANSFORM … ADD` adds takes it the same
+way), modifier included (`varchar(50)`, `timestamp(3)`), so either
 can serve as a relationship's join key against a column of that type. A
 `GROUP BY` key's column (in the target, its ledger and its group-delta table)
 takes its value family's type: `integer` or `bigint` by width, `text` for any

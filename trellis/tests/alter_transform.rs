@@ -12,6 +12,8 @@
 //!   `drop_single_column_removes_the_physical_column`,
 //!   `alter_single_column_recomputes_existing_rows`,
 //!   `combined_add_drop_alter_in_one_statement`)
+//! - #994: an added bare passthrough column has the type `DEFINE` gives it, modifier
+//!   included (`an_added_passthrough_column_has_the_type_define_gives_it`)
 //! - #666 (#625 F8b): an `ALTER` only registers a field build and returns
 //!   before any target row changes, and the field is built once its chunks
 //!   run (`an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the_field`,
@@ -216,6 +218,113 @@ fn into_altered(applied: Applied) -> (Vec<String>, Vec<String>, Vec<String>) {
 // ---------------------------------------------------------------------
 // ADD / DROP / ALTER, individually and combined
 // ---------------------------------------------------------------------
+
+/// Issue #994: `ALTER TRANSFORM ... ADD` creates a bare passthrough column
+/// with the type `DEFINE` gives it (the source column's own, typmod
+/// included, #45), and an expression column with its value family's type.
+/// A second transform defined with the same select is the oracle, and the
+/// capture pass's typed-copy comparison (`defs::copies`, `CopyState::drifted`)
+/// reads a passthrough as current exactly when its `(atttypid, atttypmod)` is
+/// its source column's, which is asserted directly.
+#[tokio::test]
+async fn an_added_passthrough_column_has_the_type_define_gives_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.posts (id int primary key, title text, price numeric(10,2), \
+                                    author varchar(8), qty int, note text, ts timestamptz); \
+         insert into public.posts \
+             select s, 't' || s, s + 0.5, 'a' || s, s, 'n' || s, now() from generate_series(1, 5) s;",
+    )
+    .await
+    .expect("seed");
+
+    let definer = define_only(db.dsn()).await;
+    for text in [
+        "TRANSFORM edited FROM public.posts SELECT title AS title",
+        "TRANSFORM defined FROM public.posts SELECT title AS title, price AS price, \
+         author AS who, qty AS qty, note AS note2, ts AS ts2, qty + 1 AS qty_plus",
+    ] {
+        definer.apply(text).await.expect(text);
+    }
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "edited").await;
+    wait_for_live(&raw, "defined").await;
+    trellis
+        .apply(
+            "ALTER TRANSFORM edited ADD price AS price, ADD author AS who, ADD qty AS qty, \
+             ADD note AS note2, ADD ts AS ts2, ADD qty + 1 AS qty_plus",
+        )
+        .await
+        .expect("add the columns");
+    wait_for_live(&raw, "edited").await;
+
+    let expected = [
+        ("price", "numeric(10,2)"),
+        ("who", "character varying(8)"),
+        ("qty", "integer"),
+        ("note2", "text"),
+        ("ts2", "timestamp with time zone"),
+        // An expression keeps its value family's type.
+        ("qty_plus", "integer"),
+    ];
+    for (column, expected) in expected {
+        let added = column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "edited", column).await;
+        let defined = column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "defined", column).await;
+        assert_eq!(added, defined, "{column}: ALTER ADD must match DEFINE");
+        assert_eq!(added, expected, "{column}");
+    }
+
+    // The comparison's own terms: each passthrough's type oid and typmod are
+    // its source column's.
+    let drifted: Vec<String> = raw
+        .query(
+            &format!(
+                "select t.attname::text from pg_attribute t \
+                 join pg_attribute s on s.attrelid = 'public.posts'::regclass \
+                  and s.attname = case t.attname when 'who' then 'author' \
+                      when 'note2' then 'note' when 'ts2' then 'ts' else t.attname::text end \
+                 where t.attrelid = '{DEFAULT_TARGET_SCHEMA}.edited'::regclass \
+                   and t.attname::text in ('price', 'who', 'qty', 'note2', 'ts2') \
+                   and (t.atttypid, t.atttypmod) is distinct from (s.atttypid, s.atttypmod)"
+            ),
+            &[],
+        )
+        .await
+        .expect("compare the types")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(drifted.is_empty(), "drifted from their source: {drifted:?}");
+
+    // The data is built as the define builds it.
+    let rows = |table: &'static str| {
+        let raw = &raw;
+        async move {
+            raw.query(
+                &format!(
+                    "select price::text, who::text, qty::text, note2, qty_plus::text \
+                     from {DEFAULT_TARGET_SCHEMA}.{table} order by id"
+                ),
+                &[],
+            )
+            .await
+            .expect("read")
+            .into_iter()
+            .map(|r| {
+                (0..5)
+                    .map(|i| r.get::<_, Option<String>>(i))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(rows("edited").await, rows("defined").await);
+    trellis.shutdown().await.expect("shut down");
+}
 
 #[tokio::test]
 async fn add_single_column_backfills_existing_rows() {

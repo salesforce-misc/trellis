@@ -1961,13 +1961,24 @@ pub async fn alter_transform(
         ))
         .await?;
     }
+    // An added bare passthrough takes its source column's type, as at
+    // `DEFINE` (issue #994): the same rule, not a second copy of it.
+    let add_pg_types = ddl::field_column_pg_types(
+        &*txn,
+        &merged,
+        &real_adds,
+        &current.source_columns,
+        &field_types,
+        &current.source_table,
+    )
+    .await
+    .map_err(|err| match err {
+        DdlError::Db(err) => CatalogError::Db(err),
+        DdlError::Pool(err) => CatalogError::Pool(err),
+        err => CatalogError::Ddl(err),
+    })?;
     for field in &real_adds {
-        let pg_type = ddl::pg_type_name(
-            field_types
-                .get(&field.name)
-                .copied()
-                .unwrap_or(ValueType::Numeric),
-        );
+        let pg_type = &add_pg_types[&field.name];
         txn.batch_execute(&format!(
             "alter table {target_ident} add column if not exists {} {pg_type}",
             quote_ident(&field.name)
