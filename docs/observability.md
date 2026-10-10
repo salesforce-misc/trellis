@@ -246,13 +246,14 @@ pause are arcs of one lifecycle:
   something it can't use, a relationship's join columns no longer match), the
   resume fails with `ApplyError::ResumeRefused`, whose message is define's own
   error naming the column and what to change, and the transform stays paused,
-  untouched. The resume also refuses in three cases define doesn't, where define
+  untouched. The resume also refuses in four cases define doesn't, where define
   would accept the transform and the message says to drop it and define it again:
-  its 1-1 source key was redefined, or its aggregate's group-delta table is missing
-  or has different columns from the ones define would create now
+  its 1-1 source key was redefined, its ledger table is missing, or its
+  aggregate's group-delta table is missing or has different columns from the
+  ones define would create now
   ([The repair tools](known-correctness-gaps.md#the-repair-tools)). A field resume
-  (`RESUME TRANSFORM t.col`) runs the same validation, but not the group-delta
-  checks, since it rebuilds nothing. Otherwise the resume returns it to
+  (`RESUME TRANSFORM t.col`) runs the same validation, but not the ledger and
+  group-delta checks, since it rebuilds nothing. Otherwise the resume returns it to
   `waiting_to_backfill`. If columns
   Trellis created for it no longer have the types define would give them now (after
   `integer` to `bigint`, say), the resume returns at once but the transform stays `paused`, its
@@ -470,6 +471,13 @@ without them:
   worker halts the definition and everything downstream of its target, with
   `kind` `halt`, the target as the table, and the error. Transient failures
   are retried and never charged.
+* **A failing build start.** A Re-derive build's start that fails in a way
+  that would repeat on every pass (its ledger table was dropped, say) halts the
+  definition writing that target, and everything downstream of the target, the
+  same way (#986), with `kind` `halt`, the target as the table and the error.
+  It never stops the staging worker's pass: the other definitions' builds
+  start, and the other markers discharge. A start that fails transiently, or
+  by losing its connection, is retried on the next pass instead.
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. A resume re-validates the definition as define would, so

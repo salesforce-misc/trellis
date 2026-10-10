@@ -202,6 +202,36 @@ pub(crate) async fn halt_failed_merge(
     Ok(paused)
 }
 
+/// [`halt_closure`] for a Re-derive build's start (issue #986,
+/// `staging::build::start_ready_builds`): a start that failed in a way no
+/// retry gets past (its ledger table was dropped, say) pauses the
+/// definition writing `target` and everything downstream of its target, with
+/// kind `halt`, so one definition's failure doesn't stop the pass's other
+/// builds. `Trellis::status` reports `err` (the failure's text) as the
+/// definition's `capture_failure`, and a resume rebuilds it or refuses with
+/// the repair. Records the halting stop if it paused any, in one
+/// transaction, and returns the bare targets it paused: empty when every
+/// definition it reaches was already frozen.
+pub(crate) async fn halt_failed_start(
+    pool: &Pool,
+    target: &str,
+    err: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let halted = format!("the re-derive build of {target} couldn't start");
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let paused = pause_closure(
+        &txn,
+        pool.schema(),
+        Some(Seed::Target(target.to_string())),
+        &halted,
+        err,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(paused)
+}
+
 /// Pauses, in `txn`, every unfrozen definition `seed` reaches, or, with no
 /// seed (a refused read or write, `42501`), every one the [`refusals`] read
 /// as `txn`'s role reaches; and records the halting stop if that paused any.

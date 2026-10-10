@@ -53,10 +53,11 @@ These are the tools the entries refer to:
   target from the source. Run it through `Trellis::apply` or
   `trellis apply '<statement>'`. A resume first re-runs define's validation
   against the live schema, and refuses, leaving the definition paused, while
-  define would refuse it. It also refuses in three cases define doesn't: a
-  1-1 target's source key was redefined, or an aggregate's group-delta table
-  is missing (entry 8) or has different running-sum or recompute columns from
-  the ones define would create now (entry 22). It then brings every column
+  define would refuse it. It also refuses in four cases define doesn't: a
+  1-1 target's source key was redefined, a definition's ledger table is
+  missing (entry 8), or an aggregate's group-delta table is missing (entry 8)
+  or has different running-sum or recompute columns from the ones define would
+  create now (entry 22). It then brings every column
   Trellis created for the definition with a type from the source (its key,
   passthrough and GROUP BY copies, its calculated, aggregate and ledger
   contribution columns, and its relationship projections' columns) to the
@@ -74,7 +75,8 @@ These are the tools the entries refer to:
   while define would, naming the column and what to change, and a 1-1
   definition whose source key was redefined, an aggregate whose `SUM` or
   `AVG` argument moved between an exact type and floating point (entry 22),
-  or whose group-delta table was dropped (entry 8), can only be defined again.
+  or whose ledger or group-delta table was dropped (entry 8), can only be
+  defined again.
   It's also the repair when a resume can't convert the values of a column
   Trellis created to its new type (a key moved from `text` to `uuid` by a
   `USING` that isn't a cast). The definition stays paused and its target
@@ -95,7 +97,7 @@ These are the tools the entries refer to:
 | 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | none filed |
 | 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
-| 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented (#986 for a dropped ledger) |
+| 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
 | 9 | An application trigger re-keying a parent's join column within the statement | yes | no | #788, decision pending |
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
@@ -261,19 +263,19 @@ keeps beside it (`<target>__ledger`, or an aggregate's `<target>__deltas`).
 
 **Effect:** Trellis assumes it's the only writer and doesn't correct the
 change. An edited row stays wrong until its key is recomputed for another
-reason, and a truncated target stays empty. An aggregate's resume refuses
-while its group-delta table is missing, naming the table, and the definition
-stays paused. A missing ledger isn't noticed by a resume: the rebuild's start
-then fails every staging-worker pass, and no other definition's build starts
-until the definition is paused or dropped (#986).
+reason, and a truncated target stays empty. A resume refuses while the
+definition's ledger table is missing, or an aggregate's group-delta table is,
+naming the table, and the definition stays paused. A build whose start fails
+because its ledger is gone (dropped while the definition waited to start)
+pauses that definition and what reads its target, with the error as its
+`capture_failure` of kind `halt`; the staging worker's pass goes on to start
+the other definitions' builds.
 
 **Detected?** `self_check` reports it on 1-1 targets. Nothing reports it on
 aggregate or relationship-enriched targets.
 
 **Planned work:** none for the edits. This is a documented rule
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
-#986 would have a resume refuse a missing ledger too, and keep one
-definition's failed build start from holding up the others'.
 
 **Repair:** `PAUSE`/`RESUME` the transform. If its columns or constraints
 were changed, or a table Trellis keeps beside it was dropped,

@@ -47,8 +47,8 @@ field, first runs define's validation against the live schema, and refuses,
 leaving the transform paused, while define would refuse it; the error names the
 column and what to change. A resume also refuses while the target's own tables
 are no longer what define would create (a 1-1 target whose source key was
-redefined, an aggregate whose group-delta table is missing or has different
-columns; [The repair tools](known-correctness-gaps.md#the-repair-tools)), and
+redefined, a ledger table that is missing, an aggregate whose group-delta table
+is missing or has different columns; [The repair tools](known-correctness-gaps.md#the-repair-tools)), and
 the error says to drop the transform and define it again; a field resume makes
 only the source-key check. When a resume has copies to re-type it returns
 at once, the transform still `paused` with a `capture_failure` that says so,

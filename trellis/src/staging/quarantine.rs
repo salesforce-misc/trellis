@@ -4087,11 +4087,13 @@ enum ResumeStep {
 ///    refuses with [`ApplyError::ResumeRefused`] while define would refuse
 ///    it: a key, join or `GROUP BY` column of a type or collation define
 ///    refuses, a relationship whose join columns no longer match (#590), a
-///    redefined source key. A whole-transform resume also refuses an
-///    aggregate whose group-delta table has different running-sum or
-///    recompute columns from the ones define would create now, or doesn't
-///    exist ([`catalog::check_deltas_shape`], #857, #967); a column resume
-///    doesn't make that check.
+///    redefined source key. A whole-transform resume also refuses a
+///    definition whose ledger table doesn't exist
+///    ([`catalog::check_ledger_table`], #986) and an aggregate whose
+///    group-delta table has different running-sum or recompute columns from
+///    the ones define would create now, or doesn't exist
+///    ([`catalog::check_deltas_shape`], #857, #967); a column resume doesn't
+///    make those checks.
 /// 2. **It compares each column Trellis created with a type from the
 ///    source (typed copies, and calculated, aggregate and contribution
 ///    columns) with the type define would give it now**
@@ -4131,7 +4133,7 @@ async fn resume_locked(
             });
         }
     };
-    match catalog::check_deltas_shape(txn, &definition, &revalidated).await {
+    match catalog::check_owned_tables(txn, &definition, &revalidated).await {
         Ok(()) => {}
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
             return Err(err.into());
@@ -4662,11 +4664,11 @@ async fn finish_requested_resume(
         let Some(definition) = catalog::definition_by_id_in(&txn, id).await? else {
             return Ok(());
         };
-        // The group-delta shape is checked here too, before anything is
+        // The ledger and the group-delta table are checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
         // refuse.
         let checked = match catalog::revalidate(&txn, schema, &definition).await {
-            Ok(revalidated) => catalog::check_deltas_shape(&txn, &definition, &revalidated).await,
+            Ok(revalidated) => catalog::check_owned_tables(&txn, &definition, &revalidated).await,
             Err(err) => Err(err),
         };
         match checked {

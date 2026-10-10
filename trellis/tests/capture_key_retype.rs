@@ -1833,6 +1833,61 @@ async fn a_resume_refuses_an_aggregate_whose_group_delta_table_is_missing() {
     assert!(!exists, "the refused resume must not create the table");
 }
 
+/// #986: every definition has a ledger, so a resume refuses one whose ledger
+/// an operator dropped, for a 1-1 target and an aggregate alike: the build's
+/// `start` reads it, and a resume that passed would fail every staging-worker
+/// pass after it. The message names the table and `DROP TRANSFORM`, and the
+/// definition stays paused without the table re-created.
+#[tokio::test]
+async fn a_resume_refuses_a_definition_whose_ledger_table_is_missing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount numeric); \
+         insert into public.orders values (1, 'a', 10.5), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for define in [
+        "TRANSFORM one_to_one FROM public.orders SELECT shop AS shop, amount AS amount",
+        "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+         SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+    ] {
+        trellis.apply(define).await.expect("define");
+    }
+    bring_live(&mut raw, &db.pool, &["one_to_one", "per_shop"]).await;
+
+    for target in ["one_to_one", "per_shop"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause");
+        raw.batch_execute(&format!("drop table public.{target}__ledger"))
+            .await
+            .expect("drop the ledger");
+        let message = resume_refused(&trellis, target).await;
+        assert!(
+            message.contains("DROP TRANSFORM") && message.contains(&format!("{target}__ledger")),
+            "{message}"
+        );
+        // Define would accept this definition, so the message doesn't say it
+        // would refuse it.
+        assert!(!message.contains("define would refuse"), "{message}");
+        assert_eq!(status(&raw, target).await, TransformStatus::Paused);
+        let exists: bool = raw
+            .query_one(
+                &format!("select to_regclass('public.{target}__ledger') is not null"),
+                &[],
+            )
+            .await
+            .expect("look the table up")
+            .get(0);
+        assert!(!exists, "the refused resume must not create the table");
+    }
+}
+
 /// #857 negative control: a retype that keeps every field's classification
 /// (`SUM` over `integer` moved to `bigint`) leaves the group-delta table's
 /// shape as define would create it, so the resume goes ahead.

@@ -205,6 +205,17 @@ pub enum CatalogError {
         /// The table, schema-qualified.
         deltas_table: String,
     },
+    /// A definition's ledger table doesn't exist, though define creates one
+    /// for every definition, 1-1 or aggregate (#986). Only Trellis writes its
+    /// tables, so an operator dropped it; the build's `start` reads it and
+    /// fails, and the apply writes into it. [`check_ledger_table`] refuses it,
+    /// and Trellis doesn't re-create the table: the repair is to drop the
+    /// definition and define it again.
+    LedgerTableMissing {
+        target: String,
+        /// The table, schema-qualified.
+        ledger_table: String,
+    },
     /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
     /// shares a bare table-name suffix with a *different* qualified target
     /// some other still-persisted definition already uses — e.g.
@@ -470,6 +481,7 @@ impl CatalogError {
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
+            CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             // Collides with existing state (another live definition's
             // persisted target), not a structural/semantic rejection of this
             // definition's own text — the same category
@@ -509,7 +521,8 @@ impl CatalogError {
     /// Whether this is define's own refusal of the schema as it stands, as
     /// opposed to a refusal only a resume makes ([`CatalogError::SourceKeyChanged`],
     /// [`CatalogError::AggregateDeltasShapeChanged`],
-    /// [`CatalogError::AggregateDeltasTableMissing`]), where define would
+    /// [`CatalogError::AggregateDeltasTableMissing`],
+    /// [`CatalogError::LedgerTableMissing`]), where define would
     /// accept the definition and the repair is to drop it and define it again.
     /// A resume's message says which it is.
     pub(crate) fn is_define_refusal(&self) -> bool {
@@ -518,6 +531,7 @@ impl CatalogError {
             CatalogError::SourceKeyChanged { .. }
                 | CatalogError::AggregateDeltasShapeChanged { .. }
                 | CatalogError::AggregateDeltasTableMissing { .. }
+                | CatalogError::LedgerTableMissing { .. }
         )
     }
 }
@@ -603,6 +617,15 @@ impl fmt::Display for CatalogError {
                 "the group-delta table of {target}, {deltas_table}, doesn't exist, but define \
                  would create one. Trellis doesn't re-create it: `DROP TRANSFORM` and define it \
                  again"
+            ),
+            CatalogError::LedgerTableMissing {
+                target,
+                ledger_table,
+            } => write!(
+                f,
+                "the ledger table of {target}, {ledger_table}, doesn't exist, but define \
+                 creates one for every definition. Trellis doesn't re-create it: `DROP \
+                 TRANSFORM` and define it again"
             ),
             CatalogError::TargetTableSuffixCollision {
                 target,
@@ -750,6 +773,7 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::AggregateDeltasShapeChanged { .. } => None,
             CatalogError::AggregateDeltasTableMissing { .. } => None,
+            CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
@@ -5232,6 +5256,58 @@ pub(crate) async fn revalidate(
         source_columns,
         relationships,
     })
+}
+
+/// Refuses a whole-transform resume of a definition, 1-1 or aggregate, whose
+/// ledger table doesn't exist (#986). Define creates one for every
+/// definition ([`ddl::target_table_ddl`], [`ddl::aggregate_target_table_ddl`]),
+/// and the build's `start` reads it, so a resume that passed would leave
+/// every staging-worker pass failing on it until the definition was paused
+/// or dropped. Refusing before the resume changes anything leaves the
+/// definition paused with its target as it was
+/// ([`CatalogError::LedgerTableMissing`]).
+///
+/// Only a whole-transform resume calls it, through [`check_owned_tables`]: a
+/// column resume builds nothing and never reads the ledger.
+pub(crate) async fn check_ledger_table(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition: &Definition,
+) -> Result<(), CatalogError> {
+    let (target_schema, target_bare) = definition
+        .target_table
+        .split_once('.')
+        .unwrap_or(("", definition.target_table.as_str()));
+    let ledger = format!(
+        "{target_schema}.{}",
+        super::ledger::ledger_table_name(target_bare)
+    );
+    let present: bool = txn
+        .query_one(
+            "select pg_catalog.to_regclass($1) is not null",
+            &[&ddl::regclass_arg(&ledger)],
+        )
+        .await?
+        .get(0);
+    if present {
+        return Ok(());
+    }
+    Err(CatalogError::LedgerTableMissing {
+        target: definition.target_table.clone(),
+        ledger_table: ledger,
+    })
+}
+
+/// A whole-transform resume's checks that the tables Trellis keeps beside
+/// the target are what define would create now: the ledger exists
+/// ([`check_ledger_table`]) and an aggregate's group-delta table exists with
+/// the columns define would give it ([`check_deltas_shape`]).
+pub(crate) async fn check_owned_tables(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition: &Definition,
+    revalidated: &Revalidated,
+) -> Result<(), CatalogError> {
+    check_ledger_table(txn, definition).await?;
+    check_deltas_shape(txn, definition, revalidated).await
 }
 
 /// Refuses a whole-transform resume of an aggregate whose group-delta table

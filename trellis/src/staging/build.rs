@@ -1186,8 +1186,14 @@ pub async fn qualifies(
 /// found dispatchable (`capture::reconcile`): the definitions it would
 /// otherwise park a registration marker for. Returns the ones the old build
 /// path must leave alone: those started, those waiting on their source's
-/// capture gate, and those whose start timed out waiting for the
-/// column-pause lock (#922), which the next pass starts.
+/// capture gate, those whose start timed out waiting for the column-pause
+/// lock (#922) or failed transiently, which the next pass starts, and those
+/// whose start failed for good (#986): a failure that would reproduce on
+/// every pass, such as a dropped ledger table, pauses that definition and
+/// what is downstream of its target with the error as its `capture_failure`
+/// ([`super::halt::halt_failed_start`]), so it neither fails this call nor
+/// stops the other definitions' starts. Only a lost connection returns an
+/// error from a start.
 ///
 /// The gate is the discharge's (`intake::markers`, Q2(a)): while any change
 /// to the source at or below the gate its capture install or widen recorded
@@ -1250,7 +1256,50 @@ pub async fn start_ready_builds(
                 );
                 taken.push(id);
             }
-            Err(err) => return Err(err),
+            // A lost connection fails the pass, which reconnects.
+            Err(err) if client.is_closed() => return Err(err),
+            // A transient failure (a deadlock, a cancelled statement) wrote
+            // nothing either; the next pass starts it again.
+            Err(err) if super::quarantine::is_transient_error(&err) => {
+                tracing::warn!(
+                    definition_id = id,
+                    error = %err,
+                    "re-derive build start failed transiently; retrying next pass"
+                );
+                taken.push(id);
+            }
+            // Anything else reproduces on every pass (a dropped ledger
+            // table, #986), and returning it would stop the pass before it
+            // started the other definitions' builds, parked their markers
+            // or ran their backfills. Pause this definition, and what is
+            // downstream of its target, with the error as its
+            // `capture_failure`, as a build that keeps failing does
+            // (`fail_merge`); a resume rebuilds it, or refuses with the
+            // repair. It gets no registration marker: it is frozen now.
+            Err(err) => {
+                match super::halt::halt_failed_start(
+                    pool,
+                    &definition.target_table,
+                    &err.to_string(),
+                )
+                .await
+                {
+                    Ok(paused) => tracing::warn!(
+                        definition_id = id,
+                        paused = ?paused,
+                        error = %err,
+                        "re-derive build start failed; paused the definitions it reaches \
+                         (resume them once the cause is fixed)"
+                    ),
+                    Err(halt_err) => tracing::warn!(
+                        definition_id = id,
+                        error = %err,
+                        halt_error = %halt_err,
+                        "re-derive build start failed, and pausing on it failed; retrying next pass"
+                    ),
+                }
+                taken.push(id);
+            }
         }
     }
     Ok(taken)
