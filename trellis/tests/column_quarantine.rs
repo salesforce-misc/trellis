@@ -5657,6 +5657,94 @@ async fn a_build_start_behind_a_held_column_pause_lock_waits_for_the_next_pass()
     assert_eq!(definition_status(&client, defined.id).await, "backfilling");
 }
 
+/// #978: the column-pause lock is one per instance. Instance A (the
+/// database's default instance) holds its lock exclusive in an open
+/// transaction while instance B, in the same database, defines, pauses and
+/// resumes a field and drops its transform, through a pool whose sessions
+/// give up on a lock after 100 ms. Each of B's steps takes B's own lock, so
+/// none waits on A's; a taker that keyed the lock by anything but its own
+/// pool's schema (a constant, or the default schema) would time out here.
+#[tokio::test]
+async fn another_instances_held_column_pause_lock_does_not_hold_up_this_ones() {
+    const INSTANCE_B: &str = "instance_b";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.items (id integer primary key, price numeric, tax numeric, \
+             bonus numeric)",
+        )
+        .await
+        .expect("seed source table");
+    let config_b = Config::with_schema(
+        format!("{} options='-c lock_timeout=100'", db.dsn()),
+        INSTANCE_B,
+    )
+    .expect("valid schema");
+    let pool_b = trellis::Pool::new(&config_b).expect("build instance B's pool");
+    trellis::migrate(&pool_b, &config_b)
+        .await
+        .expect("migrate instance B");
+
+    let mut holder = db.pool.get().await.expect("connect");
+    let hold = holder.transaction().await.expect("begin");
+    trellis::locks::lock_column_pauses(
+        &*hold,
+        DEFAULT_SCHEMA,
+        trellis::locks::ColumnPauseLock::Exclusive,
+        trellis::locks::ColumnPauseOp::Pause,
+    )
+    .await
+    .expect("take instance A's lock");
+    assert!(column_pause_lock_is_held(&client).await);
+
+    let source_columns = numeric_columns(&["id", "price", "tax", "bonus"]);
+    let definition = create_definition(
+        &pool_b,
+        "TRANSFORM b_sib FROM items SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("instance B's define takes its own lock");
+    let pk = source_primary_key(&pool_b, &definition.def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(
+        &pool_b,
+        &definition.def,
+        "public",
+        &pk,
+        &source_columns,
+        &definition.def.source,
+    )
+    .await
+    .expect("create target table");
+    quarantine::pause_column(&pool_b, "b_sib", "total")
+        .await
+        .expect("instance B's pause takes its own lock");
+    quarantine::resume_column(&pool_b, "b_sib", "total")
+        .await
+        .expect("instance B's resume takes its own lock");
+    let trellis_b = Trellis::connect(config_b, TrellisOptions::default())
+        .await
+        .expect("connect instance B");
+    trellis_b
+        .apply("PAUSE TRANSFORM b_sib")
+        .await
+        .expect("pause instance B's transform");
+    trellis_b
+        .apply("DROP TRANSFORM b_sib")
+        .await
+        .expect("instance B's drop takes its own lock");
+
+    assert!(
+        column_pause_lock_is_held(&client).await,
+        "A's is still held"
+    );
+    hold.rollback().await.expect("release");
+}
+
 // ---------------------------------------------------------------------
 // Issue #955: a cascade pair re-checks, under the column-pause lock, that
 // its reader still reads the paused column.

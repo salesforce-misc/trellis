@@ -252,7 +252,7 @@ Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
   build leaves it out rather than writing the frozen value, and the column's
   resume releases and builds it. Define and edit write them in their own
   transaction, whose first lock is the fence a pause of the new field bumps. A
-  pause and a define reading its column are ordered by the one global
+  pause and a define reading its column are ordered by the instance's one
   column-pause lock ([ADR-0014](0014-pause-and-drop-a-transform.md), "Order"),
   taken exclusive by every write of a pause and shared by the define, so
   either the define reads the pause or the pause's cascade finds the

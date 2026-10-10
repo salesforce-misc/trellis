@@ -79,8 +79,10 @@ edges, the marks that a pause still owes its cascade) goes through one transacti
 advisory lock per instance, taken by one helper (`locks::lock_column_pauses`). The key is
 `(922, hash(instance schema))`: advisory locks are scoped to the database, not the schema, so
 a constant key would make instances that share a database wait on each other
-([instance identity](../instance-identity.md)). Column pauses are
-operator commands plus rare fuse trips, so correctness and simplicity win over
+([instance identity](../instance-identity.md)). Nothing it orders crosses instances: the
+state it guards lives in the instance's catalog schema, and an instance that reads
+another's target sees that target as an ordinary source, never its pause state. Column
+pauses are operator commands plus rare fuse trips, so correctness and simplicity win over
 concurrency here. An earlier design locked each target by name; two deadlocks came from
 the sites it missed (a define against a `RESUME`, a `DROP TRANSFORM` against a `RESUME`),
 and each fix needed its own lock-order argument. One lock makes those cycles impossible
@@ -105,8 +107,8 @@ by construction.
   `column_pause_lock_timeouts_total{op}` ([observability](../observability.md)).
 - **Costs accepted.** Pauses, resumes and fuse trips on unrelated targets of one instance
   serialize. A holder that stalls, such as an idle-in-transaction session, blocks that
-  instance's pause activity until `lock_timeout`. A fuse trip in the capture pass can wait briefly behind an operator
-  pause.
+  instance's pause activity until `lock_timeout`. A fuse trip in the capture pass can
+  wait briefly behind an operator pause.
 
 ### Resume reconciles with source, not by catch-up
 
