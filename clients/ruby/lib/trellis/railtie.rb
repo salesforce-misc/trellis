@@ -88,16 +88,24 @@ module Trellis
       # config.trellis.instances. In a forked worker (Puma's
       # before_worker_boot, Unicorn's after_fork, Passenger's
       # starting_worker_process), or a rake task of your own. Raises
-      # ValidationError if neither is set, and whatever Trellis.connect and
-      # Trellis::Instance.connect raise; the instances this call had
-      # connected are shut down first, so a failure leaves nothing half
-      # connected.
+      # ValidationError if neither is set, or if a named instance is already
+      # connected (as Trellis.connect does for the default one), and whatever
+      # Trellis.connect and Trellis::Instance.connect raise; the instances
+      # this call had connected are shut down first, so a failure leaves
+      # nothing half connected.
       def connect
         default = connect_options
         named = instance_options
         if default.nil? && named.empty?
           raise ValidationError,
                 "config.trellis.connect is not set: give it Trellis.connect's options"
+        end
+        named.each_key do |name|
+          next unless @instances[name]&.connected?
+
+          raise ValidationError,
+                "the instance named #{name.inspect} is already connected: call " \
+                "Trellis::Instance.shutdown_all first"
         end
 
         opened = []

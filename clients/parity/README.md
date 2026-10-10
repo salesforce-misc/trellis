@@ -119,9 +119,10 @@ Each suite also fails when:
   (or field) the fixture doesn't describe;
 - a public call of the binding isn't a fixture operation, or an operation is
   never run. Each suite lists its exceptions, with the reason: Ruby's
-  `connected?` has no Elixir counterpart, because the Elixir handle is a
-  value the caller holds, and Elixir's `child_spec` and `start_link` have no
-  Ruby counterpart, because only the BEAM has a supervisor to own a handle.
+  `connected?` and `default_instance` have no Elixir counterpart, because
+  the Elixir handle is a value the caller holds, and Elixir's `child_spec`
+  and `start_link` have no Ruby counterpart, because only the BEAM has a
+  supervisor to own a handle.
 
 The Elixir suite runs the live script twice: once on a handle, and once on
 a supervised Trellis, where `connect` starts `{Trellis, options}`,
@@ -131,10 +132,13 @@ runs check the same shapes.
 The Ruby suite checks its Rails integration the same way. Each migration
 helper (`Trellis::Migration#define`, `#apply` and `#status`) has to be the
 fixture operation of the same name. Its other public calls
-(`Trellis::Railtie.connect`, `.connect_options` and `.with_handle`, and
+(`Trellis::Railtie.connect`, `.connect_options`, `.instance_options`,
+`.named_instance`, `.migrate_all` and `.with_handle`, and
 `Trellis::Migration.with_handle`) are Rails-only, and `Parity::RAILS_ONLY`
 lists each with its reason. A call added to either module fails the suite
-until it's listed.
+until it's listed. `Trellis::Instance` has exactly the fixture's operations
+(`connect` as its class method) and `connected?`, since the `Trellis`
+module delegates each call to its default instance.
 
 ## Adding a case
 

@@ -245,7 +245,9 @@ config.trellis.instances = {
 }
 ```
 
-If any instance fails to connect, the ones that did are shut down again.
+If any instance fails to connect, the ones that did are shut down again,
+and `Trellis::Railtie.connect` raises while one of them is already
+connected, as `Trellis.connect` does.
 With neither set, the Railtie does nothing. Two exceptions:
 
 - **An app booted by a rake task gets no boot handle.** `rails db:create`
@@ -256,8 +258,8 @@ With neither set, the Railtie does nothing. Two exceptions:
   `Trellis::Railtie.connect` first. It's the running task that counts:
   `rails test` boots the app outside any task and connects, but tests run
   by a rake task (`bin/rails db:test:prepare test`, or plain `rake`) don't,
-  so a test helper that needs the handle can call
-  `Trellis::Railtie.connect unless Trellis.connected?`.
+  so a test helper that needs the handles can call
+  `Trellis::Railtie.connect if Trellis::Instance.connected.empty?`.
 - **`config.trellis.connect_on_boot = false`** skips the boot connect, for a
   server that forks without a hook to shut the handle down first (a
   preloading Passenger, say). Connect in each child with

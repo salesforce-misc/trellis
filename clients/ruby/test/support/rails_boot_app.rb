@@ -126,7 +126,17 @@ when "named_instances_only"
   BootApp.config.trellis.instances = { reports: { url: ENV.fetch("TRELLIS_TEST_DSN"), schema: "boot_reports" } }
   BootApp.initialize!
   seen[:connected] = Trellis.connected?
-  seen[:named_connected] = Trellis::Railtie.named_instance(:reports).connected?
+  reports = Trellis::Railtie.named_instance(:reports)
+  seen[:named_connected] = reports.connected?
+  # A second connect raises, as Trellis.connect does for the default
+  # instance, rather than opening a second handle beside the first.
+  begin
+    Trellis::Railtie.connect
+  rescue Trellis::ValidationError => e
+    seen[:second_connect] = e.message
+  end
+  seen[:same_instance] = Trellis::Railtie.named_instance(:reports).equal?(reports)
+  seen[:instances_held] = Trellis::Instance.connected.size
 when "named_instances_rake"
   # `trellis:migrate` migrates every configured instance on handles of its
   # own, and leaves none connected.

@@ -95,7 +95,15 @@ class RailsTest < Minitest::Test
   end
 
   def test_named_instances_connect_without_a_default_connect
-    assert_equal({ "connected" => false, "named_connected" => true }, boot("named_instances_only"))
+    seen = boot("named_instances_only")
+    assert_equal false, seen.fetch("connected")
+    assert_equal true, seen.fetch("named_connected")
+    # Like a second Trellis.connect, a second Railtie.connect raises while a
+    # named instance is connected, rather than open another handle beside it.
+    assert_equal "the instance named :reports is already connected: call Trellis::Instance.shutdown_all first",
+                 seen.fetch("second_connect")
+    assert_equal true, seen.fetch("same_instance")
+    assert_equal 1, seen.fetch("instances_held")
   end
 
   def test_trellis_migrate_migrates_each_named_instance_on_a_handle_of_its_own

@@ -133,6 +133,34 @@ class InstanceTest < Minitest::Test
     assert_nil Trellis::Instance.shutdown_all, "with nothing connected it does nothing"
   end
 
+  # A shutdown that fails doesn't stop shutdown_all from attempting the
+  # rest: it raises the first failure once every instance has been tried,
+  # and warns about the others. Stand-ins for instances whose shutdown
+  # raises, since a real one's can't be made to fail on demand.
+  def test_shutdown_all_attempts_every_instance_and_raises_the_first_failure
+    attempted = []
+    failing = Struct.new(:label) do
+      define_method(:shutdown) do
+        attempted << label
+        raise Trellis::InternalError, "#{label} failed" unless label == :ok
+      end
+    end
+    stand_ins = %i[first ok second].map { |label| failing.new(label) }
+    stand_ins.each { |stand_in| Trellis::Instance.send(:register, stand_in) }
+    one = connect("inst_one")
+
+    error = nil
+    _, warned = capture_io do
+      error = assert_raises(Trellis::InternalError) { Trellis::Instance.shutdown_all }
+    end
+    assert_equal "first failed", error.message
+    assert_equal %i[first ok second], attempted
+    assert_match "second failed", warned
+    refute one.connected?, "an instance after the failures was still shut down"
+  ensure
+    stand_ins&.each { |stand_in| Trellis::Instance.send(:deregister, stand_in) }
+  end
+
   def test_an_instance_prints_its_schema_and_never_its_connection_string
     password = "s3cret-hunter2"
     instance = Trellis::Instance.connect(url: "#{TestCluster.dsn} password=#{password}", schema: "inst_one")
