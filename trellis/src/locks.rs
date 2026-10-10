@@ -475,7 +475,9 @@ mod tests {
 
     /// The cap keeps a shorter setting in force whatever unit Postgres shows
     /// it in, and replaces a longer one or `0`, for both a session and a
-    /// transaction-local setting, on both GUCs that use it (#1010).
+    /// transaction-local setting, on both GUCs that use it (#1010). The
+    /// result is read from `pg_settings` (a bare count of ms), not with the
+    /// `current_setting` conversion under test.
     #[tokio::test]
     async fn cap_keeps_a_shorter_setting_in_any_unit() {
         let cluster = testkit::TestCluster::start();
@@ -487,11 +489,16 @@ mod tests {
         let mut client = pool.connect_unpooled().await.expect("unpooled");
         let cap = 120_000u128;
         // (setting, what the cap leaves it as, in ms)
-        let cases: [(&str, i64); 10] = [
+        let cases: [(&str, i64); 15] = [
             ("0", 120_000),
             ("1ms", 1),
+            ("0.6ms", 1),
             ("200ms", 200),
+            ("5000", 5_000), // a bare number is ms; `current_setting` shows `5s`
             ("1s", 1_000),
+            ("1.5s", 1_500),
+            ("119999ms", 119_999),
+            ("120001ms", 120_000),
             ("90s", 90_000),
             ("1min", 60_000),
             ("2min", 120_000),
@@ -500,10 +507,7 @@ mod tests {
             ("1d", 120_000),
         ];
         let ms_in_force = |name: &'static str| {
-            format!(
-                "select (extract(epoch from current_setting('{name}')::interval) \
-                     * 1000)::bigint"
-            )
+            format!("select setting::bigint from pg_settings where name = '{name}'")
         };
         for name in ["lock_timeout", "statement_timeout"] {
             for (setting, expected) in cases {
@@ -522,7 +526,8 @@ mod tests {
                     .get(0);
                 assert_eq!(ms, expected, "{name} = {setting}");
             }
-            // Transaction-local: capped inside, the session's own after.
+            // Transaction-local: capped inside, the session's own after a
+            // commit (a rollback would undo a session-level one too).
             client
                 .batch_execute(&format!("set {name} = '2h'"))
                 .await
@@ -537,7 +542,7 @@ mod tests {
                 .expect("read")
                 .get(0);
             assert_eq!(inside, 120_000, "{name} inside the transaction");
-            txn.rollback().await.expect("rollback");
+            txn.commit().await.expect("commit");
             let after: i64 = client
                 .query_one(&ms_in_force(name), &[])
                 .await

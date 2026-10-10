@@ -554,6 +554,36 @@ async fn await_converged_reports_a_session_statement_timeout_as_a_db_error() {
         .expect("release lock");
 }
 
+/// The poll's `statement_timeout` is transaction-local (#1010 review): once a
+/// wait returns, the session's own setting is back, both none (`0`) and one
+/// longer than the poll's budget. A session-level one would outlive the poll
+/// and cancel the connection's later statements.
+#[tokio::test]
+async fn a_poll_leaves_the_session_statement_timeout_as_it_was() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    for session in ["0", "90000"] {
+        client
+            .batch_execute(&format!("set statement_timeout = {session}"))
+            .await
+            .expect("set statement_timeout");
+        converge::await_converged(&client, PgLsn::from(50), Duration::from_secs(5))
+            .await
+            .expect("an empty instance is converged");
+        let in_force: String = client
+            .query_one(
+                "select setting from pg_settings where name = 'statement_timeout'",
+                &[],
+            )
+            .await
+            .expect("read statement_timeout")
+            .get(0);
+        assert_eq!(in_force, session, "after a wait from {session}");
+    }
+}
+
 /// Review of issue #596: a spent budget still gets one real check. Before
 /// #596 a zero `timeout` meant "check once", and callers lean on that:
 /// generative's `quiesce` passes whatever is left of its own budget
