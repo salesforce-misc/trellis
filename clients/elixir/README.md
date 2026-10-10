@@ -65,7 +65,12 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
   fixed; `status/2` reports how many it holds (`held_keys`). `status/2`
   also reports a page the drain keeps failing on with nothing charged or
   paused (`drain_failure`, a `Trellis.DrainFailure`), and `self_check/3`
-  reports every one open (`drain_failures`).
+  reports every one open (`drain_failures`). `status/2` lists the join
+  columns of the relationships a transform reads that have no usable index
+  (`unindexed_joins`, each a `Trellis.UnindexedJoin` with `relationship`,
+  `table`, `column` and the `fix` sentence), a warning that never changes its
+  status, and `self_check/3` carries the same list on its report
+  (`unindexed_joins`).
 - `request_backfill/2`, `has_live_drain_workers/1`,
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
 - `self_check/3`: audit one page of a target against a fresh recompute from

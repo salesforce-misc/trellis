@@ -25,7 +25,14 @@
       "capture_wait": {"nullable": {"record": "CaptureWait"}},
       "capture_failure": {"nullable": {"record": "CaptureFailure"}},
       "held_keys": {"nullable": {"record": "HeldKeys"}},
-      "drain_failure": {"nullable": {"record": "DrainFailure"}}
+      "drain_failure": {"nullable": {"record": "DrainFailure"}},
+      "unindexed_joins": {"list_of": {"record": "UnindexedJoin"}}
+    },
+    "UnindexedJoin": {
+      "relationship": "string",
+      "table": "string",
+      "column": "string",
+      "fix": "string"
     },
     "HeldKeys": {
       "count": "integer",
@@ -125,7 +132,8 @@
       "next_after": {"nullable": "string"},
       "checked_through": "string",
       "held_keys": {"nullable": {"record": "HeldKeys"}},
-      "drain_failures": {"list_of": {"record": "DrainFailure"}}
+      "drain_failures": {"list_of": {"record": "DrainFailure"}},
+      "unindexed_joins": {"list_of": {"record": "UnindexedJoin"}}
     },
     "Divergence": {
       "kind": {"word_in": "divergence_kind"},
@@ -241,6 +249,24 @@
       "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
     },
     {"op": "relationships", "expect": {"list": []}},
+
+    {
+      "about": "An unindexed join column (#973): a transform reads a relationship whose from_col has no index, and status names it with the fix. Nothing converges here (status and the index are catalog reads), so these are plain expects. The block drops what it defined, so no later phase builds it.",
+      "op": "sql",
+      "args": [
+        "create table parity_accounts (id integer primary key, name text)",
+        "create table parity_invoices (id integer primary key, account_id integer)"
+      ]
+    },
+    {"op": "apply", "args": ["RELATIONSHIP parity_account FROM parity_invoices.account_id TO parity_accounts.id"], "expect": {"record": "Applied", "fields": {"kind": {"word": "relationship_defined"}}}},
+    {"op": "apply", "args": ["TRANSFORM parity_invoice_view FROM parity_invoices SELECT parity_account.name AS account_name"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
+    {"op": "status", "args": ["parity_invoice_view"], "expect": {"record": "Status", "fields": {"unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "parity_account"}, "table": {"eq": "public.parity_invoices"}, "column": {"eq": "account_id"}, "fix": {"eq": "create an index on public.parity_invoices (account_id)"}}}]}}}},
+    {"about": "The audit stops before comparing a definition that isn't live, and its report carries the same list. (A live target that reads a relationship is refused by self_check, so status is where the list is read; see known-correctness-gaps.md.)", "op": "self_check", "args": ["parity_invoice_view"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_live"}, "unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "parity_account"}, "column": {"eq": "account_id"}}}]}}}},
+    {"about": "Creating the index clears the entry on the next call, with no restart.", "op": "sql", "args": ["create index on parity_invoices (account_id)"]},
+    {"op": "status", "args": ["parity_invoice_view"], "expect": {"record": "Status", "fields": {"unindexed_joins": {"list": []}}}},
+    {"op": "apply", "args": ["PAUSE TRANSFORM parity_invoice_view"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
+    {"op": "apply", "args": ["DROP TRANSFORM parity_invoice_view"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
+    {"op": "apply", "args": ["DROP RELATIONSHIP parity_invoices.parity_account"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
 
     {"op": "await_converged", "args": ["parity: not a token"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
     {"op": "shutdown", "expect": null},
@@ -375,32 +401,44 @@
     {
       "about": "A failing backfill, which a live run can't produce cheaply: the retry time is rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null},
+      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": {"record": "BackfillFailure", "fields": {"source_table": {"eq": "public.orders"}, "attempts": {"eq": 3}, "next_attempt_at": {"time_micros": 1727222400123456}}}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}
     },
     {
       "about": "A capture lock wait, a capture failure (#687) and held keys (#759), which need a held lock, a broken source table or a refused write, so a live run can't produce them all cheaply: their times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null},
+      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null, "unindexed_joins": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"kind": {"word": "capture"}, "source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}, "held_keys": {"record": "HeldKeys", "fields": {"count": {"eq": 2}, "oldest_poisoned_at": {"time_micros": 1727222400123459}}}, "drain_failure": null}}
     },
     {
       "about": "A drain failure (#817), which needs a page the drain keeps failing on with nothing charged or paused, so a live run can't produce it cheaply: its tables and SQLSTATE cross as they are, and its times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}},
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}, "unindexed_joins": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 17}, "tables": {"list": [{"eq": "public.lines"}, {"eq": "public.orders"}]}, "error": {"eq": "permission denied for function audit_hook"}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123457}, "attempts": {"eq": 5}}}}}
     },
     {
       "about": "A self-check reports every open drain failure, oldest first and whatever its outcome; one that didn't come from Postgres has no SQLSTATE.",
       "type": "SelfCheckReport",
-      "native": {"target": "parity_prices", "outcome": {"$word": "converged"}, "status": null, "divergences": [], "rows_compared": 2, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [{"seg_seq": 3, "tables": ["public.orders"], "error": "permission denied for column note", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123458, "attempts": 4}, {"seg_seq": 9, "tables": ["public.lines"], "error": "records fail only together", "sqlstate": null, "since_micros": 1727222400123457, "last_seen_micros": 1727222400123459, "attempts": 1}]},
+      "native": {"target": "parity_prices", "outcome": {"$word": "converged"}, "status": null, "divergences": [], "rows_compared": 2, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [{"seg_seq": 3, "tables": ["public.orders"], "error": "permission denied for column note", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123458, "attempts": 4}, {"seg_seq": 9, "tables": ["public.lines"], "error": "records fail only together", "sqlstate": null, "since_micros": 1727222400123457, "last_seen_micros": 1727222400123459, "attempts": 1}], "unindexed_joins": []},
       "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "held_keys": null, "drain_failures": {"list": [{"record": "DrainFailure", "fields": {"seg_seq": {"eq": 3}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123458}, "attempts": {"eq": 4}}}, {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 9}, "tables": {"list": [{"eq": "public.lines"}]}, "error": {"eq": "records fail only together"}, "sqlstate": null, "since": {"time_micros": 1727222400123457}, "last_seen": {"time_micros": 1727222400123459}}}]}}}
     },
     {
       "about": "A definition that isn't live isn't compared: the outcome is not_live and the report names its status.",
       "type": "SelfCheckReport",
-      "native": {"target": "parity_prices", "outcome": {"$word": "not_live"}, "status": {"$word": "backfilling"}, "divergences": [], "rows_compared": 0, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": []},
+      "native": {"target": "parity_prices", "outcome": {"$word": "not_live"}, "status": {"$word": "backfilling"}, "divergences": [], "rows_compared": 0, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [], "unindexed_joins": []},
       "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_live"}, "status": {"word": "backfilling"}, "rows_compared": {"eq": 0}, "divergences": {"list": []}}}
+    },
+    {
+      "about": "An unindexed join column (#973) in a status: the entry crosses with its fix sentence, and the list keeps its order.",
+      "type": "Status",
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "unindexed_joins": [{"relationship": "customer", "table": "public.orders", "column": "customer_id", "fix": "create an index on public.orders (customer_id)"}, {"relationship": "items", "table": "public.line_items", "column": "order_id", "fix": "create an index on public.line_items (order_id)"}]},
+      "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "customer"}, "table": {"eq": "public.orders"}, "column": {"eq": "customer_id"}, "fix": {"eq": "create an index on public.orders (customer_id)"}}}, {"record": "UnindexedJoin", "fields": {"relationship": {"eq": "items"}, "table": {"eq": "public.line_items"}, "column": {"eq": "order_id"}, "fix": {"eq": "create an index on public.line_items (order_id)"}}}]}}}
+    },
+    {
+      "about": "A self-check report carries the same entries, whatever its outcome.",
+      "type": "SelfCheckReport",
+      "native": {"target": "parity_prices", "outcome": {"$word": "not_caught_up"}, "status": null, "divergences": [], "rows_compared": 0, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [], "unindexed_joins": [{"relationship": "customer", "table": "public.orders", "column": "customer_id", "fix": "create an index on public.orders (customer_id)"}]},
+      "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_caught_up"}, "unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "customer"}, "table": {"eq": "public.orders"}, "column": {"eq": "customer_id"}, "fix": {"eq": "create an index on public.orders (customer_id)"}}}]}}}
     },
     {
       "about": "A time a microsecond before the epoch lands on that microsecond, not a second off.",

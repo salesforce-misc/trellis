@@ -68,7 +68,11 @@ Nothing in the binding uses it.
   holds (`held_keys`). `status` also reports a page the drain keeps failing
   on with nothing charged or paused (`drain_failure`, a
   `Trellis::DrainFailure`), and `self_check` reports every one open
-  (`drain_failures`).
+  (`drain_failures`). `status` lists the join columns of the relationships a
+  definition reads that have no usable index (`unindexed_joins`, each a
+  `Trellis::UnindexedJoin` with `relationship`, `table`, `column` and the `fix`
+  sentence), a warning that never changes its status, and `self_check` carries
+  the same list on its report (`unindexed_joins`).
 - `Trellis.request_backfill(source_table)`,
   `Trellis.has_live_drain_workers?`, `Trellis.has_live_staging_worker?`,
   `Trellis.watermark_token`, `Trellis.await_converged(token, timeout_ms:)`.

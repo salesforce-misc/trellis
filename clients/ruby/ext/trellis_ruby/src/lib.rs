@@ -57,10 +57,10 @@ use trellis_embed::{
     PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
     PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys, PlainPoisonEntry,
     PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
-    PlainSelfCheckReport, SELF_CHECK_OUTCOMES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_OUTCOMES, capture_failure_kind_names,
+    decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
+    relationship_cardinality_names, require_transform_statement, self_check_mode,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -757,6 +757,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .drain_failure
         .map(|failure| drain_failure_hash(ruby, failure))
         .transpose()?;
+    let unindexed_joins = array(ruby, status.unindexed_joins, unindexed_join_hash)?;
     record(
         ruby,
         [
@@ -766,6 +767,21 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("capture_failure", ruby.into_value(capture_failure)),
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failure", ruby.into_value(drain_failure)),
+            ("unindexed_joins", unindexed_joins.as_value()),
+        ],
+    )
+}
+
+/// A join column of a relationship a definition reads that has no usable
+/// index.
+fn unindexed_join_hash(ruby: &Ruby, join: PlainUnindexedJoin) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("relationship", ruby.into_value(join.relationship)),
+            ("table", ruby.into_value(join.table)),
+            ("column", ruby.into_value(join.column)),
+            ("fix", ruby.into_value(join.fix)),
         ],
     )
 }
@@ -986,6 +1002,7 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
         .map(|held| held_keys_hash(ruby, held))
         .transpose()?;
     let drain_failures = array(ruby, report.drain_failures, drain_failure_hash)?;
+    let unindexed_joins = array(ruby, report.unindexed_joins, unindexed_join_hash)?;
     let status = report
         .status
         .map(|status| word_symbol(ruby, status).as_value());
@@ -1001,6 +1018,7 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
             ("divergences", divergences.as_value()),
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failures", drain_failures.as_value()),
+            ("unindexed_joins", unindexed_joins.as_value()),
         ],
     )
 }

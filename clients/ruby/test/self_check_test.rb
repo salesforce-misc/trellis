@@ -24,9 +24,9 @@ class SelfCheckTest < Minitest::Test
 
     report = Trellis.self_check("audited_widget_totals", limit: 100, timeout_ms: TIMEOUT_MS)
     assert_instance_of Trellis::SelfCheckReport, report
-    assert_equal ["audited_widget_totals", :converged, [], 2, nil, []],
+    assert_equal ["audited_widget_totals", :converged, [], 2, nil, [], []],
                  [report.target, report.outcome, report.divergences, report.rows_compared,
-                  report.next_after, report.drain_failures]
+                  report.next_after, report.drain_failures, report.unindexed_joins]
 
     # The position it checked through is a real watermark token.
     assert_nil Trellis.await_converged(report.checked_through, timeout_ms: TIMEOUT_MS)

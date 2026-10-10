@@ -31,6 +31,13 @@ defmodule Trellis.SelfCheckReport do
     oldest first, whichever transforms read its tables; `[]` when there is
     none. Each holds back the targets of the tables it holds changes to, and
     with them the convergence the audit waits on.
+  - `unindexed_joins` lists the join columns of the relationships the audited
+    transform reads that have no usable index (see `Trellis.UnindexedJoin`);
+    `[]` when there is none. It never changes the outcome. A target that
+    reads a relationship is refused once the audit reaches the comparison, so
+    the list shows here only when the audit stops before then (a capture
+    fault, `:not_live` or `:not_caught_up`); `Trellis.status/2` reports it
+    for any transform.
   """
 
   @typedoc "The verdict of one `Trellis.self_check/3` page."
@@ -48,7 +55,8 @@ defmodule Trellis.SelfCheckReport do
           next_after: cursor() | nil,
           checked_through: Trellis.watermark(),
           held_keys: Trellis.HeldKeys.t() | nil,
-          drain_failures: [Trellis.DrainFailure.t()]
+          drain_failures: [Trellis.DrainFailure.t()],
+          unindexed_joins: [Trellis.UnindexedJoin.t()]
         }
 
   @enforce_keys [
@@ -60,7 +68,8 @@ defmodule Trellis.SelfCheckReport do
     :next_after,
     :checked_through,
     :held_keys,
-    :drain_failures
+    :drain_failures,
+    :unindexed_joins
   ]
   defstruct @enforce_keys
 
@@ -75,7 +84,8 @@ defmodule Trellis.SelfCheckReport do
       next_after: report.next_after,
       checked_through: report.checked_through,
       held_keys: report.held_keys && Trellis.HeldKeys.from_native(report.held_keys),
-      drain_failures: Enum.map(report.drain_failures, &Trellis.DrainFailure.from_native/1)
+      drain_failures: Enum.map(report.drain_failures, &Trellis.DrainFailure.from_native/1),
+      unindexed_joins: Enum.map(report.unindexed_joins, &Trellis.UnindexedJoin.from_native/1)
     }
   end
 end

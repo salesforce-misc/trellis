@@ -82,8 +82,13 @@ module Trellis
   #   Every drain pass retries the page; fix the cause its error names. A
   #   paused or quarantined definition has none.
   # Every process sees them, whichever one runs the staging worker.
+  #
+  # unindexed_joins is a warning, never a hold-up: the UnindexedJoins for the
+  # join columns of the relationships it reads that have no usable index
+  # ([] when every one is indexed). It leaves status alone, and an index you
+  # create shows on the next call.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
-                       :held_keys, :drain_failure) do
+                       :held_keys, :drain_failure, :unindexed_joins) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -95,9 +100,18 @@ module Trellis
           capture_wait: wait && CaptureWait.from_native(wait),
           capture_failure: capture_failure && CaptureFailure.from_native(capture_failure),
           held_keys: held_keys && HeldKeys.from_native(held_keys),
-          drain_failure: drain_failure && DrainFailure.from_native(drain_failure))
+          drain_failure: drain_failure && DrainFailure.from_native(drain_failure),
+          unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) })
     end
   end
+
+  # A join column of a relationship a definition reads that has no usable
+  # index, as Trellis.status and Trellis.self_check report it: the
+  # relationship's name (relationship), the qualified table that holds the
+  # column (table), the column (column), and what to do about it (fix), the
+  # index to create as a sentence. Trellis doesn't create indexes on your
+  # tables.
+  UnindexedJoin = Data.define(:relationship, :table, :column, :fix)
 
   # A drain page that keeps failing with nothing charged or paused, as
   # Trellis.status and Trellis.self_check report it: the segment whose page
@@ -302,13 +316,22 @@ module Trellis
   #   instance, oldest first, whichever definitions read its tables; [] when
   #   there is none. Each holds back the targets of the tables it holds
   #   changes to, and with them the convergence the audit waits on.
+  # - unindexed_joins: the UnindexedJoins for the join columns of the
+  #   relationships the audited definition reads that have no usable index;
+  #   [] when there is none. It never changes the outcome. A target that
+  #   reads a relationship is refused once the audit reaches the comparison,
+  #   so the list shows here only when the audit stops before then (a capture
+  #   fault, :not_live or :not_caught_up); Trellis.status reports it for any
+  #   definition.
   SelfCheckReport = Data.define(:target, :outcome, :status, :divergences, :rows_compared,
-                                :next_after, :checked_through, :held_keys, :drain_failures) do
+                                :next_after, :checked_through, :held_keys, :drain_failures,
+                                :unindexed_joins) do
     def self.from_native(hash)
       held_keys = hash[:held_keys]
       new(**hash, divergences: hash.fetch(:divergences).map { |d| Divergence.new(**d) },
                   held_keys: held_keys && HeldKeys.from_native(held_keys),
-                  drain_failures: hash.fetch(:drain_failures).map { |f| DrainFailure.from_native(f) })
+                  drain_failures: hash.fetch(:drain_failures).map { |f| DrainFailure.from_native(f) },
+                  unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) })
     end
   end
 

@@ -22,7 +22,8 @@ defmodule Trellis.StatusTest do
         capture_wait: nil,
         capture_failure: nil,
         held_keys: nil,
-        drain_failure: nil
+        drain_failure: nil,
+        unindexed_joins: []
       })
 
     assert %Trellis.Status{
@@ -59,7 +60,8 @@ defmodule Trellis.StatusTest do
           detected_at_micros: 1_727_222_400_654_321
         },
         held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323},
-        drain_failure: nil
+        drain_failure: nil,
+        unindexed_joins: []
       })
 
     assert %Trellis.Status{
@@ -103,7 +105,8 @@ defmodule Trellis.StatusTest do
           since_micros: 1_727_222_400_654_321,
           last_seen_micros: 1_727_222_400_654_322,
           attempts: 5
-        }
+        },
+        unindexed_joins: []
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -115,6 +118,35 @@ defmodule Trellis.StatusTest do
              last_seen: ~U[2024-09-25 00:00:00.654322Z],
              attempts: 5
            }
+  end
+
+  test "an unindexed join becomes a struct" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        unindexed_joins: [
+          %{
+            relationship: "orders",
+            table: "public.orders",
+            column: "customer_id",
+            fix: "create an index on public.orders (customer_id)"
+          }
+        ]
+      })
+
+    assert status.unindexed_joins == [
+             %Trellis.UnindexedJoin{
+               relationship: "orders",
+               table: "public.orders",
+               column: "customer_id",
+               fix: "create an index on public.orders (customer_id)"
+             }
+           ]
   end
 
   test "a definition summary's halt becomes a capture failure of kind halt" do

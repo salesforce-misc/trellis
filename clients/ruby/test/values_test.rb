@@ -27,7 +27,8 @@ class ValuesTest < Minitest::Test
       status: :waiting_to_backfill,
       backfill_failure: { source_table: "public.orders", attempts: 3,
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
-      capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil
+      capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
+      unindexed_joins: []
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -38,7 +39,8 @@ class ValuesTest < Minitest::Test
       capture_wait: nil,
       capture_failure: nil,
       held_keys: nil,
-      drain_failure: nil
+      drain_failure: nil,
+      unindexed_joins: []
     ), status
   end
 
@@ -51,7 +53,7 @@ class ValuesTest < Minitest::Test
       capture_failure: { kind: :capture, source_table: "public.lines", columns: ["qty"],
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
-      drain_failure: nil
+      drain_failure: nil, unindexed_joins: []
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -66,7 +68,8 @@ class ValuesTest < Minitest::Test
         detected_at: Trellis::EpochMicros.to_time(MICROS)
       ),
       held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
-      drain_failure: nil
+      drain_failure: nil,
+      unindexed_joins: []
     ), status
   end
 
@@ -75,7 +78,8 @@ class ValuesTest < Minitest::Test
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
       drain_failure: { seg_seq: 17, tables: ["public.lines", "public.orders"],
                        error: "permission denied for function audit_hook", sqlstate: "42501",
-                       since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 }
+                       since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
+      unindexed_joins: []
     )
     assert_equal Trellis::DrainFailure.new(
       seg_seq: 17, tables: ["public.lines", "public.orders"],
@@ -89,7 +93,7 @@ class ValuesTest < Minitest::Test
     report = Trellis::SelfCheckReport.from_native(
       target: "order_totals", outcome: :not_live, status: :backfilling, divergences: [],
       rows_compared: 0, next_after: nil, checked_through: "1/16B3748", held_keys: nil,
-      drain_failures: []
+      drain_failures: [], unindexed_joins: []
     )
     assert_equal :not_live, report.outcome
     assert_equal :backfilling, report.status
@@ -100,13 +104,33 @@ class ValuesTest < Minitest::Test
       target: "order_totals", outcome: :converged, status: nil, divergences: [], rows_compared: 2,
       next_after: nil, checked_through: "1/16B3748", held_keys: nil,
       drain_failures: [{ seg_seq: 9, tables: ["public.orders"], error: "records fail only together",
-                         sqlstate: nil, since_micros: MICROS, last_seen_micros: MICROS, attempts: 1 }]
+                         sqlstate: nil, since_micros: MICROS, last_seen_micros: MICROS, attempts: 1 }],
+      unindexed_joins: []
     )
     assert_equal [Trellis::DrainFailure.new(
       seg_seq: 9, tables: ["public.orders"], error: "records fail only together", sqlstate: nil,
       since: Trellis::EpochMicros.to_time(MICROS), last_seen: Trellis::EpochMicros.to_time(MICROS),
       attempts: 1
     )], report.drain_failures
+  end
+
+  def test_an_unindexed_join_becomes_a_value_in_a_status_and_a_self_check_report
+    join = { relationship: "orders", table: "public.orders", column: "customer_id",
+             fix: "create an index on public.orders (customer_id)" }
+    expected = [Trellis::UnindexedJoin.new(**join)]
+
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
+      drain_failure: nil, unindexed_joins: [join]
+    )
+    assert_equal expected, status.unindexed_joins
+
+    report = Trellis::SelfCheckReport.from_native(
+      target: "order_totals", outcome: :not_caught_up, status: nil, divergences: [], rows_compared: 0,
+      next_after: nil, checked_through: "1/16B3748", held_keys: nil, drain_failures: [],
+      unindexed_joins: [join]
+    )
+    assert_equal expected, report.unindexed_joins
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure

@@ -49,10 +49,10 @@ use trellis_embed::{
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
     PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES, capture_failure_kind_names,
-    decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
-    relationship_cardinality_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    PlainSamplePage, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_OUTCOMES,
+    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
+    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -160,6 +160,28 @@ struct StatusTerm {
     capture_failure: Option<CaptureFailureTerm>,
     held_keys: Option<HeldKeysTerm>,
     drain_failure: Option<DrainFailureTerm>,
+    unindexed_joins: Vec<UnindexedJoinTerm>,
+}
+
+/// A join column of a relationship a definition reads that has no usable
+/// index, as `status/2` and `self_check/3` report it.
+#[derive(NifMap)]
+struct UnindexedJoinTerm {
+    relationship: String,
+    table: String,
+    column: String,
+    fix: String,
+}
+
+impl From<PlainUnindexedJoin> for UnindexedJoinTerm {
+    fn from(join: PlainUnindexedJoin) -> Self {
+        UnindexedJoinTerm {
+            relationship: join.relationship,
+            table: join.table,
+            column: join.column,
+            fix: join.fix,
+        }
+    }
 }
 
 /// A drain page that keeps failing with nothing charged or paused, as
@@ -419,6 +441,7 @@ struct SelfCheckReportTerm {
     divergences: Vec<DivergenceTerm>,
     held_keys: Option<HeldKeysTerm>,
     drain_failures: Vec<DrainFailureTerm>,
+    unindexed_joins: Vec<UnindexedJoinTerm>,
 }
 
 /// One divergence. `kind` is one of [`DIVERGENCE_KINDS`]; see
@@ -456,6 +479,11 @@ impl SelfCheckReportTerm {
                 .drain_failures
                 .into_iter()
                 .map(DrainFailureTerm::from)
+                .collect(),
+            unindexed_joins: report
+                .unindexed_joins
+                .into_iter()
+                .map(UnindexedJoinTerm::from)
                 .collect(),
         })
     }
@@ -839,6 +867,11 @@ fn status(
             .transpose()?,
         held_keys: status.held_keys.map(HeldKeysTerm::from),
         drain_failure: status.drain_failure.map(DrainFailureTerm::from),
+        unindexed_joins: status
+            .unindexed_joins
+            .into_iter()
+            .map(UnindexedJoinTerm::from)
+            .collect(),
     }))
 }
 

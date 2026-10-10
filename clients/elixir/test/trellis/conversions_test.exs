@@ -67,6 +67,7 @@ defmodule Trellis.ConversionsTest do
         status: nil,
         held_keys: nil,
         drain_failures: [],
+        unindexed_joins: [],
         divergences: [
           %{
             kind: :cell,
@@ -117,7 +118,8 @@ defmodule Trellis.ConversionsTest do
                }
              ],
              held_keys: nil,
-             drain_failures: []
+             drain_failures: [],
+             unindexed_joins: []
            }
   end
 
@@ -132,7 +134,8 @@ defmodule Trellis.ConversionsTest do
         status: :backfilling,
         divergences: [],
         held_keys: nil,
-        drain_failures: []
+        drain_failures: [],
+        unindexed_joins: []
       })
 
     assert report.outcome == :not_live
@@ -151,7 +154,8 @@ defmodule Trellis.ConversionsTest do
         status: nil,
         divergences: [],
         held_keys: %{count: 1, oldest_poisoned_at_micros: 1_727_222_400_654_321},
-        drain_failures: []
+        drain_failures: [],
+        unindexed_joins: []
       })
 
     assert report.held_keys == %Trellis.HeldKeys{
@@ -181,7 +185,8 @@ defmodule Trellis.ConversionsTest do
             last_seen_micros: 1_727_222_400_654_321,
             attempts: 1
           }
-        ]
+        ],
+        unindexed_joins: []
       })
 
     assert report.drain_failures == [
@@ -193,6 +198,38 @@ defmodule Trellis.ConversionsTest do
                since: ~U[2024-09-25 00:00:00.654321Z],
                last_seen: ~U[2024-09-25 00:00:00.654321Z],
                attempts: 1
+             }
+           ]
+  end
+
+  test "a self-check report's unindexed joins become structs" do
+    report =
+      SelfCheckReport.from_native(%{
+        target: "order_totals",
+        checked_through: "1/16B3748",
+        rows_compared: 0,
+        next_after: nil,
+        outcome: :not_caught_up,
+        status: nil,
+        divergences: [],
+        held_keys: nil,
+        drain_failures: [],
+        unindexed_joins: [
+          %{
+            relationship: "orders",
+            table: "public.orders",
+            column: "customer_id",
+            fix: "create an index on public.orders (customer_id)"
+          }
+        ]
+      })
+
+    assert report.unindexed_joins == [
+             %Trellis.UnindexedJoin{
+               relationship: "orders",
+               table: "public.orders",
+               column: "customer_id",
+               fix: "create an index on public.orders (customer_id)"
              }
            ]
   end

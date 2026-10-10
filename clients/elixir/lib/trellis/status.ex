@@ -34,6 +34,11 @@ defmodule Trellis.Status do
       page; fix the cause its error names. A paused or quarantined
       transform has none.
 
+  `unindexed_joins` is a warning, never a hold-up: a `Trellis.UnindexedJoin`
+  for each join column of the relationships it reads that has no usable
+  index, `[]` when every one is indexed. It leaves `status` alone, and an
+  index you create shows on the next call.
+
   Every process sees them, whichever one runs the staging worker.
   """
 
@@ -47,7 +52,8 @@ defmodule Trellis.Status do
           capture_wait: Trellis.CaptureWait.t() | nil,
           capture_failure: Trellis.CaptureFailure.t() | nil,
           held_keys: Trellis.HeldKeys.t() | nil,
-          drain_failure: Trellis.DrainFailure.t() | nil
+          drain_failure: Trellis.DrainFailure.t() | nil,
+          unindexed_joins: [Trellis.UnindexedJoin.t()]
         }
 
   @enforce_keys [
@@ -56,7 +62,8 @@ defmodule Trellis.Status do
     :capture_wait,
     :capture_failure,
     :held_keys,
-    :drain_failure
+    :drain_failure,
+    :unindexed_joins
   ]
   defstruct @enforce_keys
 
@@ -67,7 +74,8 @@ defmodule Trellis.Status do
         capture_wait: wait,
         capture_failure: capture_failure,
         held_keys: held_keys,
-        drain_failure: drain_failure
+        drain_failure: drain_failure,
+        unindexed_joins: unindexed_joins
       }) do
     %__MODULE__{
       status: status,
@@ -75,8 +83,34 @@ defmodule Trellis.Status do
       capture_wait: wait && Trellis.CaptureWait.from_native(wait),
       capture_failure: capture_failure && Trellis.CaptureFailure.from_native(capture_failure),
       held_keys: held_keys && Trellis.HeldKeys.from_native(held_keys),
-      drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure)
+      drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure),
+      unindexed_joins: Enum.map(unindexed_joins, &Trellis.UnindexedJoin.from_native/1)
     }
+  end
+end
+
+defmodule Trellis.UnindexedJoin do
+  @moduledoc """
+  A join column of a relationship a transform reads that has no usable index,
+  as `Trellis.status/2` and `Trellis.self_check/3` report it: the
+  relationship's name (`relationship`), the qualified table that holds the
+  column (`table`), the `column`, and what to do about it (`fix`), the index
+  to create as a sentence. Trellis doesn't create indexes on your tables.
+  """
+
+  @type t :: %__MODULE__{
+          relationship: String.t(),
+          table: String.t(),
+          column: String.t(),
+          fix: String.t()
+        }
+
+  @enforce_keys [:relationship, :table, :column, :fix]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{relationship: relationship, table: table, column: column, fix: fix}) do
+    %__MODULE__{relationship: relationship, table: table, column: column, fix: fix}
   end
 end
 
