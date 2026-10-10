@@ -1140,6 +1140,29 @@ fn field_value_type(
     }
 }
 
+/// The type of each of `def`'s fields, in field order: the types of the
+/// columns of the target table the engine builds for it (issue #879). A
+/// second instance that reads that target as a source needs them to model it
+/// as a [`Table`].
+///
+/// `source_columns` lists every column of the definition's source table.
+pub fn field_types(
+    program: &Program,
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Vec<(String, ValueType)> {
+    let rels = RelIndex::new(program);
+    def.fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.clone(),
+                field_value_type(&field.expr, source_columns, &rels),
+            )
+        })
+        .collect()
+}
+
 /// Runs the full three-way comparison for a 1-1 `def`: reads the SQL oracle
 /// and the evaluator recompute from `pool`, strips the pk column from the
 /// caller-supplied persisted `target` rows (as read back by

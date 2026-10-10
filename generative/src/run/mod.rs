@@ -29,7 +29,8 @@ pub use db_admin::run_convergence_with_db_admin;
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
 pub use two_instance::{
-    InstanceLabel, InstanceRun, TwoInstanceError, run_two_instance_convergence,
+    InstanceLabel, InstanceRun, TwoInstanceError, chain_off, run_two_instance_convergence,
+    share_source,
 };
 
 use std::collections::HashMap;

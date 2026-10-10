@@ -90,6 +90,34 @@
 //! keepalive. Trigger capture has no such wait. [`MAX_CHECKS_PER_RUN`] was
 //! sized for the old cost.
 //!
+//! # The shapes planned for production use (issue #879, epic #806)
+//!
+//! Everything above runs two instances that share a database but nothing
+//! else: each has its own source tables, in its own catalog schema. Epic #806
+//! plans three shapes with more in common than that, and each has a property
+//! and a hand-built pin below:
+//!
+//! 1. **One source table, two instances** ([`share_source`]). The source lives
+//!    in `public`. Instance A creates and writes it and defines the first half
+//!    of a program's transforms over it; instance B defines the second half.
+//!    Both capture the table, so both fire triggers on every write, and each
+//!    is checked against the oracle over the one table.
+//! 2. **A chain across instances** ([`chain_off`]). Instance A keeps its
+//!    targets in `public`, and instance B defines a transform over each of A's
+//!    one-to-one targets, which B captures like any source. B's targets are
+//!    checked against the oracle over A's target tables as they are in the
+//!    database. A runner step A has checked before B quiesces is what makes
+//!    B's wait cover A's writes to those tables. Then A drops a transform
+//!    whose target B reads, and B must take its dropped-source path.
+//! 3. **Two databases in one process.** The instances use the *same* schema
+//!    names, as a multi-tenant host with one database per tenant would, so
+//!    anything the engine keeps per process under a schema name alone is
+//!    shared between them.
+//!
+//! Every shape goes through [`run_two_instance_convergence`], which drives
+//! both instances to quiescence at each checkpoint and compares; none polls
+//! for convergence itself.
+//!
 //! # Running this property alone (design doc §9)
 //!
 //! ```text
@@ -100,10 +128,17 @@
 //! Every case bootstraps its own database, schemas, and migrations, so this
 //! never depends on run order or on any other property having run.
 
-use generative::backend::ManualBackend;
-use generative::generate::{Mutate, build_program, trivial_program};
-use generative::model::Program;
-use generative::run::{InstanceLabel, InstanceRun, RunError, run_two_instance_convergence};
+use generative::backend::Backend;
+use generative::backend::{ManualBackend, SourceTables};
+use generative::generate::{
+    AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program, build_program_multi,
+    build_program_multi_with_shapes, trivial_program,
+};
+use generative::model::{OpOutcome, Program};
+use generative::run::{
+    InstanceLabel, InstanceRun, RunError, chain_off, check_program, run_two_instance_convergence,
+    share_source,
+};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::{TestCluster, TestDatabase};
@@ -170,12 +205,28 @@ struct Instance {
 /// `CREATE SCHEMA`; the *target* schema does, since nothing in the engine
 /// creates a target schema on a caller's behalf.
 async fn stand_up(db: &TestDatabase, label: InstanceLabel, tag: &str) -> Instance {
-    let schema = format!("trellis_{tag}");
-    let target_schema = format!("targets_{tag}");
+    stand_up_in(
+        db,
+        label,
+        &format!("trellis_{tag}"),
+        &format!("targets_{tag}"),
+        SourceTables::Own,
+    )
+    .await
+}
 
-    let config = Config::with_schema(db.dsn().to_string(), schema.clone())
+/// [`stand_up`] with the instance schema, the target schema and the place
+/// the instance's source tables live all chosen by the caller (issue #879).
+async fn stand_up_in(
+    db: &TestDatabase,
+    label: InstanceLabel,
+    schema: &str,
+    target_schema: &str,
+    sources: SourceTables,
+) -> Instance {
+    let config = Config::with_schema(db.dsn().to_string(), schema.to_string())
         .expect("valid instance schema")
-        .with_target_schema(target_schema.clone())
+        .with_target_schema(target_schema.to_string())
         .expect("valid target schema");
     let pool = Pool::new(&config).expect("build oracle pool for instance");
 
@@ -183,8 +234,8 @@ async fn stand_up(db: &TestDatabase, label: InstanceLabel, tag: &str) -> Instanc
     // caller's behalf, so the harness does it, through the database's own
     // default-schema pool (`testkit` migrated that one already) rather than
     // through `pool` — whose `search_path` bootstrap names `target_schema`
-    // itself, which would be needlessly circular. Both `tag`s used here are
-    // plain lowercase ASCII, so the interpolation below needs no quoting;
+    // itself, which would be needlessly circular. Callers pass plain
+    // lowercase ASCII names, so the interpolation below needs no quoting;
     // `Config::with_target_schema` above has already validated the name.
     db.pool
         .get()
@@ -198,9 +249,11 @@ async fn stand_up(db: &TestDatabase, label: InstanceLabel, tag: &str) -> Instanc
         .await
         .expect("migrate instance schema");
 
-    let backend = ManualBackend::connect_with_instance(db.dsn(), &schema, &target_schema, 1, None)
-        .await
-        .expect("connect instance backend");
+    let mut backend =
+        ManualBackend::connect_with_instance(db.dsn(), schema, target_schema, 1, None)
+            .await
+            .expect("connect instance backend");
+    backend.set_source_tables(sources);
 
     Instance {
         backend,
@@ -223,6 +276,39 @@ fn describe(err: generative::run::TwoInstanceError) -> TestCaseError {
     }
 }
 
+/// Runs `program_a` on instance `a` and `program_b` on instance `b` through
+/// [`run_two_instance_convergence`], each checked against its own oracle.
+async fn run_pair(
+    a: &mut Instance,
+    b: &mut Instance,
+    program_a: &Program,
+    program_b: &Program,
+) -> Result<(), TestCaseError> {
+    let outcome = run_two_instance_convergence(
+        InstanceRun {
+            label: a.label,
+            backend: &mut a.backend,
+            pool: &a.pool,
+            program: program_a,
+        },
+        InstanceRun {
+            label: b.label,
+            backend: &mut b.backend,
+            pool: &b.pool,
+            program: program_b,
+        },
+        MAX_CHECKS_PER_RUN,
+    )
+    .await
+    .map_err(describe)?;
+
+    if outcome.as_pass() {
+        Ok(())
+    } else {
+        Err(TestCaseError::fail(format!("run did not pass: {outcome}")))
+    }
+}
+
 /// Runs `program_a` and `program_b` as two side-by-side instances in one
 /// freshly-created isolated database.
 fn run_one(program_a: &Program, program_b: &Program) -> Result<(), TestCaseError> {
@@ -231,30 +317,103 @@ fn run_one(program_a: &Program, program_b: &Program) -> Result<(), TestCaseError
             let db = h.cluster.create_isolated_database().await;
             let mut a = stand_up(&db, InstanceLabel::A, "a").await;
             let mut b = stand_up(&db, InstanceLabel::B, "b").await;
+            run_pair(&mut a, &mut b, program_a, program_b).await
+        })
+    })
+}
 
-            let outcome = run_two_instance_convergence(
-                InstanceRun {
-                    label: a.label,
-                    backend: &mut a.backend,
-                    pool: &a.pool,
-                    program: program_a,
-                },
-                InstanceRun {
-                    label: b.label,
-                    backend: &mut b.backend,
-                    pool: &b.pool,
-                    program: program_b,
-                },
-                MAX_CHECKS_PER_RUN,
+/// Instances over one source table (shape 1): `writer` creates and writes it
+/// in `public`, `reader` only reads it. Each instance keeps its own targets
+/// in its own schema, so both can name a target `d0`.
+async fn stand_up_sharing_a_source(db: &TestDatabase) -> (Instance, Instance) {
+    let a = stand_up_in(
+        db,
+        InstanceLabel::A,
+        "trellis_a",
+        "targets_a",
+        SourceTables::SharedCreate,
+    )
+    .await;
+    let b = stand_up_in(
+        db,
+        InstanceLabel::B,
+        "trellis_b",
+        "targets_b",
+        SourceTables::SharedExisting,
+    )
+    .await;
+    (a, b)
+}
+
+/// Instances in a chain (shape 2): A keeps its targets in `public`, where B's
+/// `search_path` finds them by bare name, and B reads them as its source
+/// tables.
+async fn stand_up_chain(db: &TestDatabase) -> (Instance, Instance) {
+    let a = stand_up_in(
+        db,
+        InstanceLabel::A,
+        "trellis_a",
+        "public",
+        SourceTables::Own,
+    )
+    .await;
+    let b = stand_up_in(
+        db,
+        InstanceLabel::B,
+        "trellis_b",
+        "targets_b",
+        SourceTables::SharedExisting,
+    )
+    .await;
+    (a, b)
+}
+
+fn run_sharing_a_source(program: &Program) -> Result<(), TestCaseError> {
+    let (writer, reader) = share_source(program);
+    HARNESS.with(|h| {
+        h.runtime.block_on(async {
+            let db = h.cluster.create_isolated_database().await;
+            let (mut a, mut b) = stand_up_sharing_a_source(&db).await;
+            run_pair(&mut a, &mut b, &writer, &reader).await
+        })
+    })
+}
+
+fn run_chain(program: &Program, chained: &Program) -> Result<(), TestCaseError> {
+    HARNESS.with(|h| {
+        h.runtime.block_on(async {
+            let db = h.cluster.create_isolated_database().await;
+            let (mut a, mut b) = stand_up_chain(&db).await;
+            run_pair(&mut a, &mut b, program, chained).await
+        })
+    })
+}
+
+/// Two instances in two databases of one cluster, both in the default
+/// `trellis` catalog schema and the default `public` target schema, which is
+/// the shape of one process serving a database per tenant (shape 3).
+fn run_in_two_databases(program_a: &Program, program_b: &Program) -> Result<(), TestCaseError> {
+    HARNESS.with(|h| {
+        h.runtime.block_on(async {
+            let db_a = h.cluster.create_isolated_database().await;
+            let db_b = h.cluster.create_isolated_database().await;
+            let mut a = stand_up_in(
+                &db_a,
+                InstanceLabel::A,
+                "trellis",
+                "public",
+                SourceTables::Own,
             )
-            .await
-            .map_err(describe)?;
-
-            if outcome.as_pass() {
-                Ok(())
-            } else {
-                Err(TestCaseError::fail(format!("run did not pass: {outcome}")))
-            }
+            .await;
+            let mut b = stand_up_in(
+                &db_b,
+                InstanceLabel::B,
+                "trellis",
+                "public",
+                SourceTables::Own,
+            )
+            .await;
+            run_pair(&mut a, &mut b, program_a, program_b).await
         })
     })
 }
@@ -274,6 +433,43 @@ proptest! {
         program_b in trivial_program(),
     ) {
         run_one(&program_a, &program_b)?;
+    }
+
+    /// Shape 1 (issue #879): two instances define transforms over the same
+    /// source tables, and each matches the oracle over them while one program
+    /// churns them. The instances are separated by their schemas alone, as
+    /// above, but now they capture the same tables as well.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_two_instances_over_one_source_each_match_the_oracle(
+        program in trivial_program(),
+    ) {
+        run_sharing_a_source(&program)?;
+    }
+
+    /// Shape 2 (issue #879): instance B defines transforms over instance A's
+    /// one-to-one targets, and matches the oracle over A's targets while A's
+    /// program churns its own sources. A program with no one-to-one
+    /// definition has nothing for B to read and is discarded.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_an_instance_reading_another_instances_target_matches_the_oracle(
+        program in trivial_program(),
+    ) {
+        let chained = chain_off(&program);
+        prop_assume!(chained.is_some());
+        run_chain(&program, &chained.expect("assumed above"))?;
+    }
+
+    /// Shape 3 (issue #879): two instances in two databases of one cluster,
+    /// in the same catalog schema, each match their own oracle.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_two_instances_in_two_databases_each_match_their_own_oracle(
+        program_a in trivial_program(),
+        program_b in trivial_program(),
+    ) {
+        run_in_two_databases(&program_a, &program_b)?;
     }
 }
 
@@ -344,4 +540,343 @@ async fn two_hand_built_instances_in_one_database_each_converge_independently() 
         )
     });
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
+}
+
+/// Asserts that each instance schema in `schemas` has its capture trigger
+/// installed on `schema.table`, so a run over it is known to have captured
+/// it rather than merely not noticed it.
+async fn assert_captured_by(db: &TestDatabase, schema: &str, table: &str, instances: &[&str]) {
+    let rows = db
+        .pool
+        .get()
+        .await
+        .expect("checkout")
+        .query(
+            "select tgname from pg_trigger \
+             where tgrelid = format('%I.%I', $1::text, $2::text)::regclass and not tgisinternal",
+            &[&schema, &table],
+        )
+        .await
+        .expect("read triggers");
+    let triggers: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    for instance in instances {
+        let expected = format!("{instance}_capture_insert");
+        assert!(
+            triggers.contains(&expected),
+            "{schema}.{table} should be captured by {instance}: {triggers:?}"
+        );
+    }
+}
+
+/// Shape 1, hand-built: one table, three transforms (two one-to-one and an
+/// aggregate), churned by inserts, updates, group moves, deletes, a rejected
+/// duplicate insert and a truncate. A's instance defines the first two
+/// transforms and writes; B's defines the last two, so the second
+/// transform is defined in both instances.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_instances_over_one_source_table_each_match_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let seeds = vec![
+        (Some(10), Some(1)),
+        (Some(20), Some(2)),
+        (Some(30), None),
+        (None, Some(4)),
+    ];
+    let mutates = vec![
+        Mutate::Update {
+            pk: 1,
+            c1: Some(100),
+            c2: Some(5),
+        },
+        Mutate::MoveGroup {
+            pk: 2,
+            grain: Some(3),
+        },
+        Mutate::Delete { pk: 3 },
+        Mutate::Truncate,
+        Mutate::DuplicateInsert {
+            pk: 4,
+            c1: Some(1),
+            c2: Some(1),
+        },
+        Mutate::DuplicateInsert {
+            pk: 1,
+            c1: Some(6),
+            c2: None,
+        },
+        Mutate::Update {
+            pk: 1,
+            c1: None,
+            c2: Some(9),
+        },
+    ];
+    let program = build_program_multi_with_shapes(
+        &[TableSpec::numeric_only(seeds, mutates)],
+        &[
+            (0, DefShape::OneToOne),
+            (
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count, AggregateFn::Sum(AggregateColumn::C1)],
+                },
+            ),
+            (0, DefShape::OneToOne),
+        ],
+    );
+    let (writer, reader) = share_source(&program);
+    assert_eq!(writer.defs.len(), 2);
+    assert_eq!(reader.defs.len(), 2);
+
+    let (mut a, mut b) = stand_up_sharing_a_source(&db).await;
+    run_pair(&mut a, &mut b, &writer, &reader)
+        .await
+        .unwrap_or_else(|err| panic!("two instances over one source table: {err}"));
+
+    // The run only means something if both instances really captured the one
+    // table, each with triggers of its own.
+    assert_captured_by(
+        &db,
+        "public",
+        &program.tables[0].name,
+        &["trellis_a", "trellis_b"],
+    )
+    .await;
+}
+
+/// Shape 2, hand-built: A maintains a one-to-one target in `public` from its
+/// own source, and B maintains a target from A's, through every kind of
+/// write A's source takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instance_reading_another_instances_target_matches_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = chain_program();
+    let chained = chain_off(&program).expect("a one-to-one definition to chain off");
+
+    let (mut a, mut b) = stand_up_chain(&db).await;
+    run_pair(&mut a, &mut b, &program, &chained)
+        .await
+        .unwrap_or_else(|err| panic!("B over A's target: {err}"));
+
+    // A's target is B's source, so B captured it.
+    assert_captured_by(&db, "public", &program.defs[0].target, &["trellis_b"]).await;
+}
+
+/// The first instance's program for the chain pins: a one-to-one transform
+/// whose target takes inserts, updates, a null, a delete and a revival.
+fn chain_program() -> Program {
+    build_program(
+        &[
+            (Some(10), Some(1)),
+            (Some(20), Some(2)),
+            (Some(30), Some(3)),
+        ],
+        &[
+            Mutate::Update {
+                pk: 1,
+                c1: Some(100),
+                c2: Some(5),
+            },
+            Mutate::Delete { pk: 2 },
+            Mutate::Update {
+                pk: 3,
+                c1: None,
+                c2: Some(7),
+            },
+            Mutate::DuplicateInsert {
+                pk: 2,
+                c1: Some(8),
+                c2: Some(8),
+            },
+        ],
+    )
+}
+
+/// Shape 3, hand-built: the same two programs as the same-database pin, in
+/// two databases that use the same schema names.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_instances_in_two_databases_each_converge_independently() {
+    let program_a = chain_program();
+    let program_b = build_program(
+        &[(Some(7000), Some(700)), (Some(8000), Some(800))],
+        &[Mutate::Delete { pk: 1 }],
+    );
+    let cluster = TestCluster::start();
+    let db_a = cluster.create_isolated_database().await;
+    let db_b = cluster.create_isolated_database().await;
+    let mut a = stand_up_in(
+        &db_a,
+        InstanceLabel::A,
+        "trellis",
+        "public",
+        SourceTables::Own,
+    )
+    .await;
+    let mut b = stand_up_in(
+        &db_b,
+        InstanceLabel::B,
+        "trellis",
+        "public",
+        SourceTables::Own,
+    )
+    .await;
+    run_pair(&mut a, &mut b, &program_a, &program_b)
+        .await
+        .unwrap_or_else(|err| panic!("two instances in two databases: {err}"));
+}
+
+/// Applies `op` to `instance` and checks its outcome is the one the program
+/// expects, as the runner does.
+async fn apply_expecting(instance: &mut Instance, op: &generative::model::Op) {
+    let actual = match instance.backend.apply(op).await {
+        Err(_) => OpOutcome::Fails,
+        Ok(0) => OpOutcome::AffectsNoRows,
+        Ok(_) => OpOutcome::Succeeds,
+    };
+    assert!(op.expect().matches(&actual), "{op:?} gave {actual:?}");
+}
+
+/// Quiesces `instance` and checks every definition of `program` against the
+/// oracle over the database as it is.
+async fn assert_converged(instance: &mut Instance, program: &Program, when: &str) {
+    instance.backend.quiesce().await.expect("quiesce");
+    let snapshot = instance.backend.snapshot().await.expect("snapshot");
+    let diverged = check_program(&instance.pool, program, &snapshot)
+        .await
+        .expect("the oracle reads the database");
+    assert!(
+        diverged.is_empty(),
+        "instance {} {when}: {}",
+        instance.label,
+        diverged
+            .iter()
+            .map(|(target, report)| format!("{target}: {report}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// `program` without its first definition: what is left of an instance after
+/// the operator drops that transform.
+fn without_first_definition(program: &Program) -> Program {
+    let mut rest = program.clone();
+    rest.defs.remove(0);
+    rest.def_install_after_op.remove(0);
+    rest
+}
+
+/// Shape 2's other half: instance A drops a transform whose target instance B
+/// reads, while B has changes to that target staged and not yet applied.
+///
+/// B's staging worker is stopped while A writes, so A's writes to both of its
+/// targets land in B's ring through B's capture triggers and wait there. A then
+/// drops the first transform, which drops its target table and B's triggers on
+/// it, and B's worker starts again. Its first batch holds rows naming a table
+/// that no longer exists, which is the dropped-source path
+/// (`ApplyError::SourceTableDropped`): the apply purges them and goes on.
+///
+/// What must hold: B's ring drains rather than wedging, B's other transform
+/// (over A's second target) is still maintained and matches the oracle for
+/// the writes staged before the drop and the ones after it, and B's operator
+/// can drop the transform that lost its source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let seeds = vec![
+        (Some(10), Some(1)),
+        (Some(20), Some(2)),
+        (Some(30), Some(3)),
+    ];
+    let update = |pk, c1, c2| Mutate::Update { pk, c1, c2 };
+    let mutates = vec![
+        update(1, Some(100), Some(5)),
+        update(2, Some(7), None),
+        Mutate::Delete { pk: 3 },
+        // Written while B's worker is stopped.
+        update(1, Some(11), Some(12)),
+        Mutate::DuplicateInsert {
+            pk: 3,
+            c1: Some(8),
+            c2: Some(8),
+        },
+        update(2, None, Some(2)),
+        // Written after A has dropped the first transform.
+        update(1, Some(1), Some(1)),
+        Mutate::Delete { pk: 2 },
+    ];
+    let program = build_program_multi(&[TableSpec::numeric_only(seeds, mutates)], &[0, 0]);
+    let chained = chain_off(&program).expect("two one-to-one definitions to chain off");
+    assert_eq!(chained.defs.len(), 2);
+    let ops = &program.ops;
+    let (staged_from, dropped_at) = (ops.len() - 5, ops.len() - 2);
+
+    let (mut a, mut b) = stand_up_chain(&db).await;
+    a.backend.install(&program).await.expect("install A");
+    b.backend.install(&chained).await.expect("install B");
+
+    for op in &ops[..staged_from] {
+        apply_expecting(&mut a, op).await;
+    }
+    assert_converged(&mut a, &program, "before the drop").await;
+    assert_converged(&mut b, &chained, "before the drop").await;
+
+    // B's worker stops; A's writes go on and reach B's ring only.
+    b.backend.stop_engine().await.expect("stop B's worker");
+    for op in &ops[staged_from..dropped_at] {
+        apply_expecting(&mut a, op).await;
+    }
+    a.backend.quiesce().await.expect("A applies its writes");
+    let dropped = program.defs[0].target.clone();
+    assert!(
+        b.backend.has_pending().await.expect("read B's ring"),
+        "A's writes to its targets should be staged in B's ring"
+    );
+    // The ring is four fixed tables (`staging::append::RING_SIZE`).
+    let staged_for_it = (0..4)
+        .map(|slot| format!("select 1 from seg_{slot} where src_table = 'public.{dropped}'"))
+        .collect::<Vec<_>>()
+        .join(" union all ");
+    assert!(
+        b.backend
+            .execute_raw(&staged_for_it)
+            .await
+            .expect("read B's ring")
+            > 0,
+        "rows naming {dropped} should be staged in B's ring"
+    );
+
+    // A drops the first transform; B finds out only from the rows it staged.
+    a.backend
+        .drop_transform(&dropped)
+        .await
+        .expect("A drops it");
+    b.backend.forget_table(&dropped);
+    b.backend.start_engine().await.expect("start B's worker");
+    let program_a = without_first_definition(&program);
+    let program_b = without_first_definition(&chained);
+    assert_converged(&mut a, &program_a, "after the drop").await;
+    b.backend
+        .quiesce()
+        .await
+        .expect("B's ring drains past the dropped table");
+    // B's transform over it is still `live`, with nothing to say its source is
+    // gone (#999), so the operator drops it.
+    let lost_source = chained.defs[0].target.clone();
+    b.backend
+        .drop_transform(&lost_source)
+        .await
+        .expect("B drops it");
+    assert_converged(&mut b, &program_b, "after reading a dropped source").await;
+
+    // The writes that come after are still maintained in both.
+    for op in &ops[dropped_at..] {
+        apply_expecting(&mut a, op).await;
+    }
+    assert_converged(&mut a, &program_a, "after the drop's writes").await;
+    assert_converged(&mut b, &program_b, "after the drop's writes").await;
 }

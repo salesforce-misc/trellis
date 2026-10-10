@@ -351,6 +351,25 @@ fn noise_sql_literal(value: &Option<String>) -> String {
     }
 }
 
+/// Where a [`ManualBackend`] keeps the source tables of the programs it
+/// installs (issue #879).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceTables {
+    /// In the instance's own catalog schema, which is first on the backend's
+    /// `search_path`. The instance's own writes are the only ones the table
+    /// sees, which is what every single-instance run wants.
+    #[default]
+    Own,
+    /// In `public`, created by this backend. Several instances can read a
+    /// table there, each through its own `search_path`, and the program that
+    /// owns the writes is the one this backend installs.
+    SharedCreate,
+    /// Already in `public`, because another backend created it or because it
+    /// is another instance's transform target. [`Backend::install`] only
+    /// registers it, so the backend can snapshot it and apply ops to it.
+    SharedExisting,
+}
+
 /// The manual backend. Owns a raw connection (DDL, DML, watermark reads,
 /// snapshot reads) and, once [`ManualBackend::install`] has run, a live
 /// [`EngineClient`] draining sealed batches into every installed
@@ -412,6 +431,8 @@ pub struct ManualBackend {
     /// would collide for reasons that have nothing to do with instance
     /// isolation.
     target_schema: String,
+    /// Where [`Backend::install`] puts a program's source tables.
+    source_tables: SourceTables,
     /// The resolved [`Config`] this backend's [`Pool`] and every
     /// [`EngineClient`] it starts are built from — carrying
     /// the instance schema and [`Self::target_schema`] (issue #234). Kept whole
@@ -553,6 +574,7 @@ impl ManualBackend {
             reconcile_interval: None,
             reclaim_ttl: None,
             target_schema,
+            source_tables: SourceTables::Own,
             config,
             operator: None,
         })
@@ -585,6 +607,37 @@ impl ManualBackend {
     /// [`ManualBackend::connect_to_restore`] carries it over.
     pub fn set_reclaim_ttl(&mut self, ttl: Duration) {
         self.reclaim_ttl = Some(ttl);
+    }
+
+    /// Chooses where [`Backend::install`] puts the source tables (issue
+    /// #879). Call before installing. [`SourceTables::Own`] by default.
+    pub fn set_source_tables(&mut self, source_tables: SourceTables) {
+        self.source_tables = source_tables;
+    }
+
+    /// Stops reading `table`, which the database no longer has: a later
+    /// [`Backend::snapshot`] leaves it out, and [`Backend::apply`] refuses an
+    /// op naming it (issue #879: another instance dropped the transform whose
+    /// target this instance read as a source).
+    pub fn forget_table(&mut self, table: &str) {
+        self.tables.remove(table);
+    }
+
+    /// `PAUSE TRANSFORM <target>` and then `DROP TRANSFORM <target>` (the
+    /// statement refuses a transform that isn't paused), through the public
+    /// `Trellis` facade an operator would use, and forgets the definition
+    /// here, so a later
+    /// [`Backend::quiesce`] or [`Backend::snapshot`] no longer expects it
+    /// (issue #879). The facade removes the target table with it.
+    pub async fn drop_transform(&mut self, target: &str) -> Result<(), ManualBackendError> {
+        let facade =
+            trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default())
+                .await?;
+        facade.apply(&format!("PAUSE TRANSFORM {target}")).await?;
+        facade.apply(&format!("DROP TRANSFORM {target}")).await?;
+        facade.shutdown().await?;
+        self.defs.retain(|def| def.target != target);
+        Ok(())
     }
 
     /// The highest `seg_seq` the drain audit has seen sealed, or `0` before
@@ -794,7 +847,11 @@ impl ManualBackend {
     /// function's doc comment for the exact DDL shape (`crate::model::PRIMARY_KEY_VALUE_TYPE`
     /// pk, per-column `UNIQUE`).
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
-        Ok(sql::create_source_table(&self.raw, table).await?)
+        let schema = match self.source_tables {
+            SourceTables::Own => None,
+            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
+        };
+        Ok(sql::create_source_table(&self.raw, schema, table).await?)
     }
 
     async fn install_definition(&mut self, def: &TransformDef) -> Result<(), ManualBackendError> {
@@ -1022,7 +1079,9 @@ impl super::Backend for ManualBackend {
 
     async fn install(&mut self, program: &Program) -> Result<(), ManualBackendError> {
         for table in &program.tables {
-            self.create_source_table(table).await?;
+            if self.source_tables != SourceTables::SharedExisting {
+                self.create_source_table(table).await?;
+            }
             self.tables.insert(table.name.clone(), table.clone());
         }
         // Issue #34: every relationship is declared before any definition,

@@ -221,11 +221,21 @@ pub(super) fn assignment(
 /// key declared from its own [`crate::model::PRIMARY_KEY_VALUE_TYPE`]
 /// (`bigint`), a single-column `UNIQUE` constraint
 /// on every column named in `table.unique_cols`.
+///
+/// `schema` qualifies the table's name (`None` leaves it to the session's
+/// `search_path`, which is the instance schema): a source table that more than
+/// one Trellis instance reads is created in `public`, outside every
+/// instance's catalog schema.
 pub(super) async fn create_source_table(
     raw: &tokio_postgres::Client,
+    schema: Option<&str>,
     table: &Table,
 ) -> Result<(), tokio_postgres::Error> {
-    let mut sql = format!("create table {} (", quote_ident(&table.name));
+    let name = match schema {
+        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
+        None => quote_ident(&table.name),
+    };
+    let mut sql = format!("create table {name} (");
     for (i, column) in table.columns.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");

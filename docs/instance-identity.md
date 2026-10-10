@@ -141,6 +141,13 @@ one database to keep this honest; it found two real gaps, both since closed:
   fine for a one-instance process, wrong for anything holding a `Config` (like
   `Trellis`) and impossible for two instances in one process.
 
+The same test file also runs the shapes planned for production use (issue
+#879): two instances that define transforms over one source table, an instance
+that reads another's one-to-one target (including the other dropping the
+transform that builds it), and two instances in two databases of one cluster,
+each in the default catalog schema. The Elixir client's `two_handles_test.exs`
+runs the first two with two supervised handles under distinct `:name`s.
+
 Capture triggers are named after the instance schema
 (`capture::sql::trigger_name`), and their functions live in it, so two
 instances can capture one table without replacing each other's triggers.

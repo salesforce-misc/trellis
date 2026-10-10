@@ -46,12 +46,17 @@
 //! separate correctness stories, and merging them would be exactly the way to
 //! let one hide the other.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use trellis::Pool;
+use trellis::dev::defs::ast::{
+    Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
 
 use crate::backend::Backend;
-use crate::model::{OpOutcome, Program};
+use crate::model::{Column, OpOutcome, PRIMARY_KEY_VALUE_TYPE, Program, Table};
+use crate::oracle;
 
 use super::{Divergence, Outcome, RunError, check_program};
 
@@ -307,4 +312,209 @@ fn reject_unsupported_schedule<B: Backend>(
         )));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The shapes planned for production use (issue #879, epic #806)
+// ---------------------------------------------------------------------------
+//
+// [`run_two_instance_convergence`] already holds two programs side by side and
+// checks each against its own oracle. It does not care whether the programs
+// share a source table, or whether one reads the other's target: that is
+// decided by what the two programs *declare* and by where each backend puts
+// their tables ([`crate::backend::SourceTables`]). These functions build the
+// program pairs for the two cross-instance shapes, so the harness can hand
+// them to the same runner.
+
+/// What `run_two_instance_convergence` needs from a program that is not the
+/// one writing: nothing scheduled, so every definition installs up front and
+/// no op, restart or scale-out is left for the other side to run.
+fn read_only_program(
+    tables: Vec<Table>,
+    relationships: Vec<crate::model::Relationship>,
+    defs: Vec<TransformDef>,
+) -> Program {
+    Program {
+        def_install_after_op: vec![0; defs.len()],
+        tables,
+        relationships,
+        defs,
+        ops: Vec::new(),
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
+    }
+}
+
+/// Splits `program` between two instances that share its source tables.
+///
+/// The first program is `program` with the first half of its definitions and
+/// every op: its instance creates the tables and writes them. The second is
+/// the second half of the definitions over the same tables and no ops: its
+/// instance only reads. The halves overlap by one definition when there is an
+/// odd number of them, and with a single definition both instances define it,
+/// so every program has at least one definition and the two instances
+/// capture at least one table in common.
+///
+/// Each instance is checked against the oracle over the one set of source
+/// tables, so a write one instance's capture mishandles, or a trigger of one
+/// that disturbs the other's, shows up as a divergence on one side only.
+///
+/// `program` must not schedule anything the runner refuses
+/// ([`run_two_instance_convergence`]).
+pub fn share_source(program: &Program) -> (Program, Program) {
+    let n = program.defs.len();
+    assert!(n > 0, "share_source needs a definition to give each side");
+    let mut writer = program.clone();
+    writer.defs.truncate(n.div_ceil(2));
+    writer.def_install_after_op.truncate(n.div_ceil(2));
+    let reader = read_only_program(
+        program.tables.clone(),
+        program.relationships.clone(),
+        program.defs[n / 2..].to_vec(),
+    );
+    (writer, reader)
+}
+
+/// The second instance's program for a chain: it reads the first instance's
+/// one-to-one targets as its source tables and has nothing of its own to
+/// write. `None` when the first program defines no one-to-one transform. An
+/// aggregate target can't be read by another instance (it has no primary key
+/// to capture by, issue #376), so those are left out.
+///
+/// Each source table is modelled from the definition that builds it: the
+/// source's primary key column, then one column per field, typed as the
+/// oracle types the field. The second instance's definition for it copies
+/// every field, and adds `<field>_twice` (`field + field`) for the first
+/// numeric one, so its target holds both values read straight off the first
+/// instance's target and a value computed from it. Its targets are named
+/// `e0`, `e1`, ... in the order of the first program's definitions.
+///
+/// The first instance must keep its targets where the second instance's
+/// `search_path` finds them by bare name (`public`).
+pub fn chain_off(program: &Program) -> Option<Program> {
+    let mut tables = Vec::new();
+    let mut defs = Vec::new();
+    for def in &program.defs {
+        if def.key_space != KeySpace::OneToOne {
+            continue;
+        }
+        let source = program
+            .tables
+            .iter()
+            .find(|t| t.name == def.source)
+            .unwrap_or_else(|| {
+                panic!("definition reads {:?}, which the program lacks", def.source)
+            });
+        let source_columns: HashMap<String, ValueType> = source
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.value_type))
+            .collect();
+        let field_types = oracle::field_types(program, def, &source_columns);
+
+        let mut columns = vec![Column {
+            name: source.pk_col.clone(),
+            value_type: PRIMARY_KEY_VALUE_TYPE,
+        }];
+        columns.extend(field_types.iter().map(|(name, value_type)| Column {
+            name: name.clone(),
+            value_type: *value_type,
+        }));
+        let mut fields: Vec<FieldDef> = field_types
+            .iter()
+            .map(|(name, _)| FieldDef {
+                name: name.clone(),
+                expr: Expr::Column(name.clone()),
+            })
+            .collect();
+        if let Some((name, _)) = field_types
+            .iter()
+            .find(|(_, value_type)| *value_type == ValueType::Numeric)
+        {
+            fields.push(FieldDef {
+                name: format!("{name}_twice"),
+                expr: Expr::BinaryOp {
+                    op: Operator::Add,
+                    lhs: Box::new(Expr::Column(name.clone())),
+                    rhs: Box::new(Expr::Column(name.clone())),
+                },
+            });
+        }
+        defs.push(TransformDef {
+            target: format!("e{}", defs.len()),
+            explicit_target_schema: None,
+            source: def.target.clone(),
+            explicit_source_schema: None,
+            key_space: KeySpace::OneToOne,
+            fields,
+            predicate: Predicate::True,
+        });
+        tables.push(Table {
+            name: def.target.clone(),
+            pk_col: source.pk_col.clone(),
+            columns,
+            unique_cols: Vec::new(),
+        });
+    }
+    (!defs.is_empty()).then(|| read_only_program(tables, Vec::new(), defs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generate::{Mutate, TableSpec, build_program, build_program_multi};
+
+    fn seeds() -> Vec<(Option<i64>, Option<i64>)> {
+        vec![(Some(1), Some(2)), (Some(3), None)]
+    }
+
+    #[test]
+    fn a_shared_source_goes_to_both_sides_and_only_the_first_writes() {
+        let program = build_program(&seeds(), &[Mutate::Delete { pk: 1 }]);
+        let (writer, reader) = share_source(&program);
+        assert_eq!(writer.tables, reader.tables);
+        assert_eq!(writer.ops, program.ops);
+        assert!(reader.ops.is_empty());
+        // One definition: both define it.
+        assert_eq!(writer.defs, program.defs);
+        assert_eq!(reader.defs, program.defs);
+        assert_eq!(reader.def_install_after_op, vec![0]);
+    }
+
+    #[test]
+    fn the_definitions_split_with_one_in_common_when_odd() {
+        let spec = || TableSpec::numeric_only(seeds(), Vec::new());
+        let program = build_program_multi(&[spec()], &[0, 0, 0]);
+        let (writer, reader) = share_source(&program);
+        assert_eq!(writer.defs, program.defs[..2]);
+        assert_eq!(reader.defs, program.defs[1..]);
+        assert_eq!(writer.def_install_after_op.len(), writer.defs.len());
+        let program = build_program_multi(&[spec()], &[0, 0]);
+        let (writer, reader) = share_source(&program);
+        assert_eq!(writer.defs, program.defs[..1]);
+        assert_eq!(reader.defs, program.defs[1..]);
+    }
+
+    #[test]
+    fn a_chain_reads_the_first_programs_target_as_a_table_of_its_own() {
+        let program = build_program(&seeds(), &[]);
+        let def = &program.defs[0];
+        let chained = chain_off(&program).expect("the program has a one-to-one definition");
+        assert!(chained.ops.is_empty());
+        let [table] = &chained.tables[..] else {
+            panic!("one source table: {:?}", chained.tables)
+        };
+        let [read] = &chained.defs[..] else {
+            panic!("one definition: {:?}", chained.defs)
+        };
+        assert_eq!(table.name, def.target);
+        assert_eq!(read.source, def.target);
+        // The primary key, then every field of the first program's definition.
+        assert_eq!(table.columns.len(), 1 + def.fields.len());
+        assert_eq!(table.columns[0].name, table.pk_col);
+        // Every field is copied, and the numeric one is doubled.
+        let copied: Vec<&str> = read.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(copied.contains(&"total"), "{copied:?}");
+        assert!(copied.contains(&"total_twice"), "{copied:?}");
+    }
 }

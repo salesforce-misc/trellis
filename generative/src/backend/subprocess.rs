@@ -516,7 +516,7 @@ impl super::Backend for SubprocessBackend {
 
     async fn install(&mut self, program: &Program) -> Result<(), SubprocessBackendError> {
         for table in &program.tables {
-            sql::create_source_table(&self.raw, table).await?;
+            sql::create_source_table(&self.raw, None, table).await?;
             self.tables.insert(table.name.clone(), table.clone());
         }
         // Issue #34: relationships before definitions — see

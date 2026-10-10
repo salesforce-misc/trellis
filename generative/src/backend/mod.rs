@@ -18,7 +18,7 @@ mod subprocess;
 
 pub use manual::{
     ManualApplier, ManualBackend, ManualBackendError, SEAL_ON_DEMAND_INTERVAL,
-    SERVER_STOP_RECLAIM_TTL, await_pool_usable,
+    SERVER_STOP_RECLAIM_TTL, SourceTables, await_pool_usable,
 };
 pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 
