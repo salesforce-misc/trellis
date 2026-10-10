@@ -864,6 +864,20 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
         .quiesce()
         .await
         .expect("B's ring drains past the dropped table");
+    // The drain purged every staged row naming it, not only the ones in the
+    // batch it happened to fold (`quarantine::purge_dropped_table`). A drained
+    // segment keeps its rows until it is recycled, so without the purge some
+    // would still be here. This holds while B's transform over the dropped
+    // table stays `live` (#999), so the drain reads its rows rather than
+    // skipping them as a paused reader's.
+    assert_eq!(
+        b.backend
+            .execute_raw(&staged_for_it)
+            .await
+            .expect("read B's ring"),
+        0,
+        "B's ring should hold no rows naming {dropped} once it has drained"
+    );
     // B's transform over it is still `live`, with nothing to say its source is
     // gone (#999), so the operator drops it.
     let lost_source = chained.defs[0].target.clone();

@@ -119,13 +119,15 @@ defmodule Trellis.TwoHandlesTest do
     start_instance!(@b, "two_shared_b", "two_shared_b_targets")
 
     Trellis.define!(@a, "TRANSFORM shared_prices FROM two_shared_src SELECT price AS price")
+    # A captures the table before B defines anything over it, so B's capture
+    # has to go in next to A's rather than racing it in.
+    await_live(@a, "shared_prices")
 
     Trellis.define!(
       @b,
       "TRANSFORM shared_doubled FROM two_shared_src SELECT price + price AS doubled"
     )
 
-    await_live(@a, "shared_prices")
     await_live(@b, "shared_doubled")
 
     # Existing rows were carried across by the backfills.
