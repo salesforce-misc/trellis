@@ -61,11 +61,14 @@ pub enum ErrorCode {
     /// nothing and succeeds on a retry once they commit, and a column pause,
     /// resume, define, `ALTER` or `DROP TRANSFORM` waiting out the lock
     /// timeout for the column-pause lock (issue #922), which is the same
-    /// kind of wait. Kept apart from
+    /// kind of wait. It is also any public call running out of its deadline
+    /// ([`crate::TrellisError::CallTimeout`], issue #599): the server stopped
+    /// what the call started and rolled it back. Kept apart from
     /// `Internal` so a host can tell it from a bug (issue #586). Not every
-    /// timeout is this: a pool checkout timing out is `Connectivity`, and any
-    /// other Postgres statement or lock timeout is classified by its SQLSTATE
-    /// like any other server error.
+    /// timeout is this: a pool checkout timing out before the call's deadline
+    /// is `Connectivity`, and any other Postgres statement or lock timeout
+    /// that fires before it is classified by its SQLSTATE like any other
+    /// server error.
     Timeout,
     /// Anything else: engine-internal failures, "should not happen"
     /// invariants, IO failures, and Postgres errors with no more specific

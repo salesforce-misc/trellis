@@ -404,9 +404,9 @@ module Trellis
     # It waits for captured changes only: a transform that isn't :live yet
     # may still be missing rows when this returns (see #status).
     #
-    # The instance runs one call at a time, so every other call on it, from
-    # any thread, waits behind this one for up to timeout_ms. Size it
-    # accordingly.
+    # Like every call, it returns within 30 seconds: a longer timeout_ms is
+    # cut to that, and a caller that wants to wait longer calls again. Calls
+    # from other threads don't wait behind it.
     def await_converged(token, timeout_ms:)
       string!("the token", token)
       timeout_ms!(timeout_ms)
@@ -436,8 +436,8 @@ module Trellis
     #   report = trellis.self_check("order_totals", limit: 1_000, timeout_ms: 30_000,
     #                               after: report.next_after)
     #
-    # The instance runs one call at a time, and this one can hold it for up to
-    # timeout_ms per wait plus the comparison of up to `limit` keys. To sweep
+    # It runs for up to timeout_ms per wait plus the comparison of up to
+    # `limit` keys, holding one of the instance's pooled connections. To sweep
     # a large target alongside live traffic, run the audit in a process of
     # its own, connected with the defaults so it runs no background work.
     def self_check(target_table, limit:, timeout_ms:, after: nil, mode: :standard)

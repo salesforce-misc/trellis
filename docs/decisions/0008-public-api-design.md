@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-09-12
+date: 2026-10-10
 deciders: Michael Ries
 ---
 
@@ -88,7 +88,7 @@ a giant `match` over every internal variant).
 `#[non_exhaustive]` enum of coarse categories an FFI caller would branch on
 (`Parse`, `Validation`, `Connectivity`, `Conflict`, `NotFound`, `Timeout`,
 `Internal`). `Timeout` exists because `await_converged` running out of time, or a call
-running out of its deadline ([decision 6](#6-every-public-call-returns-within-30-seconds-599)),
+running out of its deadline ([decision 6](#6-every-public-call-returns-within-30-seconds)),
 is an expected, retryable outcome that a host must be able to tell from a bug.
 Every caller-facing error type (`TrellisError`, `ClientError`, `CatalogError`,
 `ApplyError`, ...) has a `code()` method, with SQLSTATE-based
@@ -131,13 +131,12 @@ storage and fuse design. What it settles (`V21__column_quarantine.sql`):
 * Threshold, escalation, paused-value semantics, and propagation to dependents
   are settled in [ADR-0003](0003-quarantine-storage-and-api.md).
 
-### 6. Every public call returns within 30 seconds (#599)
+### 6. Every public call returns within 30 seconds
 
-A call that waits on the database forever takes its caller with it. The Ruby
-binding's interrupted call left a helper thread behind; the Elixir binding's held a
-dirty scheduler; and a stuck call blocked every call behind it, because
-`BlockingTrellis` ran its jobs one at a time. The abandoned *work* kept running too:
-dropping a future doesn't stop its statement on the server.
+A call that waits on the database without bound takes its caller with it: an
+interrupted binding call holds a thread or a dirty scheduler until the engine
+answers, and a stuck call blocks every call queued behind it. Abandoning the call
+isn't enough either: dropping a future doesn't stop its statement on the server.
 
 **Decision:** every call of `Trellis` and `BlockingTrellis` has a 30-second deadline
 (`DEFAULT_CALL_BUDGET`), counted from when it is submitted, so time queued for the job
@@ -151,8 +150,8 @@ through `status` ([decision 1](#1-synchronous-calls-at-the-ffi-boundary)).
   left when it begins. Postgres starts a timer per statement and the timer covers lock
   waits, so a statement stuck on a lock is abandoned by the server and its transaction
   rolls back. `cancel_query` is rejected: a cancel request can land on the connection's
-  *next* query, and a pooled connection's next query can be the background worker's
-  ([#596](https://github.com/salesforce-misc/trellis/issues/596)).
+  *next* query, and a pooled connection's next query can be another call's or the
+  background worker's.
 * **A client-side backstop.** The call's future is dropped one second after the
   deadline, for a connection that has stopped answering. The connection stays out of
   the pool until the server has finished with what the call left on it, and its
@@ -166,7 +165,7 @@ through `status` ([decision 1](#1-synchronous-calls-at-the-ffi-boundary)).
   running until the deadline, where the server stops it. The reply is dropped.
 * **Long waits are loops of bounded calls.** `await_converged` caps its `timeout` at
   the call's deadline, and a caller that wants longer calls again. `self_check`, a full
-  comparison, is to become a background job whose progress comes back through `status`.
+  comparison, starts a background job whose progress comes back through `status`.
 
 Rejected: cancel handles (racy, as above); unbounded calls unless the caller passes a
 timeout (every caller must remember to, and a queue still piles up behind a stuck

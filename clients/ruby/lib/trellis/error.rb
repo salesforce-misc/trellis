@@ -62,7 +62,8 @@ module Trellis
 
   # A bounded wait ran out of time, such as Trellis.await_converged's
   # timeout_ms, or Trellis.release_key's wait for the pages in flight on its
-  # table. The wait is over, not the work: retry it.
+  # table, or a call ran out of its 30-second deadline (the server stopped
+  # what the call started and rolled it back). Expected, not a bug: retry it.
   class TimeoutError < Error
     CODE = :timeout
   end

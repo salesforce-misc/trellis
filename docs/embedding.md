@@ -684,7 +684,9 @@ of it. To wait longer, call again: each call is one bounded wait.
 A `BlockingTrellis` runs its calls in parallel, so a call stuck on a lock
 doesn't hold up the calls made after it. A caller's own calls stay in order,
 because it waits for each reply. Calls from different threads have no order.
-The pool bounds how many run at once.
+The pool bounds how many run at once. The Elixir binding's `Trellis.Owner`
+still hands a handle's calls over one at a time, so an Elixir call can wait
+behind the calls ahead of it before its own 30 seconds start.
 
 ## Poll to `live`, don't wait
 

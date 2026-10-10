@@ -111,7 +111,9 @@ can't outlive the lock: a session that ends mid-attach rolls back its open
 migration and frees the lock together. Attaches to one database therefore run
 one at a time, and a second one waits for the first for up to five minutes
 (only that wait is that long; the migrations run under the usual
-`lock_timeout`), then fails with a lock timeout. Without it, two
+`lock_timeout`), then fails with a lock timeout. A `migrate` call waits no
+longer than its [30-second deadline](embedding.md#every-call-returns-within-30-seconds),
+and then fails with the `timeout` error. Without it, two
 conflicting instances starting together would each scan before the other wrote
 its marker and both pass, and two clients of one instance starting together
 would both run the migration runner on the same new schema.
