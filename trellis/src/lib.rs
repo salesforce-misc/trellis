@@ -76,6 +76,7 @@ pub mod app;
 pub mod blocking;
 pub mod client;
 pub mod config;
+pub(crate) mod deadline;
 pub mod error;
 pub mod error_code;
 pub mod float;
@@ -168,6 +169,7 @@ pub use client::{Client, ClientError, ClientOptions};
 
 // --- Tier 2: composable primitives ----------------------------------------
 pub use config::Config;
+pub use deadline::DEFAULT_CALL_BUDGET;
 pub use error::Error;
 pub use error_code::ErrorCode;
 pub use float::FloatWidth;

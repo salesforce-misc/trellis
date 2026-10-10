@@ -64,6 +64,19 @@
 //! relationship's projection from its to-side table (milestone E, #624,
 //! replaces it).
 //!
+//! **Every call returns within a deadline** (issue #599, `crate::deadline`):
+//! 30 seconds ([`DEFAULT_CALL_BUDGET`](crate::DEFAULT_CALL_BUDGET)) from when
+//! the call is made, a wait for a pooled connection included. What it started
+//! on the server is stopped by the server's own `statement_timeout`, not
+//! abandoned, and its transaction rolls back; the caller gets
+//! [`TrellisError::CallTimeout`], whose code is [`ErrorCode::Timeout`]. Two
+//! methods run outside it: [`Trellis::shutdown`], which ends background work
+//! rather than serving a request, and [`Trellis::self_check`], a full
+//! comparison that is to become a background job polled through
+//! [`Trellis::status`]. [`Trellis::connect`], [`Trellis::pool`],
+//! [`Trellis::config`] and [`Trellis::metrics`] make no call to the database
+//! that could wait.
+//!
 //! # Lifecycle
 //!
 //! ```no_run
@@ -179,6 +192,12 @@ pub struct TrellisOptions {
     /// client. A `Trellis::connect` that starts no client builds no runtime,
     /// so it never reads the cap.
     pub worker_threads: Option<usize>,
+    /// The deadline of each public call, in place of
+    /// [`DEFAULT_CALL_BUDGET`](crate::DEFAULT_CALL_BUDGET). Not part of the
+    /// contract: it exists so tests can exercise the deadline without waiting
+    /// out 30 seconds.
+    #[doc(hidden)]
+    pub call_deadline: Option<Duration>,
 }
 
 /// A connected Trellis instance — see the [module docs](self).
@@ -195,6 +214,9 @@ pub struct Trellis {
     /// The name this handle's log events carry as `trellis_instance`: its
     /// database and catalog schema (see [`crate::instance_log::name_of`]).
     instance: std::sync::Arc<str>,
+    /// How long each public call has to finish (issue #599,
+    /// `crate::deadline`).
+    call_budget: Duration,
     /// Keeps `trellis_instance_up` at 1 for this instance until the handle
     /// is dropped or shut down.
     _running: crate::metrics::RunningInstance,
@@ -221,10 +243,44 @@ impl Trellis {
         Ok(Self {
             _running: crate::metrics::RunningInstance::new(&instance),
             instance,
+            call_budget: options.call_deadline.unwrap_or(crate::DEFAULT_CALL_BUDGET),
             config,
             pool,
             client,
         })
+    }
+
+    /// Runs one public call: under this instance's name in the log, and
+    /// within its deadline (issue #599, `crate::deadline`). The wrapper of
+    /// every public method that touches the database except the two
+    /// documented on [`Trellis::shutdown`] and [`Trellis::self_check`].
+    fn call<'a, T: 'a>(
+        &'a self,
+        call: impl std::future::Future<Output = Result<T, TrellisError>> + Send + 'a,
+    ) -> impl std::future::Future<Output = Result<T, TrellisError>> + Send + 'a {
+        self.submitted(std::time::Instant::now(), call)
+    }
+
+    /// [`Trellis::call`] for a call that was submitted at `submitted`:
+    /// [`BlockingTrellis`](crate::BlockingTrellis) hands a job over a channel,
+    /// and the time it spends queued counts against the deadline.
+    ///
+    /// Boxes the call first, so the wrappers around it hold a pointer rather
+    /// than a copy of it each: the futures of `apply` and its kin are large,
+    /// and the deadline's layers would otherwise put several copies on the
+    /// stack of whatever polls them.
+    pub(crate) fn submitted<'a, T: 'a>(
+        &'a self,
+        submitted: std::time::Instant,
+        call: impl std::future::Future<Output = Result<T, TrellisError>> + Send + 'a,
+    ) -> impl std::future::Future<Output = Result<T, TrellisError>> + Send + 'a {
+        let call: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + 'a>> =
+            Box::pin(call);
+        crate::deadline::bounded(
+            submitted,
+            self.call_budget,
+            crate::instance_log::scoped(self.instance.clone(), call),
+        )
     }
 
     /// The connection pool backing this instance. Exposed for callers that
@@ -266,7 +322,7 @@ impl Trellis {
     /// Applies Trellis's schema migrations. Idempotent — safe to call on
     /// every startup.
     pub async fn migrate(&self) -> Result<(), TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             crate::migrate(&self.pool, &self.config)
                 .await
                 .map_err(TrellisError::Engine)
@@ -378,7 +434,7 @@ impl Trellis {
     /// calculated field is an `ALTER TRANSFORM ... DROP <field>`, tracked
     /// separately (issues #241/#242), not a `DROP`.
     pub async fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             match defs::parse_statement(statement_text)? {
                 defs::Statement::DefineTransform(parsed) => {
                     let source_columns = self
@@ -553,7 +609,7 @@ impl Trellis {
     /// and finds a [`DefinitionSummary::halt`] has a definition stopped until
     /// an operator fixes the cause and resumes it.
     pub async fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
         let mut client = self.pool.get().await?;
         // One repeatable-read transaction, so the reported statuses are
         // derived from the same catalog state the rows come from.
@@ -641,7 +697,7 @@ impl Trellis {
         &self,
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let mut client = self.pool.get().await?;
             // Issue #73: `transform_definitions.target_table` is persisted
             // fully-qualified, but every caller here only ever has the bare name
@@ -797,7 +853,7 @@ impl Trellis {
 
     /// Every registered relationship declaration, oldest first.
     pub async fn relationships(&self) -> Result<Vec<RelationshipSummary>, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let client = self.pool.get().await?;
             let rows = client
                 .query(
@@ -858,7 +914,7 @@ impl Trellis {
     /// reader yet and the discharge dispatches no definition whose capture
     /// isn't current. The running staging worker discharges the marker.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let mut client = self.pool.get().await?;
             // The first schema on the path with the table, as define resolves a
             // bare name. A table the role can't use doesn't resolve, and is
@@ -914,7 +970,7 @@ impl Trellis {
         &self,
         watermark: SystemTime,
     ) -> Result<Vec<PoisonEntry>, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let client = self.pool.get().await?;
             let rows = client
                 .query(
@@ -946,7 +1002,7 @@ impl Trellis {
     /// join against poisoned-row detail. The read a dashboard/health-check
     /// polls.
     pub async fn quarantined(&self) -> Result<Vec<QuarantineEntry>, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let client = self.pool.get().await?;
             let mut entries = Vec::new();
 
@@ -1007,7 +1063,7 @@ impl Trellis {
     /// whether the name is real, matching "no rows here means live" for
     /// every column not individually tracked).
     pub async fn quarantine_status(&self, target: &str) -> Result<QuarantineEntry, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let target = QuarantineTarget::parse(target);
             let client = self.pool.get().await?;
             match &target {
@@ -1099,7 +1155,7 @@ impl Trellis {
         after: Option<(String, String)>,
         limit: i64,
     ) -> Result<Vec<PoisonSample>, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let target = QuarantineTarget::parse(target);
             let client = self.pool.get().await?;
             let rows = match &target {
@@ -1216,7 +1272,7 @@ impl Trellis {
         source_table: &str,
         key: &str,
     ) -> Result<(), TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             match quarantine::release_key(&self.pool, transform, source_table, key).await {
                 Ok(_) => Ok(()),
                 Err(ApplyError::TransformNotFound { transform }) => {
@@ -1231,6 +1287,10 @@ impl Trellis {
     /// Stops any background work this connection started (staging worker and
     /// drain workers) and waits for it to exit cleanly. A no-op for a
     /// connection that started none.
+    ///
+    /// Outside the call deadline (issue #599): it ends background work rather
+    /// than serving a request, and each worker's own lock waits are bounded by
+    /// the lock timeout.
     pub async fn shutdown(self) -> Result<(), TrellisError> {
         crate::instance_log::scoped(self.instance, async move {
             if let Some(client) = self.client {
@@ -1277,7 +1337,7 @@ impl Trellis {
     /// the all-`drain_threads: 0` fleet this method exists to catch, since
     /// nothing in such a fleet would ever run one.
     pub async fn has_live_drain_workers(&self) -> Result<bool, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let client = self.pool.get().await?;
             Ok(worker_registry::has_live_workers(&**client, DEFAULT_RECLAIM_TTL).await?)
         })
@@ -1309,7 +1369,7 @@ impl Trellis {
     /// triggers in the application's own transactions meanwhile (issue #622),
     /// but nothing seals or dispatches a backfill.
     pub async fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let client = self.pool.get().await?;
             Ok(
                 crate::staging::session::producer_is_running(&**client, self.config.schema())
@@ -1353,7 +1413,7 @@ impl Trellis {
     /// # }
     /// ```
     pub async fn watermark_token(&self) -> Result<PgLsn, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let client = self.pool.get().await?;
             Ok(converge::watermark_token(&**client).await?)
         })
@@ -1393,6 +1453,10 @@ impl Trellis {
     /// reads `backfilling` from the call's return, so polling for `live`
     /// first waits out the rebuild (#625 F7).
     ///
+    /// Like every call, this lasts at most the call's deadline (30 seconds,
+    /// issue #599): a longer `timeout` is cut to what is left of it, and a
+    /// caller that wants to wait longer calls again.
+    ///
     /// Holds one pooled connection for the whole call (it polls on it), so a
     /// long `timeout` on a small `pool_max_size` is a real, if bounded, draw
     /// on this [`Trellis`]'s own pool — note the background [`Client`]'s
@@ -1402,8 +1466,15 @@ impl Trellis {
         token: PgLsn,
         timeout: Duration,
     ) -> Result<(), TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
+        self.call(async {
             let client = self.pool.get().await?;
+            // A call lasts at most its deadline (issue #599), so a longer wait
+            // is capped to what is left of it. A caller that wants to wait
+            // longer calls again: each call is one bounded wait.
+            let timeout = match crate::deadline::current() {
+                Some(deadline) => timeout.min(deadline.remaining()),
+                None => timeout,
+            };
             Ok(converge::await_converged(&client, token, timeout).await?)
         })
         .await
@@ -1451,6 +1522,12 @@ impl Trellis {
     /// ([`SelfCheckReport::held_keys`], #759), whatever the outcome, so a
     /// held key isn't hidden behind a `Converged` page that didn't reach it
     /// or a `NotCaughtUp` its parked changes cause.
+    ///
+    /// Outside the call deadline (issue #599): a page's comparison can take
+    /// longer than 30 seconds, and `timeout` bounds only each convergence wait
+    /// it makes. #599 decides it becomes a background job whose progress comes
+    /// back through [`Trellis::status`]; until it does, it runs unbounded by
+    /// the deadline.
     pub async fn self_check(
         &self,
         target_table: &str,
@@ -2274,6 +2351,20 @@ pub enum TrellisError {
     /// reporting a divergence, which is a successful audit) — see
     /// [`SelfCheckError`].
     SelfCheck(SelfCheckError),
+    /// The call did not finish within its deadline (issue #599): 30 seconds
+    /// from when it was submitted, queueing and the wait for a pooled
+    /// connection included. Whatever the call had running on the server was
+    /// stopped by the server's own `statement_timeout`, and its transaction
+    /// rolled back, so the call changed nothing it did not commit before the
+    /// deadline: a multi-transaction call such as [`Trellis::migrate`] keeps
+    /// each migration that committed. Expected and retryable, like any other
+    /// [`ErrorCode::Timeout`]: look at what the call waits on (a lock a long
+    /// application transaction holds, a database that is behind) and call
+    /// again.
+    CallTimeout {
+        /// The deadline the call had.
+        budget: Duration,
+    },
 }
 
 impl TrellisError {
@@ -2311,6 +2402,7 @@ impl TrellisError {
             }
             TrellisError::Staging(err) => err.code(),
             TrellisError::SelfCheck(err) => err.code(),
+            TrellisError::CallTimeout { .. } => ErrorCode::Timeout,
         }
     }
 }
@@ -2369,6 +2461,12 @@ impl std::fmt::Display for TrellisError {
             ),
             TrellisError::Staging(err) => write!(f, "{err}"),
             TrellisError::SelfCheck(err) => write!(f, "{err}"),
+            TrellisError::CallTimeout { budget } => write!(
+                f,
+                "the call did not finish within its {}s deadline; the work it started on the \
+                 server was stopped and rolled back",
+                budget.as_secs_f64()
+            ),
         }
     }
 }
@@ -2385,7 +2483,8 @@ impl std::error::Error for TrellisError {
             | TrellisError::TableNotCaptured { .. }
             | TrellisError::BlockingThreadExitedBeforeReady
             | TrellisError::BlockingThreadGone
-            | TrellisError::CalledFromAsyncContext => None,
+            | TrellisError::CalledFromAsyncContext
+            | TrellisError::CallTimeout { .. } => None,
             TrellisError::BlockingSpawn(err) => Some(err),
             TrellisError::Apply(err) => Some(err),
             TrellisError::TransformNotFound(_) | TrellisError::ColumnNotFound { .. } => None,
@@ -2456,6 +2555,7 @@ mod client_options_tests {
             staging: true,
             drain_threads: 3,
             worker_threads: Some(2),
+            call_deadline: None,
         };
         let client = Trellis::client_options(&options);
         assert_eq!(client.worker_threads, Some(2));
@@ -2480,6 +2580,7 @@ mod client_options_tests {
             staging: true,
             drain_threads: 0,
             worker_threads: Some(0),
+            ..Default::default()
         };
         match Trellis::connect(config, options).await {
             Err(TrellisError::Client(ClientError::Spawn(err))) => {

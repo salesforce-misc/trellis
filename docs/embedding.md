@@ -647,6 +647,45 @@ own tables, which no schema dump holds. A database loaded from the dump
 then fails with a `conflict` error because its table exists. Build a
 database that needs its transforms by running the migrations.
 
+## Every call returns within 30 seconds
+
+Every call on a `Trellis` or `BlockingTrellis` handle has a 30-second deadline,
+counted from when the call is submitted. Time queued for the handle and time
+waiting for a pooled connection count against it. A call that runs out of
+time returns the `timeout` error (Rust's `TrellisError::CallTimeout`), the
+same code as `await_converged` running out of time: it's expected and
+retryable, not a bug. Look at what the call waits on, usually a lock a long
+application transaction holds, and call again.
+
+The deadline is enforced on the server, not just abandoned by the caller. A
+connection a call checks out gets a `statement_timeout` of the time left, and
+so does every transaction it opens, so Postgres stops a statement stuck on a
+lock and rolls its transaction back. A timed-out call changes nothing it
+hadn't already committed. `migrate` commits one migration at a time and
+gives each the time left, so one that runs out leaves the earlier ones
+applied. A statement outside a transaction runs under the time left when its
+connection was checked out. A caller that goes away (Ctrl-C, a killed
+thread) leaves its call running until the deadline, where the server stops
+it, and the reply is dropped.
+
+Heavy work isn't done inside a call. `apply` registers a definition and
+returns, and the build runs in the background, so a caller that needs the
+result polls `status` ([below](#poll-to-live-dont-wait)). One statement
+still reads table rows inside the call: a to-one relationship's declaration
+(or a transform reading through one) seeds the relationship's projection from
+its to-side table, and on a large enough table it runs out of time and
+registers nothing.
+
+An `await_converged` timeout longer than the deadline is cut to what is left
+of it. To wait longer, call again: each call is one bounded wait.
+`self_check` is the exception for now: it runs outside the deadline, and its
+`timeout` argument bounds each convergence wait it makes, not the whole call.
+
+A `BlockingTrellis` runs its calls in parallel, so a call stuck on a lock
+doesn't hold up the calls made after it. A caller's own calls stay in order,
+because it waits for each reply. Calls from different threads have no order.
+The pool bounds how many run at once.
+
 ## Poll to `live`, don't wait
 
 `define` (and `apply` with a `TRANSFORM`) returns once the definition is
@@ -817,9 +856,9 @@ Trellis.await_converged(token, timeout_ms: 30_000)
 transform that isn't `live` yet, `catching_up` included, can still be missing
 rows after it returns, which is why the poll comes first. When the timeout
 runs out first, it fails with a `timeout` error, not `internal`: the target is
-behind, not broken, so retry or allow longer. A binding handle runs one call
-at a time, so every other call on it waits behind an `await_converged` for up
-to its timeout; keep the timeout short on a handle that also serves requests.
+behind, not broken, so retry or allow longer. The wait never lasts past the
+call's [30-second deadline](#every-call-returns-within-30-seconds), whatever
+timeout is passed; call again to wait longer.
 
 A repair is visible to the poll too. `request_backfill` (and a capture
 re-install) rebuilds each plain aggregate and plain 1-1 reader of the table

@@ -11,6 +11,18 @@
 //! and blocks the calling thread on the reply. The calling thread itself
 //! never needs a runtime of its own.
 //!
+//! **Every call returns within 30 seconds** (issue #599). The deadline counts
+//! from when the call is submitted, so time a job spends queued for the
+//! background thread counts against it, and what the call started on the
+//! server is stopped by the server at the deadline (see `crate::deadline`).
+//! A call that runs out of time returns [`TrellisError::CallTimeout`]. The
+//! background thread runs each job as a task of its own, so a call stuck on a
+//! lock holds up none of the calls made after it. A caller's own calls stay in
+//! order, because it waits for each reply; calls from different threads have no
+//! order. The exceptions are [`BlockingTrellis::self_check`] and
+//! [`BlockingTrellis::shutdown`], which `Trellis` runs outside the deadline
+//! too (see [`Trellis::self_check`] and [`Trellis::shutdown`]).
+//!
 //! **Blocks only on registration, never on backfill.**
 //! [`BlockingTrellis::apply`] is exactly as fast (or slow) as
 //! [`Trellis::apply`] (see `app`'s module doc), which only registers: a new
@@ -19,9 +31,14 @@
 //! background field build (#666, #625 F8b). The one statement that still
 //! reads table rows inside the call is a to-one relationship's declaration
 //! (or a transform reading through one), which seeds the relationship's
-//! projection from its to-side table.
+//! projection from its to-side table. It is bound by the deadline like any
+//! call: on a to-side table too large to seed in time it returns the timeout
+//! error and registers nothing.
 
-use std::time::{Duration, SystemTime};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_postgres::types::PgLsn;
@@ -84,10 +101,14 @@ enum Job {
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
 
+/// A [`Job`] and the instant its caller submitted it, which its deadline
+/// counts from.
+type Submitted = (Instant, Job);
+
 /// A synchronous facade over [`Trellis`] — see the module doc comment.
 ///
 /// Every method blocks the calling thread until the background thread
-/// replies, but none of them (nor [`BlockingTrellis::connect`] itself)
+/// replies (within the call's 30-second deadline, see the module doc), but none of them (nor [`BlockingTrellis::connect`] itself)
 /// require that thread to already be inside a `tokio` runtime. Dropping a
 /// `BlockingTrellis` without calling [`BlockingTrellis::shutdown`] closes
 /// the job channel — ending the background thread's loop and dropping the
@@ -111,7 +132,7 @@ enum Job {
 /// tables opens its own connection. The `surface_tests` module below checks
 /// that no other method is missing.
 pub struct BlockingTrellis {
-    job_tx: mpsc::UnboundedSender<Job>,
+    job_tx: mpsc::UnboundedSender<Submitted>,
     /// A copy of the configuration the background thread's [`Trellis`]
     /// connected with, so [`BlockingTrellis::config`] can hand out a
     /// reference without a round trip. [`Config`] is immutable once built, so
@@ -131,7 +152,7 @@ impl BlockingTrellis {
     /// per-core default. The cap is per runtime and per handle (see that
     /// option's doc comment).
     pub fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<Submitted>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), TrellisError>>();
         let kept_config = config.clone();
 
@@ -303,14 +324,10 @@ impl BlockingTrellis {
     /// reflected in its target(s), or `timeout` elapses. See
     /// [`Trellis::await_converged`].
     ///
-    /// **The one method that can occupy the background thread for a
-    /// caller-chosen duration.** That thread services jobs strictly one
-    /// at a time, so any other `BlockingTrellis` call issued concurrently
-    /// from another thread — [`BlockingTrellis::shutdown`] included — queues
-    /// behind an in-flight `await_converged` for up to `timeout`. Bounded,
-    /// never a hang (`timeout` always expires and the loop moves on), but it
-    /// does mean `timeout` sets the worst-case latency of every *other* call
-    /// on a shared handle, not just this one. Size it accordingly.
+    /// Like every call, it lasts at most the call's deadline (30 seconds): a
+    /// longer `timeout` is cut to what is left of it, and a caller that wants
+    /// to wait longer calls again. It holds one pooled connection while it
+    /// waits, and no other call on the handle waits behind it.
     pub fn await_converged(&self, token: PgLsn, timeout: Duration) -> Result<(), TrellisError> {
         self.submit(|reply| Job::AwaitConverged(token, timeout, reply))
     }
@@ -319,11 +336,11 @@ impl BlockingTrellis {
     /// its definition from the source. See [`Trellis::self_check`] for what
     /// `scope`, `mode` and `timeout` mean and what the report holds.
     ///
-    /// Like [`BlockingTrellis::await_converged`], this can hold the
-    /// background thread for up to `timeout` per convergence await it makes
-    /// (one under [`SelfCheckMode::Strict`], up to two under
-    /// [`SelfCheckMode::Standard`]), plus the comparison itself, so every
-    /// other call on a shared handle queues behind it for that long.
+    /// Outside the call deadline, like [`Trellis::self_check`]: it can run
+    /// for up to `timeout` per convergence await it makes (one under
+    /// [`SelfCheckMode::Strict`], up to two under [`SelfCheckMode::Standard`]),
+    /// plus the comparison itself. It holds one pooled connection meanwhile,
+    /// and no other call on the handle waits behind it.
     pub fn self_check(
         &self,
         target_table: &str,
@@ -367,8 +384,10 @@ impl BlockingTrellis {
             return Err(TrellisError::CalledFromAsyncContext);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
+        // The deadline runs from here: the time a job spends queued on the
+        // channel counts against it (issue #599).
         self.job_tx
-            .send(make_job(reply_tx))
+            .send((Instant::now(), make_job(reply_tx)))
             .map_err(|_| TrellisError::BlockingThreadGone)?;
         reply_rx
             .blocking_recv()
@@ -380,14 +399,19 @@ impl BlockingTrellis {
 /// [`Trellis`], signals readiness, then services [`Job`]s until the channel
 /// closes (every [`BlockingTrellis`] handle dropped without calling
 /// `shutdown`) or [`Job::Shutdown`] is received.
+///
+/// Each job runs as a task of its own (issue #599), so a call blocked on a
+/// lock doesn't hold up the ones behind it. The pool and each call's deadline
+/// bound how many run at once, and an in-flight job outlives the caller that
+/// stopped waiting for it only until its deadline.
 async fn run(
     config: Config,
     options: TrellisOptions,
-    mut job_rx: mpsc::UnboundedReceiver<Job>,
+    mut job_rx: mpsc::UnboundedReceiver<Submitted>,
     ready_tx: std::sync::mpsc::Sender<Result<(), TrellisError>>,
 ) {
-    let trellis = match Trellis::connect(config, options).await {
-        Ok(trellis) => trellis,
+    let shared = match Trellis::connect(config, options).await {
+        Ok(trellis) => Arc::new(trellis),
         Err(err) => {
             let _ = ready_tx.send(Err(err));
             return;
@@ -400,62 +424,153 @@ async fn run(
         return;
     }
 
-    while let Some(job) = job_rx.recv().await {
+    let mut tasks = tokio::task::JoinSet::new();
+    while let Some((submitted, job)) = job_rx.recv().await {
+        // Reap the finished ones, so the set doesn't grow with the calls made.
+        while tasks.try_join_next().is_some() {}
+        let trellis = shared.clone();
+        // Each arm builds its call's future inside a closure of its own, which
+        // boxes it before it returns: the engine's futures are large, and an
+        // arm that built them in this function's frame would put every arm's
+        // at once on the stack of a thread that keeps the default size.
         match job {
-            Job::Migrate(reply) => {
-                let _ = reply.send(trellis.migrate().await);
-            }
-            Job::Apply(text, reply) => {
-                let _ = reply.send(trellis.apply(&text).await);
-            }
-            Job::Definitions(reply) => {
-                let _ = reply.send(trellis.definitions().await);
-            }
+            Job::Migrate(reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                Box::pin(async move {
+                    let _ = reply.send(t.submitted(at, t.migrate()).await);
+                })
+            }),
+            Job::Apply(text, reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                Box::pin(async move {
+                    let _ = reply.send(t.submitted(at, t.apply(&text)).await);
+                })
+            }),
+            Job::Definitions(reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                Box::pin(async move {
+                    let _ = reply.send(t.submitted(at, t.definitions()).await);
+                })
+            }),
             Job::Relationships(reply) => {
-                let _ = reply.send(trellis.relationships().await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.relationships()).await);
+                    })
+                })
             }
             Job::RequestBackfill(table, reply) => {
-                let _ = reply.send(trellis.request_backfill(&table).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.request_backfill(&table)).await);
+                    })
+                })
             }
             Job::PoisonedSince(watermark, reply) => {
-                let _ = reply.send(trellis.poisoned_since(watermark).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.poisoned_since(watermark)).await);
+                    })
+                })
             }
             Job::Status(table, reply) => {
-                let _ = reply.send(trellis.status(&table).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.status(&table)).await);
+                    })
+                })
             }
-            Job::Quarantined(reply) => {
-                let _ = reply.send(trellis.quarantined().await);
-            }
+            Job::Quarantined(reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                Box::pin(async move {
+                    let _ = reply.send(t.submitted(at, t.quarantined()).await);
+                })
+            }),
             Job::QuarantineStatus(target, reply) => {
-                let _ = reply.send(trellis.quarantine_status(&target).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.quarantine_status(&target)).await);
+                    })
+                })
             }
             Job::SampleQuarantined(target, after, limit, reply) => {
-                let _ = reply.send(trellis.sample_quarantined(&target, after, limit).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(
+                            t.submitted(at, t.sample_quarantined(&target, after, limit))
+                                .await,
+                        );
+                    })
+                })
             }
             Job::ReleaseKey(transform, source_table, key, reply) => {
-                let _ = reply.send(trellis.release_key(&transform, &source_table, &key).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(
+                            t.submitted(at, t.release_key(&transform, &source_table, &key))
+                                .await,
+                        );
+                    })
+                })
             }
             Job::HasLiveDrainWorkers(reply) => {
-                let _ = reply.send(trellis.has_live_drain_workers().await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.has_live_drain_workers()).await);
+                    })
+                })
             }
             Job::HasLiveStagingWorker(reply) => {
-                let _ = reply.send(trellis.has_live_staging_worker().await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.has_live_staging_worker()).await);
+                    })
+                })
             }
             Job::WatermarkToken(reply) => {
-                let _ = reply.send(trellis.watermark_token().await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.submitted(at, t.watermark_token()).await);
+                    })
+                })
             }
             Job::AwaitConverged(token, timeout, reply) => {
-                let _ = reply.send(trellis.await_converged(token, timeout).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                    Box::pin(async move {
+                        let _ =
+                            reply.send(t.submitted(at, t.await_converged(token, timeout)).await);
+                    })
+                })
             }
+            // Exempt from the call deadline, like `Trellis::self_check`.
             Job::SelfCheck(table, scope, mode, timeout, reply) => {
-                let _ = reply.send(trellis.self_check(&table, scope, mode, timeout).await);
+                spawn_call(&mut tasks, trellis, submitted, move |t, _| {
+                    Box::pin(async move {
+                        let _ = reply.send(t.self_check(&table, scope, mode, timeout).await);
+                    })
+                })
             }
             Job::Shutdown(reply) => {
-                let _ = reply.send(trellis.shutdown().await);
+                // The calls still running finish or hit their deadline first:
+                // the `Trellis` can only be shut down once nothing else holds
+                // it.
+                drop(trellis);
+                while tasks.join_next().await.is_some() {}
+                let Ok(owned) = Arc::try_unwrap(shared) else {
+                    unreachable!("every task has finished, so none still holds the Trellis");
+                };
+                let _ = reply.send(owned.shutdown().await);
                 return;
             }
         }
     }
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Spawns the call `make` builds for `trellis`, submitted at `submitted`.
+fn spawn_call(
+    tasks: &mut tokio::task::JoinSet<()>,
+    trellis: Arc<Trellis>,
+    submitted: Instant,
+    make: impl FnOnce(Arc<Trellis>, Instant) -> Pin<Box<dyn Future<Output = ()> + Send>>,
+) {
+    tasks.spawn(make(trellis, submitted));
 }
 
 /// Issue #587: a public [`Trellis`] method with no [`BlockingTrellis`] twin

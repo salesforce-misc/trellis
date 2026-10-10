@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 use testkit::TestCluster;
-use trellis::config::DEFAULT_TARGET_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 
 use trellis::{
     BlockingTrellis, Config, SelfCheckError, SelfCheckMode, SelfCheckScope, TransformStatus,
@@ -197,5 +197,98 @@ fn calling_from_inside_a_tokio_runtime_errors_instead_of_panicking() {
     );
 
     drop(caller_runtime);
+    trellis.shutdown().expect("shutdown (sync)");
+}
+
+/// Issue #599: a call stuck on a lock ends at its deadline with the timeout
+/// error, and does not hold up the calls made after it on the same handle.
+/// The job loop used to run one job at a time, so a call behind a stuck one
+/// waited out the stuck one's whole wait.
+///
+/// The only wait is for the stuck call to be queued on the lock, a
+/// precondition the test cannot proceed without (#297's concern is a wait for
+/// convergence): the assertions that follow are about the *other* call.
+#[test]
+fn a_stuck_call_times_out_and_does_not_hold_up_the_calls_behind_it() {
+    use std::time::Instant;
+    use testkit::crash::OpenTransaction;
+
+    const DEADLINE: Duration = Duration::from_secs(3);
+
+    let cluster = TestCluster::start();
+    let runtime = tokio::runtime::Runtime::new().expect("build setup runtime");
+    let db = runtime.block_on(cluster.create_isolated_database());
+    let (observer, connection) = runtime
+        .block_on(tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls))
+        .expect("connect observer");
+    runtime.spawn(async move {
+        let _ = connection.await;
+    });
+    let holder = runtime.block_on(OpenTransaction::begin(db.dsn()));
+    runtime.block_on(holder.execute(&format!(
+        "lock table {DEFAULT_SCHEMA}.transform_definitions in access exclusive mode"
+    )));
+
+    let trellis = BlockingTrellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            call_deadline: Some(DEADLINE),
+            ..Default::default()
+        },
+    )
+    .expect("connect (sync)");
+
+    std::thread::scope(|scope| {
+        let stuck = scope.spawn(|| {
+            let started = Instant::now();
+            let result = trellis.definitions();
+            (result, started.elapsed())
+        });
+
+        // The stuck call is on the server, queued on the lock.
+        runtime.block_on(async {
+            let give_up = Instant::now() + Duration::from_secs(30);
+            loop {
+                let waiting: i64 = observer
+                    .query_one(
+                        "select count(*) from pg_stat_activity \
+                         where datname = current_database() and wait_event_type = 'Lock'",
+                        &[],
+                    )
+                    .await
+                    .expect("read pg_stat_activity")
+                    .get(0);
+                if waiting > 0 {
+                    break;
+                }
+                assert!(Instant::now() < give_up, "the call never reached the lock");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        // A call behind it on the same handle answers well inside the stuck
+        // call's wait.
+        let started = Instant::now();
+        trellis
+            .watermark_token()
+            .expect("a call behind a stuck one");
+        assert!(
+            started.elapsed() < DEADLINE / 2,
+            "a call behind a stuck one took {:?}",
+            started.elapsed()
+        );
+
+        let (result, elapsed) = stuck.join().expect("the stuck call's thread");
+        let err = result.expect_err("a call stuck on a lock must not finish");
+        assert!(matches!(err, TrellisError::CallTimeout { .. }), "{err}");
+        assert_eq!(err.code(), trellis::ErrorCode::Timeout);
+        assert!(
+            elapsed >= DEADLINE - Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < DEADLINE + Duration::from_secs(1), "{elapsed:?}");
+    });
+
+    runtime.block_on(holder.rollback());
     trellis.shutdown().expect("shutdown (sync)");
 }
