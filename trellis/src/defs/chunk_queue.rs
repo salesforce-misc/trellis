@@ -1760,10 +1760,14 @@ mod tests {
         rows: i64,
     ) -> (i64, TransformDef) {
         let text = format!("TRANSFORM {target} FROM {source} SELECT a + a AS x");
+        // The target's ledger, which define creates with it and which a
+        // resume needs to exist (#986).
+        let ledger =
+            super::super::ledger::one_to_one_ledger_ddl(&format!("public.{target}__ledger"));
         raw.batch_execute(&format!(
             "create table public.{source} (id bigint primary key, a numeric); \
              insert into public.{source} select g, g from generate_series(1, {rows}) g; \
-             create table public.{target} (id bigint primary key, x numeric); \
+             create table public.{target} (id bigint primary key, x numeric){ledger}; \
              insert into source_table_versions (source_table, version) \
              values ('public.{source}', 1)"
         ))
