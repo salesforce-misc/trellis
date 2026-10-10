@@ -57,6 +57,13 @@ Issues labelled `good first contribution`.
 - [x] Reviews
   - Changes must be approved via peer code review
 
+# Grammar Compatibility
+
+Each major version reads every transform-grammar version written by the previous
+two major versions. A change to what accepted definition text means bumps the
+grammar version and ships a compatibility rule for the version it replaces; see
+[ADR-0018](docs/decisions/0018-grammar-versioning.md).
+
 # Creating a Pull Request
 
 1. **Ensure the bug/feature was not already reported** by searching on GitHub under Issues.  If none exists, create a new issue so that other contributors can keep track of what you are trying to add/fix and offer suggestions (or let you know if there is already an effort in progress).

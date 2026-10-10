@@ -467,6 +467,16 @@ seeds it from the to-side rows, and defining a transform that reads a column
 through it widens that projection, in the same transaction
 ([embedding](embedding.md#what-the-staging-worker-needs-from-the-database)).
 
+## Grammar versions
+
+Every stored definition records the grammar version it was written in. A
+release that changes what accepted text means bumps that version, and keeps
+reading the older one under its old rules, so an upgrade never re-interprets a
+stored definition. Each major version reads every grammar version the previous
+two majors wrote; a newer version, from a downgrade, is refused. Rewriting a
+definition moves it to the current version without a rebuild. The rules are in
+[0018-grammar-versioning](decisions/0018-grammar-versioning.md).
+
 ## Scope
 
 This document describes the logical model only, not the physical storage or
