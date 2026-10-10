@@ -227,6 +227,7 @@ fn usize_list(args: &[String], name: &str, default: &[usize]) -> Vec<usize> {
 /// throughput scenarios want different drain-worker counts).
 fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
     EngineTuning {
+        staging_worker: default.staging_worker && !args.iter().any(|a| a == "--no-staging-worker"),
         application_threads: number(args, "--application-threads")
             .map(|v| v as usize)
             .unwrap_or(default.application_threads),
@@ -553,8 +554,13 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             let duration = secs(args, "--duration-secs").unwrap_or(IDLE_DEFAULT_DURATION);
             let tuning = throughput_tuning(args);
 
-            let result = runtime().block_on(idle_cost::run(warmup, duration, &tuning));
+            let statements = args.iter().any(|a| a == "--statements");
+
+            let result = runtime().block_on(idle_cost::run(warmup, duration, &tuning, statements));
             println!("{}", result.to_json());
+            if let Some(rows) = &result.statements_json {
+                println!("{rows}");
+            }
             eprintln!(
                 "idle: {:.1} transactions/sec, {:.0} WAL bytes/sec ({:.2} KB/s), {:.2} seals/sec",
                 result.xact_commit_per_sec,

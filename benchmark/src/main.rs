@@ -44,6 +44,9 @@
 //! cargo run -p benchmark --features engine-access --release -- write-tax --variants none,trigger,trigger+exception --shapes orm100x16+hold
 //! cargo run -p benchmark --features engine-access --release -- capture-ceiling --writers 1,4,8,16,32
 //! cargo run -p benchmark --features engine-access --release -- idle-cost --application-threads 8 --duration-secs 60
+//! # per-statement attribution (issue #350): the cluster must preload pg_stat_statements
+//! TRELLIS_TESTKIT_PG_OPTIONS='shared_preload_libraries=pg_stat_statements pg_stat_statements.track=all track_activity_query_size=4096' \
+//!   cargo run -p benchmark --features engine-access --release -- idle-cost --statements [--no-staging-worker | --application-threads 0]
 //! # the load generator's own reach, no engine running (issue #276)
 //! cargo run -p benchmark --features engine-access --release -- generator-reach --connections 8 --rows-per-commit 1
 //! ```

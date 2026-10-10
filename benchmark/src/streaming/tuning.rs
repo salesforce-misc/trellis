@@ -54,6 +54,11 @@ pub const STOCK_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// field, so a scenario that overrides nothing measures the shipped defaults.
 #[derive(Debug, Clone)]
 pub struct EngineTuning {
+    /// Whether the client also owns capture
+    /// ([`ClientOptions::staging_worker`]). Stock for these scenarios is
+    /// `true`; `false` measures a drain-only fleet (issue #350's split of the
+    /// idle cost into its staging and drain halves).
+    pub staging_worker: bool,
     /// How many drain workers the client runs
     /// ([`ClientOptions::application_threads`]).
     pub application_threads: usize,
@@ -77,6 +82,7 @@ pub struct EngineTuning {
 impl Default for EngineTuning {
     fn default() -> Self {
         Self {
+            staging_worker: true,
             // Not `ClientOptions::default()`'s 0: every streaming scenario
             // needs at least one drain worker to make progress at all, and
             // a definition's build runs on drain threads, so it never goes
@@ -114,7 +120,7 @@ impl EngineTuning {
     /// #427), so there is no table list to pass.
     pub fn client_options(&self) -> ClientOptions {
         ClientOptions {
-            staging_worker: true,
+            staging_worker: self.staging_worker,
             application_threads: self.application_threads,
             poll_interval: self.poll_interval,
             maintenance_interval: self.maintenance_interval,

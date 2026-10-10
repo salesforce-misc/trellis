@@ -18,13 +18,33 @@
 //!
 //! **On "queries/sec"**: #268's prediction is phrased in queries/sec, but
 //! there is no query counter without `pg_stat_statements`, which this
-//! harness's ephemeral cluster doesn't preload. In this regime almost every
+//! harness's ephemeral cluster doesn't preload unless asked to (see
+//! "Per-statement attribution" below). In this regime almost every
 //! statement the wake path issues (`register_drainer`,
 //! `next_claimable_segments`, the maintenance tick's reads) runs as its own
 //! autocommit round trip rather than batched inside an explicit transaction,
 //! so `xact_commit`'s delta is a reasonable stand-in — which is why this
 //! reports `xact_commit_per_sec` and nothing that pretends to be a second,
 //! independently measured number.
+//!
+//! ## Per-statement attribution (issue #350)
+//!
+//! `--statements` turns the window into an attribution run: it creates
+//! `pg_stat_statements`, resets it right before the window and reads every
+//! statement's calls, rows and WAL right after, as one extra JSON line
+//! (`"scenario":"idle-cost-statements"`). The cluster must preload the
+//! library, which the testkit passes through from its environment:
+//!
+//! ```text
+//! TRELLIS_TESTKIT_PG_OPTIONS='shared_preload_libraries=pg_stat_statements \
+//!   pg_stat_statements.track=all track_activity_query_size=4096' \
+//!   bench idle-cost --statements
+//! ```
+//!
+//! `--no-staging-worker` and `--application-threads 0` split the idle cost
+//! into its halves. A definition only goes live with a staging worker *and* a
+//! drain thread, so for either the install runs under a full client first and
+//! the measured client replaces it before the warm-up.
 
 use std::time::{Duration, Instant};
 
@@ -90,6 +110,9 @@ pub struct IdleCostResult {
     pub wal_bytes_per_sec: f64,
     pub seals_delta: i64,
     pub seals_per_sec: f64,
+    /// Every statement `pg_stat_statements` saw across the window, as one JSON
+    /// line, when `--statements` asked for it.
+    pub statements_json: Option<String>,
 }
 
 impl IdleCostResult {
@@ -125,18 +148,39 @@ impl IdleCostResult {
 /// module's window lengths that is well under a transaction/sec of the
 /// hundreds being measured, and it is not subtracted out — the reported number
 /// is what the database saw, with the instrument's own tiny cost included.
-pub async fn run(warmup: Duration, duration: Duration, tuning: &EngineTuning) -> IdleCostResult {
+pub async fn run(
+    warmup: Duration,
+    duration: Duration,
+    tuning: &EngineTuning,
+    statements: bool,
+) -> IdleCostResult {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
 
     let source = create_chain_source_table(&raw, "idle").await;
-    let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
+    // A definition only goes live with a staging worker and a drain thread, so
+    // a half-install (`--no-staging-worker`, `--application-threads 0`) is
+    // brought up by a full client that the measured one then replaces.
+    let setup = EngineTuning {
+        staging_worker: true,
+        application_threads: tuning.application_threads.max(1),
+        ..tuning.clone()
+    };
+    let mut client =
+        trellis::Client::start(db.dsn(), setup.client_options()).expect("client start");
     let chain = install_chain_hops(&db.pool, &source, 1).await;
     wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;
+    if !tuning.staging_worker || tuning.application_threads == 0 {
+        client.shutdown().await.expect("setup client shutdown");
+        client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
+    }
 
     tokio::time::sleep(warmup).await;
 
+    if statements {
+        reset_statements(&raw).await;
+    }
     let commit_before = xact_commit(&raw).await;
     let lsn_before = wal_lsn(&raw).await;
     let seg_seq_before = active_seg_seq(&raw).await;
@@ -148,6 +192,11 @@ pub async fn run(warmup: Duration, duration: Duration, tuning: &EngineTuning) ->
     let commit_delta = xact_commit(&raw).await - commit_before;
     let wal_delta = wal_bytes_since(&raw, &lsn_before).await;
     let seals_delta = active_seg_seq(&raw).await - seg_seq_before;
+    let statements_json = if statements {
+        Some(read_statements(&raw).await)
+    } else {
+        None
+    };
 
     client.shutdown().await.expect("client shutdown");
 
@@ -162,5 +211,46 @@ pub async fn run(warmup: Duration, duration: Duration, tuning: &EngineTuning) ->
         wal_bytes_per_sec: wal_delta as f64 / elapsed,
         seals_delta,
         seals_per_sec: seals_delta as f64 / elapsed,
+        statements_json,
     }
+}
+
+/// Creates `pg_stat_statements` (if needed) and zeroes it. Panics with the
+/// settings to pass if the cluster did not preload the library.
+async fn reset_statements(raw: &RawClient) {
+    let preload: String = raw
+        .query_one("show shared_preload_libraries", &[])
+        .await
+        .expect("show shared_preload_libraries")
+        .get(0);
+    assert!(
+        preload.contains("pg_stat_statements"),
+        "--statements needs a cluster that preloads pg_stat_statements; run with \
+         TRELLIS_TESTKIT_PG_OPTIONS='shared_preload_libraries=pg_stat_statements \
+         pg_stat_statements.track=all track_activity_query_size=4096'"
+    );
+    raw.batch_execute("create extension if not exists pg_stat_statements")
+        .await
+        .expect("create extension pg_stat_statements");
+    raw.query_one("select pg_stat_statements_reset()::text", &[])
+        .await
+        .expect("reset pg_stat_statements");
+}
+
+/// Every recorded statement as a single `idle-cost-statements` JSON line,
+/// busiest first. The reads `reset_statements` and this function themselves
+/// issue show up in it (a handful of calls); the analysis drops them by text.
+async fn read_statements(raw: &RawClient) -> String {
+    raw.query_one(
+        "select jsonb_build_object('scenario', 'idle-cost-statements', 'rows', \
+                coalesce(jsonb_agg(to_jsonb(t) order by t.calls desc), '[]'::jsonb))::text \
+         from (select dbid::bigint as dbid, queryid::text as queryid, toplevel, calls, rows, \
+                      wal_bytes::bigint as wal_bytes, wal_records, \
+                      round(total_exec_time::numeric, 3)::float8 as total_exec_ms, query \
+               from pg_stat_statements) t",
+        &[],
+    )
+    .await
+    .expect("read pg_stat_statements")
+    .get(0)
 }
