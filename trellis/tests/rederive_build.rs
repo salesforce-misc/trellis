@@ -2546,3 +2546,87 @@ async fn a_resumed_build_s_flip_takes_the_superseded_builds_done_rows() {
     assert_eq!(build_rows(&f).await, 0);
     f.assert_agg_oracle().await;
 }
+
+/// `target`'s done `backfill_chunks` rows, and all of them.
+async fn rows_of(f: &Fixture, target: &str) -> (i64, i64) {
+    let row = f
+        .raw
+        .query_one(
+            "select count(*) filter (where bc.done), count(*) from backfill_chunks bc \
+             join transform_definitions d on d.id = bc.definition_id \
+             where split_part(d.target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("count a definition's rows");
+    (row.get(0), row.get(1))
+}
+
+/// The flip deletes only its own definition's rows (#966). Two definitions
+/// on one source build together: the 1-1 one has no deltas to merge, so it
+/// flips as its last chunk commits, while the aggregate's done rows (its
+/// plan job, and whatever chunks ran first) wait on their merge. Those stay
+/// until the aggregate's own flip.
+#[tokio::test]
+async fn a_flip_leaves_another_definition_s_done_rows() {
+    let mut f = Fixture::new(60, &[ONE, AGG]).await;
+    f.pass().await;
+    f.run_chunks_by_hand(usize::MAX).await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(
+        rows_of(&f, "one").await,
+        (0, 0),
+        "the 1-1 flip took its rows"
+    );
+    assert_eq!(
+        rows_of(&f, "agg").await,
+        (7, 7),
+        "the aggregate's plan job and six chunks, all done, wait on its merge"
+    );
+
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    assert_eq!(build_rows(&f).await, 0);
+    f.assert_one_oracle().await;
+    f.assert_agg_oracle().await;
+}
+
+/// The flip leaves an undone row behind (#966): a chunk a worker held
+/// across a pause and a resume (`chunk_queue::STALE`). The resumed build
+/// goes live without it, and the worker that still holds it writes nothing
+/// when it runs it after the flip; giving it up discards the row.
+#[tokio::test]
+async fn a_chunk_held_across_a_resume_outlives_the_flip_and_is_discarded() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job");
+    let held = {
+        let client = f.db.pool.get().await.expect("pool");
+        chunk_queue::claim_chunks_of(&**client, "held", 1, &[chunk_queue::KIND_REDERIVE])
+            .await
+            .expect("claim a chunk")
+    };
+    assert_eq!(held.len(), 1);
+    let trellis = f.trellis().await;
+    trellis
+        .apply("PAUSE TRANSFORM agg")
+        .await
+        .expect("pause the building transform");
+    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where not done and claimed_by = 'held'")
+            .await,
+        1,
+        "the flip leaves the held chunk to its worker"
+    );
+    assert_eq!(build_rows(&f).await, 1, "and deletes every other row");
+
+    build::run_claimed(&f.db.pool, &held[0], "held", &OPTIONS).await;
+    assert_eq!(build_rows(&f).await, 0, "giving it up discards it");
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
