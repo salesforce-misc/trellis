@@ -38,18 +38,21 @@ defmodule Trellis.LogBridgeTest do
     assert %{
              level: :info,
              meta: %{domain: [:elixir, :trellis], target: "trellis::defs::lifecycle"}
-           } = receive_line("drop is a no-op; no such definition transform=no_such_transform_one")
+           } =
+             receive_line(
+               ~r/\Adrop is a no-op; no such definition trellis_instance=\S+\/\S+ transform=no_such_transform_one\z/
+             )
   end
 
   # The bridge forwards asynchronously, so lines an earlier test's engine
   # logged can still be queued when the handler goes on, and `flush/0` hands
-  # them over first. Skips to the event carrying `text`.
-  defp receive_line(text) do
+  # them over first. Skips to the event whose text matches `pattern`.
+  defp receive_line(pattern) do
     receive do
       {:logged, %{msg: {:string, message}} = event} ->
-        if IO.chardata_to_string(message) == text, do: event, else: receive_line(text)
+        if IO.chardata_to_string(message) =~ pattern, do: event, else: receive_line(pattern)
     after
-      1_000 -> flunk("#{inspect(text)} was never logged")
+      1_000 -> flunk("#{inspect(pattern)} was never logged")
     end
   end
 
