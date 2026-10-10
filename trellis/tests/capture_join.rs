@@ -22,14 +22,10 @@ use trellis::capture::CaptureError;
 use trellis::capture::install::{Installed, LockingOperation, installed};
 use trellis::capture::reconcile::{self, PassOutcome};
 use trellis::defs::TransformStatus;
-use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
+use trellis::locks::{USER_TABLE_DDL_LOCK_TIMEOUT, USER_TABLE_DDL_RETRY_INTERVAL};
 use trellis::{ClientOptions, Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = "trellis";
-
-/// Well above `USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms) for a loaded box: what a
-/// pass's own reads may add to its lock budget.
-const SLACK: Duration = Duration::from_millis(750);
 
 async fn connect(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -376,6 +372,13 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
 /// The maintenance loop is the only sealer, so a pass may spend only its
 /// budget on locked tables: each gets its first attempt, and no retry starts
 /// that couldn't end by the deadline.
+///
+/// Asserts the attempts each wait reports, not how long the pass took (#1005):
+/// a retry needs `USER_TABLE_DDL_RETRY_INTERVAL` plus one lock timeout left
+/// before the deadline, so a budget under that allows exactly one attempt per
+/// table however slow the box is. A pass that retried past its deadline would
+/// never return (the holders never let go), so the wall-clock guard below only
+/// turns that hang into a failure.
 #[tokio::test]
 async fn a_pass_respects_its_budget_on_locked_tables() {
     let cluster = TestCluster::start();
@@ -397,16 +400,31 @@ async fn a_pass_respects_its_budget_on_locked_tables() {
     let _hold_u = hold_table(db.dsn(), "public.u").await;
     let _hold_v = hold_table(db.dsn(), "public.v").await;
 
-    let budget = Duration::from_millis(400);
-    let started = Instant::now();
-    let outcome = capture_pass(&mut raw, &db.pool, budget).await;
-    let took = started.elapsed();
+    let no_retry_fits = USER_TABLE_DDL_RETRY_INTERVAL + USER_TABLE_DDL_LOCK_TIMEOUT;
+    // Zero: the deadline is past before the pass starts, so every table's
+    // first attempt comes after it. The other: u's first attempt is under way
+    // when the budget runs out, and no retry fits in what is left.
+    for budget in [Duration::ZERO, no_retry_fits - Duration::from_millis(1)] {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            capture_pass(&mut raw, &db.pool, budget),
+        )
+        .await
+        .expect("a pass stops retrying at its deadline");
 
-    assert_eq!(outcome.waiting.len(), 2, "{outcome:?}");
-    assert!(outcome.ready.is_empty());
-    // The budget, plus v's one attempt past it, plus the pass's own reads.
-    let bound = budget + 2 * USER_TABLE_DDL_LOCK_TIMEOUT + SLACK;
-    assert!(took <= bound, "the pass took {took:?}, over {bound:?}");
+        assert!(outcome.ready.is_empty(), "{outcome:?}");
+        let attempts: BTreeMap<&str, u32> = outcome
+            .waiting
+            .iter()
+            .map(|wait| (wait.table.as_str(), wait.attempts))
+            .collect();
+        assert_eq!(
+            attempts,
+            BTreeMap::from([("public.u", 1), ("public.v", 1)]),
+            "budget {budget:?}: each locked table gets its first attempt and no retry; \
+             {outcome:?}"
+        );
+    }
 }
 
 /// A definition that reads a new column of a relationship's to-side is not

@@ -639,14 +639,16 @@ async fn run(
     let started = Instant::now();
     let mut retry = DdlRetry::new(operation.what(), USER_TABLE_DDL_LOCK_TIMEOUT, deadline);
     let mut log = BlockerLog::new(operation);
+    let mut attempts = 0;
     loop {
+        attempts += 1;
         match attempt(client, schema, op, retry.lock_timeout()).await {
             Err(err) if locks::is_lock_not_available(&err) => {
                 if retry.again(&err).await {
-                    log.after_timeout(&*client, op, started).await;
+                    log.after_timeout(&*client, op, started, attempts).await;
                     continue;
                 }
-                let wait = lock_wait(&*client, op, started).await?;
+                let wait = lock_wait(&*client, op, started, attempts).await?;
                 log.at_deadline(&wait);
                 return Ok(Progress::Waiting(Box::new(wait)));
             }
@@ -818,6 +820,9 @@ pub struct LockWait {
     /// When this pass began waiting: its first attempt. A caller that
     /// retries in passes keeps the first pass's value.
     pub waiting_since: SystemTime,
+    /// How many attempts this call made at the lock: the first always runs,
+    /// and a retry only if it could end by the call's deadline.
+    pub attempts: u32,
     /// When the blockers were read (Postgres's `clock_timestamp()`).
     pub observed_at: SystemTime,
     /// Every other session holding, or queued for, a lock on the table that
@@ -972,6 +977,7 @@ async fn lock_wait(
     client: &impl GenericClient,
     op: Op<'_>,
     started: Instant,
+    attempts: u32,
 ) -> Result<LockWait, tokio_postgres::Error> {
     let conflicts = op.lock().1;
     let observed_at: SystemTime = client
@@ -986,6 +992,7 @@ async fn lock_wait(
         waiting_since: observed_at
             .checked_sub(started.elapsed())
             .unwrap_or(observed_at),
+        attempts,
         observed_at,
         blockers,
     })
@@ -1028,11 +1035,17 @@ impl BlockerLog {
     /// After a timed-out attempt that will be retried: reads and logs the
     /// blockers if a line is due. A failed read is logged and otherwise
     /// ignored: the retry goes on either way.
-    async fn after_timeout(&mut self, client: &impl GenericClient, op: Op<'_>, started: Instant) {
+    async fn after_timeout(
+        &mut self,
+        client: &impl GenericClient,
+        op: Op<'_>,
+        started: Instant,
+        attempts: u32,
+    ) {
         if !self.due() {
             return;
         }
-        match lock_wait(client, op, started).await {
+        match lock_wait(client, op, started, attempts).await {
             Ok(wait) => self.log(&wait, "retrying"),
             Err(error) => crate::instance_log::debug!(
                 what = self.operation.what(),
@@ -1208,6 +1221,7 @@ mod tests {
             operation: LockingOperation::Install,
             lock_mode: LockingOperation::Install.lock_mode().to_string(),
             waiting_since: at - Duration::from_millis(300),
+            attempts: 1,
             observed_at: at,
             blockers: vec![
                 blocker("client backend", "update orders set a = 1"),
