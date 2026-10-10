@@ -145,12 +145,12 @@ and collation), row-level security and subscriptions, and, for a 1-1 definition,
 source key that is still the one its target is keyed by. While define would refuse
 it, the resume refuses with define's error, names the column and what to change, and
 changes nothing: the definition stays paused. Every definition also needs its ledger
-table to exist (only a hand edit drops it; #986), and an aggregate gets one more check,
+table to exist (only a hand edit drops it, #986), and an aggregate gets one more check,
 that its group-delta table is the one define would create now: it exists (likewise),
 and its running-sum and recompute columns are define's (a `SUM` or `AVG`
 argument that moved between an exact type and floating point changes them). The
 resume refuses each of these too, names `DROP TRANSFORM`, and changes nothing; a column resume
-doesn't make the check, since it builds nothing. A field resume runs the same check on
+doesn't make these checks, since it builds nothing. A field resume runs define's validation on
 its definition, and leaves a dependent its cascade reaches paused while that
 dependent's check fails. The dependent's check runs on the definition read under the
 column-pause lock, which every `ALTER TRANSFORM` that changes it takes exclusive, so it is

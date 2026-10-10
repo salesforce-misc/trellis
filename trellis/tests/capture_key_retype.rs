@@ -1781,6 +1781,67 @@ async fn the_worker_refuses_a_requested_resume_whose_delta_table_s_shape_changed
     );
 }
 
+/// #986: the staging worker checks the ledger too before it re-types
+/// anything. The operator's resume is accepted (a widened column is waiting
+/// to be re-typed), then the ledger is dropped: the worker's pass refuses the
+/// resume, names the table and `DROP TRANSFORM`, and leaves the column as it
+/// was, for a 1-1 target and an aggregate alike.
+#[tokio::test]
+async fn the_worker_refuses_a_requested_resume_whose_ledger_was_dropped_first() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount numeric); \
+         insert into public.orders values (1, 1, 10.5), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for define in [
+        "TRANSFORM one_to_one FROM public.orders SELECT shop AS shop, amount AS amount",
+        "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+         SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+    ] {
+        trellis.apply(define).await.expect("define");
+    }
+    bring_live(&mut raw, &db.pool, &["one_to_one", "per_shop"]).await;
+
+    raw.batch_execute("alter table public.orders alter column shop type bigint")
+        .await
+        .expect("widen the column both targets copy");
+    capture_pass(&mut raw, &db.pool).await;
+    for target in ["one_to_one", "per_shop"] {
+        resume(&trellis, target).await;
+        assert_retyping(&trellis, &raw, target).await;
+        raw.batch_execute(&format!("drop table public.{target}__ledger"))
+            .await
+            .expect("drop the ledger");
+    }
+    capture_pass(&mut raw, &db.pool).await;
+
+    for target in ["one_to_one", "per_shop"] {
+        let reported = trellis
+            .status(target)
+            .await
+            .expect("status")
+            .expect("registered");
+        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+        let error = reported.capture_failure.expect("reason").error;
+        assert!(
+            error.starts_with("the resume was refused:")
+                && error.contains(&format!("{target}__ledger"))
+                && error.contains("DROP TRANSFORM"),
+            "{target}: {error}"
+        );
+        assert_eq!(
+            column_type(&raw, &format!("public.{target}"), "shop").await,
+            "integer",
+            "{target}"
+        );
+    }
+}
+
 /// #967: an aggregate whose group-delta table is gone (an operator dropped
 /// it) has nothing to compare, but define would create one, and the rebuild
 /// writes its chunks into it. A resume refuses, names the table and

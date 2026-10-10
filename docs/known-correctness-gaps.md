@@ -269,7 +269,11 @@ naming the table, and the definition stays paused. A build whose start fails
 because its ledger is gone (dropped while the definition waited to start)
 pauses that definition and what reads its target, with the error as its
 `capture_failure` of kind `halt`; the staging worker's pass goes on to start
-the other definitions' builds.
+the other definitions' builds. A live definition whose ledger is dropped
+fails each drain page that applies a change for it: the keys those pages
+touch are held once their retries run out, and the definition is
+quarantined once enough are, while the other definitions on its source carry
+on. Its resume then refuses the same way.
 
 **Detected?** `self_check` reports it on 1-1 targets. Nothing reports it on
 aggregate or relationship-enriched targets.

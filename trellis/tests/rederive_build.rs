@@ -1234,6 +1234,118 @@ async fn a_start_that_fails_doesn_t_stop_the_pass_discharging_other_markers() {
     );
 }
 
+/// #986: a start that fails transiently (here its read of the ledger waits
+/// out `lock_timeout` behind another session's lock, `55P03`) is retried on
+/// the next pass, not paused, and the pass still starts the other
+/// definitions' builds.
+#[tokio::test]
+async fn a_start_that_fails_transiently_is_retried_next_pass_and_not_paused() {
+    let mut f = Fixture::new(150, &[ONE, AGG]).await;
+    let holder = connect(f.db.dsn()).await;
+    holder
+        .batch_execute("begin; lock table public.one__ledger in access exclusive mode")
+        .await
+        .expect("hold the first definition's ledger");
+    f.raw
+        .batch_execute("set lock_timeout = '200ms'")
+        .await
+        .expect("make the pass's lock waits short");
+
+    // The holder's open transaction is one the discharge's fence wait waits
+    // out, so this pass gives it only a moment.
+    trellis::client::reconcile_pass(
+        &mut f.raw,
+        &f.db.pool,
+        DEFAULT_SCHEMA,
+        WAKE,
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("reconcile pass");
+    assert_eq!(
+        f.status("one").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(
+        f.count("select count(*) from capture_failures").await,
+        0,
+        "a transient failure records nothing"
+    );
+
+    holder
+        .batch_execute("rollback")
+        .await
+        .expect("release the ledger");
+    f.raw
+        .batch_execute("reset lock_timeout")
+        .await
+        .expect("reset lock_timeout");
+    f.pass().await;
+    assert_eq!(f.status("one").await.as_deref(), Some("backfilling"));
+    assert_eq!(f.build("one").await.as_deref(), Some("rederive"));
+}
+
+/// Known-gaps entry 8: a live definition whose ledger is dropped fails each
+/// drain page that applies a change for it, until the keys it touches are
+/// held and the definition is quarantined. The other definition on the
+/// source stays live, and the quarantined one's resume refuses with the
+/// repair.
+#[tokio::test]
+async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
+    let mut f = Fixture::new(50, &[ONE, AGG]).await;
+    f.pass().await;
+    f.run("one").await;
+    f.run("agg").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.raw
+        .batch_execute(
+            "drop table public.one__ledger; \
+             update public.src set v = v + 1 where id <= 6",
+        )
+        .await
+        .expect("drop the ledger and change some rows");
+
+    // Each page fails until its keys' retries run out: a bounded number of
+    // explicit drains, not a timed wait.
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        trellis::staging::seal_if_active_nonempty(&mut f.raw, WAKE)
+            .await
+            .expect("seal");
+        while let Some(seg) = apply::next_claimable_segment(&f.raw)
+            .await
+            .expect("next claimable segment")
+        {
+            if apply::drain_once(&f.db.pool, seg, "drainer", 1, WAKE, &watermark)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        if f.status("one").await.as_deref() == Some("quarantined") {
+            break;
+        }
+    }
+    assert_eq!(f.status("one").await.as_deref(), Some("quarantined"));
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+
+    let refusal = f
+        .trellis()
+        .await
+        .apply("RESUME TRANSFORM one")
+        .await
+        .expect_err("a resume of a definition without its ledger is refused")
+        .to_string();
+    assert!(
+        refusal.contains("DROP TRANSFORM") && refusal.contains("one__ledger"),
+        "{refusal}"
+    );
+}
+
 /// A worker that dies after a chunk's or a merge's commit, before its own
 /// flip check, leaves a finished build `backfilling`; the next worker step
 /// that finds nothing to claim makes the flip (`work_once`'s idle check).
