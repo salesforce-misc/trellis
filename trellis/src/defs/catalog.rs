@@ -5251,12 +5251,15 @@ pub(crate) async fn revalidate(
 /// definition paused with its target as it was. A definition `route` doesn't
 /// take expects no table, so a missing one is nothing to compare.
 ///
-/// `route` returns `None` for a definition [`revalidate`] has just
-/// validated only when its calculated fields' alias expansion is larger than
-/// the build's size budget ([`crate::defs::backfill::substituted_field_exprs`]),
-/// which [`validate`] doesn't bound. Define then creates no group-delta table
-/// and a drain halts on the target (`ApplyError::AggregateOffLedger`), so the
-/// arm is reachable, and wants no table rather than panicking.
+/// `route` takes every aggregate [`revalidate`] accepts and define created.
+/// Its other refusals (a missing column or relationship, a to-many path, a
+/// type it can't infer) are [`validate`]'s too, and the one `validate`
+/// doesn't make, an alias expansion past the build's size budget
+/// ([`crate::defs::backfill::substituted_field_exprs`]), depends on the
+/// definition's text alone, and define's DDL refuses it
+/// ([`ddl::aggregate_target_table_ddl`] makes the same substitution). So
+/// `route` returning `None` here is only defensive: it wants no table, as
+/// define would, rather than panicking.
 ///
 /// Only a whole-transform resume calls it ([`Revalidated`] is its input): a
 /// column resume of an aggregate field builds nothing and never reads the

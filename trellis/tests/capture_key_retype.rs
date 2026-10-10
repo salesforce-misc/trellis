@@ -1252,6 +1252,8 @@ async fn resume_refuses_a_redefined_source_key() {
             && refused.contains("drop the definition and define it again"),
         "{refused}"
     );
+    // Define would accept this definition: only a resume refuses it (#967).
+    assert!(!refused.contains("define would refuse"), "{refused}");
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
 }
 

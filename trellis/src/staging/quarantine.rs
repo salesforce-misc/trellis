@@ -3705,16 +3705,18 @@ pub(crate) async fn resume_pairs(
                         error = %reason,
                         "dependent column stays paused: its definition no longer validates"
                     );
-                    hold_orphaned_pause(
-                        pool,
-                        &t,
-                        &c,
-                        &format!(
+                    // A refusal define doesn't make (a redefined source
+                    // key) never validates "again" by itself: its own text
+                    // names the repair.
+                    let why = if reason.is_define_refusal() {
+                        format!(
                             "its definition no longer validates ({reason}); \
                              RESUME it once the definition validates again"
-                        ),
-                    )
-                    .await?;
+                        )
+                    } else {
+                        format!("its definition can't be resumed: {reason}")
+                    };
+                    hold_orphaned_pause(pool, &t, &c, &why).await?;
                     continue;
                 }
                 Err(err) => return Err(err),
