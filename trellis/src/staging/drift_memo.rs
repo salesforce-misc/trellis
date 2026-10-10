@@ -255,7 +255,7 @@ pub(crate) fn record(instance: &str, table: &str, id: i64, current: Option<(Stri
             memo.remove(&key);
         }
     });
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(any(test, feature = "internals"))]
     probe::count(instance, id);
 }
 
@@ -279,8 +279,8 @@ pub(crate) fn forget_instance(instance: &str) {
 
 /// How many times the capture pass has run the full comparison for a
 /// definition, for tests that pin the skip. Compiled only under
-/// `cfg(any(test, feature = "test-util"))`.
-#[cfg(any(test, feature = "test-util"))]
+/// `cfg(any(test, feature = "internals"))`.
+#[cfg(any(test, feature = "internals"))]
 mod probe {
     use super::*;
 
@@ -294,6 +294,7 @@ mod probe {
             .or_default() += 1;
     }
 
+    #[cfg(any(test, feature = "internals"))]
     pub(super) fn get(instance: &str, id: i64) -> u64 {
         CHECKS
             .lock()
@@ -306,7 +307,7 @@ mod probe {
 
 /// The number of full comparisons the capture pass has run for definition
 /// `id` of the instance with schema `schema` in database `database`.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(any(test, feature = "internals"))]
 pub fn checks(database: &str, schema: &str, id: i64) -> u64 {
     probe::get(
         &crate::capture::reconcile::instance_key(database, schema),
