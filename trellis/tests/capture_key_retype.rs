@@ -1821,7 +1821,10 @@ async fn a_resume_refuses_an_aggregate_whose_group_delta_table_is_missing() {
     assert!(!message.contains("define would refuse"), "{message}");
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Paused);
     let exists: bool = raw
-        .query_one("select to_regclass('public.per_shop__deltas') is not null", &[])
+        .query_one(
+            "select to_regclass('public.per_shop__deltas') is not null",
+            &[],
+        )
         .await
         .expect("look the table up")
         .get(0);
