@@ -373,14 +373,24 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
 /// budget on locked tables: each gets its first attempt, and no retry starts
 /// that couldn't end by the deadline.
 ///
-/// Asserts the attempts each wait reports, not how long the pass took (#1005):
-/// a retry needs `USER_TABLE_DDL_RETRY_INTERVAL` plus one lock timeout left
-/// before the deadline, so a budget under that allows exactly one attempt per
-/// table however slow the box is. A pass that retried past its deadline would
-/// never return (the holders never let go), so the wall-clock guard below only
+/// Asserts the attempts each wait reports, not how long the pass took (#1005).
+/// A retry needs `USER_TABLE_DDL_RETRY_INTERVAL` plus one lock timeout left
+/// before the deadline when it is decided, after an attempt: a budget under
+/// that allows exactly one attempt per table however slow the box is, and
+/// the table tried after one that ran out of budget gets exactly one too.
+/// Only "a retry that fits is taken" depends on the box's speed, and only
+/// one way: it fails if the first attempt ends less than a retry's length
+/// before the deadline. A pass that retried past its deadline would
+/// never return (the holders never let go), so the wall-clock guard only
 /// turns that hang into a failure.
 #[tokio::test]
 async fn a_pass_respects_its_budget_on_locked_tables() {
+    async fn pass(raw: &mut Client, pool: &trellis::Pool, budget: Duration) -> PassOutcome {
+        tokio::time::timeout(Duration::from_secs(60), capture_pass(raw, pool, budget))
+            .await
+            .expect("a pass stops retrying at its deadline")
+    }
+
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -399,32 +409,45 @@ async fn a_pass_respects_its_budget_on_locked_tables() {
     }
     let _hold_u = hold_table(db.dsn(), "public.u").await;
     let _hold_v = hold_table(db.dsn(), "public.v").await;
-
-    let no_retry_fits = USER_TABLE_DDL_RETRY_INTERVAL + USER_TABLE_DDL_LOCK_TIMEOUT;
-    // Zero: the deadline is past before the pass starts, so every table's
-    // first attempt comes after it. The other: u's first attempt is under way
-    // when the budget runs out, and no retry fits in what is left.
-    for budget in [Duration::ZERO, no_retry_fits - Duration::from_millis(1)] {
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(60),
-            capture_pass(&mut raw, &db.pool, budget),
-        )
-        .await
-        .expect("a pass stops retrying at its deadline");
-
+    // The attempts at each held table, in the order the pass tried them.
+    let attempts = |outcome: &PassOutcome| -> Vec<(String, u32)> {
         assert!(outcome.ready.is_empty(), "{outcome:?}");
-        let attempts: BTreeMap<&str, u32> = outcome
+        outcome
             .waiting
             .iter()
-            .map(|wait| (wait.table.as_str(), wait.attempts))
-            .collect();
+            .map(|wait| (wait.table.clone(), wait.attempts))
+            .collect()
+    };
+
+    // Zero: the deadline has passed before either first attempt. One under
+    // a retry's length: whenever the first table's attempt ends, at most
+    // that is left, so no retry fits.
+    let no_retry_fits = USER_TABLE_DDL_RETRY_INTERVAL + USER_TABLE_DDL_LOCK_TIMEOUT;
+    for budget in [Duration::ZERO, no_retry_fits - Duration::from_millis(1)] {
+        let outcome = pass(&mut raw, &db.pool, budget).await;
+        let mut tried = attempts(&outcome);
+        tried.sort();
         assert_eq!(
-            attempts,
-            BTreeMap::from([("public.u", 1), ("public.v", 1)]),
+            tried,
+            [("public.u".to_string(), 1), ("public.v".to_string(), 1)],
             "budget {budget:?}: each locked table gets its first attempt and no retry; \
              {outcome:?}"
         );
     }
+
+    // A budget a retry fits in many times over: the first table tried
+    // retries until the deadline stops it, and the second, tried only after
+    // that, gets its first attempt alone. The first table's first attempt
+    // ends about 60 ms into the pass here, and under 250 ms with every core
+    // busy, so a retry fits unless that attempt ends over 2.75 s in.
+    let budget = Duration::from_secs(3);
+    let outcome = pass(&mut raw, &db.pool, budget).await;
+    let tried = attempts(&outcome);
+    assert!(
+        matches!(tried.as_slice(), [(_, first), (_, 1)] if *first >= 2),
+        "budget {budget:?}: the first table retries while a retry fits, the second \
+         gets one attempt; {tried:?}"
+    );
 }
 
 /// A definition that reads a new column of a relationship's to-side is not
