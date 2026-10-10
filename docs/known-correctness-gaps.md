@@ -640,7 +640,9 @@ them, and nothing pauses.
   `0.12345678901234568` where `d` now holds `0.12345678901234567890123`.
 
 **Detected?** A failed write shows as a held key on the definition's
-`status`. A rounded value shows only in `self_check`, on a 1-1 target.
+`status`. A rounded value shows only in `self_check`, on a 1-1 target. An
+`ALTER TRANSFORM` that adds or changes a field reading the column is refused,
+naming the column, its recorded type and its type now.
 
 **Planned work:** none filed. #824 pauses for a widening, and leaves a move
 to another type family as it was.

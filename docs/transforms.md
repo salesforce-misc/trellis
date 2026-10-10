@@ -457,11 +457,12 @@ An `ALTER TRANSFORM` validates the definition it would leave against the source'
 live columns, the schema as of its own commit and not as of define, with define's
 rules: it refuses what define would refuse, naming the column and what to change.
 A column the host added since define is readable by an added or changed field,
-and a field named after it is refused. A column the host dropped or retyped since
-refuses an edit that leaves a field reading it, so drop or change that field in
-the same statement. An edit that reads a source column whose type differs from the
-one recorded at define records the live type for it; columns it doesn't read keep
-theirs until a `RESUME`.
+and a field named after it is refused. A column the host dropped, or retyped so
+that a field reading it no longer validates, refuses an edit that leaves that
+field, so drop or change the field in the same statement. An added or changed
+field can't read a column whose type the host changed since the transform was
+defined or last resumed, even one it would validate over: `PAUSE` and `RESUME` the
+transform first, which re-types it over the source as it is now, then edit it.
 
 **`apply` only registers.** Every statement returns once the change is
 recorded; none reads the transform's source rows. A new transform is built in the

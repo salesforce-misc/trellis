@@ -2104,6 +2104,141 @@ async fn an_edit_over_an_unchanged_schema_leaves_the_recorded_columns_alone() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test]
+async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table readings (id bigint primary key, x integer, y numeric); \
+         insert into readings select s, s, s from generate_series(1, 3) s;",
+    )
+    .await
+    .expect("seed readings");
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM reading_calc FROM readings SELECT x AS x, y AS y")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "reading_calc").await;
+    let version = persisted_definition_version(&raw, "reading_calc").await;
+    let recorded = persisted_source_columns(&raw, "reading_calc").await;
+
+    // Another type family: nothing pauses, and the passthrough `x` keeps
+    // applying through the recorded `integer`.
+    raw.batch_execute("alter table readings alter column x type double precision")
+        .await
+        .expect("the host retypes x");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM reading_calc ADD x + y AS xy")
+        .await
+        .expect_err("xy would be built over double precision and applied over integer");
+    let TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) = err else {
+        panic!("expected UnsupportedAlter, got {err:?}");
+    };
+    for part in [
+        "'xy'",
+        "'x'",
+        "as integer",
+        "as double precision",
+        "RESUME TRANSFORM reading_calc",
+    ] {
+        assert!(detail.contains(part), "{part} in {detail}");
+    }
+    assert_eq!(
+        persisted_definition_version(&raw, "reading_calc").await,
+        version
+    );
+    assert_eq!(
+        persisted_source_columns(&raw, "reading_calc").await,
+        recorded
+    );
+
+    // An edit that builds nothing over `x` goes ahead, and leaves `x`
+    // recorded as it was: the passthrough applies as it did before the edit.
+    trellis
+        .apply("ALTER TRANSFORM reading_calc ADD y + y AS y2")
+        .await
+        .expect("y2 reads only y");
+    assert_eq!(
+        persisted_source_columns(&raw, "reading_calc").await,
+        recorded
+    );
+    wait_for_live(&raw, "reading_calc").await;
+
+    // A resume re-types the definition, and the edit goes ahead after it.
+    trellis
+        .apply("PAUSE TRANSFORM reading_calc")
+        .await
+        .expect("pause");
+    trellis
+        .apply("RESUME TRANSFORM reading_calc")
+        .await
+        .expect("resume");
+    wait_for_live(&raw, "reading_calc").await;
+    trellis
+        .apply("ALTER TRANSFORM reading_calc ADD x + y AS xy")
+        .await
+        .expect("x is recorded as the source has it now");
+    assert!(
+        persisted_source_columns(&raw, "reading_calc")
+            .await
+            .contains("\"x\": \"double precision\"")
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_field_reading_a_column_the_source_dropped_is_dropped_by_an_edit_and_refuses_others() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    // No capture pass from here on, so nothing pauses the definition for
+    // the dropped column before the edits below.
+    trellis.shutdown().await.expect("stop the pipeline");
+    let trellis = define_only(db.dsn()).await;
+
+    raw.batch_execute("alter table orders drop column b")
+        .await
+        .expect("the host drops b");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS a2")
+        .await
+        .expect_err("the edit would leave the field b reading a column the source dropped");
+    match err {
+        TrellisError::Catalog(CatalogError::Validate(
+            trellis::ValidationError::UnresolvedColumn { field, column },
+        )) => assert_eq!((field.as_str(), column.as_str()), ("b", "b")),
+        other => panic!("expected UnresolvedColumn, got {other:?}"),
+    }
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("an edit dropping the field is what define would accept");
+    assert!(
+        !column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc")
+            .await
+            .contains("b")
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 // ---------------------------------------------------------------------
 // Column-granularity drop refusal (issue #241), and its retrofit onto
 // `DROP TRANSFORM` (issue #242)

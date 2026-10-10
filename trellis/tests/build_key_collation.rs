@@ -86,10 +86,12 @@ impl Fixture {
         ))
         .await
         .expect("seed the source");
+        // The source's own types: an `ALTER TRANSFORM` refuses to build a
+        // field over a column recorded as another type than the source has.
         let columns = [
             ("id".to_string(), ValueType::Text),
-            ("g".to_string(), ValueType::Numeric),
-            ("v".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Integer(trellis::IntWidth::Int4)),
+            ("v".to_string(), ValueType::Integer(trellis::IntWidth::Int8)),
         ]
         .into_iter()
         .collect();
