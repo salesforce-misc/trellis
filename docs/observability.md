@@ -246,12 +246,14 @@ pause are arcs of one lifecycle:
   something it can't use, a relationship's join columns no longer match), the
   resume fails with `ApplyError::ResumeRefused`, whose message is define's own
   error naming the column and what to change, and the transform stays paused,
-  untouched. The resume makes three refusals define doesn't, where define would
-  accept the transform and the message says to `DROP TRANSFORM` and define it again:
+  untouched. The resume also refuses in three cases define doesn't, where define
+  would accept the transform and the message says to drop it and define it again:
   its 1-1 source key was redefined, or its aggregate's group-delta table is missing
-  or has other columns than define would create now
-  ([The repair tools](known-correctness-gaps.md#the-repair-tools)). A field resume (`RESUME TRANSFORM t.col`) runs the
-  same check. Otherwise the resume returns it to `waiting_to_backfill`. If columns
+  or has different columns from the ones define would create now
+  ([The repair tools](known-correctness-gaps.md#the-repair-tools)). A field resume
+  (`RESUME TRANSFORM t.col`) runs the same validation, but not the group-delta
+  checks, since it rebuilds nothing. Otherwise the resume returns it to
+  `waiting_to_backfill`. If columns
   Trellis created for it no longer have the types define would give them now (after
   `integer` to `bigint`, say), the resume returns at once but the transform stays `paused`, its
   `capture_failure` reading "resuming: …", until the staging worker has re-typed them

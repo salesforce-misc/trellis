@@ -44,11 +44,13 @@ A refusal after define is a pause, not a loss: `RESUME` rebuilds the target from
 source once the condition is fixed ([Status](#status)). `status()`'s
 `capture_failure` carries the reason. Every `RESUME`, of a transform or of one
 field, first runs define's validation against the live schema, and refuses,
-leaving the transform paused, while define would refuse it or while the target's
-own tables are no longer what define would create (a 1-1 target whose source key
-was redefined, an aggregate whose group-delta table is missing or has other
-columns; [The repair tools](known-correctness-gaps.md#the-repair-tools)); the
-error names the column and what to change. When a resume has copies to re-type it returns
+leaving the transform paused, while define would refuse it; the error names the
+column and what to change. A resume also refuses while the target's own tables
+are no longer what define would create (a 1-1 target whose source key was
+redefined, an aggregate whose group-delta table is missing or has different
+columns; [The repair tools](known-correctness-gaps.md#the-repair-tools)), and
+the error says to drop the transform and define it again; a field resume makes
+only the source-key check. When a resume has copies to re-type it returns
 at once, the transform still `paused` with a `capture_failure` that says so,
 and the staging worker re-types them and starts the rebuild. The re-type honours
 the `statement_timeout` of Trellis's role or database: one cancelled three times ends
@@ -432,7 +434,8 @@ as ambiguous and the address must name the schema.
 **Semantics** are covered by
 [0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md).
 In short: `PAUSE` and `DROP` are idempotent; `RESUME` re-validates the
-transform against the live schema, refusing while define would, and rebuilds
+transform against the live schema, refusing while define would or while the
+target's own tables aren't what define would create, and rebuilds
 by a fresh backfill rather than catching up on changes that happened during
 the pause;
 `DROP` removes the target table's data along with the definition, and is refused
