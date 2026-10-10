@@ -23,7 +23,11 @@
 //!   `DROP`: declaring a to-one relationship seeds its parent projection
 //!   from the whole to-side inside the call (`defs::catalog::
 //!   ensure_relationship_projection_in_txn`), which milestone E (#624)
-//!   replaces, so this measures that cost rather than gating on it.
+//!   replaces, so this measures that cost rather than gating on it. On the
+//!   100M source that seed outlasts the stock 30 s call deadline (#599), so
+//!   these two statements go through a second handle whose deadline is the
+//!   build timeout ([`long_call_options`]); every other statement keeps the
+//!   stock deadline, so one that outlasts it still shows as a failure.
 //!
 //! The added field is dropped again, so the scenario's oracle still compares
 //! the target's own columns.
@@ -127,6 +131,17 @@ impl ApplyAudit {
             opt(self.alter_alter_built_secs),
             opt(self.resume_column_built_secs),
         )
+    }
+}
+
+/// The options of the handle that carries `--apply-latency-big-to-side`'s two
+/// statements: the stock ones with the call deadline raised to `build_timeout`
+/// (the scenario's bound on any one wait), so the seed of a 100M-row to-side
+/// is timed instead of ending in `CallTimeout` at 30 s (#1011).
+fn long_call_options(build_timeout: Duration) -> trellis::TrellisOptions {
+    trellis::TrellisOptions {
+        call_deadline: Some(build_timeout.max(trellis::DEFAULT_CALL_BUDGET)),
+        ..Default::default()
     }
 }
 
@@ -305,9 +320,15 @@ pub async fn run(
     );
 
     if big_to_side {
+        let long = trellis::Trellis::connect(
+            trellis::Config::from_dsn(dsn.to_string()).expect("valid dsn"),
+            long_call_options(build_timeout),
+        )
+        .await
+        .expect("connect the long-deadline define-only Trellis");
         audit.statements.push(
             timed(
-                &trellis,
+                &long,
                 "define_relationship_big_to_side",
                 &format!("RELATIONSHIP apply_big FROM apply_parent.id TO {source}.id"),
             )
@@ -315,12 +336,15 @@ pub async fn run(
         );
         audit.statements.push(
             timed(
-                &trellis,
+                &long,
                 "drop_relationship_big_to_side",
                 "DROP RELATIONSHIP apply_parent.apply_big",
             )
             .await,
         );
+        long.shutdown()
+            .await
+            .expect("shut the long-deadline Trellis down");
     }
 
     trellis
@@ -328,4 +352,18 @@ pub async fn run(
         .await
         .expect("shut the define-only Trellis down");
     audit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_big_to_side_handle_outlasts_the_stock_call_deadline() {
+        let long = long_call_options(Duration::from_secs(3600));
+        assert_eq!(long.call_deadline, Some(Duration::from_secs(3600)));
+        // A short build timeout never lowers it below the stock deadline.
+        let short = long_call_options(Duration::from_secs(5));
+        assert_eq!(short.call_deadline, Some(trellis::DEFAULT_CALL_BUDGET));
+    }
 }

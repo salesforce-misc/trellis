@@ -78,24 +78,16 @@ impl CallDeadline {
     /// `local` is `SET LOCAL` (inside a transaction); otherwise the setting
     /// lasts for the session.
     ///
-    /// It reads the setting in force with `current_setting`, whose text
-    /// (`50ms`, `2min`, `0`) parses as an interval, not from `pg_settings`:
-    /// that view builds every setting the server has on each read, about
-    /// 0.3 ms, which every call paid twice over.
+    /// The statement itself is [`crate::locks::cap_timeout_sql`], which reads
+    /// the setting in force with `current_setting`, not `pg_settings` (#1010);
+    /// this adds the time-left computation and the clamp to at least 1 ms.
     pub(crate) fn set_statement_timeout_sql(&self, local: bool) -> String {
         let ms = self
             .remaining()
             .as_nanos()
             .div_ceil(1_000_000)
             .clamp(1, i32::MAX as u128);
-        format!(
-            "select set_config('statement_timeout', \
-                 case when kept between 1 and {ms} then kept::text else '{ms}' end, \
-                 {local}) \
-             from (select (extract(epoch from \
-                     current_setting('statement_timeout')::interval) * 1000)::bigint as kept) \
-                 as in_force"
-        )
+        crate::locks::cap_timeout_sql("statement_timeout", ms, local)
     }
 
     /// How long a connection that ran under this deadline may still be busy
