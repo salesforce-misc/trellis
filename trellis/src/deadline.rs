@@ -77,6 +77,11 @@ impl CallDeadline {
     ///
     /// `local` is `SET LOCAL` (inside a transaction); otherwise the setting
     /// lasts for the session.
+    ///
+    /// It reads the setting in force with `current_setting`, whose text
+    /// (`50ms`, `2min`, `0`) parses as an interval, not from `pg_settings`:
+    /// that view builds every setting the server has on each read, about
+    /// 0.3 ms, which every call paid twice over.
     pub(crate) fn set_statement_timeout_sql(&self, local: bool) -> String {
         let ms = self
             .remaining()
@@ -85,9 +90,11 @@ impl CallDeadline {
             .clamp(1, i32::MAX as u128);
         format!(
             "select set_config('statement_timeout', \
-                 case when setting::bigint between 1 and {ms} then setting else '{ms}' end, \
+                 case when kept between 1 and {ms} then kept::text else '{ms}' end, \
                  {local}) \
-             from pg_settings where name = 'statement_timeout'"
+             from (select (extract(epoch from \
+                     current_setting('statement_timeout')::interval) * 1000)::bigint as kept) \
+                 as in_force"
         )
     }
 
@@ -219,6 +226,9 @@ mod tests {
         let sql = deadline.set_statement_timeout_sql(true);
         assert!(sql.contains("between 1 and 15") || sql.contains("between 1 and 14"));
         assert!(sql.contains("true)"));
+        // `pg_settings` builds every setting on each read: a third of a
+        // millisecond on every call.
+        assert!(!sql.contains("pg_settings"), "{sql}");
         let past = CallDeadline {
             at: Instant::now() - Duration::from_secs(1),
             budget: Duration::from_secs(2),

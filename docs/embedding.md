@@ -663,8 +663,11 @@ so does every transaction it opens, so Postgres stops a statement stuck on a
 lock and rolls its transaction back. A timed-out call changes nothing it
 hadn't already committed. `migrate` commits one migration at a time and
 gives each the time left, so one that runs out leaves the earlier ones
-applied. A statement outside a transaction runs under the time left when its
-connection was checked out. A caller that goes away (Ctrl-C, a killed
+applied. Postgres times each statement on its own, so a statement's limit is
+the time left when its transaction began (or, outside a transaction, when its
+connection was checked out): one that starts late in a call can run on the
+server past the deadline by up to that much, though the call itself returns on
+time. A caller that goes away (Ctrl-C, a killed
 thread) leaves its call running until the deadline, where the server stops
 it, and the reply is dropped.
 
