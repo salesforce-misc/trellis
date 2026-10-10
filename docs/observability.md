@@ -314,10 +314,17 @@ index on that table and column, which Trellis doesn't create on your tables
 says what counts as indexed and why it matters). It is a warning: the transform
 reads the column either way, each read scanning the table until the index exists,
 and its status is unaffected. The list is read from the catalog on each call, so an
-index you create shows on the next one, with no restart. `self_check` reports the
-same list with every report, as `unindexed_joins` on `SelfCheckReport`, whatever
-the outcome; it never changes the outcome. The CLI's `trellis status` prints one
-warning line per entry under the transform.
+index you create shows on the next one, with no restart. A join column that no
+longer exists isn't listed. The CLI's `trellis status` prints one warning line per
+entry under the transform.
+
+`SelfCheckReport` carries the same list as `unindexed_joins` on each report, and it
+never changes the outcome. A 1-1 transform that reads a relationship gets a report
+only when the audit stops before comparing rows: a capture fault, `NotLive` or
+`NotCaughtUp`. Otherwise `self_check` refuses it with `UnsupportedExpr`, and it
+refuses an aggregate before any report
+([known gap: `self_check` audits 1-1 targets only](known-correctness-gaps.md#16-self_check-audits-1-1-targets-only)),
+so `status` is the place to read the warning.
 
 ### Backfill status and the `xmin` caveat
 

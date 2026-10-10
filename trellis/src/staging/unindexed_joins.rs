@@ -7,9 +7,14 @@
 //! has an index). Without an index each read scans the table. Trellis never
 //! creates indexes on a source table (ADR-0005), so `Trellis::status` reports
 //! the columns a definition reads that lack one
-//! (`DefinitionStatus::unindexed_joins`) and `self_check` reports them for
-//! the audited definition (`SelfCheckReport::unindexed_joins`). Neither
-//! changes the definition's status or the audit's outcome: it is a warning.
+//! (`DefinitionStatus::unindexed_joins`), and `self_check` carries them on
+//! each report it returns for the audited definition
+//! (`SelfCheckReport::unindexed_joins`). `self_check` doesn't compare a
+//! target that reads a relationship yet (`SelfCheckError::UnsupportedExpr`),
+//! so it returns a report for one only when it stops before the comparison:
+//! a capture fault, a definition that isn't live, or a wait that runs out of
+//! time. `status` is where the warning reliably shows. Neither changes the
+//! definition's status or the audit's outcome: it is a warning.
 //!
 //! "Indexed" is [`ddl::key_column_in`]'s definition, the one the batch reads
 //! plan against, so a column reported here is exactly one whose reads run
@@ -47,7 +52,7 @@ impl UnindexedJoin {
 /// The join columns of the relationships `def` reads through, from
 /// `source_table`, that have no usable index, in relationship-name order
 /// with a relationship's `from_col` before its `to_col`. A relationship no
-/// longer declared is left out.
+/// longer declared, and a column that no longer exists, are left out.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
     source_table: &str,
@@ -62,7 +67,11 @@ pub(crate) async fn for_definition(
             columns.push((rel.qualified_to_table(), &rel.def.to_col));
         }
         for (table, column) in columns {
-            if !ddl::column_is_indexed_in(client, &table, column).await? {
+            // A column (or table) that no longer exists has no index to
+            // create: what its drop did to the definition is reported
+            // elsewhere.
+            let key_column = ddl::key_column_in(client, &table, column).await?;
+            if key_column.is_some_and(|key_column| !key_column.indexed) {
                 unindexed.push(UnindexedJoin {
                     relationship: rel.def.name.clone(),
                     table,

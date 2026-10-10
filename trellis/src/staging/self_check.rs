@@ -252,6 +252,13 @@ pub struct SelfCheckReport {
     /// fix for each is an index on its table and column, which Trellis
     /// doesn't create. Read live when the audit ends, so an index created
     /// since shows. Empty when there is none.
+    ///
+    /// A target that reads a relationship is refused with
+    /// [`SelfCheckError::UnsupportedExpr`] once the audit reaches the
+    /// comparison, so it gets a report, and this list, only when the audit
+    /// stops before then: a capture fault, a definition that isn't live, or
+    /// [`SelfCheckOutcome::NotCaughtUp`]. `Trellis::status` reports the same
+    /// list for any definition.
     pub unindexed_joins: Vec<UnindexedJoin>,
 }
 

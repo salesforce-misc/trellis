@@ -450,11 +450,13 @@ for summary in trellis.definitions().await? {
 }
 ```
 
-`self_check` reports the same list with each audit, whatever the outcome. In
-`trellis-embed`, `PlainDefinitionStatus` and `PlainSelfCheckReport` carry it as
-`unindexed_joins`, each entry with `relationship`, `table`, `column` and the
-`fix` sentence. The CLI's `trellis status` prints each entry as a warning line
-under its definition.
+`self_check` carries the same list on the reports it returns, but it refuses a
+target that reads a relationship once it reaches the comparison
+([observability](observability.md#transform-status-lifecycle)), so read the
+warning from `status`. In `trellis-embed`, `PlainDefinitionStatus` and
+`PlainSelfCheckReport` carry it as `unindexed_joins`, each entry with
+`relationship`, `table`, `column` and the `fix` sentence. The CLI's
+`trellis status` prints each entry as a warning line under its definition.
 
 ## Migrations and transactions
 

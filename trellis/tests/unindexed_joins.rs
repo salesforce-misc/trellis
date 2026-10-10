@@ -3,7 +3,7 @@
 //! `from_col`, or a to-many relationship's `to_col`, has no usable index.
 //! The report is a warning: it never changes the definition's status.
 //!
-//! `self_check` reports the same list; its tests are in `self_check.rs`.
+//! `self_check` carries the same list; its test is in `self_check.rs`.
 //! Nothing here waits for anything (#297): a definition's status and its
 //! join columns' indexes are both catalog reads, so no capture, worker or
 //! drain runs.
@@ -139,9 +139,10 @@ async fn a_to_one_relationships_to_col_is_never_reported() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// An index that is not ready, or is being dropped, or is under another
-/// collation than its column's, doesn't count: the same definition of
-/// "indexed" the planner setting reads (#972).
+/// An index that is not ready, or is being dropped, doesn't count: the same
+/// definition of "indexed" the planner setting reads (#972). The collation
+/// condition is pinned at define time
+/// (`defs_relationship_catalog::an_index_that_is_not_ready_or_under_another_collation_still_warns`).
 #[tokio::test]
 async fn an_index_the_planner_would_not_use_does_not_silence_the_warning() {
     let cluster = TestCluster::start();
@@ -186,6 +187,27 @@ async fn the_warning_does_not_change_the_definitions_status() {
     let clean = definition_status(&trellis).await;
     assert!(clean.unindexed_joins.is_empty());
     assert_eq!(warned.status, clean.status);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A join column that no longer exists has no index to create: `status`
+/// leaves it out rather than advise indexing a column the table doesn't
+/// have. What the drop does to the definition is `status`'s other fields'
+/// to report.
+#[tokio::test]
+async fn a_dropped_join_column_is_not_reported() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = fixture(&db).await;
+    raw.batch_execute(
+        "alter table orders drop column customer_id; \
+         alter table line_items drop column order_id",
+    )
+    .await
+    .expect("drop both join columns");
+
+    assert_eq!(unindexed(&trellis).await, Vec::new());
 
     trellis.shutdown().await.expect("shutdown");
 }

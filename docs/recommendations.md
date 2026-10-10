@@ -171,8 +171,8 @@ since with no index to use, turning sequential scans off would only cost the
 read its parallel scan. An index you create or drop takes effect on a later
 batch, with no restart or redefine. It changes speed only, never results.
 
-`status()` and `self_check` list each join column a definition reads that has no
-such index, with the index to create
+`status()` lists each join column a definition reads that has no such index,
+with the index to create
 ([observability](observability.md#transform-status-lifecycle)).
 
 ## Roles and permissions
