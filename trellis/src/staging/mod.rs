@@ -63,6 +63,7 @@ pub mod build;
 pub mod capture_audit;
 pub mod claim;
 pub mod converge;
+pub(crate) mod drift_memo;
 pub mod error;
 pub mod fold;
 pub(crate) mod halt;
@@ -100,6 +101,8 @@ pub use apply::{
 pub use claim::{
     DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, reclaim_stale_drainers, register_drainer,
 };
+#[cfg(any(test, feature = "internals"))]
+pub use drift_memo::checks as drift_checks;
 pub use error::StagingError;
 #[cfg(any(test, feature = "internals"))]
 pub use ledger::explain_page as explain_ledger_page;

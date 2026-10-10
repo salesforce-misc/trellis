@@ -39,7 +39,11 @@
 //! [`crate::staging::schema_change::pause_readers_of_retyped`]). A table
 //! Trellis created whose every such column widened by changing only the
 //! catalog (a longer `varchar`, say) is re-typed in place instead, with no
-//! pause. That check runs on the seam-fed tables too.
+//! pause. That check runs on the seam-fed tables too. It compares a
+//! definition's typed copies with the live schema only when something it
+//! reads has changed since the last comparison found them all current: the
+//! pass fingerprints those tables' columns once, before any check
+//! ([`crate::staging::drift_memo`], #858).
 //!
 //! Before any of that, the pass resumes each definition an upstream's resume
 //! paused, once that upstream is `live` (#828, #970,
@@ -153,6 +157,10 @@ pub async fn reconcile(
         .get(0);
     let instance = instance_key(&database, schema);
     let instance = instance.as_str();
+    // #858: read before any check, so a change that commits during the pass
+    // is checked again by the next one (`staging::drift_memo`).
+    let drift =
+        crate::staging::drift_memo::Fingerprints::read(&*client, schema, &snapshot.catalog).await?;
     let mut outcome = PassOutcome::default();
 
     for table in desired {
@@ -223,6 +231,7 @@ pub async fn reconcile(
             schema,
             instance,
             &snapshot.catalog,
+            &drift,
             table,
         )
         .await
@@ -279,7 +288,7 @@ pub async fn reconcile(
         .filter(|t| !desired_set.contains(t))
         .collect();
     seam_fed.sort();
-    for table in seam_fed {
+    for &table in &seam_fed {
         match crate::staging::schema_change::pause_readers_of_unsupported(
             client,
             schema,
@@ -307,6 +316,7 @@ pub async fn reconcile(
             schema,
             instance,
             &snapshot.catalog,
+            &drift,
             table,
         )
         .await
@@ -345,6 +355,14 @@ pub async fn reconcile(
     // A table that is neither read nor installed any more can't be waited on.
     let known: HashSet<&String> = desired.iter().chain(installed.iter()).collect();
     forget_reports_except(instance, &known);
+    crate::staging::drift_memo::retain_tables(
+        instance,
+        &known
+            .iter()
+            .chain(seam_fed.iter())
+            .map(|t| t.as_str())
+            .collect(),
+    );
 
     for (table, err) in &outcome.failed {
         // No longer waiting for a lock, whatever it did last pass.
@@ -648,6 +666,7 @@ pub fn forget_instance(database: &str, schema: &str) {
     let instance = instance_key(database, schema);
     with_reports(|reports| reports.retain(|(i, _), _| *i != instance));
     crate::staging::schema_change::forget_failed_retypes(&instance);
+    crate::staging::drift_memo::forget_instance(&instance);
 }
 
 fn forget_reports_except(instance: &str, known: &HashSet<&String>) {
@@ -656,7 +675,7 @@ fn forget_reports_except(instance: &str, known: &HashSet<&String>) {
 
 /// The registry's key for one instance: its database and schema. Two
 /// instances in one process can share a schema name in different databases.
-fn instance_key(database: &str, schema: &str) -> String {
+pub(crate) fn instance_key(database: &str, schema: &str) -> String {
     format!("{database}\u{1f}{schema}")
 }
 

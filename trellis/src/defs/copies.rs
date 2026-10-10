@@ -48,6 +48,10 @@
 //! type family, pauses nothing here and is re-typed only by a resume: every
 //! value still fits, or define's own checks own it.
 //!
+//! The comparison costs a few queries per definition, so the capture pass
+//! runs it for a definition only when a table it reads has changed since a
+//! comparison found every column current (`staging::drift_memo`, [`inputs`]).
+//!
 //! The ledger's `__from_key` is always `text`, and an aggregate's hidden
 //! partials (`numeric` sums, `bigint` counts) have fixed types, so none of
 //! them is checked.
@@ -313,6 +317,52 @@ pub(crate) async fn typed_copies(
     }
     copies.extend(inferred_copies(client, def, source, target, rels).await?);
     Ok(copies)
+}
+
+/// Every relation [`typed_copies`] and [`inspect`] read for `def`, which
+/// reads `source` (qualified) into `target` (qualified), as SQL resolves
+/// them (`to_regclass` text): the source, the to-side of each of `rels`, the
+/// target and, for an aggregate, its ledger and group-delta table, and
+/// `projections`, the projection tables (bare names, in `schema`) of `rels`.
+/// A superset of the tables the copies are in and read from: the capture
+/// pass fingerprints these to skip the comparison while none changed
+/// (`staging::drift_memo`, #858). A table `typed_copies` starts reading
+/// belongs here.
+pub(crate) fn inputs(
+    schema: &str,
+    def: &TransformDef,
+    source: &str,
+    target: &str,
+    rels: &[&RelationshipDefinition],
+    projections: &[&str],
+) -> Vec<String> {
+    let mut names = vec![
+        super::ddl::regclass_arg(source),
+        super::ddl::qualified_target_table_ident(target),
+    ];
+    names.extend(
+        rels.iter()
+            .map(|r| super::ddl::regclass_arg(&r.qualified_to_table())),
+    );
+    if matches!(def.key_space, KeySpace::Aggregate { .. }) {
+        let (target_schema, target_bare) = target.split_once('.').unwrap_or(("", target));
+        names.push(super::ledger::qualified_ledger_table(
+            target_schema,
+            target_bare,
+        ));
+        names.push(super::ledger::qualified_deltas_table(
+            target_schema,
+            target_bare,
+        ));
+    }
+    names.extend(
+        projections
+            .iter()
+            .map(|p| super::ddl::qualified_relationship_projection_table(schema, p)),
+    );
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The columns of `def`'s target and ledger typed by an expression

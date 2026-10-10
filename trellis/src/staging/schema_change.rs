@@ -42,6 +42,7 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::Client;
 
 use super::apply::ApplyError;
+use super::drift_memo::{self, Fingerprints};
 use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
@@ -470,6 +471,11 @@ pub(crate) async fn pause_readers_in_hierarchy(
 /// changed without a pause (a widening, a wider `numeric` scale) is
 /// re-recorded here, as a resume would.
 ///
+/// The fourth check's comparison of a definition's columns with the live
+/// schema is skipped while every relation it reads is as it was when the last
+/// comparison found every column current (`drift`, [`drift_memo`], #858). The
+/// other checks read the key columns' types and run every pass.
+///
 /// A key column the table no longer has is
 /// [`pause_readers_of_missing`]'s, which the pass runs first. Returns whether
 /// it paused any. Costs no query for a table no unpaused definition reads.
@@ -480,9 +486,11 @@ pub(crate) async fn pause_readers_of_retyped(
     schema: &str,
     instance: &str,
     catalog: &CaptureCatalog,
+    drift: &Fingerprints,
     table: &str,
 ) -> Result<bool, CaptureError> {
     let readers = unpaused_readers(catalog, table);
+    drift_memo::retain_readers(instance, table, &readers);
     if readers.is_empty() {
         return Ok(false);
     }
@@ -636,6 +644,25 @@ pub(crate) async fn pause_readers_of_retyped(
 
         // #767, #824: the columns Trellis created for it typed from columns
         // of this table, each with the type define would give it now.
+        //
+        // #858: skipped while every relation it reads is as it was when its
+        // last comparison found every column current
+        // ([`drift_memo`]).
+        let stamp = drift.stamp(schema, catalog, reader);
+        if let Some(copy_tables) = stamp
+            .as_deref()
+            .and_then(|stamp| drift_memo::skippable(instance, table, reader.id, stamp))
+        {
+            checked.push(Checked {
+                id: reader.id,
+                columns,
+                reasons,
+                refused,
+                states: Vec::new(),
+                skipped: copy_tables,
+            });
+            continue;
+        }
         let copies: Vec<copies::TypedCopy> = copies::typed_copies(
             &*client,
             schema,
@@ -649,12 +676,27 @@ pub(crate) async fn pause_readers_of_retyped(
         .filter(|c| c.columns_of(table).next().is_some())
         .collect();
         let states = copies::inspect(&*client, copies).await?;
+        // The stamp was read before the comparison, so a change that
+        // committed since it was read is checked again next pass.
+        drift_memo::record(
+            instance,
+            table,
+            reader.id,
+            stamp
+                .filter(|_| states.iter().all(|s| !s.drifted()))
+                .map(|stamp| {
+                    let tables: BTreeSet<String> =
+                        states.iter().map(|s| s.copy.table.clone()).collect();
+                    (stamp, tables.into_iter().collect())
+                }),
+        );
         checked.push(Checked {
             id: reader.id,
             columns,
             reasons,
             refused,
             states,
+            skipped: Vec::new(),
         });
     }
 
@@ -669,6 +711,7 @@ pub(crate) async fn pause_readers_of_retyped(
         mut reasons,
         refused,
         states,
+        skipped: _,
     } in checked
     {
         // Without a refusal, every key column flagged above is one whose
@@ -964,6 +1007,10 @@ struct Checked {
     reasons: Vec<String>,
     refused: bool,
     states: Vec<copies::CopyState>,
+    /// When the comparison of its copies was skipped (#858): the tables
+    /// holding a column the last comparison found, none of them drifted.
+    /// `states` is empty then.
+    skipped: Vec<String>,
 }
 
 /// Re-types each table Trellis created whose every widened column, across
@@ -1037,7 +1084,10 @@ async fn retype_in_place(
         }
         let owners: Vec<i64> = checked
             .iter()
-            .filter(|c| c.states.iter().any(|s| s.copy.table == table))
+            .filter(|c| {
+                c.states.iter().any(|s| s.copy.table == table)
+                    || c.skipped.contains(&table.to_string())
+            })
             .map(|c| c.id)
             .collect::<BTreeSet<_>>()
             .into_iter()

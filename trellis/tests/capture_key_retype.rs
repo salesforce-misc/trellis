@@ -3762,3 +3762,302 @@ async fn a_re_type_outlasting_the_statement_timeout_is_counted() {
     );
     assert_eq!(timeout_cancels(&raw, "item_names").await, Some(1));
 }
+
+// ---------------------------------------------------------------------
+// #858: the capture pass skips a definition's typed-copy comparison while
+// nothing it reads has changed (`staging::drift_memo`).
+// ---------------------------------------------------------------------
+
+/// Every comparison of typed copies the capture pass has run for the
+/// definitions of `raw`'s database, by target.
+async fn copy_checks(raw: &Client) -> std::collections::BTreeMap<String, u64> {
+    let database: String = raw
+        .query_one("select pg_catalog.current_database()::text", &[])
+        .await
+        .expect("database")
+        .get(0);
+    raw.query(
+        "select id, split_part(target_table, '.', 2) from transform_definitions order by id",
+        &[],
+    )
+    .await
+    .expect("definitions")
+    .into_iter()
+    .map(|row| {
+        let id: i64 = row.get(0);
+        (
+            row.get::<_, String>(1),
+            trellis::staging::drift_checks(&database, SCHEMA, id),
+        )
+    })
+    .collect()
+}
+
+/// `setup`'s three live definitions after one capture pass has compared
+/// each and recorded it, with the checks run so far.
+async fn settled(
+    db: &testkit::TestDatabase,
+    raw: &mut Client,
+) -> (Trellis, std::collections::BTreeMap<String, u64>) {
+    let trellis = setup(db.dsn(), raw, &db.pool).await;
+    capture_pass(raw, &db.pool).await;
+    let checks = copy_checks(raw).await;
+    assert!(checks.values().all(|n| *n > 0), "{checks:?}");
+    (trellis, checks)
+}
+
+/// The skip itself: passes over an unchanged schema compare no definition's
+/// copies, however many definitions read the table.
+#[tokio::test]
+async fn passes_over_an_unchanged_schema_compare_no_copies() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    for _ in 0..3 {
+        capture_pass(&mut raw, &db.pool).await;
+    }
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+
+    // Writes to the source change no column.
+    raw.batch_execute("insert into public.posts values (4, 'bob', 'd', 2, 2.50)")
+        .await
+        .expect("write");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+}
+
+/// A widening after clean passes is found by the next pass, and only the
+/// definitions on the changed tables are compared again.
+#[tokio::test]
+async fn a_widening_after_clean_passes_is_caught_on_the_next_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, settled) = settled(&db, &mut raw).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+
+    raw.batch_execute("alter table public.posts alter column kind type bigint")
+        .await
+        .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Paused);
+    let error = paused_for(&trellis, "per_kind", "public.posts", &["kind"]).await;
+    assert!(
+        error.contains("integer") && error.contains("bigint"),
+        "{error}"
+    );
+    let after = copy_checks(&raw).await;
+    assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
+}
+
+/// A catalog-only widening of a column read through a relationship, after
+/// clean passes, is re-typed in place by the next pass, both sides alike.
+#[tokio::test]
+async fn a_catalog_only_widening_after_clean_passes_is_re_typed_on_the_next_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+
+    raw.batch_execute(
+        "alter table public.users alter column handle type varchar(40); \
+         alter table public.posts alter column author type varchar(40);",
+    )
+    .await
+    .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+
+    for target in ["post_authors", "post_titles", "per_kind"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("projection")
+        .get(0);
+    assert_eq!(
+        column_type(&raw, &format!("trellis.{projection}"), "handle").await,
+        "character varying(40)"
+    );
+    let after = copy_checks(&raw).await;
+    assert!(after["post_authors"] > settled["post_authors"], "{after:?}");
+}
+
+/// A column re-typed and re-typed back between two passes ends where it was,
+/// but is not the column the last comparison saw: the next pass compares
+/// again. The fingerprint carries each row's `xmin` for this.
+#[tokio::test]
+async fn a_column_re_typed_and_back_between_passes_is_compared_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    raw.batch_execute(
+        "alter table public.posts alter column kind type bigint; \
+         alter table public.posts alter column kind type integer;",
+    )
+    .await
+    .expect("there and back");
+    capture_pass(&mut raw, &db.pool).await;
+
+    for target in ["post_authors", "post_titles", "per_kind"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    let after = copy_checks(&raw).await;
+    assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
+    // And settled again.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, after);
+}
+
+/// A column Trellis created, re-typed by hand away from what define would
+/// give it, is found though the source never changed: the target's own
+/// columns are fingerprinted too.
+#[tokio::test]
+async fn a_copy_re_typed_by_hand_is_compared_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    raw.batch_execute("alter table public.post_titles alter column title type varchar(100)")
+        .await
+        .expect("narrow the copy by hand");
+    capture_pass(&mut raw, &db.pool).await;
+    let after = copy_checks(&raw).await;
+    assert!(after["post_titles"] > settled["post_titles"], "{after:?}");
+}
+
+/// A definition paused for a widening and resumed is compared afresh, finds
+/// its copies current, and then settles: nothing recorded before the pause
+/// stands in for the comparison after the resume.
+#[tokio::test]
+async fn a_resumed_definition_is_compared_again_and_then_skipped() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, settled) = settled(&db, &mut raw).await;
+
+    raw.batch_execute("alter table public.posts alter column kind type bigint")
+        .await
+        .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Paused);
+    resume(&trellis, "per_kind").await;
+    bring_live(&mut raw, &db.pool, &["per_kind"]).await;
+    assert_eq!(column_type(&raw, "public.per_kind", "kind").await, "bigint");
+    capture_pass(&mut raw, &db.pool).await;
+    let after = copy_checks(&raw).await;
+    assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
+    for _ in 0..2 {
+        capture_pass(&mut raw, &db.pool).await;
+    }
+    assert_eq!(copy_checks(&raw).await, after);
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Live);
+}
+
+/// The aggregate's ledger and the relationship's projection are read by the
+/// comparison, so a change to either alone, with the source untouched,
+/// brings it back.
+#[tokio::test]
+async fn a_change_to_a_ledger_or_projection_column_alone_is_compared_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, mut last) = settled(&db, &mut raw).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("projection")
+        .get(0);
+
+    for (table, alter, target) in [
+        (
+            "public.per_kind__ledger".to_string(),
+            "alter column kind type bigint",
+            "per_kind",
+        ),
+        (
+            format!("trellis.{projection}"),
+            "alter column name type varchar(5)",
+            "post_authors",
+        ),
+    ] {
+        raw.batch_execute(&format!("alter table {table} {alter}"))
+            .await
+            .unwrap_or_else(|err| panic!("{table}: {err}"));
+        capture_pass(&mut raw, &db.pool).await;
+        let after = copy_checks(&raw).await;
+        assert!(after[target] > last[target], "{table}: {after:?}");
+        last = after;
+    }
+}
+
+/// A copy found different from what define would give it, though the source
+/// is not past it (here the source narrowed), is compared on every pass.
+#[tokio::test]
+async fn a_drifted_copy_is_never_skipped() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    raw.batch_execute("alter table public.posts alter column title type varchar(5)")
+        .await
+        .expect("narrow the source");
+    capture_pass(&mut raw, &db.pool).await;
+    let first = copy_checks(&raw).await;
+    assert!(first["post_titles"] > settled["post_titles"], "{first:?}");
+    capture_pass(&mut raw, &db.pool).await;
+    let second = copy_checks(&raw).await;
+    assert!(second["post_titles"] > first["post_titles"], "{second:?}");
+    assert_eq!(status(&raw, "post_titles").await, TransformStatus::Live);
+}
+
+/// `ALTER TRANSFORM` rewrites a definition in place, giving it a column
+/// Trellis copies from the source. The column joins the comparison at once:
+/// the definition's recorded stamp names the definition it was taken from.
+#[tokio::test]
+async fn a_column_added_by_alter_transform_is_compared_after_clean_passes() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, settled) = settled(&db, &mut raw).await;
+
+    trellis
+        .apply("ALTER TRANSFORM post_titles ADD kind AS k")
+        .await
+        .expect("add a passthrough");
+    bring_live(&mut raw, &db.pool, &["post_titles"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let added = copy_checks(&raw).await;
+    assert!(added["post_titles"] > settled["post_titles"], "{added:?}");
+    assert_eq!(
+        column_type(&raw, "public.post_titles", "k").await,
+        "integer"
+    );
+
+    raw.batch_execute("alter table public.posts alter column kind type bigint")
+        .await
+        .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+    // The new copy is among those found outgrown, with the group-by key.
+    let error = paused_for(&trellis, "post_titles", "public.posts", &["kind"]).await;
+    assert!(error.contains("public.post_titles.k"), "{error}");
+}
