@@ -1926,8 +1926,8 @@ mod tests {
                 "{table}: the target must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
             );
-            // The estimates lag with the statistics, so the scans' actual
-            // rows say what was read (#791).
+            // What the scans actually read, not what the planner expected
+            // them to (#791).
             let read = testkit::plan::rows_read(&plan, target);
             assert!(
                 read <= 2 * keys.len() as u64,

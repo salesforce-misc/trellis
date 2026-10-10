@@ -5145,13 +5145,54 @@ mod tests {
                 "{table}: the source must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
             );
-            // The estimates lag with the statistics, so the scans' actual
-            // rows say what was read (#791).
+            // What the scans actually read, not what the planner expected
+            // them to (#791).
             let read = testkit::plan::rows_read(&plan, source);
             assert!(
                 read <= 2 * keys.len() as u64,
                 "{table}: the source must be read for the batch's keys alone, \
                  {read} rows read, got:\n{plan}"
+            );
+            // The plan above is explained through `query_by_entry_key`; a 1-1
+            // ledger page's Re-derive read must run the statement that way
+            // too (#791). Without the settings, a stale source is scanned.
+            let txn = client.transaction().await.expect("begin");
+            // It reads the newest segment from Trellis's own schema too.
+            txn.batch_execute(&format!(
+                "set local search_path to {}, public",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("set search_path");
+            let seq_scans = "select seq_scan from pg_stat_xact_user_tables \
+                             where relid = $1::text::regclass";
+            let before: i64 = txn
+                .query_one(seq_scans, &[&table])
+                .await
+                .expect("scans")
+                .get(0);
+            let rederived = crate::staging::one_to_one_ledger::read_rows(
+                &txn, table, table, &pk, &columns, &keys,
+            )
+            .await
+            .expect("re-derive read");
+            let after: i64 = txn
+                .query_one(seq_scans, &[&table])
+                .await
+                .expect("scans")
+                .get(0);
+            txn.rollback().await.expect("rollback");
+            assert_eq!(
+                after, before,
+                "{table}: the Re-derive read must not scan the source, as its plan above doesn't"
+            );
+            assert_eq!(
+                rederived
+                    .rows
+                    .into_keys()
+                    .collect::<std::collections::HashSet<_>>(),
+                owned.iter().cloned().collect(),
+                "{table}: the Re-derive read finds every key's row"
             );
             let found: std::collections::HashSet<String> = client
                 .query(&query.sql, &query.params())
@@ -5260,8 +5301,8 @@ mod tests {
                 "{table}: the target must be matched to the keys without comparing \
                  every row with every key, got:\n{plan}"
             );
-            // The estimates lag with the statistics, so the scans' actual
-            // rows say what was read (#791).
+            // What the scans actually read, not what the planner expected
+            // them to (#791).
             let read = testkit::plan::rows_read(&plan, &table["public.".len()..]);
             assert!(
                 read <= 2 * rows.len() as u64,
@@ -9283,10 +9324,14 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// ([`delete_single_keys`]) do. A composite key is always the full key of
 /// a primary key or unique index (`ddl::identity_key_columns`), so the
 /// settings always have an index to probe, and no detection is needed as for
-/// a relationship's join column (`key_column_in`). A plan test per statement
-/// holds a composite table analyzed at 100 rows and grown to 1M to the
-/// batch's keys by the rows its scans actually read, since the estimates lag
-/// with the statistics (#791).
+/// a relationship's join column (`key_column_in`). Each composite statement
+/// among them has a plan test on a two-column key analyzed at 100 rows and
+/// grown to 400k or 1M, which counts the rows its scans actually read rather
+/// than the planner's estimates, and holds them to the batch (#791).
+/// [`apply_target`]'s composite delete runs without the settings: its
+/// `exists` probed the key's index once per key for 5,000 keys of a
+/// two-column key analyzed at 100 rows and grown to 1M or 3M, and of a
+/// four-column one grown to 1M, on PostgreSQL 16, 17 and 18.
 ///
 /// The bound alone isn't enough on PostgreSQL 16, which prices an index scan
 /// for thousands of `= any` values far above 17's estimate: it scanned a
