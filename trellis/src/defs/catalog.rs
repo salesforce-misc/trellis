@@ -1013,8 +1013,14 @@ pub async fn install_definition(
             .any(|f| source_columns.contains_key(&f.name))
     {
         let qualified_source = resolve_source_to_define(pool, &def).await?;
-        reject_fields_named_after_primary_key(pool, &qualified_source, &def.fields, source_columns)
-            .await?;
+        let client = pool.get().await?;
+        reject_fields_named_after_primary_key(
+            &**client,
+            &qualified_source,
+            &def.fields,
+            source_columns,
+        )
+        .await?;
     }
     let relationships = resolve_relationships_for_new_definition(pool, &def).await?;
     validate_for_define(pool, &def, source_columns, &relationships).await?;
@@ -1691,6 +1697,19 @@ pub(crate) async fn is_definition_target(
 /// unchanged from the one already checked when the target was first defined
 /// — re-running it would only re-confirm the same edge is still not a cycle.
 ///
+/// **The live schema (issue #980).** The merged definition is validated
+/// against the source's columns as they are when the edit commits
+/// ([`validate_edit`]), read in the edit's transaction under the version
+/// fence and the definition's row lock, not against the columns recorded when
+/// the definition was defined: a column the host added since is readable, and
+/// a field named after it is refused, as at a define; a column it dropped or
+/// retyped refuses an edit that leaves a field reading it until the edit
+/// drops or changes that field. The edit then records the live type of each
+/// source column the edited definition reads whose recorded type differs
+/// ([`record_read_source_columns`]), since a field's builds and applies infer
+/// and cast through the recorded types. It records nothing else: a column the
+/// definition doesn't read keeps its recorded type until a `RESUME`.
+///
 /// **The `DROP <field>` refusal.** Requires column-granularity dependency
 /// edges finer than a whole-transform drop's table-level check — exactly
 /// issue #242's gap, closed once via [`column_dependents_any_keyspace`] and
@@ -1806,27 +1825,16 @@ pub async fn alter_transform(
         )));
     }
 
-    // Issue #566: an added field can't take a key column's name, exactly as
-    // at install. Ahead of `validate` for the same reason as there.
-    reject_fields_named_after_primary_key(
-        pool,
-        &current.source_table,
-        &real_adds,
-        &current.source_columns,
-    )
-    .await?;
-
-    // Reuse the exact validator (and, inside it, the exact column-cycle
-    // detector) a first `define` runs — see this function's own doc comment
-    // on why the table-level whole-graph check is deliberately not re-run.
-    let relationships = resolve_relationships(pool, &merged, &current.source_table).await?;
-    validate_with_source(
-        &merged,
-        &current.source_columns,
-        &relationships,
-        &current.source_table,
-    )?;
-    let field_types = infer_field_types(&merged, &current.source_columns, &relationships)?;
+    // Fail fast, before the transaction's fence waits on any drain: the
+    // edited definition against the source as it is now, as a define would
+    // read it (issue #980). Authoritative only after the locks below, which
+    // read it again.
+    let field_types = {
+        let client = pool.get().await?;
+        validate_edit(&**client, &current.source_table, &merged, &real_adds)
+            .await?
+            .field_types
+    };
 
     // Pre-transaction dependency check for every real `DROP` — issue #241's
     // column-granularity refusal, using #242's same infrastructure.
@@ -1945,6 +1953,18 @@ pub async fn alter_transform(
     let old_version: i64 = row.get(1);
     let new_version = old_version + 1;
 
+    // The edited definition against the source's live columns, read under
+    // the fence and the row lock: the same read and rules a define makes, so
+    // an edit never commits a definition define would refuse (issue #980).
+    // The columns the definition was defined over are not consulted: a host
+    // change since (a column added, dropped or retyped) counts here.
+    let EditedSchema {
+        source_columns,
+        relationships,
+        field_types,
+    } = validate_edit(&*txn, &current.source_table, &merged, &real_adds).await?;
+    record_read_source_columns(&*txn, current.id, &merged, &source_columns).await?;
+
     // Re-check every real `DROP`'s dependents inside the transaction,
     // against this transaction's own view of `transform_definitions` — the
     // same ordering discipline `lifecycle::drop_transform`'s
@@ -1991,7 +2011,7 @@ pub async fn alter_transform(
         &*txn,
         &merged,
         &real_adds,
-        &current.source_columns,
+        &source_columns,
         &field_types,
         &current.source_table,
     )
@@ -2181,6 +2201,94 @@ pub async fn alter_transform(
         dropped,
         altered,
     })
+}
+
+/// What [`validate_edit`] read from the live schema.
+struct EditedSchema {
+    /// The source's columns and their value types ([`live_source_columns`]).
+    source_columns: HashMap<String, ValueType>,
+    /// The relationships the edited definition reads through.
+    relationships: HashMap<String, ResolvedRelationship>,
+    /// The result type of each of the edited definition's fields.
+    field_types: HashMap<String, ValueType>,
+}
+
+/// Validates `merged`, the definition an `ALTER TRANSFORM` would leave,
+/// against `source_table`'s live columns (issue #980), with the rules a
+/// define applies: the source still exists, no added field takes a key
+/// column's name (#566), and the definition passes [`validate`] over the
+/// live columns and relationships. A source column added, dropped or
+/// retyped since define is judged as it is now, for every field, edited or
+/// not: an edit that leaves a field reading a dropped column is refused
+/// until the same edit drops or changes that field.
+///
+/// Reads through `client`, so the transaction that commits the edit reads
+/// the schema it commits against.
+async fn validate_edit(
+    client: &impl GenericClient,
+    source_table: &str,
+    merged: &TransformDef,
+    real_adds: &[FieldDef],
+) -> Result<EditedSchema, CatalogError> {
+    let source_columns = live_source_columns(client, source_table).await?;
+    if source_columns.is_empty() {
+        return Err(CatalogError::SourceTableNotFound(source_table.to_string()));
+    }
+    // Issue #566: an added field can't take a key column's name, exactly as
+    // at install. Ahead of `validate` for the same reason as there.
+    reject_fields_named_after_primary_key(client, source_table, real_adds, &source_columns).await?;
+    // Reuse the exact validator (and, inside it, the exact column-cycle
+    // detector) a first `define` runs — see `alter_transform`'s own doc
+    // comment on why the table-level whole-graph check is deliberately not
+    // re-run.
+    let relationships = resolve_relationships_in(client, merged, source_table).await?;
+    validate_with_source(merged, &source_columns, &relationships, source_table)?;
+    let field_types = infer_field_types(merged, &source_columns, &relationships)?;
+    Ok(EditedSchema {
+        source_columns,
+        relationships,
+        field_types,
+    })
+}
+
+/// Records, as definition `id`'s persisted source column types, the live type
+/// of each source column `edited` reads whose recorded type differs or is
+/// missing (issue #980). The builds and applies of an edit's fields cast and
+/// infer through the persisted types, and a field is typed over the live
+/// ones, so a column added since define must be recorded for a field that
+/// reads it to apply at all, and a retyped one for the field to apply through
+/// the type it was validated and created over. A column the edited definition
+/// doesn't read is left as recorded, so an edit never moves a type for
+/// something it didn't validate, and an unchanged schema writes nothing. Under
+/// the definition's row lock: a resume's own record
+/// ([`record_source_columns`]) can't interleave.
+async fn record_read_source_columns(
+    client: &impl GenericClient,
+    id: i64,
+    edited: &TransformDef,
+    live: &HashMap<String, ValueType>,
+) -> Result<(), CatalogError> {
+    let recorded = source_columns_in(client, id).await?;
+    let changed: HashMap<String, ValueType> = super::oracle::referenced_source_columns(edited)
+        .into_iter()
+        .filter_map(|column| {
+            let value_type = *live.get(&column)?;
+            (recorded.get(&column) != Some(&value_type)).then_some((column, value_type))
+        })
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let (keys, vals) = encode_type_map(&changed);
+    client
+        .execute(
+            "update transform_definitions \
+             set source_columns = source_columns || jsonb_object($2::text[], $3::text[]) \
+             where id = $1",
+            &[&id, &keys, &vals],
+        )
+        .await?;
+    Ok(())
 }
 
 /// What an edit's clauses change, net of each other: [`plan_alter`]'s result.
@@ -4695,7 +4803,7 @@ async fn confirm_qualified_source(
 /// shares a name with one of `source_columns`: a definition with none costs
 /// no query.
 async fn reject_fields_named_after_primary_key(
-    pool: &Pool,
+    client: &impl GenericClient,
     qualified_source: &str,
     fields: &[FieldDef],
     source_columns: &HashMap<String, ValueType>,
@@ -4703,7 +4811,7 @@ async fn reject_fields_named_after_primary_key(
     if !fields.iter().any(|f| source_columns.contains_key(&f.name)) {
         return Ok(());
     }
-    let pk = ddl::source_primary_key(pool, qualified_source)
+    let pk = ddl::source_primary_key_in_txn(client, qualified_source)
         .await
         .map_err(CatalogError::Ddl)?;
     let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
