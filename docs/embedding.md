@@ -96,10 +96,12 @@ thread a handle starts: each runtime also has a thread driving it and a
 blocking pool Tokio grows on demand (for DNS lookups, for one).
 
 Connections follow the same rule. A handle's calls draw on a pool of up to 20
-connections, and a handle that runs a client has a second pool of up to 20,
-plus a `LISTEN` connection outside the pools for each drain thread. A process
-with several handles holds the sum, so add them up against the server's
-`max_connections`.
+connections, and a handle that runs a client has a second pool of up to 20.
+The client also opens connections outside both pools: the staging worker holds
+one for as long as it runs, and each drain thread holds a `LISTEN` connection,
+plus up to two more while it drains (one that keeps its claims alive, and one
+while it pages through an oversized share). A process with several handles
+holds the sum, so add them up against the server's `max_connections`.
 
 ### What the staging worker needs from the database
 

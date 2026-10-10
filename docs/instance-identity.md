@@ -161,17 +161,22 @@ trigger names do. `ClientOptions::wake_channel` overrides the default; every
 
 One thing remains the operator's responsibility, not the engine's:
 
-* **Distinct transform target schemas** (`Config::target_schema`) if the two
-  instances materialize similarly-named targets. Target tables are
-  application data, deliberately outside the instance schema (see
-  `DEFAULT_TARGET_SCHEMA`), so nothing keeps two instances' targets apart
-  automatically. Only the targets you name need this. The tables Trellis
-  generates for itself, such as a to-one relationship's projection
+* **Target names that don't clash.** Target tables are application data,
+  deliberately outside the instance schema (see `DEFAULT_TARGET_SCHEMA`), and
+  two instances may share a target schema (`public` by default). A define
+  never takes over a relation it didn't create, so a target whose name, or
+  whose `<target>__ledger` or `<target>__deltas`, is already taken in the
+  target schema, by the other instance's target or anything else, is refused
+  ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
+  Whichever instance defines a name second is the one refused. Give the
+  instances distinct target names, or distinct target schemas
+  (`Config::target_schema`). Only the targets you name need this. The tables
+  Trellis generates for itself, such as a to-one relationship's projection
   (`_trellis_rel_projection_<id>`, numbered per instance), live in the instance
   schema, so two instances sharing a target schema can't collide on them
   (issue #435).
 
-## Two instances capturing one source
+## What two instances in one database share
 
 Instances in one database keep separate rings, triggers and workers, but they
 share the tables of the application, and Postgres coordinates access to a table
@@ -194,12 +199,17 @@ source share these:
   settles one after the other. When a capture pass can't get in, the
   definition's `capture_wait` lists the sessions that hold or queue for the
   lock, the other instance's among them.
-* **One lock over every column pause.** A pause, a `RESUME`, a `DROP TRANSFORM`
-  and an `ALTER TRANSFORM` that builds or drops a field take one advisory
-  lock exclusively, a define takes it shared, and Postgres keys an advisory
-  lock by database, not by schema. They therefore queue behind each other across instances. A wait that
-  outlasts the session's 30 s `lock_timeout` fails that call with a retryable
-  error and counts in `column_pause_lock_timeouts_total`.
+
+Two locks are shared by every two instances in one database, whatever they
+read, because Postgres keys an advisory lock by database, not by schema:
+
+* **One lock over every column pause.** What writes a field's pause state takes
+  one advisory lock exclusively: a `PAUSE` or `RESUME` of a field, a column fuse
+  trip, a `DROP TRANSFORM`, an `ALTER TRANSFORM` that builds or drops a field,
+  and the build that releases the pauses such an `ALTER` left. A define takes
+  it shared. They therefore queue behind each other across instances. A wait
+  that outlasts the session's 30 s `lock_timeout` fails that step with a
+  retryable error and counts in `column_pause_lock_timeouts_total`.
 * **The attach lock**, described [above](#a-catalog-schema-that-belongs-to-another-instance).
 
 What stays separate is the rest: each instance's ring, claims, catalog,
@@ -211,8 +221,8 @@ keyed by schema.
 An instance can read another instance's 1-1 target as a source, exactly as it
 would any other table with a primary key. Its capture triggers sit on the
 owner's target table, so every row the owner's drain writes there fires them,
-as an application's write would, and the owner needs no change. It cannot read another instance's
-aggregate target. Trellis requires a source table to have a primary key
+as an application's write would, and the owner needs no change. It cannot read
+another instance's aggregate target. Trellis requires a source table to have a primary key
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)), and an aggregate
 target has none: its grouping columns may be `NULL`, so its identity is a
 `UNIQUE NULLS NOT DISTINCT` constraint. Inside the owning instance that never

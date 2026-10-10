@@ -69,7 +69,9 @@ defmodule Trellis do
   Each handle pays for itself. It owns a connection pool of up to 20
   connections and a small Rust runtime (`:worker_threads` threads). A handle
   with `staging: true` or `drain_threads` above `0` also owns a second runtime
-  and pool of the same size, and one `LISTEN` connection for each drain thread.
+  and pool of the same size, plus connections outside both pools: one for the
+  staging worker, and for each drain thread a `LISTEN` connection and up to two
+  more while it drains.
   Handles share no budget, so size all of them together against the server's
   `max_connections`. Each instance has its own staging worker, so set
   `staging: true` in one process of the fleet per instance.
@@ -153,8 +155,8 @@ defmodule Trellis do
     Default `"public"`.
   - `:staging`: whether this connection runs the staging worker, which
     installs change capture on the source tables and starts each new
-    transform's backfill. Exactly one connection in a fleet should.
-    Default `false`.
+    transform's backfill. Exactly one connection of each instance in a fleet
+    should. Default `false`.
   - `:drain_threads`: how many threads apply staged changes to the targets.
     Default `0`.
   - `:worker_threads`: the worker threads of each Rust runtime a handle owns
@@ -220,8 +222,8 @@ defmodule Trellis do
 
   Returns `{:error, %Trellis.Error{}}` if the connect fails, so the
   supervisor's start fails with the reason. A second `staging: true`
-  process fails that way (`:conflict`) while the first is alive: in a
-  rolling deploy, stop the old one before the new one starts.
+  process for the same instance fails that way (`:conflict`) while the first
+  is alive: in a rolling deploy, stop the old one before the new one starts.
 
   Every call made through the process's name runs in the process, one at a
   time, as it would on the handle, which runs one call at a time anyway.

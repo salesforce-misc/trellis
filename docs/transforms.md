@@ -39,6 +39,7 @@ a key, index or policy itself.
 | `JOIN` | Yes (parse error). Cross-join is not supported. | n/a | Use a [relationship](#relationships). |
 | A `WHERE` other than `TRUE` | Yes (parse error). Partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)). | n/a | None. |
 | Chaining off a transform that is not `live` (`TransformNotLive`) | Yes. | n/a | Wait for the upstream to go `live`, then define. |
+| A target whose name is taken: a relation of any kind already exists in the target schema under the target's name or the name of a table Trellis keeps beside it (`<target>__ledger`, `<target>__deltas`). That includes another definition's target, in this instance or in another instance sharing the target schema. | Yes (`TargetTableExists`, a `conflict` error). Trellis writes only to target tables it creates, and `DROP TRANSFORM` drops the target, so it never takes over an existing relation. | n/a | Choose another target name, give the instance its own target schema ([instance-identity](instance-identity.md)), or drop or rename the existing relation. |
 
 A refusal after define is a pause, not a loss: `RESUME` rebuilds the target from
 source once the condition is fixed ([Status](#status)). `status()`'s

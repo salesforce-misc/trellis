@@ -118,9 +118,9 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 ```
 
 `connect/1`'s defaults (`staging: false, drain_threads: 0`) run nothing in
-the background. Exactly one connection in a fleet should set `staging: true`,
-and some connection must run drain threads, or no definition ever reaches
-`:live`.
+the background. For each instance (catalog schema), exactly one connection
+in a fleet should set `staging: true`, and some connection must run drain
+threads, or no definition ever reaches `:live`.
 
 ### Conventions
 
