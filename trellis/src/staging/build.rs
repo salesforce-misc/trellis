@@ -55,7 +55,9 @@
 //!   retried after a short backoff without a charge.
 //! - **Live** ([`try_complete`], B7). The flip is strict: the plan job is
 //!   done, every chunk is done, and the delta table is empty, checked under
-//!   the definition's row lock. No catch-up is parked.
+//!   the definition's row lock. No catch-up is parked. The same transaction
+//!   deletes the definition's done `backfill_chunks` rows, so the table holds
+//!   one build's rows at a time, not every build's.
 //!
 //! A pause freezes the build where it is: claims and merges skip a frozen
 //! definition, and its deltas stay. A drop takes the chunk rows (`on delete
@@ -3326,7 +3328,8 @@ async fn vacuum_deltas(
 /// all the others committed. It checks without a lock first, and only then
 /// takes the definition row `for update` and checks again, so only a
 /// possibly-last caller takes the lock. No catch-up is parked: the
-/// definition applied from its start.
+/// definition applied from its start. The flip deletes the definition's done
+/// rows (#966).
 pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError> {
     let mut client = pool.get().await?;
     if !build_done(&**client, id).await? {
@@ -3342,6 +3345,19 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
         txn.rollback().await?;
         return Ok(false);
     }
+    // The build's rows are spent: every claim and check filters on `not
+    // done`, so nothing reads a done row, and the completion checks above
+    // scan all of the definition's rows to find the undone ones. Deleting
+    // them here keeps the table, and what those checks scan, to one build's
+    // rows however many builds the definition has had (#966). It takes the
+    // done rows of a build a resume superseded too. An undone row left is a
+    // [`chunk_queue::STALE`] one a worker still holds, which is discarded
+    // when the worker gives it up.
+    txn.execute(
+        "delete from backfill_chunks where definition_id = $1 and done",
+        &[&id],
+    )
+    .await?;
     txn.execute(
         "update transform_definitions set status = $2, build = null where id = $1",
         &[&id, &TransformStatus::Live.as_str()],

@@ -327,6 +327,12 @@ async fn a_rederive_build_goes_from_waiting_to_live_with_no_catch_up() {
         "the start enqueued the plan job"
     );
     assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep'")
+            .await,
+        0,
+        "a fresh build's ledger is empty at its start, so it gets no sweep"
+    );
+    assert_eq!(
         f.count("select count(*) from pending_backfill").await,
         0,
         "no marker is parked for a re-derive build (the install's join marker discharged)"
@@ -347,21 +353,14 @@ async fn a_rederive_build_goes_from_waiting_to_live_with_no_catch_up() {
         "a finished build clears `build`"
     );
     assert_eq!(
-        f.count("select count(*) from backfill_chunks where kind = 'rederive'")
-            .await,
+        steps.iter().filter(|step| **step == Step::Chunk).count(),
         20,
         "200 rows in chunks of 10"
     );
     assert_eq!(
-        f.count("select count(*) from backfill_chunks where kind = 'sweep'")
-            .await,
+        f.count("select count(*) from backfill_chunks").await,
         0,
-        "a fresh build's ledger is empty at its start, so it gets no sweep"
-    );
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks where not done")
-            .await,
-        0
+        "the flip deleted the build's rows (#966)"
     );
     assert_eq!(f.count("select count(*) from public.agg__deltas").await, 0);
     f.assert_agg_oracle().await;
@@ -837,16 +836,13 @@ async fn a_chunk_killed_mid_write_is_reclaimed_and_rerun() {
     assert_eq!(reclaimed, 1, "the dead worker's claim is freed");
     f.run("agg").await;
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
-    let done: bool = f
-        .raw
-        .query_one(
-            "select done from backfill_chunks where id = $1",
-            &[&chunk.id],
-        )
-        .await
-        .expect("read the chunk")
-        .get(0);
-    assert!(done, "another worker ran the reclaimed chunk");
+    // The flip deleted the build's rows (#966), so the chunk's range is
+    // known to have run by the target alone: the oracle below covers it.
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks").await,
+        0,
+        "another worker ran the reclaimed chunk, and the flip deleted it"
+    );
     f.assert_agg_oracle().await;
 }
 
@@ -1932,21 +1928,14 @@ async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
     );
     assert_eq!(f.build("one").await, None);
     assert_eq!(
-        f.count("select count(*) from backfill_chunks where kind = 'rederive'")
-            .await,
+        steps.iter().filter(|step| **step == Step::Chunk).count(),
         20,
-        "200 rows in chunks of 10"
+        "200 rows in chunks of 10, and no old build ran"
     );
     assert_eq!(
-        f.count("select count(*) from backfill_chunks where kind in ('range', 'direct')")
-            .await,
+        f.count("select count(*) from backfill_chunks").await,
         0,
-        "no old build ran"
-    );
-    assert_eq!(
-        f.count("select count(*) from backfill_chunks where kind = 'sweep'")
-            .await,
-        0
+        "the flip deleted the build's rows (#966)"
     );
     assert_eq!(
         f.count("select count(*) from pg_class where relname = 'one__deltas'")
@@ -2438,5 +2427,122 @@ async fn an_aggregate_rederive_tombstone_outlives_a_batch_its_read_saw() {
         f.rows(AGG_EXPECTED).await,
         "agg equals a from-scratch GROUP BY over the source"
     );
+    f.assert_agg_oracle().await;
+}
+
+/// The `backfill_chunks` rows of the one definition.
+async fn build_rows(f: &Fixture) -> i64 {
+    f.count("select count(*) from backfill_chunks").await
+}
+
+/// A finished build leaves none of its rows behind (#966): the flip deletes
+/// the definition's done rows with the build, so the table doesn't keep a
+/// full set per rebuild, and the completion check (`build_done`) that reads
+/// the definition's rows after every chunk sees only the current build's.
+/// A rebuild over a non-empty ledger is a plan job and a sweep, whatever
+/// rebuilds came before it.
+async fn rebuilds_leave_no_rows(definition: &str, target: &str) {
+    let mut f = Fixture::new(200, &[definition]).await;
+    f.pass().await;
+    f.run(target).await;
+    assert_eq!(f.status(target).await.as_deref(), Some("live"));
+    assert_eq!(
+        build_rows(&f).await,
+        0,
+        "the first build's rows went with it"
+    );
+
+    let trellis = f.trellis().await;
+    for rebuild in 1..=3 {
+        trellis
+            .request_backfill("src")
+            .await
+            .expect("request a rebuild");
+        assert_eq!(f.status(target).await.as_deref(), Some("backfilling"));
+        assert_eq!(
+            build_rows(&f).await,
+            2,
+            "rebuild {rebuild} starts from its plan job and its sweep alone"
+        );
+        f.run(target).await;
+        assert_eq!(f.status(target).await.as_deref(), Some("live"));
+        assert_eq!(
+            build_rows(&f).await,
+            0,
+            "rebuild {rebuild} leaves no rows behind"
+        );
+    }
+    match target {
+        "agg" => f.assert_agg_oracle().await,
+        _ => f.assert_one_oracle().await,
+    }
+}
+
+#[tokio::test]
+async fn an_aggregate_s_done_build_rows_do_not_pile_up_over_rebuilds() {
+    rebuilds_leave_no_rows(AGG, "agg").await;
+}
+
+#[tokio::test]
+async fn a_one_to_one_s_done_build_rows_do_not_pile_up_over_rebuilds() {
+    rebuilds_leave_no_rows(ONE, "one").await;
+}
+
+/// Done rows stay while their build runs (#966): only the flip deletes
+/// them, so a build in progress is judged by all its rows. With the plan
+/// job and every chunk done but deltas owed, `try_complete` leaves the rows
+/// and the definition as they are, and the merge that flips the definition
+/// takes the rows with it.
+#[tokio::test]
+async fn done_rows_stay_until_the_flip() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    f.pass().await;
+    f.run_chunks_by_hand(usize::MAX).await;
+    let rows = build_rows(&f).await;
+    assert_eq!(rows, 7, "the plan job and six chunks");
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where done")
+            .await,
+        rows
+    );
+    let id = f.definition_id().await;
+    assert!(!build::try_complete(&f.db.pool, id).await.expect("try"));
+    assert_eq!(build_rows(&f).await, rows, "an unfinished build keeps them");
+
+    while f.step(&OPTIONS).await.progressed() {}
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    assert_eq!(build_rows(&f).await, 0, "the flip took them");
+    f.assert_agg_oracle().await;
+}
+
+/// A build a resume superseded leaves done rows behind (the plan job and
+/// chunks it finished), which the resumed build's flip deletes with its own
+/// (#966). Completion still waits for every row of the resumed build.
+#[tokio::test]
+async fn a_resumed_build_s_flip_takes_the_superseded_builds_done_rows() {
+    let mut f = Fixture::new(100, &[AGG]).await;
+    f.pass().await;
+    assert_eq!(f.run_chunks_by_hand(4).await, 4);
+    let trellis = f.trellis().await;
+    trellis
+        .apply("PAUSE TRANSFORM agg")
+        .await
+        .expect("pause the building transform");
+    trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+    f.pass().await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where done")
+            .await,
+        4,
+        "the superseded build's plan job and three chunks are still there"
+    );
+    let id = f.definition_id().await;
+    assert!(!build::try_complete(&f.db.pool, id).await.expect("try"));
+    assert_eq!(f.status("agg").await.as_deref(), Some("backfilling"));
+
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    assert_eq!(build_rows(&f).await, 0);
     f.assert_agg_oracle().await;
 }
