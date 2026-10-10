@@ -1261,7 +1261,7 @@ pub async fn start_ready_builds(
             // A transient failure (a deadlock, a cancelled statement) wrote
             // nothing either; the next pass starts it again.
             Err(err) if super::quarantine::is_transient_error(&err) => {
-                tracing::warn!(
+                crate::instance_log::warn!(
                     definition_id = id,
                     error = %err,
                     "re-derive build start failed transiently; retrying next pass"
@@ -1284,14 +1284,14 @@ pub async fn start_ready_builds(
                 )
                 .await
                 {
-                    Ok(paused) => tracing::warn!(
+                    Ok(paused) => crate::instance_log::warn!(
                         definition_id = id,
                         paused = ?paused,
                         error = %err,
                         "re-derive build start failed; paused the definitions it reaches \
                          (resume them once the cause is fixed)"
                     ),
-                    Err(halt_err) => tracing::warn!(
+                    Err(halt_err) => crate::instance_log::warn!(
                         definition_id = id,
                         error = %err,
                         halt_error = %halt_err,
