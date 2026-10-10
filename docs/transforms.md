@@ -470,13 +470,13 @@ through it widens that projection, in the same transaction
 ## Grammar versions
 
 Every stored definition records the grammar version it was written in. A
-release that changes what accepted text means bumps that version, and keeps
-reading the older one under its old rules, so an upgrade never re-interprets a
-stored definition. Each major version reads every grammar version the previous
-two majors wrote. A transform written under an older version than that is
-paused until you drop it and define it again, and a version newer than the
-binary knows, from a downgrade, is refused. A release that bumps the version
-can also rewrite a stored definition to it, without a rebuild. The rules are in
+breaking release that changes what accepted text means bumps that version and
+keeps reading the older one under its old rules, so an upgrade never
+re-interprets a stored definition. Each major version reads every grammar
+version the previous two majors wrote. A transform written under an older
+version than that is paused until you drop it and define it again, and a version
+newer than the binary knows, from a downgrade, is refused. A stored definition
+can be rewritten to the current version without a rebuild. The rules are in
 [0018-grammar-versioning](decisions/0018-grammar-versioning.md).
 
 ## Scope

@@ -60,9 +60,10 @@ Issues labelled `good first contribution`.
 # Grammar Compatibility
 
 Each major version reads every transform-grammar version written by the previous
-two major versions. A change to what accepted definition text means bumps the
-grammar version and ships a compatibility rule for the version it replaces; see
-[ADR-0018](docs/decisions/0018-grammar-versioning.md).
+two major versions (each 0.x minor counts as a major before 1.0). A change to
+what accepted definition text means bumps the grammar version, ships only in a
+breaking release, and brings a compatibility rule for the version it replaces;
+see [ADR-0018](docs/decisions/0018-grammar-versioning.md).
 
 # Creating a Pull Request
 

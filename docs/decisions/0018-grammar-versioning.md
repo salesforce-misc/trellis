@@ -6,183 +6,149 @@ deciders: Michael Ries
 
 # Grammar Versions on Stored Definitions
 
-## Context
+Trellis stores each definition as text (`transform_definitions.definition_text`,
+`relationship_definitions.definition_text`) and parses it again on every read,
+with the parser new statements go through
+([ADR-0004](0004-transform-definition-grammar.md)). An `ALTER TRANSFORM` stores
+the edited definition rendered back into the grammar. Validation, row
+evaluation, the build's SQL and a `RESUME`'s re-validation each resolve names in
+the parsed tree on their own.
 
-Trellis stores a definition as text, not as a serialized AST:
-`transform_definitions.definition_text` and
-`relationship_definitions.definition_text`. A `TRANSFORM` or `RELATIONSHIP`
-statement is stored verbatim, and an `ALTER TRANSFORM` stores the edited
-definition rendered back into the grammar. Every read parses the text again
-with the parser a new statement goes through
-([ADR-0004](0004-transform-definition-grammar.md)). Validation, row
-evaluation and the build's SQL then resolve the names in the parsed tree, each
-on its own, and a `RESUME` validates the stored definition again.
+So a stored definition means whatever the binary reading it says it means. If a
+release changes what accepted text means (how a name resolves, what an
+expression evaluates to, whether it is accepted at all), every stored definition
+containing that text silently takes the new meaning on its next load, while its
+target still holds rows computed under the old one.
 
-That keeps one format for a definition, but it ties a stored definition's
-meaning to whichever binary reads it. If a release changes what some accepted
-text means (how a name resolves, what an expression evaluates to, whether it is
-accepted at all), every stored definition containing that text silently takes
-the new meaning the next time it is loaded, while its target still holds rows
-computed under the old one. Nothing today records which grammar a text was
-written in.
+This ADR settles how a stored definition keeps its meaning across grammar
+changes. The definition version of
+[ADR-0015](0015-transform-redefinition.md) counts edits to one definition, not
+changes to the language, and the ordered migrations in `trellis/migrations/`
+version the catalog's own schema; both are out of scope.
 
-The definition version of [ADR-0015](0015-transform-redefinition.md) doesn't
-cover this: it counts edits to one definition's fields, not changes to the
-language. The catalog's own table schema is out of scope here too, since the
-ordered migrations in `trellis/migrations/` already version it.
+## Decisions
 
-## Decision
+### Every stored definition carries a grammar version, stamped when its text is written
 
-1. **A marker on every stored definition.** Each transform and relationship
-   definition carries a `grammar_version`, an integer, written whenever its text
-   is written: at define, at declare, at `ALTER TRANSFORM` and at a rewrite.
-   Nothing else writes the text, so a pause, a resume or a rebuild leaves both
-   as they are. One counter covers the whole grammar. The binary has a current
-   version; grammar 1 is the grammar as it stands when the marker is
-   introduced.
-2. **A change in meaning bumps the version; additive syntax doesn't.** A change
-   bumps it when some text the current version accepts would parse, resolve or
-   evaluate differently, or be refused. A change that only accepts text the
-   current version refuses, such as a new function, needs no bump. A new keyword
-   that was a valid identifier is a change in meaning, not an addition. A bump
-   that retires a meaning also gives it a spelling in the new grammar, so every
-   older text can be translated (decision 3).
-   [OPEN: whether a fix that makes evaluation match what the documentation
-   already says is a change in meaning. Recommendation: no; it ships with the
-   definitions to rebuild, since a compatibility rule would keep the wrong
-   values and a rewrite couldn't spell them.]
-3. **Loading dispatches on the version, in one place.** Every read of stored
-   transform text goes through one entry point that takes the text and its
-   version and returns the definition in the current grammar's terms, so
-   nothing after it sees a version:
-   - the current version parses as today;
-   - an older version inside the support window parses under that version's
-     rules, and its compatibility rule translates the tree into one that means
-     the same under the current rules;
-   - an older version outside the window is not read: the load fails, and the
-     attach pauses the transform, with `capture_failure` naming the stored
-     version, the oldest this binary reads, and the fix (drop it and define it
-     again). `RESUME` refuses until then, and `DROP TRANSFORM` works without
-     reading the text;
-   - a version newer than the binary knows is refused: the load fails, and the
-     definition is neither read nor written. Stored text that fails to parse
-     at a version the binary does know fails the same way, which is how a
-     downgrade past an additive change shows up.
+Each transform and relationship definition stores an integer `grammar_version`
+beside its text, written whenever the text is: at define, declare,
+`ALTER TRANSFORM` and rewrite. A pause, resume or rebuild writes neither. The
+binary has a current version, and grammar 1 is the grammar when the marker is
+introduced. One counter covers the whole grammar, since one parser reads both
+kinds of statement.
 
-   Attaching (`migrate`) checks every stored definition's version before
-   anything else runs. It pauses each one outside the window, and refuses the
-   attach if any is newer, naming the definitions and their versions. The
-   load-time refusal still stands, since a process can connect without
-   attaching and a newer binary can write after the attach.
+Because only a write stamps it, reading a definition can never move it to rules
+it wasn't written under.
 
-   A relationship needs none of this. Its name, both endpoints and both join
-   columns each have a catalog column of their own, and loading reads those
-   rather than the text, so a grammar change can't change what a stored
-   relationship means and one is never outside the window. Its text and version
-   are kept as written.
+### A change in meaning bumps the version; additive syntax doesn't
 
-   Old text is never read under new rules.
-4. **Rewriting moves a definition to the current grammar.** A client can
-   rewrite a stored definition's text to the current version: Trellis renders
-   the definition decision 3 loads back into the current grammar. The rewrite
-   must keep its meaning: the same target columns and types, and the same
-   values. Trellis checks that by loading the new text and comparing its tree
-   with the old text's, and refuses a rewrite that differs. A rewrite changes no
-   column, so it needs no rebuild and doesn't bump the definition version. An
-   `ALTER TRANSFORM` of an older-version definition is a rewrite plus the edit:
-   it loads the definition, applies the edit and renders the result under the
-   current grammar.
-5. **The compatibility rule.** *Each major version reads every grammar version
-   written by the previous two major versions.* An operator can upgrade across
-   up to two major versions in one step, then rewrite. Before 1.0, each 0.x
-   minor counts as a major: 0.9 reads what 0.7 and 0.8 wrote, and 1.0 reads what
-   0.8 and 0.9 wrote. Support for a grammar version may be dropped in the third
-   major after the last one that writes it, so the oldest version a binary reads
-   is the one written by the major two before it. [OPEN: whether a version bump
-   may ship in a minor release. Recommendation: only in a major (a 0.x minor
-   before 1.0), since a bump refuses text the previous release accepted, and
-   the window above assumes one grammar version per major.]
-6. **Each bump ships its own rules.** A change that bumps the version brings,
-   with it, the previous version's compatibility rule (its parser rules and the
-   translation from its tree, which loading and rewriting share), and stored
-   fixtures at every version still in the window. How to translate a particular
-   change is decided with that change, not here.
+A change bumps the version when some text the current version accepts would
+parse, resolve or evaluate differently, or be refused. A new keyword that was a
+valid identifier is such a change. A change that only accepts text the current
+version refuses, such as a new function under
+[ADR-0004's growth policy](0004-transform-definition-grammar.md#growth-policy),
+needs no bump: every stored text keeps its meaning, and an older binary refuses
+the new text rather than misreading it.
 
-### Worked example
+A bump that retires a meaning gives it a spelling in the new grammar, so every
+older text can be translated. A bump ships only in a release semver allows to
+break compatibility (a 0.x minor before 1.0, a major after), because it refuses
+text the previous release accepted.
 
-Take a grammar in which a bare name that names both a source column and a
-field whose expression is something else reads as the field, so that
+[OPEN: whether a fix that makes evaluation match what the documentation already
+says is a change in meaning. Recommendation: no; it ships with the definitions
+to rebuild, since a compatibility rule would keep the wrong values and a rewrite
+couldn't spell them.]
+
+### Loading translates older text into the current grammar, in one place
+
+Every read of stored transform text goes through one entry point that takes the
+text and its version and returns the definition in the current grammar's terms:
+
+- **Current version:** parses as today.
+- **Older, inside the support window:** parses under that version's rules, and
+  its compatibility rule translates the tree into one that means the same under
+  the current rules.
+- **Older, outside the window:** not read. The load fails and the transform
+  pauses, its `capture_failure` naming the stored version, the oldest version
+  this binary reads, and the fix: drop the transform and define it again.
+  `RESUME` refuses; `DROP TRANSFORM` works without reading the text.
+- **Newer than the binary knows:** refused, and the definition is neither read
+  nor written. Text that fails to parse at a known version fails the same way,
+  which is how a downgrade past an additive change shows up.
+
+Nothing after the entry point sees a version. Names are resolved in several
+places after the parse; translating once keeps every one of them on the current
+rules, lets an older definition pass a resume's re-validation, and gives
+rewriting the same code.
+
+Attaching (`migrate`) checks every stored definition's version before anything
+else runs. It pauses each one outside the window, and refuses the attach if any
+is newer, naming those definitions. The load-time check stands on its own, since
+a process can connect without attaching and a newer binary can write after the
+attach.
+
+Too old pauses and too new refuses because the fixes differ: the operator can
+fix a too-old definition here by redefining it, while a too-new one means the
+wrong binary is running.
+
+### Relationships load from their catalog columns, not their text
+
+A relationship's name, endpoints and join columns each have a catalog column,
+set at declare and never changed. Loading reads those columns, so a grammar
+change can't alter what a stored relationship means, and none is ever outside
+the window. Its text and version are kept as written.
+
+### Rewriting moves a definition to the current grammar without a rebuild
+
+A client can rewrite a stored definition's text to the current version. Trellis
+renders the loaded definition in the current grammar, loads the new text, and
+refuses the rewrite unless the two trees match. Matching trees mean the same
+target columns, types and values, so the target's rows stay correct: a rewrite
+needs no rebuild and doesn't bump the definition version. An `ALTER TRANSFORM`
+of an older-version definition is a rewrite plus the edit.
+
+### Each major version reads the grammar versions of the previous two
+
+*Each major version reads every grammar version written by the previous two
+major versions.* Before 1.0, each 0.x minor counts as a major: 0.9 reads what
+0.7 and 0.8 wrote, and 1.0 reads what 0.8 and 0.9 wrote. An operator can skip
+one major in an upgrade, and a binary carries compatibility rules for at most
+three majors' versions. A definition that is never rewritten leaves the window
+after two majors, which is why rewriting ships with every bump.
+
+### Each bump ships its compatibility rule and fixtures
+
+A bump brings the previous version's compatibility rule (its parser rules and
+the tree translation that loading and rewriting share), and stored fixtures at
+every version still in the window. How to translate a particular change is
+decided with that change.
+
+## Example
+
+Suppose a grammar read a bare name that names both a source column and a field
+as the field, so that
 
 ```text
 TRANSFORM t FROM public.src GROUP BY grp
-SELECT grp AS grp, (val * 2) AS val, SUM(val) AS total
+SELECT grp AS grp, (grp + 1) AS val, SUM(val) AS total
 ```
 
-means `SUM(val * 2)`. Changing it to refuse such a name, and to read a
+means `SUM(grp + 1)`. Changing that grammar to refuse such a name, and to read a
 qualified `src.val` as the source column, changes what accepted text means, so
-it bumps the version. Grammar 1 already reads names the second way
-([Calculated Fields](../transforms.md#calculated-fields)). The older version's
-compatibility rule translates a bare name that names both into the field's
-expression, so every stored definition keeps reading `SUM(val * 2)`, and a
-rewrite renders that tree as `SUM(src.val * 2)`. Loading the rewritten text
-gives the same tree, so the check passes. Admitting a new function under the
-growth policy of
-[ADR-0004](0004-transform-definition-grammar.md#growth-policy), by contrast, is
-additive: no text an earlier version accepted calls it.
-
-### Why
-
-**A marker, not nothing.** Without one, a meaning change silently re-interprets
-every stored definition while its target holds rows computed the old way, and no
-rebuild is triggered to reconcile them. A marker makes the reader choose the
-rules the text was written under.
-
-**Stamped when written, never when read.** The version records the rules the
-text was written in. Loading never changes it, so reading a definition can't
-move it to rules it wasn't written for.
-
-**Translated where it is read.** Names are resolved in several places after the
-parse: validation, row evaluation, the build's SQL and a resume's
-re-validation. Translating once, at load, keeps every one of them on the current
-rules alone, lets an older definition pass a resume's re-validation, and makes
-the translation a rewrite needs the same code that loading runs.
-
-**One counter.** One parser reads both kinds of statement. Separate counters
-would version one language twice.
-
-**Relationships load from their columns.** Everything a relationship statement
-says is already stored in columns the migrations version, and nothing changes
-them after the declare. Reading the columns ties a relationship's meaning to the
-catalog schema rather than the grammar, so it never needs a paused state it
-doesn't have.
-
-**Additive changes don't bump.** Every stored text keeps its meaning, so a bump
-would only force rewrites for nothing. A downgrade past new syntax or a new
-function still can't misread anything: the older parser refuses the text, and
-the load fails.
-
-**Rewriting is checked, and needs no rebuild.** The text is the only thing that
-changes. Comparing what both texts load to proves the target's rows are still
-correct, so they stay as they are.
-
-**Two major versions.** Reading two majors back lets an operator skip a major,
-and bounds the compatibility rules a binary carries to the versions of three
-majors. A definition that is never rewritten leaves the window after two
-majors, which is why a rewrite ships with every bump.
-
-**Too old pauses; too new refuses.** A version older than the window is
-something this binary knows it can't read, and the operator can fix it here by
-redefining. A newer version means the binary is the wrong one, and the fix is to
-run the right one, not to touch the definition.
+it bumps the version. The older version's compatibility rule translates the bare
+name into the field's expression, so every stored definition keeps meaning
+`SUM(grp + 1)`, and a rewrite renders that tree as `SUM(grp + 1)`, which loads
+to the same tree. (Grammar 1 already reads names the new way; see
+[Calculated Fields](../transforms.md#calculated-fields).)
 
 ## Consequences
 
-- Every stored definition carries its grammar version from the first release, so
-  a later grammar change has a defined path rather than a silent one.
-- A meaning change to the grammar costs a version bump, a compatibility rule for
-  the version it replaces, and fixtures, carried for two majors.
-- Upgrades may skip one major version. Skipping more, without rewriting in
-  between, pauses the definitions written before the window.
+- A meaning change to the grammar costs a breaking release, a version bump, a
+  compatibility rule for the version it replaces, and fixtures, all carried for
+  two majors.
+- Upgrades may skip one major. Skipping more without rewriting in between pauses
+  the definitions written before the window.
 - A downgrade across a grammar change is refused rather than run on
   re-interpreted definitions, and so is an older binary running beside a newer
   one once the newer one writes a newer version.
