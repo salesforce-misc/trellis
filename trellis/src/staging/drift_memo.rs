@@ -55,10 +55,10 @@
 //!   functions define's type inference resolves an expression's type with,
 //!   `search_path`. None of them changes a column's type oid or modifier,
 //!   which is what drift is.
-//! - `xmin` is 32 bits and is replaced by a frozen marker when vacuum freezes
-//!   the row. A frozen row compares as a change once (a recheck); a repeat of
-//!   an `xmin` needs a wraparound of the transaction counter between two
-//!   passes.
+//! - `xmin` is 32 bits. Vacuum freezing a row keeps its `xmin` (Postgres
+//!   marks the row frozen in its header bits), so a freeze changes no
+//!   fingerprint; a repeat of an `xmin` needs a wraparound of the transaction
+//!   counter between two passes.
 //!
 //! Nothing resets the memo for correctness: every input of the comparison is
 //! in the stamp. It is dropped for a definition when its comparison finds a

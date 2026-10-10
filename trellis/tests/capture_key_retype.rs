@@ -4061,3 +4061,79 @@ async fn a_column_added_by_alter_transform_is_compared_after_clean_passes() {
     let error = paused_for(&trellis, "post_titles", "public.posts", &["kind"]).await;
     assert!(error.contains("public.post_titles.k"), "{error}");
 }
+
+/// A definition whose comparison is skipped still owns the tables it has a
+/// copy on. Here `post_authors` and `post_nicks` share the relationship's
+/// projection; a widening of the to-side column only `post_nicks` reads waits
+/// out the projection's lock in one pass, and the next pass, which skips
+/// `post_authors`, re-types the projection in place and asks for the release
+/// of both definitions' held keys, as it would after comparing both.
+#[tokio::test]
+async fn a_skipped_definition_still_owns_a_projection_re_typed_in_place() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, _) = settled(&db, &mut raw).await;
+    raw.batch_execute(
+        "alter table public.users add column nick varchar(4); \
+         update public.users set nick = left(handle, 2)",
+    )
+    .await
+    .expect("a second to-side column");
+    trellis
+        .apply("TRANSFORM post_nicks FROM public.posts SELECT author.nick AS nick")
+        .await
+        .expect("define post_nicks");
+    bring_live(&mut raw, &db.pool, &["post_nicks"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("projection")
+        .get(0);
+    let projection = format!("trellis.{projection}");
+
+    let locker = connect(db.dsn()).await;
+    locker
+        .batch_execute(&format!(
+            "begin; lock table {projection} in access share mode"
+        ))
+        .await
+        .expect("hold a lock on the projection");
+    raw.batch_execute("alter table public.users alter column nick type varchar(10)")
+        .await
+        .expect("widen the column only post_nicks reads");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, &projection, "nick").await,
+        "character varying(4)"
+    );
+    let waited = copy_checks(&raw).await;
+
+    locker.batch_execute("rollback").await.expect("let go");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, &projection, "nick").await,
+        "character varying(10)"
+    );
+    let after = copy_checks(&raw).await;
+    assert_eq!(
+        after["post_authors"], waited["post_authors"],
+        "skipped: {after:?}"
+    );
+    assert!(after["post_nicks"] > waited["post_nicks"], "{after:?}");
+
+    let owners: Vec<String> = raw
+        .query(
+            "select distinct split_part(d.target_table, '.', 2) \
+             from retype_releases r join transform_definitions d on d.id = r.transform_id \
+             order by 1",
+            &[],
+        )
+        .await
+        .expect("read retype_releases")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(owners, ["post_authors", "post_nicks"]);
+}
