@@ -13,7 +13,11 @@ Trellis owns lives in `public` or under unqualified names.
   touching the application tables sharing the database.
 * **Multiple instances per cluster.** The schema name is configurable, so
   several Trellis instances can coexist in one cluster — even one database —
-  each isolated within its own schema.
+  each isolated within its own schema. A process holds one handle for each
+  instance it uses, with its own runtimes and connections and nothing shared
+  between handles
+  ([ADR-0010](decisions/0010-embeddable-clients.md#decision-3-the-binding-owns-one-handle-per-instance-rust-owns-its-threads),
+  decision 3).
 
 ## Default and configuration
 
@@ -167,8 +171,47 @@ One thing remains the operator's responsibility, not the engine's:
   schema, so two instances sharing a target schema can't collide on them
   (issue #435).
 
+## Two instances capturing one source
+
+Instances in one database keep separate rings, triggers and workers, but they
+share the tables of the application, and Postgres coordinates access to a table
+by its locks, whatever instance asks. So two instances that both read one
+source share these:
+
+* **Two sets of triggers per write.** Each instance installs capture triggers of
+  its own on the table, named for its schema, with their functions in its
+  schema. A write to the table fires both sets, and each appends the change to
+  its own instance's ring in the writer's transaction. A writer pays for every
+  instance that captures the table. Each instance's capture pass installs,
+  widens and uninstalls only its own triggers, so one instance leaving the table
+  leaves the other's capture running.
+* **Capture DDL that can wait on the other's.** Installing or widening capture
+  takes `SHARE ROW EXCLUSIVE` on the source, which conflicts with itself, and
+  removing it takes `ACCESS EXCLUSIVE`. While one instance's attempt holds or
+  waits for the table lock, the other instance's attempt waits behind it. An
+  attempt gives up after 50 ms and retries, which keeps short the queue of
+  application writers behind it, and a table both instances want to change
+  settles one after the other. When a capture pass can't get in, the
+  definition's `capture_wait` lists the sessions that hold or queue for the
+  lock, the other instance's among them.
+* **One lock over every column pause.** A pause, a `RESUME`, a `DROP TRANSFORM`
+  and an `ALTER TRANSFORM` that builds or drops a field take one advisory
+  lock exclusively, a define takes it shared, and Postgres keys an advisory
+  lock by database, not by schema. They therefore queue behind each other across instances. A wait that
+  outlasts the session's 30 s `lock_timeout` fails that call with a retryable
+  error and counts in `column_pause_lock_timeouts_total`.
+* **The attach lock**, described [above](#a-catalog-schema-that-belongs-to-another-instance).
+
+What stays separate is the rest: each instance's ring, claims, catalog,
+generated tables and wake channel, and its one staging worker, whose lock is
+keyed by schema.
+
+## One instance reading another's target
+
 An instance can read another instance's 1-1 target as a source, exactly as it
-would any other table with a primary key. It cannot read another instance's
+would any other table with a primary key. Its capture triggers sit on the
+owner's target table, so every row the owner's drain writes there fires them,
+as an application's write would, and the owner needs no change. It cannot read another instance's
 aggregate target. Trellis requires a source table to have a primary key
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)), and an aggregate
 target has none: its grouping columns may be `NULL`, so its identity is a
@@ -183,6 +226,8 @@ the downstream transform in the instance that owns it. The same goes for a relat
 RELATIONSHIP` rejects an endpoint that is another instance's aggregate target
 with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
 would capture it just the same.
+
+## Convergence waits
 
 Co-tenant instances don't slow each other's convergence waits.
 `staging::watermark_token` is `pg_current_wal_insert_lsn()`, a cluster-wide LSN, but

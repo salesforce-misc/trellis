@@ -34,19 +34,19 @@ nothing in the background.
 |---|---|---|
 | Migration run (`rails db:migrate`, `mix ecto.migrate`, a release task) | `false` | `0` |
 | Web process, console, background job | `false` | `0` |
-| The dedicated Trellis worker, exactly one per fleet | `true` | `N` (at least 1) |
+| The dedicated Trellis worker, exactly one per fleet and instance | `true` | `N` (at least 1) |
 | Extra drain capacity, if the worker's threads can't keep up | `false` | `N` |
 
-Four rules sit behind that table:
+Four rules sit behind that table, and they hold for each instance separately:
 
-* **Exactly one process sets `staging: true`.** The staging worker holds a
-  lock for as long as it runs, and a second `staging: true` connect fails
-  with a `conflict` error while the first is alive. In a rolling deploy,
-  stop the old worker before the new one connects, or retry the new one's
-  connect until the old one has gone.
-* **At least one process runs drain threads.** Drain threads take their work
-  from a queue in the database, so any number of processes can run them;
-  the dedicated worker's own are usually enough.
+* **Exactly one process sets `staging: true` for each instance.** The staging
+  worker holds a lock for as long as it runs, and a second `staging: true`
+  connect to the same instance fails with a `conflict` error while the first
+  is alive. In a rolling deploy, stop the old worker before the new one
+  connects, or retry the new one's connect until the old one has gone.
+* **At least one process runs drain threads for each instance.** Drain threads
+  take their work from a queue in the database, so any number of processes can
+  run them; the dedicated worker's own are usually enough.
 * **`migrate` runs before the worker connects.** The staging worker reads
   Trellis's own tables as it starts, so a `staging: true` connect to a
   schema `migrate` hasn't created yet fails with a `not_found` error.
@@ -73,6 +73,16 @@ migration gets a handle of its own from `Trellis::Migration`, always with
 the defaults (see [Migrations and transactions](#migrations-and-transactions)
 and `clients/ruby/README.md`).
 
+**Several instances.** A handle belongs to one instance: a catalog schema in a
+database ([instance identity](instance-identity.md)). A process that uses
+two instances, in different databases or in two schemas of one, connects a
+handle for each, and the table and rules above apply to each instance on its
+own: the dedicated worker process sets `staging` and `drain_threads` on every
+handle it holds, and a web process leaves them off on all of them. In Elixir
+each handle is its own `{Trellis, name: ..., schema: ...}` child. Connect the
+handles once, at boot, never per request. One `Trellis.Metrics.render_prometheus/0`
+route covers all of them ([observability](observability.md#several-instances-in-one-process)).
+
 A third option, `worker_threads`, is unrelated to either: it caps the worker
 threads of each Tokio runtime a handle owns, which is the runtime a
 `BlockingTrellis` or binding handle services its calls on and the runtime of
@@ -84,6 +94,12 @@ worker threads, and a process with H such handles holds up to `2 * worker_thread
 Size it for the handles you open. It caps worker threads only, not every
 thread a handle starts: each runtime also has a thread driving it and a
 blocking pool Tokio grows on demand (for DNS lookups, for one).
+
+Connections follow the same rule. A handle's calls draw on a pool of up to 20
+connections, and a handle that runs a client has a second pool of up to 20,
+plus a `LISTEN` connection outside the pools for each drain thread. A process
+with several handles holds the sum, so add them up against the server's
+`max_connections`.
 
 ### What the staging worker needs from the database
 
@@ -278,8 +294,9 @@ defmodule MyAppWeb.HealthController do
   use MyAppWeb, :controller
 
   def workers(conn, _params) do
-    # The node's one handle, the one ADR-0010 decision 3 describes, owned
-    # by `{Trellis, name: MyApp.Trellis, ...}` in the supervision tree.
+    # This instance's handle, the kind ADR-0010 decision 3 describes, owned
+    # by `{Trellis, name: MyApp.Trellis, ...}` in the supervision tree. With
+    # several instances, check the handle of each.
     trellis = MyApp.Trellis
 
     cond do

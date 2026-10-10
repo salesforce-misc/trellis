@@ -74,17 +74,33 @@ Corollary: the bindings are deliberately thin. Where a host-language
 convenience needs something the crate doesn't expose, widen the crate's API,
 don't reach around it.
 
-## Decision 3: the binding owns one handle; Rust owns its threads
+## Decision 3: the binding owns one handle per instance; Rust owns its threads
 
-**One handle per OS process, created at boot, held as an opaque resource.**
-This resolves ADR-0008's first open question. `Trellis::connect` runs the
-instance-identity check, builds the pool, and optionally starts background
-workers — none of it per-call.
+**One handle per instance, created at boot, never per request, held as an
+opaque resource.** An instance is one catalog schema in one database
+([instance identity](../instance-identity.md)). A process holds one handle for
+each instance it uses: a host that serves several databases holds one per
+database, and a host that wants two instances in one database holds one per
+catalog schema. This resolves ADR-0008's first open question. `Trellis::connect`
+runs the instance-identity check, builds the pool, and optionally starts
+background workers — none of it per-call, which is why a handle is created once
+and shared rather than connected per request.
 
 * **Elixir:** a `ResourceArc` owned by a process in the supervision tree, so
-  shutdown is a supervisor concern and the destructor is only a backstop.
-* **Ruby:** a `TypedData` behind a module-level singleton, with explicit
-  shutdown and `at_exit` as backstop.
+  shutdown is a supervisor concern and the destructor is only a backstop. Each
+  handle has a process of its own, told apart by its `:name`.
+* **Ruby:** a `TypedData` owned by a `Trellis::Instance`, with explicit
+  shutdown and `at_exit` as backstop. The `Trellis` module is the shortcut for
+  a process's default instance.
+
+**Each handle pays for itself.** A handle owns the runtime its calls run on and
+a pool of up to 20 connections (`pool_max_size`). A handle that runs a
+background client (`staging` or `drain_threads`) also owns a second runtime and
+a second pool of up to 20, plus dedicated connections outside the pools,
+including one `LISTEN` connection for each drain thread. A process with *N*
+handles that run clients therefore holds up to *2N* runtimes and *2N* pools, and
+the host sizes that sum against the server's `max_connections` and its own
+thread count.
 
 **Every call is dirty/GVL-released**, because each method blocks on a database
 round trip — far past what either host VM tolerates on a scheduler thread.
@@ -115,7 +131,7 @@ each pool's connections (`pool_max_size`, one pool for the calls and one for
 the client) are outside it.
 
 **A handle does not survive `fork`.** Puma, Unicorn, Passenger, and Resque all
-fork; Rust threads do not cross `fork`, so a child inherits the handle and its
+fork; Rust threads do not cross `fork`, so a child inherits each handle and its
 file descriptors but no threads to service them, and every call hangs forever.
 The Ruby binding therefore connects *after* fork and records the owning pid,
 raising on any call from a different pid rather than deadlocking. The BEAM does
