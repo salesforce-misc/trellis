@@ -534,6 +534,18 @@ struct GaugeState {
     chunk_max_nanos: AtomicU64,
     /// The last segment count per state.
     segments: Mutex<BTreeMap<String, u64>>,
+    /// Woken by each [`refresh_instance_gauges`] of the instance, for the
+    /// test that pins the client's refresh task ([`refreshed`]).
+    #[cfg(test)]
+    refreshed: tokio::sync::Notify,
+}
+
+/// Returns once `instance`'s gauges have been refreshed since the last call
+/// returned (or ever, on the first call).
+#[cfg(test)]
+pub(crate) async fn refreshed(instance: &Arc<str>) {
+    let state = gauge_state(instance);
+    state.refreshed.notified().await;
 }
 
 /// `instance`'s [`GaugeState`]. Entries live as long as the process: one per
@@ -569,6 +581,8 @@ pub fn refresh_instance_gauges() {
         metrics::gauge!(STAGING_SEGMENTS_METRIC, INSTANCE_LABEL => label.clone(), "state" => segment_state.clone())
             .set(*count as f64);
     }
+    #[cfg(test)]
+    state.refreshed.notify_one();
 }
 
 /// The instance the calling code runs under, as the label value.
@@ -1055,7 +1069,12 @@ mod tests {
         let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         let mut sites = 0;
         for macro_name in ["counter!(", "gauge!(", "histogram!("] {
-            for (at, _) in code.match_indices(&format!("metrics::{macro_name}")) {
+            // Imported (`use metrics::counter;`) or by path, but not the
+            // `describe_*!` registrations, which name no series.
+            for (at, _) in code
+                .match_indices(macro_name)
+                .filter(|(at, _)| !code[..*at].ends_with("describe_"))
+            {
                 let call = &code[at..];
                 let call = &call[..call.find(')').unwrap()];
                 sites += 1;
@@ -1066,6 +1085,41 @@ mod tests {
             }
         }
         assert!(sites >= 14, "found {sites} recording sites");
+    }
+
+    fn rust_files(dir: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, into);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                into.push(path);
+            }
+        }
+    }
+
+    /// Every series is recorded in this file, where the test above checks
+    /// its label: no other file of the crate calls a `metrics` macro.
+    #[test]
+    fn no_other_file_records_a_metric() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|file| **file != src.join("metrics.rs"))
+            .filter(|file| {
+                let text = std::fs::read_to_string(file).unwrap();
+                ["counter!(", "gauge!(", "histogram!("]
+                    .iter()
+                    .any(|name| text.contains(name))
+            })
+            .map(|file| file.display().to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "record through crate::metrics, so the series carries trellis_instance: {offenders:?}"
+        );
     }
 
     /// Issue #873: a gauge nothing sets for the idle timeout drops out, one

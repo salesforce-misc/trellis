@@ -99,12 +99,13 @@ One process can hold several handles, for different catalog schemas or
 different databases. They share one registry, and `render_prometheus()` returns
 every handle's series in a single body, once. Every series carries
 `trellis_instance="<database>/<schema>"` (`mydb/trellis`), always, even with a
-single instance. The value is the one `trellis_instance` field of the instance's
+single instance. It is the value the `trellis_instance` field of the instance's
 [log events](#logs-and-traces) carries, so a series and a log line of one
 instance match. The label is `trellis_instance` and not `instance` because
 Prometheus attaches its own `instance` label to every scraped series (the scrape
 target), and renames a clash to `exported_instance`. Two handles of the same
-instance, in one process or several, write the same series.
+instance in one process write the same series. Handles in different processes
+stay apart by that scrape-target `instance` label.
 
 An instance whose handle stopped (shut down, or dropped) leaves its series in the
 registry:
@@ -121,8 +122,8 @@ registry:
   dropped. It never expires, so it keeps reporting 0. Alert on
   `trellis_instance_up == 0`, not on the absence of a series.
 
-A restart empties the registry, so `trellis_instance_up` has no series for an
-instance until its first handle starts.
+A process restart empties the registry, so `trellis_instance_up` has no series
+for an instance until its first handle in the new process starts.
 
 ### Quantiles via histograms, not summaries
 
@@ -153,8 +154,9 @@ let body = trellis.metrics().render_prometheus();
 The registry is process-wide, so mount `render_prometheus()` from inside the
 process running the engine — a separate scrape-only process renders an empty
 registry. Mount it once per process: any handle's `metrics()` renders every
-handle's series (see [above](#several-instances-in-one-process)). `cli/src/commands/run.rs`'s `--prometheus-bind <ADDR>` flag is a
-minimal template: a small TCP listener alongside the live pipeline answering each
+handle's series (see [above](#several-instances-in-one-process)).
+`cli/src/commands/run.rs`'s `--prometheus-bind <ADDR>` flag is a minimal
+template: a small TCP listener alongside the live pipeline answering each
 request with the rendered registry.
 
 ### Retention: left to Prometheus, not Trellis

@@ -69,9 +69,10 @@ defmodule TrellisTest do
     eventually("widget_prices' applied changes to reach the metrics", fn ->
       metrics = Trellis.Metrics.render_prometheus()
 
-      if metrics =~ ~r/^trellis_changes_applied_total\{transform="[^"]*widget_prices"\} \d+$/m,
-        do: {:done, :ok},
-        else: {:waiting, metrics}
+      if metrics =~
+           ~r/^trellis_changes_applied_total\{trellis_instance="[^"]+",transform="[^"]*widget_prices"\} \d+$/m,
+         do: {:done, :ok},
+         else: {:waiting, metrics}
     end)
 
     assert :ok = Trellis.shutdown(trellis)

@@ -607,6 +607,48 @@ mod client_runtime_tests {
         assert_eq!(worker, "app/tenant_a");
         assert_eq!(blocking, "app/tenant_a");
     }
+
+    /// Issue #873: a running client sets its instance's gauges again on a
+    /// timer, so the recorder's idle timeout drops only a stopped instance's.
+    /// A client with no staging worker and no drain workers never touches the
+    /// database, so this needs none. The timeout only bounds a failure.
+    #[test]
+    fn a_running_client_refreshes_its_instances_gauges_every_interval() {
+        use std::time::Duration;
+
+        use super::{Client, ClientOptions};
+
+        let config = crate::config::Config::with_schema(
+            "postgres://app@127.0.0.1:1/gauge_refresh",
+            "gauge_refresh",
+        )
+        .expect("config");
+        let instance = crate::instance_log::name_of(&config);
+        let client = Client::start_with_config(
+            config,
+            ClientOptions {
+                maintenance_interval: Duration::from_millis(10),
+                ..ClientOptions::default()
+            },
+        )
+        .expect("start a client with no workers");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // Two refreshes: the task runs, and runs again.
+            for _ in 0..2 {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    crate::metrics::refreshed(&instance),
+                )
+                .await
+                .expect("the running client refreshed its gauges");
+            }
+            client.shutdown().await.expect("shutdown");
+        });
+    }
 }
 
 // ---------------------------------------------------------------------

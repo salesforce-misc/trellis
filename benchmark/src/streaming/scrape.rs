@@ -18,7 +18,8 @@
 //! process-wide ([`trellis::metrics`]' `OnceLock` handle), not
 //! per-`Client`/per-database. A scenario that starts several clients in one
 //! process — a depth ladder looping over depths, a ramp looping over rates —
-//! sees every earlier run's counts still sitting in the same series. Taking a
+//! sees every earlier run's counts still sitting in the registry (each run's
+//! under its own `trellis_instance`, which the readers here sum over). Taking a
 //! scrape immediately before a measurement window and subtracting it isolates
 //! that window's own contribution. Every series read here is cumulative
 //! (Prometheus convention: bucket counts and `_count`/`_total` only increase),
@@ -124,18 +125,26 @@ impl HistogramSnapshot {
     }
 }
 
-/// The trailing value on the first line matching `prefix`-and-`labels`, or
-/// `None` if no such line exists — a scrape taken before a fresh transform
+/// The sum of the trailing values on every line matching `prefix`-and-`labels`,
+/// or `None` if no such line exists — a scrape taken before a fresh transform
 /// has ever been observed legitimately has no line at all, which is not an
 /// error.
+///
+/// Summed, not the first match: every series carries `trellis_instance`
+/// (#873), and each probe of a ramp runs against a fresh database, so the
+/// process holds one series of the same transform per probe, rendered in no
+/// fixed order. Their sum is the cumulative count a scenario diffs across its
+/// window, as the single series was before the label.
 fn metric_line_value(rendered: &str, prefix: &str, labels: &[String]) -> Option<f64> {
     rendered
         .lines()
-        .find(|line| {
-            line.starts_with(prefix) && labels.iter().all(|label| line.contains(label.as_str()))
+        .filter(|line| {
+            line.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('{'))
+                && labels.iter().all(|label| line.contains(label.as_str()))
         })
-        .and_then(|line| line.rsplit(' ').next())
-        .and_then(|v| v.parse().ok())
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        .fold(None, |sum, value| Some(sum.unwrap_or(0.0) + value))
 }
 
 fn transform_label(transform: &str) -> String {
@@ -395,6 +404,30 @@ trellis_changes_applied_total{transform=\"t\"} 10\n";
         assert_eq!(snap.bucket(LE_P99), 9);
         assert_eq!(snap.bucket(LE_MAX), 10);
         assert_eq!(counter_value(SAMPLE, CHANGES_APPLIED_METRIC, "t"), 10);
+    }
+
+    /// #873: an earlier probe's instance keeps its series of the same
+    /// transform, and the exporter renders the two in either order. The
+    /// window is the same whichever comes first.
+    #[test]
+    fn an_earlier_probes_series_does_not_hide_this_ones() {
+        let old = "trellis_changes_applied_total{trellis_instance=\"db1/trellis\",transform=\"t\"} 50\n\
+                   trellis_end_to_end_latency_seconds_count{trellis_instance=\"db1/trellis\",transform=\"t\"} 50\n";
+        let new = |n: u64| {
+            format!(
+                "trellis_changes_applied_total{{trellis_instance=\"db2/trellis\",transform=\"t\"}} {n}\n\
+                 trellis_end_to_end_latency_seconds_count{{trellis_instance=\"db2/trellis\",transform=\"t\"}} {n}\n"
+            )
+        };
+        for (before, after) in [
+            (format!("{old}{}", new(3)), format!("{}{old}", new(10))),
+            (format!("{}{old}", new(3)), format!("{old}{}", new(10))),
+        ] {
+            let applied = counter_value(&after, CHANGES_APPLIED_METRIC, "t")
+                - counter_value(&before, CHANGES_APPLIED_METRIC, "t");
+            assert_eq!(applied, 7);
+            assert_eq!(e2e(&after).since(&e2e(&before)).count, 7);
+        }
     }
 
     #[test]
