@@ -93,6 +93,37 @@ Supporting counters/gauges keep the histograms interpretable:
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#transform-status-lifecycle), a small enumerable state.
 
+### Several instances in one process
+
+One process can hold several handles, for different catalog schemas or
+different databases. They share one registry, and `render_prometheus()` returns
+every handle's series in a single body, once. Every series carries
+`trellis_instance="<database>/<schema>"` (`mydb/trellis`), always, even with a
+single instance. The value is the one `trellis_instance` field of the instance's
+[log events](#logs-and-traces) carries, so a series and a log line of one
+instance match. The label is `trellis_instance` and not `instance` because
+Prometheus attaches its own `instance` label to every scraped series (the scrape
+target), and renames a clash to `exported_instance`. Two handles of the same
+instance, in one process or several, write the same series.
+
+An instance whose handle stopped (shut down, or dropped) leaves its series in the
+registry:
+
+* **Counters and histograms** stay at their last value. Their rate is 0, which
+  is true.
+* **Gauges** (`staging_segments`, `build_chunk_seconds_max`) disappear once
+  nothing has set them for 60 seconds. A running handle sets each of its gauges
+  again every 300 ms (`maintenance_interval`), to its last known value, so only a
+  stopped instance's expire. A running instance whose staging worker cannot read
+  the ring keeps reporting the last segment counts it read.
+* **`trellis_instance_up{trellis_instance}`** is 1 while at least one handle of
+  the instance runs in this process, and 0 once the last one has shut down or been
+  dropped. It never expires, so it keeps reporting 0. Alert on
+  `trellis_instance_up == 0`, not on the absence of a series.
+
+A restart empties the registry, so `trellis_instance_up` has no series for an
+instance until its first handle starts.
+
 ### Quantiles via histograms, not summaries
 
 Median and p99 are computed at query time from exported bucket counts
@@ -121,7 +152,8 @@ let body = trellis.metrics().render_prometheus();
 
 The registry is process-wide, so mount `render_prometheus()` from inside the
 process running the engine — a separate scrape-only process renders an empty
-registry. `cli/src/commands/run.rs`'s `--prometheus-bind <ADDR>` flag is a
+registry. Mount it once per process: any handle's `metrics()` renders every
+handle's series (see [above](#several-instances-in-one-process)). `cli/src/commands/run.rs`'s `--prometheus-bind <ADDR>` flag is a
 minimal template: a small TCP listener alongside the live pipeline answering each
 request with the rendered registry.
 

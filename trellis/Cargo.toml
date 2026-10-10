@@ -7,6 +7,8 @@ edition.workspace = true
 deadpool-postgres = "0.14.1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+# `MetricKindMask`, for the exporter's gauge idle timeout (issue #873).
+metrics-util = { version = "0.20.4", default-features = false }
 # Issue #56/ADR-0009 decision 3: the `tracing` facade every span/event in
 # this crate goes through. Unconditional (unlike the four crates below) —
 # emitting spans/events costs nothing when no subscriber is installed (a

@@ -195,6 +195,9 @@ pub struct Trellis {
     /// The name this handle's log events carry as `trellis_instance`: its
     /// database and catalog schema (see [`crate::instance_log::name_of`]).
     instance: std::sync::Arc<str>,
+    /// Keeps `trellis_instance_up` at 1 for this instance until the handle
+    /// is dropped or shut down.
+    _running: crate::metrics::RunningInstance,
 }
 
 impl Trellis {
@@ -214,8 +217,10 @@ impl Trellis {
         } else {
             None
         };
+        let instance = crate::instance_log::name_of(&config);
         Ok(Self {
-            instance: crate::instance_log::name_of(&config),
+            _running: crate::metrics::RunningInstance::new(&instance),
+            instance,
             config,
             pool,
             client,

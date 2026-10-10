@@ -2197,6 +2197,7 @@ dependencies = [
  "getrandom 0.4.3",
  "metrics",
  "metrics-exporter-prometheus",
+ "metrics-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

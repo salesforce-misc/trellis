@@ -16,8 +16,8 @@
 //! - chunk transactions (`trellis_build_chunk_seconds`): how many, and p50
 //!   and p99 read off the histogram's buckets (about 25% apart, so each is
 //!   the upper bound of the bucket it falls in), and the max
-//!   (`trellis_build_chunk_seconds_max`, the process's, which is this run's:
-//!   the bench runs one scenario per process);
+//!   (`trellis_build_chunk_seconds_max`, the instance's, which is this run's:
+//!   the bench runs one scenario, with one instance, per process);
 //! - rows built, delta rows appended and merged, chunks that gave up on
 //!   their entry lock, and seals refused for a full ring.
 //!
@@ -39,23 +39,48 @@ use crate::streaming::disk_tier::json_ms;
 /// How often [`sample_peaks`] reads the WAL directory and the delta table.
 pub const PEAK_POLL: Duration = Duration::from_millis(250);
 
-/// Every series of one scrape, by its full name and labels.
+/// Every series of one scrape, by its name and labels other than
+/// `trellis_instance` (the bench runs one instance per process, so its label
+/// would only be noise in every lookup).
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot(HashMap<String, f64>);
+
+/// `series` without its `trellis_instance="..."` label.
+fn without_instance_label(series: &str) -> String {
+    let Some(at) = series.find("trellis_instance=\"") else {
+        return series.to_string();
+    };
+    let value_start = at + "trellis_instance=\"".len();
+    let Some(value_len) = series[value_start..].find('"') else {
+        return series.to_string();
+    };
+    let mut end = value_start + value_len + 1;
+    if series[end..].starts_with(',') {
+        end += 1;
+    }
+    let labels = format!("{}{}", &series[..at], &series[end..]);
+    labels.replace("{}", "").replace(",}", "}")
+}
 
 impl MetricsSnapshot {
     /// Parses one Prometheus text exposition.
     pub fn parse(rendered: &str) -> Self {
-        Self(
-            rendered
-                .lines()
-                .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-                .filter_map(|line| {
-                    let (series, value) = line.rsplit_once(' ')?;
-                    Some((series.to_string(), value.parse().ok()?))
-                })
-                .collect(),
-        )
+        let mut series_values = HashMap::new();
+        for line in rendered.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let Some((series, value)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            let Ok(value) = value.parse::<f64>() else {
+                continue;
+            };
+            *series_values
+                .entry(without_instance_label(series))
+                .or_insert(0.0) += value;
+        }
+        Self(series_values)
     }
 
     /// One scrape of this process's registry.
@@ -337,6 +362,28 @@ trellis_build_rows_total 20100
 trellis_build_delta_rows_total{step=\"appended\"} 300
 trellis_seal_refused_total 2
 ";
+
+    /// The engine labels every series with its instance (#873); the profile
+    /// reads them by name and its own labels.
+    #[test]
+    fn the_instance_label_is_not_part_of_a_series_key() {
+        let snapshot = MetricsSnapshot::parse(
+            "trellis_build_rows_total{trellis_instance=\"db/trellis\"} 7\n\
+             trellis_build_delta_rows_total{trellis_instance=\"db/trellis\",step=\"merged\"} 3\n\
+             trellis_build_chunk_seconds_bucket{trellis_instance=\"db/trellis\",le=\"0.5\"} 2\n\
+             trellis_instance_up{trellis_instance=\"db/trellis\"} 1\n",
+        );
+        assert_eq!(snapshot.get("trellis_build_rows_total"), 7.0);
+        assert_eq!(
+            snapshot.get("trellis_build_delta_rows_total{step=\"merged\"}"),
+            3.0
+        );
+        assert_eq!(
+            snapshot.buckets("trellis_build_chunk_seconds"),
+            vec![(0.5, 2.0)]
+        );
+        assert_eq!(snapshot.get("trellis_instance_up"), 1.0);
+    }
 
     #[test]
     fn the_window_is_the_difference_of_two_scrapes() {

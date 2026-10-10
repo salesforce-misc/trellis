@@ -4,9 +4,14 @@ defmodule Trellis.Metrics do
   crate's `trellis::Metrics::render_prometheus`
   (`docs/decisions/0009-observability-decisions.md`).
 
-  The registry is process-wide. It aggregates everything every Trellis
-  handle in this OS process has recorded, so it needs no handle and works
-  before `Trellis.connect/1` and after `Trellis.shutdown/1`.
+  The registry is process-wide: one body holds the series of every Trellis
+  handle in this OS process, so it needs no handle and works before
+  `Trellis.connect/1` and after `Trellis.shutdown/1`. Every series carries a
+  `trellis_instance="<database>/<catalog schema>"` label, the same value as
+  the `trellis_instance` of the instance's log lines, so handles in one VM
+  stay apart. `trellis_instance_up` is 1 while an instance has a running
+  handle and 0 after its last one shuts down; the other gauges of a stopped
+  instance disappear after 60 seconds. See `docs/observability.md`.
 
   The binding opens no port. Serve the text from a route the host already
   has, for example with Plug:

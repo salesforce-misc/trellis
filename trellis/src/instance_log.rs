@@ -40,6 +40,10 @@
 //! test fails on a `tracing` event macro anywhere else in this crate, so a new
 //! event cannot go out without the field. An event emitted outside any scope
 //! (a test calling an engine function directly) reads [`UNSCOPED`].
+//!
+//! The metrics read the same scope ([`current`]) for their `trellis_instance`
+//! label, so a metric series and the log lines of one instance carry the same
+//! value.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -100,6 +104,13 @@ pub(crate) fn enter_thread(name: &Arc<str>) {
     let _ = CURRENT.try_with(|current| *current.borrow_mut() = Some(Arc::clone(name)));
 }
 
+/// The current thread's instance name: the label value every metric carries
+/// (`metrics.rs`, issue #873) and the field value every log event carries.
+/// [`UNSCOPED`] on a thread no handle has scoped.
+pub(crate) fn current() -> Arc<str> {
+    current_name().unwrap_or_else(|| Arc::from(UNSCOPED))
+}
+
 /// The name set on the current thread, to carry onto another one.
 fn current_name() -> Option<Arc<str>> {
     CURRENT
@@ -126,6 +137,13 @@ impl Drop for Restore {
         let previous = self.0.take();
         let _ = CURRENT.try_with(|current| *current.borrow_mut() = previous);
     }
+}
+
+/// Runs `f` with `name` as the current thread's instance.
+#[cfg(test)]
+pub(crate) fn run_scoped<R>(name: &Arc<str>, f: impl FnOnce() -> R) -> R {
+    let _restore = Restore::set(name);
+    f()
 }
 
 /// Runs `future` with `name` as the instance on every poll, so the name

@@ -494,7 +494,7 @@ mod tests {
     /// counted for `op` so far in this process.
     fn timeouts_counted(op: ColumnPauseOp) -> u64 {
         let prefix = format!(
-            "trellis_column_pause_lock_timeouts_total{{op=\"{}\"}} ",
+            "trellis_column_pause_lock_timeouts_total{{trellis_instance=\"unknown\",op=\"{}\"}} ",
             op.label()
         );
         crate::metrics::Metrics::new()

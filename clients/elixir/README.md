@@ -80,7 +80,9 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 - `Trellis.Migration`: `define`, `apply` and `status` in an Ecto migration.
 - `Trellis.Metrics.render_prometheus/0`: the process-wide metrics registry
   as Prometheus text, for a `/metrics` route the host already serves (the
-  binding opens no port). It needs no handle.
+  binding opens no port). It needs no handle. Every series carries the
+  `trellis_instance` label (`<database>/<catalog schema>`, as in the log
+  lines), so handles in one VM stay apart.
 - `Trellis.LogBridge`: started with the `:trellis_pg` application, it forwards
   the engine's log lines to `Logger` (`domain: [:trellis]`, the Rust module
   as `:target` metadata). Every line names its instance in the text, as
