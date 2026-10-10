@@ -1904,6 +1904,7 @@ pub async fn alter_transform(
     if !build_fields.is_empty() || !real_drops.is_empty() {
         crate::locks::lock_column_pauses(
             &*txn,
+            pool.schema(),
             crate::locks::ColumnPauseLock::Exclusive,
             crate::locks::ColumnPauseOp::Alter,
         )
@@ -2992,6 +2993,7 @@ async fn create_definition_inner(
     // define starts run after it, in transactions of their own.
     crate::locks::lock_column_pauses(
         &*txn,
+        pool.schema(),
         crate::locks::ColumnPauseLock::Shared,
         crate::locks::ColumnPauseOp::Define,
     )

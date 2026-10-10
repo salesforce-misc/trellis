@@ -82,7 +82,7 @@ Supporting counters/gauges keep the histograms interpretable:
 * `column_pause_lock_timeouts_total{op}` — waits for the column-pause lock that ran
   out the transaction's `lock_timeout` (30 s, or one second for the capture pass's
   cascade pairs), by the operation that waited: `pause`, `resume`, `fuse`, `cascade`,
-  `define`, `drop`, `alter` or `capture`. Pause operations serialize on that one lock
+  `define`, `drop`, `alter` or `capture`. Pause operations of an instance serialize on its one lock
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)), so a nonzero rate means a
   holder stayed in it too long, or column pauses became a hot path. Each timeout failed
   one call with a retryable error; nothing is retried in a loop.

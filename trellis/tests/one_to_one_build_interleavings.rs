@@ -2249,12 +2249,13 @@ async fn a_build_in_flight_holds_no_column_pause_lock() {
         .await;
     chunk.reached(PausePoint::AfterRederiveRead).await;
 
+    let (class, object) = trellis::locks::column_pause_lock_key(trellis::config::DEFAULT_SCHEMA);
     let held: i64 = d
         .ctl
         .query_one(
             "select count(*) from pg_locks \
-             where locktype = 'advisory' and classid = 922 and objid = 0 and objsubid = 2",
-            &[],
+             where locktype = 'advisory' and classid = $1 and objid = $2 and objsubid = 2",
+            &[&(class as u32), &(object as u32)],
         )
         .await
         .expect("read pg_locks")
@@ -2267,6 +2268,7 @@ async fn a_build_in_flight_holds_no_column_pause_lock() {
         .expect("set the timeout");
     trellis::locks::lock_column_pauses(
         &*txn,
+        trellis::config::DEFAULT_SCHEMA,
         trellis::locks::ColumnPauseLock::Exclusive,
         trellis::locks::ColumnPauseOp::Pause,
     )

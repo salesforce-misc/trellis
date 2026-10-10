@@ -5036,19 +5036,27 @@ async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_s
 }
 
 // ---------------------------------------------------------------------
-// Issue #922: one global column-pause lock. Lock order, DROP vs RESUME
+// Issue #922: one column-pause lock per instance. Lock order, DROP vs RESUME
 // (#921), the timeout, and a define holding the lock for its catalog
 // transaction only.
 // ---------------------------------------------------------------------
 
+/// The default-schema instance's column-pause lock key as `pg_locks` shows it
+/// (`classid` and `objid` are unsigned `oid`s).
+fn column_pause_lock_oids() -> (u32, u32) {
+    let (class, object) = trellis::locks::column_pause_lock_key(trellis::config::DEFAULT_SCHEMA);
+    (class as u32, object as u32)
+}
+
 /// Whether backend `pid` holds the column-pause lock, in either mode.
 async fn holds_column_pause_lock(client: &Client, pid: i32) -> bool {
+    let (class, object) = column_pause_lock_oids();
     client
         .query_one(
             "select exists (select 1 from pg_locks \
              where pid = $1 and locktype = 'advisory' and granted \
-               and classid = 922 and objid = 0 and objsubid = 2)",
-            &[&pid],
+               and classid = $2 and objid = $3 and objsubid = 2)",
+            &[&pid, &class, &object],
         )
         .await
         .expect("read pg_locks")
@@ -5057,12 +5065,13 @@ async fn holds_column_pause_lock(client: &Client, pid: i32) -> bool {
 
 /// Whether anything holds the column-pause lock.
 async fn column_pause_lock_is_held(client: &Client) -> bool {
+    let (class, object) = column_pause_lock_oids();
     client
         .query_one(
             "select exists (select 1 from pg_locks \
              where locktype = 'advisory' and granted \
-               and classid = 922 and objid = 0 and objsubid = 2)",
-            &[],
+               and classid = $1 and objid = $2 and objsubid = 2)",
+            &[&class, &object],
         )
         .await
         .expect("read pg_locks")
@@ -5411,6 +5420,7 @@ async fn a_pause_behind_a_held_column_pause_lock_times_out_retryably() {
     let hold = holder.transaction().await.expect("begin");
     trellis::locks::lock_column_pauses(
         &*hold,
+        trellis::config::DEFAULT_SCHEMA,
         trellis::locks::ColumnPauseLock::Exclusive,
         trellis::locks::ColumnPauseOp::Resume,
     )
@@ -5621,6 +5631,7 @@ async fn a_build_start_behind_a_held_column_pause_lock_waits_for_the_next_pass()
     let hold = holder.transaction().await.expect("begin");
     trellis::locks::lock_column_pauses(
         &*hold,
+        trellis::config::DEFAULT_SCHEMA,
         trellis::locks::ColumnPauseLock::Exclusive,
         trellis::locks::ColumnPauseOp::Pause,
     )

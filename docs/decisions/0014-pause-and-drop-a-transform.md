@@ -76,7 +76,10 @@ commits. If that walk fails, the edit still succeeds and the capture pass finish
 
 Every read-to-decide and write of a column's pause state (`column_status` rows, cascade
 edges, the marks that a pause still owes its cascade) goes through one transaction-level
-advisory lock, taken by one helper (`locks::lock_column_pauses`). Column pauses are
+advisory lock per instance, taken by one helper (`locks::lock_column_pauses`). The key is
+`(922, hash(instance schema))`: advisory locks are scoped to the database, not the schema, so
+a constant key would make instances that share a database wait on each other
+([instance identity](../instance-identity.md)). Column pauses are
 operator commands plus rare fuse trips, so correctness and simplicity win over
 concurrency here. An earlier design locked each target by name; two deadlocks came from
 the sites it missed (a define against a `RESUME`, a `DROP TRANSFORM` against a `RESUME`),
@@ -100,9 +103,9 @@ by construction.
   the caller gets a retryable error (`ErrorCode::Timeout`). A fuse trip and the capture
   pass's callers retry on their next pass. Each timeout is counted by
   `column_pause_lock_timeouts_total{op}` ([observability](../observability.md)).
-- **Costs accepted.** Pauses, resumes and fuse trips on unrelated targets serialize. A
-  holder that stalls, such as an idle-in-transaction session, blocks pause activity until
-  `lock_timeout`. A fuse trip in the capture pass can wait briefly behind an operator
+- **Costs accepted.** Pauses, resumes and fuse trips on unrelated targets of one instance
+  serialize. A holder that stalls, such as an idle-in-transaction session, blocks that
+  instance's pause activity until `lock_timeout`. A fuse trip in the capture pass can wait briefly behind an operator
   pause.
 
 ### Resume reconciles with source, not by catch-up

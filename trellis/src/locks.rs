@@ -109,11 +109,27 @@ pub fn is_lock_not_available(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// The one advisory lock every read-to-decide and every write of the column
-/// pauses' state takes (#922, ADR-0014 "Locking"): `column_status` rows, the
-/// cascade edges (`column_pause_cascades`) and the pending marks on them.
-/// A two-int key, so it shares nothing with the single-`bigint` session locks.
-const COLUMN_PAUSE_LOCK_KEY: (i32, i32) = (922, 0);
+/// The first int of the column-pause lock's key (#922).
+const COLUMN_PAUSE_LOCK_CLASS: i32 = 922;
+
+/// The advisory lock key of `schema`'s column-pause lock, the one lock every
+/// read-to-decide and every write of that instance's column-pause state takes
+/// (#922, ADR-0014 "Locking"): `column_status` rows, the cascade edges
+/// (`column_pause_cascades`) and the pending marks on them.
+///
+/// Advisory locks are keyed by `(database, key)` and know nothing of schemas,
+/// so the instance schema is hashed into the key, as the producer singleton's
+/// is (`staging::session::producer_singleton_lock_key`, #234): instances
+/// sharing a database don't serialize each other's pauses (#978). A two-int
+/// key, so it shares nothing with the single-`bigint` session locks. Two
+/// schemas whose hashes collide would share the lock, which costs those two
+/// instances the coupling this avoids and nothing else.
+pub fn column_pause_lock_key(schema: &str) -> (i32, i32) {
+    let hash = crate::staging::session::fnv1a_64(schema);
+    // Fold the 64 bits onto 32, then reinterpret as the signed `int4` the
+    // lock function takes.
+    (COLUMN_PAUSE_LOCK_CLASS, ((hash >> 32) ^ hash) as u32 as i32)
+}
 
 /// How a transaction holds the column-pause lock ([`lock_column_pauses`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,9 +229,10 @@ pub enum ColumnPauseLockError {
     Db(tokio_postgres::Error),
 }
 
-/// Takes the transaction-scoped column-pause lock in `mode` for `op`: the
-/// only place a column-pause advisory lock is taken (rule 8 of #922; the
-/// guard `tests::only_the_helper_takes_the_column_pause_lock` greps for it).
+/// Takes the transaction-scoped column-pause lock of the instance whose
+/// schema is `schema` in `mode` for `op`: the only place a column-pause
+/// advisory lock is taken (rule 8 of #922; the guard
+/// `tests::only_the_helper_takes_the_column_pause_lock` greps for it).
 ///
 /// **Lock order.** A transaction that needs it takes these in this order,
 /// and holds each to its commit:
@@ -240,6 +257,7 @@ pub enum ColumnPauseLockError {
 /// [`ColumnPauseLockError::Timeout`]; the caller's transaction is aborted.
 pub async fn lock_column_pauses(
     txn: &impl tokio_postgres::GenericClient,
+    schema: &str,
     mode: ColumnPauseLock,
     op: ColumnPauseOp,
 ) -> Result<(), ColumnPauseLockError> {
@@ -247,7 +265,7 @@ pub async fn lock_column_pauses(
         ColumnPauseLock::Exclusive => "select pg_advisory_xact_lock($1, $2)",
         ColumnPauseLock::Shared => "select pg_advisory_xact_lock_shared($1, $2)",
     };
-    let (class, object) = COLUMN_PAUSE_LOCK_KEY;
+    let (class, object) = column_pause_lock_key(schema);
     match txn.execute(sql, &[&class, &object]).await {
         Ok(_) => Ok(()),
         Err(err) if is_lock_not_available(&err) => {
@@ -513,21 +531,32 @@ mod tests {
     async fn a_held_lock_times_out_with_the_retryable_error_and_counts_the_metric() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
+        let schema = crate::config::DEFAULT_SCHEMA;
         let mut holder = db.pool.get().await.expect("connect");
         let mut waiter = db.pool.get().await.expect("connect");
         let hold = holder.transaction().await.expect("begin");
-        lock_column_pauses(&*hold, ColumnPauseLock::Exclusive, ColumnPauseOp::Pause)
-            .await
-            .expect("an idle lock is granted at once");
+        lock_column_pauses(
+            &*hold,
+            schema,
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Pause,
+        )
+        .await
+        .expect("an idle lock is granted at once");
 
         let before = timeouts_counted(ColumnPauseOp::Resume);
         let attempt = waiter.transaction().await.expect("begin");
         set_local_lock_timeout(&*attempt, Duration::from_millis(100))
             .await
             .expect("set the timeout");
-        let err = lock_column_pauses(&*attempt, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
-            .await
-            .expect_err("the lock is held");
+        let err = lock_column_pauses(
+            &*attempt,
+            schema,
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Resume,
+        )
+        .await
+        .expect_err("the lock is held");
         let ColumnPauseLockError::Timeout(timeout) = &err else {
             panic!("a named timeout, got {err:?}");
         };
@@ -548,32 +577,52 @@ mod tests {
             .await
             .expect("set the timeout");
         let before = timeouts_counted(ColumnPauseOp::Define);
-        let err = lock_column_pauses(&*attempt, ColumnPauseLock::Shared, ColumnPauseOp::Define)
-            .await
-            .expect_err("the lock is held exclusive");
+        let err = lock_column_pauses(
+            &*attempt,
+            schema,
+            ColumnPauseLock::Shared,
+            ColumnPauseOp::Define,
+        )
+        .await
+        .expect_err("the lock is held exclusive");
         assert!(matches!(err, ColumnPauseLockError::Timeout(_)));
         assert_eq!(timeouts_counted(ColumnPauseOp::Define), before + 1);
         drop(attempt);
 
         hold.commit().await.expect("release");
         let retry = waiter.transaction().await.expect("begin");
-        lock_column_pauses(&*retry, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
-            .await
-            .expect("the retry finds it free");
+        lock_column_pauses(
+            &*retry,
+            schema,
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Resume,
+        )
+        .await
+        .expect("the retry finds it free");
         retry.commit().await.expect("commit");
 
         // Two shared holders at once, then an exclusive one that has to wait.
         let shared_a = holder.transaction().await.expect("begin");
-        lock_column_pauses(&*shared_a, ColumnPauseLock::Shared, ColumnPauseOp::Define)
-            .await
-            .expect("shared");
+        lock_column_pauses(
+            &*shared_a,
+            schema,
+            ColumnPauseLock::Shared,
+            ColumnPauseOp::Define,
+        )
+        .await
+        .expect("shared");
         let shared_b = waiter.transaction().await.expect("begin");
         set_local_lock_timeout(&*shared_b, Duration::from_millis(100))
             .await
             .expect("set the timeout");
-        lock_column_pauses(&*shared_b, ColumnPauseLock::Shared, ColumnPauseOp::Define)
-            .await
-            .expect("defines don't wait on each other");
+        lock_column_pauses(
+            &*shared_b,
+            schema,
+            ColumnPauseLock::Shared,
+            ColumnPauseOp::Define,
+        )
+        .await
+        .expect("defines don't wait on each other");
         let mut third = db.pool.get().await.expect("connect");
         let exclusive = third.transaction().await.expect("begin");
         set_local_lock_timeout(&*exclusive, Duration::from_millis(100))
@@ -582,6 +631,7 @@ mod tests {
         assert!(
             lock_column_pauses(
                 &*exclusive,
+                schema,
                 ColumnPauseLock::Exclusive,
                 ColumnPauseOp::Alter
             )
@@ -589,6 +639,69 @@ mod tests {
             .is_err(),
             "an exclusive taker waits for the shared holders"
         );
+    }
+
+    /// #978: the lock is one per instance, not per database. Instance A holds
+    /// its column-pause lock in an open transaction; instance B, in the same
+    /// database, takes its own at once (a `lock_timeout` of a few
+    /// milliseconds turns any wait into a failure, so no polling), and a
+    /// second taker of A's still waits.
+    #[tokio::test]
+    async fn instances_in_one_database_take_their_own_column_pause_lock() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut a = db.pool.get().await.expect("connect");
+        let mut b = db.pool.get().await.expect("connect");
+        let mut a_again = db.pool.get().await.expect("connect");
+        let hold_a = a.transaction().await.expect("begin");
+        lock_column_pauses(
+            &*hold_a,
+            "instance_a",
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Pause,
+        )
+        .await
+        .expect("an idle lock is granted at once");
+
+        let txn_b = b.transaction().await.expect("begin");
+        set_local_lock_timeout(&*txn_b, Duration::from_millis(5))
+            .await
+            .expect("set the timeout");
+        for mode in [ColumnPauseLock::Exclusive, ColumnPauseLock::Shared] {
+            lock_column_pauses(&*txn_b, "instance_b", mode, ColumnPauseOp::Pause)
+                .await
+                .expect("another instance's lock is not held");
+        }
+
+        let txn_a = a_again.transaction().await.expect("begin");
+        set_local_lock_timeout(&*txn_a, Duration::from_millis(5))
+            .await
+            .expect("set the timeout");
+        // An op of its own: the timeout metric is process-wide, and
+        // another test counts `resume`'s.
+        let err = lock_column_pauses(
+            &*txn_a,
+            "instance_a",
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Fuse,
+        )
+        .await
+        .expect_err("the same instance's lock is held");
+        assert!(matches!(err, ColumnPauseLockError::Timeout(_)));
+    }
+
+    /// The key is a pure function of the schema: the same schema always
+    /// takes the same lock, and distinct schemas take distinct ones, in the
+    /// two-int key space (so never a single-`bigint` session lock).
+    #[test]
+    fn the_column_pause_lock_key_follows_the_schema() {
+        assert_eq!(column_pause_lock_key("a"), column_pause_lock_key("a"));
+        assert_ne!(column_pause_lock_key("a"), column_pause_lock_key("b"));
+        assert_ne!(
+            column_pause_lock_key("public"),
+            column_pause_lock_key("trellis_b")
+        );
+        assert_eq!(column_pause_lock_key("a").0, COLUMN_PAUSE_LOCK_CLASS);
     }
 
     /// Rule 8 of #922: one function takes the column-pause lock, so a new

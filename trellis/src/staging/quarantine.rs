@@ -2719,8 +2719,13 @@ async fn trip_column_fuse(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     bump_pause_fence(&*txn, fence.as_deref()).await?;
-    crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Fuse)
-        .await?;
+    crate::locks::lock_column_pauses(
+        &*txn,
+        pool.schema(),
+        ColumnPauseLock::Exclusive,
+        ColumnPauseOp::Fuse,
+    )
+    .await?;
     let mark: String = txn
         .query_one(
             "insert into column_status \
@@ -2971,8 +2976,13 @@ async fn pause_dependent(
         downstream_transform,
     )
     .await?;
-    crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Cascade)
-        .await?;
+    crate::locks::lock_column_pauses(
+        &*txn,
+        pool.schema(),
+        ColumnPauseLock::Exclusive,
+        ColumnPauseOp::Cascade,
+    )
+    .await?;
     let upstream_paused = txn
         .query_opt(
             "select 1 from column_status \
@@ -3197,8 +3207,13 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
         bump_pause_fence(&*txn, fence.as_deref()).await?;
-        crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Pause)
-            .await?;
+        crate::locks::lock_column_pauses(
+            &*txn,
+            pool.schema(),
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Pause,
+        )
+        .await?;
         let mark: String = txn
             .query_one(
                 "insert into column_status \
@@ -3368,8 +3383,13 @@ pub async fn resume_column(
         // no paused state, so it takes no fence.
         let mut locked = pool.get().await?;
         let txn = locked.transaction().await?;
-        crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
-            .await?;
+        crate::locks::lock_column_pauses(
+            &*txn,
+            pool.schema(),
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Resume,
+        )
+        .await?;
         if reads_paused_sibling(&*txn, pool, transform, column).await? {
             // Test-only pause point (#922). See `super::interleave`.
             #[cfg(any(test, feature = "test-util"))]
@@ -3607,8 +3627,13 @@ pub(crate) async fn resume_pairs(
         // edit reading them holds the lock too, so it reads either before
         // this starts or after it commits. See
         // `crate::locks::lock_column_pauses` for the order.
-        crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
-            .await?;
+        crate::locks::lock_column_pauses(
+            &*txn,
+            pool.schema(),
+            ColumnPauseLock::Exclusive,
+            ColumnPauseOp::Resume,
+        )
+        .await?;
         let Some(row) = txn
             .query_opt(
                 "select status, build from transform_definitions where id = $1 for update",
@@ -3790,8 +3815,13 @@ async fn hold_orphaned_pause(
 ) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    crate::locks::lock_column_pauses(&*txn, ColumnPauseLock::Exclusive, ColumnPauseOp::Resume)
-        .await?;
+    crate::locks::lock_column_pauses(
+        &*txn,
+        pool.schema(),
+        ColumnPauseLock::Exclusive,
+        ColumnPauseOp::Resume,
+    )
+    .await?;
     let held = txn
         .execute(
             "update column_status s set local_fuse = true, last_error = $3 \

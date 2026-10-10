@@ -23,6 +23,21 @@ use super::error::StagingError;
 /// Not itself the lock key — see [`producer_singleton_lock_key`].
 const PRODUCER_SINGLETON_LOCK_NAMESPACE: u64 = 0x7247_4c53_5453_4747; // "trellis producer" byte soup
 
+/// FNV-1a, 64 bit, of `text`'s bytes: the hash both advisory-lock keys that
+/// are derived from an instance schema use ([`producer_singleton_lock_key`],
+/// `locks::lock_column_pauses`).
+pub(crate) fn fnv1a_64(text: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// The advisory lock key the producer singleton is acquired under, **derived
 /// from the instance schema** (issue #234).
 ///
@@ -72,14 +87,7 @@ const PRODUCER_SINGLETON_LOCK_NAMESPACE: u64 = 0x7247_4c53_5453_4747; // "trelli
 /// broken for exactly the configuration it is most likely to be used in (a
 /// default-schema instance alongside a named one).
 pub fn producer_singleton_lock_key(schema: &str) -> i64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in schema.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
+    let hash = fnv1a_64(schema);
     // `as i64` is a plain bit reinterpretation, not a lossy narrowing:
     // `pg_advisory_lock` takes a signed `bigint`, and every one of the 64
     // bits is equally good as a key, so wrapping into the negative half of

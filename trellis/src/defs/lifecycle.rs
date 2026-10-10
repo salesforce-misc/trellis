@@ -304,6 +304,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // it (`crate::locks::lock_column_pauses`).
     crate::locks::lock_column_pauses(
         &*txn,
+        pool.schema(),
         crate::locks::ColumnPauseLock::Exclusive,
         crate::locks::ColumnPauseOp::Drop,
     )
