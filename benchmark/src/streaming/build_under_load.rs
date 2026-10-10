@@ -25,9 +25,9 @@
 //! What it measures:
 //!
 //! - the build's wall time and progress (sampled from `backfill_chunks` every
-//!   [`MONITOR_POLL`]; today's aggregate build is one direct-build job, so
-//!   `chunks` reads 1), and define -> `live`, which includes the go-live
-//!   catch-up re-read;
+//!   [`MONITOR_POLL`]: the Re-derive build's plan job, chunks and sweep, which
+//!   its flip to `live` deletes, so `chunks` is the most seen before it), and
+//!   define -> `live`, which includes any go-live catch-up re-read;
 //! - define -> converged and the tail from the writers stopping to
 //!   convergence;
 //! - the writers' commit latency during the build and overall, and whether
@@ -243,7 +243,8 @@ pub struct BuildUnderLoadResult {
     /// define -> the first chunk claimed / the first chunk done.
     pub first_claim_secs: Option<f64>,
     pub first_chunk_secs: Option<f64>,
-    /// `backfill_chunks` rows the build had (the most seen at once).
+    /// `backfill_chunks` rows the build had (the most seen at once, before
+    /// the flip to `live` deleted them, #966).
     pub chunks: i64,
     /// define -> the definition left `waiting_to_backfill`/`backfilling`.
     pub build_secs: f64,
@@ -764,6 +765,11 @@ async fn monitor_build(
                     p.built.get_or_insert(now);
                 }
                 "live" => {
+                    // The flip deleted the build's rows (#966): a build that
+                    // ran its chunks and flipped between two polls was
+                    // claimed and done by this one.
+                    p.first_claim.get_or_insert(now);
+                    p.first_done.get_or_insert(now);
                     p.built.get_or_insert(now);
                     p.live = Some(now);
                     return p;

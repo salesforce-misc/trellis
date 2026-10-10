@@ -119,7 +119,8 @@ definition's target takes one fence per build (see below):
    increments to a delta table, and drain threads merge them into the groups,
    one merge partition per thread.
 4. **Live.** The transaction that leaves the plan done, every chunk done and
-   the delta table empty moves the definition to `live`.
+   the delta table empty moves the definition to `live`, and deletes the
+   build's finished plan job, chunks and sweep from the queue.
 
 **A source that is another definition's target.** Such a source is never
 captured: its writes reach Apply through the target-mutation seam, whose
