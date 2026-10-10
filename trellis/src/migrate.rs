@@ -128,3 +128,40 @@ async fn run_up_to_latest(pg_client: &mut tokio_postgres::Client) -> Result<(), 
     embedded::migrations::runner().run_async(pg_client).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Issue #599: inside a call, each migration pass runs under the budget
+    /// left when the pass starts, not the one the session was opened with.
+    /// The session's `statement_timeout` after the run is the budget the
+    /// last pass was given.
+    #[tokio::test]
+    async fn each_migration_pass_gets_the_budget_left_when_it_starts() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let setting = "select setting::bigint from pg_settings where name = 'statement_timeout'";
+        let (opened, last) =
+            crate::deadline::bounded(Instant::now(), Duration::from_secs(20), async {
+                let attach = async {
+                    let mut client = pool.connect_unpooled().await?;
+                    let opened: i64 = client.query_one(setting, &[]).await?.get(0);
+                    identity::prepare_attach(&mut client, &config).await?;
+                    // Stands for the time the earlier migrations took.
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    run_migrations(&mut client).await?;
+                    let last: i64 = client.query_one(setting, &[]).await?.get(0);
+                    Ok::<_, Error>((opened, last))
+                };
+                attach.await.map_err(crate::TrellisError::Engine)
+            })
+            .await
+            .expect("migrate inside a call");
+        assert!((19_000..=20_000).contains(&opened), "when opened: {opened}");
+        assert!((1..=18_500).contains(&last), "for the last pass: {last}");
+    }
+}

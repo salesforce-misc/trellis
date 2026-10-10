@@ -156,7 +156,7 @@ impl Drop for Client {
         };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(reset_session(inner, settle));
+                runtime.spawn(reset_session(Unreset(Some(inner)), settle));
             }
             // Nothing to reset it on: close it rather than pool it still
             // carrying a call's timeout.
@@ -170,16 +170,35 @@ impl Drop for Client {
 const RESET_GRACE: Duration = Duration::from_secs(5);
 
 /// Clears the call's `statement_timeout` and returns the connection to the
-/// pool, or closes it if it won't answer.
-async fn reset_session(client: deadpool_postgres::Client, settle: Duration) {
-    match tokio::time::timeout(
+/// pool, or closes it if it won't answer. The connection is closed too if
+/// this task is dropped before the reset lands, even before its first poll
+/// (its runtime shutting down): only a connection the reset reached goes
+/// back to the pool.
+async fn reset_session(mut unreset: Unreset, settle: Duration) {
+    let reset = tokio::time::timeout(
         settle + RESET_GRACE,
-        client.simple_query("reset statement_timeout"),
+        unreset
+            .0
+            .as_ref()
+            .expect("held until reset")
+            .simple_query("reset statement_timeout"),
     )
-    .await
-    {
-        Ok(Ok(_)) => drop(client),
-        _ => drop(deadpool_postgres::Object::take(client)),
+    .await;
+    if let Ok(Ok(_)) = reset {
+        drop(unreset.0.take());
+    }
+}
+
+/// A released call connection that still carries the call's
+/// `statement_timeout`: closed when dropped, unless [`reset_session`] took
+/// it back out once its reset landed.
+struct Unreset(Option<deadpool_postgres::Client>);
+
+impl Drop for Unreset {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            drop(deadpool_postgres::Object::take(client));
+        }
     }
 }
 
@@ -1315,6 +1334,85 @@ mod tests {
 
     /// Issue #591: `Pool`'s derived `Debug` reaches the DSN only through
     /// `deadpool_postgres::Manager`'s `tokio_postgres::Config`, whose own
+    /// Issue #599: a call connection whose reset never ran (its runtime shut
+    /// down with the reset task still queued) is closed, not pooled with the
+    /// call's `statement_timeout` still set. The connection's driver runs on
+    /// a runtime that stays up, and the call runs on a current-thread runtime
+    /// that never polls the queued reset before it is dropped. With one
+    /// connection in the pool, the next checkout would be that session.
+    #[test]
+    fn a_call_connection_whose_reset_never_ran_is_not_pooled() {
+        let setup = tokio::runtime::Runtime::new().expect("setup runtime");
+        let cluster = testkit::TestCluster::start();
+        let db = setup.block_on(cluster.create_isolated_database());
+        let config = Config::from_dsn(db.dsn().to_string())
+            .expect("dsn")
+            .with_pool_max_size(1)
+            .expect("pool size");
+        let pool = Pool::new(&config).expect("pool");
+        // Opened here, so its driver lives on `setup`.
+        setup.block_on(async {
+            drop(pool.get().await.expect("open the connection"));
+        });
+
+        let call = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("call runtime");
+        call.block_on(crate::deadline::bounded(
+            std::time::Instant::now(),
+            Duration::from_secs(30),
+            async {
+                let client = pool.get().await.map_err(crate::TrellisError::Engine)?;
+                // Released at the end of the call: its reset is queued on
+                // `call`, which returns without running it.
+                drop(client);
+                Ok(())
+            },
+        ))
+        .expect("the call");
+        drop(call);
+
+        let timeout: String = setup.block_on(async {
+            pool.get()
+                .await
+                .expect("check out again")
+                .query_one("show statement_timeout", &[])
+                .await
+                .expect("show")
+                .get(0)
+        });
+        assert_eq!(
+            timeout, "0",
+            "the call's statement_timeout came back to the pool"
+        );
+    }
+
+    /// Issue #599: a transaction opened inside a call gets the budget left
+    /// when it begins, not the one its connection was checked out with.
+    #[tokio::test]
+    async fn a_calls_transaction_gets_the_budget_left_when_it_begins() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("dsn")).expect("pool");
+        let (session, local) =
+            crate::deadline::bounded(std::time::Instant::now(), Duration::from_secs(3), async {
+                let mut client = pool.get().await.map_err(crate::TrellisError::Engine)?;
+                let setting = "select setting::bigint from pg_settings \
+                               where name = 'statement_timeout'";
+                let session: i64 = client.query_one(setting, &[]).await.expect("read").get(0);
+                // Stands for the call's earlier work.
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let txn = client.transaction().await.expect("begin");
+                let local: i64 = txn.query_one(setting, &[]).await.expect("read").get(0);
+                Ok((session, local))
+            })
+            .await
+            .expect("the call");
+        assert!((2500..=3000).contains(&session), "at checkout: {session}");
+        assert!((1..=1500).contains(&local), "at begin: {local}");
+    }
+
     /// `Debug` masks the password. This pins that, so a dependency bump
     /// that changes it fails here rather than in someone's logs.
     #[test]
