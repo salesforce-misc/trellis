@@ -106,8 +106,97 @@ when "puma_hooks"
   Process.kill(:KILL, pid) if seen[:child].is_a?(String)
   Process.waitpid(pid)
   seen[:parent_connected] = Trellis.connected?
+when "named_instances"
+  # config.trellis.instances connect with the default instance at boot.
+  BootApp.config.trellis.instances = { reports: { url: ENV.fetch("TRELLIS_TEST_DSN"), schema: "boot_reports" } }
+  BootApp.initialize!
+  seen[:connected] = Trellis.connected?
+  seen[:named_schema] = Trellis::Railtie.named_instance(:reports).config.schema
+  seen[:named_class] = Trellis::Railtie.named_instance("reports").class.name
+  begin
+    Trellis::Railtie.named_instance(:nope)
+  rescue Trellis::ValidationError => e
+    seen[:unknown_instance] = e.message
+  end
+  reports = Trellis::Railtie.named_instance(:reports)
+  Trellis::Instance.shutdown_all
+  seen[:connected_after_shutdown_all] = [Trellis.connected?, reports.connected?]
+when "named_instances_only"
+  BootApp.config.trellis.connect = nil
+  BootApp.config.trellis.instances = { reports: { url: ENV.fetch("TRELLIS_TEST_DSN"), schema: "boot_reports" } }
+  BootApp.initialize!
+  seen[:connected] = Trellis.connected?
+  seen[:named_connected] = Trellis::Railtie.named_instance(:reports).connected?
+when "named_instances_rake"
+  # `trellis:migrate` migrates every configured instance on handles of its
+  # own, and leaves none connected.
+  BootApp.config.trellis.instances = { reports: { url: ENV.fetch("TRELLIS_TEST_DSN"), schema: "boot_reports" } }
+  require "rake"
+  Rake.with_application do |rake|
+    rake.init("rails", ["probe"])
+    BootApp.load_tasks
+    Rake::Task["environment"].enhance { BootApp.initialize! }
+    Rake::Task.define_task(probe: :environment) do
+      Rake::Task["trellis:migrate"].invoke
+      seen[:connected_after_migrate] = Trellis.connected?
+      seen[:named_after_migrate] = Trellis::Railtie.instance_options.keys
+      seen[:with_handle] = Trellis::Railtie.with_handle(:reports) { |trellis| trellis.config.schema }
+      seen[:with_handle_unknown] = begin
+        Trellis::Railtie.with_handle(:nope) { nil }
+      rescue Trellis::ValidationError => e
+        e.message
+      end
+    end
+    rake.top_level
+  end
+when "failed_connect_rolls_back"
+  # A named instance that can't connect doesn't leave the default one (or an
+  # earlier named one) connected.
+  BootApp.config.trellis.connect_on_boot = false
+  BootApp.config.trellis.instances = {
+    first: { url: ENV.fetch("TRELLIS_TEST_DSN"), schema: "boot_reports" },
+    broken: { url: ENV.fetch("TRELLIS_TEST_DSN"), schema: "boot_reports", worker_threads: 0 }
+  }
+  BootApp.initialize!
+  begin
+    Trellis::Railtie.connect
+  rescue Trellis::ValidationError => e
+    seen[:error] = e.message
+  end
+  seen[:connected] = Trellis.connected?
+  begin
+    Trellis::Railtie.named_instance(:first)
+    seen[:first_connected] = true
+  rescue Trellis::ValidationError
+    seen[:first_connected] = false
+  end
+when "puma_hooks_named"
+  # The same hooks with a named instance: shutdown_all in the parent, and
+  # each worker connects every instance of its own.
+  BootApp.config.trellis.instances = { reports: { url: ENV.fetch("TRELLIS_TEST_DSN"), schema: "boot_reports" } }
+  BootApp.initialize!
+  reports = Trellis::Railtie.named_instance(:reports)
+  reports.migrate
+  Trellis::Instance.shutdown_all
+  reader, writer = IO.pipe
+  pid = fork do
+    reader.close
+    Trellis::Railtie.connect
+    writer.puts JSON.generate(connected: Trellis.connected?,
+                              named: Trellis::Railtie.named_instance(:reports).status("no_such_target"))
+    Trellis::Instance.shutdown_all
+    exit!(0)
+  rescue StandardError => e
+    writer.puts JSON.generate(error: e.class.name)
+    exit!(1)
+  end
+  writer.close
+  seen[:child] = reader.wait_readable(60) ? JSON.parse(reader.gets || "null") : "no report within 60s"
+  Process.kill(:KILL, pid) if seen[:child].is_a?(String)
+  Process.waitpid(pid)
+  seen[:parent_connected] = [Trellis.connected?, reports.connected?]
 else
   abort "unknown scenario: #{ARGV[0]}"
 end
 puts JSON.generate(seen)
-Trellis.shutdown
+Trellis::Instance.shutdown_all

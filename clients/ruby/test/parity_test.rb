@@ -86,6 +86,16 @@ class ParityTest < Minitest::Test
     assert_equal (Parity::OPERATIONS.keys + Parity::HARNESS_OPS).sort, used.sort
   end
 
+  # Trellis::Instance is where every call lives: the module delegates each
+  # one to its default instance, so an instance has exactly the fixture's
+  # operations, `connect` as a class method and `connected?` besides.
+  def test_an_instance_has_every_fixture_operation_and_nothing_else
+    calls = Trellis::Instance.public_instance_methods(false).map(&:to_s) - %w[inspect to_s]
+    calls = calls.map { |name| name.delete_suffix("?") }
+    assert_equal (Parity::OPERATIONS.keys - ["connect"] + ["connected"]).sort, calls.sort
+    assert_equal %w[connect connected shutdown_all], Trellis::Instance.singleton_methods(false).map(&:to_s).sort
+  end
+
   # The Rails integration adds no call to `Trellis`: each migration helper
   # is the fixture operation of the same name, and every other public call
   # it has is a listed Rails-only exception.

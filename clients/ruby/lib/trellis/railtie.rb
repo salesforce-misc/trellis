@@ -15,11 +15,22 @@ module Trellis
   #   }
   #
   # config.trellis.connect takes Trellis.connect's options, and is the one
-  # place the Rails integration reads them from: the boot connect, the
-  # migration helpers (Trellis::Migration) and `rails trellis:migrate` all
-  # use it. Leave it nil (the default) and the Railtie does nothing.
+  # place the Rails integration reads the default instance's from: the boot
+  # connect, the migration helpers (Trellis::Migration) and `rails
+  # trellis:migrate` all use it. Leave it nil (the default) and the Railtie
+  # does nothing for the default instance.
   #
-  # When it's set, the app's handle connects in an after_initialize hook,
+  # An app that runs more instances (a second catalog schema, or another
+  # database) names the extras in config.trellis.instances, each with
+  # Trellis::Instance.connect's options. The Railtie connects them with the
+  # default instance, `rails trellis:migrate` migrates them, and
+  # Trellis::Railtie.named_instance(:reports) returns one:
+  #
+  #   config.trellis.instances = {
+  #     reports: { url: ENV.fetch("REPORTS_DATABASE_URL"), schema: "reports" }
+  #   }
+  #
+  # When either is set, the app's handles connect in an after_initialize hook,
   # except in these two cases:
   #
   # - An app booted by a rake task (`rails db:migrate`, `rails db:create`,
@@ -40,7 +51,7 @@ module Trellis
   # and connect one in each worker:
   #
   #   # config/puma.rb
-  #   before_fork { Trellis.shutdown }
+  #   before_fork { Trellis::Instance.shutdown_all }
   #   before_worker_boot { Trellis::Railtie.connect } # on_worker_boot before Puma 7
   #
   # With Puma's fork_worker, worker 0 forks the others, so it needs
@@ -49,13 +60,14 @@ module Trellis
   class Railtie < ::Rails::Railtie
     config.trellis = ActiveSupport::OrderedOptions.new
     config.trellis.connect = nil
+    config.trellis.instances = {}
     config.trellis.connect_on_boot = true
 
     rake_tasks do
       namespace :trellis do
-        desc "Create or upgrade Trellis's own tables, with config.trellis.connect's url"
+        desc "Create or upgrade Trellis's own tables, for config.trellis.connect and config.trellis.instances"
         task migrate: :environment do
-          Trellis::Railtie.with_handle { nil }
+          Trellis::Railtie.migrate_all
         end
       end
     end
@@ -66,46 +78,109 @@ module Trellis
 
     config.after_initialize { Trellis::Railtie.instance.send(:boot) }
 
+    # The instances Railtie.connect opened for config.trellis.instances,
+    # by name.
+    @instances = {}
+
     class << self
-      # Connects this process's handle with config.trellis.connect's options:
-      # in a forked worker (Puma's before_worker_boot, Unicorn's after_fork,
-      # Passenger's starting_worker_process), or a rake task of your own.
-      # Raises ValidationError if config.trellis.connect isn't set, and
-      # whatever Trellis.connect raises.
+      # Connects this process's instances from the config: the default
+      # instance from config.trellis.connect (when set), and each of
+      # config.trellis.instances. In a forked worker (Puma's
+      # before_worker_boot, Unicorn's after_fork, Passenger's
+      # starting_worker_process), or a rake task of your own. Raises
+      # ValidationError if neither is set, and whatever Trellis.connect and
+      # Trellis::Instance.connect raise; the instances this call had
+      # connected are shut down first, so a failure leaves nothing half
+      # connected.
       def connect
-        Trellis.connect(**required_connect_options)
+        default = connect_options
+        named = instance_options
+        if default.nil? && named.empty?
+          raise ValidationError,
+                "config.trellis.connect is not set: give it Trellis.connect's options"
+        end
+
+        opened = []
+        begin
+          if default
+            Trellis.connect(**default)
+            opened << -> { Trellis.shutdown }
+          end
+          named.each do |name, options|
+            instance = Trellis::Instance.connect(**options)
+            @instances[name] = instance
+            opened << -> { @instances.delete(name)&.shutdown }
+          end
+        rescue Exception # rubocop:disable Lint/RescueException
+          opened.reverse_each { |undo| ignoring_errors(&undo) }
+          raise
+        end
+        nil
       end
 
-      # Runs the block with this process's handle, running Trellis.migrate
-      # first, and returns the block's value. If the process isn't connected
+      # The instance config.trellis.instances names `name`, connected by
+      # Railtie.connect. Raises ValidationError if there is none.
+      def named_instance(name)
+        instance = @instances[name.to_sym]
+        return instance if instance&.connected?
+
+        raise ValidationError,
+              "no connected instance named #{name.inspect}: name it in config.trellis.instances " \
+              "and call Trellis::Railtie.connect"
+      end
+
+      # Runs the block with an instance, running its migrate first, and
+      # returns the block's value. With no name, the default instance,
+      # yielded as well as reachable as the Trellis module; with a name, that
+      # instance of config.trellis.instances. If the instance isn't connected
       # (a rake task gets no boot handle), connects one for the length of
-      # the block from config.trellis.connect, with staging: false and
-      # drain_threads: 0 so it starts no background work, and shuts it down
-      # after. What `rails trellis:migrate` and Trellis::Migration's helpers
-      # run on, for a script or rake task of your own that needs Trellis the
-      # way a migration does. Needs no ActiveRecord.
+      # the block from its config, with staging: false and drain_threads: 0 so
+      # it starts no background work, and shuts it down after. What `rails
+      # trellis:migrate` and Trellis::Migration's helpers run on, for a script
+      # or rake task of your own that needs Trellis the way a migration does.
+      # Needs no ActiveRecord.
       #
       # Raises what the block raises. If the shutdown fails too, that's a
       # warning, so it doesn't hide the block's error; after a block that
       # returned, the shutdown's error is raised. Raises ValidationError if
-      # the process isn't connected and config.trellis.connect isn't set.
-      def with_handle
-        if Trellis.connected?
-          Trellis.migrate
-          return yield
+      # the instance isn't connected and its options aren't configured.
+      def with_handle(name = nil)
+        instance = name ? @instances[name.to_sym] : (Trellis.default_instance if Trellis.connected?)
+        if instance&.connected?
+          instance.migrate
+          return yield(instance)
         end
 
-        Trellis.connect(**required_connect_options.merge(staging: false, drain_threads: 0))
+        options = name ? named_options(name) : required_connect_options
+        options = options.merge(staging: false, drain_threads: 0)
+        instance = name ? Trellis::Instance.connect(**options) : connect_default(options)
         primary = nil
         begin
-          Trellis.migrate
-          yield
+          instance.migrate
+          yield instance
         rescue Exception => e # any exception, Interrupt too: it's re-raised
           primary = e
           raise
         ensure
-          shutdown_after(primary)
+          shutdown_after(name, instance, primary)
         end
+      end
+
+      # Runs Trellis.migrate on the default instance (when
+      # config.trellis.connect is set) and on each of
+      # config.trellis.instances, each as with_handle does. Raises
+      # ValidationError if neither is set.
+      def migrate_all
+        default = connect_options
+        named = instance_options
+        if default.nil? && named.empty?
+          raise ValidationError,
+                "config.trellis.connect is not set: give it Trellis.connect's options"
+        end
+
+        with_handle { nil } if default
+        named.each_key { |name| with_handle(name) { nil } }
+        nil
       end
 
       # config.trellis.connect, as Trellis.connect's keyword options, or nil
@@ -113,25 +188,66 @@ module Trellis
       def connect_options
         app = ::Rails.respond_to?(:application) && ::Rails.application or return nil
         options = app.config.trellis.connect or return nil
+
+        keyword_options("config.trellis.connect", options)
+      end
+
+      # config.trellis.instances, as each name's Trellis::Instance.connect
+      # keyword options; empty when it isn't set (or there's no Rails app).
+      def instance_options
+        app = ::Rails.respond_to?(:application) && ::Rails.application or return {}
+        instances = app.config.trellis.instances
+        return {} if instances.nil? || instances.empty?
+
+        unless instances.respond_to?(:to_h)
+          raise ValidationError,
+                "config.trellis.instances must be a Hash of names to Trellis::Instance.connect's " \
+                "options, got: #{instances.inspect}"
+        end
+
+        instances.to_h.to_h do |name, options|
+          [name.to_sym, keyword_options("config.trellis.instances[#{name.inspect}]", options)]
+        end
+      end
+
+      private
+
+      def keyword_options(what, options)
         unless options.respond_to?(:to_h)
           raise ValidationError,
-                "config.trellis.connect must be a Hash of Trellis.connect's options, got: #{options.inspect}"
+                "#{what} must be a Hash of Trellis.connect's options, got: #{options.inspect}"
         end
 
         options.to_h.transform_keys(&:to_sym)
       end
-
-      private
 
       def required_connect_options
         connect_options or
           raise ValidationError, "config.trellis.connect is not set: give it Trellis.connect's options"
       end
 
-      # Shuts with_handle's own handle down. With a primary error on its way
-      # out, a failed shutdown is only a warning: raising would replace it.
-      def shutdown_after(primary)
-        Trellis.shutdown
+      def named_options(name)
+        instance_options.fetch(name.to_sym) do
+          raise ValidationError, "config.trellis.instances has no #{name.inspect}"
+        end
+      end
+
+      def connect_default(options)
+        Trellis.connect(**options)
+        Trellis.default_instance
+      end
+
+      def ignoring_errors
+        yield
+      rescue StandardError => e
+        warn "trellis: shutting down after a failed connect failed: #{e.class}: #{e.message}"
+      end
+
+      # Shuts with_handle's own instance down. With a primary error on its
+      # way out, a failed shutdown is only a warning: raising would replace
+      # it.
+      def shutdown_after(name, instance, primary)
+        name ? instance.shutdown : Trellis.shutdown
       rescue StandardError => e
         raise unless primary
 
@@ -145,7 +261,7 @@ module Trellis
       return if rake_running?
 
       settings = ::Rails.application.config.trellis
-      return unless settings.connect && settings.connect_on_boot
+      return unless settings.connect_on_boot && (settings.connect || !self.class.instance_options.empty?)
 
       self.class.connect
     end

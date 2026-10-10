@@ -83,6 +83,42 @@ class RailsTest < Minitest::Test
     assert_equal false, seen.fetch("parent_connected")
   end
 
+  # config.trellis.instances: extra named instances, connected with the
+  # default one and reachable by name.
+  def test_boot_connects_the_named_instances_with_the_default_one
+    seen = boot("named_instances")
+    assert_equal true, seen.fetch("connected")
+    assert_equal "boot_reports", seen.fetch("named_schema")
+    assert_equal "Trellis::Instance", seen.fetch("named_class")
+    assert_match "no connected instance named :nope", seen.fetch("unknown_instance")
+    assert_equal [false, false], seen.fetch("connected_after_shutdown_all")
+  end
+
+  def test_named_instances_connect_without_a_default_connect
+    assert_equal({ "connected" => false, "named_connected" => true }, boot("named_instances_only"))
+  end
+
+  def test_trellis_migrate_migrates_each_named_instance_on_a_handle_of_its_own
+    seen = boot("named_instances_rake")
+    assert_equal false, seen.fetch("connected_after_migrate")
+    assert_equal ["reports"], seen.fetch("named_after_migrate")
+    assert_equal "boot_reports", seen.fetch("with_handle")
+    assert_equal "config.trellis.instances has no :nope", seen.fetch("with_handle_unknown")
+  end
+
+  def test_a_named_instance_that_cannot_connect_leaves_nothing_connected
+    seen = boot("failed_connect_rolls_back")
+    assert_match "worker_threads must be a positive Integer", seen.fetch("error")
+    assert_equal false, seen.fetch("connected")
+    assert_equal false, seen.fetch("first_connected")
+  end
+
+  def test_the_fork_hooks_give_each_worker_every_instance
+    seen = boot("puma_hooks_named")
+    assert_equal({ "connected" => true, "named" => nil }, seen.fetch("child"))
+    assert_equal [false, false], seen.fetch("parent_connected")
+  end
+
   private
 
   def boot(scenario)

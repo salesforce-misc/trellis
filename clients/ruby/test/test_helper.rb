@@ -17,7 +17,7 @@ module TrellisTestCase
 
   # Every test leaves this process disconnected, whatever it did.
   def teardown
-    Trellis.shutdown if Trellis.connected?
+    Trellis::Instance.shutdown_all
     super
   end
 

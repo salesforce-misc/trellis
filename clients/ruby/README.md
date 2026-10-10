@@ -8,8 +8,10 @@ work is epic #140.
 
 The surface mirrors the Rust crate's `BlockingTrellis` (issues #151 and
 #152), and the Elixir binding's (`clients/elixir`) wherever Ruby and Elixir
-don't call for a difference. Every method is on the `Trellis` module, which
-holds the process's one handle.
+don't call for a difference. Every method is on `Trellis::Instance`, one
+catalog schema's handle, and a process holds as many as it has schemas. The
+`Trellis` module is the shortcut for the common case: it holds the process's
+default instance and delegates every call to it.
 
 ## Installing
 
@@ -49,7 +51,10 @@ Nothing in the binding uses it.
 ## Usage
 
 - `Trellis.connect(url:, ...)`, `Trellis.migrate`, `Trellis.config`,
-  `Trellis.shutdown`, `Trellis.connected?`: the handle's lifecycle.
+  `Trellis.shutdown`, `Trellis.connected?`: the default instance's
+  lifecycle. `Trellis::Instance.connect(url:, ...)` returns another
+  instance, which has every call below as a method (see
+  [Several instances](#several-instances)).
 - `Trellis.apply(statement)`: any statement of Trellis's grammar
   (`TRANSFORM`, `RELATIONSHIP`, `PAUSE TRANSFORM`, `RESUME TRANSFORM`,
   `DROP TRANSFORM`, `DROP RELATIONSHIP`, `ALTER TRANSFORM`), returning what
@@ -124,11 +129,35 @@ The defaults run nothing in the background. Exactly one process in a fleet
 should set `staging: true`, and some process must run drain threads, or no
 definition ever reaches `:live`.
 
+### Several instances
+
+A process can hold several Trellis instances, for different catalog schemas
+in one database or for different databases. `Trellis::Instance.connect`
+takes `Trellis.connect`'s options and returns an instance with the same
+methods:
+
+```ruby
+reports = Trellis::Instance.connect(url: "host=localhost dbname=app", schema: "reports")
+reports.migrate
+reports.define("TRANSFORM monthly_totals FROM orders SELECT total AS total")
+reports.status("monthly_totals").status # => :live, once it has backfilled
+reports.shutdown                        # every other instance keeps running
+```
+
+Each instance has its own connections, threads and `worker_threads` cap;
+nothing is shared between them. `Trellis.connect` opens the default
+instance, `Trellis.default_instance` returns it, and a second
+`Trellis.connect` raises while it is connected. `Trellis::Instance.connect`
+has no such limit. `Trellis::Instance.connected` lists the instances the
+process holds, and `Trellis::Instance.shutdown_all` shuts them all down, the
+default one included.
+
 ### Conventions
 
-- **One handle per process, held by the `Trellis` module** (ADR-0010
-  decision 3). `connect` raises if the process is already connected;
-  `shutdown` it first. An `at_exit` hook shuts it down if the app didn't.
+- **One default instance, held by the `Trellis` module** (ADR-0010
+  decision 3). `Trellis.connect` raises if it is already connected;
+  `Trellis.shutdown` it first. An `at_exit` hook shuts down every instance
+  the process holds if the app didn't.
 - **Every call releases the GVL** while it waits on the database, so other
   threads (Puma's request threads, say) keep running, and `Thread#kill`,
   `Thread#raise` and Ctrl-C interrupt a thread waiting in one. An interrupt
@@ -152,7 +181,7 @@ definition ever reaches `:live`.
 
   ```ruby
   # config/puma.rb, in a Rails app (see "In a Rails app" below)
-  before_fork { Trellis.shutdown }
+  before_fork { Trellis::Instance.shutdown_all }
   before_worker_boot { Trellis::Railtie.connect }
   ```
 - **Errors** are raised as a subclass of `Trellis::Error` per error code
@@ -201,9 +230,23 @@ config.trellis.connect = {
 }
 ```
 
-With it set, the app's handle connects as the app boots (an
+With it set, the app's default instance connects as the app boots (an
 `after_initialize` hook), and the `at_exit` hook shuts it down. Left `nil`,
-the default, the Railtie does nothing. Two exceptions:
+the default, the Railtie connects no default instance.
+
+An app with more instances names them in `config.trellis.instances`, each
+with `Trellis::Instance.connect`'s options. They connect with the default
+instance (which is optional when they are set), and
+`Trellis::Railtie.named_instance(:reports)` returns one:
+
+```ruby
+config.trellis.instances = {
+  reports: { url: ENV.fetch("REPORTS_DATABASE_URL"), schema: "reports" }
+}
+```
+
+If any instance fails to connect, the ones that did are shut down again.
+With neither set, the Railtie does nothing. Two exceptions:
 
 - **An app booted by a rake task gets no boot handle.** `rails db:create`
   may run before the database exists, and `rails db:migrate` must not start
@@ -229,14 +272,14 @@ worker:
 
 ```ruby
 # config/puma.rb
-before_fork { Trellis.shutdown }               # the parent's boot handle
+before_fork { Trellis::Instance.shutdown_all } # the parent's boot handles
 before_worker_boot { Trellis::Railtie.connect } # on_worker_boot before Puma 7
 
 # Only with fork_worker, where worker 0 forks the others (at boot, on a
 # respawn and on a refork): shut its handle down around each fork. The
 # master, already disconnected by before_fork, stays that way.
 trellis_was_connected = false
-before_worker_fork { trellis_was_connected = Trellis.connected?; Trellis.shutdown }
+before_worker_fork { trellis_was_connected = !Trellis::Instance.connected.empty?; Trellis::Instance.shutdown_all }
 after_worker_fork { Trellis::Railtie.connect if trellis_was_connected }
 ```
 
@@ -291,8 +334,8 @@ end
   TRANSFORM` of a target only the statement names. A migration that
   includes `Trellis::Migration` and defines a public `change` raises
   before anything runs.
-- **Which handle.** If the process is connected, the helpers use its
-  handle. Otherwise (`rails db:migrate` is never connected), each call
+- **Which handle.** The helpers run on the default instance. If the process
+  is connected, they use its handle. Otherwise (`rails db:migrate` is never connected), each call
   connects one from `config.trellis.connect`, always with `staging: false`
   and `drain_threads: 0`, runs `Trellis.migrate`, makes its call and shuts
   the handle down.
@@ -329,13 +372,18 @@ tables before the worker restarts.
 
 `Trellis::Railtie.with_handle { ... }` is what `trellis:migrate` and the
 helpers use, for a script or rake task of your own that needs Trellis the
-way a migration does. Neither it nor `trellis:migrate` needs ActiveRecord.
+way a migration does. It yields the instance, and `with_handle(:reports)`
+runs on an instance of `config.trellis.instances`, which is how a migration
+reaches one (`Trellis::Railtie.with_handle(:reports) { |reports|
+reports.define "TRANSFORM ..." }`). `trellis:migrate` migrates the default
+instance and every instance of `config.trellis.instances`. Neither it nor
+`trellis:migrate` needs ActiveRecord.
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
 
 ## Layout
 
-- `lib/`: the `Trellis` module, its error classes and its `Data` values,
+- `lib/`: the `Trellis` module and `Trellis::Instance`, its error classes and its `Data` values,
   and the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
   loaded only in an app that has Rails.
 - `ext/trellis_ruby/`: the extension crate, a member of the repository's

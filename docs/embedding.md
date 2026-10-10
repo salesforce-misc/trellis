@@ -207,10 +207,11 @@ The crate doesn't try to make an engine safe to inherit mid-flight: it can't
 reach the locks inside its dependencies. The host language's binding owns
 the fork boundary instead. The Ruby binding enforces the contract: every
 call on an inherited handle raises `Trellis::ForkedHandleError`, and so does
-`Trellis.connect` in a child forked while its parent had a handle running,
-rather than risk the hang. In a Rails app under a preloading server, that
-means shutting the boot handle down in the parent and connecting one in each
-worker: Puma's `before_fork { Trellis.shutdown }` and
+`Trellis.connect` (or `Trellis::Instance.connect`) in a child forked while its
+parent had a handle running, rather than risk the hang. In a Rails app under a
+preloading server, that means shutting the boot handles down in the parent and
+connecting them again in each worker: Puma's
+`before_fork { Trellis::Instance.shutdown_all }` and
 `before_worker_boot { Trellis::Railtie.connect }` (`clients/ruby/README.md`
 covers Unicorn, Passenger and Puma's `fork_worker`, which needs
 `before_worker_fork`/`after_worker_fork` too). The BEAM never forks,
@@ -267,7 +268,8 @@ In Elixir the two checks are `Trellis.has_live_drain_workers/1` and
 `Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}` (or the
 boolean itself from the bang variant). In Ruby they are the predicates
 `Trellis.has_live_drain_workers?` and `Trellis.has_live_staging_worker?`, on
-the process's one handle, raising a `Trellis::Error` if the database can't
+the process's default instance (a `Trellis::Instance` has the same methods
+for each further instance), raising a `Trellis::Error` if the database can't
 answer.
 
 **Phoenix**, wired as a `Plug` health-check endpoint polled by the
@@ -304,7 +306,7 @@ every web request:
 ```ruby
 class TrellisWorkerHealthCheck
   def self.perform
-    # The process's one handle is the `Trellis` module's (ADR-0010 decision 3).
+    # The process's default instance is the `Trellis` module's (ADR-0010 decision 3).
     unless Trellis.has_live_drain_workers?
       Rails.logger.error("no live Trellis drain workers — every transform is stalled")
       # ... page, raise, whatever this app's alerting expects ...

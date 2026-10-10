@@ -84,6 +84,14 @@ module Trellis
   # down. A migration's own handle never runs background work: staging and
   # drain_threads are always the defaults, whatever the configuration says.
   #
+  # The helpers run on the default instance. A migration for an instance
+  # named in config.trellis.instances runs its statements on that instance
+  # itself, in the same transaction-free way:
+  #
+  #   Trellis::Railtie.with_handle(:reports) do |reports|
+  #     reports.define "TRANSFORM monthly_totals FROM orders SELECT total AS total"
+  #   end
+  #
   # == Running a migration once
   #
   # A define isn't idempotent: a second define of a target that exists

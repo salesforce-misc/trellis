@@ -52,7 +52,8 @@ module Parity
   NOT_OPERATIONS = {
     # The handle lives in the module here and in a variable in Elixir, so
     # only Ruby has a call that asks whether there is one.
-    "connected?" => "Ruby's module-held handle"
+    "connected?" => "Ruby's module-held handle",
+    "default_instance" => "Ruby's module-held default instance, for code that takes a Trellis::Instance"
   }.freeze
 
   # The Rails integration's public calls outside the migration helpers, none
@@ -62,9 +63,12 @@ module Parity
   # Elixir lists its supervision calls, child_spec and start_link, the same
   # way.
   RAILS_ONLY = {
-    "Trellis::Railtie.connect" => "`connect` with config.trellis.connect's options",
+    "Trellis::Railtie.connect" => "`connect` with config.trellis.connect's and config.trellis.instances' options",
     "Trellis::Railtie.connect_options" => "reads config.trellis.connect",
-    "Trellis::Railtie.with_handle" => "a handle of its own from config.trellis.connect, around a block",
+    "Trellis::Railtie.instance_options" => "reads config.trellis.instances",
+    "Trellis::Railtie.named_instance" => "an instance of config.trellis.instances",
+    "Trellis::Railtie.migrate_all" => "`migrate` on each configured instance",
+    "Trellis::Railtie.with_handle" => "a handle of its own from config.trellis.connect (or a named instance), around a block",
     "Trellis::Migration.with_handle" => "Trellis::Railtie.with_handle, raising a migration's error"
   }.freeze
 
