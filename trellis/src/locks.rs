@@ -70,17 +70,30 @@ fn millis(timeout: Duration) -> u128 {
     timeout.as_millis().clamp(1, i32::MAX as u128)
 }
 
+/// A `select set_config(...)` statement capping the timeout GUC `name`
+/// (`lock_timeout`, `statement_timeout`) at `ms` milliseconds: it keeps a
+/// shorter setting already in force and replaces a longer one or `0` (no
+/// timeout, Postgres's default). `local` is `set_config`'s `is_local`.
+///
+/// The setting in force is read with `current_setting`, whose text (`50ms`,
+/// `90s`, `2min`, `0`) parses as an interval, not from `pg_settings`: that
+/// view builds every setting the server has on each read, about 0.28 ms
+/// against 0.016 ms (#1010). `name` and `ms` are trusted, not user input.
+pub(crate) fn cap_timeout_sql(name: &str, ms: u128, local: bool) -> String {
+    format!(
+        "select set_config('{name}', \
+             case when kept between 1 and {ms} then kept::text else '{ms}' end, \
+             {local}) \
+         from (select (extract(epoch from current_setting('{name}')::interval) * 1000)::bigint \
+                   as kept) as in_force"
+    )
+}
+
 /// The statement a session runs at connect to cap its `lock_timeout` at
 /// [`LOCK_TIMEOUT`]: keeps a shorter setting already in force, replaces a
 /// longer one or `0` (no timeout, Postgres's default).
 pub(crate) fn session_lock_timeout_sql() -> String {
-    let ms = millis(LOCK_TIMEOUT);
-    format!(
-        "select set_config('lock_timeout', \
-             case when setting::bigint between 1 and {ms} then setting else '{ms}' end, \
-             false) \
-         from pg_settings where name = 'lock_timeout'"
-    )
+    cap_timeout_sql("lock_timeout", millis(LOCK_TIMEOUT), false)
 }
 
 /// Sets the current transaction's `lock_timeout` to `timeout` (`set local`,
@@ -383,7 +396,7 @@ mod tests {
         let sql = session_lock_timeout_sql();
         let ms = LOCK_TIMEOUT.as_millis();
         assert!(
-            sql.contains(&format!("between 1 and {ms} then setting else '{ms}'")),
+            sql.contains(&format!("between 1 and {ms} then kept::text else '{ms}'")),
             "{sql}"
         );
     }
@@ -458,6 +471,80 @@ mod tests {
             .expect("show")
             .get(0);
         assert_eq!(shown, cap_ms());
+    }
+
+    /// The cap keeps a shorter setting in force whatever unit Postgres shows
+    /// it in, and replaces a longer one or `0`, for both a session and a
+    /// transaction-local setting, on both GUCs that use it (#1010).
+    #[tokio::test]
+    async fn cap_keeps_a_shorter_setting_in_any_unit() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        )
+        .expect("pool");
+        let mut client = pool.connect_unpooled().await.expect("unpooled");
+        let cap = 120_000u128;
+        // (setting, what the cap leaves it as, in ms)
+        let cases: [(&str, i64); 10] = [
+            ("0", 120_000),
+            ("1ms", 1),
+            ("200ms", 200),
+            ("1s", 1_000),
+            ("90s", 90_000),
+            ("1min", 60_000),
+            ("2min", 120_000),
+            ("3min", 120_000),
+            ("1h", 120_000),
+            ("1d", 120_000),
+        ];
+        let ms_in_force = |name: &'static str| {
+            format!(
+                "select (extract(epoch from current_setting('{name}')::interval) \
+                     * 1000)::bigint"
+            )
+        };
+        for name in ["lock_timeout", "statement_timeout"] {
+            for (setting, expected) in cases {
+                client
+                    .batch_execute(&format!("set {name} = '{setting}'"))
+                    .await
+                    .expect("set");
+                client
+                    .batch_execute(&cap_timeout_sql(name, cap, false))
+                    .await
+                    .expect("cap");
+                let ms: i64 = client
+                    .query_one(&ms_in_force(name), &[])
+                    .await
+                    .expect("read")
+                    .get(0);
+                assert_eq!(ms, expected, "{name} = {setting}");
+            }
+            // Transaction-local: capped inside, the session's own after.
+            client
+                .batch_execute(&format!("set {name} = '2h'"))
+                .await
+                .expect("set");
+            let txn = client.transaction().await.expect("begin");
+            txn.batch_execute(&cap_timeout_sql(name, cap, true))
+                .await
+                .expect("cap");
+            let inside: i64 = txn
+                .query_one(&ms_in_force(name), &[])
+                .await
+                .expect("read")
+                .get(0);
+            assert_eq!(inside, 120_000, "{name} inside the transaction");
+            txn.rollback().await.expect("rollback");
+            let after: i64 = client
+                .query_one(&ms_in_force(name), &[])
+                .await
+                .expect("read")
+                .get(0);
+            assert_eq!(after, 7_200_000, "{name} after the transaction");
+        }
     }
 
     #[tokio::test]

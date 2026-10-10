@@ -2384,15 +2384,19 @@ mod wake_listener_tests {
         let admin = connect_plain(db.dsn(), DEFAULT_SCHEMA)
             .await
             .expect("connect");
+        // The listener's is the only other session in this database. Not
+        // matched by its query text: `pg_stat_activity.query` is cut at
+        // `track_activity_query_size` (1024 bytes), and the setup batch ahead
+        // of the `LISTEN` can push that off the end.
         let terminated: i64 = admin
             .query_one(
                 "select count(*) from ( \
                    select pg_terminate_backend(pid) from pg_stat_activity \
                    where datname = current_database() \
                      and pid <> pg_backend_pid() \
-                     and query like '%listen%' || $1 || '%' \
+                     and backend_type = 'client backend' \
                  ) t",
-                &[&CHANNEL],
+                &[],
             )
             .await
             .expect("terminate the listener's backend")

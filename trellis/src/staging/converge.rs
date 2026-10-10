@@ -531,12 +531,8 @@ async fn poll_within_deadline(
     // `i32::MAX` ms.
     let budget_ms = budget.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128);
     let message = format!(
-        "select set_config('statement_timeout', \
-             case when setting::bigint between 1 and {budget_ms} then setting \
-                  else '{budget_ms}' end, \
-             true) \
-         from pg_settings where name = 'statement_timeout'; \
-         {statement}"
+        "{}; {statement}",
+        crate::locks::cap_timeout_sql("statement_timeout", budget_ms, true)
     );
     let messages = match tokio::time::timeout(
         budget.saturating_add(SERVER_REPORT_GRACE),
