@@ -200,21 +200,14 @@ source share these:
   definition's `capture_wait` lists the sessions that hold or queue for the
   lock, the other instance's among them.
 
-Two locks are shared by every two instances in one database, whatever they
-read, because Postgres keys an advisory lock by database, not by schema:
-
-* **One lock over every column pause.** What writes a field's pause state takes
-  one advisory lock exclusively: a `PAUSE` or `RESUME` of a field, a column fuse
-  trip, a `DROP TRANSFORM`, an `ALTER TRANSFORM` that builds or drops a field,
-  and the build that releases the pauses such an `ALTER` left. A define takes
-  it shared. They therefore queue behind each other across instances. A wait
-  that outlasts the session's 30 s `lock_timeout` fails that step with a
-  retryable error and counts in `column_pause_lock_timeouts_total`.
-* **The attach lock**, described [above](#a-catalog-schema-that-belongs-to-another-instance).
+Every two instances in one database also share the attach lock, whatever they
+read, because Postgres keys an advisory lock by database, not by schema (see
+[above](#a-catalog-schema-that-belongs-to-another-instance)).
 
 What stays separate is the rest: each instance's ring, claims, catalog,
-generated tables and wake channel, and its one staging worker, whose lock is
-keyed by schema.
+generated tables and wake channel, its one staging worker, and its
+column-pause lock, whose key follows the schema, so a pause, resume or define
+in one instance never waits on another's.
 
 ## One instance reading another's target
 
