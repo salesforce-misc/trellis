@@ -742,7 +742,10 @@ pub async fn cancel_claimed(pool: &Pool, claimed_by: &str) -> Result<u64, SelfCh
 /// [`crate::Trellis::self_check`] run to its end by hand, for tests: starts
 /// the job through the facade, runs the pages a worker would
 /// ([`work_once`], with `options`) until the job is finished, and returns the
-/// job as a poll reads it. There is no wait in it: each pass is the next page.
+/// job as a poll reads it. With no worker running, there is no wait in it:
+/// each pass is the next page. A test that also runs a live client's workers
+/// can lose the job to one of them; it then waits, bounded, for that worker
+/// to finish it.
 #[cfg(any(test, feature = "internals"))]
 pub async fn run_to_end(
     trellis: &crate::Trellis,
@@ -752,14 +755,34 @@ pub async fn run_to_end(
     options: &WorkerOptions,
 ) -> Result<SelfCheckJob, crate::TrellisError> {
     let job = trellis.self_check(target_table, mode, timeout).await?;
-    while work_once(trellis.pool(), "run_to_end", options)
-        .await
-        .map_err(crate::TrellisError::SelfCheck)?
-    {}
-    Ok(trellis
-        .self_check_job(job.id)
-        .await?
-        .expect("the job exists until its transform is dropped or it is replaced"))
+    let give_up = std::time::Instant::now()
+        + page_budget(options.compare_budget, job_timeout(timeout)).saturating_mul(4);
+    loop {
+        if work_once(trellis.pool(), "run_to_end", options)
+            .await
+            .map_err(crate::TrellisError::SelfCheck)?
+        {
+            continue;
+        }
+        let polled = trellis
+            .self_check_job(job.id)
+            .await?
+            .expect("the job exists until its transform is dropped or it is replaced");
+        if polled.state.is_finished() {
+            return Ok(polled);
+        }
+        // Another worker holds it.
+        assert!(
+            std::time::Instant::now() < give_up,
+            "the self_check job's worker did not finish it: {polled:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(any(test, feature = "internals"))]
+fn job_timeout(timeout: Duration) -> Duration {
+    timeout.min(MAX_AWAIT_TIMEOUT)
 }
 
 #[cfg(test)]
