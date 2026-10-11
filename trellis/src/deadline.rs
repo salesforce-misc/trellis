@@ -30,7 +30,9 @@
 //! [`TrellisError::CallTimeout`] ([`crate::ErrorCode::Timeout`]).
 //!
 //! Background work (the staging worker, drain workers) runs outside any call,
-//! so none of this applies to it: [`current`] is `None` there.
+//! so none of this applies to it: [`current`] is `None` there. A step of it
+//! that must be bounded the same way, a `self_check` page, runs under
+//! [`within`].
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -138,6 +140,44 @@ pub(crate) async fn bounded<T>(
                 Ok(result) => result,
                 Err(_) => Err(TrellisError::CallTimeout { budget }),
             }
+        })
+        .await
+}
+
+/// A background step that ran past its budget ([`within`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetExpired {
+    pub(crate) budget: Duration,
+}
+
+/// Runs a step of background work (outside any public call) under a deadline
+/// of `budget` from now, so everything it asks of the database is bounded the
+/// way a call's is: a connection it checks out gets a session
+/// `statement_timeout` of the budget left, every transaction it opens a
+/// `SET LOCAL` of the same, and a checkout waits no longer than what is left.
+/// The server stops the work at the deadline. Past it by [`BACKSTOP_GRACE`]
+/// the step's future is dropped, for a connection that stopped answering, and
+/// the connection stays out of the pool until the server has finished with
+/// what it left (see [`crate::pool::Client`]'s `Drop`).
+///
+/// A step already inside a deadline keeps it, like [`bounded`].
+pub(crate) async fn within<T>(
+    budget: Duration,
+    work: impl Future<Output = T>,
+) -> Result<T, BudgetExpired> {
+    if current().is_some() {
+        return Ok(work.await);
+    }
+    let deadline = CallDeadline {
+        at: Instant::now() + budget,
+        budget,
+    };
+    CURRENT
+        .scope(deadline, async move {
+            let backstop = tokio::time::Instant::from_std(deadline.at + BACKSTOP_GRACE);
+            tokio::time::timeout_at(backstop, work)
+                .await
+                .map_err(|_| BudgetExpired { budget })
         })
         .await
 }

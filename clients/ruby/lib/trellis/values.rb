@@ -106,7 +106,7 @@ module Trellis
   end
 
   # A join column of a relationship a definition reads that has no usable
-  # index, as Trellis.status and Trellis.self_check report it: the
+  # index, as Trellis.status reports it: the
   # relationship's name (relationship), the qualified table that holds the
   # column (table), the column (column), and what to do about it (fix), the
   # index to create as a sentence. Trellis doesn't create indexes on your
@@ -287,51 +287,74 @@ module Trellis
     end
   end
 
-  # What Trellis.self_check found auditing one page of a target table
-  # against a fresh recompute of its definition from the source.
+  # A background check of a target table, as Trellis.self_check starts it and
+  # Trellis.self_check_job reads it back.
+  #
+  # - id: what Trellis.self_check_job takes.
+  # - target: the audited target's bare table name.
+  # - mode: :standard or :strict, as the job was started. A second
+  #   Trellis.self_check of a target whose job is still running returns that
+  #   job, so its mode is the first call's.
+  # - state: :queued (no worker has taken it up yet; with no drain worker
+  #   anywhere in the fleet it stays so), :running, then :done, :failed
+  #   (error says why) or :cancelled (the worker running it shut down; error
+  #   says so). Only :done carries a report.
+  # - rows_compared: the distinct keys the pages so far compared; it moves
+  #   while the job is :running.
+  # - report: the SelfCheckReport, once the job is :done; nil before.
+  # - error: why a :failed or :cancelled job ended; nil otherwise.
+  #
+  # A job ends when its transform is dropped, and Trellis.self_check_job then
+  # returns nil for it.
+  SelfCheckJob = Data.define(:id, :target, :mode, :state, :rows_compared, :report, :error) do
+    def self.from_native(hash)
+      report = hash[:report]
+      new(**hash, report: report && SelfCheckReport.from_native(report))
+    end
+
+    # Whether the job has ended, so polling it again changes nothing.
+    def finished?
+      %i[done failed cancelled].include?(state)
+    end
+  end
+
+  # What a finished Trellis.self_check job found auditing the whole of a
+  # target table against a fresh recompute of its definition from the source.
   #
   # - outcome: :converged (every compared cell, row and column matched),
   #   :not_caught_up (the target didn't catch up within timeout_ms: not a
-  #   verdict on correctness, and nothing was compared), :not_live (the
-  #   transform isn't :live, so nothing was awaited or compared; see status),
-  #   or :diverged (see divergences).
+  #   verdict on correctness), :not_live (the transform isn't :live, so
+  #   nothing was awaited or compared; see status), or :diverged (see
+  #   divergences).
   # - status: the transform's status when outcome is :not_live (a rebuild
   #   Trellis.request_backfill starts reads :backfilling from the call's
   #   return, so poll status until it is :live, then check again); nil for
   #   every other outcome.
   # - divergences: the Divergences found; [] unless outcome is :diverged.
-  # - rows_compared: the distinct keys compared; 0 when the target didn't
-  #   catch up.
-  # - next_after: the opaque cursor to pass as the next call's `after:` to
-  #   audit the following page. nil means this page reached the end of the
-  #   target. A page that fills `limit:` exactly still returns a cursor, so a
-  #   sweep can end on a page that compares nothing.
+  # - rows_compared: the distinct keys compared.
+  # - truncated: true when the job stopped before the end of the target's
+  #   keys: it found 1,000 divergences, or the transform stopped being :live,
+  #   stopped catching up or lost its capture partway. rows_compared says how
+  #   far it got.
   # - checked_through: the watermark the outcome holds through, a token
   #   Trellis.await_converged takes.
   # - held_keys: whatever the outcome, a HeldKeys while the transform holds
-  #   keys in quarantine, nil otherwise. Their target rows are ones the audit
-  #   can't vouch for, and a key with held changes keeps the target from
-  #   catching up, so the outcome is :not_caught_up until it is released.
+  #   keys in quarantine, nil otherwise; read when the job is polled. Their
+  #   target rows are ones the audit can't vouch for, and a key with held
+  #   changes keeps the target from catching up, so the outcome is
+  #   :not_caught_up until it is released.
   # - drain_failures: whatever the outcome, every DrainFailure open on the
-  #   instance, oldest first, whichever definitions read its tables; [] when
-  #   there is none. Each holds back the targets of the tables it holds
-  #   changes to, and with them the convergence the audit waits on.
-  # - unindexed_joins: the UnindexedJoins for the join columns of the
-  #   relationships the audited definition reads that have no usable index;
-  #   [] when there is none. It never changes the outcome. A target that
-  #   reads a relationship is refused once the audit reaches the comparison,
-  #   so the list shows here only when the audit stops before then (a capture
-  #   fault, :not_live or :not_caught_up); Trellis.status reports it for any
-  #   definition.
+  #   instance when the job is polled, oldest first, whichever definitions
+  #   read its tables; [] when there is none. Each holds back the targets of
+  #   the tables it holds changes to, and with them the convergence the audit
+  #   waits on.
   SelfCheckReport = Data.define(:target, :outcome, :status, :divergences, :rows_compared,
-                                :next_after, :checked_through, :held_keys, :drain_failures,
-                                :unindexed_joins) do
+                                :truncated, :checked_through, :held_keys, :drain_failures) do
     def self.from_native(hash)
       held_keys = hash[:held_keys]
       new(**hash, divergences: hash.fetch(:divergences).map { |d| Divergence.new(**d) },
                   held_keys: held_keys && HeldKeys.from_native(held_keys),
-                  drain_failures: hash.fetch(:drain_failures).map { |f| DrainFailure.from_native(f) },
-                  unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) })
+                  drain_failures: hash.fetch(:drain_failures).map { |f| DrainFailure.from_native(f) })
     end
   end
 
@@ -354,7 +377,7 @@ module Trellis
   #   owner, the Trellis role missing a privilege, or the table joined a
   #   partition or inheritance hierarchy). `detail` says what, and `table`
   #   names the table (nil for a missing privilege). self_check reports these
-  #   before, and instead of, comparing any rows, so rows_compared is 0.
+  #   before, and instead of, comparing any rows.
   #
   # Fields a kind doesn't carry are nil.
   Divergence = Data.define(:kind, :key, :column, :persisted, :recomputed, :table, :detail)

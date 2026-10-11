@@ -72,18 +72,28 @@ Nothing in the binding uses it.
   transform holds, once its cause is fixed; `status` reports how many it
   holds (`held_keys`). `status` also reports a page the drain keeps failing
   on with nothing charged or paused (`drain_failure`, a
-  `Trellis::DrainFailure`), and `self_check` reports every one open
-  (`drain_failures`). `status` lists the join columns of the relationships a
-  definition reads that have no usable index (`unindexed_joins`, each a
-  `Trellis::UnindexedJoin` with `relationship`, `table`, `column` and the `fix`
-  sentence), a warning that never changes its status, and `self_check` carries
-  the same list on its report (`unindexed_joins`).
+  `Trellis::DrainFailure`), and a finished `self_check` job's report lists
+  every one open (`drain_failures`). `status` lists the join columns of the
+  relationships a definition reads that have no usable index
+  (`unindexed_joins`, each a `Trellis::UnindexedJoin` with `relationship`,
+  `table`, `column` and the `fix` sentence), a warning that never changes its
+  status.
 - `Trellis.request_backfill(source_table)`,
   `Trellis.has_live_drain_workers?`, `Trellis.has_live_staging_worker?`,
   `Trellis.watermark_token`, `Trellis.await_converged(token, timeout_ms:)`.
-- `Trellis.self_check(target_table, limit:, timeout_ms:, after:, mode:)`:
-  audit one page of a target against a fresh recompute from its source,
-  reporting any divergence.
+- `Trellis.self_check(target_table, timeout_ms:, mode:)` and
+  `Trellis.self_check_job(id)`: check a target against a fresh recompute from
+  its source, as a background job. `self_check` starts it and returns a
+  `Trellis::SelfCheckJob` (`id`, `target`, `mode`, `state`, `rows_compared`,
+  `report`, `error`) at once; a drain worker runs it, and `self_check_job`
+  reads it back by `id` until `state` is `:done` (`:queued` and `:running` are
+  in progress; `:failed` and `:cancelled` carry an `error`; `finished?` says
+  which), when `report` is a `Trellis::SelfCheckReport` (`outcome`,
+  `divergences`, `rows_compared`, `truncated`, ...). A target whose job is
+  still unfinished gets that job back; the next call replaces a finished one,
+  and `self_check_job` returns `nil` for the replaced job or one whose
+  transform was dropped. With no drain worker anywhere in the fleet a job
+  stays `:queued`.
 
 ```ruby
 require "trellis/pg"
@@ -164,7 +174,7 @@ default one included.
   one. The thread waits for the reply itself, so an interrupt leaves no thread
   behind. It abandons the wait, not the work: a `define` that was interrupted
   may still register its transform (`Trellis.status` tells you whether it
-  did). Every call but `self_check` ends within 30 seconds on its own, and
+  did). Every call ends within 30 seconds on its own, and
   the server stops what it started at that deadline, so an abandoned call
   holds a pooled connection for at most that long. A call that runs out of
   time raises `Trellis::TimeoutError`. A call stuck on a lock doesn't hold up the others:
@@ -200,15 +210,15 @@ default one included.
   has `{:ok, value}` / `{:error, error}` and bang variants, every Ruby
   method returns its value or raises.
 - **Words are symbols** (statuses, quarantine states, cardinalities,
-  `Applied` kinds, `self_check` outcomes and divergence kinds), each from a
+  `Applied` kinds, `self_check` modes, states and outcomes, and divergence kinds), each from a
   closed set: none is ever made from a string the database returned.
 - **Times are `Time`s** in UTC, at microsecond precision. They cross the
   extension as epoch microseconds.
 - **A quarantine target is an address string**, `"transform"` or
   `"transform.column"`, exactly as `Trellis.quarantined` reports it.
 - **Cursors and tokens are opaque strings**: `sample_quarantined`'s
-  `next_cursor`, `self_check`'s `next_after` and `watermark_token`'s token.
-  Pass back what the previous call returned.
+  `next_cursor` and `watermark_token`'s token. Pass back what the previous call
+  returned.
 - **Durations are milliseconds**, as `timeout_ms:`, matching the Elixir
   binding.
 - **Results are `Data` values** (`Trellis::Definition`,

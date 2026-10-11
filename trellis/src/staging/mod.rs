@@ -42,8 +42,9 @@
 //!   holds a claim — the read behind `Trellis::has_live_drain_workers`.
 //! - [`self_check`] is issue #174's production recompute audit
 //!   (ADR-0013): a read-only, keyset-bounded comparison of a persisted 1-1
-//!   target against an independently-rendered Postgres recompute — see
-//!   [`crate::app::Trellis::self_check`] for the public facade.
+//!   target against an independently-rendered Postgres recompute.
+//!   [`self_check_job`] is the background job around it that
+//!   [`crate::app::Trellis::self_check`] starts (#1023).
 //!   [`capture_audit`] is the check of every captured table's triggers,
 //!   functions and privileges it runs first (#622 C9).
 //! - [`error`] is this module's error type.
@@ -79,6 +80,7 @@ pub mod retire;
 pub(crate) mod schema_change;
 pub mod seal;
 pub mod self_check;
+pub mod self_check_job;
 pub mod session;
 pub mod state;
 pub(crate) mod target_mutations;
@@ -128,9 +130,8 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 pub use capture_audit::CaptureFault;
 pub use holdup::DrainFailure;
 pub use quarantine::HeldKeys;
-pub use self_check::{
-    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope,
-};
+pub use self_check::{Divergence, SelfCheckMode, SelfCheckOutcome};
+pub use self_check_job::{SelfCheckJob, SelfCheckJobState, SelfCheckReport};
 pub use session::ProducerSession;
 pub use state::segment_state_counts;
 pub use unindexed_joins::UnindexedJoin;

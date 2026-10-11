@@ -58,13 +58,15 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use tokio_postgres::GenericClient;
 
 use crate::defs::ddl::regclass_arg;
 
 /// A subscription that replicates into a table Trellis reads, found by
 /// [`subscribed`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Subscribed {
     /// The table, as its unquoted `schema.table` identity.
     pub table: String,

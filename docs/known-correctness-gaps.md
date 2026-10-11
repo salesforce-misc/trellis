@@ -83,10 +83,11 @@ These are the tools the entries refer to:
   keeps its rows: Trellis doesn't empty a target the application reads on its
   own.
 * **`self_check(target, …)`** detects divergence but never repairs it. It
-  audits the target's capture triggers, then compares the target with a
-  recompute of it in Postgres
-  ([ADR-0013](decisions/0013-self-check-production-recompute-audit.md)).
-  **It only audits 1-1 targets** (entry 16).
+  starts a background job that audits the target's capture triggers, then
+  compares the target with a recompute of it in Postgres, a page of keys at a
+  time ([ADR-0013](decisions/0013-self-check-production-recompute-audit.md));
+  `self_check_job(id)` reads its progress and verdict. **It only audits 1-1
+  targets** (entry 16).
 
 ## Summary
 
@@ -94,7 +95,7 @@ These are the tools the entries refer to:
 |---|---|---|---|---|
 | 1 | `ALTER COLUMN … TYPE … USING` that rewrites values | yes | `self_check` (1-1 targets only) | #703, study pending |
 | 2 | A column dropped and re-added under the same name | yes | `self_check` (1-1 targets only) | #703, study pending |
-| 3 | A source key re-collated while a `self_check` sweep runs | the sweep can skip or repeat keys | no | none filed |
+| 3 | A source key re-collated while a `self_check` job runs | the job can skip or repeat keys | no | none filed |
 | 5 | Capture switched off and back on, or the table attached to a hierarchy and detached, between two reconcile passes | yes | no | #707, study pending |
 | 6 | A capture function body replaced by hand | yes | not by the audit | #707, study pending |
 | 8 | Hand edits to a target table | yes | `self_check` (1-1 targets only) | none; documented |
@@ -168,16 +169,16 @@ first *is* detected; see [What isn't on this list](#what-isnt-on-this-list).)
 **Repair:** the same as entry 1: `request_backfill`, or `PAUSE`/`RESUME` the
 readers.
 
-## 3. A source key re-collated while a `self_check` sweep runs
+## 3. A source key re-collated while a `self_check` job runs
 
 **Trigger:** `ALTER COLUMN id TYPE text COLLATE "C"` (or any change between
 deterministic collations) on a source's key column while a `self_check`
-sweep of a 1-1 target pages through it.
+job of a 1-1 target pages through it.
 
 **Effect:** the data stays right: byte equality doesn't change, so nothing
 pauses. But `self_check` pages the source and the target under the source
-key's collation, and its `next_after` cursor continues in the new order, so a
-sweep that straddles the change can skip or repeat keys. It also reads each
+key's collation, and the job's saved cursor continues in the new order, so a
+job that straddles the change can skip or repeat keys. It also reads each
 page of the target by a scan instead of the target's key index (#782). A
 build that straddles the change is pinned to the collation it planned under
 (#769) and doesn't lose rows, but its remaining range reads scan the source.
@@ -186,7 +187,7 @@ build that straddles the change is pinned to the collation it planned under
 
 **Planned work:** none filed.
 
-**Repair:** start a new sweep after the change.
+**Repair:** start a new `self_check` after the change.
 
 ## 5. Capture switched off and back on between two reconcile passes
 
@@ -494,11 +495,10 @@ shape (#528).
 **Trigger:** any divergence of an aggregate target or a relationship-enriched
 1-1 target from what its definition computes, from any cause above.
 
-**Effect:** `self_check` on an aggregate target returns `UnsupportedKeySpace`
-before it audits anything. On a 1-1 target with a field read through a
-relationship it audits capture, and reports a fault there, but the comparison
-returns `UnsupportedExpr`. Neither kind of target is compared with a recompute,
-so a stale value in one is silent.
+**Effect:** `self_check` on an aggregate target is refused with
+`UnsupportedKeySpace`, and on a 1-1 target with a field read through a
+relationship with `UnsupportedExpr`, when the job is started. Neither kind of
+target is compared with a recompute, so a stale value in one is silent.
 
 **Detected?** Not applicable. Each entry's "Detected?" line says `self_check`
 only for plain 1-1 targets.
@@ -868,8 +868,8 @@ refusing them up front:
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
   A value a copy can't hold that drains before the pass is quarantined, and
   the resume releases it. A change between deterministic collations needs
-  nothing (but see [a source key re-collated while a `self_check` sweep
-  runs](#3-a-source-key-re-collated-while-a-self_check-sweep-runs)). A
+  nothing (but see [a source key re-collated while a `self_check` job
+  runs](#3-a-source-key-re-collated-while-a-self_check-job-runs)). A
   field's move to another type family pauses nothing (entry 22).
 * **A widening that changes only the catalog of a column Trellis copies with
   its type.** `varchar(n)` to a longer `varchar`, to `text` or to

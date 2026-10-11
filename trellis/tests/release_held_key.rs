@@ -21,10 +21,10 @@ use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::staging::interleave::PausePoint;
+use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{ApplyError, DEFAULT_DEATH_THRESHOLD, StagedWatermark, apply};
 use trellis::{
-    Config, ErrorCode, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis, TrellisError,
-    TrellisOptions,
+    Config, ErrorCode, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisError, TrellisOptions,
 };
 
 const NUMS: &str = "public.nums";
@@ -275,20 +275,11 @@ async fn self_check_reports_a_held_key() {
     let mut d = start().await;
     hold_key_1(&mut d).await;
     let trellis = trellis(&d).await;
-    let scope = || SelfCheckScope {
-        after: None,
-        limit: 100,
-    };
 
     // The key's parked change holds back convergence, so the audit can't
     // compare; the held key says why.
     let report = trellis
-        .self_check(
-            "doubles",
-            scope(),
-            SelfCheckMode::Strict,
-            Duration::from_millis(200),
-        )
+        .self_check_to_end("doubles", SelfCheckMode::Strict, Duration::from_millis(200))
         .await
         .expect("self_check doubles");
     assert!(
@@ -299,12 +290,7 @@ async fn self_check_reports_a_held_key() {
     assert_eq!(report.held_keys.expect("a held key").count, 1);
 
     let report = trellis
-        .self_check(
-            "copies",
-            scope(),
-            SelfCheckMode::Strict,
-            Duration::from_secs(30),
-        )
+        .self_check_to_end("copies", SelfCheckMode::Strict, Duration::from_secs(30))
         .await
         .expect("self_check copies");
     assert!(

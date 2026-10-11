@@ -25,8 +25,7 @@ defmodule Trellis.Owner do
 
   @doc false
   # `:infinity`, like the handle itself: every call that can wait long takes
-  # a bound of its own (`await_converged/3`'s and `self_check/3`'s
-  # `timeout_ms`), and a caller still exits if the owner does.
+  # a bound of its own (`await_converged/3`'s `timeout_ms`), and a caller still exits if the owner does.
   def call(server, function, args),
     do: GenServer.call(server, {:native, function, args}, :infinity)
 

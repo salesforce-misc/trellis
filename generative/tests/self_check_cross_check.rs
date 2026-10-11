@@ -54,10 +54,39 @@ use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 use trellis::dev::defs::qualified_target_table;
+use trellis::dev::staging::{SelfCheckWorkerOptions, work_self_check_once};
 use trellis::{
-    Config, Divergence, Pool, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis,
+    Config, Divergence, Pool, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, Trellis,
     TrellisOptions,
 };
+
+/// `Trellis::self_check` run to its end. The call starts a background job and
+/// returns (#1023); this test has no drain worker, so it runs the job's pages
+/// itself, the way `ManualBackend` drains by hand, and reads the report back
+/// through the facade. The page holds a whole generated target (the largest is
+/// `MAX_TABLES * MAX_SEED_ROWS` rows), so a job is one page.
+async fn self_check_to_end(trellis: &Trellis, pool: &Pool, target: &str) -> SelfCheckReport {
+    let job = trellis
+        .self_check(target, SelfCheckMode::Strict, Duration::from_secs(30))
+        .await
+        .expect("start self_check");
+    let worker = SelfCheckWorkerOptions::new(Duration::from_secs(30));
+    while work_self_check_once(pool, "generative", &worker)
+        .await
+        .expect("a self_check page")
+    {}
+    let job = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll the job")
+        .expect("the job exists");
+    job.report.unwrap_or_else(|| {
+        panic!(
+            "the job ended {:?} with no report: {:?}",
+            job.state, job.error
+        )
+    })
+}
 
 /// A 1-1 numeric-`+` program — reproduced from
 /// `generative/tests/oracle.rs::numeric_add_program` rather than shared
@@ -162,18 +191,7 @@ async fn self_check_and_the_generative_sql_oracle_agree_the_target_is_correct() 
         .await
         .expect("connect read-only trellis");
 
-    let report = trellis
-        .self_check(
-            &target_name,
-            SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
-            SelfCheckMode::Strict,
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("self_check");
+    let report = self_check_to_end(&trellis, &pool, &target_name).await;
 
     assert!(
         matches!(report.outcome, SelfCheckOutcome::Converged),
@@ -237,18 +255,7 @@ async fn self_checks_recompute_matches_the_generative_sql_oracles_recompute_for_
         .await
         .expect("connect read-only trellis");
 
-    let report = trellis
-        .self_check(
-            &target_name,
-            SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
-            SelfCheckMode::Strict,
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("self_check");
+    let report = self_check_to_end(&trellis, &pool, &target_name).await;
 
     let divergences = match report.outcome {
         SelfCheckOutcome::Diverged(divergences) => divergences,
@@ -597,21 +604,7 @@ fn run_swept_tampering_case(
             let trellis = Trellis::connect(config, TrellisOptions::default())
                 .await
                 .expect("connect read-only trellis");
-            let report = trellis
-                .self_check(
-                    &def.target,
-                    SelfCheckScope {
-                        after: None,
-                        // Comfortably above trivial_one_to_one_program_with's
-                        // largest possible target (MAX_TABLES * MAX_SEED_ROWS
-                        // rows) — one page always covers the whole target.
-                        limit: 1000,
-                    },
-                    SelfCheckMode::Strict,
-                    Duration::from_secs(30),
-                )
-                .await
-                .expect("self_check");
+            let report = self_check_to_end(&trellis, &pool, &def.target).await;
 
             let divergences = match report.outcome {
                 SelfCheckOutcome::Diverged(divergences) => divergences,

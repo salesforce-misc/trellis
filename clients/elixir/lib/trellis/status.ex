@@ -92,7 +92,7 @@ end
 defmodule Trellis.UnindexedJoin do
   @moduledoc """
   A join column of a relationship a transform reads that has no usable index,
-  as `Trellis.status/2` and `Trellis.self_check/3` report it: the
+  as `Trellis.status/2` reports it: the
   relationship's name (`relationship`), the qualified table that holds the
   column (`table`), the `column`, and what to do about it (`fix`), the index
   to create as a sentence. Trellis doesn't create indexes on your tables.

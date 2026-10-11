@@ -1820,6 +1820,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     reclaim_ttl,
                     &build_options,
                     &mut merge_failures,
+                    &mut shutdown_rx,
                 )
                 .await;
                 if !build_progress
@@ -1899,6 +1900,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                 reclaim_ttl,
                 &build_options,
                 &mut merge_failures,
+                &mut shutdown_rx,
             )
             .await;
         let made_progress = drained || build_progress;
@@ -1911,8 +1913,9 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
 /// A drain worker's build work for one pass of its loop, after its segments
 /// (#625 B6, global since F3): one old-build chunk (a plain 1-1 range or a
 /// direct-build job, [`drain_backfill_chunks`]), then one step of the
-/// Re-derive builds' work ([`rederive_build_step`]). Returns whether either
-/// did work.
+/// Re-derive builds' work ([`rederive_build_step`]), and, when neither had
+/// any, one page of a `self_check` job ([`self_check_step`], #1023).
+/// Returns whether any did work.
 async fn build_step(
     pool: &Pool,
     claimed_by: &str,
@@ -1920,10 +1923,62 @@ async fn build_step(
     reclaim_ttl: Duration,
     build_options: &staging::build::WorkerOptions,
     merge_failures: &mut staging::build::MergeFailures,
+    shutdown_rx: &mut watch::Receiver<bool>,
 ) -> bool {
     let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
     let rederive = rederive_build_step(pool, claimed_by, build_options, merge_failures).await;
-    old || rederive
+    if old || rederive {
+        return true;
+    }
+    self_check_step(pool, claimed_by, reclaim_ttl, shutdown_rx).await
+}
+
+/// One page of a `self_check` job ([`staging::self_check_job::work_once`]),
+/// if there is one to run. Returns whether it ran one.
+///
+/// A page is bounded by its own budget (`staging::self_check_job::page_budget`),
+/// but a shutdown does not wait for it: the page is dropped where it is, the
+/// worker's jobs are marked cancelled, and the statement the page had on the
+/// server is stopped by that budget. A failure of the step itself (the claim
+/// or a save) is logged at warn and retried on the next pass.
+async fn self_check_step(
+    pool: &Pool,
+    claimed_by: &str,
+    reclaim_ttl: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let options = staging::self_check_job::WorkerOptions::new(reclaim_ttl);
+    let page = staging::self_check_job::work_once(pool, claimed_by, &options);
+    tokio::select! {
+        biased;
+        () = async { let _ = shutdown_rx.wait_for(|stopping| *stopping).await; } => {
+            // Bounded: the pool may be what is unreachable.
+            let cancelled = tokio::time::timeout(
+                Duration::from_secs(5),
+                staging::self_check_job::cancel_claimed(pool, claimed_by),
+            )
+            .await;
+            if !matches!(cancelled, Ok(Ok(_))) {
+                crate::instance_log::warn!(
+                    worker = %claimed_by,
+                    "could not mark this worker's self_check job cancelled on shutdown; \
+                     another worker takes it over once it has gone stale"
+                );
+            }
+            false
+        }
+        result = page => match result {
+            Ok(ran) => ran,
+            Err(error) => {
+                crate::instance_log::warn!(
+                    worker = %claimed_by,
+                    error = %error,
+                    "self_check step failed; retrying on the next pass"
+                );
+                false
+            }
+        },
+    }
 }
 
 /// One step of the running Re-derive builds' work

@@ -71,7 +71,8 @@ module Trellis
   #   instance.apply("RESUME TRANSFORM order_totals.total").
   # - Operations: request_backfill, has_live_drain_workers?,
   #   has_live_staging_worker?, the read-your-writes pair watermark_token and
-  #   await_converged, and the audit self_check.
+  #   await_converged, and the audit self_check, a background job that
+  #   self_check_job reads back.
   #
   # Every call blocks on the database with the GVL released, so other threads
   # run meanwhile, and Thread#kill, Thread#raise, Timeout.timeout and Ctrl-C
@@ -83,9 +84,9 @@ module Trellis
   # Conventions: times are Times in UTC, at microsecond precision; a
   # quarantine target is an address string, a transform's bare target table
   # name ("order_totals") or "transform.column" ("order_totals.total"); the
-  # cursors sample_quarantined and self_check return, and watermark_token's
-  # token, are opaque strings to pass back unchanged; and every symbol in a
-  # result comes from a closed set, never from a string the database returned.
+  # cursor sample_quarantined returns, and watermark_token's token, are opaque
+  # strings to pass back unchanged; and every symbol in a result comes from a
+  # closed set, never from a string the database returned.
   #
   # An instance doesn't survive `fork`. Shut every instance down before
   # forking (Instance.shutdown_all; Puma's before_fork) and connect after
@@ -416,44 +417,55 @@ module Trellis
       nil
     end
 
-    # Audits one page of target_table against a fresh recompute of its
-    # definition from the source tables, and returns a SelfCheckReport of
-    # what differs.
+    # Starts a background check of target_table against a fresh recompute of
+    # its definition from the source tables, and returns a SelfCheckJob at
+    # once. The comparison is a drain worker's, a page of keys at a time
+    # (with no drain worker anywhere in the fleet the job stays :queued, as
+    # a define does); poll self_check_job with the job's id until it is
+    # finished, and its report is the verdict.
     #
-    # - limit: the most keys to audit in this call.
-    # - timeout_ms: how long to wait for the target to catch up, per wait. A
-    #   :standard check waits up to twice, a :strict one once.
-    # - after: the previous report's next_after; nil for the first page.
+    # - timeout_ms: how long a page of the job waits for the target to catch
+    #   up, per wait. A :standard check waits up to twice per page, a
+    #   :strict one once.
     # - mode: :standard re-checks anything that differs after a fresh wait,
     #   so a change still in flight isn't reported; it is safe while the
     #   source is being written. :strict skips the re-check, and is only
     #   sound once writes to the audited tables have stopped.
     #
-    # Only a one-row-per-source-key transform can be audited: an aggregate
-    # target raises ValidationError, and an unknown one NotFoundError. A
-    # column that is paused is left out of the comparison. To sweep a whole
-    # target, chain calls through next_after:
+    # A target whose job is still :queued or :running gets that job back,
+    # whatever mode and timeout_ms this call passed; a finished job stays
+    # until the next self_check of its target replaces it. Only a
+    # one-row-per-source-key transform that reads no relationship can be
+    # audited: an aggregate or relationship-reading target raises
+    # ValidationError, and an unknown one NotFoundError. A column that is
+    # paused is left out of the comparison.
     #
-    #   report = trellis.self_check("order_totals", limit: 1_000, timeout_ms: 30_000)
-    #   report = trellis.self_check("order_totals", limit: 1_000, timeout_ms: 30_000,
-    #                               after: report.next_after)
+    #   job = trellis.self_check("order_totals", timeout_ms: 30_000)
+    #   sleep 1 until (job = trellis.self_check_job(job.id)).finished?
+    #   job.report.outcome # => :converged
     #
-    # It runs for up to timeout_ms per wait plus the comparison of up to
-    # `limit` keys, holding one of the instance's pooled connections. To sweep
-    # a large target alongside live traffic, run the audit in a process of
-    # its own, connected with the defaults so it runs no background work.
-    def self_check(target_table, limit:, timeout_ms:, after: nil, mode: :standard)
+    # The call reads nothing of the target, so it returns well inside the
+    # 30-second call limit, holding no connection afterwards.
+    def self_check(target_table, timeout_ms:, mode: :standard)
       string!("the target table", target_table)
-      limit!(limit)
       timeout_ms!(timeout_ms)
-      cursor!(after, "a cursor from a previous report")
       unless SELF_CHECK_MODES.include?(mode)
         raise ValidationError, "mode must be :standard or :strict, got: #{mode.inspect}"
       end
 
-      SelfCheckReport.from_native(
-        handle.self_check(target_table, after, limit, mode.to_s, timeout_ms)
-      )
+      SelfCheckJob.from_native(handle.self_check(target_table, mode.to_s, timeout_ms))
+    end
+
+    # The SelfCheckJob that self_check returned with this id, as it stands
+    # now, or nil when there is none: a newer self_check of its target
+    # replaced it, or its transform was dropped.
+    def self_check_job(id)
+      unless id.is_a?(Integer) && id.between?(-(2**63), MAX_LIMIT)
+        raise ValidationError, "the job id must be an Integer, got: #{id.inspect}"
+      end
+
+      hash = handle.self_check_job(id)
+      hash && SelfCheckJob.from_native(hash)
     end
 
     # Stops this instance: its background work, its connections and its
