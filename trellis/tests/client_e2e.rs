@@ -895,18 +895,16 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     backdate_dead_claims(&raw).await;
 
     // A drain-only client — no staging worker anywhere in this test, and
-    // this is the *only* client instance running. Without the app-worker
-    // loop's own reclaim sweep, nothing would ever free the stale claim
-    // above.
+    // this is the *only* client instance running. Without the client's own
+    // chunk-reclaim sweep (its upkeep task, which runs while its drain
+    // workers do), nothing would ever free the stale claim above.
     // Default `reclaim_ttl` and heartbeat: a live worker's claim can't be
     // falsely reclaimed within this test's budget, so the only thing it
-    // waits on is the work itself. A short `maintenance_interval` just keeps
-    // the sweep cadence tight; the first sweep runs as soon as each worker
-    // starts anyway.
+    // waits on is the work itself. The upkeep task sweeps as soon as it
+    // starts, which frees the backdated claim at once.
     let options = ClientOptions {
         staging_worker: false,
         application_threads: 2,
-        maintenance_interval: Duration::from_millis(50),
         poll_interval: Duration::from_millis(50),
         ..Default::default()
     };
@@ -967,8 +965,8 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
 /// `install_definition_chunks_a_composite_key_boundary_inside_a_group_into_exactly_two_chunks`.
 ///
 /// What *does* need a live client is the other half of the original test:
-/// that a real, running `TrellisClient`'s own background maintenance loop
-/// (which sweeps `reclaim_stale_chunks`) and application-thread pool (which
+/// that a real, running `TrellisClient`'s own upkeep task (which sweeps
+/// `reclaim_stale_chunks`) and application-thread pool (which
 /// claims and drains `backfill_chunks` work) actually notice and correctly
 /// finish a reclaimed composite-key chunk on their own, with no test code
 /// driving them step by step — that's the wiring this test proves, kept as
@@ -1063,13 +1061,11 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
 
     // Default `reclaim_ttl` and heartbeat: a live worker's claim can't be
     // falsely reclaimed within this test's budget, so the only thing it
-    // waits on is the work itself. A short `maintenance_interval` just keeps
-    // the sweep cadence tight; the first sweep runs as soon as each worker
-    // starts anyway.
+    // waits on is the work itself. The client's upkeep task sweeps as soon
+    // as it starts, which frees the backdated claims at once.
     let options = ClientOptions {
         staging_worker: false,
         application_threads: 2,
-        maintenance_interval: Duration::from_millis(50),
         poll_interval: Duration::from_millis(50),
         ..Default::default()
     };

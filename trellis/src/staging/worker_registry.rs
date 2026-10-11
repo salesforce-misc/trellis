@@ -11,7 +11,9 @@
 //! worker is mid-batch), so a worker that's running, healthy, and idle
 //! leaves no trace there — an empty claim table is indistinguishable from an
 //! empty fleet. This module is the fix: [`register_worker`] upserts one row
-//! per worker at `Client::start` and again on every maintenance tick,
+//! per worker at `Client::start` and again every third of the reclaim TTL
+//! by the client's one upkeep task (which runs only while an app-worker task
+//! does, and is independent of how long a worker spends inside one drain),
 //! [`deregister_worker`] removes it on clean shutdown, and
 //! [`has_live_workers`] is the cheap, health-check-shaped read
 //! `Trellis::has_live_drain_workers` sits behind.
@@ -43,7 +45,7 @@ use super::error::StagingError;
 
 /// Upserts `worker_id`'s row, bumping `last_seen` to now. Called once at
 /// `Client::start` (registration, only when `application_threads > 0`) and
-/// again on every maintenance tick (heartbeat) — one call serves both, the
+/// again from the client's upkeep task (heartbeat) — one call serves both, the
 /// same shape [`super::claim::register_drainer`] already uses for a
 /// different registry.
 pub async fn register_worker(
@@ -114,8 +116,10 @@ const RECLAIM_STALE_WORKERS_SQL: &str = "\
 /// `last_seen` is older than `ttl`, returning how many it removed. Purely
 /// table hygiene after an unclean shutdown elsewhere in the fleet (crash,
 /// `kill -9`, a dropped `Client` that never called `shutdown`) — it bounds
-/// the table's growth and nothing more. Uses the same `ttl` value
-/// [`super::liveness::reclaim_stale`] applies to a claim.
+/// the table's growth and nothing more. `maintenance_loop` passes its
+/// `reclaim_ttl`, but never less than [`super::liveness::DEFAULT_RECLAIM_TTL`]
+/// (what `Trellis::has_live_drain_workers` reads), so it never deletes a row
+/// that check still counts as live.
 ///
 /// [`has_live_workers`] never depends on this having run — see the module
 /// doc comment for why requiring a reclaim pass before the read would be

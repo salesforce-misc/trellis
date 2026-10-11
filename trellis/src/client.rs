@@ -90,8 +90,14 @@ pub struct ClientOptions {
     /// How long a claim may sit unrefreshed before it's taken back: ring
     /// segment claims by [`staging::reclaim_stale`] (the maintenance loop,
     /// only when `staging_worker` is set), and backfill-chunk claims by
-    /// [`chunk_queue::reclaim_stale_chunks`] (every app-worker task,
-    /// regardless of `staging_worker`).
+    /// [`chunk_queue::reclaim_stale_chunks`] (one sweep per client with
+    /// `application_threads > 0`, regardless of `staging_worker`, run every
+    /// third of this TTL, or of [`staging::DEFAULT_RECLAIM_TTL`] if that is
+    /// shorter, for as long as one of its app-worker tasks runs).
+    ///
+    /// The same task refreshes the client's worker-registry row, which
+    /// [`crate::app::Trellis::has_live_drain_workers`] reads against
+    /// [`staging::DEFAULT_RECLAIM_TTL`] whatever this is set to.
     ///
     /// Must be at least twice [`HeartbeatDaemonConfig::interval`] (see
     /// [`Self::heartbeat`]), or [`Client::start`] rejects the options with
@@ -737,6 +743,7 @@ async fn run(
         let _ = staging::register_worker(&**conn, &client_id).await;
     }
 
+    let live_workers = LiveWorkers::default();
     let mut app_worker_tasks = Vec::with_capacity(options.application_threads);
     for i in 0..options.application_threads {
         let claimed_by = format!("{client_id}-app-{i}");
@@ -745,13 +752,12 @@ async fn run(
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
             claimed_by,
-            worker_id: client_id.clone(),
             wake_channel: wake_channel.clone(),
             drainer_window: options.drainer_window,
             heartbeat_config: options.heartbeat.clone(),
             poll_interval: options.poll_interval,
             reclaim_ttl: options.reclaim_ttl,
-            chunk_reclaim_interval: options.maintenance_interval,
+            alive: live_workers.enter(),
             watermark: watermark.clone(),
             drain_batch_cap: options.drain_batch_cap,
             build_chunk_rows: options.build_chunk_rows.max(1),
@@ -761,6 +767,21 @@ async fn run(
             shutdown_rx.clone(),
         )));
     }
+
+    // The process's one worker-registry heartbeat and chunk-reclaim sweep
+    // (#1013, #273): see `worker_upkeep_loop`. A staging-only client has no
+    // workers to be alive for, so it runs none.
+    let upkeep_task = (options.application_threads > 0).then(|| {
+        let pool = pool.clone();
+        let worker_id = client_id.clone();
+        let reclaim_ttl = options.reclaim_ttl;
+        tokio::spawn(worker_upkeep_loop(
+            upkeep_interval(reclaim_ttl),
+            live_workers.clone(),
+            shutdown_rx.clone(),
+            async move || worker_upkeep_pass(&pool, &worker_id, reclaim_ttl).await,
+        ))
+    });
 
     // Keeps this instance's gauges set for as long as the client runs, so the
     // recorder's idle timeout drops only a stopped instance's
@@ -787,6 +808,9 @@ async fn run(
         let _ = task.await;
     }
     for task in app_worker_tasks {
+        let _ = task.await;
+    }
+    if let Some(task) = upkeep_task {
         let _ = task.await;
     }
 
@@ -1144,8 +1168,17 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // drain-only client's row would otherwise sit forever.
                 // `staging::has_live_workers` never depends on this having
                 // run (see `staging::worker_registry`'s doc comment); this
-                // is purely about bounding the table's size over time.
-                let reclaimed = staging::reclaim_stale_workers(c, reclaim_ttl).await;
+                // is purely about bounding the table's size over time. Kept
+                // at least `DEFAULT_RECLAIM_TTL`, the TTL
+                // `has_live_drain_workers` reads: a peer with the default
+                // `reclaim_ttl` refreshes its row only every third of that
+                // (`upkeep_interval`), so this client's shorter `reclaim_ttl`
+                // would delete a live peer's row between two refreshes.
+                let reclaimed = staging::reclaim_stale_workers(
+                    c,
+                    reclaim_ttl.max(staging::DEFAULT_RECLAIM_TTL),
+                )
+                .await;
                 failed = failures.check("reclaim_stale_workers", reclaimed).is_err();
             }
             if !failed {
@@ -1641,12 +1674,6 @@ struct AppWorkerConfig {
     dsn: String,
     schema: String,
     claimed_by: String,
-    /// This `Client`'s own worker-registry key (issue #144) — the same
-    /// `client_id` every app-worker task of this `Client` shares, distinct
-    /// from `claimed_by`'s per-task suffix. One row represents the process,
-    /// not each individual task, so every task of the same `Client` heartbeats
-    /// the same row (a harmless, idempotent upsert either way).
-    worker_id: String,
     wake_channel: String,
     drainer_window: Duration,
     heartbeat_config: HeartbeatDaemonConfig,
@@ -1658,14 +1685,11 @@ struct AppWorkerConfig {
     /// regardless of whether this particular client also happens to run the
     /// staging worker.
     reclaim_ttl: Duration,
-    /// How often this app-worker task sweeps `backfill_chunks` for a stale
-    /// claim (see [`sweep_stale_chunks_if_due`]) — independent of
-    /// `ClientOptions::staging_worker`, since a stale backfill-chunk claim
-    /// isn't a capture/ring concern the way segment maintenance is (see
-    /// this field's own call site's doc comment). Reuses
-    /// `ClientOptions::maintenance_interval`'s cadence rather than inventing
-    /// a third interval knob.
-    chunk_reclaim_interval: Duration,
+    /// Held for as long as this worker loop runs and dropped when it ends,
+    /// however it ends (a panic included): the gate on
+    /// [`worker_upkeep_loop`], so a process whose workers are all gone stops
+    /// refreshing its registry row.
+    alive: WorkerAlive,
     /// Issue #132, epic #127, guard (a): this fleet's shared in-process
     /// "staged-through" watermark — the one `run()` constructs, always
     /// caught up under trigger capture — threaded here so
@@ -1703,13 +1727,12 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         dsn,
         schema,
         claimed_by,
-        worker_id,
         wake_channel,
         drainer_window,
         heartbeat_config,
         poll_interval,
         reclaim_ttl,
-        chunk_reclaim_interval,
+        alive: _alive,
         watermark,
         drain_batch_cap,
         build_chunk_rows,
@@ -1729,14 +1752,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     let heartbeat = HeartbeatDaemon::spawn(dsn.clone(), schema.clone(), heartbeat_config);
     let mut wake = WakeListener::spawn(dsn.clone(), schema.clone(), wake_channel.clone());
 
-    // Due immediately on the very first tick, same as `maintenance_loop`'s
-    // own `next_reconcile` — see `sweep_stale_chunks_if_due`.
-    let mut next_chunk_reclaim = Instant::now();
-    // Issue #144: same "due immediately" reasoning — `Client::run` already
-    // registers `worker_id` once before this loop starts, but that row's
-    // `last_seen` must keep advancing on this same cadence for the whole
-    // life of the worker, not just once at startup.
-    let mut next_worker_heartbeat = Instant::now();
     let mut drain_failures = DrainFailures::default();
     // The group-delta merges that failed on this worker, backing off (#901).
     let mut merge_failures = staging::build::MergeFailures::default();
@@ -1745,35 +1760,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         if *shutdown_rx.borrow() {
             break;
         }
-
-        // Backfill-chunk reclaim sweep (independent of `staging_worker` —
-        // see `AppWorkerConfig::chunk_reclaim_interval`'s doc comment): a
-        // drain-only fleet (`staging_worker: false`, `application_threads` >
-        // 0, no other client running `staging_worker: true` anywhere) would
-        // otherwise have nothing to free a crashed drain worker's claimed
-        // chunk — `maintenance_loop`'s own sweep only ever runs alongside the
-        // staging worker. Cheap/idempotent to also run this when a staging
-        // worker *is* present in the same process (its `maintenance_loop`
-        // sweeps too): a no-op UPDATE matching zero rows either way.
-        sweep_stale_chunks_if_due(
-            &pool,
-            reclaim_ttl,
-            chunk_reclaim_interval,
-            &mut next_chunk_reclaim,
-        )
-        .await;
-
-        // Issue #144: keeps this process's worker-registry row alive on the
-        // same cadence as the chunk-reclaim sweep above, for the same
-        // "independent of `staging_worker`" reason — a drain-only fleet has
-        // no `maintenance_loop` anywhere to do this instead.
-        heartbeat_worker_if_due(
-            &pool,
-            &worker_id,
-            chunk_reclaim_interval,
-            &mut next_worker_heartbeat,
-        )
-        .await;
 
         // `register_drainer` doubles as the liveness refresh
         // `count_live_drainers` reads below (see its own doc comment), so it
@@ -1951,57 +1937,99 @@ async fn rederive_build_step(
     }
 }
 
-/// Runs [`chunk_queue::reclaim_stale_chunks`] if `interval` has elapsed since
-/// `next_due` (mutated in place to the next due time, mirroring
-/// `maintenance_loop`'s own `next_reconcile` throttle), else does nothing.
-///
-/// Gap this closes (public-api-design review): `reclaim_stale_chunks` used to
-/// only ever run from [`maintenance_loop`], which is only spawned `if
-/// options.staging_worker`. A drain-only client (`staging_worker: false`,
-/// `application_threads > 0` — a normal, documented fleet topology) had no
-/// self-healing for a crashed drain worker's claimed chunk: it would sit
-/// stuck at `Backfilling` forever unless some *other* client instance in the
-/// fleet happened to also run with `staging_worker: true`. Unlike segment
-/// maintenance (legitimately tied to the staging-worker singleton), reclaiming
-/// a stale backfill-chunk claim has nothing to do with capture, so it's
-/// wired here instead — into the one loop every client with
-/// `application_threads > 0` runs regardless of `staging_worker`.
-async fn sweep_stale_chunks_if_due(
-    pool: &Pool,
-    reclaim_ttl: Duration,
-    interval: Duration,
-    next_due: &mut Instant,
-) {
-    if Instant::now() < *next_due {
-        return;
+/// How many of one `Client`'s app-worker loops are still running. The gate on
+/// [`worker_upkeep_loop`]: it keeps the registry row fresh only while this is
+/// nonzero.
+#[derive(Clone, Default)]
+struct LiveWorkers(Arc<std::sync::atomic::AtomicUsize>);
+
+/// One running worker loop's entry in [`LiveWorkers`], removed on drop. A
+/// worker task that panics unwinds through its locals, so its entry goes
+/// with it.
+struct WorkerAlive(Arc<std::sync::atomic::AtomicUsize>);
+
+impl LiveWorkers {
+    /// Counts one more worker loop. Taken before the loop is spawned, so the
+    /// upkeep loop never sees a count of zero for a worker that has not been
+    /// polled yet.
+    fn enter(&self) -> WorkerAlive {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        WorkerAlive(self.0.clone())
     }
-    if let Ok(mut client) = pool.get().await {
-        let _ = chunk_queue::reclaim_stale_chunks(&mut **client, reclaim_ttl).await;
+
+    fn any(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
-    *next_due = Instant::now() + interval;
 }
 
-/// Refreshes `worker_id`'s [`staging::worker_registry`] row (issue #144) if
-/// `interval` has elapsed since `next_due`, else does nothing — same
-/// due-timer shape as [`sweep_stale_chunks_if_due`], and for the same
-/// underlying reason: `Client::run`'s registration at startup is a single
-/// point-in-time write, but the row's `last_seen` must keep advancing for
-/// [`staging::has_live_workers`] to keep reporting this worker live, on a
-/// cadence that has to work whether or not this `Client` also runs
-/// `maintenance_loop` (i.e. regardless of `staging_worker`).
-async fn heartbeat_worker_if_due(
-    pool: &Pool,
-    worker_id: &str,
+impl Drop for WorkerAlive {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The smallest pass interval [`upkeep_interval`] returns, so a very small
+/// `reclaim_ttl` (tests) cannot make the loop spin.
+const MIN_UPKEEP_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How often [`worker_upkeep_loop`] runs: a third of the shorter of the TTL
+/// [`crate::app::Trellis::has_live_drain_workers`] reads the registry row
+/// against ([`staging::DEFAULT_RECLAIM_TTL`], which a client's own
+/// `reclaim_ttl` does not change) and the client's `reclaim_ttl` (what a
+/// stale chunk claim waits out). A row therefore stays fresh across two
+/// missed passes, and a stale claim is swept within `reclaim_ttl` plus a
+/// third of it.
+fn upkeep_interval(reclaim_ttl: Duration) -> Duration {
+    (staging::DEFAULT_RECLAIM_TTL.min(reclaim_ttl) / 3).max(MIN_UPKEEP_INTERVAL)
+}
+
+/// A process's worker-registry heartbeat and backfill-chunk reclaim sweep,
+/// run by one task on the client runtime rather than by every drain worker
+/// (#1013, #273). They used to be due-timers inside each worker's loop, so
+/// eight workers upserted one shared row and ran the same sweep every ~405
+/// ms, and a process whose workers were all inside a drain or build chunk
+/// longer than [`staging::DEFAULT_RECLAIM_TTL`] let its row age out and read
+/// as dead. Both duties are independent of `staging_worker`: a drain-only
+/// fleet has no `maintenance_loop` anywhere to do them.
+///
+/// The loop stops when no worker loop is left (`live_workers`), so a process
+/// whose workers have all panicked or exited stops refreshing its row and
+/// drops out of `has_live_drain_workers` within the TTL, as the docs promise.
+/// It does not deregister then: the row ages out, the same as a crashed
+/// process's. A clean shutdown deregisters in [`run`].
+///
+/// `pass` is [`worker_upkeep_pass`] in production; it is a parameter so a
+/// test can step the loop without waiting on a clock.
+async fn worker_upkeep_loop(
     interval: Duration,
-    next_due: &mut Instant,
+    live_workers: LiveWorkers,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut pass: impl AsyncFnMut(),
 ) {
-    if Instant::now() < *next_due {
-        return;
+    loop {
+        if *shutdown_rx.borrow() || !live_workers.any() {
+            return;
+        }
+        pass().await;
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
     }
-    if let Ok(client) = pool.get().await {
+}
+
+/// One pass of [`worker_upkeep_loop`]: bumps `worker_id`'s
+/// [`staging::worker_registry`] row, then frees any backfill-chunk claim
+/// unrefreshed for `reclaim_ttl` (what `maintenance_loop` also does, but only
+/// alongside the staging worker: a stale claim is not a capture concern, and
+/// a crashed drain worker's chunk would otherwise sit at `Backfilling`
+/// forever in a drain-only fleet). Failures are not fatal: the next pass
+/// retries.
+async fn worker_upkeep_pass(pool: &Pool, worker_id: &str, reclaim_ttl: Duration) {
+    if let Ok(mut client) = pool.get().await {
         let _ = staging::register_worker(&**client, worker_id).await;
+        let _ = chunk_queue::reclaim_stale_chunks(&mut **client, reclaim_ttl).await;
     }
-    *next_due = Instant::now() + interval;
 }
 
 /// Claims one pending direct-build backfill chunk (`defs::chunk_queue`,
@@ -3173,21 +3201,21 @@ mod backfill_chunk_failure_tests {
     use crate::defs::model::TransformStatus;
     use crate::integer::IntWidth;
 
-    const WORKER: &str = "issue-616-worker";
+    pub(super) const WORKER: &str = "issue-616-worker";
 
-    struct Fixture {
+    pub(super) struct Fixture {
         _cluster: testkit::TestCluster,
         _db: testkit::TestDatabase,
-        pool: Pool,
-        raw: tokio_postgres::Client,
+        pub(super) pool: Pool,
+        pub(super) raw: tokio_postgres::Client,
         trellis: Trellis,
-        id: i64,
+        pub(super) id: i64,
     }
 
     /// Seeds `public.nums` with `rows` rows (`x = id`, except `x = bad_x` at
     /// `bad_id`) and registers `TRANSFORM doubles FROM nums SELECT x + x`
     /// over it, its build dispatched onto the chunk queue.
-    async fn seed(rows: i64, bad: Option<(i64, i32)>) -> Fixture {
+    pub(super) async fn seed(rows: i64, bad: Option<(i64, i32)>) -> Fixture {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
@@ -4176,5 +4204,282 @@ mod runtime_tests {
         let err = client_runtime(&options, std::sync::Arc::from("app/t"))
             .expect_err("zero workers must not build");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod worker_upkeep_tests {
+    //! #1013, #273: the process's one worker-registry heartbeat and
+    //! chunk-reclaim sweep. The loop is stepped through its `pass` parameter
+    //! rather than a clock, so none of this waits for a tick (#297). The
+    //! tests that start a real `Client` await a trigger's notification of
+    //! the client's own write instead of polling for it.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::backfill_chunk_failure_tests::{WORKER, seed};
+    use super::*;
+
+    async fn stale_registry_row(raw: &tokio_postgres::Client, worker_id: &str) {
+        raw.execute(
+            "update worker_registry set last_seen = now() - interval '10 seconds' \
+             where worker_id = $1",
+            &[&worker_id],
+        )
+        .await
+        .expect("age the row");
+    }
+
+    /// The row is live against `DEFAULT_RECLAIM_TTL`-shaped reads whatever the
+    /// drain threads are doing: its owner (`LiveWorkers` held, no pass from any
+    /// worker loop anywhere in this test) is "inside a long chunk" for as long
+    /// as the guard is held. Each pass finds the row aged past the TTL, as a
+    /// 30 s chunk would have left it, and puts it back; once the last guard is
+    /// dropped (a worker panic, a shutdown) the loop stops, and nothing
+    /// refreshes the row any more.
+    #[tokio::test]
+    async fn the_row_stays_live_while_workers_are_busy_and_stops_when_they_are_gone() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = Pool::new(&config).expect("pool");
+        let raw = pool.get().await.expect("connection");
+        let ttl = Duration::from_secs(5);
+
+        staging::register_worker(&**raw, "w")
+            .await
+            .expect("register");
+        let live_workers = LiveWorkers::default();
+        let workers = std::sync::Mutex::new(Some(live_workers.enter()));
+        let passes = AtomicUsize::new(0);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            worker_upkeep_loop(
+                Duration::from_millis(1),
+                live_workers,
+                shutdown_rx,
+                async || {
+                    let n = passes.fetch_add(1, Ordering::SeqCst) + 1;
+                    stale_registry_row(&raw, "w").await;
+                    assert!(
+                        !staging::has_live_workers(&**raw, ttl).await.expect("read"),
+                        "the row aged out before pass {n}"
+                    );
+                    worker_upkeep_pass(&pool, "w", Duration::from_secs(60)).await;
+                    assert!(
+                        staging::has_live_workers(&**raw, ttl).await.expect("read"),
+                        "pass {n} did not refresh the row"
+                    );
+                    if n == 3 {
+                        // The last worker loop ends.
+                        workers.lock().expect("lock").take();
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("the loop stops once no worker loop is alive");
+
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            3,
+            "no pass after the last worker went"
+        );
+    }
+
+    /// A worker loop that panics drops its entry like one that returns.
+    #[test]
+    fn a_panicking_worker_loop_leaves_the_live_count() {
+        let live_workers = LiveWorkers::default();
+        assert!(!live_workers.any());
+        let alive = live_workers.enter();
+        let other = live_workers.enter();
+        assert!(live_workers.any());
+        let panicked = std::thread::spawn(move || {
+            let _alive = alive;
+            panic!("worker loop panic");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(live_workers.any(), "one worker loop is still running");
+        drop(other);
+        assert!(!live_workers.any());
+    }
+
+    /// A claim a dead worker holds is still reclaimed, by the sweep in the
+    /// per-process pass alone (no `maintenance_loop` and no worker loop runs
+    /// here).
+    #[tokio::test]
+    async fn a_stale_chunk_claim_is_reclaimed_by_the_upkeep_pass() {
+        let f = seed(10, None).await;
+        let claimed = chunk_queue::claim_chunks(&f.raw, "dead-worker", 1)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert!(
+            chunk_queue::claim_chunks(&f.raw, WORKER, 1)
+                .await
+                .expect("claim")
+                .is_empty(),
+            "the dead worker's claim holds the chunk"
+        );
+
+        // A TTL the claim has not outlived leaves it alone.
+        worker_upkeep_pass(&f.pool, "w", Duration::from_secs(3600)).await;
+        assert!(
+            chunk_queue::claim_chunks(&f.raw, WORKER, 1)
+                .await
+                .expect("claim")
+                .is_empty(),
+            "a live claim is not swept"
+        );
+
+        worker_upkeep_pass(&f.pool, "w", Duration::ZERO).await;
+        assert_eq!(
+            chunk_queue::claim_chunks(&f.raw, WORKER, 1)
+                .await
+                .expect("claim")
+                .len(),
+            1,
+            "the pass reclaimed the stale claim"
+        );
+    }
+
+    /// The pass interval is bounded by the TTL the health check reads, not by
+    /// a client's own `reclaim_ttl`, and by that `reclaim_ttl` when shorter.
+    #[test]
+    fn the_upkeep_interval_is_a_third_of_the_shorter_ttl() {
+        let third = staging::DEFAULT_RECLAIM_TTL / 3;
+        assert_eq!(upkeep_interval(staging::DEFAULT_RECLAIM_TTL), third);
+        assert_eq!(upkeep_interval(Duration::from_secs(3600)), third);
+        assert_eq!(
+            upkeep_interval(Duration::from_secs(3)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(upkeep_interval(Duration::ZERO), MIN_UPKEEP_INTERVAL);
+    }
+
+    /// Connects to `db` and has every `op` (`update` or `delete`) of a
+    /// `worker_registry` row send the row's `worker_id` to the returned
+    /// receiver, so a test awaits a client's write instead of polling for it.
+    /// The trigger's `NOTIFY` is part of the writing transaction, so it
+    /// arrives once that write has committed.
+    async fn registry_writes(
+        db: &testkit::TestDatabase,
+        op: &str,
+    ) -> (
+        tokio_postgres::Client,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (raw, mut connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(Ok(message)) =
+                std::future::poll_fn(|cx| connection.poll_message(cx)).await
+            {
+                if let tokio_postgres::AsyncMessage::Notification(n) = message {
+                    let _ = tx.send(n.payload().to_string());
+                }
+            }
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {schema}, public; \
+             create function registry_{op}() returns trigger language plpgsql as $$ \
+             begin perform pg_notify('registry_{op}', old.worker_id); return null; end $$; \
+             create trigger registry_{op} after {op} on worker_registry \
+             for each row execute function registry_{op}(); \
+             listen registry_{op}",
+            schema = crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("notify on registry writes");
+        (raw, rx)
+    }
+
+    /// `run` wires the loop: a started client's upkeep task refreshes its row
+    /// with no maintenance loop (`staging_worker: false`). The startup
+    /// registration inserts the row, so only a pass updates it, and the
+    /// first pass runs as soon as the task starts. The test awaits that
+    /// update; the timeout only bounds a failure.
+    #[tokio::test]
+    async fn a_started_client_refreshes_its_row_from_the_upkeep_task() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (raw, mut updated) = registry_writes(&db, "update").await;
+        let client = Client::start(
+            db.dsn(),
+            ClientOptions {
+                staging_worker: false,
+                application_threads: 2,
+                ..ClientOptions::default()
+            },
+        )
+        .expect("start");
+
+        let refreshed = tokio::time::timeout(Duration::from_secs(60), updated.recv())
+            .await
+            .expect("the upkeep task refreshed the row")
+            .expect("listener");
+        let registered: String = raw
+            .query_one("select worker_id from worker_registry", &[])
+            .await
+            .expect("one registered row")
+            .get(0);
+        assert_eq!(refreshed, registered);
+
+        client.shutdown().await.expect("shutdown");
+    }
+
+    /// A staging worker whose own `reclaim_ttl` is shorter than
+    /// `DEFAULT_RECLAIM_TTL` still leaves a row `has_live_drain_workers`
+    /// counts live: a peer with the default `reclaim_ttl` refreshes its row
+    /// only every third of `DEFAULT_RECLAIM_TTL`, so a sweep at this
+    /// client's TTL would delete it between two refreshes. A row past every
+    /// TTL goes in the same sweep statement, and its deletion says the sweep
+    /// has run.
+    #[tokio::test]
+    async fn the_registry_sweep_keeps_a_row_the_health_check_counts_live() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (raw, mut deleted) = registry_writes(&db, "delete").await;
+        raw.batch_execute(
+            "insert into worker_registry (worker_id, registered_at, last_seen) values \
+             ('crashed', now() - interval '1 hour', now() - interval '1 hour'), \
+             ('between-refreshes', now() - interval '1 second', now() - interval '1 second')",
+        )
+        .await
+        .expect("seed the registry");
+        let client = Client::start(
+            db.dsn(),
+            ClientOptions {
+                staging_worker: true,
+                reclaim_ttl: Duration::from_millis(200),
+                heartbeat: HeartbeatDaemonConfig {
+                    interval: Duration::from_millis(100),
+                    ..HeartbeatDaemonConfig::default()
+                },
+                ..ClientOptions::default()
+            },
+        )
+        .expect("start");
+
+        tokio::time::timeout(Duration::from_secs(60), deleted.recv())
+            .await
+            .expect("the maintenance loop swept the registry")
+            .expect("listener");
+        let left: Vec<String> = raw
+            .query("select worker_id from worker_registry", &[])
+            .await
+            .expect("read the registry")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(left, ["between-refreshes"]);
+
+        client.shutdown().await.expect("shutdown");
     }
 }
