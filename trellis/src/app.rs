@@ -1506,7 +1506,7 @@ impl Trellis {
     /// survive a re-check behind a fresh await before it's reported) or
     /// [`SelfCheckMode::Strict`] (skips the re-check — sound only once the
     /// caller has itself stopped writes to the audited tables). `timeout`
-    /// bounds each convergence await a page of the job makes (one per page
+    /// (at most an hour) bounds each convergence await a page of the job makes (one per page
     /// under [`SelfCheckMode::Strict`], up to two under
     /// [`SelfCheckMode::Standard`]) — see [`Trellis::await_converged`]'s own
     /// doc comment for how to size it; a target that's merely still

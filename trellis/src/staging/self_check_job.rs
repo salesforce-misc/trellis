@@ -67,6 +67,12 @@ use super::self_check::{
 /// How many keys one page compares unless a worker is told otherwise.
 pub const DEFAULT_PAGE_KEYS: i64 = 10_000;
 
+/// The longest a page waits for the target to catch up, each time it waits.
+/// A longer `timeout` is cut to it when the job is started: the page's
+/// budget is built from it, and the claim's arithmetic on it must not
+/// overflow.
+pub const MAX_AWAIT_TIMEOUT: Duration = Duration::from_secs(3600);
+
 /// How many divergences a job collects before it stops walking and reports
 /// what it has, with [`SelfCheckReport::truncated`] set. A target that wrong
 /// is wrong everywhere, and the rest only makes the row large.
@@ -244,8 +250,8 @@ fn millis(timeout: Duration) -> i64 {
 /// unfinished job the target already has (see the module doc). Refuses what
 /// the check could never run on: no such transform, an aggregate target, a
 /// field that reads a relationship. `timeout` bounds each convergence wait
-/// the job's pages make; see [`crate::Trellis::await_converged`] for how to
-/// size it.
+/// the job's pages make, up to [`MAX_AWAIT_TIMEOUT`]; see
+/// [`crate::Trellis::await_converged`] for how to size it.
 pub async fn start(
     pool: &Pool,
     target_table: &str,
@@ -255,6 +261,7 @@ pub async fn start(
     let def = self_check::comparable_definition(pool, target_table).await?;
     self_check::check_renders(&def)?;
 
+    let timeout = timeout.min(MAX_AWAIT_TIMEOUT);
     let mut client = pool.get().await?;
     let id = loop {
         let txn = client.transaction().await?;
