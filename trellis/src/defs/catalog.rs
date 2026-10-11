@@ -225,7 +225,8 @@ pub enum CatalogError {
     /// schema would carry the other's data. Refused by define, and by a
     /// resume ([`revalidate`]) of a definition whose target schema has since
     /// become one. The repair is a target in an ordinary schema: `TRANSFORM
-    /// <schema>.<target>` with such a schema.
+    /// <schema>.<target>` with such a schema, after a `DROP TRANSFORM` for a
+    /// definition a resume refused.
     TargetInCatalogSchema {
         /// The definition's target, `schema.table`.
         target: String,
@@ -546,7 +547,13 @@ impl CatalogError {
     /// [`CatalogError::AggregateDeltasTableMissing`],
     /// [`CatalogError::LedgerTableMissing`]), where define would
     /// accept the definition and the repair is to drop it and define it again.
-    /// A resume's message says which it is.
+    /// A resume's message says which it is: a define refusal's says to fix the
+    /// schema and resume. [`CatalogError::TargetInCatalogSchema`] is define's
+    /// refusal too, but counts as a resume's own here, because fixing the
+    /// schema would mean removing another instance's catalog from the
+    /// schema that holds the target, whose uninstall drops the target with
+    /// it: its repair is also to drop the definition and define it again,
+    /// in an ordinary schema, and its own message says so.
     pub(crate) fn is_define_refusal(&self) -> bool {
         !matches!(
             self,
@@ -554,6 +561,7 @@ impl CatalogError {
                 | CatalogError::AggregateDeltasShapeChanged { .. }
                 | CatalogError::AggregateDeltasTableMissing { .. }
                 | CatalogError::LedgerTableMissing { .. }
+                | CatalogError::TargetInCatalogSchema { .. }
         )
     }
 }
@@ -673,7 +681,17 @@ impl fmt::Display for CatalogError {
                     f,
                     ". Put the target in an ordinary schema with `TRANSFORM <schema>.<target>` \
                      (or `TRELLIS_TARGET_SCHEMA`, for an unqualified one)"
-                )
+                )?;
+                // Only another instance's catalog can appear under a
+                // definition after define (see `is_define_refusal`).
+                if !*own {
+                    write!(
+                        f,
+                        "; a transform already defined in \"{schema}\" can't resume there: \
+                         `DROP TRANSFORM` it and define it again in an ordinary schema"
+                    )?;
+                }
+                Ok(())
             }
             CatalogError::TargetTableSuffixCollision {
                 target,

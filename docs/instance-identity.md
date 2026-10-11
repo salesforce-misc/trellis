@@ -103,11 +103,8 @@ The scan sees a marker only if the role attaching can read it, and an
 instance's marker only once that instance has attached at V83 or later. A role
 without `USAGE` on another instance's schema still sees rule 3 (the table
 exists), but not rule 4. Rule 3 and rule 4 compare the catalog schema with
-`Config::target_schema` only. A transform whose target is schema-qualified
-(`TRANSFORM other_schema.t`) names its own schema, so define checks that one: it
-refuses a target in this instance's catalog schema or in a schema with a
-`trellis_instance` table, with a `TargetInCatalogSchema` error, and so does a
-`RESUME` of a definition whose target schema has since become one ([Supported
+`Config::target_schema` only. A schema-qualified target (`TRANSFORM other_schema.t`)
+names its own schema, which define and `RESUME` check instead ([Supported
 sources and targets](transforms.md#supported-sources-and-targets)).
 
 A marker is written at the end of an attach, so the check must not run while
