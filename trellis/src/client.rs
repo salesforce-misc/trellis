@@ -737,7 +737,7 @@ async fn run(
         let _ = staging::register_worker(&**conn, &client_id).await;
     }
 
-    let mut app_worker_tasks = Vec::with_capacity(options.application_threads);
+    let mut app_worker_tasks = Vec::with_capacity(options.application_threads + 1);
     for i in 0..options.application_threads {
         let claimed_by = format!("{client_id}-app-{i}");
         let worker_config = AppWorkerConfig {
@@ -758,6 +758,18 @@ async fn run(
         };
         app_worker_tasks.push(tokio::spawn(app_worker_loop(
             worker_config,
+            shutdown_rx.clone(),
+        )));
+    }
+
+    // #1023: `self_check` jobs run beside the drain workers, never in their
+    // loop (see `self_check_loop`), wherever drain workers run.
+    if options.application_threads > 0 {
+        app_worker_tasks.push(tokio::spawn(self_check_loop(
+            pool.clone(),
+            format!("{client_id}-self-check"),
+            options.reclaim_ttl,
+            options.poll_interval,
             shutdown_rx.clone(),
         )));
     }
@@ -1820,7 +1832,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     reclaim_ttl,
                     &build_options,
                     &mut merge_failures,
-                    &mut shutdown_rx,
                 )
                 .await;
                 if !build_progress
@@ -1900,7 +1911,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                 reclaim_ttl,
                 &build_options,
                 &mut merge_failures,
-                &mut shutdown_rx,
             )
             .await;
         let made_progress = drained || build_progress;
@@ -1913,9 +1923,8 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
 /// A drain worker's build work for one pass of its loop, after its segments
 /// (#625 B6, global since F3): one old-build chunk (a plain 1-1 range or a
 /// direct-build job, [`drain_backfill_chunks`]), then one step of the
-/// Re-derive builds' work ([`rederive_build_step`]), and, when neither had
-/// any, one page of a `self_check` job ([`self_check_step`], #1023).
-/// Returns whether any did work.
+/// Re-derive builds' work ([`rederive_build_step`]). Returns whether either
+/// did work.
 async fn build_step(
     pool: &Pool,
     claimed_by: &str,
@@ -1923,14 +1932,45 @@ async fn build_step(
     reclaim_ttl: Duration,
     build_options: &staging::build::WorkerOptions,
     merge_failures: &mut staging::build::MergeFailures,
-    shutdown_rx: &mut watch::Receiver<bool>,
 ) -> bool {
     let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
     let rederive = rederive_build_step(pool, claimed_by, build_options, merge_failures).await;
-    if old || rederive {
-        return true;
+    old || rederive
+}
+
+/// The task that runs `self_check` jobs (#1023) in a process that runs drain
+/// workers: one page per pass ([`self_check_step`]), straight on to the next
+/// while there is one, `poll_interval` apart while there is none, until
+/// shutdown.
+///
+/// It is its own task, not a step of the drain workers' loop, because a page
+/// waits for the target to converge before it compares, and convergence is
+/// the drain workers' work: a drain worker that ran the page would wait on
+/// itself, and with one drain worker in the fleet every page under write load
+/// would end `NotCaughtUp` at its timeout. Beside them, it costs the pool one
+/// connection at a time and takes nothing from the drains.
+async fn self_check_loop(
+    pool: Pool,
+    claimed_by: String,
+    reclaim_ttl: Duration,
+    poll_interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        let ran = self_check_step(&pool, &claimed_by, reclaim_ttl, &mut shutdown_rx).await;
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        if !ran {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        }
     }
-    self_check_step(pool, claimed_by, reclaim_ttl, shutdown_rx).await
 }
 
 /// One page of a `self_check` job ([`staging::self_check_job::work_once`]),

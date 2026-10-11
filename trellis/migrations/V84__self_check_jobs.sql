@@ -1,9 +1,9 @@
 -- `self_check` as a background job (#1023, #599).
 --
--- `Trellis::self_check` registers a row here and returns; a drain worker
--- (`ClientOptions::application_threads`) claims it and compares the target
--- against a fresh recompute one keyset page per pass of its loop
--- (`staging::self_check_job`). The caller polls the row by `id`.
+-- `Trellis::self_check` registers a row here and returns; a process that runs
+-- drain workers (`ClientOptions::application_threads`) claims it on a task
+-- beside them and compares the target against a fresh recompute one keyset
+-- page per pass (`staging::self_check_job`). The caller polls the row by `id`.
 --
 -- * `state` is `queued` (registered, no worker yet), `running` (a worker holds
 --   it), then one of `done` (the comparison ended; `outcome` says how),

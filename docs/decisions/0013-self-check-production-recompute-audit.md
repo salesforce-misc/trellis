@@ -24,9 +24,11 @@ It audits one target at a time, is read-only, and returns at once with a job. A
 whole-target comparison can take far longer than a public call may
 ([ADR-0008](0008-public-api-design.md#6-every-public-call-returns-within-30-seconds)),
 so no call runs it: `self_check` registers a row in `self_check_jobs` and a
-drain worker (`application_threads`, in any process of the fleet) walks the
-target a keyset page at a time, saving its cursor, its count and the
-divergences so far in that row after each page. The caller polls the job with
+process that runs drain workers (`application_threads`, any process of the
+fleet) walks the target a keyset page at a time on a task beside them, not on
+a drain worker, since a page waits for the convergence the drain workers
+produce. It saves its cursor, its count and the divergences so far in that
+row after each page. The caller polls the job with
 `self_check_job(id)`. A job is `queued`, `running`, then `done`, `failed` or
 `cancelled`; a `done` job carries a `SelfCheckReport` for the whole target:
 any divergences (cell, missing row, extra row, missing/extra column, and a
@@ -200,7 +202,7 @@ standing cost.
 ## Consequences
 
 - `self_check` is a real read load: a full recompute scans source and target.
-  It runs page by page on a drain worker, each page bounded and holding no
+  It runs page by page beside the drain workers, each page bounded and holding no
   lock, and its caller never waits on it.
 - It needs a drain worker somewhere in the fleet, as a build does; with none, a
   job stays `queued`.

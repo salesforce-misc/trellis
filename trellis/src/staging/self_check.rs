@@ -97,8 +97,8 @@
 //!
 //! This module compares one keyset page ([`SelfCheckScope`]) of a target:
 //! [`check_page`] and the audit under it. The public `self_check` is a
-//! background job built from those pages, one per pass of a drain worker's
-//! loop ([`super::self_check_job`], #1023, #599): it registers a row and
+//! background job built from those pages, one per pass of a worker task
+//! ([`super::self_check_job`], #1023, #599): it registers a row and
 //! returns, a worker walks the target's keyspace page by page, and the
 //! caller polls the row. No page runs inside a public call.
 //!
@@ -480,7 +480,7 @@ impl From<crate::error::Error> for SelfCheckError {
 
 /// Audits one keyset page of `target_table` — see the module doc comment for
 /// the full design. The background job ([`super::self_check_job`]) runs this
-/// once per pass of a worker's loop, each from where the last ended; it is
+/// once per pass of its worker, each from where the last ended; it is
 /// not reached from a public call.
 #[cfg(any(test, feature = "internals"))]
 pub async fn check_page(

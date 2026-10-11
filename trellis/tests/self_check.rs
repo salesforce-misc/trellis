@@ -2622,6 +2622,86 @@ async fn a_drain_worker_runs_a_job_in_the_background() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// A job's page waits for the target to converge before it compares, and
+/// convergence is the drain workers' work, so the page must not run on one of
+/// them. With a single drain worker and a change that only a drain can apply
+/// (sealed by hand once the job is running: no staging worker runs), the job
+/// still converges: the worker drains while the page waits. A page run in the
+/// drain worker's own loop would wait on itself and end `NotCaughtUp` at its
+/// timeout. (Bounded polls of the job's state, as above.)
+#[tokio::test]
+async fn a_job_does_not_wait_on_the_drain_worker_it_runs_beside() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, mut raw) = totals_fixture(&db, 3).await;
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect a worker");
+    // Staged in the active segment, which only a seal hands to a drain.
+    raw.execute("insert into widgets values (4, 40)", &[])
+        .await
+        .expect("write a source row");
+
+    let job = trellis
+        .self_check(
+            "widget_totals",
+            SelfCheckMode::Strict,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("start");
+    let mut claimed = false;
+    for _ in 0..600 {
+        let polled = trellis
+            .self_check_job(job.id)
+            .await
+            .expect("poll")
+            .expect("job");
+        if polled.state != SelfCheckJobState::Queued {
+            claimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(claimed, "no worker claimed the job within 30 s");
+    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+
+    let mut done = None;
+    for _ in 0..600 {
+        let polled = trellis
+            .self_check_job(job.id)
+            .await
+            .expect("poll")
+            .expect("job");
+        if polled.state.is_finished() {
+            done = Some(polled);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let done = done.expect("the job finished within 30 s");
+    assert_eq!(done.state, SelfCheckJobState::Done, "{:?}", done.error);
+    let report = done.report.expect("report");
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "the page waited on the drain it was blocking: {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 4, "the drained row was compared");
+
+    running.shutdown().await.expect("shutdown");
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// A shutdown stops the worker mid-page and marks its job cancelled, so the
 /// poll shows it. The worker's page is blocked on the target's table, which
 /// the shutdown doesn't wait for.

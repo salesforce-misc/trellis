@@ -909,8 +909,9 @@ verdict on correctness.
 
 Comparing a whole target with a recompute of it can take far longer than a
 call may, so `self_check` doesn't do it. It registers a job and returns the job
-at once, and a drain worker (`drain_threads > 0`, in any process of the fleet)
-walks the target a page of keys at a time. The caller polls the job by its id
+at once, and a process that runs drain workers (`drain_threads > 0`, any
+process of the fleet) walks the target a page of keys at a time, on a task of
+its own so the drains the check waits on go on. The caller polls the job by its id
 until it is finished, and reads the verdict from the report:
 
 ```rust
@@ -938,11 +939,11 @@ let report = loop {
   so a retry joins the check in progress. A finished job stays until the next
   `self_check` of its target replaces it; polling the replaced id, or the id of
   a job whose transform was dropped, returns nothing.
-* **What the job holds.** Nothing between pages. A page is a read-only
-  statement under one snapshot, bounded on the server like a call is, so a
-  stuck page fails the job rather than sit on a connection, and a worker that
-  stops mid-page (a shutdown, a crash) leaves a job another worker resumes or
-  the poll shows cancelled. `timeout` bounds each convergence wait a page
+* **What the job holds.** Nothing between pages. A page only reads, its
+  comparison one statement under one snapshot, bounded on the server like a
+  call is, so a stuck page fails the job rather than sit on a connection, and
+  a worker that stops mid-page (a shutdown, a crash) leaves a job another
+  worker resumes or the poll shows cancelled. `timeout` bounds each convergence wait a page
   makes, not the job.
 * **The report** covers the whole target: `rows_compared`, every divergence
   found (up to 1,000, after which `truncated` is set and the job stops), and,
