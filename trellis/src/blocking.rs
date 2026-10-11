@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_postgres::types::PgLsn;
 
 use crate::app::{
@@ -472,7 +472,7 @@ impl BlockingTrellis {
     /// background thread to exit cleanly. See [`Trellis::shutdown`].
     ///
     /// Calls still in flight are cancelled, not waited for: their callers get
-    /// [`TrellisError::BlockingThreadGone`], and what each had started on the
+    /// [`TrellisError::CancelledByShutdown`], and what each had started on the
     /// server ends at its own deadline (see the module doc). A call stuck on a
     /// lock therefore doesn't hold the shutdown up.
     pub fn shutdown(self) -> Result<(), TrellisError> {
@@ -494,8 +494,9 @@ impl BlockingTrellis {
     /// Sends `make_job(reply)` to the background thread and returns the
     /// reply's receiving end, without waiting for it. The one primitive every
     /// method above is built from. A [`TrellisError::BlockingThreadGone`]
-    /// means the background thread panicked (or was never actually running
-    /// the loop below, which can't happen from this module's own `connect`).
+    /// means no reply came: the background thread panicked, or the call's own
+    /// task did (or the thread was never actually running the loop below,
+    /// which can't happen from this module's own `connect`).
     fn start<T: Send + 'static>(
         &self,
         make_job: impl FnOnce(oneshot::Sender<Result<T, TrellisError>>) -> Job,
@@ -656,126 +657,93 @@ async fn run(
         return;
     }
 
-    let mut tasks = tokio::task::JoinSet::new();
+    let (stopping, stop) = watch::channel(false);
+    let mut calls = Calls {
+        tasks: tokio::task::JoinSet::new(),
+        stop,
+    };
     while let Some((submitted, job)) = job_rx.recv().await {
         // Reap the finished ones, so the set doesn't grow with the calls made.
-        while tasks.try_join_next().is_some() {}
+        while calls.tasks.try_join_next().is_some() {}
         let trellis = shared.clone();
         // Each arm builds its call's future inside a closure of its own, which
         // boxes it before it returns: the engine's futures are large, and an
         // arm that built them in this function's frame would put every arm's
         // at once on the stack of a thread that keeps the default size.
         match job {
-            Job::Migrate(reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                Box::pin(async move {
-                    let _ = reply.send(t.submitted(at, t.migrate()).await);
-                })
+            Job::Migrate(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.migrate()).await })
             }),
-            Job::Apply(text, reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                Box::pin(async move {
-                    let _ = reply.send(t.submitted(at, t.apply(&text)).await);
-                })
+            Job::Apply(text, reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.apply(&text)).await })
             }),
-            Job::Definitions(reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                Box::pin(async move {
-                    let _ = reply.send(t.submitted(at, t.definitions()).await);
-                })
+            Job::Definitions(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.definitions()).await })
             }),
-            Job::Relationships(reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.relationships()).await);
-                    })
-                })
-            }
+            Job::Relationships(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.relationships()).await })
+            }),
             Job::RequestBackfill(table, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.request_backfill(&table)).await);
-                    })
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.request_backfill(&table)).await })
                 })
             }
             Job::PoisonedSince(watermark, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.poisoned_since(watermark)).await);
-                    })
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.poisoned_since(watermark)).await })
                 })
             }
-            Job::Status(table, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.status(&table)).await);
-                    })
-                })
-            }
-            Job::Quarantined(reply) => spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                Box::pin(async move {
-                    let _ = reply.send(t.submitted(at, t.quarantined()).await);
-                })
+            Job::Status(table, reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.status(&table)).await })
+            }),
+            Job::Quarantined(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.quarantined()).await })
             }),
             Job::QuarantineStatus(target, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.quarantine_status(&target)).await);
-                    })
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.quarantine_status(&target)).await })
                 })
             }
             Job::SampleQuarantined(target, after, limit, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                calls.spawn(trellis, submitted, reply, move |t, at| {
                     Box::pin(async move {
-                        let _ = reply.send(
-                            t.submitted(at, t.sample_quarantined(&target, after, limit))
-                                .await,
-                        );
+                        t.submitted(at, t.sample_quarantined(&target, after, limit))
+                            .await
                     })
                 })
             }
             Job::ReleaseKey(transform, source_table, key, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
+                calls.spawn(trellis, submitted, reply, move |t, at| {
                     Box::pin(async move {
-                        let _ = reply.send(
-                            t.submitted(at, t.release_key(&transform, &source_table, &key))
-                                .await,
-                        );
+                        t.submitted(at, t.release_key(&transform, &source_table, &key))
+                            .await
                     })
                 })
             }
             Job::HasLiveDrainWorkers(reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.has_live_drain_workers()).await);
-                    })
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.has_live_drain_workers()).await })
                 })
             }
             Job::HasLiveStagingWorker(reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.has_live_staging_worker()).await);
-                    })
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.has_live_staging_worker()).await })
                 })
             }
-            Job::WatermarkToken(reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.submitted(at, t.watermark_token()).await);
-                    })
-                })
-            }
+            Job::WatermarkToken(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.watermark_token()).await })
+            }),
             Job::AwaitConverged(token, timeout, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, at| {
-                    Box::pin(async move {
-                        let _ =
-                            reply.send(t.submitted(at, t.await_converged(token, timeout)).await);
-                    })
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(
+                        async move { t.submitted(at, t.await_converged(token, timeout)).await },
+                    )
                 })
             }
             // Exempt from the call deadline, like `Trellis::self_check`.
             Job::SelfCheck(table, scope, mode, timeout, reply) => {
-                spawn_call(&mut tasks, trellis, submitted, move |t, _| {
-                    Box::pin(async move {
-                        let _ = reply.send(t.self_check(&table, scope, mode, timeout).await);
-                    })
+                calls.spawn(trellis, submitted, reply, move |t, _| {
+                    Box::pin(async move { t.self_check(&table, scope, mode, timeout).await })
                 })
             }
             Job::Shutdown(reply) => {
@@ -784,10 +752,12 @@ async fn run(
                 // for a call stuck on a lock would hold the shutdown up for
                 // its whole deadline. What a cancelled call started on the
                 // server ends at the server's own `statement_timeout` for it
-                // (see `crate::deadline`).
+                // (see `crate::deadline`); a `self_check`, which runs outside
+                // the deadline, has none, and its statement runs until the
+                // server next writes to the closed connection.
                 drop(trellis);
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
+                let _ = stopping.send(true);
+                while calls.tasks.join_next().await.is_some() {}
                 let Ok(owned) = Arc::try_unwrap(shared) else {
                     unreachable!("every task has finished, so none still holds the Trellis");
                 };
@@ -796,17 +766,44 @@ async fn run(
             }
         }
     }
-    while tasks.join_next().await.is_some() {}
+    while calls.tasks.join_next().await.is_some() {}
 }
 
-/// Spawns the call `make` builds for `trellis`, submitted at `submitted`.
-fn spawn_call(
-    tasks: &mut tokio::task::JoinSet<()>,
-    trellis: Arc<Trellis>,
-    submitted: Instant,
-    make: impl FnOnce(Arc<Trellis>, Instant) -> Pin<Box<dyn Future<Output = ()> + Send>>,
-) {
-    tasks.spawn(make(trellis, submitted));
+/// The calls [`run`] has spawned, each a task of its own, and the signal that
+/// stops them all: `Job::Shutdown` sets it.
+struct Calls {
+    tasks: tokio::task::JoinSet<()>,
+    stop: watch::Receiver<bool>,
+}
+
+impl Calls {
+    /// Spawns the call `make` builds for `trellis`, submitted at `submitted`,
+    /// and sends its result to `reply`. A shutdown drops the call where it is
+    /// and replies [`TrellisError::CancelledByShutdown`] instead.
+    fn spawn<T: Send + 'static>(
+        &mut self,
+        trellis: Arc<Trellis>,
+        submitted: Instant,
+        reply: oneshot::Sender<Result<T, TrellisError>>,
+        make: impl FnOnce(
+            Arc<Trellis>,
+            Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<T, TrellisError>> + Send>>,
+    ) {
+        let call = make(trellis, submitted);
+        let mut stop = self.stop.clone();
+        self.tasks.spawn(async move {
+            let result = tokio::select! {
+                result = call => result,
+                // `Err` only once the sender is gone, which `run` keeps until
+                // every task has ended: the branch is then disabled, not taken.
+                Ok(_) = stop.wait_for(|stopping| *stopping) => {
+                    Err(TrellisError::CancelledByShutdown)
+                }
+            };
+            let _ = reply.send(result);
+        });
+    }
 }
 
 /// Issue #587: a public [`Trellis`] method with no [`BlockingTrellis`] twin

@@ -380,12 +380,11 @@ fn a_started_call_wakes_its_waker_and_a_shutdown_does_not_wait_for_it() {
         started.elapsed()
     );
 
-    // The call was cancelled: its waker was woken, and it reports the
-    // background thread gone.
+    // The call was cancelled: its waker was woken, and it says why.
     assert!(woken.0.load(Ordering::SeqCst) > 0, "the waker never woke");
     match Pin::new(&mut stuck).poll(&mut cx) {
-        Poll::Ready(Err(TrellisError::BlockingThreadGone)) => {}
-        other => panic!("expected BlockingThreadGone, got {other:?}"),
+        Poll::Ready(Err(TrellisError::CancelledByShutdown)) => {}
+        other => panic!("expected CancelledByShutdown, got {other:?}"),
     }
 
     runtime.block_on(holder.rollback());

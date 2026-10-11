@@ -164,7 +164,9 @@ through `status` ([decision 1](#1-synchronous-calls-at-the-ffi-boundary)).
 * **Abandoned calls aren't cancelled early.** A caller that goes away leaves its call
   running until the deadline, where the server stops it. The reply is dropped. The
   Ruby binding waits on the calling thread, so an abandoned call costs no thread. A
-  `shutdown` cancels the calls in flight instead of waiting for them.
+  `BlockingTrellis` shutdown cancels the calls in flight instead of waiting for them,
+  and they return `TrellisError::CancelledByShutdown`. The Elixir binding's `shutdown`
+  still takes its handle only once the calls in flight on it have returned.
 * **Long waits are loops of bounded calls.** `await_converged` caps its `timeout` at
   the call's deadline, and a caller that wants longer calls again. `self_check`, a full
   comparison, starts a background job whose progress comes back through `status`.

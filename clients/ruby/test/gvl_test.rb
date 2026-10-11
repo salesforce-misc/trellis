@@ -176,9 +176,10 @@ class GvlTest < Minitest::Test
     elapsed = monotonic - started
 
     assert_operator elapsed, :<, 10, "shutdown waited #{elapsed.round(1)}s for a call stuck on a lock"
-    assert_raises(Trellis::Error, "the stuck call fails once the handle is shut down") do
+    error = assert_raises(Trellis::ValidationError, "the stuck call fails once the handle is shut down") do
       stuck.join(10) or flunk "the stuck call never ended after the shutdown"
     end
+    assert_match(/shut down/, error.message)
   ensure
     release&.close
     wait_for_child(holder, seconds: 30) if holder

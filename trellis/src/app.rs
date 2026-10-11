@@ -2310,10 +2310,16 @@ pub enum TrellisError {
     /// exited (panicked, or its setup future dropped its ready-sender)
     /// before ever signalling ready.
     BlockingThreadExitedBeforeReady,
-    /// A [`crate::blocking::BlockingTrellis`] method's background thread was
-    /// no longer there to service the call (it panicked after connecting
-    /// successfully) — the job channel send or reply recv failed.
+    /// A [`crate::blocking::BlockingTrellis`] call got no reply: the
+    /// background thread was no longer there to service it (it panicked after
+    /// connecting successfully), or the call's own task panicked — the job
+    /// channel send or reply recv failed.
     BlockingThreadGone,
+    /// A [`crate::blocking::BlockingTrellis`] call was still in flight when
+    /// the handle was shut down, and the shutdown cancelled it rather than
+    /// wait for it. What the call had started on the server ends at the
+    /// call's deadline, where the server stops it.
+    CancelledByShutdown,
     /// A [`crate::blocking::BlockingTrellis`] method was called from a thread
     /// that already has a `tokio` runtime entered (e.g. from inside
     /// `#[tokio::test]` or a `tokio::spawn`ed task). Blocking such a thread
@@ -2396,6 +2402,9 @@ impl TrellisError {
             | TrellisError::BlockingThreadGone => ErrorCode::Internal,
             // Caller misuse (wrong calling context), not an engine fault.
             TrellisError::CalledFromAsyncContext => ErrorCode::Validation,
+            // A call racing its handle's shutdown: the same category the
+            // bindings give a call made after it.
+            TrellisError::CancelledByShutdown => ErrorCode::Validation,
             TrellisError::Apply(err) => err.code(),
             TrellisError::TransformNotFound(_) | TrellisError::ColumnNotFound { .. } => {
                 ErrorCode::NotFound
@@ -2436,6 +2445,10 @@ impl std::fmt::Display for TrellisError {
             TrellisError::BlockingThreadGone => write!(
                 f,
                 "BlockingTrellis's runtime thread was no longer running to service this call"
+            ),
+            TrellisError::CancelledByShutdown => write!(
+                f,
+                "this call was cancelled because its Trellis handle was shut down while it ran"
             ),
             TrellisError::CalledFromAsyncContext => write!(
                 f,
@@ -2483,6 +2496,7 @@ impl std::error::Error for TrellisError {
             | TrellisError::TableNotCaptured { .. }
             | TrellisError::BlockingThreadExitedBeforeReady
             | TrellisError::BlockingThreadGone
+            | TrellisError::CancelledByShutdown
             | TrellisError::CalledFromAsyncContext
             | TrellisError::CallTimeout { .. } => None,
             TrellisError::BlockingSpawn(err) => Some(err),
