@@ -21,7 +21,7 @@ use testkit::crash::OpenTransaction;
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::{Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
+use trellis::{Config, ErrorCode, SelfCheckMode, Trellis, TrellisError, TrellisOptions};
 
 /// The shortened call deadline.
 const DEADLINE: Duration = Duration::from_millis(700);
@@ -200,6 +200,10 @@ async fn a_call_stuck_on_a_lock_ends_at_its_deadline_and_the_server_drops_it() {
     stuck!(f, "has_live_drain_workers", t => t.has_live_drain_workers());
     // Capped to the deadline: an hour's wait is one call's 700 ms.
     stuck!(f, "await_converged", t => t.await_converged(token, Duration::from_secs(3600)));
+    // A start and a poll read the catalog and nothing else: the comparison is
+    // a worker's, not a call's (#1023).
+    stuck!(f, "self_check", t => t.self_check("widget_totals", SelfCheckMode::Strict, Duration::from_secs(1)));
+    stuck!(f, "self_check_job", t => t.self_check_job(1));
 
     holder.rollback().await;
 }
@@ -359,6 +363,8 @@ fn every_public_method_is_tested_or_exempt() {
         "has_live_staging_worker",
         "watermark_token",
         "await_converged",
+        "self_check",
+        "self_check_job",
     ];
     const EXEMPT: &[(&str, &str)] = &[
         (
@@ -372,11 +378,6 @@ fn every_public_method_is_tested_or_exempt() {
             "shutdown",
             "ends background work, not a request; each worker's own waits are bounded by \
              the lock timeout",
-        ),
-        (
-            "self_check",
-            "a full target comparison; #599 decided it becomes a background job polled \
-             through `status`, which is a follow-up",
         ),
     ];
     let source = std::fs::read_to_string(

@@ -25,6 +25,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
 use trellis::defs::subscription::{Subscribed, subscribed};
 use trellis::intake::markers;
+use trellis::staging::self_check::CheckPageExt;
 use trellis::{CaptureFault, CatalogError, Divergence, SelfCheckOutcome, TrellisError};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -420,12 +421,8 @@ async fn status(trellis: &trellis::Trellis, target: &str) -> trellis::Definition
 
 async fn self_check(trellis: &trellis::Trellis, target: &str) -> SelfCheckOutcome {
     trellis
-        .self_check(
+        .self_check_to_end(
             target,
-            trellis::SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
             trellis::SelfCheckMode::Strict,
             Duration::from_secs(30),
         )

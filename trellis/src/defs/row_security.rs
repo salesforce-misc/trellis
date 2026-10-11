@@ -117,6 +117,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use tokio_postgres::GenericClient;
 
 use crate::capture::install::RING_OWNER;
@@ -124,7 +126,7 @@ use crate::defs::ddl::regclass_arg;
 
 /// Row-level security that applies to a role Trellis reads `table` as, found
 /// by [`applying`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RowSecurity {
     /// The table, as its unquoted `schema.table` identity.
     pub table: String,

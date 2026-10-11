@@ -169,7 +169,8 @@ through `status` ([decision 1](#1-synchronous-calls-at-the-ffi-boundary)).
   still takes its handle only once the calls in flight on it have returned.
 * **Long waits are loops of bounded calls.** `await_converged` caps its `timeout` at
   the call's deadline, and a caller that wants longer calls again. `self_check`, a full
-  comparison, starts a background job whose progress comes back through `status`.
+  comparison, starts a background job and returns it; the caller polls
+  `self_check_job` with the job's id.
 
 Rejected: cancel handles (racy, as above); unbounded calls unless the caller passes a
 timeout (every caller must remember to, and a queue still piles up behind a stuck

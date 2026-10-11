@@ -60,16 +60,17 @@ use magnus::{
     Error, Exception, ExceptionClass, IntoValue, RArray, RClass, RHash, RModule, Ruby,
     StaticSymbol, Value, function, method,
 };
-use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, SelfCheckScope, TrellisOptions};
+use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
     PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
     PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys, PlainPoisonEntry,
     PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
-    PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_OUTCOMES, capture_failure_kind_names,
-    decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
-    relationship_cardinality_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -360,31 +361,32 @@ impl Handle {
         })
     }
 
-    /// Audits up to `limit` of `target_table`'s keys after `after` (`nil`
-    /// for the first page) against a fresh recompute from the source, in
-    /// `mode` (`"standard"` or `"strict"`), waiting up to `timeout_ms` per
-    /// convergence await. Like `await_converged`, it holds the handle for as
-    /// long as it waits.
+    /// Starts a background check of `target_table` against a fresh recompute
+    /// from the source, in `mode` (`"standard"` or `"strict"`), waiting up to
+    /// `timeout_ms` per convergence await its pages make, and returns the job
+    /// at once. A target whose job is still running gets that job back.
     fn self_check(
         ruby: &Ruby,
         rb_self: &Self,
         target_table: String,
-        after: Option<String>,
-        limit: i64,
         mode: String,
         timeout_ms: u64,
     ) -> Result<RHash, Error> {
         rb_self.check_pid(ruby)?;
         let mode = self_check_mode(&mode).map_err(|err| raise(ruby, err))?;
-        let report = rb_self.call(ruby, |trellis| {
-            trellis.start_self_check(
-                &target_table,
-                SelfCheckScope { after, limit },
-                mode,
-                Duration::from_millis(timeout_ms),
-            )
+        let job = rb_self.call(ruby, |trellis| {
+            trellis.start_self_check(&target_table, mode, Duration::from_millis(timeout_ms))
         })?;
-        self_check_hash(ruby, PlainSelfCheckReport::from(&report))
+        self_check_job_hash(ruby, PlainSelfCheckJob::from(&job))
+    }
+
+    /// The `self_check` job `id`, or `nil` when there is none: a newer
+    /// `self_check` of its target replaced it, or its transform was dropped.
+    fn self_check_job(ruby: &Ruby, rb_self: &Self, id: i64) -> Result<Option<RHash>, Error> {
+        rb_self.check_pid(ruby)?;
+        let job = rb_self.call(ruby, |trellis| trellis.start_self_check_job(id))?;
+        job.map(|job| self_check_job_hash(ruby, PlainSelfCheckJob::from(&job)))
+            .transpose()
     }
 
     /// The configuration the handle connected with, all but the connection
@@ -820,6 +822,8 @@ fn symbol_words() -> impl Iterator<Item = &'static str> {
         .chain(relationship_cardinality_names())
         .chain(PlainApplied::KINDS)
         .chain(SELF_CHECK_OUTCOMES)
+        .chain(SELF_CHECK_STATES)
+        .chain(SELF_CHECK_MODES)
         .chain(DIVERGENCE_KINDS)
         .chain(capture_failure_kind_names())
 }
@@ -1148,7 +1152,28 @@ fn poison_entry_hash(ruby: &Ruby, entry: PlainPoisonEntry) -> Result<RHash, Erro
     )
 }
 
-/// What `self_check` found. `outcome` is one of [`SELF_CHECK_OUTCOMES`];
+/// A `self_check` job. `mode` is one of [`SELF_CHECK_MODES`], `state` one of
+/// [`SELF_CHECK_STATES`]; `report` is set once it is `done`.
+fn self_check_job_hash(ruby: &Ruby, job: PlainSelfCheckJob) -> Result<RHash, Error> {
+    let report = job
+        .report
+        .map(|report| self_check_hash(ruby, report))
+        .transpose()?;
+    record(
+        ruby,
+        [
+            ("id", ruby.into_value(job.id)),
+            ("target", ruby.into_value(job.target)),
+            ("mode", word_symbol(ruby, job.mode).as_value()),
+            ("state", word_symbol(ruby, job.state).as_value()),
+            ("rows_compared", ruby.into_value(job.rows_compared)),
+            ("report", ruby.into_value(report)),
+            ("error", ruby.into_value(job.error)),
+        ],
+    )
+}
+
+/// What a finished `self_check` job found. `outcome` is one of [`SELF_CHECK_OUTCOMES`];
 /// `divergences` is empty unless it is `diverged`, and `status` is set only
 /// when it is `not_live`.
 fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, Error> {
@@ -1158,7 +1183,6 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
         .map(|held| held_keys_hash(ruby, held))
         .transpose()?;
     let drain_failures = array(ruby, report.drain_failures, drain_failure_hash)?;
-    let unindexed_joins = array(ruby, report.unindexed_joins, unindexed_join_hash)?;
     let status = report
         .status
         .map(|status| word_symbol(ruby, status).as_value());
@@ -1168,13 +1192,12 @@ fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, E
             ("target", ruby.into_value(report.target)),
             ("checked_through", ruby.into_value(report.checked_through)),
             ("rows_compared", ruby.into_value(report.rows_compared)),
-            ("next_after", ruby.into_value(report.next_after)),
+            ("truncated", ruby.into_value(report.truncated)),
             ("outcome", word_symbol(ruby, report.outcome).as_value()),
             ("status", ruby.into_value(status)),
             ("divergences", divergences.as_value()),
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failures", drain_failures.as_value()),
-            ("unindexed_joins", unindexed_joins.as_value()),
         ],
     )
 }
@@ -1227,6 +1250,16 @@ fn self_check_outcomes(ruby: &Ruby) -> RArray {
     word_symbols(ruby, SELF_CHECK_OUTCOMES)
 }
 
+/// Every mode symbol a `self_check` job can carry.
+fn self_check_modes(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, SELF_CHECK_MODES)
+}
+
+/// Every state symbol a `self_check` job can carry.
+fn self_check_states(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, SELF_CHECK_STATES)
+}
+
 /// Every divergence kind symbol `self_check`'s report can carry.
 fn divergence_kinds(ruby: &Ruby) -> RArray {
     word_symbols(ruby, DIVERGENCE_KINDS)
@@ -1262,6 +1295,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("cardinality_names", function!(cardinality_names, 0))?;
     native.define_module_function("applied_kinds", function!(applied_kinds, 0))?;
     native.define_module_function("self_check_outcomes", function!(self_check_outcomes, 0))?;
+    native.define_module_function("self_check_modes", function!(self_check_modes, 0))?;
+    native.define_module_function("self_check_states", function!(self_check_states, 0))?;
     native.define_module_function("divergence_kinds", function!(divergence_kinds, 0))?;
     native.define_module_function("capture_failure_kinds", function!(capture_failure_kinds, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
@@ -1290,7 +1325,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     handle.define_method("watermark_token", method!(Handle::watermark_token, 0))?;
     handle.define_method("await_converged", method!(Handle::await_converged, 2))?;
-    handle.define_method("self_check", method!(Handle::self_check, 5))?;
+    handle.define_method("self_check", method!(Handle::self_check, 3))?;
+    handle.define_method("self_check_job", method!(Handle::self_check_job, 1))?;
     handle.define_method("config", method!(Handle::config, 0))?;
     handle.define_method("shutdown", method!(Handle::shutdown, 0))?;
     Ok(())

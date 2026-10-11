@@ -1,7 +1,7 @@
 defmodule Trellis.SelfCheckTest do
-  # `self_check/3` end to end: audit a live target that matches its source,
-  # page through it, then corrupt one target cell behind the engine's back
-  # and see the audit name it.
+  # `self_check/3` end to end: start a background check of a live target that
+  # matches its source, read the job back by id, then corrupt one target cell
+  # behind the engine's back and see the check name it.
   #
   # Shares the suite's one database and runs its one staging worker, so it
   # doesn't run concurrently with the other integration tests.
@@ -9,7 +9,7 @@ defmodule Trellis.SelfCheckTest do
 
   import Trellis.Eventually
 
-  alias Trellis.{Divergence, SelfCheckReport, Status, TestCluster}
+  alias Trellis.{Divergence, SelfCheckJob, SelfCheckReport, Status, TestCluster}
 
   @timeout_ms 30_000
 
@@ -20,7 +20,7 @@ defmodule Trellis.SelfCheckTest do
     :ok
   end
 
-  test "a matching target converges, pages by next_after, and a corrupted cell diverges" do
+  test "a matching target converges and a corrupted cell diverges" do
     pg = TestCluster.postgrex!()
 
     Postgrex.query!(
@@ -47,53 +47,58 @@ defmodule Trellis.SelfCheckTest do
 
     :ok = Trellis.await_converged!(trellis, Trellis.watermark_token!(trellis), @timeout_ms)
 
-    assert %SelfCheckReport{
-             target: "audited_widget_totals",
-             outcome: :converged,
-             divergences: [],
+    # The call returns the job; a drain worker runs it.
+    started = Trellis.self_check!(trellis, "audited_widget_totals", timeout_ms: @timeout_ms)
+
+    assert %SelfCheckJob{target: "audited_widget_totals", mode: :standard} = started
+    assert started.state in [:queued, :running, :done]
+
+    assert %SelfCheckJob{
+             state: :done,
              rows_compared: 2,
-             next_after: nil,
-             checked_through: checked_through
-           } =
-             Trellis.self_check!(trellis, "audited_widget_totals",
-               limit: 100,
-               timeout_ms: @timeout_ms
-             )
+             error: nil,
+             report: %SelfCheckReport{
+               target: "audited_widget_totals",
+               outcome: :converged,
+               divergences: [],
+               rows_compared: 2,
+               truncated: false,
+               drain_failures: [],
+               checked_through: checked_through
+             }
+           } = job = await_job(trellis, started.id)
+
+    assert SelfCheckJob.finished?(job)
 
     # The position it checked through is a real watermark token.
     assert :ok = Trellis.await_converged(trellis, checked_through, @timeout_ms)
 
-    # One key a page: sweeping through `next_after` visits each key once
-    # and ends on a `nil` cursor. A page that fills its limit exactly still
-    # hands back a cursor (the engine can't know no key follows), so the
-    # sweep ends on an empty third page.
-    pages = sweep(trellis, "audited_widget_totals", 1)
-
-    assert Enum.map(pages, &{&1.rows_compared, is_binary(&1.next_after)}) ==
-             [{1, true}, {1, true}, {0, false}]
-
-    assert Enum.all?(pages, &(&1.outcome == :converged))
-
     # The engine wrote 11 (10 + 1); this test overwrites it.
     Postgrex.query!(pg, "update audited_widget_totals set total = 9999 where id = '1'", [])
 
-    assert {:ok,
-            %SelfCheckReport{
-              outcome: :diverged,
-              divergences: [
-                %Divergence{
-                  kind: :cell,
-                  key: "1",
-                  column: "total",
-                  persisted: "9999",
-                  recomputed: "11"
-                }
-              ]
-            }} =
-             Trellis.self_check(trellis, "audited_widget_totals",
-               limit: 100,
-               timeout_ms: @timeout_ms
-             )
+    # A new check replaces the finished one: its id is gone.
+    second =
+      Trellis.self_check!(trellis, "audited_widget_totals",
+        timeout_ms: @timeout_ms,
+        mode: :strict
+      )
+
+    assert {:ok, nil} = Trellis.self_check_job(trellis, started.id)
+
+    assert %SelfCheckJob{
+             report: %SelfCheckReport{
+               outcome: :diverged,
+               divergences: [
+                 %Divergence{
+                   kind: :cell,
+                   key: "1",
+                   column: "total",
+                   persisted: "9999",
+                   recomputed: "11"
+                 }
+               ]
+             }
+           } = await_job(trellis, second.id)
 
     # A source attached as a partition is no longer captured whole, which the
     # capture audit reports before it compares anything. The staging worker
@@ -117,20 +122,45 @@ defmodule Trellis.SelfCheckTest do
       Postgrex.query!(pg, "alter table audited_widgets_all detach partition audited_widgets", [])
     end)
 
-    assert {:ok,
-            %SelfCheckReport{
-              outcome: :diverged,
-              rows_compared: 0,
-              divergences: [
-                %Divergence{kind: :capture, table: "public.audited_widgets", detail: detail}
-              ]
-            }} =
-             Trellis.self_check(trellis, "audited_widget_totals",
-               limit: 100,
-               timeout_ms: @timeout_ms
-             )
+    third = Trellis.self_check!(trellis, "audited_widget_totals", timeout_ms: @timeout_ms)
+
+    assert %SelfCheckJob{
+             report: %SelfCheckReport{
+               outcome: :diverged,
+               rows_compared: 0,
+               divergences: [
+                 %Divergence{kind: :capture, table: "public.audited_widgets", detail: detail}
+               ]
+             }
+           } = await_job(trellis, third.id)
 
     assert detail =~ "partition of public.audited_widgets_all"
+  end
+
+  # With no drain worker anywhere, a job is registered and stays queued, and a
+  # second call for the target returns the same job.
+  test "a job no worker runs stays queued, and a second call returns it" do
+    pg = TestCluster.postgrex!()
+    Postgrex.query!(pg, "create table queued_widgets (id integer primary key, price integer)", [])
+
+    trellis = Trellis.connect!(url: TestCluster.info()["dsn"])
+    on_exit(fn -> Trellis.shutdown(trellis) end)
+
+    Trellis.apply!(
+      trellis,
+      "TRANSFORM queued_widget_prices FROM queued_widgets SELECT price AS price"
+    )
+
+    job = Trellis.self_check!(trellis, "queued_widget_prices", timeout_ms: 1_000, mode: :strict)
+
+    assert %SelfCheckJob{state: :queued, mode: :strict, rows_compared: 0, report: nil, error: nil} =
+             job
+
+    refute SelfCheckJob.finished?(job)
+
+    assert job == Trellis.self_check!(trellis, "queued_widget_prices", timeout_ms: 5_000)
+    assert {:ok, job} == Trellis.self_check_job(trellis, job.id)
+    assert {:ok, nil} = Trellis.self_check_job(trellis, job.id + 1_000)
   end
 
   test "an unknown target is :not_found, and bad options are :validation" do
@@ -138,18 +168,16 @@ defmodule Trellis.SelfCheckTest do
     on_exit(fn -> Trellis.shutdown(trellis) end)
 
     assert {:error, %Trellis.Error{code: :not_found, message: message}} =
-             Trellis.self_check(trellis, "no_such_target", limit: 10, timeout_ms: 1_000)
+             Trellis.self_check(trellis, "no_such_target", timeout_ms: 1_000)
 
     assert message =~ "no_such_target"
 
     for options <- [
-          [timeout_ms: 1_000],
-          [limit: 10],
-          [limit: 0, timeout_ms: 1_000],
-          [limit: 10, timeout_ms: -1],
-          [limit: 10, timeout_ms: 1_000, mode: :lenient],
-          [limit: 10, timeout_ms: 1_000, after: 5],
-          [limit: 10, timeout_ms: 1_000, page: 2]
+          [],
+          [timeout_ms: -1],
+          [timeout_ms: 1_000, mode: :lenient],
+          [limit: 10, timeout_ms: 1_000],
+          [timeout_ms: 1_000, after: "1"]
         ] do
       assert {:error, %Trellis.Error{code: :validation}} =
                Trellis.self_check(trellis, "no_such_target", options),
@@ -157,21 +185,16 @@ defmodule Trellis.SelfCheckTest do
     end
   end
 
-  # Every page of a strict audit of `target`, `limit` keys at a time,
-  # through to the one whose `next_after` is `nil`.
-  defp sweep(trellis, target, limit, cursor \\ nil) do
-    report =
-      Trellis.self_check!(trellis, target,
-        limit: limit,
-        timeout_ms: @timeout_ms,
-        mode: :strict,
-        after: cursor
-      )
+  defp await_job(trellis, id) do
+    eventually("self_check job #{id} to finish", fn ->
+      case Trellis.self_check_job!(trellis, id) do
+        %SelfCheckJob{} = job ->
+          if SelfCheckJob.finished?(job), do: {:done, job}, else: {:waiting, job}
 
-    case report.next_after do
-      nil -> [report]
-      next -> [report | sweep(trellis, target, limit, next)]
-    end
+        nil ->
+          {:waiting, nil}
+      end
+    end)
   end
 
   defp await_live(trellis, target) do

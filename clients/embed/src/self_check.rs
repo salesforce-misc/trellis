@@ -1,21 +1,26 @@
-//! `self_check`'s report crosses as a [`PlainSelfCheckReport`]: its outcome
-//! as a word and its divergences as a flat list, each tagged with its kind's
-//! word (ADR-0010 decision 4). A host makes atoms or symbols of those words
-//! from [`SELF_CHECK_OUTCOMES`] and [`DIVERGENCE_KINDS`], allocated at load.
+//! `self_check` starts a background job (#1023), and the job crosses as a
+//! [`PlainSelfCheckJob`]: its id, its state as a word, how many keys it has
+//! compared, and, once it is done, its report. The report is a
+//! [`PlainSelfCheckReport`]: its outcome as a word and its divergences as a
+//! flat list, each tagged with its kind's word (ADR-0010 decision 4). A host
+//! makes atoms or symbols of those words from [`SELF_CHECK_STATES`],
+//! [`SELF_CHECK_OUTCOMES`] and [`DIVERGENCE_KINDS`], allocated at load.
 //!
 //! The report's `checked_through` position crosses as a watermark token
 //! ([`crate::encode_watermark`]), so a host can hand it straight to
-//! `await_converged`. Its `next_after` is already a plain string: the keyset
-//! cursor the next page's `after` takes back.
+//! `await_converged`.
 //!
 //! The mode goes the other way, as a word [`self_check_mode`] reads.
 
-use trellis::{Divergence, ErrorCode, SelfCheckMode, SelfCheckOutcome, SelfCheckReport};
-
-use crate::{
-    PlainDrainFailure, PlainError, PlainHeldKeys, PlainUnindexedJoin, encode_watermark,
-    transform_status,
+use trellis::{
+    Divergence, ErrorCode, SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome,
+    SelfCheckReport,
 };
+
+use crate::{PlainDrainFailure, PlainError, PlainHeldKeys, encode_watermark, transform_status};
+
+/// Every word [`PlainSelfCheckJob::state`] can be.
+pub const SELF_CHECK_STATES: [&str; 5] = ["queued", "running", "done", "failed", "cancelled"];
 
 /// Every word [`PlainSelfCheckReport::outcome`] can be.
 pub const SELF_CHECK_OUTCOMES: [&str; 4] = ["converged", "not_caught_up", "not_live", "diverged"];
@@ -46,6 +51,49 @@ pub fn self_check_mode(word: &str) -> Result<SelfCheckMode, PlainError> {
     }
 }
 
+/// A [`SelfCheckJob`] flattened to plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainSelfCheckJob {
+    /// The id to poll the job by.
+    pub id: i64,
+    /// The audited target's bare table name.
+    pub target: String,
+    /// One of [`SELF_CHECK_MODES`].
+    pub mode: &'static str,
+    /// One of [`SELF_CHECK_STATES`]: `queued` (no worker has taken it),
+    /// `running`, then `done`, `failed` or `cancelled`.
+    pub state: &'static str,
+    /// How many distinct keys the pages so far compared.
+    pub rows_compared: i64,
+    /// The result, when `state` is `done`.
+    pub report: Option<PlainSelfCheckReport>,
+    /// Why the job is `failed` or `cancelled`.
+    pub error: Option<String>,
+}
+
+impl From<&SelfCheckJob> for PlainSelfCheckJob {
+    fn from(job: &SelfCheckJob) -> Self {
+        PlainSelfCheckJob {
+            id: job.id,
+            target: job.target.clone(),
+            mode: match job.mode {
+                SelfCheckMode::Standard => "standard",
+                SelfCheckMode::Strict => "strict",
+            },
+            state: match job.state {
+                SelfCheckJobState::Queued => "queued",
+                SelfCheckJobState::Running => "running",
+                SelfCheckJobState::Done => "done",
+                SelfCheckJobState::Failed => "failed",
+                SelfCheckJobState::Cancelled => "cancelled",
+            },
+            rows_compared: job.rows_compared,
+            report: job.report.as_ref().map(PlainSelfCheckReport::from),
+            error: job.error.clone(),
+        }
+    }
+}
+
 /// A [`SelfCheckReport`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainSelfCheckReport {
@@ -53,12 +101,12 @@ pub struct PlainSelfCheckReport {
     pub target: String,
     /// The position the outcome was checked through, as a watermark token.
     pub checked_through: String,
-    /// How many distinct keys the call compared; zero when the target never
+    /// How many distinct keys the job compared; zero when the target never
     /// caught up.
     pub rows_compared: i64,
-    /// The cursor to pass as the next call's `after`, or `None` when this
-    /// page reached the end of the target's keys.
-    pub next_after: Option<String>,
+    /// Whether the job stopped before the end of the target's keys; see
+    /// [`SelfCheckReport::truncated`].
+    pub truncated: bool,
     /// One of [`SELF_CHECK_OUTCOMES`].
     pub outcome: &'static str,
     /// The audited definition's status word (one of
@@ -75,10 +123,6 @@ pub struct PlainSelfCheckReport {
     /// oldest first, whatever the outcome; see
     /// [`SelfCheckReport::drain_failures`].
     pub drain_failures: Vec<PlainDrainFailure>,
-    /// The join columns of the relationships the audited definition reads
-    /// that have no usable index, whatever the outcome; see
-    /// [`SelfCheckReport::unindexed_joins`].
-    pub unindexed_joins: Vec<PlainUnindexedJoin>,
 }
 
 /// One [`Divergence`] flattened to plain data. `kind` is one of
@@ -123,7 +167,7 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
             target: report.target.clone(),
             checked_through: encode_watermark(report.checked_through),
             rows_compared: report.rows_compared,
-            next_after: report.next_after.clone(),
+            truncated: report.truncated,
             outcome,
             status,
             divergences,
@@ -132,11 +176,6 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
                 .drain_failures
                 .iter()
                 .map(PlainDrainFailure::from)
-                .collect(),
-            unindexed_joins: report
-                .unindexed_joins
-                .iter()
-                .map(PlainUnindexedJoin::from)
                 .collect(),
         }
     }
@@ -200,11 +239,10 @@ mod tests {
             target: "order_totals".to_string(),
             checked_through: PgLsn::from(0x1_016B_3748),
             rows_compared: 42,
-            next_after: Some("42".to_string()),
+            truncated: false,
             outcome,
             held_keys: None,
             drain_failures: Vec::new(),
-            unindexed_joins: Vec::new(),
         }
     }
 
@@ -218,13 +256,12 @@ mod tests {
                 target: "order_totals".to_string(),
                 checked_through: "1/16B3748".to_string(),
                 rows_compared: 42,
-                next_after: Some("42".to_string()),
+                truncated: false,
                 outcome: "converged",
                 status: None,
                 divergences: Vec::new(),
                 held_keys: None,
                 drain_failures: Vec::new(),
-                unindexed_joins: Vec::new(),
             }
         );
         // The position is a real watermark token, so a host can wait on it.
@@ -248,29 +285,6 @@ mod tests {
                 count: 2,
                 oldest_poisoned_at_micros: 1_727_222_400_000_001,
             })
-        );
-    }
-
-    #[test]
-    fn unindexed_joins_cross_with_any_outcome() {
-        let mut warned = report(SelfCheckOutcome::Converged);
-        warned.unindexed_joins = vec![trellis::UnindexedJoin {
-            relationship: "orders".to_string(),
-            table: "public.orders".to_string(),
-            column: "customer_id".to_string(),
-        }];
-
-        let plain = PlainSelfCheckReport::from(&warned);
-
-        assert_eq!(plain.outcome, "converged");
-        assert_eq!(
-            plain.unindexed_joins,
-            vec![PlainUnindexedJoin {
-                relationship: "orders".to_string(),
-                table: "public.orders".to_string(),
-                column: "customer_id".to_string(),
-                fix: "create an index on public.orders (customer_id)".to_string(),
-            }]
         );
     }
 
@@ -429,6 +443,61 @@ mod tests {
         // Every kind produced is one a host allocated at load.
         for divergence in &plain.divergences {
             assert!(DIVERGENCE_KINDS.contains(&divergence.kind));
+        }
+    }
+
+    #[test]
+    fn a_job_crosses_with_its_state_word_and_its_report_only_when_done() {
+        let job = |state, report: Option<SelfCheckReport>, error: Option<&str>| SelfCheckJob {
+            id: 7,
+            target: "order_totals".to_string(),
+            mode: SelfCheckMode::Strict,
+            state,
+            rows_compared: 42,
+            report,
+            error: error.map(str::to_string),
+        };
+
+        let queued = PlainSelfCheckJob::from(&job(SelfCheckJobState::Queued, None, None));
+        assert_eq!(
+            queued,
+            PlainSelfCheckJob {
+                id: 7,
+                target: "order_totals".to_string(),
+                mode: "strict",
+                state: "queued",
+                rows_compared: 42,
+                report: None,
+                error: None,
+            }
+        );
+
+        let done = PlainSelfCheckJob::from(&job(
+            SelfCheckJobState::Done,
+            Some(report(SelfCheckOutcome::Converged)),
+            None,
+        ));
+        assert_eq!(done.state, "done");
+        assert_eq!(done.report.expect("report").outcome, "converged");
+
+        let cancelled = PlainSelfCheckJob::from(&job(
+            SelfCheckJobState::Cancelled,
+            None,
+            Some("cancelled: the worker running it shut down"),
+        ));
+        assert_eq!(cancelled.state, "cancelled");
+        assert!(cancelled.error.expect("why").contains("shut down"));
+
+        for state in [
+            SelfCheckJobState::Queued,
+            SelfCheckJobState::Running,
+            SelfCheckJobState::Done,
+            SelfCheckJobState::Failed,
+            SelfCheckJobState::Cancelled,
+        ] {
+            let word = PlainSelfCheckJob::from(&job(state, None, None)).state;
+            assert!(SELF_CHECK_STATES.contains(&word), "{word}");
+            assert_eq!(word, state.as_str());
         }
     }
 

@@ -123,17 +123,25 @@
       "samples": {"list_of": {"record": "PoisonSample"}},
       "next_cursor": {"nullable": "string"}
     },
+    "SelfCheckJob": {
+      "id": "integer",
+      "target": "string",
+      "mode": {"word_in": "self_check_mode"},
+      "state": {"word_in": "self_check_state"},
+      "rows_compared": "integer",
+      "report": {"nullable": {"record": "SelfCheckReport"}},
+      "error": {"nullable": "string"}
+    },
     "SelfCheckReport": {
       "target": "string",
       "outcome": {"word_in": "self_check_outcome"},
       "status": {"nullable": {"word_in": "transform_status"}},
       "divergences": {"list_of": {"record": "Divergence"}},
       "rows_compared": "integer",
-      "next_after": {"nullable": "string"},
+      "truncated": "boolean",
       "checked_through": "string",
       "held_keys": {"nullable": {"record": "HeldKeys"}},
-      "drain_failures": {"list_of": {"record": "DrainFailure"}},
-      "unindexed_joins": {"list_of": {"record": "UnindexedJoin"}}
+      "drain_failures": {"list_of": {"record": "DrainFailure"}}
     },
     "Divergence": {
       "kind": {"word_in": "divergence_kind"},
@@ -181,7 +189,7 @@
 
     {"about": "The quarantine reads name a transform, so an unknown one is not_found rather than empty.", "op": "quarantine_status", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
     {"op": "sample_quarantined", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
-    {"op": "self_check", "args": ["parity_nowhere"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"error": "not_found"}},
+    {"op": "self_check", "args": ["parity_nowhere"], "opts": {"timeout_ms": 0}, "expect": {"error": "not_found"}},
     {"op": "request_backfill", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
     {"op": "release_key", "args": ["parity_nowhere", "parity_items", "1"], "expect": {"error": "not_found"}},
     {"op": "apply", "args": ["TRANSFORM parity_oops"], "expect": {"error": "parse"}},
@@ -261,7 +269,7 @@
     {"op": "apply", "args": ["RELATIONSHIP parity_account FROM parity_invoices.account_id TO parity_accounts.id"], "expect": {"record": "Applied", "fields": {"kind": {"word": "relationship_defined"}}}},
     {"op": "apply", "args": ["TRANSFORM parity_invoice_view FROM parity_invoices SELECT parity_account.name AS account_name"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
     {"op": "status", "args": ["parity_invoice_view"], "expect": {"record": "Status", "fields": {"unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "parity_account"}, "table": {"eq": "public.parity_invoices"}, "column": {"eq": "account_id"}, "fix": {"eq": "create an index on public.parity_invoices (account_id)"}}}]}}}},
-    {"about": "The audit stops before comparing a definition that isn't live, and its report carries the same list. (A live target that reads a relationship is refused by self_check, so status is where the list is read; see known-correctness-gaps.md.)", "op": "self_check", "args": ["parity_invoice_view"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_live"}, "unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "parity_account"}, "column": {"eq": "account_id"}}}]}}}},
+    {"about": "A target that reads a relationship can't be compared, so the job isn't started for it. (status is where its unindexed join columns are read; see known-correctness-gaps.md.)", "op": "self_check", "args": ["parity_invoice_view"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
     {"about": "Creating the index clears the entry on the next call, with no restart.", "op": "sql", "args": ["create index on parity_invoices (account_id)"]},
     {"op": "status", "args": ["parity_invoice_view"], "expect": {"record": "Status", "fields": {"unindexed_joins": {"list": []}}}},
     {"op": "apply", "args": ["PAUSE TRANSFORM parity_invoice_view"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
@@ -277,7 +285,6 @@
     {"about": "A captured write to a defined source: the token below has work outstanding (#556).", "op": "sql", "args": ["update parity_items set price = 51 where id = 5"]},
     {"op": "watermark_token", "save": "idle_token", "expect": "string"},
     {"about": "Nothing drains the write, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
-    {"about": "The audit compares only a live definition. With no drain worker nothing is built, so these are not live yet, whichever word they are at.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_live"}, "status": {"word_in": "transform_status"}, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null, "drain_failures": {"list": []}}}},
     {"op": "shutdown", "expect": null},
 
     {"about": "connect is lazy, so an unreachable database is the first call's connectivity error.", "op": "connect", "opts": {"url": "host=/nonexistent-trellis-parity port=1 dbname=parity"}, "expect": null},
@@ -330,20 +337,21 @@
     },
     {"op": "status", "args": ["parity_scratch"], "expect": null},
 
-    {"about": "Self-check paging: five rows two at a time, the cursor carried from each report to the next.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000}, "save": "check_1", "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "converged"}, "divergences": {"list": []}, "rows_compared": {"eq": 2}, "next_after": "string", "drain_failures": {"list": []}}}},
-    {"op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000, "after": {"$ref": "check_1.next_after"}}, "save": "check_2", "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "rows_compared": {"eq": 2}, "next_after": "string"}}},
-    {"about": "The last page: fewer rows than the limit, and no cursor.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000, "after": {"$ref": "check_2.next_after"}}, "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "rows_compared": {"eq": 1}, "next_after": null}}},
+    {"about": "A self_check returns its job at once; a drain worker runs it, and the report is read back by the job's id once the state is done.", "op": "self_check", "args": ["parity_prices"], "opts": {"timeout_ms": 30000, "mode": {"$word": "strict"}}, "save": "check_1", "expect": {"record": "SelfCheckJob", "fields": {"id": "integer", "target": {"eq": "parity_prices"}, "mode": {"word": "strict"}}}},
+    {"op": "self_check_job", "args": [{"$ref": "check_1.id"}], "until": {"record": "SelfCheckJob", "fields": {"id": {"ref": "check_1.id"}, "state": {"word": "done"}, "rows_compared": {"eq": 5}, "error": null, "report": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "converged"}, "status": null, "divergences": {"list": []}, "rows_compared": {"eq": 5}, "truncated": {"eq": false}, "drain_failures": {"list": []}}}}}, "waiting_for": "the self_check job to finish"},
     {"about": "A target row edited behind Trellis's back is a cell divergence, its values as Postgres renders them.", "op": "sql", "args": ["update parity_prices set price = 999 where id = 1"]},
+    {"about": "The next self_check of the target replaces the finished job, so the old id is gone.", "op": "self_check", "args": ["parity_prices"], "opts": {"timeout_ms": 30000, "mode": {"$word": "strict"}}, "save": "check_2", "expect": {"record": "SelfCheckJob", "fields": {"id": "integer"}}},
+    {"op": "self_check_job", "args": [{"$ref": "check_1.id"}], "expect": null},
     {
-      "op": "self_check",
-      "args": ["parity_prices"],
-      "opts": {"limit": 10, "timeout_ms": 30000, "mode": {"$word": "strict"}},
-      "expect": {"record": "SelfCheckReport", "fields": {
+      "op": "self_check_job",
+      "args": [{"$ref": "check_2.id"}],
+      "until": {"record": "SelfCheckJob", "fields": {"state": {"word": "done"}, "report": {"record": "SelfCheckReport", "fields": {
         "outcome": {"word": "diverged"},
         "rows_compared": {"eq": 5},
-        "next_after": null,
+        "truncated": {"eq": false},
         "divergences": {"list": [{"record": "Divergence", "fields": {"kind": {"word": "cell"}, "key": {"eq": "1"}, "column": {"eq": "price"}, "persisted": {"eq": "999"}, "recomputed": {"eq": "10"}}}]}
-      }}
+      }}}},
+      "waiting_for": "the second self_check job to finish"
     },
 
     {"about": "Doubling 2e9 overflows integer, so each row fails the column; five trip its pause.", "op": "sql", "args": ["insert into parity_ledger (id, n) values (1, 2000000000), (2, 2000000000), (3, 2000000000), (4, 2000000000), (5, 2000000000)"]},
@@ -390,11 +398,10 @@
     {"op": "has_live_staging_worker", "until": {"eq": true}, "waiting_for": "a live staging worker"},
     {"op": "has_live_drain_workers", "expect": {"eq": false}},
     {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"status": {"word": "live"}}}},
-    {"about": "A captured write nothing drains: a live definition's audit gives up waiting rather than failing.", "op": "sql", "args": ["update parity_items set price = 52 where id = 5"]},
-    {"op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_caught_up"}, "status": null, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null, "drain_failures": {"list": []}}}},
-    {"about": "A re-read of the table rebuilds its live readers in the call's own transaction, so they read backfilling as soon as it returns, and the audit says so rather than comparing a target the rebuild is about to change (#625 F7).", "op": "request_backfill", "args": ["parity_items"], "expect": null},
-    {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"status": {"word": "backfilling"}}}},
-    {"op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_live"}, "status": {"word": "backfilling"}, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null, "drain_failures": {"list": []}}}},
+    {"about": "A self_check is a background job a drain worker runs. With none, the call still registers it and returns at once, queued, and a second call for the target returns that job.", "op": "self_check", "args": ["parity_prices"], "opts": {"timeout_ms": 0, "mode": {"$word": "strict"}}, "save": "queued_check", "expect": {"record": "SelfCheckJob", "fields": {"target": {"eq": "parity_prices"}, "mode": {"word": "strict"}, "state": {"word": "queued"}, "rows_compared": {"eq": 0}, "report": null, "error": null}}},
+    {"op": "self_check", "args": ["parity_prices"], "opts": {"timeout_ms": 0}, "expect": {"record": "SelfCheckJob", "fields": {"id": {"ref": "queued_check.id"}, "mode": {"word": "strict"}, "state": {"word": "queued"}}}},
+    {"op": "self_check_job", "args": [{"$ref": "queued_check.id"}], "expect": {"ref": "queued_check"}},
+    {"about": "A job that was never started, or was replaced, is nil.", "op": "self_check_job", "args": [0], "expect": null},
     {"op": "shutdown", "expect": null}
   ],
   "conversions": [
@@ -419,13 +426,13 @@
     {
       "about": "A self-check reports every open drain failure, oldest first and whatever its outcome; one that didn't come from Postgres has no SQLSTATE.",
       "type": "SelfCheckReport",
-      "native": {"target": "parity_prices", "outcome": {"$word": "converged"}, "status": null, "divergences": [], "rows_compared": 2, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [{"seg_seq": 3, "tables": ["public.orders"], "error": "permission denied for column note", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123458, "attempts": 4}, {"seg_seq": 9, "tables": ["public.lines"], "error": "records fail only together", "sqlstate": null, "since_micros": 1727222400123457, "last_seen_micros": 1727222400123459, "attempts": 1}], "unindexed_joins": []},
+      "native": {"target": "parity_prices", "outcome": {"$word": "converged"}, "status": null, "divergences": [], "rows_compared": 2, "truncated": false, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [{"seg_seq": 3, "tables": ["public.orders"], "error": "permission denied for column note", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123458, "attempts": 4}, {"seg_seq": 9, "tables": ["public.lines"], "error": "records fail only together", "sqlstate": null, "since_micros": 1727222400123457, "last_seen_micros": 1727222400123459, "attempts": 1}]},
       "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "held_keys": null, "drain_failures": {"list": [{"record": "DrainFailure", "fields": {"seg_seq": {"eq": 3}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123458}, "attempts": {"eq": 4}}}, {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 9}, "tables": {"list": [{"eq": "public.lines"}]}, "error": {"eq": "records fail only together"}, "sqlstate": null, "since": {"time_micros": 1727222400123457}, "last_seen": {"time_micros": 1727222400123459}}}]}}}
     },
     {
       "about": "A definition that isn't live isn't compared: the outcome is not_live and the report names its status.",
       "type": "SelfCheckReport",
-      "native": {"target": "parity_prices", "outcome": {"$word": "not_live"}, "status": {"$word": "backfilling"}, "divergences": [], "rows_compared": 0, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [], "unindexed_joins": []},
+      "native": {"target": "parity_prices", "outcome": {"$word": "not_live"}, "status": {"$word": "backfilling"}, "divergences": [], "rows_compared": 0, "truncated": false, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": []},
       "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_live"}, "status": {"word": "backfilling"}, "rows_compared": {"eq": 0}, "divergences": {"list": []}}}
     },
     {
@@ -435,10 +442,10 @@
       "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "customer"}, "table": {"eq": "public.orders"}, "column": {"eq": "customer_id"}, "fix": {"eq": "create an index on public.orders (customer_id)"}}}, {"record": "UnindexedJoin", "fields": {"relationship": {"eq": "items"}, "table": {"eq": "public.line_items"}, "column": {"eq": "order_id"}, "fix": {"eq": "create an index on public.line_items (order_id)"}}}]}}}
     },
     {
-      "about": "A self-check report carries the same entries, whatever its outcome.",
+      "about": "A job that stopped before the end of the target's keys says so: the outcome is not_caught_up, the report is truncated, and the position it stopped at is a token.",
       "type": "SelfCheckReport",
-      "native": {"target": "parity_prices", "outcome": {"$word": "not_caught_up"}, "status": null, "divergences": [], "rows_compared": 0, "next_after": null, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": [], "unindexed_joins": [{"relationship": "customer", "table": "public.orders", "column": "customer_id", "fix": "create an index on public.orders (customer_id)"}]},
-      "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_caught_up"}, "unindexed_joins": {"list": [{"record": "UnindexedJoin", "fields": {"relationship": {"eq": "customer"}, "table": {"eq": "public.orders"}, "column": {"eq": "customer_id"}, "fix": {"eq": "create an index on public.orders (customer_id)"}}}]}}}
+      "native": {"target": "parity_prices", "outcome": {"$word": "not_caught_up"}, "status": null, "divergences": [], "rows_compared": 10000, "truncated": true, "checked_through": "1/16B3748", "held_keys": null, "drain_failures": []},
+      "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_caught_up"}, "rows_compared": {"eq": 10000}, "truncated": {"eq": true}}}
     },
     {
       "about": "A time a microsecond before the epoch lands on that microsecond, not a second off.",

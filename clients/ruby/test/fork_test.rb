@@ -30,7 +30,8 @@ class ForkTest < Minitest::Test
     "has_live_staging_worker?" => -> { Trellis.has_live_staging_worker? },
     "watermark_token" => -> { Trellis.watermark_token },
     "await_converged" => -> { Trellis.await_converged("0/0", timeout_ms: 1_000) },
-    "self_check" => -> { Trellis.self_check("t", limit: 1, timeout_ms: 1_000) }
+    "self_check" => -> { Trellis.self_check("t", timeout_ms: 1_000) },
+    "self_check_job" => -> { Trellis.self_check_job(1) }
   }.freeze
 
   def test_a_forked_child_s_calls_raise_rather_than_hang

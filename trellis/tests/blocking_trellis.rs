@@ -21,8 +21,8 @@ use testkit::TestCluster;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 
 use trellis::{
-    BlockingTrellis, Config, SelfCheckError, SelfCheckMode, SelfCheckScope, TransformStatus,
-    TrellisError, TrellisOptions,
+    BlockingTrellis, Config, SelfCheckError, SelfCheckMode, TransformStatus, TrellisError,
+    TrellisOptions,
 };
 
 /// (a) + (c): a full lifecycle — connect, migrate, define, definitions(), a
@@ -81,14 +81,10 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
     );
 
     // Issue #587: `self_check` reaches the engine through the blocking
-    // facade too. An unregistered target fails before any convergence wait,
-    // so this proves the bridge without needing a staging worker.
+    // facade too. An unregistered target is refused when the job is started,
+    // so this proves the bridge without needing a worker.
     let result = trellis.self_check(
         "no_such_target",
-        SelfCheckScope {
-            after: None,
-            limit: 10,
-        },
         SelfCheckMode::Strict,
         Duration::from_secs(1),
     );

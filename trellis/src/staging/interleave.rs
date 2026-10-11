@@ -221,6 +221,11 @@ pub enum PausePoint {
     /// target (`super::build::run_plan`). The batch holds the definition
     /// row `for key share` and the plan row, and has written nothing.
     AfterPlanHold,
+    /// After a worker claims a `self_check` job and before the page it runs
+    /// (`super::self_check_job::work_once`, #1023), for the audited target's
+    /// bare name. The page holds no lock and no transaction, so the target
+    /// can be dropped, written or checked again here.
+    BeforeSelfCheckPage,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

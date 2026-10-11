@@ -43,16 +43,17 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use rustler::{Atom, Env, NifMap, ResourceArc, Term};
-use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisOptions};
+use trellis::{BlockingTrellis, Config, ErrorCode, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
     PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_OUTCOMES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
-    self_check_mode, system_time_from_epoch_micros, transform_status_names,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -316,6 +317,8 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
         .chain(relationship_cardinality_names())
         .chain(PlainApplied::KINDS)
         .chain(SELF_CHECK_OUTCOMES)
+        .chain(SELF_CHECK_STATES)
+        .chain(SELF_CHECK_MODES)
         .chain(DIVERGENCE_KINDS)
         .chain(capture_failure_kind_names())
         .chain(LOG_LEVELS)
@@ -427,7 +430,37 @@ struct SamplePageTerm {
     next_cursor: Option<String>,
 }
 
-/// What `self_check/3` found. `outcome` is one of
+/// A `self_check/3` job. `mode` is one of [`SELF_CHECK_MODES`] and `state` one
+/// of [`SELF_CHECK_STATES`]; `report` is set once it is `done`.
+#[derive(NifMap)]
+struct SelfCheckJobTerm {
+    id: i64,
+    target: String,
+    mode: Atom,
+    state: Atom,
+    rows_compared: i64,
+    report: Option<SelfCheckReportTerm>,
+    error: Option<String>,
+}
+
+impl SelfCheckJobTerm {
+    fn new(env: Env, job: PlainSelfCheckJob) -> NifReply<Self> {
+        Ok(SelfCheckJobTerm {
+            id: job.id,
+            target: job.target,
+            mode: word_atom(env, job.mode)?,
+            state: word_atom(env, job.state)?,
+            rows_compared: job.rows_compared,
+            report: job
+                .report
+                .map(|report| SelfCheckReportTerm::new(env, report))
+                .transpose()?,
+            error: job.error,
+        })
+    }
+}
+
+/// What a finished `self_check/3` job found. `outcome` is one of
 /// [`SELF_CHECK_OUTCOMES`]; `divergences` is empty unless it is `diverged`,
 /// and `status` is set only when it is `not_live`.
 #[derive(NifMap)]
@@ -435,13 +468,12 @@ struct SelfCheckReportTerm {
     target: String,
     checked_through: String,
     rows_compared: i64,
-    next_after: Option<String>,
+    truncated: bool,
     outcome: Atom,
     status: Option<Atom>,
     divergences: Vec<DivergenceTerm>,
     held_keys: Option<HeldKeysTerm>,
     drain_failures: Vec<DrainFailureTerm>,
-    unindexed_joins: Vec<UnindexedJoinTerm>,
 }
 
 /// One divergence. `kind` is one of [`DIVERGENCE_KINDS`]; see
@@ -463,7 +495,7 @@ impl SelfCheckReportTerm {
             target: report.target,
             checked_through: report.checked_through,
             rows_compared: report.rows_compared,
-            next_after: report.next_after,
+            truncated: report.truncated,
             outcome: word_atom(env, report.outcome)?,
             status: report
                 .status
@@ -479,11 +511,6 @@ impl SelfCheckReportTerm {
                 .drain_failures
                 .into_iter()
                 .map(DrainFailureTerm::from)
-                .collect(),
-            unindexed_joins: report
-                .unindexed_joins
-                .into_iter()
-                .map(UnindexedJoinTerm::from)
                 .collect(),
         })
     }
@@ -797,33 +824,36 @@ fn await_converged(handle: ResourceArc<Handle>, token: String, timeout_ms: u64) 
     Ok(rustler::types::atom::ok())
 }
 
-/// Audits up to `limit` of `target_table`'s keys after `after` (`nil` for the
-/// first page) against a fresh recompute from the source, in `mode`
-/// (`"standard"` or `"strict"`), waiting up to `timeout_ms` per convergence
-/// await.
-///
-/// Like `await_converged`, it holds a dirty IO scheduler, and the handle, for
-/// as long as it waits.
+/// Starts a background check of `target_table` against a fresh recompute
+/// from the source, in `mode` (`"standard"` or `"strict"`), waiting up to
+/// `timeout_ms` per convergence await its pages make, and returns the job at
+/// once. A target whose job is still running gets that job back.
 #[rustler::nif(schedule = "DirtyIo")]
 fn self_check(
     env: Env,
     handle: ResourceArc<Handle>,
     target_table: String,
-    after: Option<String>,
-    limit: i64,
     mode: String,
     timeout_ms: u64,
-) -> NifReply<SelfCheckReportTerm> {
+) -> NifReply<SelfCheckJobTerm> {
     let mode = self_check_mode(&mode).map_err(plain)?;
-    let report = handle.with(|trellis| {
-        trellis.self_check(
-            &target_table,
-            SelfCheckScope { after, limit },
-            mode,
-            Duration::from_millis(timeout_ms),
-        )
+    let job = handle.with(|trellis| {
+        trellis.self_check(&target_table, mode, Duration::from_millis(timeout_ms))
     })?;
-    SelfCheckReportTerm::new(env, PlainSelfCheckReport::from(&report))
+    SelfCheckJobTerm::new(env, PlainSelfCheckJob::from(&job))
+}
+
+/// The `self_check/3` job `id`, or `nil` when there is none: a newer
+/// `self_check` of its target replaced it, or its transform was dropped.
+#[rustler::nif(schedule = "DirtyIo")]
+fn self_check_job(
+    env: Env,
+    handle: ResourceArc<Handle>,
+    id: i64,
+) -> NifReply<Option<SelfCheckJobTerm>> {
+    let job = handle.with(|trellis| trellis.self_check_job(id))?;
+    job.map(|job| SelfCheckJobTerm::new(env, PlainSelfCheckJob::from(&job)))
+        .transpose()
 }
 
 /// The configuration a handle connected with, as `config/1` returns it.
@@ -923,6 +953,18 @@ fn applied_kinds(env: Env) -> NifReply<Vec<Atom>> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn self_check_outcomes(env: Env) -> NifReply<Vec<Atom>> {
     word_atoms(env, SELF_CHECK_OUTCOMES.to_vec())
+}
+
+/// Every mode atom a `self_check/3` job can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn self_check_modes(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, SELF_CHECK_MODES.to_vec())
+}
+
+/// Every state atom a `self_check/3` job can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn self_check_states(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, SELF_CHECK_STATES.to_vec())
 }
 
 /// Every divergence kind atom `self_check/3`'s report can carry.

@@ -330,7 +330,7 @@ the worker runs.
 quarantine, whatever its status: how many, and when the one held longest was poisoned.
 A held key's target row stays as it was, and a key with changes parked holds back every
 watermark token taken since, so `await_converged` and `self_check` don't converge past it
-until it is released. `self_check` reports the same `held_keys` with every audit, so a
+until it is released. A finished `self_check` job's report carries the same `held_keys`, so a
 `live` transform can't hide one. `Trellis::sample_quarantined` lists the keys and their
 errors; fix the cause and release each with `Trellis::release_key`, or resume the
 transform ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
@@ -370,11 +370,9 @@ index you create shows on the next one, with no restart. A join column that no
 longer exists isn't listed. The CLI's `trellis status` prints one warning line per
 entry under the transform.
 
-`SelfCheckReport` carries the same list as `unindexed_joins` on each report, and it
-never changes the outcome. A 1-1 transform that reads a relationship gets a report
-only when the audit stops before comparing rows: a capture fault, `NotLive` or
-`NotCaughtUp`. Otherwise `self_check` refuses it with `UnsupportedExpr`, and it
-refuses an aggregate before any report
+`self_check` refuses a 1-1 transform that reads a relationship with
+`UnsupportedExpr`, and an aggregate with `UnsupportedKeySpace`, when its job is
+started
 ([known gap: `self_check` audits 1-1 targets only](known-correctness-gaps.md#16-self_check-audits-1-1-targets-only)),
 so `status` is the place to read the warning.
 

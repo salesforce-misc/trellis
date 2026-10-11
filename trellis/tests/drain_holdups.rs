@@ -19,6 +19,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
 use trellis::intake::markers;
+use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{StagedWatermark, apply, quarantine, seal};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -324,12 +325,8 @@ async fn an_unpinned_refusal_is_a_holdup_its_readers_report_until_the_page_commi
 
     let report = it
         .trellis
-        .self_check(
+        .self_check_to_end(
             "q_copy",
-            trellis::SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
             trellis::SelfCheckMode::Strict,
             Duration::from_secs(1),
         )

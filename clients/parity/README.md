@@ -94,7 +94,7 @@ comparison.
 | `"string"`, `"integer"`, `"boolean"`, `"time"` | any value of that type |
 | `{"eq": v}` | exactly `v` |
 | `{"word": w}` | the word `w` |
-| `{"word_in": set}` | a word from a closed set the extension reports: `transform_status`, `quarantine_state`, `cardinality`, `applied_kind`, `self_check_outcome`, `divergence_kind`, `capture_failure_kind` |
+| `{"word_in": set}` | a word from a closed set the extension reports: `transform_status`, `quarantine_state`, `cardinality`, `applied_kind`, `self_check_mode`, `self_check_state`, `self_check_outcome`, `divergence_kind`, `capture_failure_kind` |
 | `{"time_micros": n}` | the time `n` microseconds from the epoch |
 | `{"error": code}` | an error with that code |
 | `{"ref": path}` | the same canonical value as a saved result |
@@ -154,8 +154,8 @@ that times out). The staging worker installs capture in a first pass that
 finishes before `connect` returns, so a write made in phase one isn't
 captured at all: the build covers it by reading the source, and it holds no
 token back. The same arrangement runs once more at the end, over live
-definitions, for the `self_check` outcomes that need a write nothing drains
-(`not_caught_up`) and a rebuild nothing can finish (`not_live`).
+definitions, for a `self_check` job that no drain worker runs, which stays
+`queued`.
 
 In phase two, mind what runs after a step returns. `ALTER` and `RESUME`
 rebuild the one definition they name, and `request_backfill` rebuilds each

@@ -12,6 +12,7 @@ defmodule Trellis.ConversionsTest do
     Relationship,
     RelationshipSummary,
     SamplePage,
+    SelfCheckJob,
     SelfCheckReport
   }
 
@@ -50,6 +51,11 @@ defmodule Trellis.ConversionsTest do
     assert Trellis.Native.self_check_outcomes() ==
              {:ok, [:converged, :not_caught_up, :not_live, :diverged]}
 
+    assert Trellis.Native.self_check_modes() == {:ok, [:standard, :strict]}
+
+    assert Trellis.Native.self_check_states() ==
+             {:ok, [:queued, :running, :done, :failed, :cancelled]}
+
     assert Trellis.Native.divergence_kinds() ==
              {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column, :capture]}
 
@@ -62,12 +68,11 @@ defmodule Trellis.ConversionsTest do
         target: "order_totals",
         checked_through: "1/16B3748",
         rows_compared: 2,
-        next_after: "2",
+        truncated: false,
         outcome: :diverged,
         status: nil,
         held_keys: nil,
         drain_failures: [],
-        unindexed_joins: [],
         divergences: [
           %{
             kind: :cell,
@@ -94,7 +99,7 @@ defmodule Trellis.ConversionsTest do
              target: "order_totals",
              checked_through: "1/16B3748",
              rows_compared: 2,
-             next_after: "2",
+             truncated: false,
              outcome: :diverged,
              status: nil,
              divergences: [
@@ -118,8 +123,7 @@ defmodule Trellis.ConversionsTest do
                }
              ],
              held_keys: nil,
-             drain_failures: [],
-             unindexed_joins: []
+             drain_failures: []
            }
   end
 
@@ -129,13 +133,12 @@ defmodule Trellis.ConversionsTest do
         target: "order_totals",
         checked_through: "1/16B3748",
         rows_compared: 0,
-        next_after: nil,
+        truncated: false,
         outcome: :not_live,
         status: :backfilling,
         divergences: [],
         held_keys: nil,
-        drain_failures: [],
-        unindexed_joins: []
+        drain_failures: []
       })
 
     assert report.outcome == :not_live
@@ -149,13 +152,12 @@ defmodule Trellis.ConversionsTest do
         target: "order_totals",
         checked_through: "1/16B3748",
         rows_compared: 0,
-        next_after: nil,
+        truncated: false,
         outcome: :not_caught_up,
         status: nil,
         divergences: [],
         held_keys: %{count: 1, oldest_poisoned_at_micros: 1_727_222_400_654_321},
-        drain_failures: [],
-        unindexed_joins: []
+        drain_failures: []
       })
 
     assert report.held_keys == %Trellis.HeldKeys{
@@ -170,7 +172,7 @@ defmodule Trellis.ConversionsTest do
         target: "order_totals",
         checked_through: "1/16B3748",
         rows_compared: 2,
-        next_after: nil,
+        truncated: false,
         outcome: :converged,
         status: nil,
         divergences: [],
@@ -185,8 +187,7 @@ defmodule Trellis.ConversionsTest do
             last_seen_micros: 1_727_222_400_654_321,
             attempts: 1
           }
-        ],
-        unindexed_joins: []
+        ]
       })
 
     assert report.drain_failures == [
@@ -202,36 +203,72 @@ defmodule Trellis.ConversionsTest do
            ]
   end
 
-  test "a self-check report's unindexed joins become structs" do
-    report =
-      SelfCheckReport.from_native(%{
+  test "a self-check job carries its report only once it is done" do
+    queued =
+      SelfCheckJob.from_native(%{
+        id: 7,
         target: "order_totals",
-        checked_through: "1/16B3748",
+        mode: :strict,
+        state: :queued,
         rows_compared: 0,
-        next_after: nil,
-        outcome: :not_caught_up,
-        status: nil,
-        divergences: [],
-        held_keys: nil,
-        drain_failures: [],
-        unindexed_joins: [
-          %{
-            relationship: "orders",
-            table: "public.orders",
-            column: "customer_id",
-            fix: "create an index on public.orders (customer_id)"
-          }
-        ]
+        report: nil,
+        error: nil
       })
 
-    assert report.unindexed_joins == [
-             %Trellis.UnindexedJoin{
-               relationship: "orders",
-               table: "public.orders",
-               column: "customer_id",
-               fix: "create an index on public.orders (customer_id)"
-             }
-           ]
+    assert queued == %SelfCheckJob{
+             id: 7,
+             target: "order_totals",
+             mode: :strict,
+             state: :queued,
+             rows_compared: 0,
+             report: nil,
+             error: nil
+           }
+
+    refute SelfCheckJob.finished?(queued)
+
+    done =
+      SelfCheckJob.from_native(%{
+        id: 7,
+        target: "order_totals",
+        mode: :standard,
+        state: :done,
+        rows_compared: 2,
+        error: nil,
+        report: %{
+          target: "order_totals",
+          checked_through: "1/16B3748",
+          rows_compared: 2,
+          truncated: false,
+          outcome: :converged,
+          status: nil,
+          divergences: [],
+          held_keys: nil,
+          drain_failures: []
+        }
+      })
+
+    assert %SelfCheckReport{outcome: :converged, rows_compared: 2, truncated: false} = done.report
+    assert SelfCheckJob.finished?(done)
+
+    cancelled =
+      SelfCheckJob.from_native(%{
+        id: 7,
+        target: "order_totals",
+        mode: :standard,
+        state: :cancelled,
+        rows_compared: 1,
+        report: nil,
+        error: "cancelled: the worker running it shut down"
+      })
+
+    assert SelfCheckJob.finished?(cancelled)
+    assert cancelled.error =~ "shut down"
+
+    for state <- [:failed, :cancelled, :done],
+        do: assert(SelfCheckJob.finished?(%{done | state: state}))
+
+    for state <- [:queued, :running], do: refute(SelfCheckJob.finished?(%{done | state: state}))
   end
 
   defp native_definition do

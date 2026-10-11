@@ -7,14 +7,10 @@
 //! has an index). Without an index each read scans the table. Trellis never
 //! creates indexes on a source table (ADR-0005), so `Trellis::status` reports
 //! the columns a definition reads that lack one
-//! (`DefinitionStatus::unindexed_joins`), and `self_check` carries them on
-//! each report it returns for the audited definition
-//! (`SelfCheckReport::unindexed_joins`). `self_check` doesn't compare a
-//! target that reads a relationship yet (`SelfCheckError::UnsupportedExpr`),
-//! so it returns a report for one only when it stops before the comparison:
-//! a capture fault, a definition that isn't live, or a wait that runs out of
-//! time. `status` is where the warning reliably shows. Neither changes the
-//! definition's status or the audit's outcome: it is a warning.
+//! (`DefinitionStatus::unindexed_joins`). `self_check` doesn't compare a
+//! target that reads a relationship (`SelfCheckError::UnsupportedExpr`), so
+//! `status` is where the warning shows. It doesn't change the definition's
+//! status: it is a warning.
 //!
 //! "Indexed" is [`ddl::key_column_in`]'s definition, the one the batch reads
 //! plan against, so a column reported here is exactly one whose reads run
@@ -29,8 +25,7 @@ use crate::defs::ddl;
 use crate::defs::model::RelationshipCardinality;
 
 /// A join column of a relationship a definition reads that has no usable
-/// index (#973); see `DefinitionStatus::unindexed_joins` and
-/// `SelfCheckReport::unindexed_joins`.
+/// index (#973); see `DefinitionStatus::unindexed_joins`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnindexedJoin {
     /// The relationship's name.

@@ -64,17 +64,26 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
   `release_key/4` releases one key a transform holds, once its cause is
   fixed; `status/2` reports how many it holds (`held_keys`). `status/2`
   also reports a page the drain keeps failing on with nothing charged or
-  paused (`drain_failure`, a `Trellis.DrainFailure`), and `self_check/3`
-  reports every one open (`drain_failures`). `status/2` lists the join
+  paused (`drain_failure`, a `Trellis.DrainFailure`), and a finished `self_check/3`
+  job's report lists every one open (`drain_failures`). `status/2` lists the join
   columns of the relationships a transform reads that have no usable index
   (`unindexed_joins`, each a `Trellis.UnindexedJoin` with `relationship`,
   `table`, `column` and the `fix` sentence), a warning that never changes its
-  status, and `self_check/3` carries the same list on its report
-  (`unindexed_joins`).
+  status.
 - `request_backfill/2`, `has_live_drain_workers/1`,
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
-- `self_check/3`: audit one page of a target against a fresh recompute from
-  its source, reporting any divergence.
+- `self_check/3` and `self_check_job/2`: check a target against a fresh
+  recompute from its source, as a background job. `self_check/3` starts it and
+  returns a `Trellis.SelfCheckJob` (`id`, `target`, `mode`, `state`,
+  `rows_compared`, `report`, `error`) at once; a drain worker runs it, and
+  `self_check_job/2` reads it back by `id` until `state` is `:done`
+  (`:queued` and `:running` are in progress; `:failed` and `:cancelled` carry
+  an `error`), when `report` is a `Trellis.SelfCheckReport` (`outcome`,
+  `divergences`, `rows_compared`, `truncated`, ...). A target whose job is
+  still unfinished gets that job back; the next call replaces a finished
+  one, and `self_check_job/2` returns `nil` for the replaced job or one whose
+  transform was dropped. With no drain worker anywhere in the fleet a job
+  stays `:queued`.
 - `start_link/1`, as `{Trellis, options}` in a supervision tree: a process
   that owns the handle, so every function above also takes its name.
 - `Trellis.Migration`: `define`, `apply` and `status` in an Ecto migration.
@@ -133,9 +142,8 @@ threads, or no definition ever reaches `:live`.
 - Times are `DateTime`s. They cross the NIF as epoch microseconds.
 - A quarantine target is an address string, `"transform"` or
   `"transform.column"`, exactly as `quarantined/1` reports it.
-- `sample_quarantined/3`'s and `self_check/3`'s cursors and
-  `watermark_token/1`'s token are opaque: pass back what the previous call
-  returned.
+- `sample_quarantined/3`'s cursor and `watermark_token/1`'s token are
+  opaque: pass back what the previous call returned.
 - Every call that takes a handle runs on a dirty IO scheduler.
   `Trellis.Metrics.render_prometheus/0` runs on a dirty CPU scheduler.
 

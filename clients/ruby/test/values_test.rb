@@ -92,8 +92,8 @@ class ValuesTest < Minitest::Test
   def test_a_not_live_self_check_report_names_the_status_it_found
     report = Trellis::SelfCheckReport.from_native(
       target: "order_totals", outcome: :not_live, status: :backfilling, divergences: [],
-      rows_compared: 0, next_after: nil, checked_through: "1/16B3748", held_keys: nil,
-      drain_failures: [], unindexed_joins: []
+      rows_compared: 0, truncated: false, checked_through: "1/16B3748", held_keys: nil,
+      drain_failures: []
     )
     assert_equal :not_live, report.outcome
     assert_equal :backfilling, report.status
@@ -102,10 +102,9 @@ class ValuesTest < Minitest::Test
   def test_a_self_check_reports_drain_failures_become_values_whatever_the_outcome
     report = Trellis::SelfCheckReport.from_native(
       target: "order_totals", outcome: :converged, status: nil, divergences: [], rows_compared: 2,
-      next_after: nil, checked_through: "1/16B3748", held_keys: nil,
+      truncated: false, checked_through: "1/16B3748", held_keys: nil,
       drain_failures: [{ seg_seq: 9, tables: ["public.orders"], error: "records fail only together",
-                         sqlstate: nil, since_micros: MICROS, last_seen_micros: MICROS, attempts: 1 }],
-      unindexed_joins: []
+                         sqlstate: nil, since_micros: MICROS, last_seen_micros: MICROS, attempts: 1 }]
     )
     assert_equal [Trellis::DrainFailure.new(
       seg_seq: 9, tables: ["public.orders"], error: "records fail only together", sqlstate: nil,
@@ -114,7 +113,7 @@ class ValuesTest < Minitest::Test
     )], report.drain_failures
   end
 
-  def test_an_unindexed_join_becomes_a_value_in_a_status_and_a_self_check_report
+  def test_an_unindexed_join_becomes_a_value_in_a_status
     join = { relationship: "orders", table: "public.orders", column: "customer_id",
              fix: "create an index on public.orders (customer_id)" }
     expected = [Trellis::UnindexedJoin.new(**join)]
@@ -124,13 +123,6 @@ class ValuesTest < Minitest::Test
       drain_failure: nil, unindexed_joins: [join]
     )
     assert_equal expected, status.unindexed_joins
-
-    report = Trellis::SelfCheckReport.from_native(
-      target: "order_totals", outcome: :not_caught_up, status: nil, divergences: [], rows_compared: 0,
-      next_after: nil, checked_through: "1/16B3748", held_keys: nil, drain_failures: [],
-      unindexed_joins: [join]
-    )
-    assert_equal expected, report.unindexed_joins
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure

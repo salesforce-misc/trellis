@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
+use trellis::staging::self_check::CheckPageExt;
 use trellis::{
     ClientOptions, Config, DefinitionStatus, SelfCheckOutcome, TransformStatus, Trellis,
     TrellisOptions,
@@ -291,15 +292,7 @@ async fn assert_targets_match(app: &Client, admin: &Client, with_double: bool) {
 
 async fn self_check_converges(trellis: &Trellis, target: &str) {
     let outcome = trellis
-        .self_check(
-            target,
-            trellis::SelfCheckScope {
-                after: None,
-                limit: 1000,
-            },
-            trellis::SelfCheckMode::Strict,
-            WAIT,
-        )
+        .self_check_to_end(target, trellis::SelfCheckMode::Strict, WAIT)
         .await
         .unwrap_or_else(|err| panic!("self_check {target}: {err}"))
         .outcome;

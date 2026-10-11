@@ -46,7 +46,8 @@ require_relative "instance"
 # - Quarantine: quarantined, quarantine_status, sample_quarantined,
 #   poisoned_since, release_key.
 # - Operations: request_backfill, has_live_drain_workers?,
-#   has_live_staging_worker?, watermark_token, await_converged, self_check.
+#   has_live_staging_worker?, watermark_token, await_converged, self_check,
+#   self_check_job.
 #
 #   # A deploy's migration step: the defaults run nothing in the background.
 #   Trellis.connect(url: "host=localhost dbname=app")

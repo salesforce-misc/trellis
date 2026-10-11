@@ -18,13 +18,41 @@ test suite can perform.
 
 ## Decisions
 
-### `self_check` is a public method on `Trellis`
+### `self_check` is a public method on `Trellis`, and it starts a background job
 
-It audits one target at a time, is read-only, and returns a `SelfCheckReport`
-describing any divergences (cell, missing row, extra row, missing/extra column, and a
-broken capture), the
-LSN checked through, the rows compared, and whether the scan was bounded. Fleet-wide
-sweeps are a caller-side loop over `definitions()`, not a behaviour of the primitive.
+It audits one target at a time, is read-only, and returns at once with a job. A
+whole-target comparison can take far longer than a public call may
+([ADR-0008](0008-public-api-design.md#6-every-public-call-returns-within-30-seconds)),
+so no call runs it: `self_check` registers a row in `self_check_jobs` and a
+drain worker (`application_threads`, in any process of the fleet) walks the
+target a keyset page at a time, saving its cursor, its count and the
+divergences so far in that row after each page. The caller polls the job with
+`self_check_job(id)`. A job is `queued`, `running`, then `done`, `failed` or
+`cancelled`; a `done` job carries a `SelfCheckReport` for the whole target:
+any divergences (cell, missing row, extra row, missing/extra column, and a
+broken capture), the LSN checked through, the rows compared, and whether the
+walk stopped short of the end of the keys (`truncated`). The report also
+carries the keys the definition holds in quarantine and the drain failures
+open on the instance, read when it is polled.
+
+* **One job per target.** A second `self_check` while a target's job is
+  `queued` or `running` returns that job, whatever mode and timeout it passed.
+  A finished job stays until the next `self_check` of the target replaces it.
+* **Every page is bounded and holds nothing.** A page runs under a deadline of
+  its own (the comparison's budget plus the two convergence waits a
+  `Standard` page can make), so the server stops a stuck statement and the job
+  fails rather than hold a connection. It is read-only and takes no lock
+  between statements, so it never holds up a drain.
+* **A worker stops cleanly.** A worker told to shut down drops its page and
+  marks its jobs `cancelled`; a job whose worker vanished is taken over by
+  another worker after a TTL and resumes at its saved cursor; dropping the
+  transform deletes the job's row, which ends the walk.
+* **Refused at the start**: an unknown target, an aggregate or relationship
+  target (see [Scope](#scope-1-1-targets)).
+
+Fleet-wide sweeps are a caller-side loop over `definitions()`, not a behaviour
+of the primitive. There is no cursor-paged variant of the call: paging is how a
+worker walks the target, not something the caller drives.
 
 ### The capture audit runs first
 
@@ -79,8 +107,10 @@ kind: poll the status until it is `live`, then check again.
 
 A rebuild is a status transition made in the repairing call's own
 transaction ([ADR-0002](0002-async-data-flow.md#convergence-and-status)), so a
-check made right after `request_backfill` returns is told `backfilling`
-instead of comparing a target the rebuild is still changing.
+job started right after `request_backfill` returns is told `backfilling`
+instead of comparing a target the rebuild is still changing. Each page reads
+the status again: a job whose definition stops being `live` partway ends
+there with what it had found.
 
 ### Postgres is the oracle; the comparison is two-way
 
@@ -134,7 +164,9 @@ must never report a merely-lagging target as diverged. It takes a watermark toke
 awaits convergence through it (bounded by a timeout; on timeout it reports "not caught
 up," never a divergence), and reads the target and runs the recompute under one
 snapshot: one statement reads both sides, which gives it one snapshot under any
-isolation level.
+isolation level. This is done for each page of the job's walk: a job's pages are
+read at different instants, each after its own wait, and a page that can't catch up
+ends the job as "not caught up."
 
 A snapshot alone is not sufficient under live load: a single snapshot pins source and
 target at one instant, but a correctly-working target legitimately lags its source by
@@ -146,7 +178,7 @@ the documented strong guarantee for callers that can quiesce.
 ### Scope: 1-1 targets
 
 `self_check` audits 1-1 targets; asked for an aggregate or a relationship-enriched
-target it returns an error naming the limit
+target it refuses to start a job and returns an error naming the limit
 ([known correctness gaps](../known-correctness-gaps.md)). The audit query projects the
 target's key so a divergence is reported per key.
 
@@ -167,11 +199,13 @@ standing cost.
 
 ## Consequences
 
-- `self_check` is a real read load — a full recompute scans source and target — so
-  bounded, keyset-scoped calls are mandatory; there is no unbounded "check everything"
-  convenience method.
-- Trellis gains a shipped, public answer to "is this target correct right now," usable
-  by operators, by a thin CLI wrapper, and as a shared end-of-test assertion that
-  turns integration tests into correctness tests.
-- The engine's evaluator stays internal to the engine and the test suite; the public
-  audit path is the independently-rendered query in `self_check`.
+- `self_check` is a real read load: a full recompute scans source and target.
+  It runs page by page on a drain worker, each page bounded and holding no
+  lock, and its caller never waits on it.
+- It needs a drain worker somewhere in the fleet, as a build does; with none, a
+  job stays `queued`.
+- Trellis gains a shipped, public answer to "is this target correct right now,"
+  usable by operators, by a thin CLI wrapper, and as a shared end-of-test
+  assertion that turns integration tests into correctness tests.
+- The engine's evaluator stays internal to the engine and the test suite; the
+  public audit path is the independently-rendered query in `self_check`.

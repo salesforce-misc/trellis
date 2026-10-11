@@ -19,10 +19,9 @@
 //! background thread runs each job as a task of its own, so a call stuck on a
 //! lock holds up none of the calls made after it. A caller's own calls stay in
 //! order, because it waits for each reply; calls from different threads have no
-//! order. The exceptions are [`BlockingTrellis::self_check`] and
-//! [`BlockingTrellis::shutdown`], which `Trellis` runs outside the deadline
-//! too (see [`Trellis::self_check`] and [`Trellis::shutdown`]). A shutdown
-//! cancels the calls still in flight rather than waiting for them.
+//! order. The one exception is [`BlockingTrellis::shutdown`], which `Trellis`
+//! runs outside the deadline (see [`Trellis::shutdown`]). A shutdown cancels
+//! the calls still in flight rather than waiting for them.
 //!
 //! **Waiting is the caller's to choose.** Each method has a `start_*` twin
 //! (`apply` and [`BlockingTrellis::start_apply`], say) that submits the job and
@@ -61,7 +60,7 @@ use crate::app::{
 };
 use crate::client::build_runtime;
 use crate::config::Config;
-use crate::staging::{SelfCheckMode, SelfCheckReport, SelfCheckScope};
+use crate::staging::{SelfCheckJob, SelfCheckMode};
 
 /// One [`BlockingTrellis`] method call, carried over a channel to the
 /// dedicated background thread that owns the real, async [`Trellis`] (see
@@ -105,10 +104,13 @@ enum Job {
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
     SelfCheck(
         String,
-        SelfCheckScope,
         SelfCheckMode,
         Duration,
-        oneshot::Sender<Result<SelfCheckReport, TrellisError>>,
+        oneshot::Sender<Result<SelfCheckJob, TrellisError>>,
+    ),
+    PollSelfCheck(
+        i64,
+        oneshot::Sender<Result<Option<SelfCheckJob>, TrellisError>>,
     ),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
@@ -435,24 +437,18 @@ impl BlockingTrellis {
         self.start(|reply| Job::AwaitConverged(token, timeout, reply))
     }
 
-    /// Audits one page of `target_table` against an independent recompute of
-    /// its definition from the source. See [`Trellis::self_check`] for what
-    /// `scope`, `mode` and `timeout` mean and what the report holds.
-    ///
-    /// Outside the call deadline, like [`Trellis::self_check`]: it can run
-    /// for up to `timeout` per convergence await it makes (one under
-    /// [`SelfCheckMode::Strict`], up to two under [`SelfCheckMode::Standard`]),
-    /// plus the comparison itself. It holds one pooled connection meanwhile,
-    /// and no other call on the handle waits behind it.
+    /// Starts a background check of `target_table` against an independent
+    /// recompute of its definition from the source, and returns the job at
+    /// once. See [`Trellis::self_check`] for what `mode` and `timeout` mean,
+    /// what a second call for the same target returns, and how the job is
+    /// run.
     pub fn self_check(
         &self,
         target_table: &str,
-        scope: SelfCheckScope,
         mode: SelfCheckMode,
         timeout: Duration,
-    ) -> Result<SelfCheckReport, TrellisError> {
-        self.start_self_check(target_table, scope, mode, timeout)
-            .wait()
+    ) -> Result<SelfCheckJob, TrellisError> {
+        self.start_self_check(target_table, mode, timeout).wait()
     }
 
     /// Submits [`BlockingTrellis::self_check`] and returns without waiting for
@@ -460,12 +456,23 @@ impl BlockingTrellis {
     pub fn start_self_check(
         &self,
         target_table: &str,
-        scope: SelfCheckScope,
         mode: SelfCheckMode,
         timeout: Duration,
-    ) -> PendingCall<SelfCheckReport> {
+    ) -> PendingCall<SelfCheckJob> {
         let target_table = target_table.to_string();
-        self.start(|reply| Job::SelfCheck(target_table, scope, mode, timeout, reply))
+        self.start(|reply| Job::SelfCheck(target_table, mode, timeout, reply))
+    }
+
+    /// The `self_check` job `id`: its state, progress and, once done, its
+    /// report. See [`Trellis::self_check_job`].
+    pub fn self_check_job(&self, id: i64) -> Result<Option<SelfCheckJob>, TrellisError> {
+        self.start_self_check_job(id).wait()
+    }
+
+    /// Submits [`BlockingTrellis::self_check_job`] and returns without waiting
+    /// for it.
+    pub fn start_self_check_job(&self, id: i64) -> PendingCall<Option<SelfCheckJob>> {
+        self.start(|reply| Job::PollSelfCheck(id, reply))
     }
 
     /// Stops any background work this connection started and waits for the
@@ -740,10 +747,16 @@ async fn run(
                     )
                 })
             }
-            // Exempt from the call deadline, like `Trellis::self_check`.
-            Job::SelfCheck(table, scope, mode, timeout, reply) => {
-                calls.spawn(trellis, submitted, reply, move |t, _| {
-                    Box::pin(async move { t.self_check(&table, scope, mode, timeout).await })
+            Job::SelfCheck(table, mode, timeout, reply) => {
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(
+                        async move { t.submitted(at, t.self_check(&table, mode, timeout)).await },
+                    )
+                })
+            }
+            Job::PollSelfCheck(id, reply) => {
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.self_check_job(id)).await })
                 })
             }
             Job::Shutdown(reply) => {
@@ -752,9 +765,7 @@ async fn run(
                 // for a call stuck on a lock would hold the shutdown up for
                 // its whole deadline. What a cancelled call started on the
                 // server ends at the server's own `statement_timeout` for it
-                // (see `crate::deadline`); a `self_check`, which runs outside
-                // the deadline, has none, and its statement runs until the
-                // server next writes to the closed connection.
+                // (see `crate::deadline`).
                 drop(trellis);
                 let _ = stopping.send(true);
                 while calls.tasks.join_next().await.is_some() {}

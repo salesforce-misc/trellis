@@ -91,6 +91,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use tokio_postgres::GenericClient;
 
 use crate::capture::install::RING_OWNER;
@@ -107,7 +109,7 @@ use crate::staging::append::RING_SIZE;
 /// captured table as its unquoted `schema.table` identity, except
 /// [`CaptureFault::MissingPrivilege`], which is about the instance, not one
 /// table.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CaptureFault {
     /// None of the table's capture triggers or functions exist.
     NotInstalled { table: String },
