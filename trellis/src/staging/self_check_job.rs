@@ -3,10 +3,12 @@
 //! The comparison of a whole target against a fresh recompute can take far
 //! longer than a public call may (30 seconds, `docs/decisions/0008-public-api-design.md`
 //! decision 6), so no public call runs it. [`start`] registers a row in
-//! `self_check_jobs` and returns it; a drain worker
-//! (`ClientOptions::application_threads`, in any process of the fleet) claims
-//! the row and runs the comparison one keyset page per pass of its loop
-//! ([`work_once`]); the caller reads the row back by its id ([`get`]).
+//! `self_check_jobs` and returns it; a process that runs drain workers
+//! (`ClientOptions::application_threads`, any process of the fleet) claims
+//! the row on a task of its own beside them and runs the comparison one
+//! keyset page per pass ([`work_once`]); the caller reads the row back by its
+//! id ([`get`]). Not on a drain worker: a page waits for the target to
+//! converge, which is the drain workers' work.
 //! This is the shape of a build, which `apply` registers and a worker
 //! finishes, and like a build it needs a worker somewhere: with none, a job
 //! stays `queued`.
@@ -103,7 +105,7 @@ pub struct WorkerOptions {
 }
 
 impl WorkerOptions {
-    /// The options a drain worker runs with.
+    /// The options a process's `self_check` task runs with.
     pub fn new(reclaim_ttl: Duration) -> Self {
         WorkerOptions {
             page_keys: DEFAULT_PAGE_KEYS,
@@ -436,6 +438,7 @@ enum Step {
 /// two schema findings repeat on every page, so they are kept once.
 fn fold_page(progress: &mut Progress, page: SelfCheckPage) -> Step {
     let checked_through = page.checked_through;
+    let mut dropped = false;
     let finish = |progress: &mut Progress, stopped: SelfCheckOutcome, truncated: bool| {
         let outcome = if progress.divergences.is_empty() {
             stopped
@@ -465,8 +468,15 @@ fn fold_page(progress: &mut Progress, page: SelfCheckPage) -> Step {
                     divergence,
                     Divergence::MissingColumn { .. } | Divergence::ExtraColumn { .. }
                 ) && progress.divergences.contains(&divergence);
-                if !repeats {
+                if repeats {
+                    continue;
+                }
+                // One page can find far more than the cap (every row of it,
+                // every column): the rest are left out, not kept.
+                if progress.divergences.len() < MAX_DIVERGENCES {
                     progress.divergences.push(divergence);
+                } else {
+                    dropped = true;
                 }
             }
             if capture {
@@ -477,7 +487,8 @@ fn fold_page(progress: &mut Progress, page: SelfCheckPage) -> Step {
     progress.rows_compared += page.rows_compared;
 
     if progress.divergences.len() >= MAX_DIVERGENCES {
-        return finish(progress, SelfCheckOutcome::Converged, true);
+        let more = dropped || page.next_after.is_some();
+        return finish(progress, SelfCheckOutcome::Converged, more);
     }
     match page.next_after {
         None => finish(progress, SelfCheckOutcome::Converged, false),
@@ -729,7 +740,7 @@ pub async fn cancel_claimed(pool: &Pool, claimed_by: &str) -> Result<u64, SelfCh
 }
 
 /// [`crate::Trellis::self_check`] run to its end by hand, for tests: starts
-/// the job through the facade, runs the pages a drain worker would
+/// the job through the facade, runs the pages a worker would
 /// ([`work_once`], with `options`) until the job is finished, and returns the
 /// job as a poll reads it. There is no wait in it: each pass is the next page.
 #[cfg(any(test, feature = "internals"))]
@@ -860,6 +871,37 @@ mod tests {
         assert!(
             matches!(finish.outcome, SelfCheckOutcome::Diverged(d) if d.len() == MAX_DIVERGENCES)
         );
+    }
+
+    #[test]
+    fn a_page_that_finds_more_than_the_cap_keeps_only_the_cap() {
+        let mut progress = Progress::default();
+        let many: Vec<Divergence> = (0..MAX_DIVERGENCES + 5)
+            .map(|i| cell(&i.to_string()))
+            .collect();
+        let finish = finished(fold_page(
+            &mut progress,
+            page(SelfCheckOutcome::Diverged(many), 5_000, None),
+        ));
+        assert!(finish.truncated, "divergences were left out");
+        match finish.outcome {
+            SelfCheckOutcome::Diverged(kept) => {
+                assert_eq!(kept.len(), MAX_DIVERGENCES);
+                assert_eq!(kept[0], cell("0"), "the first ones found are kept");
+            }
+            other => panic!("expected Diverged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exactly_the_cap_on_the_last_page_is_not_cut_short() {
+        let mut progress = Progress::default();
+        let many: Vec<Divergence> = (0..MAX_DIVERGENCES).map(|i| cell(&i.to_string())).collect();
+        let finish = finished(fold_page(
+            &mut progress,
+            page(SelfCheckOutcome::Diverged(many), 5_000, None),
+        ));
+        assert!(!finish.truncated, "nothing was left out and no key unread");
     }
 
     #[test]

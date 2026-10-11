@@ -89,8 +89,8 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
-    /// One pass of a drain worker's `self_check` step, for a harness that
-    /// runs no drain worker of its own and hand-drives the job it started
+    /// One pass of the `self_check` worker task, for a harness that runs no
+    /// drain workers (so no such task) and hand-drives the job it started
     /// through `Trellis::self_check` (#1023), the way `ManualBackend` drains
     /// by hand.
     pub use crate::staging::self_check_job::{

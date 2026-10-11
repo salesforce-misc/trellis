@@ -1486,8 +1486,9 @@ impl Trellis {
     /// production recompute audit — and returns the job at once. Read-only.
     ///
     /// The comparison is a background job (#1023, #599): this call registers
-    /// it and returns, and a drain worker (`drain_threads > 0`, in any
-    /// process of the fleet) walks the target a keyset page at a time, saving
+    /// it and returns, and a process that runs drain workers
+    /// (`drain_threads > 0`, any process of the fleet) walks the target a
+    /// keyset page at a time on a task beside them, saving
     /// its progress as it goes. Poll [`Trellis::self_check_job`] with the
     /// returned job's `id` until its state is finished
     /// ([`SelfCheckJobState::is_finished`](crate::SelfCheckJobState::is_finished)); [`SelfCheckJob::report`](crate::SelfCheckJob::report) is then
