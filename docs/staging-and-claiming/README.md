@@ -102,7 +102,7 @@ high-volume ones be append-only and vacuum-free.
 | `ring_slot_mirror` (sequence) | `setval` once per seal | the pointer's slot, as writers read it, at any isolation level |
 | `segments` (registry) | one row per live batch, updated | state machine, fence, bucket mask |
 | `seg_claims` | one row per in-flight bucket | the claim; its primary key *is* the exclusion |
-| `drainers` | one row per live worker | share denominator for fair fan-out |
+| `drainers` | one row per live drain thread, refreshed once per third of the drainer window | share denominator for fair fan-out |
 | `poison` / `poison_held` / `key_deaths` | per quarantined key and transform | keeps a killer change from wedging the system |
 | `transform_fuse_gate` | one row per transform with a poisoned key | serializes concurrent evictions' fuse checks (issue #159) |
 

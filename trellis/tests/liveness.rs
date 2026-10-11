@@ -611,7 +611,7 @@ async fn a_daemon_keeps_its_claimants_drainer_row_fresh_through_a_long_drain() {
     // Both workers last came around their loop an hour ago: the busy one
     // because it has been inside one drain ever since.
     for id in ["busy-worker", "idle-worker"] {
-        claim::register_drainer(&client, id)
+        claim::register_drainers(&client, &[id])
             .await
             .expect("register drainer");
     }

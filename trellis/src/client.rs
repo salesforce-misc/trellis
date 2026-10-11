@@ -122,7 +122,13 @@ pub struct ClientOptions {
     /// the pass early when it sees one (issue #476).
     pub reconcile_interval: Duration,
     /// The window [`staging::count_live_drainers`] uses to size a claim's
-    /// share of a batch's buckets.
+    /// share of a batch's buckets: a drain thread counts while its `drainers`
+    /// row was refreshed within it. A client refreshes the rows of its running
+    /// drain threads once per third of this window (and once at start), in
+    /// one statement from one task, so a thread busy in a long drain still
+    /// counts and a thread that has exited stops counting within the window.
+    /// Do not set it below a few seconds: each refresh is a database round
+    /// trip.
     pub drainer_window: Duration,
     /// The out-of-band heartbeat daemon's tick interval and idle-exit
     /// timeout, one per app-worker task. The same interval also paces each
@@ -745,8 +751,19 @@ async fn run(
 
     let live_workers = LiveWorkers::default();
     let mut app_worker_tasks = Vec::with_capacity(options.application_threads + 1);
-    for i in 0..options.application_threads {
-        let claimed_by = format!("{client_id}-app-{i}");
+    let drainer_ids: Vec<String> = (0..options.application_threads)
+        .map(|i| format!("{client_id}-app-{i}"))
+        .collect();
+    // Every drain thread is a counted drainer before the first one claims, so
+    // its first claim does not size its share as the only worker. The
+    // registration task below keeps the rows fresh from here on.
+    if !drainer_ids.is_empty()
+        && let Ok(conn) = pool.get().await
+    {
+        let _ = staging::register_drainers(&**conn, &drainer_ids).await;
+    }
+    for claimed_by in drainer_ids {
+        let alive = live_workers.enter(claimed_by.clone());
         let worker_config = AppWorkerConfig {
             pool: pool.clone(),
             dsn: dsn.clone(),
@@ -757,7 +774,7 @@ async fn run(
             heartbeat_config: options.heartbeat.clone(),
             poll_interval: options.poll_interval,
             reclaim_ttl: options.reclaim_ttl,
-            alive: live_workers.enter(),
+            alive,
             watermark: watermark.clone(),
             drain_batch_cap: options.drain_batch_cap,
             build_chunk_rows: options.build_chunk_rows.max(1),
@@ -795,6 +812,19 @@ async fn run(
         )));
     }
 
+    // The drain threads' drainer rows, on a cadence derived from the window
+    // they are counted within (`drainer_registration_interval`).
+    let registration_task = (options.application_threads > 0).then(|| {
+        let pool = pool.clone();
+        let workers = live_workers.clone();
+        tokio::spawn(worker_upkeep_loop(
+            drainer_registration_interval(options.drainer_window),
+            live_workers.clone(),
+            shutdown_rx.clone(),
+            async move || drainer_registration_pass(&pool, &workers).await,
+        ))
+    });
+
     // Keeps this instance's gauges set for as long as the client runs, so the
     // recorder's idle timeout drops only a stopped instance's
     // (`crate::metrics::refresh_instance_gauges`).
@@ -823,6 +853,9 @@ async fn run(
         let _ = task.await;
     }
     if let Some(task) = upkeep_task {
+        let _ = task.await;
+    }
+    if let Some(task) = registration_task {
         let _ = task.await;
     }
 
@@ -1773,21 +1806,11 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             break;
         }
 
-        // `register_drainer` doubles as the liveness refresh
-        // `count_live_drainers` reads below (see its own doc comment), so it
-        // does need to run on every iteration — `drainers.last_seen` decays
-        // over `drainer_window` (30s by default), and this loop's own
-        // `poll_interval` floor (200ms by default) is comfortably inside
-        // that window even when idle. A drain can outlast the window (a
-        // paged one runs for minutes), so while this worker's claims are
-        // registered with `heartbeat`, the daemon refreshes the same row on
-        // its own tick (issue #654). What's wasteful isn't the cadence,
-        // it's checking out a separate pooled connection just for it: one
-        // connection serves both this and `next_claimable_segments` below.
-        // A failed refresh isn't fatal — it costs this worker one tick of
-        // undercounting toward the share denominator, not correctness — so
-        // it doesn't block trying `next_claimable_segments` on the same
-        // connection.
+        // This worker's `drainers` row, which `count_live_drainers` reads
+        // below, is kept fresh by [`drainer_registration_pass`] on a cadence
+        // of its own, not on every wake: a wake that finds nothing to do
+        // would otherwise cost an upsert, and a worker inside a long drain
+        // or build chunk would not come back around to refresh it.
         //
         // Issue #63 Milestone 2: asks for several segments at once rather
         // than just the lowest one, so a burst of quickly sealing segments
@@ -1797,10 +1820,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // `drain_batch_cap` by row count; a segment over the cap comes back
         // alone and pages.
         let seg_seqs = match pool.get().await {
-            Ok(client) => {
-                let _ = staging::register_drainer(&**client, &claimed_by).await;
-                staging::next_claimable_segments(&**client, drain_batch_cap).await
-            }
+            Ok(client) => staging::next_claimable_segments(&**client, drain_batch_cap).await,
             Err(err) => Err(err.into()),
         };
 
@@ -2032,34 +2052,57 @@ async fn rederive_build_step(
     }
 }
 
-/// How many of one `Client`'s app-worker loops are still running. The gate on
-/// [`worker_upkeep_loop`]: it keeps the registry row fresh only while this is
-/// nonzero.
+/// The drainer ids (`claimed_by`) of one `Client`'s app-worker loops that are
+/// still running. The gate on [`worker_upkeep_loop`]: it keeps the registry row
+/// fresh only while this is non-empty. The drainer registration pass reads it
+/// too, so a drain thread that is gone stops being registered.
 #[derive(Clone, Default)]
-struct LiveWorkers(Arc<std::sync::atomic::AtomicUsize>);
+struct LiveWorkers(Arc<std::sync::Mutex<Vec<String>>>);
 
 /// One running worker loop's entry in [`LiveWorkers`], removed on drop. A
 /// worker task that panics unwinds through its locals, so its entry goes
 /// with it.
-struct WorkerAlive(Arc<std::sync::atomic::AtomicUsize>);
+struct WorkerAlive {
+    live: LiveWorkers,
+    id: String,
+}
 
 impl LiveWorkers {
-    /// Counts one more worker loop. Taken before the loop is spawned, so the
-    /// upkeep loop never sees a count of zero for a worker that has not been
-    /// polled yet.
-    fn enter(&self) -> WorkerAlive {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        WorkerAlive(self.0.clone())
+    fn ids_guard(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        // The list is only ever pushed to and removed from, so a poisoned
+        // lock still holds a valid list.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Counts one more worker loop, registered as the drainer `id`. Taken
+    /// before the loop is spawned, so the upkeep loop never sees a count of
+    /// zero for a worker that has not been polled yet.
+    fn enter(&self, id: String) -> WorkerAlive {
+        self.ids_guard().push(id.clone());
+        WorkerAlive {
+            live: self.clone(),
+            id,
+        }
     }
 
     fn any(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+        !self.ids_guard().is_empty()
+    }
+
+    /// The drainer ids of the worker loops running now.
+    fn ids(&self) -> Vec<String> {
+        self.ids_guard().clone()
     }
 }
 
 impl Drop for WorkerAlive {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let mut ids = self.live.ids_guard();
+        if let Some(at) = ids.iter().position(|id| *id == self.id) {
+            ids.swap_remove(at);
+        }
     }
 }
 
@@ -2094,7 +2137,9 @@ fn upkeep_interval(reclaim_ttl: Duration) -> Duration {
 /// process's. A clean shutdown deregisters in [`run`].
 ///
 /// `pass` is [`worker_upkeep_pass`] in production; it is a parameter so a
-/// test can step the loop without waiting on a clock.
+/// test can step the loop without waiting on a clock. The drainer
+/// registration ([`drainer_registration_pass`]) runs on this loop too, at its
+/// own interval, so the same gate applies to it.
 async fn worker_upkeep_loop(
     interval: Duration,
     live_workers: LiveWorkers,
@@ -2124,6 +2169,29 @@ async fn worker_upkeep_pass(pool: &Pool, worker_id: &str, reclaim_ttl: Duration)
     if let Ok(mut client) = pool.get().await {
         let _ = staging::register_worker(&**client, worker_id).await;
         let _ = chunk_queue::reclaim_stale_chunks(&mut **client, reclaim_ttl).await;
+    }
+}
+
+/// How often the drain threads' `drainers` rows are refreshed: a third of
+/// the window ([`ClientOptions::drainer_window`]) a row counts as live within,
+/// so a live row stays inside the window across two missed passes. A drainer
+/// that exits drops out of the count within the window.
+fn drainer_registration_interval(drainer_window: Duration) -> Duration {
+    (drainer_window / 3).max(MIN_UPKEEP_INTERVAL)
+}
+
+/// One pass of the drainer registration: upserts a `drainers` row for every
+/// drain thread whose worker loop is running. A thread that panicked or
+/// exited is not in the list, so its row ages out; a thread busy in a long
+/// drain or build chunk is, so its row stays fresh. Failures are not fatal:
+/// the next pass retries.
+async fn drainer_registration_pass(pool: &Pool, workers: &LiveWorkers) {
+    let ids = workers.ids();
+    if ids.is_empty() {
+        return;
+    }
+    if let Ok(client) = pool.get().await {
+        let _ = staging::register_drainers(&**client, &ids).await;
     }
 }
 
@@ -4345,7 +4413,7 @@ mod worker_upkeep_tests {
             .await
             .expect("register");
         let live_workers = LiveWorkers::default();
-        let workers = std::sync::Mutex::new(Some(live_workers.enter()));
+        let workers = std::sync::Mutex::new(Some(live_workers.enter("w".to_string())));
         let passes = AtomicUsize::new(0);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4389,8 +4457,8 @@ mod worker_upkeep_tests {
     fn a_panicking_worker_loop_leaves_the_live_count() {
         let live_workers = LiveWorkers::default();
         assert!(!live_workers.any());
-        let alive = live_workers.enter();
-        let other = live_workers.enter();
+        let alive = live_workers.enter("a".to_string());
+        let other = live_workers.enter("b".to_string());
         assert!(live_workers.any());
         let panicked = std::thread::spawn(move || {
             let _alive = alive;
@@ -4574,6 +4642,309 @@ mod worker_upkeep_tests {
             .map(|row| row.get(0))
             .collect();
         assert_eq!(left, ["between-refreshes"]);
+
+        client.shutdown().await.expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod drainer_registration_tests {
+    //! #273: the drain threads' `drainers` rows are refreshed by one task on a
+    //! cadence derived from `drainer_window`, not by each thread on every wake.
+    //! The cadence is stepped with a paused clock and the pass is called
+    //! directly, so none of this waits for a tick (#297). The tests that start
+    //! a real `Client` await a trigger's notification of its writes; the one
+    //! negative assertion (no write per wake) ends on a sentinel the test sends
+    //! itself.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A raw connection with a trigger on `drainers` that notifies
+    /// `drainer_writes` with `<op>:<drainer_id>` for each row written, and the
+    /// receiver of those notifications.
+    async fn drainer_writes(
+        db: &testkit::TestDatabase,
+    ) -> (
+        tokio_postgres::Client,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (raw, mut connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(Ok(message)) =
+                std::future::poll_fn(|cx| connection.poll_message(cx)).await
+            {
+                if let tokio_postgres::AsyncMessage::Notification(n) = message {
+                    let _ = tx.send(n.payload().to_string());
+                }
+            }
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {schema}, public; \
+             create function drainer_writes() returns trigger language plpgsql as $$ \
+             begin perform pg_notify('drainer_writes', tg_op || ':' || new.drainer_id); \
+             return null; end $$; \
+             create trigger drainer_writes after insert or update on drainers \
+             for each row execute function drainer_writes(); \
+             listen drainer_writes",
+            schema = crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("notify on drainer writes");
+        (raw, rx)
+    }
+
+    async fn age_drainers(raw: &tokio_postgres::Client) {
+        raw.execute(
+            "update drainers set last_seen = now() - interval '1 hour'",
+            &[],
+        )
+        .await
+        .expect("age the rows");
+    }
+
+    async fn live_drainers(raw: &tokio_postgres::Client, window: Duration) -> Vec<String> {
+        let mut ids: Vec<String> = raw
+            .query(
+                "select drainer_id from drainers \
+                 where last_seen > now() - (interval '1 second' * $1::float8)",
+                &[&window.as_secs_f64()],
+            )
+            .await
+            .expect("read drainers")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The interval is a third of the window, so a live row survives two
+    /// missed passes, and a very small window cannot make the loop spin.
+    #[test]
+    fn the_registration_interval_is_a_third_of_the_drainer_window() {
+        assert_eq!(
+            drainer_registration_interval(staging::DEFAULT_DRAINER_WINDOW),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            drainer_registration_interval(Duration::from_secs(90)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            drainer_registration_interval(Duration::ZERO),
+            MIN_UPKEEP_INTERVAL
+        );
+    }
+
+    /// The loop registers at once, then once per interval, and not per
+    /// anything a worker does: the clock is the only thing that moves it.
+    #[tokio::test(start_paused = true)]
+    async fn registration_runs_at_start_then_once_per_interval() {
+        let interval = drainer_registration_interval(staging::DEFAULT_DRAINER_WINDOW);
+        let live_workers = LiveWorkers::default();
+        let _alive = live_workers.enter("w".to_string());
+        let passes = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(worker_upkeep_loop(interval, live_workers, shutdown_rx, {
+            let passes = passes.clone();
+            async move || {
+                passes.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "the first pass is at once"
+        );
+        tokio::time::sleep(interval - Duration::from_millis(1)).await;
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "nothing before the interval"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(passes.load(Ordering::SeqCst), 2, "one pass per interval");
+        tokio::time::sleep(interval * 3).await;
+        assert_eq!(passes.load(Ordering::SeqCst), 5);
+
+        shutdown_tx.send(true).expect("shutdown");
+        task.await.expect("the loop stops on shutdown");
+    }
+
+    /// A busy thread's row stays inside the window and a dead thread's row
+    /// ages out. Both threads are "inside a long drain" for as long as their
+    /// guards are held (no pass from any worker loop runs here): each pass
+    /// finds every row a long drain would have aged out and puts back the
+    /// live threads'. Dropping a guard (a worker panic or exit) leaves that
+    /// thread's row to age out while its sibling's stays fresh.
+    #[tokio::test]
+    async fn a_busy_threads_row_stays_inside_the_window_and_a_dead_threads_ages_out() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = Pool::new(&config).expect("pool");
+        let raw = pool.get().await.expect("connection");
+        let window = staging::DEFAULT_DRAINER_WINDOW;
+
+        let live_workers = LiveWorkers::default();
+        let busy = live_workers.enter("busy".to_string());
+        let doomed = std::sync::Mutex::new(Some(live_workers.enter("doomed".to_string())));
+        let busy = std::sync::Mutex::new(Some(busy));
+        let passes = AtomicUsize::new(0);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            worker_upkeep_loop(
+                Duration::from_millis(1),
+                live_workers.clone(),
+                shutdown_rx,
+                async || {
+                    let n = passes.fetch_add(1, Ordering::SeqCst) + 1;
+                    age_drainers(&raw).await;
+                    assert!(
+                        live_drainers(&raw, window).await.is_empty(),
+                        "the rows aged out before pass {n}"
+                    );
+                    drainer_registration_pass(&pool, &live_workers).await;
+                    let live = live_drainers(&raw, window).await;
+                    match n {
+                        1 | 2 => assert_eq!(live, ["busy", "doomed"], "pass {n}"),
+                        3 => {
+                            assert_eq!(live, ["busy", "doomed"], "pass {n}");
+                            // The doomed thread's worker loop ends.
+                            doomed.lock().expect("lock").take();
+                        }
+                        4 => {
+                            assert_eq!(live, ["busy"], "a dead thread is not registered");
+                            // The last worker loop ends.
+                            busy.lock().expect("lock").take();
+                        }
+                        _ => unreachable!("no pass after the last worker went"),
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("the loop stops once no worker loop is alive");
+        assert_eq!(passes.load(Ordering::SeqCst), 4);
+
+        // Nothing left to register: a pass with no live thread writes nothing.
+        age_drainers(&raw).await;
+        drainer_registration_pass(&pool, &live_workers).await;
+        assert!(live_drainers(&raw, window).await.is_empty());
+    }
+
+    /// A started client counts every drain thread before the first claim, and
+    /// then writes no `drainers` row per wake: with a wake every few
+    /// milliseconds and a window of an hour, the only writes are the
+    /// registration at start and the registration task's first pass. The
+    /// sentinel `notify` is sent from the test after shutdown, so everything
+    /// the client wrote has been delivered by the time it arrives.
+    #[tokio::test]
+    async fn a_started_client_registers_at_start_and_not_per_wake() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (raw, mut writes) = drainer_writes(&db).await;
+        let client = Client::start(
+            db.dsn(),
+            ClientOptions {
+                staging_worker: false,
+                application_threads: 2,
+                poll_interval: Duration::from_millis(2),
+                drainer_window: Duration::from_secs(3600),
+                ..ClientOptions::default()
+            },
+        )
+        .expect("start");
+
+        // The registration at start, and the task's first pass, per thread.
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let write = tokio::time::timeout(Duration::from_secs(60), writes.recv())
+                .await
+                .expect("a registration write")
+                .expect("listener");
+            seen.push(write);
+        }
+        // Many wakes happen while the client stays up.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        client.shutdown().await.expect("shutdown");
+        raw.batch_execute("notify drainer_writes, 'end'")
+            .await
+            .expect("sentinel");
+        while let Some(write) = writes.recv().await {
+            if write == "end" {
+                break;
+            }
+            seen.push(write);
+        }
+
+        seen.sort();
+        let ids: Vec<String> = raw
+            .query("select drainer_id from drainers order by drainer_id", &[])
+            .await
+            .expect("read drainers")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            seen,
+            [
+                format!("INSERT:{}", ids[0]),
+                format!("INSERT:{}", ids[1]),
+                format!("UPDATE:{}", ids[0]),
+                format!("UPDATE:{}", ids[1]),
+            ],
+            "the registration at start and the task's first pass, nothing per wake"
+        );
+    }
+
+    /// The cadence is wired from `drainer_window`: with a short window the
+    /// task keeps refreshing both threads' rows after the first pass.
+    #[tokio::test]
+    async fn a_started_client_keeps_refreshing_its_threads_rows() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_raw, mut writes) = drainer_writes(&db).await;
+        let client = Client::start(
+            db.dsn(),
+            ClientOptions {
+                staging_worker: false,
+                application_threads: 2,
+                drainer_window: Duration::from_millis(60),
+                ..ClientOptions::default()
+            },
+        )
+        .expect("start");
+
+        // Inserts at start, then updates, two per pass: three passes' worth.
+        // At the interval of this window they take well under a second; a
+        // task on the default upkeep cadence (10 s) would need 20 s, so the
+        // bound separates the two without being tight.
+        let mut updates = 0;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while updates < 6 {
+                if writes
+                    .recv()
+                    .await
+                    .expect("listener")
+                    .starts_with("UPDATE:")
+                {
+                    updates += 1;
+                }
+            }
+        })
+        .await
+        .expect("the task keeps refreshing the rows at the window's cadence");
 
         client.shutdown().await.expect("shutdown");
     }

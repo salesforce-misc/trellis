@@ -457,13 +457,13 @@ async fn drainer_registration_is_the_share_denominator_floored_at_one() {
         .expect("count live drainers (none registered)");
     assert_eq!(count, 1);
 
-    claim::register_drainer(&client, "w1")
+    claim::register_drainers(&client, &["w1"])
         .await
         .expect("register w1");
-    claim::register_drainer(&client, "w2")
+    claim::register_drainers(&client, &["w2"])
         .await
         .expect("register w2");
-    claim::register_drainer(&client, "w2")
+    claim::register_drainers(&client, &["w2"])
         .await
         .expect("re-register w2 (upsert, not a duplicate row)");
 
@@ -471,6 +471,20 @@ async fn drainer_registration_is_the_share_denominator_floored_at_one() {
         .await
         .expect("count live drainers (two registered)");
     assert_eq!(count, 2);
+
+    // A client registers all of its threads in one call: one row per id (a
+    // repeated id is one row, as is an id already registered), and no ids
+    // is no write.
+    claim::register_drainers(&client, &["w2", "w3", "w4", "w3"])
+        .await
+        .expect("register a batch");
+    claim::register_drainers::<&str>(&client, &[])
+        .await
+        .expect("register nothing");
+    let count = claim::count_live_drainers(&client, Duration::from_secs(30))
+        .await
+        .expect("count live drainers (four registered)");
+    assert_eq!(count, 4);
 }
 
 /// Issue #756: every process start registers drainers under a fresh worker
@@ -482,10 +496,10 @@ async fn the_drainer_sweep_deletes_only_rows_older_than_its_horizon() {
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
 
-    claim::register_drainer(&client, "dead")
+    claim::register_drainers(&client, &["dead"])
         .await
         .expect("register dead");
-    claim::register_drainer(&client, "live")
+    claim::register_drainers(&client, &["live"])
         .await
         .expect("register live");
     client

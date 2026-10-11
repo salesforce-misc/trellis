@@ -46,7 +46,7 @@ use super::error::StagingError;
 /// Upserts `worker_id`'s row, bumping `last_seen` to now. Called once at
 /// `Client::start` (registration, only when `application_threads > 0`) and
 /// again from the client's upkeep task (heartbeat) — one call serves both, the
-/// same shape [`super::claim::register_drainer`] already uses for a
+/// same shape [`super::claim::register_drainers`] already uses for a
 /// different registry.
 pub async fn register_worker(
     client: &impl GenericClient,

@@ -102,7 +102,7 @@ pub use apply::{
     ApplyError, DEFAULT_DRAIN_BATCH_CAP, drain_many_with_cap, next_claimable_segments,
 };
 pub use claim::{
-    DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, reclaim_stale_drainers, register_drainer,
+    DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, reclaim_stale_drainers, register_drainers,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use drift_memo::checks as drift_checks;

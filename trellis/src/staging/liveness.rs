@@ -269,12 +269,11 @@ const DAEMON_REFRESH_SQL: &str = "\
 
 /// Bumps `drainers.last_seen` for every distinct claimant in the daemon's
 /// registry: a worker holding a claim the daemon is refreshing is, by
-/// definition, a live drainer. The worker loop's own
-/// [`super::claim::register_drainer`] only runs between drains, so without
-/// this a worker inside a paged drain longer than the drainer window (30 s)
-/// dropped out of [`super::claim::count_live_drainers`], and claims made
-/// meanwhile divided the free buckets among the idle workers only (issue
-/// #654).
+/// definition, a live drainer. A `Client` also registers its live drain
+/// threads on a cadence of its own ([`super::claim::register_drainers`]), so
+/// this is the same refresh from a second source: it keeps the row of a
+/// claimant that uses the daemon without a `Client` (issue #654) counted
+/// through a drain longer than the drainer window.
 const DAEMON_DRAINER_REFRESH_SQL: &str = "\
     insert into drainers (drainer_id, last_seen) \
     select distinct d, now() from unnest($1::text[]) as d \

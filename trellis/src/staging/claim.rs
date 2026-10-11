@@ -5,7 +5,7 @@
 //! Scope: this module decides how many buckets a batch gets
 //! ([`SEG_BUCKETS`]/[`MIN_ROWS_TO_SPLIT`], applied by
 //! `super::seal::seal_phase2`), tracks live workers as the share
-//! denominator ([`register_drainer`]/[`count_live_drainers`]), and lets a
+//! denominator ([`register_drainers`]/[`count_live_drainers`]), and lets a
 //! worker claim a share of a batch's free buckets ([`claim`]) with the
 //! `sealed -> draining` flip committing in the same statement. It does
 //! *not* compute deltas, apply them, or complete a batch (`draining ->
@@ -54,18 +54,28 @@ pub const MIN_ROWS_TO_SPLIT: i64 = 256;
 /// toward the share denominator claim-time sizing divides by.
 pub const DEFAULT_DRAINER_WINDOW: Duration = Duration::from_secs(30);
 
-/// Upserts `id`'s row in the drainer registry, bumping `last_seen` to now —
-/// the registration half of the share denominator [`count_live_drainers`]
-/// reads. This is just "a worker exists," called once per worker-loop
-/// iteration. While a drain runs, the loop doesn't come back around, so
-/// [`super::liveness::HeartbeatDaemon`] refreshes the same row on its own
-/// tick for every claimant it holds claims for (issue #654).
-pub async fn register_drainer(client: &impl GenericClient, id: &str) -> Result<(), StagingError> {
+/// Upserts one row per id in the drainer registry, bumping `last_seen` to now
+/// — the registration half of the share denominator [`count_live_drainers`]
+/// reads. A drainer is one drain thread (its `claimed_by`), and the share
+/// denominator counts rows, so each thread keeps a row of its own. A
+/// `Client` registers all of its live threads in one statement, on a cadence
+/// of its own (`trellis::client`'s `drainer_registration_interval`: a third
+/// of the drainer window), rather than each thread on every wake. Empty `ids`
+/// issue nothing.
+pub async fn register_drainers<S: AsRef<str>>(
+    client: &impl GenericClient,
+    ids: &[S],
+) -> Result<(), StagingError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
     client
         .execute(
-            "insert into drainers (drainer_id, last_seen) values ($1, now()) \
+            "insert into drainers (drainer_id, last_seen) \
+             select distinct d, now() from unnest($1::text[]) as d \
              on conflict (drainer_id) do update set last_seen = excluded.last_seen",
-            &[&id],
+            &[&ids],
         )
         .await?;
     Ok(())
