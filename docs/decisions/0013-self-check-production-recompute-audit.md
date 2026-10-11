@@ -44,7 +44,7 @@ the staging worker installed it:
 - each function exists, is `SECURITY DEFINER`, and is owned by the role that
   owns the ring (the one Trellis role that runs the migrations and installs
   and owns capture). That is not necessarily the schema's owner: a DBA can
-  pre-create the schema as another role (issue #701);
+  pre-create the schema as another role;
 - the role each function runs as still has `USAGE` on the schema, `INSERT` on
   every ring segment, and `USAGE` on the change-id sequence and the ring slot
   mirror;

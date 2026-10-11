@@ -2,8 +2,6 @@
 status: accepted
 date: 2026-09-27
 deciders: Michael Ries
-consulted:
-informed:
 ---
 
 # Data Flow: Synchronous Capture, Asynchronous Exactly-Once Derivation
@@ -16,7 +14,8 @@ them.*
 Trellis derives tables from other tables. Two questions decide the whole
 design: *where* a derivation runs, and *how* a source change is captured and
 ordered so that the derivation is applied exactly once. This ADR answers
-both.
+both. [ADR-0017](0017-partitioned-sources.md) extends its capture and truncate
+decisions to partitioned sources.
 
 **Derivation is asynchronous.** Source changes are batched, and derived
 values are computed and written by drain workers outside the application's
@@ -50,23 +49,21 @@ been applied to the same row or group. Trellis has many producers of absolute
 writes (an image-less recompute, the relationship reverse path, a projection
 refresh, a go-live re-read), each reading live `READ COMMITTED` state and
 each racing out-of-order parallel drains. Ordering them by position needs one
-precedence rule per pairing of producers (#556's inventory); one ordering
-mechanism for every absolute write replaces those rules. The research behind
-it (#558, #565, #617) also measured scaling cliffs in the alternatives, a
-logical-replication capture and a one-pass build, that this design avoids:
+precedence rule per pairing of producers; one ordering
+mechanism for every absolute write replaces those rules. My measurements also
+found scaling cliffs in the alternatives, a logical-replication capture and a
+one-pass build, that this design avoids:
 
-- a logical replication slot stages at most about 120k rows/s whatever the
-  writers do, and never captured a 10M-row `COPY`
-  (#565 [E1](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977));
-- a one-pass go-live re-read could not finish at 100M rows on a 31 GB box, because
-  a drain batch held its whole share of a segment in memory
-  (#617 [step 3](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5857993459));
-- the earlier relationship reverse path lost updates under to-side churn (#582,
-  #558 [experiment 4](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5845224204)).
+- I measured a logical replication slot staging at most about 120k rows/s
+  whatever the writers do, and it never captured a 10M-row `COPY`;
+- I ran a one-pass go-live re-read at 100M rows on a 31 GB box and it could not
+  finish, because a drain batch held its whole share of a segment in memory;
+- I ran a relationship reverse path that keeps a settled projection as
+  correctness state under to-side churn and it lost updates, never converging to
+  the right target.
 
 Conventions: **must** is a requirement the evidence forces; **should** is a
-recommendation the evidence supports but does not force; evidence links point
-at the comment that produced the number.
+recommendation the evidence supports but does not force.
 
 ## Derivation is asynchronous
 
@@ -113,20 +110,20 @@ never-fail rule).
 ## Invariants
 
 The design is these invariants; every element below exists to hold one of
-them. I0 to I5 come from the ledger note (#558) as the experiments
-refined them; I6 to I8 come from #565 and #617.
+them. I0 to I5 are the ledger's ordering rules as my experiments
+refined them; I6 to I8 are the rules the capture and build experiments forced.
 
 | | Invariant | Evidence and refinements |
 |---|---|---|
 | **I0** | **One database.** Sources, the ring, every ledger and every target live in one Postgres database, so one snapshot orders every commit Trellis will see. | Design premise; made exact by trigger capture, which makes a ring row's transaction the source commit's. Nothing here works across databases. |
-| **I1** | **Read after lock.** Every live read that feeds an absolute write happens after the writer holds the lock on the ledger state it will write, and the snapshot it stores is taken **in the same statement** as the read. One write reads first: a build chunk's insert of the entry of a key that has none, from a read in the same statement. Its uniqueness check comes after the read, and finding no entry there means no Apply has written the key since the read's snapshot, because the tombstone GC, the one thing that removes an entry an Apply wrote, skips a ledger under a build (I4). A page deletes only a placeholder it wrote no change to, which holds no applied change, and a source truncate commits before the chunk's first read, which holds the source's lock, so it empties no change the snapshot doesn't see. A key that has an entry by then is locked and read afresh. The rule needs `READ COMMITTED`, where each statement reads from a snapshot of its own, so a read after the lock sees what the lock waited for; at `REPEATABLE READ` or `SERIALIZABLE` it would read from the transaction's first snapshot, taken before the lock. Every session Trellis opens sets `default_transaction_isolation` to `read committed`, whatever the server's, database's or role's default, and a transaction that needs one snapshot for several reads asks for its level explicitly. | [Exp 2](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484) scenarios 2/2b hold (Apply demonstrably blocks on the entry lock). [Exp 1b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484): a snapshot taken in a separate statement differed from the read's in 99.7% of samples under load; the stored basis is the full `pg_snapshot`, not `xmin`/`xmax`. |
-| **I2** | **Visibility-checked application.** A change C for row r is applied iff C's transaction is **not** visible in r's basis snapshot **and** C's ring position is above r's `applied_lsn` (and above the target's truncate floor, [Truncate](#truncate-ddl-drop)). Skipping is exact, never "maybe counted, re-derive". | Exp 2: skip-iff-visible alone fails scenarios 5b/9/9c (same-key order across batches is not decidable from visibility); stamping Apply's own snapshot fails 9b/9d; visible-or-`applied_lsn` passes all seventeen. An in-flight id is decidable from the stored list ([exp 1b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484): 0 disagreements over ~1.1M pairs); #617 saw 0 in-progress cases at 10M. |
-| **I3** | **Per-row ordering state; groups are pure sums.** The ledger entry is the only place a row's applied contribution and group live. A group value is the sum of its entries' contributions, so group updates commute and a group row is only ever incremented. A relationship's parent is read under the child's entry lock ([Relationships](#relationships-the-parent-is-read-under-the-childs-entry-lock)). | Exp 2 scenarios 4 and 5. |
-| **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry stays, with its `applied_lsn` and `applied_seg`, until every batch at or below its `applied_seg` is fully drained ([Convergence and status](#convergence-and-status)). | Exp 2 scenario 9 (an older update resurrects a deleted row without it). The batch-watermark form is exact under triggers because a same-key predecessor of a delete committed before the delete's trigger ran ([trigger-capture analysis](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847674780)). |
-| **I5** | **One lock order, taken as one sorted batch.** A page's 1-1 targets, then its aggregate targets, each in target order; per target its ledger entries, then its rows or groups, each locked in key order in one statement per class. Never a per-row loop. | Exp 2 finding 3: a per-row loop deadlocked 19–22 times in 20 s; the sorted batch never did. The built paths held it in the D9 round (no deadlock in any benchmark, and group moves and the hot-key case converge with none). The unbuilt factored relationship layout is the one variant that deadlocked ([Relationships](#relationships-the-parent-is-read-under-the-childs-entry-lock)). |
-| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. A schema change to a read column never fails the application's statement. A missing ring table or a revoked privilege does, loudly ([Consequences](#consequences-and-costs)). | [E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119): a bare `CREATE TRIGGER` stalled every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. [E4](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977): a renamed read column failed every insert until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
-| **I7** | **No Trellis transaction waits for a lock while it holds a snapshot open.** Every lock statement runs under a `lock_timeout`; on timeout the transaction rolls back and the work is retried from outside any transaction. | [#617 final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160): a drain batch's ledger insert waited 1 h 50 min behind chunk transactions; the open transaction held back vacuum and the sealer for the whole wait. |
-| **I8** | **Memory is bounded by a batch cap, never by segment size.** A drain batch folds, re-reads and applies at most a fixed number of changes and pages through a larger bucket. | [#617 step 3](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5857993459): ~650 B per staged row held per worker, 6.32 GB at 10M, OOM at 100M; fewer workers bound nothing because each worker then holds more buckets. |
+| **I1** | **Read after lock.** Every live read that feeds an absolute write happens after the writer holds the lock on the ledger state it will write, and the snapshot it stores is taken **in the same statement** as the read. One write reads first: a build chunk's insert of the entry of a key that has none, from a read in the same statement. Its uniqueness check comes after the read, and finding no entry there means no Apply has written the key since the read's snapshot, because the tombstone GC, the one thing that removes an entry an Apply wrote, skips a ledger under a build (I4). A page deletes only a placeholder it wrote no change to, which holds no applied change, and a source truncate commits before the chunk's first read, which holds the source's lock, so it empties no change the snapshot doesn't see. A key that has an entry by then is locked and read afresh. The rule needs `READ COMMITTED`, where each statement reads from a snapshot of its own, so a read after the lock sees what the lock waited for; at `REPEATABLE READ` or `SERIALIZABLE` it would read from the transaction's first snapshot, taken before the lock. Every session Trellis opens sets `default_transaction_isolation` to `read committed`, whatever the server's, database's or role's default, and a transaction that needs one snapshot for several reads asks for its level explicitly. | In my interleaving experiment (seventeen hand-driven scenarios of Apply racing a Re-derive and other producers), the scenarios where a stalled Re-derive meets a change to the same key, committed before or after its snapshot, hold, and Apply demonstrably blocks on the entry lock. In a snapshot-timing experiment I measured a snapshot taken in a separate statement differing from the read's in 99.7% of samples under load; the stored basis is the full `pg_snapshot`, not `xmin`/`xmax`. |
+| **I2** | **Visibility-checked application.** A change C for row r is applied iff C's transaction is **not** visible in r's basis snapshot **and** C's ring position is above r's `applied_lsn` (and above the target's truncate floor, [Truncate](#truncate-ddl-drop)). Skipping is exact, never "maybe counted, re-derive". | In the interleaving experiment, skip-iff-visible alone fails three scenarios (same-key order across batches is not decidable from visibility); stamping Apply's own snapshot fails two more; visible-or-`applied_lsn` passes all seventeen. An in-flight id is decidable from the stored list (0 disagreements over ~1.1M pairs in the snapshot-timing experiment); my 10M chunked-build runs saw 0 in-progress cases. |
+| **I3** | **Per-row ordering state; groups are pure sums.** The ledger entry is the only place a row's applied contribution and group live. A group value is the sum of its entries' contributions, so group updates commute and a group row is only ever incremented. A relationship's parent is read under the child's entry lock ([Relationships](#relationships-the-parent-is-read-under-the-childs-entry-lock)). | In the interleaving experiment, eight workers creating the same groups at once, and a row passing through a group within one folded batch while that group rebuilds, both hold with groups as sums and no pre-lock or probe. |
+| **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry stays, with its `applied_lsn` and `applied_seg`, until every batch at or below its `applied_seg` is fully drained ([Convergence and status](#convergence-and-status)). | In the interleaving experiment an older update resurrects a deleted row unless the tombstone is kept. The batch-watermark form is exact under triggers because a same-key predecessor of a delete committed before the delete's trigger ran. |
+| **I5** | **One lock order, taken as one sorted batch.** A page's 1-1 targets, then its aggregate targets, each in target order; per target its ledger entries, then its rows or groups, each locked in key order in one statement per class. Never a per-row loop. | In the interleaving experiment a per-row loop deadlocked 19–22 times in 20 s; the sorted batch never did. The implemented paths held it in my benchmark round (no deadlock in any benchmark, and group moves and the hot-key case converge with none). The unbuilt factored relationship layout is the one variant that deadlocked ([Relationships](#relationships-the-parent-is-read-under-the-childs-entry-lock)). |
+| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. A schema change to a read column never fails the application's statement. A missing ring table or a revoked privilege does, loudly ([Consequences](#consequences-and-costs)). | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. I renamed a read column under the capture function and every insert failed until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
+| **I7** | **No Trellis transaction waits for a lock while it holds a snapshot open.** Every lock statement runs under a `lock_timeout`; on timeout the transaction rolls back and the work is retried from outside any transaction. | In my 100M chunked-build run, a drain batch's ledger insert waited 1 h 50 min behind chunk transactions; the open transaction held back vacuum and the sealer for the whole wait. |
+| **I8** | **Memory is bounded by a batch cap, never by segment size.** A drain batch folds, re-reads and applies at most a fixed number of changes and pages through a larger bucket. | In my one-pass build, a drain held ~650 B per staged row per worker: 6.32 GB at 10M, OOM at 100M; fewer workers bound nothing because each worker then holds more buckets. |
 
 ## Capture by statement triggers
 
@@ -138,15 +135,11 @@ What it does there is one append.
   `TRUNCATE`, each appending the statement's rows to the active ring segment in the
   writer's transaction. The ring row's `row_txid` (`DEFAULT
   pg_current_xact_id()`) is therefore the source commit's `xid8`, and it is
-  the identity I2 checks. *Evidence:* statement triggers beat row triggers
-  5–10x above 1 row/commit
-  ([E1](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977));
-  capture scales with writers to ~1.9M rows/s at 1,000 rows/commit and ~190k
-  at 1 row/commit
-  ([E2](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119));
-  at 1 row/commit the tax vanishes under a real fsync (within 1% of no
-  capture at 16 writers,
-  [E1 disk](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5850979670)).
+  the identity I2 checks. *Evidence:* I measured statement triggers beating
+  row triggers 5–10x above 1 row/commit; capture scaling with writers to
+  ~1.9M rows/s at 1,000 rows/commit and ~190k at 1 row/commit; and, at 1
+  row/commit on disk, the tax vanishing under a real fsync (within 1% of no
+  capture at 16 writers).
 - **Must:** the generated function names only the primary key and the
   columns the table's definitions read (plus relationship `from_col`s), emits
   **NEW-only** images (a delete emits the key), renders every value with
@@ -155,22 +148,20 @@ What it does there is one append.
   `SET` clauses on the function, carries
   a `WHEN` clause that skips an update touching no read column, is
   `SECURITY DEFINER` owned by the Trellis role (the one role that owns
-  Trellis's schema and performs every Trellis operation; #622 plan Q3) with
+  Trellis's schema and performs every Trellis operation) with
   a pinned `search_path`, is `ENABLE ALWAYS`, and reads the active slot
   schema-qualified through the sequence mirror
   ([The seal fence](#the-seal-fence-under-application-writers)). *Evidence:*
-  [E3](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119):
-  only `format()` and `hstore` with pinned settings are byte-identical to
-  `tuple_to_json` across all 38 type families; `::text` and `to_jsonb` are
-  not; an unpinned image silently depends on the application session's
+  I compared image encodings across 38 type families: only `format()` and
+  `hstore` with pinned settings are byte-identical to `tuple_to_json`;
+  `::text` and `to_jsonb` are not; an unpinned image silently depends on the application session's
   `DateStyle`, `TimeZone`, `bytea_output`, `IntervalStyle` and
   `extra_float_digits`; an encoding that reads every column costs 3.3 ms and
   323 KB per row on a 100 KB column, 40x the control, where naming only the
   read columns costs +30 µs. NEW-only is exact because the ledger holds the
-  old side ([trigger-capture analysis](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847674780)).
-  The `WHEN` clause is a filter inside the function (a statement trigger
-  with transition tables can't take a `WHEN`): an update row whose imaged
-  columns are all unchanged (`record_image_ne` over the typed values) stages
+  old side. The `WHEN` clause is a filter inside the function (a statement
+  trigger with transition tables can't take a `WHEN`): an update row whose
+  imaged columns are all unchanged (compared over the typed values) stages
   nothing. The NEW image is the **live row** whenever it can differ from the
   transition row: the fifth trigger, `<schema>_capture_begin` (`BEFORE … FOR
   EACH STATEMENT`), marks each statement's span, and capture re-reads its
@@ -183,17 +174,15 @@ What it does there is one append.
   rate is 0, as with no capture. **The ring still carries the old image:**
   every remaining reader of it is relationship machinery (the to-one
   projection and guards, the to-many reverse path, the generation bump,
-  prior-image hints), so dropping it, with the fold's OLD-only fields, is
-  milestone E (#624). An aggregate Apply takes a key's old group and
-  contribution from its ledger entry, not from the image.
-  [E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)
-  for the privilege model: the application needs nothing on Trellis's
+  prior-image hints). An aggregate Apply takes a key's old group and
+  contribution from its ledger entry, not from the image. On the privilege
+  model, I checked that the application needs nothing on Trellis's
   schema. The Trellis role must own each source table or be a member of its
-  owning role, because `ENABLE ALWAYS` needs ownership, not just `TRIGGER`
-  (#622 plan finding 3). It needs no superuser.
+  owning role, because `ENABLE ALWAYS` needs ownership, not just `TRIGGER`.
+  It needs no superuser.
 - **Must (I6):** `CREATE TRIGGER` and `DROP TRIGGER` run under a short
   `lock_timeout` in a retry loop, one attempt per interval, until they land.
-  *Evidence:* [E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119).
+  *Evidence:* the `lock_timeout` retry measurement under I6.
   The join's commit is also the **join fence**: `SHARE ROW EXCLUSIVE` waits
   out every writer in flight, so every commit either precedes the trigger
   and is visible to any snapshot taken after it, or ran the trigger. No
@@ -210,13 +199,11 @@ What it does there is one append.
   it applies anything later, and the staging worker's reconcile regenerates
   the function over the columns the remaining readers need. Definitions that
   don't read a missing column keep applying. *Evidence:*
-  [E4](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977)
-  (rename or drop of a named column fails every insert until regenerated;
-  add, rename or drop of any *other* column is harmless). The guard's
-  column count costs +3.4–5 µs per single-row statement.
-  [E10](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)
-  found event triggers unavailable on some hosts, which is why regeneration
-  does not depend on one.
+  I ran schema changes against the capture function: rename or drop of a
+  named column fails every insert until regenerated; add, rename or drop of
+  any *other* column is harmless. The guard's column count costs +3.4–5 µs
+  per single-row statement. I also found event triggers unavailable on some
+  hosts, which is why regeneration does not depend on one.
 - **Must:** the self-check audit
   ([ADR-0013](0013-self-check-production-recompute-audit.md)) verifies from
   `pg_trigger` that every captured table's triggers exist, are enabled
@@ -226,9 +213,10 @@ What it does there is one append.
   recompute comparison (five triggers, one Trellis
   role). Replica-mode sessions are covered by
   `ENABLE ALWAYS`; an owner who disables or drops the trigger by name is
-  documented as uncaptured until the audit runs (see also gaps 5 and 6 in
-  [known correctness gaps](../known-correctness-gaps.md)). *Evidence:*
-  [E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119).
+  documented as uncaptured until the audit runs (see also the known
+  correctness gaps
+  [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
+  [A capture function body replaced by hand](../known-correctness-gaps.md#6-a-capture-function-body-replaced-by-hand)).
 - **Only the staging worker creates or drops triggers**, from the catalog
   alone, on its reconcile pass: a table gains triggers when something
   registers a reader of it and loses them when its last reader is dropped.
@@ -243,8 +231,7 @@ What it does there is one append.
   proof of the ordering argument.
 - **Cost to state.** On disk at 1,000 rows/commit with 16 writers the
   writer's throughput is 0.49x no-capture and the ring row is ~2.9x the
-  source row's WAL bytes
-  ([E1 disk](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5850979670));
+  source row's WAL bytes (I measured both on disk);
   the NEW-only and `WHEN` cuts are unmeasured. No synchronous capture can
   lose less than 25% at 1,000 rows/commit, so the bar is: batched writes cost
   no more than one expression index's CPU per row; p99 commit latency at 1
@@ -264,18 +251,18 @@ a Trellis `READ COMMITTED` transaction.
   (`ring_slot_mirror`, `pg_sequence_last_value()`), which the seal sets in
   phase 2 before the `xmax` bump, and the writer's xid is assigned in the
   same statement as that read. *Evidence:*
-  [E4 inference 6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977):
-  a `REPEATABLE READ` or `SERIALIZABLE` writer read a pointer two flips old
-  from `segment_pointer` and its rows landed in a slot no batch would read.
+  I ran `REPEATABLE READ` and `SERIALIZABLE` writers across seals: one read a
+  pointer two flips old from `segment_pointer` and its rows landed in a slot
+  no batch would read.
   Stage 03 states the proof for the mirror.
 - **Must:** the truncate barrier decides `has_truncate` after the batch's
-  contents are fixed (#598).
+  contents are fixed.
 - **Per-key order is `(lsn, change_id)`** with `lsn =
   pg_current_wal_insert_lsn()` read in the trigger; the fold's ordering rule
   is unchanged. Cross-key commit order is not available from triggers and,
   under I3, not needed. *Evidence:*
-  [E4](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977):
-  per-key order held in every interleaving; a `CACHE`d sequence alone
+  I ran concurrent writers on one key: per-key order held in every
+  interleaving; a `CACHE`d sequence alone
   inverted a key's order; with the LSN it holds because a second writer on
   the same key runs its trigger only after the first commits.
 - The maintenance loop is not "the only sealer" in any argument here; nothing
@@ -292,12 +279,10 @@ state that orders its writes.
   aggregate argument (`__arg<n>`, shared by every field over the same
   argument, none at all for `COUNT(*)`) plus a `__member` flag; and the
   ordering state `__applied_lsn`, `__applied_seg` (the tombstone GC
-  watermark, I4), `__basis` and `__tombstone` (`defs::ledger`). It is
+  watermark, I4), `__basis` and `__tombstone`. It is
   written in the same transaction as the target, entries locked in key
   order before any group row is touched. *Evidence:*
-  [#558 design note](https://github.com/salesforce-misc/trellis/issues/558),
-  [exp 3](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5842993962)
-  for the prototyped schema.
+  I prototyped this schema in a ledger prototype.
 - **Must:** a 1-1 target's ledger is a slim side table,
   `<target>__ledger(from_key primary key, applied_lsn, applied_seg, basis,
   tombstone)`, beside an unchanged target table; the target row holds the
@@ -307,7 +292,7 @@ state that orders its writes.
   per key (a placeholder insert, then a sorted `for update`). Its cost is
   one more row write per change: ~200 B of WAL per row in `throughput-ramp`
   (about 500 B right after a checkpoint, with its full-page images), and
-  the placeholder insert settles a new key's Apply on its own (#724).
+  the placeholder insert settles a new key's Apply on its own.
 - **Must:** exactly two operations exist, and every producer is one of them.
   - **Re-derive(r).** Lock r's entry (inserting a placeholder if absent;
     a build chunk instead inserts an absent entry from its read, I1).
@@ -327,8 +312,8 @@ state that orders its writes.
     pending under its own ring row. The exact point a read stores is
     therefore the full `pg_snapshot` taken in the same statement as the
     read (I1), on every entry that read wrote; a read in keyspace chunks
-    stores each chunk's own (`chunked_read_exact_point_*` in
-    `trellis/tests/ledger_interleavings.rs`).
+    stores each chunk's own, which a test of chunked keyspace reads
+    checks.
   - **Apply(r, C, image).** Lock r's entry. If C is visible in the entry's
     basis, or C's position is at or below `applied_lsn`, stop (I2).
     Otherwise `delta = f(NEW) − entry.contrib`, group += delta, entry :=
@@ -349,9 +334,7 @@ state that orders its writes.
 
 - **Must keep contributions.** A membership-only ledger (group key and basis,
   contribution recomputed from source) saves 1–2% of WAL and produced wrong
-  relationship targets on both shapes it ran
-  ([exp 3](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5842993962),
-  [exp 4](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5845224204)).
+  relationship targets on both shapes I ran it on.
 - **Non-invertible fields** (`MIN`, `MAX`, `BOOL_AND`, composed expressions)
   are recomputed from the ledger's contributions by an index scan on
   `group_key` under the group's lock, never from the source. This is the one
@@ -359,10 +342,9 @@ state that orders its writes.
   ledger locks as every increment. A build's merger folds a group it only
   added entries to instead: each `MIN`/`MAX`/`BOOL_AND`/`BOOL_OR` becomes
   itself over the stored value and those entries' current contributions,
-  read by key under the same group lock (#625 F5). A group a value may have
+  read by key under the same group lock. A group a value may have
   left, or whose row the merge creates, is recomputed.
-- **Cost to state.** Measured on the implementation (#623 D9,
-  [round](https://github.com/salesforce-misc/trellis/issues/623#issuecomment-5982698251)),
+- **Cost to state.** I measured the implementation
   against the old aggregate path on trigger capture, same session, 8
   workers: the 40k- and 400k-group shapes drain (the old path never did),
   4k groups is 19–32% faster end to end, a 5,000-row page cap costs
@@ -371,8 +353,9 @@ state that orders its writes.
   fold-in ratio: 400 groups is 33–57% slower in-window (39–51% end to end),
   because the old path wrote one group row per group per page and the
   ledger writes one entry per source row. WAL per folded row is 2.5–2.6x
-  the old path's before the #775 changes, and Postgres CPU per folded row
-  1.8–2.6x. These bars are open for #629.
+  the old path's in that measurement, taken before Apply's updates were made
+  HOT-eligible, and Postgres CPU per folded row
+  1.8–2.6x.
 - **Ledger size and WAL.** The ledger is 2.6–3.1x a narrow source table on
   disk (~100 B per entry) and adds 1.5–1.8x a ledger-less apply's WAL, 40–45%
   of the ledger's share being full-page images after a checkpoint. `contrib`
@@ -393,18 +376,14 @@ state that orders its writes.
   lock statement over the entries it touches, one `update … from batch`
   that computes deltas and rewrites entries, one sorted upsert of group
   increments. The fold's "mixed visibility → re-derive" case disappears for
-  image-bearing changes
-  ([trigger-capture analysis](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847674780);
-  [exp 2](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484)
-  finding 1).
+  image-bearing changes.
 - **Must (fold):** an image-less `op = 'delete'` is the key's final state
   within a fold window, whatever precedes it. *Evidence:*
-  [#617 step 4 dry run](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5853104094):
-  under NEW-only capture, a delete sharing a fold window with an earlier
-  write of the same key was dropped by the "latest row with any image" rule;
-  11–12 groups wrong at 1M.
+  in a 1M-row build dry run under NEW-only capture, a delete sharing a fold
+  window with an earlier write of the same key was dropped by the "latest row
+  with any image" rule, leaving 11–12 groups wrong.
 - **Must (fold):** the fold statement never plans a nested loop over stale
-  ring statistics (#581).
+  ring statistics.
 - **Must (I8):** a batch folds, re-reads and applies at most a fixed number
   of changes (a per-batch cap on folded records, on the order of 10^5) and
   pages through a larger bucket in key-range pages; per-key `(lsn,
@@ -416,10 +395,8 @@ state that orders its writes.
   permanent: the ledger would make split keys safe (Apply is per-key ordered
   by `applied_lsn` and takes its old side from the ledger) but does not need
   them. Each page is its own transaction behind a claim check, advancing a
-  durable per-bucket cursor; only a bucket's last page marks it drained
-  (#620). *Evidence:*
-  [#617 step 3](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5857993459),
-  [#556 requirement](https://github.com/salesforce-misc/trellis/issues/556#issuecomment-5859042432).
+  durable per-bucket cursor; only a bucket's last page marks it drained.
+  *Evidence:* the one-pass build's memory measurement under I8.
 - **Must (I7):** every lock statement in Apply runs under `lock_timeout`; a
   timeout releases the claim's transaction and retries the page after a
   backoff, outside any transaction.
@@ -467,7 +444,7 @@ entry lock and in the same statement as the child's own read (I1).
   exception, for an Apply and a Re-derive alike, is a child that joins a
   parent while the parent's reverse page is uncommitted, after that page
   found the parent's children: the child reads the old value, and the
-  reverse's recompute doesn't reach it (#892,
+  reverse's recompute doesn't reach it (see
   [known correctness gaps: a to-one relationship field keeps a superseded
   parent value under concurrent writes](../known-correctness-gaps.md#21-a-to-one-relationship-field-keeps-a-superseded-parent-value-under-concurrent-writes)). A
   Re-derive whose row joins a parent outside the set the page's Phase 2
@@ -481,12 +458,11 @@ entry lock and in the same statement as the child's own read (I1).
 - **Cost.** A parent change with fan-out N rewrites N child entries, where a
   factored layout (a per-`(group, parent)` partial count `P` and a parent
   table `T` of applied to-side values, so a parent change never touches a
-  child) writes one row per group. [Exp 4b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5851003675)
+  child) writes one row per group. I
   prototyped the factored layout: the oracle matched on all six shapes and
   five converged in 21 s against the per-child path's 24–113 s, but it
   deadlocked 9–16 times per 100k-fan-out run on disk and never on tmpfs, and
-  the cycle was not found. It is not built:
-  [#809](https://github.com/salesforce-misc/trellis/issues/809).
+  the cycle was not found. It is not built.
 
 ## A build is Re-derive over chunks, and applies from its first chunk
 
@@ -525,25 +501,24 @@ applying.
   active at its commit (seal phase 1 can't move it until the start commits),
   every change committed before the start is in a batch at or below it, and
   a page re-derives rather than applies the keys of such a batch. *Evidence:*
-  [#617 step 2](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5852918496):
-  oracle matched on four 10M runs under 2,000 writes/s, with 196–361k changes
-  correctly skipped by chunk bases and 0 in-progress ids.
+  in four 10M-row runs of a chunked-build prototype under 2,000 writes/s the
+  oracle matched, with 196–361k changes correctly skipped by chunk bases and 0
+  in-progress ids.
 - **A source that is another definition's target takes a per-build fence.**
   Such a source is fed by the mutation seam ([Multi-hop](#multi-hop-a-targets-writes-reach-its-readers-through-the-mutation-seam)),
   not by capture. A seam writer decides inside its own apply transaction
   whether a definition applies, so one that decided before the build's start
   committed can commit after a chunk's snapshot, and neither the chunk nor
   the ring carries its write. The plan job's first act is a fence, the id of
-  a transaction begun after the start commit (the marker fence's rule,
-  #431), and it plans no chunk until the oldest running transaction began
+  a transaction begun after the start commit (the marker fence's rule),
+  and it plans no chunk until the oldest running transaction began
   after it. That covers a writer only if it held its transaction id when it
   checked, so the seam's check takes the id first, in a statement of its
   own. Only a seam-fed build waits, and only on older transactions;
-  `status` names the fence (`BuildWait::Fence`). The seam stays
-  ([#807](https://github.com/salesforce-misc/trellis/issues/807)), so this
-  fence stays. *Evidence:* `tests/target_mutation_seam.rs` freezes an upstream
-  writer after its reader check and starts the downstream: without the fence
-  the downstream misses the writer's row.
+  `status` names the fence (`BuildWait::Fence`). The seam stays, so this
+  fence stays. *Evidence:* a test freezes an upstream writer after its reader
+  check and starts the downstream: without the fence the downstream misses the
+  writer's row.
   A source that is another aggregate's target is keyed by its nullable
   `GROUP BY` columns, and a key with a `NULL` part is in no chunk's range
   (the range is a row comparison). An aggregate's plan job stages an
@@ -555,11 +530,9 @@ applying.
   aggregate or 1-1 definition on a captured source or on another
   definition's target. Two kinds keep the one-pass build: a definition with a
   relationship path in any field (1-1 or aggregate), and a 1-1 definition
-  whose alias chain is cyclic (`build::qualifies`). They build in one pass, with a fence wait and a go-live catch-up that
-  re-reads every table the build read and sweeps the target for unbacked
-  rows (`intake::markers`, `intake::resume_orphans`; the definition reports
-  `catching_up` meanwhile). Moving them to Re-derive would remove that path
-  (milestone F, #625).
+  whose alias chain is cyclic. They build in one pass, with a fence wait and a
+  go-live catch-up that re-reads every table the build read and sweeps the
+  target for unbacked rows (the definition reports `catching_up` meanwhile).
 - **Must (I3):** group application during a build is a **separate,
   commutative, batched step**. A chunk records its group deltas without
   locking any group row, and a merger applies accumulated deltas to group
@@ -568,10 +541,9 @@ applying.
   partition, and the merger is any drain worker claiming a partition's rows:
   this needs no new locks, keeps I5, and survives a crash because the delta
   rows are durable. *Evidence:*
-  [#617 final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160):
-  a 100k-row chunk touches ~63% of 100k groups, so chunk transactions that
-  lock groups serialize on them; 10x larger chunks cut define-to-live by
-  only a third.
+  in my 100M chunked-build run, a 100k-row chunk touched ~63% of 100k groups,
+  so chunk transactions that lock groups serialize on them; at 10M, 10x larger
+  chunks cut define-to-live by only a third.
 - **Must (I7):** chunk transactions are short (one range, no group locks,
   under `lock_timeout`), and a captured-change batch never waits inside its
   transaction for a chunk's lock.
@@ -579,10 +551,9 @@ applying.
   captured changes. A worker claims a chunk only when the ring's undrained
   backlog is under a bound, and the sealer is never refused for the duration
   of a build. *Evidence:*
-  [step 2](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5852918496):
-  seal refused for the whole build, tail 90–213 s after `live`;
-  [final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160):
-  a 6.09M-row undrained segment at 100M.
+  in my 10M chunked-build runs without backpressure the seal was refused for
+  the whole build, with a tail of 90–213 s after `live`; in the 100M run a
+  6.09M-row segment sat undrained.
 - **Must (acceptance):** per-row build cost is independent of table size;
   a build of N rows runs in bounded memory and bounded WAL retention, in
   time linear in N, and converges to the oracle at 100M under load.
@@ -596,7 +567,7 @@ applying.
   reclaimed like a sealed segment, a crashed worker's chunk is re-run
   (Re-derive is idempotent), a failing chunk backs off with its error on
   `Trellis::status` and never starves other work, a resume supersedes held
-  chunks through the claim fence so no stale write lands after it (#434),
+  chunks through the claim fence so no stale write lands after it,
   and no definition is ever `backfilling` without a chunk row or delta row
   driving it forward. A staging worker is still required for anything to
   seal; drain threads are required for anything to build.
@@ -625,9 +596,8 @@ applying.
   rows alone is sound; a transaction straddling the token over-reports, the
   safe direction. The token is the insert position because the write
   position, `pg_current_wal_lsn()`, lags a commit made with
-  `synchronous_commit = off` and can sit below its rows' `origin_lsn`
-  (issue #697). There is no capture watermark to check. *Evidence:*
-  [E5](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977).
+  `synchronous_commit = off` and can sit below its rows' `origin_lsn`. There
+  is no capture watermark to check.
 - **Must:** three stored statuses: `waiting_to_backfill` (registered, chunk
   plan not yet written; normally momentary), `backfilling` (applying, chunks
   or deltas outstanding), `live`. A one-pass build adds
@@ -638,12 +608,12 @@ applying.
 - **Must:** a `live` reader of an upstream (another definition's target it
   reads directly or through a relationship) that is not `live` reports the
   upstream's state, transitively, computed when status is read and never
-  stored (#497's rule).
+  stored.
 - **Must (I4):** tombstone GC by a batch watermark. Every entry records
   `applied_seg`, the newest segment (`seg_seq`) whose changes it reflects,
   and maintenance deletes each tombstone whose `applied_seg` is at or below
   the **contiguous drained prefix**: the highest `seg_seq` at or below which
-  every segment is drained (`staging::retire::collect_tombstones`). The
+  every segment is drained. The
   prefix, not the segment just drained, because segments drain out of order
   and a fence is a snapshot, not a position. A same-key predecessor of a
   delete committed before the delete's trigger ran, so it is in the delete's
@@ -661,12 +631,12 @@ applying.
   see, so every change the `basis` does see completed before D and is in D's
   batch or an earlier one, which D's page's stamp covers; a Re-derive that
   deletes it stamps its own read's segment. A revival keeps the old stamp,
-  which can only delay the GC (`defs::ledger::tombstone_seg_sql`). The GC
+  which can only delay the GC. The GC
   skips the ledger of a definition under a build (`backfilling`, or a
   frozen Re-derive build), holding the definition's row `for key share`
   while a batch runs, which a build's start waits on: a build chunk's insert
   of a new key's entry needs every tombstone written after its snapshot to
-  stay until the insert (#723).
+  stay until the insert.
 - Every repair of a definition on the Re-derive build is a rebuild:
   Re-derive over the key space, which I2 makes safe against any pending
   change. A resume starts one, as does an explicit `request_backfill` and a
@@ -706,7 +676,7 @@ that is still changing.
 ## Truncate, DDL, drop
 
 - `AFTER TRUNCATE` statement triggers per captured table stage one truncate
-  row; the drain barrier is restated under xid order (#598). A to-side
+  row; the drain barrier is restated under xid order. A to-side
   truncate is the parent operation with zero values for every parent of the
   table.
 - **A source truncate resets the target and raises a floor**, an O(1)
@@ -735,8 +705,8 @@ that is still changing.
 A target is never captured by triggers. A definition that reads another
 definition's target (a chained hop) learns of its changes from rows the
 writer stages in the same transaction as the write: image-less recomputes, or
-change-shaped rows for a relationship endpoint
-(`staging::target_mutations`). A building target's writes reach its readers
+change-shaped rows for a relationship endpoint.
+A building target's writes reach its readers
 the same way, so a rebuilt upstream needs no catch-up for its readers. A
 worker propagating downstream appends to the active segment, never the batch
 it is draining.
@@ -745,8 +715,7 @@ Targets are not trigger-captured, though the writer stages their changes in
 the same ring row shape the triggers write for a source, so intake and the
 drain path are shared and only the producer differs. Trellis is a target's
 only writer and already knows each change as it makes it; a trigger would
-re-derive what the writer has in hand
-([#807](https://github.com/salesforce-misc/trellis/issues/807)).
+re-derive what the writer has in hand.
 
 - A trigger adds per-row cost to every target write; the seam adds none
   beyond the staging insert itself.
@@ -754,8 +723,7 @@ re-derive what the writer has in hand
   carry `hop_gen` to a trigger, but that rebuilds in SQL what the writer
   already has.
 - Cascading truncates on a captured target would need their own handling.
-- Capturing targets interacts with demand-driven sealing (#272).
-- One propagation path serves multi-hop (#354).
+- One propagation path serves multi-hop.
 
 ## Rejected alternatives
 
@@ -763,24 +731,24 @@ Each alternative below is recorded with the number that rejected it.
 
 | Alternative | Why not |
 |---|---|
-| **Capture by logical replication** (a `pgoutput` slot decoded by an intake thread; the 2026-08-15 decision). Chosen then because it kept everything off the write path and needed no trigger on user tables. | Staging is capped at ~120k rows/s at 1,000 rows/commit and 18.6k at 1 row/commit whatever the writers do, and a 10M-row `COPY` was never staged; total CPU per row is 4–5x the trigger's, paid later ([E1](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977), [E9](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)). A stopped Trellis pins the whole database's WAL rather than growing a ring at ~188 B/row ([E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)). The decoder's 32-bit xid must be widened to `xid8` for I2, and the naive widening is silently wrong for every id before an epoch boundary ([exp 1a](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484)). Decoding needs `REPLICA IDENTITY FULL` on every table a relationship touches. Slot loss, failover and the replication privilege are operational surface the trigger has none of. |
-| **Row-level triggers.** | 5–10x the statement trigger's cost above 1 row/commit ([E1](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5842011977)). |
-| **Column-agnostic image encodings** (`to_jsonb`, `jsonb_each_text`, `::text`, `hstore(NEW)`). | Not byte-identical to `tuple_to_json`, or identical but reading every column, which costs 40x on a 100 KB column ([E3](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)). |
-| **Ordering by LSN with live reads guarded by horizons and basis checks:** the recompute horizon and extinct horizon (#321), `min_image_lsn`, the build horizon (#442), per-key basis locks (#344), the watermark wait before enumeration (#312), `has_recompute` and `vanished_images` (#486), bucketed advisory locks (#389), keep-every-image fold (#494), prior image on enumeration (#392). | Each closes one pairing of one producer against one drain order, found in review of the previous fix at roughly two new issues per fix, and none was found by the generative suite (#556). A live read has no way to tell which commits it reflects; only a snapshot does (I2). |
-| **Visibility-only I2**, and **Apply stamping its own snapshot as the basis.** | Each fails named exp 2 scenarios (5b/9/9c and 9b/9d) ([exp 2](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484)). |
-| **Membership-only ledger** (no stored contribution). | Wrong for relationships on both shapes it ran; saves 1–2% of WAL ([exp 3](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5842993962), [exp 4](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5845224204)). |
-| **Group rows as absolute writes:** forced recomputes from a live `GROUP BY`, an existence probe and pre-lock before incrementing. | Not orderable without a horizon; the probe's scan is #326's 40k-group cliff where nothing drains; the pre-lock deadlocks on new groups (#539). Groups as sums with sorted increments: 0 deadlocks ([exp 2](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484) scenario 4). |
-| **The settled projection as correctness state** for to-one relationships of aggregates (a relationship-enriched 1-1 target still reads it), with the reverse fast path, `to_side_superseded` (#507), the `for share` stamp (#531), refresh markers (#529/#533/#547), seeding and widening (#543/#544). | Loses updates under to-side churn (#582: never converged, wrong target, reproducibly); needs `REPLICA IDENTITY FULL` on both sides; every consistency rule for it is a pairing rule. The factored T table is the parent's applied value under the ledger's own locks ([exp 4b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5851003675)). |
-| **Per-child contribution rewrite on a parent change.** | 2.3–3.1x the time and 5x the WAL at 100k fan-out on tmpfs, 2.4–2.9x on disk ([exp 4](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5845224204), [exp 4b](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5851003675)). |
-| **Finding a parent's children by the ledger index alone**, or **by the index plus a live from-side scan**, or **by locking the to-side inside the application's transaction.** | The index alone misses a child moving in uncommitted (exp 2 scenario 6b); the scan works but keeps a live read; the lock puts Trellis on the application's commit path (I6). T as dependency lock replaces all three. |
-| **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep** (the 2026-08 and 2026-09 build designs, #485/#436). | The re-read is a full enumeration per build that scales with table size, not with what changed; at 100M it reaches `live` after 2,305 s and its drain then runs out of memory ([#617 step 3](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5857993459)). Nothing can tell a table unchanged since the build from one changed and changed back (#468), so the re-read could never be skipped. The one-pass build's algorithmic wins (scan once, chunk the writes) do not carry over: the new build is per-row work with no `GROUP BY` per chunk, and its acceptance bar is linear time. |
+| **Capture by logical replication** (a `pgoutput` slot decoded by an intake thread). It keeps everything off the write path and needs no trigger on user tables. | I measured staging capped at ~120k rows/s at 1,000 rows/commit and 18.6k at 1 row/commit whatever the writers do, with a 10M-row `COPY` never staged, and total CPU per row 4–5x the trigger's, paid later. A stopped Trellis pins the whole database's WAL rather than growing a ring at ~188 B/row. The decoder's 32-bit xid must be widened to `xid8` for I2, and I found the naive widening silently wrong for every id before an epoch boundary. Decoding needs `REPLICA IDENTITY FULL` on every table a relationship touches. Slot loss, failover and the replication privilege are operational surface the trigger has none of. |
+| **Row-level triggers.** | I measured 5–10x the statement trigger's cost above 1 row/commit. |
+| **Column-agnostic image encodings** (`to_jsonb`, `jsonb_each_text`, `::text`, `hstore(NEW)`). | Not byte-identical to `tuple_to_json`, or identical but reading every column, which I measured costing 40x on a 100 KB column. |
+| **Ordering by LSN with live reads guarded by horizons and basis checks:** the recompute horizon and extinct horizon, a minimum-image LSN, the build horizon, per-key basis locks, the watermark wait before enumeration, recompute and vanished-image flags, bucketed advisory locks, a keep-every-image fold, prior image on enumeration. | Each closes one pairing of one producer against one drain order, found in review of the previous fix at roughly two new problems per fix, and the generative suite found none of them. A live read has no way to tell which commits it reflects; only a snapshot does (I2). |
+| **Visibility-only I2**, and **Apply stamping its own snapshot as the basis.** | Each fails scenarios of the interleaving experiment: visibility-only fails three, and stamping Apply's own snapshot fails two. |
+| **Membership-only ledger** (no stored contribution). | Wrong for relationships on both shapes I ran it on; saves 1–2% of WAL. |
+| **Group rows as absolute writes:** forced recomputes from a live `GROUP BY`, an existence probe and pre-lock before incrementing. | Not orderable without a horizon; the probe's scan is the 40k-group cliff where nothing drains; the pre-lock deadlocks on new groups. Groups as sums with sorted increments: 0 deadlocks in the interleaving experiment. |
+| **The settled projection as correctness state** for to-one relationships of aggregates (a relationship-enriched 1-1 target still reads it), with the reverse fast path, a to-side-superseded flag, the `for share` stamp, refresh markers, seeding and widening. | Loses updates under to-side churn (I ran it: never converged, wrong target, reproducibly); needs `REPLICA IDENTITY FULL` on both sides; every consistency rule for it is a pairing rule. The factored T table is the parent's applied value under the ledger's own locks. |
+| **Per-child contribution rewrite on a parent change.** | I measured 2.3–3.1x the time and 5x the WAL at 100k fan-out on tmpfs, 2.4–2.9x on disk. |
+| **Finding a parent's children by the ledger index alone**, or **by the index plus a live from-side scan**, or **by locking the to-side inside the application's transaction.** | The index alone misses a child moving in uncommitted (a scenario of the interleaving experiment); the scan works but keeps a live read; the lock puts Trellis on the application's commit path (I6). T as dependency lock replaces all three. |
+| **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep.** | The re-read is a full enumeration per build that scales with table size, not with what changed; I ran it at 100M, where it reaches `live` after 2,305 s and its drain then runs out of memory. Nothing can tell a table unchanged since the build from one changed and changed back, so the re-read could never be skipped. The one-pass build's algorithmic wins (scan once, chunk the writes) do not carry over: the new build is per-row work with no `GROUP BY` per chunk, and its acceptance bar is linear time. |
 | **`catching_up` as a stored status with marker fences, generations and go-live catch-ups.** | Needed only by a build that skips changes. A definition on the Re-derive build applies from its first chunk, so there is nothing to catch up; builds not yet on it keep the status ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)). |
-| **Bounding drain memory by running fewer workers.** | Each worker then holds more buckets; bounds nothing ([#617 step 3](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5857993459)). |
-| **Fixing the build's cost by chunk size.** | 10x larger chunks leave 2.0x the time and 3.7x the WAL ([#617 final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160)). |
-| **#556 (B): resolve every image-less trigger into an image at staging time**, so Phase 2 never reads live state. | Under trigger capture the only image-less change is a delete, and every other image-less producer is an enumeration this ADR replaces with Re-derive under lock. What B leaves untouched is out-of-order parallel batches for one key, which needs `applied_lsn`, not images. A resolver on the seal path is itself a live read racing the drains. |
-| **#556 (C): serialize absolute writes per target** through one writer or one advisory lock. | Does not fix identity: a serialized write still reads live state ahead of pending deltas and still needs a horizon. Serializes the build, the largest producer of absolute writes, which is already CPU-bound on eight workers at 14–15k rows/s. |
-| **#556 (D): thread source transaction ids through the ring.** | Adopted, in the exact form `row_txid` gives for free under trigger capture. |
-| **#556 (E): LSN-versioned projection rows.** | Covers the relationship half only. The T table is E's idea in a cheaper shape: one applied value with its position per parent, not a version history per row. |
+| **Bounding drain memory by running fewer workers.** | Each worker then holds more buckets; I measured that it bounds nothing. |
+| **Fixing the build's cost by chunk size.** | I ran 10x larger chunks and they left 2.0x the time and 3.7x the WAL. |
+| **Resolve every image-less trigger into an image at staging time**, so Phase 2 never reads live state. | Under trigger capture the only image-less change is a delete, and every other image-less producer is an enumeration this ADR replaces with Re-derive under lock. What this leaves untouched is out-of-order parallel batches for one key, which needs `applied_lsn`, not images. A resolver on the seal path is itself a live read racing the drains. |
+| **Serialize absolute writes per target** through one writer or one advisory lock. | Does not fix identity: a serialized write still reads live state ahead of pending deltas and still needs a horizon. Serializes the build, the largest producer of absolute writes, which is already CPU-bound on eight workers at 14–15k rows/s. |
+| **Thread source transaction ids through the ring.** | Adopted, in the exact form `row_txid` gives for free under trigger capture. |
+| **LSN-versioned projection rows.** | Covers the relationship half only. The T table is this idea in a cheaper shape: one applied value with its position per parent, not a version history per row. |
 
 ## Consequences and costs
 
@@ -802,26 +770,22 @@ Each alternative below is recorded with the number that rejected it.
 - **The failure mode of a broken capture is loud, not silent.** A schema
   change to a read column never fails the statement (I6). A missing ring
   table or revoked privilege does, with a `CONTEXT` line naming the capture
-  function
-  ([E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)):
+  function:
   the application sees the fault at once, not after data is lost. One silent-uncapture path is an owner disabling
   the trigger by name, which the audit reports; the others are the
-  disable-and-restore and replaced-function cases in
-  [known correctness gaps](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes)
-  (gaps 5 and 6).
+  disable-and-restore and replaced-function cases, the known correctness gaps
+  [Capture switched off and back on between two reconcile passes](../known-correctness-gaps.md#5-capture-switched-off-and-back-on-between-two-reconcile-passes) and
+  [A capture function body replaced by hand](../known-correctness-gaps.md#6-a-capture-function-body-replaced-by-hand).
 - **Hosted compatibility** is core Postgres for everything required
   (statement triggers, transition tables, `SECURITY DEFINER`, the `TRIGGER`
-  privilege); no event trigger is needed
-  ([E10](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)).
+  privilege); no event trigger is needed.
   No replication privilege, slot or publication is needed, and a
   backup-and-restore carries the ring with the data.
 - **Drain backpressure becomes the operator's number.** Capture can outrun
   the drain by ~20x (1.9M rows/s against ~85k folded rows/s with the
-  ledger), and the ring lives in the application's database at ~188 B per
-  captured row when nothing drains
-  ([E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)).
-  The bound on that growth is designed but not built
-  ([#808](https://github.com/salesforce-misc/trellis/issues/808)):
+  ledger), and I measured the ring in the application's database at ~188 B per
+  captured row when nothing drains.
+  The bound on that growth is designed but not built:
   - **Gauges** report the ring's rows and bytes, the age of its oldest
     undrained row, and its undrained bytes per source table.
   - **A soft bound, `ring_warn_bytes`, is on by default.** Above it,
@@ -850,27 +814,24 @@ Each alternative below is recorded with the number that rejected it.
   is `live` when registration returns: callers poll `Trellis::status` to
   `live`, then use a token
   ([embedding](../embedding.md#poll-to-live-dont-wait)).
-- **Every number above was taken on one box.** #565's phase 1 and #558's
-  experiments 1–4 ran on tmpfs; the disk-backed numbers are from a single
-  NVMe with ~0.4 ms fsyncs and, for #558's disk tier, a box that was not
-  always quiet
-  ([disk tier](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5851008357),
-  [caveat](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847942345)).
+- **I took every number above on one box.** The capture-throughput
+  experiments and the first four ledger experiments ran on tmpfs; the
+  disk-backed numbers are from a single NVMe with ~0.4 ms fsyncs and, for the
+  ledger experiments' disk tier, a box that was not always quiet.
   Within-session ratios stand; absolute bars are restated in
   [validation 4](#validation-and-acceptance).
 
 ## Validation and acceptance
 
-Deliverable 4 of #556. Nothing below polls for convergence (#297).
+Nothing below polls for convergence.
 
-1. **One deterministic interleaving test per exp 2 scenario** (2, 2b, 3, 4,
-   5, 5b, 6, 6b, 6c, 7, 8, 8b, 9, 9b, 9c, 9d, 10) on the real engine,
-   hand-driven with advisory locks, plus one per superseded issue in #556's
-   matrix (#389, #392, #494, #524, #525, #528, #539, #549, #550).
-2. **The generative concurrent tier** (#557) with the three planted
-   violations of #558's experiment 6 (skip the lock, compare LSN instead of
-   visibility, delete tombstones early), each caught within the nightly
-   budget. **Merge gate.**
+1. **One deterministic interleaving test per scenario of the interleaving
+   experiment** (all seventeen) on the real engine, hand-driven with advisory
+   locks, plus one for each of the nine superseded problems in the inventory of
+   producer pairings that motivated this design.
+2. **The generative concurrent tier** with three planted violations (skip
+   the lock, compare LSN instead of visibility, delete tombstones early), each
+   caught within the nightly budget. **Merge gate.**
 3. **`build-under-load` at 100M** on the implementation branch, disk-backed,
    under a 16 GB memory cap: oracle ok, memory bounded, WAL retention
    bounded, time linear in N, per-row cost flat from 1M to 100M.
@@ -879,12 +840,13 @@ Deliverable 4 of #556. Nothing below polls for convergence (#297).
    window and storage stated on every number: `fold-in-ratio`,
    `group-contention` (400/4k/40k), `rel-churn` (10/1k/100k children per
    parent, 100 and 1,000 parent updates/s, child-only churn),
-   `build-under-load`, #565's E1 and E2, each with a same-session control on
+   `build-under-load`, and the two capture benchmarks (statement against row
+   triggers, and scaling with writers), each with a same-session control on
    the pre-change code. The bars in this ADR are restated from that round.
-   *#623 D9 ran the aggregate half* (`fold-in-ratio`, `group-contention`,
-   `build-under-load` at 10M, on tmpfs and disk, against D3's base):
-   [round](https://github.com/salesforce-misc/trellis/issues/623#issuecomment-5982698251).
-   It is #575's control. `rel-churn` and E1/E2 remain for #629.
+   *My implementation round ran the aggregate half* (`fold-in-ratio`,
+   `group-contention`, `build-under-load` at 10M, on tmpfs and disk, against a
+   same-session control). `rel-churn` and the capture benchmarks have not been
+   run in that round.
 5. **Writer-coupling tests:** schema change of a read column under load
    (writes succeed, definition pauses, regeneration restores capture); join
    and drop under a 30 s open transaction (worst writer wait under 100 ms);
@@ -896,21 +858,14 @@ Deliverable 4 of #556. Nothing below polls for convergence (#297).
 
 ## Reusable material
 
-Prototype branches on the fork (mmmries/trellis):
-`exp/issue-558-ledger-experiments` (ledger Apply, `rel-churn`,
-`experiments/issue-558/RESULTS.md` and `HANDOFF.md`),
-`exp/issue-558-factored` (P and T tables), `exp/issue-558-exp5` (chunked
-ledger build in `trellis/src/staging/ledger_build.rs`, `build-under-load`
-with the disk columns and the memory sampler), `exp/issue-558-exp5-trigger`,
-`spike/565-trigger-capture` (`experiments/issue-565/capture_sql.py` with
-the `new_only` and `skip_noop` shapes, the phase-1 harness). Already in
-`main`: #597 (the fence mirror).
+Prototype branches on the fork (mmmries/trellis) hold the ledger Apply and
+`rel-churn` experiments with their results and handoff notes, the factored P
+and T tables, the chunked ledger build with `build-under-load` (the disk
+columns and the memory sampler), a trigger-capture variant of that build, and
+the trigger-capture spike (the capture SQL with the `new_only` and `skip_noop`
+shapes, and the phase-1 harness). The fence mirror is already in `main`.
 
 ## More information
 
 - [Documenting Architecture Decisions](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
   for the ADR form ([ADR-0001](0001-use-adr.md)).
-- Epic #556 (the seam and its inventory), #558 (ledger design note and
-  experiments 1–4b), #565 (trigger capture, E1–E10), #617 (the build under
-  load at 10M and 100M), #618 (the outline this ADR was drafted from, and
-  the debate).

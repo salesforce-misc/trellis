@@ -2,8 +2,6 @@
 status: accepted
 date: 2026-09-16
 deciders: Michael Ries
-consulted:
-informed:
 ---
 
 # Embeddable Clients for Ruby and Elixir
@@ -14,21 +12,20 @@ migration files and wants the `TRANSFORM` derived from a table to live in the
 same file as its `CREATE TABLE`. The host loads Trellis over an FFI boundary
 rather than deploying a separate service.
 
-This ADR records four decisions about that boundary. Roadmap, phasing, and
-packaging live in GitHub issues.
+This ADR records four decisions about that boundary. It builds on three pieces
+of [ADR-0008](0008-public-api-design.md) made for this boundary:
 
-It builds on three pieces of [ADR-0008](0008-public-api-design.md) (issue #82)
-made for this boundary:
-
-* [`BlockingTrellis`](../../trellis/src/blocking.rs) — synchronous facade over
-  async `Trellis`, owning a dedicated thread with its own Tokio runtime.
-* [`ErrorCode`](../../trellis/src/error_code.rs) — a `#[non_exhaustive]`,
-  small taxonomy with a stable `as_str()`, reported by every error that
-  can reach a caller.
-* The transform status lifecycle (#55): `define()` returns once the definition
+* `BlockingTrellis` — synchronous facade over async `Trellis`, owning a
+  dedicated thread with its own Tokio runtime.
+* `ErrorCode` — a `#[non_exhaustive]`, small taxonomy with a stable `as_str()`,
+  reported by every error that can reach a caller.
+* The transform status lifecycle: `define()` returns once the definition
   is registered and its backfill queued; completion is polled via `status()`.
 
-## Decision 1: each binding wraps the `trellis` crate directly
+The metrics and logs an embedder surfaces are
+[ADR-0009](0009-observability-decisions.md)'s.
+
+## 1. Each binding wraps the `trellis` crate directly
 
 Each binding is a thin Rust crate wrapping `BlockingTrellis`: an Elixir
 [Rustler](https://github.com/rusterlium/rustler) NIF, and a Ruby
@@ -53,11 +50,11 @@ instead of one, plus manual allocation contracts where a mistake segfaults
 rather than raises. Its only payoff is a third host language later, cheaper to
 add as another Rustler/Magnus crate than to pay for up front.
 
-A shared *Rust* helper crate for decision 4's conversions is compatible with
-this and may be introduced if the bindings duplicate enough conversion code;
-it holds no Rustler or Magnus types and is not the rejected C-ABI shim.
+A shared *Rust* helper crate holds decision 4's conversions, written once for
+both bindings; it holds no Rustler or Magnus types and is not the rejected
+C-ABI shim.
 
-## Decision 2: bindings never reimplement the client over SQL
+## 2. Bindings never reimplement the client over SQL
 
 A binding may not touch Trellis's catalog, staging, or target tables with its
 own SQL. Every operation goes through the `trellis` crate.
@@ -74,14 +71,14 @@ Corollary: the bindings are deliberately thin. Where a host-language
 convenience needs something the crate doesn't expose, widen the crate's API,
 don't reach around it.
 
-## Decision 3: the binding owns one handle per instance; Rust owns its threads
+## 3. The binding owns one handle per instance; Rust owns its threads
 
 **One handle per instance, created at boot, never per request, held as an
 opaque resource.** An instance is one catalog schema in one database
 ([instance identity](../instance-identity.md)). A process holds one handle for
 each instance it uses: a host that serves several databases holds one per
 database, and a host that wants two instances in one database holds one per
-catalog schema. This resolves ADR-0008's first open question. `Trellis::connect`
+catalog schema. `Trellis::connect`
 runs the instance-identity check, builds the pool, and optionally starts
 background workers — none of it per-call, which is why a handle is created once
 and shared rather than connected per request.
@@ -107,7 +104,7 @@ round trip — far past what either host VM tolerates on a scheduler thread.
 
 * **Elixir:** every NIF runs on a dirty IO scheduler, no exceptions for
   calls that look cheap (`status/2` is still a query). The exceptions are
-  the two in-process reads with no round trip (#149): rendering the metrics
+  the two in-process reads with no round trip: rendering the metrics
   registry runs on a dirty *CPU* scheduler, because its cost grows with the
   registry, and draining the log bridge's bounded queue, which never waits,
   runs on a normal one.
@@ -137,7 +134,7 @@ The Ruby binding therefore connects *after* fork and records the owning pid,
 raising on any call from a different pid rather than deadlocking. The BEAM does
 not fork, but the pid guard is cheap enough to carry in both.
 
-## Decision 4: only plain data crosses, and errors cross as `(code, message)`
+## 4. Only plain data crosses, and errors cross as `(code, message)`
 
 **Errors** carry exactly `ErrorCode::as_str()` plus the `Display` message — no
 error chain, no `source()` walking, no internal variant names.
@@ -181,12 +178,7 @@ where there is one implementation to get right — decision 2 applied to types.
 * Two binding crates must track the crate's public API; keeping them in this
   repo, built and tested by the same CI run, is the cheapest way to hold that line.
 * Decision 4's flattening is mechanical and testable in Rust, ahead of either host.
-
-## Related issues
-
-#82 / [ADR-0008](0008-public-api-design.md) (the public API these bindings
-wrap), #55 (the status lifecycle behind the poll-to-`live` contract), #49 /
-[ADR-0009](0009-observability-decisions.md) (the metrics and logs an embedder
-surfaces), #144 (the worker-registry heartbeat and `Trellis::has_live_drain_workers`
-health check this decision's third point implies a fleet needs — see
-[docs/embedding.md](../embedding.md)).
+* Because the host can't see Rust's threads (decision 3), a fleet needs a health
+  check that some handle runs the background workers: the worker-registry
+  heartbeat behind `Trellis::has_live_drain_workers` (see
+  [embedding](../embedding.md)).

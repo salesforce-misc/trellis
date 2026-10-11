@@ -2,8 +2,6 @@
 status: accepted
 date: 2026-08-20
 deciders: Michael Ries
-consulted: 
-informed:
 ---
 
 # Quarantine Storage and Error API
@@ -14,19 +12,19 @@ than block the write. This ADR settles where per-row and per-column status
 lives, the API applications use to discover and clear quarantines, and how the
 fuse guarding against runaway per-row tracking behaves.
 
-## Decision
+## Quarantine has two independent fuse tiers, with no auto-escalation
 
-Quarantine is tracked at two independent fuse tiers, with no auto-escalation:
+A failure either belongs to a whole key or to one column's formula, and pausing
+more than the failure reaches stops work that would still compute cleanly:
 
-* **Whole-key fuse** — a sparse **`poison`** exception table
-  (`V13__quarantine.sql`, `V71__poison_per_transform.sql`), one row per
+* **Whole-key fuse** — a sparse **`poison`** exception table, one row per
   *source* row poisoned for one transform. The key is left out of that
   transform's apply only: every other transform reading the source keeps
   applying it. Tripping the fuse moves that transform to `quarantined`;
   resuming deletes the keys it holds and rebuilds the target from the source
   without clearing it (see [ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)).
 * **Per-`(transform, column)` fuse** — `column_failures`, `column_status`, and a
-  `column_deaths` counter (`V21__column_quarantine.sql`). A failure in one
+  `column_deaths` counter. A failure in one
   column's formula pauses only that column, leaving healthy columns on the same
   transform computing.
 
@@ -38,9 +36,11 @@ is unaffected by column pausing.
 Applications discover and clear quarantines through the client-library reads
 (below).
 
-## Options considered
+## Row and column status lives in a sparse exception table
 
-Storage granularity for row/column status:
+A row's absence from the exception table *is* its healthy status, so the hot
+path writes nothing for the rows that succeed. Two other granularities would
+answer "is this row valid" too:
 
 * **In the neighbor table** — status columns beside the derived values. Cheapest
   to read, but a target row can be written by several transforms, so avoiding
@@ -60,7 +60,7 @@ mitigate with primary keys on both paths (below) and expect most consumers to
 ask the API "is transform X (or column X.Y) quarantining anything" rather than
 check rows inline.
 
-## Exception table shape
+## The exception key is the source row and the transform that failed it
 
 The exception key is the source row and the transform whose apply of it
 failed, not any downstream target: one source row's change fans out to several
@@ -73,8 +73,7 @@ transforms/columns at once, and a failure in one of them is that one's to hold.
   counter) are keyed by the transform too, and every one of them goes with
   the transform's definition when it is dropped (`on delete cascade`).
 * **`poison_held`** — also `(transform_id, src_table, key)`, one row per held
-  key however many batches change it while it is held
-  ([#803](https://github.com/salesforce-misc/trellis/issues/803)). A release
+  key however many batches change it while it is held. A release
   re-derives the key from its live row rather than replaying what was parked,
   so the row keeps only what the release reads, and each batch that leaves the
   key out merges its change into it, in the batch's own transaction: the
@@ -91,10 +90,10 @@ transforms/columns at once, and a failure in one of them is that one's to hold.
 
 **`src_table` here is the canonical, fully-qualified identity of the source
 table, not whatever spelling the ring row being diagnosed happened to carry**
-(issue #283, [ADR-0011](0011-fully-qualified-names.md)'s qualified identity). Every one of these tables —
+([ADR-0011](0011-fully-qualified-names.md)'s qualified identity). Every one of these tables —
 `poison`, `poison_held`, `key_deaths` and `column_failures` — is both written
-and read under it, with `staging::quarantine` resolving the ring spelling once
-per source table per batch. A ring row may carry a bare or a qualified spelling
+and read under it, with the ring spelling resolved once per source table per
+batch. A ring row may carry a bare or a qualified spelling
 of one source (`orders`, `public.orders`); keying on the raw spelling would
 split one source's quarantine state in two: half-threshold fuse budgets that
 never trip, two death counters for one row, and a fold exclusion blind to a key
@@ -117,8 +116,7 @@ needs pausing, as the per-column tier does.
 
 * **Isolation names the transform.** A record that fails alone is probed again
   with the transforms reading its table directly left out but one, to find the
-  one(s) whose apply it fails in (`staging::quarantine::attribute`). Every
-  probe runs on the failure path only.
+  one(s) whose apply it fails in. Every probe runs on the failure path only.
   * A record that fails with every direct reader left out fails in the work
     done for the transforms reading its table through a relationship (the
     to-side's reverse recomputes and settled projection). With several
@@ -131,8 +129,9 @@ needs pausing, as the per-column tier does.
     is left out in turn, and every one whose absence lets the record apply is
     charged: it is in every failing combination. When no one is (two separate
     failing pairs, say), the record is charged to nobody, as a failure only two
-    records reproduce together is, and the page is a drain holdup
-    ([known gap 24](../known-correctness-gaps.md#24-a-change-only-two-separate-pairs-of-definitions-fail-on-together)).
+    records reproduce together is, and the page is a drain holdup (known
+    correctness gap
+    [A change only two separate pairs of definitions fail on together](../known-correctness-gaps.md#24-a-change-only-two-separate-pairs-of-definitions-fail-on-together)).
   * Each probe counts toward the isolation's probe limit. At the limit, a
     record is charged to the transforms its probes had pinned, and to every
     relationship's readers it hadn't probed yet; a probe that hits a transient
@@ -147,18 +146,16 @@ needs pausing, as the per-column tier does.
   compute and its apply leaves no held row behind.
 * **A failure that is really in the source** (one every reader hits, such as an
   image that won't decode) is poisoned once per transform that hits it.
-* **Accepted costs:** two transforms can disagree on one key, one current and
-  one frozen, which the quarantine API shows; and the source-wide case writes a
-  poison row per transform.
-* **Rejected:** one poison row per source row for every reader (one
-  transform's failure would freeze the key in every sibling), and per-column
-  whole-key poison (a whole-key failure is one that can't be pinned to a
-  column, and the per-column tier already exists).
+* **Why not one poison row per source row, or per column?** One row per
+  source row for every reader would let one transform's failure freeze the key
+  in every sibling. Per-column whole-key poison has nothing to pin: a whole-key
+  failure is one that can't be pinned to a column, and the per-column tier
+  already exists.
 
-## Column status table
+## A dense column-status table answers "is anything paused"
 
-`column_status` (`V21__column_quarantine.sql`) is a small dense table of each
-transform's currently-paused columns, so "is anything paused right now" is a
+`column_status` is a small dense table of each transform's currently-paused
+columns, so "is anything paused right now" is a
 cheap read rather than a scan over per-row failure detail. Keyed on
 `(transform_table, column_name)`; carries `paused_at` and `last_error`.
 
@@ -168,7 +165,7 @@ tripped; `false` means an upstream column it reads was paused (see
 every column live; the table does not replace the transform's overall lifecycle
 status.
 
-## Client library API
+## The client API is three reads, separated by cost, and one release
 
 Three calls, separated by cost:
 
@@ -216,20 +213,19 @@ target from the source without clearing it (see
 [ADR-0014](0014-pause-and-drop-a-transform.md#resume-reconciles-with-source-not-by-catch-up)
 and [data-flow](../data-flow.md)).
 
-Settled parameters (`V21__column_quarantine.sql` / `staging::quarantine`):
+Settled parameters:
 
-* **Threshold** — a fixed count, matching the row-level fuse's
-  `DEFAULT_DEATH_THRESHOLD`; not percentage-based, not per-transform configurable.
+* **Threshold** — a fixed count, matching the row-level fuse's death
+  threshold; not percentage-based, not per-transform configurable.
 * **Counter** — an incrementally-maintained `column_deaths` table, the same
   `key_deaths`-style write-amplification tradeoff, not a live aggregate query.
 * **Paused-column value** — freezes at the last computed value; never nulled.
   Staleness is discoverable via `column_status`/the API, not an in-band marker.
 * **Propagation** — tripping either fuse cascades the pause to 1-1 downstream
-  transforms reading the paused column (`column_pause_cascades`,
-  `defs::catalog::column_dependents`), so no downstream reader silently consumes
+  transforms reading the paused column, so no downstream reader silently consumes
   a frozen value. The column-level fuse only ever freezes a column of a 1-1
-  transform, and the cascade stops at aggregates
-  ([known correctness gaps](../known-correctness-gaps.md)). Each reader's pause
+  transform, and the cascade stops at aggregates (known correctness gap
+  [A paused column doesn't pause the aggregates that read it](../known-correctness-gaps.md#19-a-paused-column-doesnt-pause-the-aggregates-that-read-it)). Each reader's pause
   commits in a transaction of its own, fenced against its writers in flight, so
   a cascade can fail part-way. The walk is idempotent: it walks on through a
   reader that is paused already, so running it again reaches the readers the
@@ -288,9 +284,8 @@ hit the threshold there forever, and the next single new eviction would
 re-quarantine it. Other transforms' rows are untouched: each transform's held
 keys are its own, so the delete un-evicts nothing out from under a sibling.
 
-`staging::quarantine::resume_transform` also stamps
-`transform_definitions.fuse_rearmed_at` (`V29__transform_fuse_rearm.sql`) as the
-resume's epoch: a backfill chunk of the build before it is stale against it, and
+The resume also stamps the transform's definition with a fuse re-arm time as
+the resume's epoch: a backfill chunk of the build before it is stale against it, and
 an eviction whose isolation read the old epoch poisons nothing for the rebuilt
 transform.
 
@@ -319,14 +314,15 @@ until one of these releases it:
   (the CLI's `trellis release`, and `release_key` in each binding) releases one
   key once its cause is fixed. It takes the transform's bare target, as
   `status` does, and the source table and key as `sample_quarantined` reports
-  them, the table in either spelling (#283). In one transaction it deletes the
+  them, the table in either spelling. In one transaction it deletes the
   transform's `poison`, `poison_held` and `key_deaths` rows for the key and
   stages one image-less `Recompute` of it, which re-derives the key from its
-  current row, including the to-one projection rewrite of #754. Beside it, it
+  current row, including the rewrite of its to-one relationship projections.
+  Beside it, it
   stages each join value the held row names (`join_values`), so the
   `Recompute` also re-derives the relationship readers that may have read the
   key under a value between its first parked pre-image and its current row,
-  which an out-of-order drain can leave behind (#944). The parked
+  which an out-of-order drain can leave behind. The parked
   changes are discarded, not replayed. The `Recompute` reaches every reader of
   the table: one that doesn't hold the key re-derives it, which is idempotent,
   and one that does parks it. If the cause is still there, the `Recompute`
@@ -352,8 +348,9 @@ keys:
 
 * **A drain page** parks a change for a held key in its apply's transaction,
   holding the version fence of the key's table `for share` from its first lock
-  to its commit. The release's first lock is a bump of that fence (#744's rule
-  for a fence bump), so it waits for every such page and then reads the key's
+  to its commit. The release's first lock is a bump of that fence (a fence
+  comes first in a transaction, as in [ADR-0014](0014-pause-and-drop-a-transform.md)'s
+  lock order), so it waits for every such page and then reads the key's
   rows, the page's parked change among them. A page computed before the release
   that applies after it misses its fence and computes again, finding the key
   no longer held. A page reads the poisoned keys before its fence, so one can
@@ -384,8 +381,7 @@ poisons it, as the later one would. A clean apply clears the count too, and an
 eviction that finds it cleared skips the key the same way. The check is one
 read inside the eviction's transaction, with no new lock or state. A build
 chunk's eviction charges and poisons in one transaction, so it
-has no such window. The threshold is decided in one place
-(`quarantine::crosses_threshold`) so that a key that poisons on its first
+has no such window. The threshold is decided in one place so that a key that poisons on its first
 failure is checked against its own.
 
 A held key is visible wherever its transform's state is read. `status` reports
@@ -400,7 +396,7 @@ reports `not_caught_up` until it is released.
 A transient failure (a lost connection, a lock or serialization conflict) is retried.
 A failure that reproduces is isolated to the source key that causes it and the transform
 whose apply it fails in, and the key is evicted to `poison` for that transform once its
-`key_deaths` count reaches `DEFAULT_DEATH_THRESHOLD`.
+`key_deaths` count reaches the death threshold.
 A page's `COMMIT` is classified like any of its statements, since a deferred constraint
 or constraint trigger an application puts on a target fails there, and a connection can
 drop there. A connection that drops after the `COMMIT` lands retries a page that
@@ -444,6 +440,22 @@ resolves.
 transform is resumed or dropped ([Releasing held keys](#releasing-held-keys)); nothing
 moves entries elsewhere by age. A held key's parked work is one row, so it doesn't grow
 while the key waits. Dead-letter by age was rejected, since a release never replays the
-parked changes; an opt-in backoff retry is
-[#861](https://github.com/salesforce-misc/trellis/issues/861), and a configurable
-threshold is [#862](https://github.com/salesforce-misc/trellis/issues/862).
+parked changes.
+
+## Consequences
+
+* Validity is checked on read as an *absence* from the exception tables, not a
+  column in hand; a consumer asks the API rather than checking rows inline.
+* Two transforms can disagree on one key, one current and one frozen, which the
+  quarantine API shows; and a failure that is really in the source writes a
+  poison row per transform that hits it.
+* A paused column freezes at its last computed value. Its staleness is visible
+  only through `column_status` and the API, not in the target row, and a
+  pause stops at aggregates.
+* A held key stays frozen until it is released, or its transform is resumed or
+  dropped: nothing retries it or moves it on by age, and while it waits it holds
+  back the transform's convergence, so `self_check` reports `not_caught_up`.
+* The fuse thresholds are fixed counts, not configurable per transform.
+* A drain holdup charges and pauses nothing: the page stays where it is, retried
+  every pass and reported by `status` and `self_check`, until its cause is
+  fixed.

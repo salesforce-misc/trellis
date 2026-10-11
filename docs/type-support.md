@@ -339,7 +339,7 @@ date)`. The accepted keywords are `DATE`, `TIMESTAMP`, `TIME`, `TIMETZ`,
 literal's text must be in the type's canonical Postgres output spelling, which
 also makes the Rust evaluator's text agree with Postgres's byte for byte. A
 general `CAST(<expr> AS <type>)` over a non-literal is refused by name. See
-[ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-issue-109).
+[ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-spell-constants-in-canonical-postgres-form).
 
 ## Immutability
 

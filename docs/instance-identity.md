@@ -16,7 +16,7 @@ Trellis owns lives in `public` or under unqualified names.
   each isolated within its own schema. A process holds one handle for each
   instance it uses, with its own runtimes and connections and nothing shared
   between handles
-  ([ADR-0010](decisions/0010-embeddable-clients.md#decision-3-the-binding-owns-one-handle-per-instance-rust-owns-its-threads),
+  ([ADR-0010](decisions/0010-embeddable-clients.md#3-the-binding-owns-one-handle-per-instance-rust-owns-its-threads),
   decision 3).
 
 ## Default and configuration

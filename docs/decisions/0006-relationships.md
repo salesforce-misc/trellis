@@ -2,8 +2,6 @@
 status: accepted
 date: 2026-09-02
 deciders: Michael Ries
-consulted:
-informed:
 ---
 
 # Named Relationships
@@ -33,7 +31,8 @@ expression language.
 
 * A relationship name is **unique per from-table**, not global. `posts` may
   declare both `author` and `editor` at `users` as independent relationships.
-  "From-table" means the fully-qualified table (issue #288): `blog.posts` and
+  "From-table" means the fully-qualified table
+  ([ADR-0011](0011-fully-qualified-names.md)): `blog.posts` and
   `shop.posts` are different tables, so each may declare its own `author`.
 * Relationships may be declared in any order, as long as every endpoint
   resolves and the dependency graph stays acyclic.
@@ -58,7 +57,7 @@ expression language.
   * Every endpoint, owned or not, must have a key (its primary key, or for an
     aggregate target its `GROUP BY` columns) whose types are all on the
     [primary-key allowlist](../type-support.md): apply keys every change the
-    relationship propagates by it .
+    relationship propagates by it.
 * Every requirement on the endpoints and join columns is checked when the
   relationship is declared, so one Trellis accepts can't halt the instance
   later over the tables' shape at that time. The full list is in
@@ -193,3 +192,18 @@ Relationships are **immutable once declared**, like transforms: to change a join
 key, declare a new relationship and cut over. Editing the calculated columns
 that *consume* a relationship is transform redefinition
 ([ADR-0015](0015-transform-redefinition.md)).
+
+## Consequences
+
+* Changing a relationship's join key means declaring a new relationship and
+  cutting the transforms over to it; nothing edits one in place.
+* Every relationship names its join key: Trellis never infers one from a
+  foreign key.
+* A bare to-one reference needs a to-side Trellis can prove unique, so the user
+  adds a `UNIQUE` constraint or uses the aggregate form; Trellis never adds one.
+* A to-side change that a field isn't linear in re-derives every child under
+  that join value, so a write to a parent with many children costs one
+  re-derive per child. Trellis creates and owns a join-key index on each
+  target's ledger to find them.
+* An endpoint that is one of the instance's own targets must be `live` before a
+  relationship can name it.

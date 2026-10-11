@@ -2,8 +2,6 @@
 status: accepted
 date: 2026-09-02
 deciders: Michael Ries
-consulted:
-informed:
 ---
 
 # Source Schema Is User-Owned
@@ -12,13 +10,17 @@ Trellis reads source tables (changes are captured by triggers it installs; see
 [capture by triggers](../staging-and-claiming/01-capture-by-triggers.md)) and
 derives target tables from them. As features grow, it's tempting to *improve* the
 source schema on the user's behalf — add an index, add a `UNIQUE` constraint a
-transform relies on. This ADR rejects that.
+transform relies on. This ADR rejects that. It is project-wide, not
+feature-specific: it governs how every definition type validates against source
+tables — transforms, relationships (see
+[0006-relationships](0006-relationships.md)), and transform redefinition (see
+[0015-transform-redefinition](0015-transform-redefinition.md)).
 
-## Decision
+## Trellis never modifies the source schema
 
-**Trellis never modifies the source schema.** No indexes, no constraint changes,
-no DDL against a source table other than the capture triggers themselves. The user owns those
-tables; Trellis is a reader. Instead:
+No indexes, no constraint changes, no DDL against a source table other than the
+capture triggers themselves. The user owns those tables; Trellis is a reader.
+Instead:
 
 1. **Validate strongly at definition time.** Every definition is checked against
    the introspected source schema (`pg_catalog` / `information_schema`) before
@@ -30,6 +32,8 @@ tables; Trellis is a reader. Instead:
    target; add one, or go through an aggregate," or "no index on
    `order_line_items.product_id`; related-row updates will be slow — consider
    `CREATE INDEX ... ON order_line_items (product_id)`."
+
+## A missing correctness prerequisite rejects; a missing performance one warns
 
 Correctness vs. performance sets the severity:
 
@@ -46,10 +50,3 @@ Correctness vs. performance sets the severity:
   never assume them. Requirements are checked and surfaced, never applied.
 * Error and warning messages are first-class product surface: the guidance *is*
   how a user learns to shape a schema Trellis can serve well.
-
-## Scope
-
-Project-wide, not feature-specific. Governs how every definition type validates
-against source tables — transforms, relationships (see
-[0006-relationships](0006-relationships.md)), and transform redefinition (see
-[0015-transform-redefinition](0015-transform-redefinition.md)).

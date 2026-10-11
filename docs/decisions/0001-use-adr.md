@@ -2,8 +2,6 @@
 status: accepted
 date: 2026-08-14
 deciders: Michael Ries
-consulted: 
-informed:
 ---
 
 # Use ADR System

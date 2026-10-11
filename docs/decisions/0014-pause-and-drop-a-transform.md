@@ -120,7 +120,7 @@ siblings and is not recoverable by replay.
 Resume therefore reconciles the target with current source data rather than catching up
 over buffered changes, because there are none. The target is not cleared and rebuilt.
 Readers keep seeing its rows throughout, and the reconciliation has two halves, committed
-together in one transaction (issue #330) and read on one snapshot (issue #436):
+together in one transaction and read on one snapshot:
 
 - Every target row that no current source row backs is deleted. That covers a 1-1 row
   whose source row was deleted, and an aggregate group whose rows were all deleted or,
@@ -143,14 +143,14 @@ appear the same way. The deletes, the build's included, go through the target-mu
 seam like any other target write, so a live definition reading this target drops them too.
 
 Before any of that, resume re-validates the definition against the live schema, with
-the same checks define runs (`defs::catalog::revalidate`): its fields over the source's
+the same checks define runs: its fields over the source's
 live columns, the source key's type and collations, each relationship it reads
 through (both join columns still on the allowlist and still the same type, modifier
 and collation), row-level security and subscriptions, and, for a 1-1 definition, a
 source key that is still the one its target is keyed by. While define would refuse
 it, the resume refuses with define's error, names the column and what to change, and
 changes nothing: the definition stays paused. Every definition also needs its ledger
-table to exist (only a hand edit drops it, #986), and an aggregate gets one more check,
+table to exist (only a hand edit drops it), and an aggregate gets one more check,
 that its group-delta table is the one define would create now: it exists (likewise),
 and its running-sum and recompute columns are define's (a `SUM` or `AVG`
 argument that moved between an exact type and floating point changes them). The
@@ -220,7 +220,7 @@ upstream's target.
 
 At the start of each capture pass, before it finishes the requested resumes, the pass
 resumes each definition paused with a cause whose upstream is `live`, with no resume
-request: its rebuild has finished (#476), so each downstream rebuild starts only after
+request: its rebuild has finished, so each downstream rebuild starts only after
 the one above it, and one `RESUME` of the head carries the chain. It takes the path an
 operator's `RESUME` takes, in one transaction, under the definition's lock, after
 re-reading that the definition is still frozen with the same cause: a `RESUME` by hand
@@ -236,7 +236,7 @@ request are the two states a definition passes through, each move is one transac
 and a crash leaves one of them for the next pass to go on from. A `RESUME` by hand of a
 waiting definition resumes it at once, whether or not its upstream is `live`. A `PAUSE`
 of one changes nothing, since it is already paused, so the pass still resumes it once
-the upstream is `live` (#971). A chained definition the
+the upstream is `live`. A chained definition the
 re-type leaves refused, failing its own re-validation (a relationship's join columns no
 longer match), keeps its own error and records no cause. So does one already paused for
 another reason, by the operator or by quarantine, and the pass leaves it alone.
@@ -268,8 +268,8 @@ restarts, so it doesn't take the table's lock every pass.
 
 A value written between the source's `ALTER` and that re-type fails its write (`22001`
 or `22003`), and its key may be held. One whose characters past the old `varchar`
-length are all spaces is stored truncated instead, and stays so ([known correctness
-gaps, entry 23](../known-correctness-gaps.md#23-a-value-padded-with-spaces-past-a-widened-varchars-old-length-drained-before-trellis-re-types-its-copy)).
+length are all spaces is stored truncated instead, and stays so (known correctness gap
+[A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy](../known-correctness-gaps.md#23-a-value-padded-with-spaces-past-a-widened-varchars-old-length-drained-before-trellis-re-types-its-copy)).
 The re-type's transaction records a release request for each definition with a column
 on the table (`retype_releases`).
 After the pass, the staging worker releases each key such a definition holds whose
@@ -301,7 +301,7 @@ them has no use we can name, and the paused state already serves it.
 Because the target table and its columns are Trellis-owned, dropping them is Trellis's
 to do. Source tables remain user-owned and untouched. That ownership holds because
 registration only ever creates a target table: it refuses a transform whose target name
-already names any relation (#440), so a table Trellis later drops is always one it created.
+already names any relation, so a table Trellis later drops is always one it created.
 
 ### Drops go in reverse dependency order — no cascade
 

@@ -6,8 +6,8 @@ deciders: Michael Ries
 
 # Grammar Versions on Stored Definitions
 
-Trellis stores each definition as text (`transform_definitions.definition_text`,
-`relationship_definitions.definition_text`) and parses it again on every read,
+Trellis stores each transform and relationship definition as text in its
+catalog and parses it again on every read,
 with the parser new statements go through
 ([ADR-0004](0004-transform-definition-grammar.md)). An `ALTER TRANSFORM` stores
 the edited definition rendered back into the grammar. Validation, row
@@ -23,8 +23,8 @@ target still holds rows computed under the old one.
 This ADR settles how a stored definition keeps its meaning across grammar
 changes. The definition version of
 [ADR-0015](0015-transform-redefinition.md) counts edits to one definition, not
-changes to the language, and the ordered migrations in `trellis/migrations/`
-version the catalog's own schema; both are out of scope.
+changes to the language, and the catalog's ordered schema migrations version
+the catalog's own schema; both are out of scope.
 
 ## Decisions
 
