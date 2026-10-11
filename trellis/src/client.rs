@@ -127,8 +127,11 @@ pub struct ClientOptions {
     /// drain threads once per third of this window (and once at start), in
     /// one statement from one task, so a thread busy in a long drain still
     /// counts and a thread that has exited stops counting within the window.
-    /// Do not set it below a few seconds: each refresh is a database round
-    /// trip.
+    /// A refresh has to commit inside the window, after the pass's pool
+    /// checkout and round trip, so keep it at a few seconds or more; a row
+    /// that misses the window only makes peers' shares larger until the next
+    /// refresh. Give every process of a fleet the same value: a peer
+    /// refreshing on a third of a longer window drops out of a shorter one.
     pub drainer_window: Duration,
     /// The out-of-band heartbeat daemon's tick interval and idle-exit
     /// timeout, one per app-worker task. The same interval also paces each
@@ -743,25 +746,23 @@ async fn run(
     // worker tasks does it run." Only when `application_threads > 0` — a
     // staging-only client (capture + ring maintenance, no app workers)
     // does no draining, so it must not register as though it did.
-    if options.application_threads > 0
+    //
+    // On the same connection, every drain thread becomes a counted drainer
+    // before the first one claims, so its first claim does not size its share
+    // as the only worker. The registration task below keeps the rows fresh
+    // from here on.
+    let drainer_ids: Vec<String> = (0..options.application_threads)
+        .map(|i| format!("{client_id}-app-{i}"))
+        .collect();
+    if !drainer_ids.is_empty()
         && let Ok(conn) = pool.get().await
     {
         let _ = staging::register_worker(&**conn, &client_id).await;
+        let _ = staging::register_drainers(&**conn, &drainer_ids).await;
     }
 
     let live_workers = LiveWorkers::default();
     let mut app_worker_tasks = Vec::with_capacity(options.application_threads + 1);
-    let drainer_ids: Vec<String> = (0..options.application_threads)
-        .map(|i| format!("{client_id}-app-{i}"))
-        .collect();
-    // Every drain thread is a counted drainer before the first one claims, so
-    // its first claim does not size its share as the only worker. The
-    // registration task below keeps the rows fresh from here on.
-    if !drainer_ids.is_empty()
-        && let Ok(conn) = pool.get().await
-    {
-        let _ = staging::register_drainers(&**conn, &drainer_ids).await;
-    }
     for claimed_by in drainer_ids {
         let alive = live_workers.enter(claimed_by.clone());
         let worker_config = AppWorkerConfig {
@@ -1733,7 +1734,8 @@ struct AppWorkerConfig {
     /// Held for as long as this worker loop runs and dropped when it ends,
     /// however it ends (a panic included): the gate on
     /// [`worker_upkeep_loop`], so a process whose workers are all gone stops
-    /// refreshing its registry row.
+    /// refreshing its registry row, and this worker's `drainers` row stops
+    /// being refreshed once it is gone.
     alive: WorkerAlive,
     /// Issue #132, epic #127, guard (a): this fleet's shared in-process
     /// "staged-through" watermark — the one `run()` constructs, always
@@ -1748,7 +1750,8 @@ struct AppWorkerConfig {
     build_chunk_rows: i64,
 }
 
-/// One application-worker task: registers itself as a drainer, runs an
+/// One application-worker task (its `drainers` row is written by [`run`] and
+/// the drainer registration task, not by the loop itself): runs an
 /// out-of-band heartbeat daemon for its ring-segment claims, then loops
 /// claiming and draining sealed batches *and* claiming and executing pending
 /// direct-build backfill chunks (docs/decisions/0007's amendment) until

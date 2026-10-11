@@ -31,7 +31,7 @@ batch is split into buckets at seal time, and workers claim buckets.
 **How many buckets** is decided **once, by the seal, from configuration and batch
 size only**: at least `MIN_ROWS_TO_SPLIT` (256) rows seals into `SEG_BUCKETS`
 (default 8); anything smaller gets 1. It deliberately **does not** consult the
-live-worker registry — workers register lazily and the count swings run to run, so
+live-worker registry — the count moves as workers start, stop and die, so
 an immutable, safety-critical partition must not be sampled from a registry that
 moves under it.
 

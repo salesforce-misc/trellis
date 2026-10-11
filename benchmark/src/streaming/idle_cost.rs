@@ -20,8 +20,8 @@
 //! there is no query counter without `pg_stat_statements`, which this
 //! harness's ephemeral cluster doesn't preload unless asked to (see
 //! "Per-statement attribution" below). In this regime almost every
-//! statement the wake path issues (`register_drainer`,
-//! `next_claimable_segments`, the maintenance tick's reads) runs as its own
+//! statement the idle path issues (`next_claimable_segments`, the drainer
+//! registration, the maintenance tick's reads) runs as its own
 //! autocommit round trip rather than batched inside an explicit transaction,
 //! so `xact_commit`'s delta is a reasonable stand-in — which is why this
 //! reports `xact_commit_per_sec` and nothing that pretends to be a second,
