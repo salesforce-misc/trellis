@@ -61,9 +61,10 @@ use trellis::{
 };
 
 /// `Trellis::self_check` run to its end. The call starts a background job and
-/// returns (#1023); this test has no drain worker, so it runs the job's pages
-/// itself, the way `ManualBackend` drains by hand, and reads the report back
-/// through the facade. The page holds a whole generated target (the largest is
+/// returns (#1023). The caller stops the backend's engine first, and with it
+/// the worker task that would otherwise race this one for the job, so this
+/// runs every page of it by hand, the way `ManualBackend` drains, and reads
+/// the report back through the facade. The page holds a whole generated target (the largest is
 /// `MAX_TABLES * MAX_SEED_ROWS` rows), so a job is one page.
 async fn self_check_to_end(trellis: &Trellis, pool: &Pool, target: &str) -> SelfCheckReport {
     let job = trellis
@@ -191,6 +192,7 @@ async fn self_check_and_the_generative_sql_oracle_agree_the_target_is_correct() 
         .await
         .expect("connect read-only trellis");
 
+    backend.stop_engine().await.expect("stop the engine");
     let report = self_check_to_end(&trellis, &pool, &target_name).await;
 
     assert!(
@@ -255,6 +257,7 @@ async fn self_checks_recompute_matches_the_generative_sql_oracles_recompute_for_
         .await
         .expect("connect read-only trellis");
 
+    backend.stop_engine().await.expect("stop the engine");
     let report = self_check_to_end(&trellis, &pool, &target_name).await;
 
     let divergences = match report.outcome {
@@ -604,6 +607,7 @@ fn run_swept_tampering_case(
             let trellis = Trellis::connect(config, TrellisOptions::default())
                 .await
                 .expect("connect read-only trellis");
+            backend.stop_engine().await.expect("stop the engine");
             let report = self_check_to_end(&trellis, &pool, &def.target).await;
 
             let divergences = match report.outcome {
