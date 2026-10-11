@@ -95,6 +95,11 @@
 //! after its transaction begins, before it takes the definition's fuse gate
 //! and row (#880). A test runs the isolation inside [`with_scope`].
 //!
+//! A Re-derive plan job's batch (`super::build::run_plan`) fires
+//! [`PausePoint::AfterPlanHold`] for the definition's target after it holds
+//! the definition row and its claim, before it inserts its chunks. A test
+//! runs the job inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -211,6 +216,11 @@ pub enum PausePoint {
     /// own reason (`local_fuse`) and leaves it paused with that sibling, for
     /// the column's (bare) target (`super::quarantine::resume_column`, #922).
     BeforeSiblingHeldResume,
+    /// After a Re-derive plan job's batch transaction holds the job's claim
+    /// and before it inserts the batch's chunks, for the definition's
+    /// target (`super::build::run_plan`). The batch holds the definition
+    /// row `for key share` and the plan row, and has written nothing.
+    AfterPlanHold,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

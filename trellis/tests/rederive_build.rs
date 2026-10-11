@@ -2630,3 +2630,243 @@ async fn a_chunk_held_across_a_resume_outlives_the_flip_and_is_discarded() {
     assert_eq!(f.status("agg").await.as_deref(), Some("live"));
     f.assert_agg_oracle().await;
 }
+
+/// The advisory lock the frozen plan job waits on.
+const PLAN_PAUSE_LOCK: i64 = 0x7a1a;
+
+/// Waits until the backends blocked on a lock number `queued` and, when
+/// `behind` is set, until one of them is blocked behind that backend. Not a
+/// wait for convergence: it returns once Postgres reports the queue the test
+/// built on purpose, as the other lock-order tests do with `pg_blocking_pids`.
+async fn wait_for_queue(raw: &Client, behind: Option<i32>, queued: i64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let waiting: i64 = raw
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where pid <> pg_backend_pid() \
+                   and ($1::int is null or $1 = any(pg_blocking_pids(pid))) \
+                   and cardinality(pg_blocking_pids(pid)) > 0",
+                &[&behind],
+            )
+            .await
+            .expect("count the queue")
+            .get(0);
+        if waiting >= queued {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue never formed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Claims the Re-derive plan job as `held` and pauses the building transform,
+/// the state a pause leaves a job a worker has claimed in.
+async fn paused_with_a_claimed_plan_job(f: &mut Fixture) -> (chunk_queue::ClaimedChunk, Trellis) {
+    f.pass().await;
+    let plan = {
+        let client = f.db.pool.get().await.expect("pool");
+        chunk_queue::claim_chunks_of(&**client, "held", 1, &[chunk_queue::KIND_PLAN])
+            .await
+            .expect("claim the plan job")
+    };
+    assert_eq!(plan.len(), 1, "the plan job");
+    let trellis = f.trellis().await;
+    trellis
+        .apply("PAUSE TRANSFORM agg")
+        .await
+        .expect("pause the building transform");
+    (plan.into_iter().next().expect("one plan job"), trellis)
+}
+
+/// Runs `action` while a plan job's batch is frozen after it holds its claim
+/// and before it inserts its chunks (`PausePoint::AfterPlanHold`), and lets
+/// the batch go once `action` has queued behind it. The batch's foreign-key
+/// check on the definition row must not wait on `action`, which holds that
+/// row and waits on the plan row: the batch takes the definition row first.
+/// Returns what `action` returned.
+async fn action_against_a_frozen_plan_batch(
+    f: &mut Fixture,
+    action: &'static str,
+) -> Result<(), String> {
+    use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+
+    let (plan, trellis) = paused_with_a_claimed_plan_job(f).await;
+    let gate = connect(f.db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&PLAN_PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::AfterPlanHold, "public.agg", PLAN_PAUSE_LOCK);
+    let pool = f.db.pool.clone();
+    let batch = tokio::spawn(with_scope(scope, async move {
+        build::run_claimed(&pool, &plan, "held", &OPTIONS).await;
+    }));
+    let frozen = reached.await.expect("the plan batch reached its pause");
+
+    let acting = tokio::spawn(async move { trellis.apply(action).await });
+    wait_for_queue(&f.raw, Some(frozen.backend_pid), 1).await;
+    gate.execute("select pg_advisory_unlock($1)", &[&PLAN_PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+    batch.await.expect("the plan batch task");
+    acting
+        .await
+        .expect("the action task")
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A `RESUME TRANSFORM` that arrives while a plan job's batch holds its claim
+/// completes: the batch took the definition row before its claim, so the
+/// resume waits behind it for the definition row and the batch's insert never
+/// waits on the resume (found by a generative sweep as `40P01` on
+/// `backfill_chunks`). The resumed build then runs to live.
+#[tokio::test]
+async fn a_resume_arriving_mid_plan_batch_does_not_deadlock_with_it() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    action_against_a_frozen_plan_batch(&mut f, "RESUME TRANSFORM agg")
+        .await
+        .expect("the resume is not a deadlock victim");
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// The same for `DROP TRANSFORM`, whose cascade delete of the chunks waits on
+/// the plan row the batch holds.
+#[tokio::test]
+async fn a_drop_arriving_mid_plan_batch_does_not_deadlock_with_it() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    action_against_a_frozen_plan_batch(&mut f, "DROP TRANSFORM agg")
+        .await
+        .expect("the drop is not a deadlock victim");
+    assert_eq!(f.status("agg").await, None, "the definition is gone");
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks").await,
+        0,
+        "and its chunks with it"
+    );
+}
+
+/// Starts a plan job's batch while `action` holds the definition row and
+/// waits on a fenced writer's lock on the plan row, then lets the writer
+/// commit. The batch must wait for `action` at its first statement, the
+/// definition row, holding nothing: a batch that took the plan row first
+/// would wait in its insert instead, behind `action`. Returns the plan job's
+/// id and what `action` returned, once the batch has ended.
+async fn plan_batch_behind(f: &mut Fixture, action: &'static str) -> (i64, Result<(), String>) {
+    let (plan, trellis) = paused_with_a_claimed_plan_job(f).await;
+
+    // A fenced writer on the plan row (`ClaimFence::hold`'s lock), which is
+    // what `action` waits out after it takes the definition row.
+    let holder = connect(f.db.dsn()).await;
+    let holder_pid: i32 = holder
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("holder pid")
+        .get(0);
+    holder.batch_execute("begin").await.expect("begin");
+    holder
+        .execute(
+            "select 1 from backfill_chunks \
+             where id = $1 and claimed_by = 'held' and not done for key share",
+            &[&plan.id],
+        )
+        .await
+        .expect("hold the plan row");
+
+    let acting = tokio::spawn(async move { trellis.apply(action).await });
+    wait_for_queue(&f.raw, Some(holder_pid), 1).await;
+    let pool = f.db.pool.clone();
+    let claimed = plan.clone();
+    let batch = tokio::spawn(async move {
+        build::run_claimed(&pool, &claimed, "held", &OPTIONS).await;
+    });
+    // `action` waits on the holder, and the batch on `action`, at the
+    // batch's definition-row statement.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let waiting: i64 = f
+            .raw
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where datname = current_database() and wait_event_type = 'Lock' \
+                   and query = 'select 1 from transform_definitions where id = $1 for key share'",
+                &[],
+            )
+            .await
+            .expect("count the batches waiting on the definition row")
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            !batch.is_finished(),
+            "the plan batch ended without waiting on the definition row"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the plan batch never waited on the definition row"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    holder.batch_execute("commit").await.expect("commit");
+
+    let acted = acting
+        .await
+        .expect("the action task")
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"));
+    batch.await.expect("the plan batch task");
+    (plan.id, acted)
+}
+
+/// A plan job whose batch starts while a resume holds the definition row
+/// waits for it holding nothing, and once the resume commits its claim is
+/// stale: it stops as superseded and writes nothing.
+#[tokio::test]
+async fn a_plan_batch_behind_a_resume_stops_as_superseded() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    let (plan_id, resumed) = plan_batch_behind(&mut f, "RESUME TRANSFORM agg").await;
+    resumed.expect("the resume is not a deadlock victim");
+
+    assert_eq!(
+        f.count(&format!(
+            "select count(*) from backfill_chunks where id = {plan_id}"
+        ))
+        .await,
+        0,
+        "the superseded plan job is discarded"
+    );
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'rederive'")
+            .await,
+        0,
+        "and it planned no chunk"
+    );
+    f.pass().await;
+    f.run("agg").await;
+    assert_eq!(f.status("agg").await.as_deref(), Some("live"));
+    f.assert_agg_oracle().await;
+}
+
+/// The same behind a drop: once the drop commits, the batch's definition-row
+/// statement finds no row, its claim is gone with the plan row, and it ends
+/// quietly having written nothing.
+#[tokio::test]
+async fn a_plan_batch_behind_a_drop_writes_nothing() {
+    let mut f = Fixture::new(60, &[AGG]).await;
+    let (_, dropped) = plan_batch_behind(&mut f, "DROP TRANSFORM agg").await;
+    dropped.expect("the drop is not a deadlock victim");
+    assert_eq!(f.status("agg").await, None, "the definition is gone");
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks").await,
+        0,
+        "and the batch planned no chunk"
+    );
+}

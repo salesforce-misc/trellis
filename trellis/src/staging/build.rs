@@ -2874,10 +2874,34 @@ async fn run_plan(
         let finished = ranges.len() < PLAN_BATCH;
         let next = ranges.last().map(|(_, hi)| hi.clone()).or(cursor.clone());
         let txn = client.transaction().await?;
+        // The definition row first, then the plan row, the order every other
+        // chunk-side writer takes them in. The insert below checks its
+        // foreign key against the definition row (`for key share`), which a
+        // resume or a drop holds `for update` while it waits on the plan row
+        // this batch locks: taken after the claim, that check closes a cycle.
+        // Here a resume or drop in flight makes this batch wait holding
+        // nothing, and one that committed first shows in the claim's stale
+        // check, so the batch stops as superseded. The claim's idle timeout
+        // goes first, so it bounds a stall that holds the definition row
+        // too.
+        fence.arm(&*txn).await?;
+        txn.execute(
+            "select 1 from transform_definitions where id = $1 for key share",
+            &[&chunk.definition_id],
+        )
+        .await?;
         if !fence.hold(&*txn).await? {
             txn.rollback().await?;
             return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
         }
+        // Test-only pause point. See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            &*txn,
+            super::interleave::PausePoint::AfterPlanHold,
+            &definition.target_table,
+        )
+        .await?;
         let (los, his): (Vec<Option<&str>>, Vec<&str>) = ranges
             .iter()
             .map(|(lo, hi)| (lo.as_deref(), hi.as_str()))
