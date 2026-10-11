@@ -951,9 +951,9 @@ let report = loop {
   the drain failures open on the instance. A job that finds its transform no
   longer live, its target no longer caught up, or its capture broken partway
   ends there with what it had found, `truncated`.
-* **A target that can't be checked is refused at the start**: an aggregate
-  (`UnsupportedKeySpace`), one that reads a relationship (`UnsupportedExpr`),
-  or an unknown name (`not_found`).
+* **A target `self_check` can't compare**
+  ([known gap 16](known-correctness-gaps.md#16-self_check-audits-1-1-targets-only)),
+  or an unknown name, is refused by the call that would start the job.
 
 In Ruby the job is a `Trellis::SelfCheckJob` (`finished?` says whether to stop
 polling) and its report a `Trellis::SelfCheckReport`; in Elixir a
