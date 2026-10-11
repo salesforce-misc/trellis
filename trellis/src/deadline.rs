@@ -80,14 +80,9 @@ impl CallDeadline {
     ///
     /// The statement itself is [`crate::locks::cap_timeout_sql`], which reads
     /// the setting in force with `current_setting`, not `pg_settings` (#1010);
-    /// this adds the time-left computation and the clamp to at least 1 ms.
+    /// this adds the time left, as [`timeout_ms`].
     pub(crate) fn set_statement_timeout_sql(&self, local: bool) -> String {
-        let ms = self
-            .remaining()
-            .as_nanos()
-            .div_ceil(1_000_000)
-            .clamp(1, i32::MAX as u128);
-        crate::locks::cap_timeout_sql("statement_timeout", ms, local)
+        crate::locks::cap_timeout_sql("statement_timeout", timeout_ms(self.remaining()), local)
     }
 
     /// How long a connection that ran under this deadline may still be busy
@@ -97,6 +92,16 @@ impl CallDeadline {
     pub(crate) fn settle_time(&self) -> Duration {
         self.budget
     }
+}
+
+/// `remaining` as a `statement_timeout` in ms: rounded up, so the server
+/// can't fire before the deadline, at least 1 (0 disables the timeout) and at
+/// most `i32::MAX` (the setting's own ceiling).
+fn timeout_ms(remaining: Duration) -> u128 {
+    remaining
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .clamp(1, i32::MAX as u128)
 }
 
 /// The deadline of the call this task is running, if it is running one.
@@ -228,6 +233,27 @@ mod tests {
         assert!(
             past.set_statement_timeout_sql(false)
                 .contains("between 1 and 1 ")
+        );
+    }
+
+    #[test]
+    fn the_timeout_rounds_up_and_stays_within_what_postgres_accepts() {
+        assert_eq!(timeout_ms(Duration::ZERO), 1, "0 would disable it");
+        assert_eq!(timeout_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(timeout_ms(Duration::from_millis(1500)), 1500);
+        assert_eq!(timeout_ms(Duration::from_nanos(1_500_000_001)), 1501);
+        assert_eq!(
+            timeout_ms(Duration::from_secs(30 * 24 * 3600)),
+            i32::MAX as u128
+        );
+        let month = CallDeadline {
+            at: Instant::now() + Duration::from_secs(30 * 24 * 3600),
+            budget: Duration::from_secs(30 * 24 * 3600),
+        };
+        let sql = month.set_statement_timeout_sql(false);
+        assert!(
+            sql.contains(&format!("between 1 and {} ", i32::MAX)),
+            "{sql}"
         );
     }
 }
