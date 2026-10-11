@@ -79,6 +79,7 @@ use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
 use crate::streaming::build_profile::{self, BuildProfile, MetricsSnapshot};
+use crate::streaming::chain::numeric_columns;
 use crate::streaming::contention::{self, ContentionSummary};
 use crate::streaming::disk_tier::{self, LatencyHistogram, json_ms};
 use crate::streaming::load::GENERATOR_UNDERSHOOT_TOLERANCE;
@@ -93,11 +94,8 @@ const TARGET: &str = "agg_totals";
 /// declares the same types to the definition.
 const SOURCE_COLUMNS_DDL: &str = "id bigint not null, grp integer not null, amt bigint not null";
 
-/// The types the definition is installed against: the source table's own
-/// ([`SOURCE_COLUMNS_DDL`]). They were once all declared `numeric`, which the
-/// table never was, so `agg_totals` recorded `amt` as `numeric` and, since
-/// #980, `ALTER TRANSFORM` refused every edit over a column whose live type
-/// differs from the recorded one (#1022).
+/// The source table's own types ([`SOURCE_COLUMNS_DDL`]), as `Trellis::apply`
+/// would read them off the catalog.
 fn source_columns() -> HashMap<String, trellis::dev::defs::ValueType> {
     use trellis::IntWidth::{Int4, Int8};
     use trellis::dev::defs::ValueType::Integer;
@@ -106,6 +104,27 @@ fn source_columns() -> HashMap<String, trellis::dev::defs::ValueType> {
         ("grp".to_string(), Integer(Int4)),
         ("amt".to_string(), Integer(Int8)),
     ])
+}
+
+/// The types `agg_totals` is installed against.
+///
+/// `--apply-latency` declares the table's own ([`source_columns`]): its
+/// `ALTER TRANSFORM ... ADD amt + 1` validates the merged definition against
+/// the live source columns, and since #980 refuses a field over a column whose
+/// live type differs from the recorded one, so an `amt` recorded as `numeric`
+/// over a `bigint` column failed it and the three statements after it (#1022).
+///
+/// Every other mode keeps declaring all three `numeric`, as it always has, so
+/// its numbers stay comparable with the ones already recorded: the declared
+/// types reach the target's DDL (`grp`, `dbl`, `lo`, `hi` are `numeric` here
+/// and `integer`/`bigint` over the real types) and the ledger's contribution
+/// column, so changing them changes what those modes measure.
+fn declared_columns(apply_latency: bool) -> HashMap<String, trellis::dev::defs::ValueType> {
+    if apply_latency {
+        source_columns()
+    } else {
+        numeric_columns(&["id", "grp", "amt"])
+    }
 }
 const LOAD_BATCH_ROWS: u64 = 1_000_000;
 const COPY_BUFFER_BYTES: usize = 1 << 20;
@@ -1033,7 +1052,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         .collect();
     tokio::time::sleep(cfg.pre_define).await;
 
-    let columns = source_columns();
+    let columns = declared_columns(cfg.apply_latency);
     let source_text = cfg.definition();
     let xmin_stop = Arc::new(AtomicBool::new(false));
     let xmin_task = tokio::spawn(sample_xmin(connect_raw(db.dsn()).await, xmin_stop.clone()));
@@ -1235,6 +1254,17 @@ mod tests {
             })
             .collect();
         assert_eq!(source_columns(), from_ddl);
+    }
+
+    /// Only `--apply-latency` declares the real types; the other modes keep
+    /// the all-`numeric` declaration their recorded numbers were taken with.
+    #[test]
+    fn only_apply_latency_declares_the_tables_types() {
+        assert_eq!(declared_columns(true), source_columns());
+        assert_eq!(
+            declared_columns(false),
+            numeric_columns(&["id", "grp", "amt"])
+        );
     }
 
     #[test]
