@@ -216,6 +216,25 @@ pub enum CatalogError {
         /// The table, schema-qualified.
         ledger_table: String,
     },
+    /// A definition's target schema is a Trellis catalog schema (#979): this
+    /// instance's own (`own`), which target tables stay out of so they can't
+    /// collide with Trellis's tables, or a schema holding another instance's
+    /// `trellis_instance` table. The target, its ledger and its group-delta
+    /// table would live there, so the other instance's uninstall (`drop
+    /// schema ... cascade`) would drop them, and a dump of one instance's
+    /// schema would carry the other's data. Refused by define, and by a
+    /// resume ([`revalidate`]) of a definition whose target schema has since
+    /// become one. The repair is a target in an ordinary schema: `TRANSFORM
+    /// <schema>.<target>` with such a schema.
+    TargetInCatalogSchema {
+        /// The definition's target, `schema.table`.
+        target: String,
+        /// The target's schema.
+        schema: String,
+        /// Whether `schema` is this instance's catalog schema, rather than
+        /// another instance's.
+        own: bool,
+    },
     /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
     /// shares a bare table-name suffix with a *different* qualified target
     /// some other still-persisted definition already uses — e.g.
@@ -482,6 +501,9 @@ impl CatalogError {
             CatalogError::AggregateDeltasShapeChanged { .. } => ErrorCode::Validation,
             CatalogError::AggregateDeltasTableMissing { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
+            // A target the definition may not have, like a row-security
+            // table: the fix is a different schema in the definition.
+            CatalogError::TargetInCatalogSchema { .. } => ErrorCode::Validation,
             // Collides with existing state (another live definition's
             // persisted target), not a structural/semantic rejection of this
             // definition's own text — the same category
@@ -627,6 +649,32 @@ impl fmt::Display for CatalogError {
                  creates one for every definition. Trellis doesn't re-create it: `DROP \
                  TRANSFORM` and define it again"
             ),
+            CatalogError::TargetInCatalogSchema {
+                target,
+                schema,
+                own,
+            } => {
+                if *own {
+                    write!(
+                        f,
+                        "target {target} is in schema \"{schema}\", this instance's catalog \
+                         schema, which holds Trellis's own tables and no target"
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "target {target} is in schema \"{schema}\", which holds another Trellis \
+                         instance's catalog (it has a `trellis_instance` table): that \
+                         instance's uninstall would drop the target, its ledger and its \
+                         group-delta table"
+                    )?;
+                }
+                write!(
+                    f,
+                    ". Put the target in an ordinary schema with `TRANSFORM <schema>.<target>` \
+                     (or `TRELLIS_TARGET_SCHEMA`, for an unqualified one)"
+                )
+            }
             CatalogError::TargetTableSuffixCollision {
                 target,
                 requested,
@@ -774,6 +822,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AggregateDeltasShapeChanged { .. } => None,
             CatalogError::AggregateDeltasTableMissing { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
+            CatalogError::TargetInCatalogSchema { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
@@ -3257,6 +3306,9 @@ async fn create_definition_inner(
     // (and still runs) ahead of the node/cycle checks below.
     let resolved_target_schema = effective_target_schema(&def, target_schema);
     let qualified_target = crate::intake::markers::qualify(resolved_target_schema, &def.target)?;
+    // #979: not in a catalog schema, this instance's or another's. Before
+    // any DDL, so nothing is created there.
+    reject_target_in_catalog_schema(&*txn, pool.schema(), &qualified_target).await?;
     // The test-fixture entry points (`target_ddl` is `None`) register against
     // a target their caller already created; `install_definition` creates it
     // below, after every check on the definition itself (issue #440).
@@ -5426,6 +5478,44 @@ async fn read_tables_of(
     Ok(read_tables)
 }
 
+/// Refuses `target` (`schema.table`) with
+/// [`CatalogError::TargetInCatalogSchema`] when its schema is
+/// `catalog_schema`, this instance's catalog schema, or holds a
+/// `trellis_instance` table, another instance's (#979). The ledger and
+/// group-delta tables live in the target's schema, so this covers them too.
+/// `pg_class`, not `information_schema`, which hides a table the role has no
+/// privilege on, as [`crate::identity`]'s scan does.
+async fn reject_target_in_catalog_schema(
+    client: &impl GenericClient,
+    catalog_schema: &str,
+    target: &str,
+) -> Result<(), CatalogError> {
+    let Some(schema) = schema_of(target) else {
+        return Ok(());
+    };
+    let own = schema == catalog_schema;
+    if !own {
+        let holds_catalog: bool = client
+            .query_one(
+                "select exists (select 1 from pg_catalog.pg_class c \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where n.nspname = $1 and c.relname = 'trellis_instance' \
+                   and c.relkind in ('r', 'p'))",
+                &[&schema],
+            )
+            .await?
+            .get(0);
+        if !holds_catalog {
+            return Ok(());
+        }
+    }
+    Err(CatalogError::TargetInCatalogSchema {
+        target: target.to_string(),
+        schema: schema.to_string(),
+        own,
+    })
+}
+
 /// What [`revalidate`] read from the live schema, for the resume to build
 /// from.
 #[derive(Debug, Clone)]
@@ -5456,6 +5546,7 @@ pub(crate) async fn revalidate(
     definition: &Definition,
 ) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
+    reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
     let source_columns = live_source_columns(txn, source).await?;
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
