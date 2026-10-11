@@ -22,3 +22,6 @@ doctest = false
 trellis = { path = "../../../../trellis" }
 trellis-embed = { path = "../../../embed" }
 rustler = "0.38"
+# The one reply thread (`REPLY_RUNTIME` in src/lib.rs). `trellis` already
+# builds tokio with these features, so this adds no crate.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

@@ -99,15 +99,27 @@ handles that run clients therefore holds up to *2N* runtimes and *2N* pools, and
 the host sizes that sum against the server's `max_connections` and its own
 thread count.
 
-**Every call is dirty/GVL-released**, because each method blocks on a database
-round trip — far past what either host VM tolerates on a scheduler thread.
+**Every call stays off the host's scheduler and GVL while it waits**, because each
+method blocks on a database round trip — far past what either host VM tolerates on a
+scheduler thread.
 
-* **Elixir:** every NIF runs on a dirty IO scheduler, no exceptions for
-  calls that look cheap (`status/2` is still a query). The exceptions are
-  the two in-process reads with no round trip: rendering the metrics
+* **Elixir:** a call on a handle runs on a normal scheduler and never waits on
+  one. The BEAM can't interrupt a NIF on a dirty scheduler, so a killed caller
+  would not exit until its call returned, and calls stuck on the database
+  would hold the node's few dirty IO schedulers. So each NIF submits the call
+  through `BlockingTrellis`'s `start_*` twin and returns a reference at once;
+  the engine sends the result to the calling process as a message, from one
+  thread that waits for every pending call (not one per call), and the
+  wrapper `receive`s it with a backstop a few seconds past the 30-second
+  deadline. A reply to a process that has exited is dropped. The public API
+  stays synchronous. The NIFs that touch no handle (the constant lookups) and
+  the handle's `connect` and `shutdown` run on dirty IO schedulers; the two
+  in-process reads with no round trip (#149) don't: rendering the metrics
   registry runs on a dirty *CPU* scheduler, because its cost grows with the
   registry, and draining the log bridge's bounded queue, which never waits,
-  runs on a normal one.
+  runs on a normal one. Sequencing belongs to the caller's process: the
+  supervised owner process keeps only the handle's lifecycle, so callers
+  don't queue behind each other.
 * **Ruby:** every call releases the GVL and supplies an unblocking function so
   `Thread#kill` and Ctrl-C are not swallowed — which requires an interruptible
   reply wait rather than a bare blocking receive. The calling Ruby thread

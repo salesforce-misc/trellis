@@ -5,25 +5,44 @@
 //! structs live in the Elixir modules under `lib/`. The contract here is
 //! deliberately narrow:
 //!
-//! - **Every NIF runs on a dirty IO scheduler** (ADR-0010 decision 3), the
-//!   constant lookups included, so there is no rule to remember about which
-//!   ones are "cheap". Two exceptions, neither of which touches a handle or
-//!   the database (issue #149):
+//! - **A call on a handle never holds a scheduler while it waits** (issue
+//!   #599). The BEAM can't interrupt a NIF running on a dirty scheduler, so a
+//!   killed caller would not exit until its call returned, and every call
+//!   stuck on the database would hold one of the node's few dirty IO
+//!   schedulers. So each handle NIF runs on a **normal** scheduler and only
+//!   *submits* the call through its `BlockingTrellis::start_*` twin, which
+//!   queues a job and returns at once. It returns `{:ok, call_ref}`, and the
+//!   engine sends `{call_ref, reply}` to the calling process when the call
+//!   ends, from a thread of this crate's ([`reply_runtime`]) that waits for
+//!   every pending call at once, so no thread or scheduler is dedicated to a
+//!   call. `reply` is `{:ok, value}` or `{:error, {code, message}}`, as below.
+//!   `Trellis.Native.call/3` is the `receive` for it, with a backstop of its
+//!   own. A reply to a process that has exited is dropped (`send_and_clear`
+//!   reports the failure, which is ignored). A call refused before it was
+//!   submitted (a handle that has been shut down, a malformed argument) is
+//!   `{:error, {code, message}}` at once, with no message to wait for.
+//! - **The NIFs that touch no handle are dirty IO**, the constant lookups
+//!   included, so there is no rule to remember about which ones are "cheap".
+//!   Plus `connect` and `shutdown`, the handle's lifecycle, which wait on a
+//!   connection and on the runtime's threads. Three exceptions, none of which
+//!   touches the database (issue #149):
 //!   - `render_prometheus` runs on a **dirty CPU** scheduler. It never waits
 //!     on IO, which is why ADR-0010 singles it out, but its cost isn't
 //!     bounded either: it formats every series in the process-wide registry
 //!     and folds in every histogram sample recorded since the last render.
 //!     On a dirty CPU scheduler that can't stall a normal scheduler, and it
-//!     doesn't queue behind dirty IO schedulers held by `await_converged`.
-//!     A scrape every few seconds makes the dirty hop's cost irrelevant.
+//!     doesn't queue behind the dirty IO schedulers.
 //!   - `take_log_records` runs on a **normal** scheduler. It never waits (an
 //!     empty queue is an empty list) and copies at most `max` records, which
-//!     `Trellis.LogBridge` keeps small. It runs every 100 ms; on a dirty IO
-//!     scheduler it would stall, and the queue fill and drop lines, whenever
-//!     every one of them was held by a long `await_converged`.
-//! - **Every NIF returns `{:ok, value}` or `{:error, {code, message}}`**, where
-//!   `code` is [`trellis_embed::PlainError::code`] as a binary. Elixir maps it
-//!   to an atom from a closed set, with a fallback for a code it doesn't know.
+//!     `Trellis.LogBridge` keeps small. It runs every 100 ms.
+//!   - `config` runs on a **normal** scheduler. It reads the configuration
+//!     the handle connected with, from memory.
+//! - **Every result is `{:ok, value}` or `{:error, {code, message}}`**, whether
+//!   a NIF returns it or sends it as a call's reply, where `code` is
+//!   [`trellis_embed::PlainError::code`] as a binary. Elixir maps it to an
+//!   atom from a closed set, with a fallback for a code it doesn't know. A
+//!   call that a shutdown cancelled is a `validation` error, like a call made
+//!   after the shutdown.
 //! - **Only plain data crosses** (decision 4). The flattening itself is
 //!   `trellis-embed`'s; this crate only turns its plain values into terms.
 //!   Words become atoms here (statuses, quarantine states, relationship
@@ -36,14 +55,16 @@
 //! reference (the BEAM garbage-collecting it) drops the [`BlockingTrellis`],
 //! which closes its job channel and lets its runtime thread wind down without
 //! blocking the scheduler that ran the destructor. That is only the backstop:
-//! `shutdown/1` is the clean, joined stop.
+//! `shutdown/1` is the clean, joined stop, and it cancels the calls still in
+//! flight rather than waiting for them.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
-use rustler::{Atom, Env, NifMap, ResourceArc, Term};
-use trellis::{BlockingTrellis, Config, ErrorCode, TrellisOptions};
+use rustler::env::OwnedEnv;
+use rustler::{Atom, Encoder, Env, NifMap, ResourceArc, Term};
+use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus,
@@ -83,17 +104,17 @@ struct ConnectOptions {
 
 /// One connected Trellis instance, owned by the BEAM as a resource.
 ///
-/// The lock is read for every call and written only by `shutdown`, which
-/// takes the [`BlockingTrellis`] out, so a call after shutdown gets an error,
-/// not a hang. Calls from several BEAM processes don't wait on each other for
-/// the lock, but the [`BlockingTrellis`] runs them one at a time on its own
-/// thread, so each waiting call holds a dirty IO scheduler until its turn.
-/// `shutdown` waits for calls already in flight before it takes the instance.
+/// The lock is read for as long as it takes to submit a call, and written by
+/// `shutdown`, which takes the [`BlockingTrellis`] out, so a call after
+/// shutdown gets an error, not a hang. It is never held while a call runs, so
+/// calls from several BEAM processes don't wait on each other for it, and
+/// `shutdown` doesn't wait for calls in flight: the [`BlockingTrellis`] runs
+/// them in parallel on its own runtime and cancels them when it shuts down.
 struct Handle {
     trellis: RwLock<Option<BlockingTrellis>>,
     /// The OS process that connected. The BEAM never forks, so this can't
     /// trip today; it is ADR-0010 decision 3's pid guard, carried here as it
-    /// will be in the Ruby binding, where a handle inherited across `fork`
+    /// is in the Ruby binding, where a handle inherited across `fork`
     /// has no threads left to answer it and would otherwise hang.
     owner_pid: u32,
 }
@@ -101,21 +122,61 @@ struct Handle {
 #[rustler::resource_impl]
 impl rustler::Resource for Handle {}
 
+/// The thread that waits for every pending call and sends its reply: one for
+/// the whole VM, because a call waiting for the engine is a task on it, not a
+/// thread (issue #599). A reply is encoded and sent here, which is a copy of
+/// a result that is plain data, so one thread keeps up.
+static REPLY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn reply_runtime() -> &'static tokio::runtime::Runtime {
+    REPLY_RUNTIME
+        .get()
+        .expect("`load` starts the reply runtime before any NIF can run")
+}
+
 impl Handle {
-    /// Runs `call` against the live instance, or reports why there isn't one.
-    fn with<T>(
+    /// Submits the call `start` makes against the live instance and returns
+    /// at once with `{:ok, call_ref}`, or reports why there isn't an instance
+    /// to submit to. When the call ends, `encode` turns its value into the
+    /// term the caller gets, and `{call_ref, {:ok, term} | {:error, {code,
+    /// message}}}` is sent to the calling process (see the module docs).
+    fn submit<'a, R, T>(
         &self,
-        call: impl FnOnce(&BlockingTrellis) -> Result<T, trellis::TrellisError>,
-    ) -> NifReply<T> {
+        env: Env<'a>,
+        start: impl FnOnce(&BlockingTrellis) -> PendingCall<R>,
+        encode: impl for<'e> FnOnce(Env<'e>, R) -> NifReply<T> + Send + 'static,
+    ) -> NifReply<Term<'a>>
+    where
+        R: Send + 'static,
+        T: Encoder,
+    {
+        self.check_pid()?;
+        let pending = {
+            let guard = self.trellis.read().map_err(|_| poisoned())?;
+            start(guard.as_ref().ok_or_else(shut_down)?)
+        };
+
+        let caller = env.pid();
+        let call_ref = env.make_ref();
+        let mut reply_env = OwnedEnv::new();
+        let saved_ref = reply_env.save(call_ref);
+        reply_runtime().spawn(async move {
+            let result = pending.await;
+            // A caller that has exited can't be sent to: its reply is dropped.
+            let _ = reply_env.send_and_clear(&caller, |env| {
+                let reply: NifReply<T> = result.map_err(plain).and_then(|value| encode(env, value));
+                (saved_ref.load(env), reply)
+            });
+        });
+        Ok(call_ref.encode(env))
+    }
+
+    /// Runs `read` against the live instance without waiting on anything, or
+    /// reports why there isn't one.
+    fn with<T>(&self, read: impl FnOnce(&BlockingTrellis) -> T) -> NifReply<T> {
         self.check_pid()?;
         let guard = self.trellis.read().map_err(|_| poisoned())?;
-        let trellis = guard.as_ref().ok_or_else(|| {
-            error(
-                ErrorCode::Validation,
-                "this Trellis handle has been shut down",
-            )
-        })?;
-        call(trellis).map_err(plain)
+        Ok(read(guard.as_ref().ok_or_else(shut_down)?))
     }
 
     fn check_pid(&self) -> NifReply<()> {
@@ -132,6 +193,13 @@ impl Handle {
             ),
         ))
     }
+}
+
+fn shut_down() -> (&'static str, String) {
+    error(
+        ErrorCode::Validation,
+        "this Trellis handle has been shut down",
+    )
 }
 
 fn poisoned() -> (&'static str, String) {
@@ -615,10 +683,12 @@ fn connect(options: ConnectOptions) -> NifReply<ResourceArc<Handle>> {
     }))
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
-fn migrate(handle: ResourceArc<Handle>) -> NifReply<Atom> {
-    handle.with(BlockingTrellis::migrate)?;
-    Ok(rustler::types::atom::ok())
+/// Applies Trellis's own migrations. Replies `:ok`.
+#[rustler::nif]
+fn migrate<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(env, BlockingTrellis::start_migrate, |_, ()| {
+        Ok(rustler::types::atom::ok())
+    })
 }
 
 /// Registers the `TRANSFORM` statement `text`.
@@ -628,232 +698,292 @@ fn migrate(handle: ResourceArc<Handle>) -> NifReply<Atom> {
 /// ...) is a `validation` error and is never applied, and text that doesn't
 /// parse is the `parse` error `apply` would return. Every form, this one
 /// included, goes through `apply/2`.
-#[rustler::nif(schedule = "DirtyIo")]
-fn define(env: Env, handle: ResourceArc<Handle>, text: String) -> NifReply<DefinitionTerm> {
+#[rustler::nif]
+fn define<'a>(env: Env<'a>, handle: ResourceArc<Handle>, text: String) -> NifReply<Term<'a>> {
     require_transform_statement(&text).map_err(plain)?;
-    let applied = handle.with(|trellis| trellis.apply(&text))?;
-    // Unreachable: the check above is `apply`'s own parser. Kept as defence,
-    // so a mistake there is an error rather than a panic.
-    let definition = applied.into_transform().ok_or_else(|| {
-        error(
-            ErrorCode::Internal,
-            "define/2 applied a statement that registered no transform",
-        )
-    })?;
-    DefinitionTerm::new(env, PlainDefinition::from(&definition))
+    handle.submit(
+        env,
+        |trellis| trellis.start_apply(&text),
+        |env, applied| {
+            // Unreachable: the check above is `apply`'s own parser. Kept as
+            // defence, so a mistake there is an error rather than a panic.
+            let definition = applied.into_transform().ok_or_else(|| {
+                error(
+                    ErrorCode::Internal,
+                    "define/2 applied a statement that registered no transform",
+                )
+            })?;
+            DefinitionTerm::new(env, PlainDefinition::from(&definition))
+        },
+    )
 }
 
 /// Runs one statement of Trellis's grammar, whatever its form, and reports
 /// what it did.
-#[rustler::nif(schedule = "DirtyIo")]
-fn apply(env: Env, handle: ResourceArc<Handle>, text: String) -> NifReply<AppliedTerm> {
-    let applied = handle.with(|trellis| trellis.apply(&text))?;
-    AppliedTerm::new(env, PlainApplied::from(&applied))
+#[rustler::nif]
+fn apply<'a>(env: Env<'a>, handle: ResourceArc<Handle>, text: String) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        |trellis| trellis.start_apply(&text),
+        |env, applied| AppliedTerm::new(env, PlainApplied::from(&applied)),
+    )
 }
 
 /// Every registered transform definition, oldest first.
-#[rustler::nif(schedule = "DirtyIo")]
-fn definitions(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<DefinitionSummaryTerm>> {
-    handle
-        .with(BlockingTrellis::definitions)?
-        .iter()
-        .map(|summary| {
-            let summary = PlainDefinitionSummary::from(summary);
-            Ok(DefinitionSummaryTerm {
-                id: summary.id,
-                target_table: summary.target_table,
-                source_table: summary.source_table,
-                source_version: summary.source_version,
-                status: word_atom(env, summary.status)?,
-                created_at_micros: summary.created_at_micros,
-                backfill_failure: summary.backfill_failure.map(BackfillFailureTerm::from),
-                halt: summary
-                    .halt
-                    .map(|halt| CaptureFailureTerm::new(env, halt))
-                    .transpose()?,
+#[rustler::nif]
+fn definitions<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(env, BlockingTrellis::start_definitions, |env, summaries| {
+        summaries
+            .iter()
+            .map(|summary| {
+                let summary = PlainDefinitionSummary::from(summary);
+                Ok(DefinitionSummaryTerm {
+                    id: summary.id,
+                    target_table: summary.target_table,
+                    source_table: summary.source_table,
+                    source_version: summary.source_version,
+                    status: word_atom(env, summary.status)?,
+                    created_at_micros: summary.created_at_micros,
+                    backfill_failure: summary.backfill_failure.map(BackfillFailureTerm::from),
+                    halt: summary
+                        .halt
+                        .map(|halt| CaptureFailureTerm::new(env, halt))
+                        .transpose()?,
+                })
             })
-        })
-        .collect()
+            .collect::<NifReply<Vec<_>>>()
+    })
 }
 
 /// Every registered relationship, oldest first.
-#[rustler::nif(schedule = "DirtyIo")]
-fn relationships(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<RelationshipSummaryTerm>> {
-    handle
-        .with(BlockingTrellis::relationships)?
-        .iter()
-        .map(|summary| {
-            let summary = PlainRelationshipSummary::try_from(summary).map_err(plain)?;
-            Ok(RelationshipSummaryTerm {
-                id: summary.id,
-                name: summary.name,
-                from_schema: summary.from_schema,
-                from_table: summary.from_table,
-                from_col: summary.from_col,
-                to_schema: summary.to_schema,
-                to_table: summary.to_table,
-                to_col: summary.to_col,
-                cardinality: word_atom(env, summary.cardinality)?,
-                created_at_micros: summary.created_at_micros,
-            })
-        })
-        .collect()
+#[rustler::nif]
+fn relationships<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        BlockingTrellis::start_relationships,
+        |env, summaries| {
+            summaries
+                .iter()
+                .map(|summary| {
+                    let summary = PlainRelationshipSummary::try_from(summary).map_err(plain)?;
+                    Ok(RelationshipSummaryTerm {
+                        id: summary.id,
+                        name: summary.name,
+                        from_schema: summary.from_schema,
+                        from_table: summary.from_table,
+                        from_col: summary.from_col,
+                        to_schema: summary.to_schema,
+                        to_table: summary.to_table,
+                        to_col: summary.to_col,
+                        cardinality: word_atom(env, summary.cardinality)?,
+                        created_at_micros: summary.created_at_micros,
+                    })
+                })
+                .collect::<NifReply<Vec<_>>>()
+        },
+    )
 }
 
 /// Re-reads `source_table` for its applying readers: a rebuild, or a go-live
 /// catch-up for the staging worker.
-#[rustler::nif(schedule = "DirtyIo")]
-fn request_backfill(handle: ResourceArc<Handle>, source_table: String) -> NifReply<Atom> {
-    handle.with(|trellis| trellis.request_backfill(&source_table))?;
-    Ok(rustler::types::atom::ok())
+#[rustler::nif]
+fn request_backfill<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<Handle>,
+    source_table: String,
+) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        |trellis| trellis.start_request_backfill(&source_table),
+        |_, ()| Ok(rustler::types::atom::ok()),
+    )
 }
 
 /// Every key poisoned after `watermark_micros` (epoch microseconds), oldest
 /// first.
-#[rustler::nif(schedule = "DirtyIo")]
-fn poisoned_since(
+#[rustler::nif]
+fn poisoned_since<'a>(
+    env: Env<'a>,
     handle: ResourceArc<Handle>,
     watermark_micros: i64,
-) -> NifReply<Vec<PoisonEntryTerm>> {
+) -> NifReply<Term<'a>> {
     let watermark = system_time_from_epoch_micros(watermark_micros).map_err(plain)?;
-    Ok(handle
-        .with(|trellis| trellis.poisoned_since(watermark))?
-        .iter()
-        .map(|entry| {
-            let entry = PlainPoisonEntry::from(entry);
-            PoisonEntryTerm {
-                transform: entry.transform,
-                src_table: entry.src_table,
-                key: entry.key,
-                last_error: entry.last_error,
-                poisoned_at_micros: entry.poisoned_at_micros,
-            }
-        })
-        .collect())
+    handle.submit(
+        env,
+        |trellis| trellis.start_poisoned_since(watermark),
+        |_, entries| {
+            Ok(entries
+                .iter()
+                .map(|entry| {
+                    let entry = PlainPoisonEntry::from(entry);
+                    PoisonEntryTerm {
+                        transform: entry.transform,
+                        src_table: entry.src_table,
+                        key: entry.key,
+                        last_error: entry.last_error,
+                        poisoned_at_micros: entry.poisoned_at_micros,
+                    }
+                })
+                .collect::<Vec<_>>())
+        },
+    )
 }
 
 /// Every quarantined transform and paused column.
-#[rustler::nif(schedule = "DirtyIo")]
-fn quarantined(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<QuarantineEntryTerm>> {
-    handle
-        .with(BlockingTrellis::quarantined)?
-        .iter()
-        .map(|entry| QuarantineEntryTerm::new(env, PlainQuarantineEntry::from(entry)))
-        .collect()
+#[rustler::nif]
+fn quarantined<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(env, BlockingTrellis::start_quarantined, |env, entries| {
+        entries
+            .iter()
+            .map(|entry| QuarantineEntryTerm::new(env, PlainQuarantineEntry::from(entry)))
+            .collect::<NifReply<Vec<_>>>()
+    })
 }
 
 /// One target's state, by its `transform` or `transform.column` address.
-#[rustler::nif(schedule = "DirtyIo")]
-fn quarantine_status(
-    env: Env,
+#[rustler::nif]
+fn quarantine_status<'a>(
+    env: Env<'a>,
     handle: ResourceArc<Handle>,
     target: String,
-) -> NifReply<QuarantineEntryTerm> {
-    let entry = handle.with(|trellis| trellis.quarantine_status(&target))?;
-    QuarantineEntryTerm::new(env, PlainQuarantineEntry::from(&entry))
+) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        |trellis| trellis.start_quarantine_status(&target),
+        |env, entry| QuarantineEntryTerm::new(env, PlainQuarantineEntry::from(&entry)),
+    )
 }
 
 /// Up to `limit` of `target`'s quarantined rows, after the opaque `cursor`
 /// (`nil` for the first page).
-#[rustler::nif(schedule = "DirtyIo")]
-fn sample_quarantined(
+#[rustler::nif]
+fn sample_quarantined<'a>(
+    env: Env<'a>,
     handle: ResourceArc<Handle>,
     target: String,
     cursor: Option<String>,
     limit: i64,
-) -> NifReply<SamplePageTerm> {
+) -> NifReply<Term<'a>> {
     let after = decode_cursor(cursor.as_deref()).map_err(plain)?;
-    let samples = handle.with(|trellis| trellis.sample_quarantined(&target, after, limit))?;
-    let page = PlainSamplePage::new(&samples, cursor.as_deref());
-    Ok(SamplePageTerm {
-        samples: page
-            .samples
-            .into_iter()
-            .map(|sample| PoisonSampleTerm {
-                src_table: sample.src_table,
-                key: sample.key,
-                error_message: sample.error_message,
+    handle.submit(
+        env,
+        |trellis| trellis.start_sample_quarantined(&target, after, limit),
+        move |_, samples| {
+            let page = PlainSamplePage::new(&samples, cursor.as_deref());
+            Ok(SamplePageTerm {
+                samples: page
+                    .samples
+                    .into_iter()
+                    .map(|sample| PoisonSampleTerm {
+                        src_table: sample.src_table,
+                        key: sample.key,
+                        error_message: sample.error_message,
+                    })
+                    .collect(),
+                next_cursor: page.next_cursor,
             })
-            .collect(),
-        next_cursor: page.next_cursor,
-    })
+        },
+    )
 }
 
 /// Releases one key `transform` holds in quarantine: `source_table` (either
 /// spelling) and `key` as `sample_quarantined/3` reports them.
-#[rustler::nif(schedule = "DirtyIo")]
-fn release_key(
+#[rustler::nif]
+fn release_key<'a>(
+    env: Env<'a>,
     handle: ResourceArc<Handle>,
     transform: String,
     source_table: String,
     key: String,
-) -> NifReply<Atom> {
-    handle.with(|trellis| trellis.release_key(&transform, &source_table, &key))?;
-    Ok(rustler::types::atom::ok())
+) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        |trellis| trellis.start_release_key(&transform, &source_table, &key),
+        |_, ()| Ok(rustler::types::atom::ok()),
+    )
 }
 
 /// Whether any drain worker in the fleet is alive.
-#[rustler::nif(schedule = "DirtyIo")]
-fn has_live_drain_workers(handle: ResourceArc<Handle>) -> NifReply<bool> {
-    handle.with(BlockingTrellis::has_live_drain_workers)
+#[rustler::nif]
+fn has_live_drain_workers<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        BlockingTrellis::start_has_live_drain_workers,
+        |_, live| Ok(live),
+    )
 }
 
 /// Whether this instance's staging worker is alive anywhere in the fleet.
-#[rustler::nif(schedule = "DirtyIo")]
-fn has_live_staging_worker(handle: ResourceArc<Handle>) -> NifReply<bool> {
-    handle.with(BlockingTrellis::has_live_staging_worker)
+#[rustler::nif]
+fn has_live_staging_worker<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        BlockingTrellis::start_has_live_staging_worker,
+        |_, live| Ok(live),
+    )
 }
 
 /// A read-your-writes token, as an opaque string.
-#[rustler::nif(schedule = "DirtyIo")]
-fn watermark_token(handle: ResourceArc<Handle>) -> NifReply<String> {
-    handle
-        .with(BlockingTrellis::watermark_token)
-        .map(encode_watermark)
+#[rustler::nif]
+fn watermark_token<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(env, BlockingTrellis::start_watermark_token, |_, token| {
+        Ok(encode_watermark(token))
+    })
 }
 
 /// Waits up to `timeout_ms` for every change committed at or before `token`
-/// to reach its targets.
+/// to reach its targets. The engine caps the wait at the call's 30-second
+/// deadline, so a longer one is cut short with a `timeout` error.
 ///
-/// Holds a dirty IO scheduler for as long as it waits, and the handle runs
-/// one call at a time, so every other call on it queues behind this one.
-#[rustler::nif(schedule = "DirtyIo")]
-fn await_converged(handle: ResourceArc<Handle>, token: String, timeout_ms: u64) -> NifReply<Atom> {
+/// The wait is the engine's, not a scheduler's: the call replies when it ends,
+/// and every other call on the handle runs beside it.
+#[rustler::nif]
+fn await_converged<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<Handle>,
+    token: String,
+    timeout_ms: u64,
+) -> NifReply<Term<'a>> {
     let token = decode_watermark(&token).map_err(plain)?;
-    handle.with(|trellis| trellis.await_converged(token, Duration::from_millis(timeout_ms)))?;
-    Ok(rustler::types::atom::ok())
+    handle.submit(
+        env,
+        |trellis| trellis.start_await_converged(token, Duration::from_millis(timeout_ms)),
+        |_, ()| Ok(rustler::types::atom::ok()),
+    )
 }
 
 /// Starts a background check of `target_table` against a fresh recompute
 /// from the source, in `mode` (`"standard"` or `"strict"`), waiting up to
 /// `timeout_ms` per convergence await its pages make, and returns the job at
 /// once. A target whose job is still running gets that job back.
-#[rustler::nif(schedule = "DirtyIo")]
-fn self_check(
-    env: Env,
+#[rustler::nif]
+fn self_check<'a>(
+    env: Env<'a>,
     handle: ResourceArc<Handle>,
     target_table: String,
     mode: String,
     timeout_ms: u64,
-) -> NifReply<SelfCheckJobTerm> {
+) -> NifReply<Term<'a>> {
     let mode = self_check_mode(&mode).map_err(plain)?;
-    let job = handle.with(|trellis| {
-        trellis.self_check(&target_table, mode, Duration::from_millis(timeout_ms))
-    })?;
-    SelfCheckJobTerm::new(env, PlainSelfCheckJob::from(&job))
+    handle.submit(
+        env,
+        |trellis| trellis.start_self_check(&target_table, mode, Duration::from_millis(timeout_ms)),
+        |env, job| SelfCheckJobTerm::new(env, PlainSelfCheckJob::from(&job)),
+    )
 }
 
 /// The `self_check/3` job `id`, or `nil` when there is none: a newer
 /// `self_check` of its target replaced it, or its transform was dropped.
-#[rustler::nif(schedule = "DirtyIo")]
-fn self_check_job(
-    env: Env,
-    handle: ResourceArc<Handle>,
-    id: i64,
-) -> NifReply<Option<SelfCheckJobTerm>> {
-    let job = handle.with(|trellis| trellis.self_check_job(id))?;
-    job.map(|job| SelfCheckJobTerm::new(env, PlainSelfCheckJob::from(&job)))
-        .transpose()
+#[rustler::nif]
+fn self_check_job<'a>(env: Env<'a>, handle: ResourceArc<Handle>, id: i64) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        |trellis| trellis.start_self_check_job(id),
+        |env, job| {
+            job.map(|job| SelfCheckJobTerm::new(env, PlainSelfCheckJob::from(&job)))
+                .transpose()
+        },
+    )
 }
 
 /// The configuration a handle connected with, as `config/1` returns it.
@@ -865,10 +995,11 @@ struct ConfigTerm {
     pool_wait_timeout_ms: u64,
 }
 
-/// The configuration the handle connected with.
-#[rustler::nif(schedule = "DirtyIo")]
+/// The configuration the handle connected with. Read from memory, so it
+/// returns the term itself, on a normal scheduler.
+#[rustler::nif]
 fn config(handle: ResourceArc<Handle>) -> NifReply<ConfigTerm> {
-    let config = handle.with(|trellis| Ok(PlainConfig::from(trellis.config())))?;
+    let config = handle.with(|trellis| PlainConfig::from(trellis.config()))?;
     Ok(ConfigTerm {
         schema: config.schema,
         target_schema: config.target_schema,
@@ -878,36 +1009,48 @@ fn config(handle: ResourceArc<Handle>) -> NifReply<ConfigTerm> {
 }
 
 /// `target_table`'s status, or `nil` when no definition writes it.
-#[rustler::nif(schedule = "DirtyIo")]
-fn status(
-    env: Env,
+#[rustler::nif]
+fn status<'a>(
+    env: Env<'a>,
     handle: ResourceArc<Handle>,
     target_table: String,
-) -> NifReply<Option<StatusTerm>> {
-    let Some(status) = handle.with(|trellis| trellis.status(&target_table))? else {
-        return Ok(None);
-    };
-    let status = PlainDefinitionStatus::from(&status);
-    Ok(Some(StatusTerm {
-        status: word_atom(env, status.status)?,
-        backfill_failure: status.backfill_failure.map(BackfillFailureTerm::from),
-        capture_wait: status.capture_wait.map(CaptureWaitTerm::from),
-        capture_failure: status
-            .capture_failure
-            .map(|failure| CaptureFailureTerm::new(env, failure))
-            .transpose()?,
-        held_keys: status.held_keys.map(HeldKeysTerm::from),
-        drain_failure: status.drain_failure.map(DrainFailureTerm::from),
-        unindexed_joins: status
-            .unindexed_joins
-            .into_iter()
-            .map(UnindexedJoinTerm::from)
-            .collect(),
-    }))
+) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        |trellis| trellis.start_status(&target_table),
+        |env, status| {
+            let Some(status) = status else {
+                return Ok(None);
+            };
+            let status = PlainDefinitionStatus::from(&status);
+            Ok(Some(StatusTerm {
+                status: word_atom(env, status.status)?,
+                backfill_failure: status.backfill_failure.map(BackfillFailureTerm::from),
+                capture_wait: status.capture_wait.map(CaptureWaitTerm::from),
+                capture_failure: status
+                    .capture_failure
+                    .map(|failure| CaptureFailureTerm::new(env, failure))
+                    .transpose()?,
+                held_keys: status.held_keys.map(HeldKeysTerm::from),
+                drain_failure: status.drain_failure.map(DrainFailureTerm::from),
+                unindexed_joins: status
+                    .unindexed_joins
+                    .into_iter()
+                    .map(UnindexedJoinTerm::from)
+                    .collect(),
+            }))
+        },
+    )
 }
 
 /// Stops the instance's background work and joins its runtime thread.
 /// Idempotent: shutting down a handle that is already shut down is `:ok`.
+///
+/// Calls still in flight are cancelled, not waited for (see
+/// `BlockingTrellis::shutdown`): each of their callers gets a `validation`
+/// error. So a call stuck on a lock doesn't hold this up, and it holds the
+/// dirty IO scheduler it runs on only for the runtime's teardown. The lock
+/// is taken only for as long as a call takes to submit.
 #[rustler::nif(schedule = "DirtyIo")]
 fn shutdown(handle: ResourceArc<Handle>) -> NifReply<Atom> {
     handle.check_pid()?;
@@ -1036,8 +1179,21 @@ fn take_log_records(env: Env, max: usize) -> NifReply<(Vec<LogRecordTerm>, u64)>
 
 /// Allocates every atom this NIF encodes up front, from the closed sets
 /// `trellis-embed` lists, so encoding a result never creates an atom.
+///
+/// Also starts [`REPLY_RUNTIME`], so a NIF never has to build it (and so a
+/// VM that can't start the thread fails to load the library, not a call).
 fn load(env: Env, _info: Term) -> bool {
-    atom_words().all(|word| Atom::from_str(env, word).is_ok())
+    if !atom_words().all(|word| Atom::from_str(env, word).is_ok()) {
+        return false;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("trellis-nif-reply")
+        .build();
+    match runtime {
+        Ok(runtime) => REPLY_RUNTIME.set(runtime).is_ok() || REPLY_RUNTIME.get().is_some(),
+        Err(_) => false,
+    }
 }
 
 rustler::init!("Elixir.Trellis.Native", load = load);

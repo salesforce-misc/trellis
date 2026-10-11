@@ -38,10 +38,12 @@ defmodule Trellis do
       {:ok, %Trellis.Status{status: :live}} = Trellis.status(trellis, "widget_prices")
       :ok = Trellis.shutdown(trellis)
 
-  Every function here blocks the calling process on a database round trip,
-  on a dirty IO scheduler, so no normal scheduler is held up. (Called through
-  a supervised Trellis's name, only its owning process runs on one, and the
-  caller waits for its reply.) Non-bang functions
+  Every function here blocks the calling process until the engine answers,
+  and holds no scheduler while it waits: the call is submitted and the
+  process waits in a `receive`, so a stuck call costs the process nothing but
+  its own wait, and killing the process ends the wait at once. Every call
+  returns within 30 seconds (a `:timeout` error if the database is too slow);
+  see "Calls" below. Non-bang functions
   return `{:ok, value}` (or `:ok`) and `{:error, %Trellis.Error{}}`; the bang
   variants return the value or raise the `Trellis.Error`.
 
@@ -100,6 +102,25 @@ defmodule Trellis do
   and `:schema`:
 
       {Trellis, name: MyApp.Billing, url: url, schema: "billing"}
+
+  ## Calls
+
+  A call returns within 30 seconds, counted from when it is submitted: if the
+  database can't answer in time (a lock held by another session, say), the
+  server stops what the call started, it rolls back, and it returns
+  `{:error, %Trellis.Error{code: :timeout}}`. Heavy work isn't done inside a
+  call: `define/2` and `apply/2` register and return, and a caller that
+  needs the result polls `status/2`.
+
+  Calls run in parallel, on one handle and across processes: a call stuck on
+  a lock doesn't delay another process's `status/2`. A process's own calls
+  stay in order, because it waits for each reply. Calls from different
+  processes have no order. A process killed during a call leaves the call
+  running until it ends or reaches its deadline, and its reply is dropped.
+
+  `shutdown/1` doesn't wait for calls in flight: it cancels them, and each
+  of their callers gets a `:validation` error, as a call made after the
+  shutdown does.
 
   `Trellis.Metrics.render_prometheus/0` covers every handle in the VM at once,
   each instance's series labeled `trellis_instance`.
@@ -225,17 +246,16 @@ defmodule Trellis do
   process for the same instance fails that way (`:conflict`) while the first
   is alive: in a rolling deploy, stop the old one before the new one starts.
 
-  Every call made through the process's name runs in the process, one at a
-  time, as it would on the handle, which runs one call at a time anyway.
-  Only the owning process waits on a dirty IO scheduler, and the callers
-  wait in its mailbox. A caller's call has no timeout of its own, so a
-  call made behind a long `await_converged/3` waits for it.
+  The process only keeps the handle's lifecycle. A call made through its
+  name asks it for the handle and then runs in the caller's own process, so
+  callers don't wait on each other.
 
-  `shutdown/1` refuses the process's name: its supervisor stops it. The
-  child spec gives it 30 seconds to shut down, since `shutdown/1` waits for
-  the background threads to exit and an in-flight call finishes first;
-  change it with `Supervisor.child_spec/2`. A process killed before it shuts
-  down leaves the handle to be shut down when it is garbage collected.
+  `shutdown/1` refuses the process's name: its supervisor stops it, which
+  cancels the calls still in flight (their callers get a `:validation`
+  error). The child spec gives it 30 seconds to shut down, since the
+  background threads have to exit; change it with `Supervisor.child_spec/2`.
+  A process killed before it shuts down leaves the handle to be shut down
+  when it is garbage collected.
   """
   @spec start_link([start_option()]) :: GenServer.on_start()
   def start_link(options) when is_list(options), do: Trellis.Owner.start_link(options)
@@ -272,7 +292,8 @@ defmodule Trellis do
   @doc "The configuration `trellis` connected with. See `Trellis.Config`."
   @spec config(trellis()) :: {:ok, Config.t()} | {:error, Error.t()}
   def config(trellis) when is_trellis(trellis) do
-    with {:ok, config} <- native(run(trellis, :config, [])) do
+    # Read from memory by a NIF that returns the term itself.
+    with {:ok, config} <- native(Native.config(handle_ref(trellis))) do
       {:ok, Config.from_native(config)}
     end
   end
@@ -551,9 +572,9 @@ defmodule Trellis do
   It waits for captured changes only: a transform that isn't `:live` yet
   may still be missing rows when this returns (see `status/2`).
 
-  The handle runs one call at a time, so every other call on it, from any
-  process, waits behind this one for up to `timeout_ms`. Size it
-  accordingly.
+  A call returns within 30 seconds, so a longer `timeout_ms` is cut short
+  with a `:timeout` error: to wait longer, call again. The wait holds no
+  scheduler, and other calls on the handle run beside it.
   """
   @spec await_converged(trellis(), watermark(), non_neg_integer()) :: :ok | {:error, Error.t()}
   def await_converged(trellis, token, timeout_ms)
@@ -654,8 +675,9 @@ defmodule Trellis do
   def self_check_job!(trellis, id), do: bang(self_check_job(trellis, id))
 
   @doc """
-  Stops the handle's background work and waits for its threads to exit. Any
-  later call on the handle returns a `:validation` error; shutting down again
+  Stops the handle's background work and waits for its threads to exit. Calls
+  still in flight are cancelled, not waited for: their callers get a
+  `:validation` error, like any later call on the handle. Shutting down again
   is `:ok`.
   """
   @spec shutdown(trellis()) :: :ok | {:error, Error.t()}
@@ -773,11 +795,12 @@ defmodule Trellis do
   defp invalid(message), do: {:error, Error.validation(message)}
 
   # A native call on a handle, or on the handle a supervised Trellis owns,
-  # run in its owning process (`Trellis.Owner`).
-  defp run(%__MODULE__{ref: ref}, function, args),
-    do: Kernel.apply(Native, function, [ref | args])
+  # run in the calling process: it submits the call and waits for the reply
+  # (`Native.call/3`).
+  defp run(trellis, function, args), do: Native.call(handle_ref(trellis), function, args)
 
-  defp run(server, function, args), do: Trellis.Owner.call(server, function, args)
+  defp handle_ref(%__MODULE__{ref: ref}), do: ref
+  defp handle_ref(server), do: Trellis.Owner.handle_ref(server)
 
   defp list(reply, from_native) do
     with {:ok, items} <- native(reply) do

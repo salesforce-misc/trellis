@@ -1,8 +1,8 @@
 defmodule Trellis.SupervisedTest do
   # `{Trellis, options}` in a supervision tree: the process that owns a
-  # handle, runs the calls made through its name, and shuts the handle down
-  # when its supervisor stops it. The parity suite runs its whole script
-  # through one too (`parity_test.exs`).
+  # handle, hands it to the callers that make their calls through its name,
+  # and shuts the handle down when its supervisor stops it. The parity suite
+  # runs its whole script through one too (`parity_test.exs`).
   #
   # Shares the suite's one database, so it doesn't run concurrently with the
   # other integration tests.
@@ -46,7 +46,7 @@ defmodule Trellis.SupervisedTest do
     assert nil == Trellis.status!(pid, "no_transform_writes_this")
     assert {:ok, %Config{schema: "trellis"}} = Trellis.config(@name)
 
-    # Callers wait in the owner's mailbox rather than each holding the handle.
+    # Each caller runs its own call, in parallel.
     results =
       1..20
       |> Enum.map(fn _ -> Task.async(fn -> Trellis.status(@name, "nor_this") end) end)

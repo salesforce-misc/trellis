@@ -1,10 +1,17 @@
 defmodule Trellis.Native do
   @moduledoc false
-  # The NIF boundary (native/trellis_nif). Every function here returns
-  # `{:ok, value}` or `{:error, {code, message}}` with `code` a binary;
-  # `Trellis` turns the error into a `Trellis.Error`. Every one that can wait
-  # runs on a dirty IO scheduler; the NIF crate's module docs list the two
-  # that don't, and why.
+  # The NIF boundary (native/trellis_nif). Every result is `{:ok, value}` or
+  # `{:error, {code, message}}` with `code` a binary; `Trellis` turns the
+  # error into a `Trellis.Error`.
+  #
+  # A call on a handle doesn't run on a dirty scheduler: the NIF submits it
+  # on a normal one and returns `{:ok, call_ref}` at once, and the engine
+  # sends `{call_ref, result}` to the calling process when the call ends
+  # (the NIF crate's module docs have the rest). `call/3` is the `receive`
+  # for that message. Nothing then holds a scheduler while the database
+  # answers, and a killed caller exits at once instead of when its NIF
+  # returns. The NIFs that touch no handle, and `connect` and `shutdown`,
+  # run on dirty IO schedulers; the NIF crate's module docs list the rest.
   #
   # A host gets the NIF precompiled: rustler_precompiled downloads the build
   # for its target from the `elixir-v<version>` GitHub release, which
@@ -46,6 +53,42 @@ defmodule Trellis.Native do
         # this workspace member into the repository's `target/`).
         mode: if(Mix.env() == :prod, do: :release, else: :debug)
       ] ++ force_build
+
+  # How long `call/3` waits for a reply: the engine's 30-second call deadline,
+  # its one-second client-side backstop after that, and a margin for the reply
+  # to be encoded and delivered. The engine always replies by then, so this
+  # only ends the wait for a reply that was lost (a bug), with the same
+  # `timeout` error a call that ran out of its deadline gets.
+  @reply_backstop_ms 35_000
+
+  @doc """
+  Runs `function` on `handle` (a handle's `ref`) with `args` and waits for its
+  result, in the calling process.
+  """
+  @spec call(reference(), atom(), [term()]) :: {:ok, term()} | {:error, {String.t(), String.t()}}
+  def call(handle, function, args) do
+    case Kernel.apply(__MODULE__, function, [handle | args]) do
+      {:ok, call_ref} when is_reference(call_ref) -> await(call_ref, @reply_backstop_ms)
+      # Refused before it was submitted: a shut-down handle, a bad argument.
+      {:error, _} = refused -> refused
+    end
+  end
+
+  @doc false
+  # The wait for call `call_ref`'s reply, public so a test can drive the
+  # backstop with a short one.
+  @spec await(reference(), non_neg_integer()) ::
+          {:ok, term()} | {:error, {String.t(), String.t()}}
+  def await(call_ref, backstop_ms) do
+    receive do
+      {^call_ref, result} -> result
+    after
+      backstop_ms ->
+        {:error,
+         {"timeout",
+          "no reply from the engine within #{backstop_ms} ms, past the call's 30-second deadline"}}
+    end
+  end
 
   def connect(_options), do: :erlang.nif_error(:nif_not_loaded)
   def migrate(_handle), do: :erlang.nif_error(:nif_not_loaded)

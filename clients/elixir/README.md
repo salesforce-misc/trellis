@@ -144,15 +144,30 @@ threads, or no definition ever reaches `:live`.
   `"transform.column"`, exactly as `quarantined/1` reports it.
 - `sample_quarantined/3`'s cursor and `watermark_token/1`'s token are
   opaque: pass back what the previous call returned.
-- Every call that takes a handle runs on a dirty IO scheduler.
-  `Trellis.Metrics.render_prometheus/0` runs on a dirty CPU scheduler.
+- A call on a handle holds no scheduler while it waits. The NIF submits the
+  call on a normal scheduler and returns a reference at once; the engine
+  sends the result to the calling process, which waits for it in a `receive`.
+  The function is synchronous to its caller, a process killed during a call
+  exits at once, and a call stuck on the database costs the VM nothing.
+  `connect/1` and `shutdown/1` run on dirty IO schedulers, as do the NIFs
+  that touch no handle; `Trellis.Metrics.render_prometheus/0` runs on a
+  dirty CPU scheduler.
+- Every call returns within 30 seconds, counted from when it is submitted
+  (a database that can't answer in time gives `{:error, %Trellis.Error{code:
+  :timeout}}`; the server stops what the call started). Calls run in
+  parallel, on one handle and across processes: a call stuck on a lock
+  doesn't delay another process's `status/2`. A process's own calls stay in
+  order, because it waits for each reply; calls from different processes
+  have no order.
+- `shutdown/1` doesn't wait for calls in flight: it cancels them, and each
+  of their callers gets a `:validation` error.
 
 ## In a Phoenix app
 
 Let the application's supervisor own the handle. `{Trellis, options}` starts
-a process that connects with `connect/1`'s options as it starts, runs every
-call made through its name, and shuts the handle down when the supervisor
-stops it:
+a process that connects with `connect/1`'s options as it starts, hands the
+handle to the callers that make calls through its name, and shuts the handle
+down when the supervisor stops it:
 
 ```elixir
 # config/runtime.exs
@@ -176,9 +191,9 @@ children = [
 {:ok, status} = Trellis.status(MyApp.Trellis, "widget_prices")
 ```
 
-The calls run in the owning process one at a time, as they would on the
-handle, so only that process waits on a dirty IO scheduler however many
-processes call it. `shutdown/1` refuses the name; the supervisor stops it.
+Each call runs in the process that makes it, in parallel with every other,
+so no process queues behind another's call. `shutdown/1` refuses the name;
+the supervisor stops it, which cancels the calls still in flight.
 
 Define transforms in Ecto migrations with `Trellis.Migration`. Trellis never
 joins a migration's transaction, so a migration that uses it must set

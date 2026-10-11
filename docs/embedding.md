@@ -710,9 +710,10 @@ of it. To wait longer, call again: each call is one bounded wait.
 A `BlockingTrellis` runs its calls in parallel, so a call stuck on a lock
 doesn't hold up the calls made after it. A caller's own calls stay in order,
 because it waits for each reply. Calls from different threads have no order.
-The pool bounds how many run at once. The Elixir binding's `Trellis.Owner`
-still hands a handle's calls over one at a time, so an Elixir call can wait
-behind the calls ahead of it before its own 30 seconds start.
+The pool bounds how many run at once. The Elixir binding submits each call
+from the calling process and waits for its reply there, so a supervised
+handle's owner process doesn't queue anyone: a call stuck on a lock holds no
+scheduler and delays no other process's `status`.
 
 The Ruby binding waits for each reply on the calling thread with the GVL
 released, so `Timeout.timeout`, `Thread#kill` and Ctrl-C return control at
@@ -721,6 +722,13 @@ once and leave no thread behind; the abandoned call ends at its deadline.
 a call stuck on a lock doesn't hold it up: they raise
 `Trellis::ValidationError`, and what each started on the server ends at the
 call's own deadline.
+
+The Elixir binding's calls run on normal schedulers: the NIF submits the call
+and returns a reference, the engine sends the result to the calling process,
+and the process waits in a `receive`. A call stuck on the database holds no
+scheduler, a process killed mid-call exits at once (its call ends at the
+deadline and the reply is dropped), and `shutdown` cancels the calls in
+flight the same way: they return `{:error, %Trellis.Error{code: :validation}}`.
 
 ## Poll to `live`, don't wait
 

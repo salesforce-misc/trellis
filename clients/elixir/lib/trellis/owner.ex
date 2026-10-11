@@ -1,19 +1,18 @@
 defmodule Trellis.Owner do
   @moduledoc false
   # The process a supervised Trellis is (`Trellis.start_link/1`): it connects
-  # the handle as it starts, runs every call made through its name, one at a
-  # time, and shuts the handle down when its supervisor stops it. The
-  # handle's resource destructor is then only the backstop, for an owner
-  # killed before `terminate/2` could run.
+  # the handle as it starts, and shuts the handle down when its supervisor
+  # stops it. The handle's resource destructor is then only the backstop, for
+  # an owner killed before `terminate/2` could run.
   #
-  # The calls run here, rather than each caller being handed the handle, to
-  # bound how many dirty IO schedulers they hold (#148). The handle runs one
-  # call at a time anyway (`BlockingTrellis`'s job loop), and a caller parks
-  # the dirty IO scheduler it calls from until its call returns, queued time
-  # included. So N callers sharing the handle would park N of the BEAM's
-  # dirty IO schedulers (10 by default) behind one slow call, and enough of
-  # them would stall the node's file IO. Through here only this process
-  # parks one; the callers wait in its mailbox.
+  # It keeps the handle's lifecycle and nothing else. Callers ask it for the
+  # handle (`handle_ref/1`) and make their calls themselves, in their own
+  # processes: a call submits its job and waits in the caller's `receive`
+  # without holding a scheduler, and the engine runs the calls of different
+  # callers in parallel, so nothing needs to be funnelled through one process
+  # (#599). Each caller sequences its own calls by waiting for each reply.
+  # Asking is a message to a process that is never busy, so it costs a
+  # round trip and never waits on a call.
 
   use GenServer
 
@@ -24,10 +23,8 @@ defmodule Trellis.Owner do
   end
 
   @doc false
-  # `:infinity`, like the handle itself: every call that can wait long takes
-  # a bound of its own (`await_converged/3`'s `timeout_ms`), and a caller still exits if the owner does.
-  def call(server, function, args),
-    do: GenServer.call(server, {:native, function, args}, :infinity)
+  # The NIF handle `server` owns. A caller exits if `server` isn't running.
+  def handle_ref(server), do: GenServer.call(server, :handle_ref)
 
   @impl true
   def init(options) do
@@ -42,9 +39,7 @@ defmodule Trellis.Owner do
   end
 
   @impl true
-  def handle_call({:native, function, args}, _from, handle) do
-    {:reply, Kernel.apply(Trellis.Native, function, [handle.ref | args]), handle}
-  end
+  def handle_call(:handle_ref, _from, handle), do: {:reply, handle.ref, handle}
 
   @impl true
   def terminate(_reason, handle) do
