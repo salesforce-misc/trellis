@@ -44,13 +44,15 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use tokio_postgres::GenericClient;
 
 use crate::defs::ddl::regclass_arg;
 
 /// One way a table is in a partition or inheritance hierarchy, found by
 /// [`hierarchy`]. Every table is an unquoted `schema.table` identity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Hierarchy {
     /// The table is partitioned. A write aimed at one of its partitions
     /// directly fires only the partition's statement triggers.

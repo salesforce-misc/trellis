@@ -31,7 +31,8 @@
 //! | [`trellis::PoisonEntry`] | fields + poison time | [`PlainPoisonEntry`] |
 //! | a page of [`trellis::PoisonSample`] | the rows + the next page's cursor | [`PlainSamplePage`] |
 //! | `watermark_token`'s `PgLsn` | an opaque string | [`encode_watermark`] / [`decode_watermark`] |
-//! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word + held keys + drain failures + unindexed joins | [`PlainSelfCheckReport`] |
+//! | [`trellis::SelfCheckJob`] | id + target + mode and state words + progress + the report once done + the error | [`PlainSelfCheckJob`] |
+//! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word + held keys + drain failures | [`PlainSelfCheckReport`] |
 //! | [`trellis::SelfCheckMode`] (an argument) | its word | [`self_check_mode`] |
 //! | [`trellis::Config`] | its fields but the DSN (which can carry a password), the pool timeout in milliseconds | [`PlainConfig`] |
 //!
@@ -84,8 +85,8 @@ pub use relationship::{
     PlainRelationship, PlainRelationshipSummary, relationship_cardinality_names,
 };
 pub use self_check::{
-    DIVERGENCE_KINDS, PlainDivergence, PlainSelfCheckReport, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
-    self_check_mode,
+    DIVERGENCE_KINDS, PlainDivergence, PlainSelfCheckJob, PlainSelfCheckReport, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, self_check_mode,
 };
 pub use statement::require_transform_statement;
 pub use status::{

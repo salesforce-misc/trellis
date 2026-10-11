@@ -211,6 +211,11 @@ pub enum PausePoint {
     /// own reason (`local_fuse`) and leaves it paused with that sibling, for
     /// the column's (bare) target (`super::quarantine::resume_column`, #922).
     BeforeSiblingHeldResume,
+    /// After a worker claims a `self_check` job and before the page it runs
+    /// (`super::self_check_job::work_once`, #1023), for the audited target's
+    /// bare name. The page holds no lock and no transaction, so the target
+    /// can be dropped, written or checked again here.
+    BeforeSelfCheckPage,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

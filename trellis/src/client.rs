@@ -737,7 +737,7 @@ async fn run(
         let _ = staging::register_worker(&**conn, &client_id).await;
     }
 
-    let mut app_worker_tasks = Vec::with_capacity(options.application_threads);
+    let mut app_worker_tasks = Vec::with_capacity(options.application_threads + 1);
     for i in 0..options.application_threads {
         let claimed_by = format!("{client_id}-app-{i}");
         let worker_config = AppWorkerConfig {
@@ -758,6 +758,18 @@ async fn run(
         };
         app_worker_tasks.push(tokio::spawn(app_worker_loop(
             worker_config,
+            shutdown_rx.clone(),
+        )));
+    }
+
+    // #1023: `self_check` jobs run beside the drain workers, never in their
+    // loop (see `self_check_loop`), wherever drain workers run.
+    if options.application_threads > 0 {
+        app_worker_tasks.push(tokio::spawn(self_check_loop(
+            pool.clone(),
+            format!("{client_id}-self-check"),
+            options.reclaim_ttl,
+            options.poll_interval,
             shutdown_rx.clone(),
         )));
     }
@@ -1924,6 +1936,89 @@ async fn build_step(
     let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
     let rederive = rederive_build_step(pool, claimed_by, build_options, merge_failures).await;
     old || rederive
+}
+
+/// The task that runs `self_check` jobs (#1023) in a process that runs drain
+/// workers: one page per pass ([`self_check_step`]), straight on to the next
+/// while there is one, `poll_interval` apart while there is none, until
+/// shutdown.
+///
+/// It is its own task, not a step of the drain workers' loop, because a page
+/// waits for the target to converge before it compares, and convergence is
+/// the drain workers' work: a drain worker that ran the page would wait on
+/// itself, and with one drain worker in the fleet every page under write load
+/// would end `NotCaughtUp` at its timeout. Beside them, it costs the pool one
+/// connection at a time and takes nothing from the drains.
+async fn self_check_loop(
+    pool: Pool,
+    claimed_by: String,
+    reclaim_ttl: Duration,
+    poll_interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        let ran = self_check_step(&pool, &claimed_by, reclaim_ttl, &mut shutdown_rx).await;
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        if !ran {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        }
+    }
+}
+
+/// One page of a `self_check` job ([`staging::self_check_job::work_once`]),
+/// if there is one to run. Returns whether it ran one.
+///
+/// A page is bounded by its own budget (`staging::self_check_job::page_budget`),
+/// but a shutdown does not wait for it: the page is dropped where it is, the
+/// worker's jobs are marked cancelled, and the statement the page had on the
+/// server is stopped by that budget. A failure of the step itself (the claim
+/// or a save) is logged at warn and retried on the next pass.
+async fn self_check_step(
+    pool: &Pool,
+    claimed_by: &str,
+    reclaim_ttl: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let options = staging::self_check_job::WorkerOptions::new(reclaim_ttl);
+    let page = staging::self_check_job::work_once(pool, claimed_by, &options);
+    tokio::select! {
+        biased;
+        () = async { let _ = shutdown_rx.wait_for(|stopping| *stopping).await; } => {
+            // Bounded: the pool may be what is unreachable.
+            let cancelled = tokio::time::timeout(
+                Duration::from_secs(5),
+                staging::self_check_job::cancel_claimed(pool, claimed_by),
+            )
+            .await;
+            if !matches!(cancelled, Ok(Ok(_))) {
+                crate::instance_log::warn!(
+                    worker = %claimed_by,
+                    "could not mark this worker's self_check job cancelled on shutdown; \
+                     another worker takes it over once it has gone stale"
+                );
+            }
+            false
+        }
+        result = page => match result {
+            Ok(ran) => ran,
+            Err(error) => {
+                crate::instance_log::warn!(
+                    worker = %claimed_by,
+                    error = %error,
+                    "self_check step failed; retrying on the next pass"
+                );
+                false
+            }
+        },
+    }
 }
 
 /// One step of the running Re-derive builds' work

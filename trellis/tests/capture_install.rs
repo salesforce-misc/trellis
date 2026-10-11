@@ -40,6 +40,7 @@ use trellis::defs::{TransformStatus, ValueType, install_definition};
 use trellis::intake::markers;
 use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
+use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{
     MIN_ROWS_TO_SPLIT, StagedWatermark, TRUNCATE_SENTINEL_KEY, apply, has_pending,
     retire_drained_segments, seal,
@@ -985,12 +986,8 @@ async fn a_schema_pre_created_by_another_role_still_captures_writes() {
         "so the capture audit runs"
     );
     let report = trellis
-        .self_check(
+        .self_check_to_end(
             "t_copy",
-            trellis::SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
             trellis::SelfCheckMode::Strict,
             Duration::from_secs(30),
         )

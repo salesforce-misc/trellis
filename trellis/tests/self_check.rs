@@ -53,10 +53,13 @@ use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::hierarchy::Hierarchy;
+use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
+use trellis::staging::self_check_job::{WorkerOptions, run_to_end, work_once};
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{
-    CaptureFault, Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope,
-    TransformStatus, Trellis, TrellisOptions,
+    CaptureFault, Config, Divergence, SelfCheckError, SelfCheckJobState, SelfCheckMode,
+    SelfCheckOutcome, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -235,7 +238,7 @@ async fn converged_target_reports_no_divergence() {
     .await;
 
     let report = trellis
-        .self_check(
+        .self_check_page(
             "widget_totals",
             SelfCheckScope {
                 after: None,
@@ -283,7 +286,7 @@ async fn self_check_reports_a_definition_under_a_rebuild_as_not_live() {
     .await;
     let check = || async {
         trellis
-            .self_check(
+            .self_check_page(
                 "widget_prices",
                 SelfCheckScope {
                     after: None,
@@ -344,7 +347,7 @@ async fn self_check_reports_a_paused_definition_as_not_live() {
         .expect("pause");
 
     let report = trellis
-        .self_check(
+        .self_check_page(
             "widget_prices",
             SelfCheckScope {
                 after: None,
@@ -436,7 +439,7 @@ async fn a_converged_target_of_typed_literals_reports_no_divergence() {
     }
 
     let report = trellis
-        .self_check(
+        .self_check_page(
             "widget_stamps",
             SelfCheckScope {
                 after: None,
@@ -490,7 +493,7 @@ async fn self_check_detects_a_divergence_seeded_by_directly_corrupting_a_target_
         .expect("corrupt target row");
 
     let report = trellis
-        .self_check(
+        .self_check_page(
             "widget_totals",
             SelfCheckScope {
                 after: None,
@@ -579,7 +582,7 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
         .expect("insert source row");
 
     let report = running
-        .self_check(
+        .self_check_page(
             "widget_prices",
             SelfCheckScope {
                 after: None,
@@ -641,7 +644,7 @@ async fn self_check_reports_a_connection_lost_during_its_convergence_wait_as_an_
 
     let audit = tokio::spawn(async move {
         let result = trellis
-            .self_check(
+            .self_check_page(
                 "widget_prices",
                 SelfCheckScope {
                     after: None,
@@ -741,7 +744,7 @@ async fn self_check_excludes_a_paused_column_from_the_comparison() {
     .expect("seed column_status");
 
     let report = trellis
-        .self_check(
+        .self_check_page(
             "widget_view",
             SelfCheckScope {
                 after: None,
@@ -806,7 +809,7 @@ async fn a_bounded_page_does_not_invent_a_divergence_from_the_two_sides_ending_a
         .expect("delete a target row");
 
     let report = trellis
-        .self_check(
+        .self_check_page(
             "widget_prices",
             SelfCheckScope {
                 after: None,
@@ -839,7 +842,7 @@ async fn a_bounded_page_does_not_invent_a_divergence_from_the_two_sides_ending_a
     // And the next page genuinely continues from there, with no gap: keys 4
     // and 5 are both intact, so it converges.
     let next = trellis
-        .self_check(
+        .self_check_page(
             "widget_prices",
             SelfCheckScope {
                 after: report.next_after.clone(),
@@ -889,7 +892,7 @@ async fn self_check_refuses_a_non_positive_limit_rather_than_vacuously_convergin
         .expect("define");
 
     let err = trellis
-        .self_check(
+        .self_check_page(
             "widget_prices",
             SelfCheckScope {
                 after: None,
@@ -939,15 +942,7 @@ async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
         .expect("define aggregate transform");
 
     let err = trellis
-        .self_check(
-            "region_counts",
-            SelfCheckScope {
-                after: None,
-                limit: 100,
-            },
-            SelfCheckMode::Standard,
-            GENEROUS_TIMEOUT,
-        )
+        .self_check("region_counts", SelfCheckMode::Standard, GENEROUS_TIMEOUT)
         .await
         .expect_err("an aggregate target must be refused, not audited");
     assert_eq!(err.code(), trellis::ErrorCode::Validation);
@@ -974,9 +969,9 @@ async fn widgets_fixture(db: &TestDatabase) -> (Trellis, Client) {
 
 /// Audits `widget_totals` once, under `Strict`: nothing writes, and no
 /// staging worker runs.
-async fn audit_widgets(trellis: &Trellis) -> trellis::SelfCheckReport {
+async fn audit_widgets(trellis: &Trellis) -> trellis::staging::self_check::SelfCheckPage {
     trellis
-        .self_check(
+        .self_check_page(
             "widget_totals",
             SelfCheckScope {
                 after: None,
@@ -992,7 +987,7 @@ async fn audit_widgets(trellis: &Trellis) -> trellis::SelfCheckReport {
 /// The capture faults `report` carries, or a panic naming what it carried
 /// instead. A capture fault is reported before, and instead of, any
 /// comparison, so no row was compared.
-fn capture_faults(report: &trellis::SelfCheckReport) -> Vec<CaptureFault> {
+fn capture_faults(report: &trellis::staging::self_check::SelfCheckPage) -> Vec<CaptureFault> {
     let SelfCheckOutcome::Diverged(divergences) = &report.outcome else {
         panic!("expected capture faults, got {:?}", report.outcome);
     };
@@ -1329,7 +1324,7 @@ async fn a_relationship_to_sides_capture_is_audited_too() {
         .await
         .expect("dispatch the build");
     let self_check = || {
-        trellis.self_check(
+        trellis.self_check_page(
             "widget_makers",
             SelfCheckScope {
                 after: None,
@@ -1485,7 +1480,7 @@ async fn audit_every_page(trellis: &Trellis, target: &str, limit: i64) -> (Vec<D
     let mut after = None;
     for _ in 0..100 {
         let report = trellis
-            .self_check(
+            .self_check_page(
                 target,
                 SelfCheckScope { after, limit },
                 SelfCheckMode::Standard,
@@ -1661,7 +1656,7 @@ async fn a_page_ends_at_the_lower_of_the_two_sides_last_keys_in_the_key_s_order(
         .expect("insert an extra target row");
 
     let report = trellis
-        .self_check(
+        .self_check_page(
             "word_values",
             SelfCheckScope {
                 after: None,
@@ -1778,9 +1773,9 @@ async fn order_view_fixture(db: &TestDatabase) -> (Trellis, Client) {
     (trellis, raw)
 }
 
-async fn audit_order_view(trellis: &Trellis) -> trellis::SelfCheckReport {
+async fn audit_order_view(trellis: &Trellis) -> trellis::staging::self_check::SelfCheckPage {
     trellis
-        .self_check(
+        .self_check_page(
             "order_view",
             SelfCheckScope {
                 after: None,
@@ -1851,6 +1846,933 @@ async fn self_check_names_an_unindexed_join_column_until_it_is_indexed() {
     let report = audit_order_view(&trellis).await;
     assert!(matches!(report.outcome, SelfCheckOutcome::NotLive(_)));
     assert_eq!(report.unindexed_joins, Vec::new());
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// `Trellis::self_check` as a background job (#1023, #599)
+//
+// A job is registered by the call and run by a drain worker, a keyset page per
+// pass. These tests hand-drive the worker (`work_once`) the way
+// `drain_to_quiescence` hand-drives the drain, so they wait for nothing; the
+// two that run a live `Client` say so.
+// ---------------------------------------------------------------------------
+
+/// The options of the worker a test drives: the defaults, but for the page
+/// size.
+fn worker(page_keys: i64) -> WorkerOptions {
+    WorkerOptions {
+        page_keys,
+        ..WorkerOptions::new(Duration::from_secs(30))
+    }
+}
+
+/// A converged `widget_totals` over `n` rows, ids `1..=n`, price `10 * id`.
+async fn totals_fixture(db: &TestDatabase, n: i32) -> (Trellis, Client) {
+    let images: Vec<String> = (1..=n)
+        .map(|id| format!(r#"{{"id":"{id}","price":"{}"}}"#, id * 10))
+        .collect();
+    let rows: Vec<(String, &str)> = (1..=n)
+        .map(|id| (id.to_string(), images[id as usize - 1].as_str()))
+        .collect();
+    let rows: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    converged_fixture(
+        db,
+        "create table widgets (id integer primary key, price integer)",
+        "widgets",
+        "TRANSFORM widget_totals FROM widgets SELECT price + price AS total",
+        &rows,
+    )
+    .await
+}
+
+/// A call to `self_check` reads nothing of the target and returns the job at
+/// once, `queued`: the comparison is a worker's. Until a worker runs, a poll
+/// finds it queued; once one does, the report is readable by id, and by a
+/// handle other than the one that started it.
+#[tokio::test]
+async fn self_check_returns_a_queued_job_and_the_result_is_readable_once_a_worker_has_run_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = totals_fixture(&db, 2).await;
+
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    assert_eq!(job.state, SelfCheckJobState::Queued);
+    assert_eq!(job.target, "widget_totals");
+    assert_eq!(job.mode, SelfCheckMode::Strict);
+    assert_eq!(job.rows_compared, 0, "nothing was compared by the call");
+    assert!(job.report.is_none() && job.error.is_none());
+
+    let polled = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(polled.state, SelfCheckJobState::Queued, "no worker has run");
+
+    assert!(
+        work_once(&db.pool, "w1", &worker(100))
+            .await
+            .expect("worker"),
+        "a worker ran the job's page"
+    );
+    assert!(
+        !work_once(&db.pool, "w1", &worker(100))
+            .await
+            .expect("worker"),
+        "and has nothing left"
+    );
+
+    let other = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let done = other
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done);
+    assert_eq!(done.rows_compared, 2);
+    let report = done.report.expect("a done job has its report");
+    assert!(matches!(report.outcome, SelfCheckOutcome::Converged));
+    assert_eq!(report.rows_compared, 2);
+    assert!(!report.truncated);
+    assert_eq!(report.target, "widget_totals");
+
+    other.shutdown().await.expect("shutdown");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// While a worker is in the middle of a page the job reads `running`, with
+/// the call that started it long since returned. A second `self_check` of the
+/// target gets that same job back, not a second one; and the report is there
+/// once the page ends.
+#[tokio::test]
+async fn a_second_self_check_of_a_running_target_returns_the_running_job() {
+    const PAUSE_LOCK: i64 = 1023;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 2).await;
+    let gate = connect_raw(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+
+    let first = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeSelfCheckPage, "widget_totals", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut page = tokio::spawn(with_scope(scope, async move {
+        work_once(&pool, "w1", &worker(100)).await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut page => panic!("the page finished without reaching its pause: {finished:?}"),
+    }
+
+    // The worker holds the job mid-page: the call has returned long since,
+    // and the comparison has not happened.
+    let running = trellis
+        .self_check_job(first.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(running.state, SelfCheckJobState::Running);
+    assert_eq!(running.rows_compared, 0);
+    assert!(running.report.is_none());
+
+    // A second call, with a different mode, joins it.
+    let second = trellis
+        .self_check("widget_totals", SelfCheckMode::Standard, GENEROUS_TIMEOUT)
+        .await
+        .expect("start again");
+    assert_eq!(second.id, first.id, "one job per target at a time");
+    assert_eq!(
+        second.mode,
+        SelfCheckMode::Strict,
+        "the running job's mode stands"
+    );
+    assert_eq!(second.state, SelfCheckJobState::Running);
+    let jobs: i64 = raw
+        .query_one("select count(*) from self_check_jobs", &[])
+        .await
+        .expect("count jobs")
+        .get(0);
+    assert_eq!(jobs, 1);
+
+    gate.execute("select pg_advisory_unlock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+    assert!(page.await.expect("page task").expect("page"));
+
+    let done = trellis
+        .self_check_job(first.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done);
+    assert!(matches!(
+        done.report.expect("report").outcome,
+        SelfCheckOutcome::Converged
+    ));
+
+    // The next call replaces the finished job with a new one.
+    let third = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start a new one");
+    assert_ne!(third.id, first.id);
+    assert_eq!(third.state, SelfCheckJobState::Queued);
+    assert!(
+        trellis
+            .self_check_job(first.id)
+            .await
+            .expect("poll")
+            .is_none(),
+        "the replaced job is gone"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A job walks the target a page at a time: with a page of two keys over five
+/// rows, three pages, and the divergences of the first and the last page are
+/// both in the one report, with the keys compared summed over the pages. The
+/// progress a poll sees between pages is what the pages so far compared.
+#[tokio::test]
+async fn a_job_walks_the_whole_target_page_by_page_and_reports_every_divergence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 5).await;
+    // Keys order as text: 1, 2, 3, 4, 5. Pages of two: {1,2} {3,4} {5}.
+    raw.execute("update widget_totals set total = 9999 where id = '1'", &[])
+        .await
+        .expect("corrupt the first page");
+    raw.execute("update widget_totals set total = 8888 where id = '5'", &[])
+        .await
+        .expect("corrupt the last page");
+
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+
+    assert!(work_once(&db.pool, "w1", &worker(2)).await.expect("page 1"));
+    let midway = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(midway.state, SelfCheckJobState::Running);
+    assert_eq!(midway.rows_compared, 2, "the first page's keys");
+    assert!(midway.report.is_none(), "no verdict before the walk ends");
+
+    assert!(work_once(&db.pool, "w1", &worker(2)).await.expect("page 2"));
+    assert!(work_once(&db.pool, "w1", &worker(2)).await.expect("page 3"));
+    assert!(
+        !work_once(&db.pool, "w1", &worker(2))
+            .await
+            .expect("nothing left")
+    );
+
+    let done = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done);
+    let report = done.report.expect("report");
+    assert_eq!(report.rows_compared, 5);
+    assert!(!report.truncated);
+    match report.outcome {
+        SelfCheckOutcome::Diverged(found) => assert_eq!(
+            found,
+            vec![
+                Divergence::Cell {
+                    key: "1".into(),
+                    column: "total".into(),
+                    persisted: Some("9999".into()),
+                    recomputed: Some("20".into()),
+                },
+                Divergence::Cell {
+                    key: "5".into(),
+                    column: "total".into(),
+                    persisted: Some("8888".into()),
+                    recomputed: Some("100".into()),
+                },
+            ]
+        ),
+        other => panic!("expected Diverged, got {other:?}"),
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `DROP TRANSFORM` while a worker is mid-page: the job's row goes with the
+/// definition, so the worker's save finds nothing and the walk ends there. A
+/// poll finds no job, and no row is left behind.
+#[tokio::test]
+async fn dropping_the_transform_ends_the_job_and_leaves_no_state() {
+    const PAUSE_LOCK: i64 = 10231;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 2).await;
+    let gate = connect_raw(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeSelfCheckPage, "widget_totals", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut page = tokio::spawn(with_scope(scope, async move {
+        work_once(&pool, "w1", &worker(100)).await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut page => panic!("the page finished without reaching its pause: {finished:?}"),
+    }
+
+    trellis
+        .apply("PAUSE TRANSFORM widget_totals")
+        .await
+        .expect("pause");
+    trellis
+        .apply("DROP TRANSFORM widget_totals")
+        .await
+        .expect("the drop doesn't wait for the page");
+    gate.execute("select pg_advisory_unlock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+    assert!(
+        page.await
+            .expect("page task")
+            .expect("the worker ends cleanly")
+    );
+
+    assert!(
+        trellis
+            .self_check_job(job.id)
+            .await
+            .expect("poll")
+            .is_none()
+    );
+    let rows: i64 = raw
+        .query_one("select count(*) from self_check_jobs", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 0, "no job state outlives the transform");
+    assert!(
+        !work_once(&db.pool, "w1", &worker(100))
+            .await
+            .expect("worker"),
+        "and nothing is left to run"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A late save by a claimant that lost its job changes nothing: its claim was
+/// taken over (its row stale) while it was mid-page, and the worker that took
+/// it over runs the page from the saved cursor and finishes the job; the
+/// first worker's page, finishing afterwards, is dropped.
+#[tokio::test]
+async fn a_stale_claimants_late_save_changes_nothing_and_its_job_is_taken_over() {
+    const PAUSE_LOCK: i64 = 10232;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 3).await;
+    raw.execute("update widget_totals set total = 9999 where id = '3'", &[])
+        .await
+        .expect("corrupt a row");
+    let gate = connect_raw(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("take the pause lock");
+
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeSelfCheckPage, "widget_totals", PAUSE_LOCK);
+    let pool = db.pool.clone();
+    let mut slow = tokio::spawn(with_scope(scope, async move {
+        work_once(&pool, "slow", &worker(100)).await
+    }));
+    tokio::select! {
+        reached = reached => { reached.expect("pause scope dropped"); }
+        finished = &mut slow => panic!("the page finished without reaching its pause: {finished:?}"),
+    }
+
+    // The first worker's claim goes stale: its row says it saved a day ago.
+    raw.execute(
+        "update self_check_jobs set claimed_at = now() - interval '1 day' where id = $1",
+        &[&job.id],
+    )
+    .await
+    .expect("age the claim");
+    // The takeover runs one page of one key and leaves the job running.
+    assert!(
+        work_once(&db.pool, "fast", &worker(1))
+            .await
+            .expect("takeover"),
+        "the stale job is taken over"
+    );
+    let taken = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(taken.state, SelfCheckJobState::Running);
+    assert_eq!(taken.rows_compared, 1);
+
+    // The slow worker's page ends now, and would finish the whole job from
+    // its stale claim. Its save is conditional on a claim it no longer has.
+    gate.execute("select pg_advisory_unlock($1)", &[&PAUSE_LOCK])
+        .await
+        .expect("release the pause lock");
+    assert!(slow.await.expect("slow task").expect("slow worker"));
+    let still = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(
+        (still.state, still.rows_compared),
+        (SelfCheckJobState::Running, 1),
+        "not rewritten by the late save"
+    );
+    let claimant: String = raw
+        .query_one(
+            "select claimed_by from self_check_jobs where id = $1",
+            &[&job.id],
+        )
+        .await
+        .expect("read")
+        .get(0);
+    assert_eq!(claimant, "fast");
+
+    // The new claimant finishes from the cursor it saved.
+    while work_once(&db.pool, "fast", &worker(1))
+        .await
+        .expect("fast worker")
+    {}
+    let done = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done);
+    let report = done.report.expect("report");
+    assert_eq!(report.rows_compared, 3);
+    let found = match report.outcome {
+        SelfCheckOutcome::Diverged(found) => found,
+        other => panic!("expected Diverged, got {other:?}"),
+    };
+    assert_eq!(found.len(), 1);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A job whose claimant is not stale is left alone by other workers.
+#[tokio::test]
+async fn a_job_another_worker_is_running_is_not_taken_over_before_it_is_stale() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 3).await;
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    raw.execute(
+        "update self_check_jobs set state = 'running', claimed_by = 'other', claimed_at = now() \
+         where id = $1",
+        &[&job.id],
+    )
+    .await
+    .expect("another worker holds it");
+
+    assert!(
+        !work_once(&db.pool, "me", &worker(100))
+            .await
+            .expect("worker"),
+        "a fresh claim is another worker's"
+    );
+    raw.execute(
+        "update self_check_jobs set claimed_at = now() - interval '1 day' where id = $1",
+        &[&job.id],
+    )
+    .await
+    .expect("age the claim");
+    assert!(
+        work_once(&db.pool, "me", &worker(100))
+            .await
+            .expect("worker"),
+        "a silent one is not"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `timeout` too long to do arithmetic on (a binding hands over a u64 of
+/// milliseconds) is cut to an hour when the job is started, so the worker's
+/// claim and a page's budget never overflow.
+#[tokio::test]
+async fn an_enormous_timeout_is_capped_so_the_job_still_runs() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 2).await;
+
+    let job = trellis
+        .self_check(
+            "widget_totals",
+            SelfCheckMode::Strict,
+            Duration::from_millis(u64::MAX),
+        )
+        .await
+        .expect("start");
+    // Another worker holds it, so this worker's claim works out whether that
+    // claim has gone stale, from the job's timeout.
+    raw.execute(
+        "update self_check_jobs set state = 'running', claimed_by = 'other', claimed_at = now() \
+         where id = $1",
+        &[&job.id],
+    )
+    .await
+    .expect("another worker holds it");
+    assert!(
+        !work_once(&db.pool, "me", &worker(100))
+            .await
+            .expect("the staleness arithmetic doesn't overflow"),
+    );
+    raw.execute(
+        "update self_check_jobs set claimed_at = now() - interval '1 day' where id = $1",
+        &[&job.id],
+    )
+    .await
+    .expect("age the claim");
+    assert!(
+        work_once(&db.pool, "me", &worker(100))
+            .await
+            .expect("worker")
+    );
+    let done = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done, "{:?}", done.error);
+    assert_eq!(done.rows_compared, 2);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A target that isn't live ends its job with the status, as the page does.
+#[tokio::test]
+async fn a_job_over_a_paused_definition_ends_not_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = totals_fixture(&db, 2).await;
+    trellis
+        .apply("PAUSE TRANSFORM widget_totals")
+        .await
+        .expect("pause");
+
+    let job = run_to_end(
+        &trellis,
+        "widget_totals",
+        SelfCheckMode::Strict,
+        GENEROUS_TIMEOUT,
+        &worker(100),
+    )
+    .await
+    .expect("job");
+    assert_eq!(job.state, SelfCheckJobState::Done);
+    let report = job.report.expect("report");
+    assert!(
+        matches!(
+            report.outcome,
+            SelfCheckOutcome::NotLive(TransformStatus::Paused)
+        ),
+        "{:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 0);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The report of a job reads what an operator needs to act on live, when it
+/// is polled: here a held key (#759) that appears after the job finished.
+#[tokio::test]
+async fn a_finished_jobs_report_reads_the_findings_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 2).await;
+    let job = run_to_end(
+        &trellis,
+        "widget_totals",
+        SelfCheckMode::Strict,
+        GENEROUS_TIMEOUT,
+        &worker(100),
+    )
+    .await
+    .expect("job");
+    assert!(job.report.expect("report").held_keys.is_none());
+
+    raw.execute(
+        "insert into poison (transform_id, src_table, key, last_error) \
+         select id, source_table, '1', 'test' from transform_definitions",
+        &[],
+    )
+    .await
+    .expect("hold key 1");
+    let polled = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    let held = polled
+        .report
+        .expect("report")
+        .held_keys
+        .expect("the held key");
+    assert_eq!(held.count, 1);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// What a check could never run on is refused when the job is started, as
+/// the call used to refuse it: an aggregate target, an unknown one, and one
+/// that reads through a relationship.
+#[tokio::test]
+async fn self_check_refuses_at_the_start_what_it_could_never_compare() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = totals_fixture(&db, 1).await;
+
+    let err = trellis
+        .self_check("no_such_target", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect_err("unknown target");
+    assert!(
+        matches!(
+            err,
+            TrellisError::SelfCheck(SelfCheckError::TargetNotFound(_))
+        ),
+        "{err}"
+    );
+    let rows: i64 = db
+        .pool
+        .get()
+        .await
+        .expect("conn")
+        .query_one("select count(*) from self_check_jobs", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(rows, 0, "a refused call registers nothing");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A target that reads through a relationship can't be compared (its leaf
+/// renderer has no relationship path), and the job isn't started for it.
+#[tokio::test]
+async fn self_check_refuses_a_relationship_reading_target_at_the_start() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = order_view_fixture(&db).await;
+
+    let err = trellis
+        .self_check("order_view", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect_err("a relationship-reading target");
+    assert!(
+        matches!(
+            err,
+            TrellisError::SelfCheck(SelfCheckError::UnsupportedExpr { .. })
+        ),
+        "{err}"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A page is bounded on the server. With the comparison's budget cut to a
+/// few hundred milliseconds and the target's table held, the page is stopped
+/// by the server at the budget, the job reads `failed` with why, nothing is
+/// left waiting on the server, and a new check can start.
+#[tokio::test]
+async fn a_page_that_runs_past_its_budget_is_stopped_by_the_server_and_fails_the_job() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 2).await;
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, Duration::ZERO)
+        .await
+        .expect("start");
+
+    let holder = testkit::crash::OpenTransaction::begin(db.dsn()).await;
+    holder
+        .execute("lock table widget_totals in access exclusive mode")
+        .await;
+    let options = WorkerOptions {
+        compare_budget: Duration::from_millis(400),
+        ..worker(100)
+    };
+    let started = std::time::Instant::now();
+    assert!(work_once(&db.pool, "w1", &options).await.expect("worker"));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the page took {elapsed:?}: the server should end it at its budget"
+    );
+
+    let waiting: i64 = raw
+        .query_one(
+            "select count(*) from pg_stat_activity \
+             where datname = current_database() and wait_event_type = 'Lock'",
+            &[],
+        )
+        .await
+        .expect("read activity")
+        .get(0);
+    assert_eq!(
+        waiting, 0,
+        "the page left a statement waiting on the server"
+    );
+    holder.rollback().await;
+
+    let failed = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(failed.state, SelfCheckJobState::Failed);
+    assert!(failed.report.is_none());
+    let why = failed.error.expect("a failed job says why");
+    assert!(why.contains("budget"), "{why}");
+
+    let next = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("a failed job doesn't block the next check");
+    assert_ne!(next.id, job.id);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A live drain worker runs the jobs of its fleet in the background, with
+/// nobody driving it: the call returns, and the job reaches `done`. (This
+/// polls the job, bounded, because the worker's pass is its own.)
+#[tokio::test]
+async fn a_drain_worker_runs_a_job_in_the_background() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = totals_fixture(&db, 3).await;
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect a worker");
+
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    let mut done = None;
+    for _ in 0..600 {
+        let polled = trellis
+            .self_check_job(job.id)
+            .await
+            .expect("poll")
+            .expect("job");
+        if polled.state.is_finished() {
+            done = Some(polled);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let done = done.expect("the worker finished the job within 30 s");
+    assert_eq!(done.state, SelfCheckJobState::Done, "{:?}", done.error);
+    assert_eq!(done.rows_compared, 3);
+
+    running.shutdown().await.expect("shutdown");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A job's page waits for the target to converge before it compares, and
+/// convergence is the drain workers' work, so the page must not run on one of
+/// them. With a single drain worker and a change that only a drain can apply
+/// (sealed by hand once the job is running: no staging worker runs), the job
+/// still converges: the worker drains while the page waits. A page run in the
+/// drain worker's own loop would wait on itself and end `NotCaughtUp` at its
+/// timeout. (Bounded polls of the job's state, as above.)
+#[tokio::test]
+async fn a_job_does_not_wait_on_the_drain_worker_it_runs_beside() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, mut raw) = totals_fixture(&db, 3).await;
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect a worker");
+    // Staged in the active segment, which only a seal hands to a drain.
+    raw.execute("insert into widgets values (4, 40)", &[])
+        .await
+        .expect("write a source row");
+
+    let job = trellis
+        .self_check(
+            "widget_totals",
+            SelfCheckMode::Strict,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("start");
+    let mut claimed = false;
+    for _ in 0..600 {
+        let polled = trellis
+            .self_check_job(job.id)
+            .await
+            .expect("poll")
+            .expect("job");
+        if polled.state != SelfCheckJobState::Queued {
+            claimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(claimed, "no worker claimed the job within 30 s");
+    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    seal::seal_phase2(&raw, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+
+    let mut done = None;
+    for _ in 0..600 {
+        let polled = trellis
+            .self_check_job(job.id)
+            .await
+            .expect("poll")
+            .expect("job");
+        if polled.state.is_finished() {
+            done = Some(polled);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let done = done.expect("the job finished within 30 s");
+    assert_eq!(done.state, SelfCheckJobState::Done, "{:?}", done.error);
+    let report = done.report.expect("report");
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "the page waited on the drain it was blocking: {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 4, "the drained row was compared");
+
+    running.shutdown().await.expect("shutdown");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A shutdown stops the worker mid-page and marks its job cancelled, so the
+/// poll shows it. The worker's page is blocked on the target's table, which
+/// the shutdown doesn't wait for.
+#[tokio::test]
+async fn a_shutdown_stops_the_worker_mid_page_and_cancels_its_job() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 3).await;
+    let holder = testkit::crash::OpenTransaction::begin(db.dsn()).await;
+    holder
+        .execute("lock table widget_totals in access exclusive mode")
+        .await;
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect a worker");
+
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    // Until the worker's comparison is queued on the held table.
+    let mut blocked = false;
+    for _ in 0..600 {
+        let waiting: i64 = raw
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where datname = current_database() and wait_event_type = 'Lock'",
+                &[],
+            )
+            .await
+            .expect("read activity")
+            .get(0);
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(blocked, "the worker's page never reached the held table");
+    let polled = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(polled.state, SelfCheckJobState::Running);
+
+    let started = std::time::Instant::now();
+    running.shutdown().await.expect("shutdown");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the shutdown waited for the page"
+    );
+
+    let cancelled = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(cancelled.state, SelfCheckJobState::Cancelled);
+    assert!(
+        cancelled.error.expect("says why").contains("shut down"),
+        "a cancelled job says it was a shutdown"
+    );
+    assert!(cancelled.report.is_none());
+    holder.rollback().await;
 
     trellis.shutdown().await.expect("shutdown");
 }

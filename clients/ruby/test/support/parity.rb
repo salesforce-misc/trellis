@@ -18,6 +18,8 @@ module Parity
     "cardinality" => -> { Trellis::Native.cardinality_names },
     "applied_kind" => -> { Trellis::Native.applied_kinds },
     "self_check_outcome" => -> { Trellis::Native.self_check_outcomes },
+    "self_check_mode" => -> { Trellis::Native.self_check_modes },
+    "self_check_state" => -> { Trellis::Native.self_check_states },
     "divergence_kind" => -> { Trellis::Native.divergence_kinds },
     "capture_failure_kind" => -> { Trellis::Native.capture_failure_kinds }
   }.freeze
@@ -45,6 +47,7 @@ module Parity
     "watermark_token" => ->(_args, _opts) { Trellis.watermark_token },
     "await_converged" => ->(args, opts) { Trellis.await_converged(*args, **opts) },
     "self_check" => ->(args, opts) { Trellis.self_check(*args, **opts) },
+    "self_check_job" => ->(args, _opts) { Trellis.self_check_job(*args) },
     "shutdown" => ->(_args, _opts) { Trellis.shutdown }
   }.freeze
 

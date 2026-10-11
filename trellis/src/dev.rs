@@ -13,8 +13,8 @@
 //! is the generative fuzz suite's *independent, evaluator-driven cross-check
 //! leg* — a second recompute whose only job is to catch divergence between
 //! the engine's Rust evaluator and Postgres semantics. Because it must stay
-//! independent of both the shipped `self_check` audit (ADR-0013; not yet
-//! implemented) and the suite's own SQL oracle, it cannot become a public
+//! independent of both the shipped `self_check` audit (ADR-0013) and the
+//! suite's own SQL oracle, it cannot become a public
 //! method. This module is that leg's reach into the
 //! engine, plus the small set of type and registry lookups its
 //! correctness assertions need. `benchmark`'s scenario oracle, which renders
@@ -89,6 +89,14 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
+    /// One pass of the `self_check` worker task, for a harness that runs no
+    /// drain workers (so no such task) and hand-drives the job it started
+    /// through `Trellis::self_check` (#1023), the way `ManualBackend` drains
+    /// by hand.
+    pub use crate::staging::self_check_job::{
+        DEFAULT_PAGE_KEYS, WorkerOptions as SelfCheckWorkerOptions,
+        work_once as work_self_check_once,
+    };
     /// The staging-worker singleton's advisory-lock key, for a crash test
     /// that holds the singleton itself to stand in for a killed engine's
     /// backend that hasn't freed it yet.

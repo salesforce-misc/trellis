@@ -182,8 +182,8 @@ pub use numeric::Numeric;
 pub use otel::OtelError;
 pub use pool::Pool;
 pub use staging::{
-    CaptureFault, Divergence, DrainFailure, HeldKeys, SelfCheckMode, SelfCheckOutcome,
-    SelfCheckReport, SelfCheckScope, UnindexedJoin,
+    CaptureFault, Divergence, DrainFailure, HeldKeys, SelfCheckJob, SelfCheckJobState,
+    SelfCheckMode, SelfCheckOutcome, SelfCheckReport, UnindexedJoin,
 };
 
 // --- Tier 2: the error types the public errors wrap -----------------------

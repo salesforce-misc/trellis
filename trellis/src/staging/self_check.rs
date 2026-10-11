@@ -4,13 +4,14 @@
 //! from-scratch recompute at any caught-up LSN. The failure mode this module
 //! guards against is a *silently stale target*: a wrong answer with no error
 //! raised and no metric out of range, invisible without an independent
-//! recompute. [`self_check`] makes that recompute a shipped,
+//! recompute. `self_check` makes that recompute a shipped,
 //! operator-callable capability instead of something only the test suite can
-//! perform — see [`crate::app::Trellis::self_check`] for the public facade.
+//! perform — see [`crate::app::Trellis::self_check`] for the public facade
+//! and [`super::self_check_job`] for the background job behind it.
 //!
 //! # Postgres is the oracle; the comparison is two-way
 //!
-//! [`self_check`] compares the persisted target against an equivalent
+//! `self_check` compares the persisted target against an equivalent
 //! recompute *query* executed by Postgres. It does not run the engine's Rust
 //! evaluator ([`crate::defs::eval::evaluate`]) as part of the comparison —
 //! re-running the evaluator would check the engine against itself.
@@ -33,7 +34,7 @@
 //!
 //! # The capture audit comes first
 //!
-//! Before it waits or compares anything, [`self_check`] checks from the
+//! Before it waits or compares anything, `self_check` checks from the
 //! catalog that every table the target is computed from is still captured
 //! as `capture::install` installed it: all five triggers present, `ENABLE
 //! ALWAYS` and calling their functions, the functions `SECURITY DEFINER` and
@@ -53,7 +54,7 @@
 //! # Quiescence: "diverged" vs "not yet caught up"
 //!
 //! A single snapshot is not sufficient under live load: a correctly-working
-//! target legitimately lags its source by CDC apply latency. [`self_check`]
+//! target legitimately lags its source by CDC apply latency. `self_check`
 //! takes a watermark token, awaits convergence through it (bounded by a
 //! timeout — on timeout it reports [`SelfCheckOutcome::NotCaughtUp`], never a
 //! divergence; any other failure of the wait is an `Err`, see [`caught_up`]),
@@ -76,7 +77,7 @@
 //! resume, an `ALTER TRANSFORM`, a capture re-install) does its work in
 //! background jobs the ring knows nothing about. A comparison made while the
 //! definition is being built would therefore agree or disagree with a state
-//! the build is about to change. So [`self_check`] compares only a `live`
+//! the build is about to change. So `self_check` compares only a `live`
 //! definition, and reports any other as [`SelfCheckOutcome::NotLive`] with
 //! its status, after the capture audit and before the wait. `live` is strict:
 //! every job of a rebuild is done before the definition reads it again, and
@@ -92,19 +93,20 @@
 //! instead of a plain keyset, is the natural next step, not a rewrite (see
 //! ADR-0013, "Scope: 1-1 first, then aggregates and relationships").
 //!
-//! # Bounded, keyset-scoped, mandatory
+//! # One page at a time
 //!
-//! There is no unbounded "check everything" convenience method here:
-//! [`SelfCheckScope`] always bounds one call to a keyset page. A fleet-wide
-//! sweep is a caller-side loop over [`crate::app::Trellis::definitions`] and
-//! repeated [`self_check`] calls chained by [`SelfCheckReport::next_after`],
-//! not a behaviour of this primitive itself.
+//! This module compares one keyset page ([`SelfCheckScope`]) of a target:
+//! [`check_page`] and the audit under it. The public `self_check` is a
+//! background job built from those pages, one per pass of a worker task
+//! ([`super::self_check_job`], #1023, #599): it registers a row and
+//! returns, a worker walks the target's keyspace page by page, and the
+//! caller polls the row. No page runs inside a public call.
 //!
 //! # Column-level quarantine
 //!
 //! A paused column ([`crate::staging::quarantine`]) holds a deliberately
 //! stale value, so comparing it would report a false divergence on exactly
-//! the targets an operator is most likely to be inspecting — [`self_check`]
+//! the targets an operator is most likely to be inspecting — `self_check`
 //! excludes any currently-paused column of the audited transform from the
 //! comparison entirely (see [`paused_columns`]).
 //!
@@ -113,8 +115,8 @@
 //! A key the audited definition holds in quarantine
 //! ([`crate::staging::quarantine`]) has a target row the definition stopped
 //! writing, and a key with changes parked holds back the convergence wait.
-//! Every report names how many keys the definition holds and since when
-//! ([`SelfCheckReport::held_keys`]), read once the audit is done, so a
+//! Every page's report names how many keys the definition holds and since when
+//! ([`SelfCheckPage::held_keys`]), read once the audit is done, so a
 //! `Converged` page that never reached one, or a `NotCaughtUp` it causes,
 //! can't hide it.
 
@@ -122,6 +124,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio_postgres::types::PgLsn;
 
 use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate};
@@ -137,12 +140,12 @@ use super::converge;
 use super::error::StagingError;
 use super::holdup::{self, DrainFailure};
 use super::quarantine::{self, HeldKeys};
-use super::unindexed_joins::{self, UnindexedJoin};
+use super::unindexed_joins::UnindexedJoin;
 
-/// One page's worth of bound for a [`self_check`] call — see the module doc
+/// One page's worth of bound for a [`check_page`] call — see the module doc
 /// comment's "Bounded, keyset-scoped, mandatory" section. `after` is a
 /// keyset cursor (the last key seen by a previous call's
-/// [`SelfCheckReport::next_after`]; `None` starts from the beginning of the
+/// [`SelfCheckPage::next_after`]; `None` starts from the beginning of the
 /// target's keyspace), and `limit` caps how many distinct keys this one call
 /// examines. There is deliberately no `Default` impl that would let a caller
 /// construct an effectively-unbounded scope by omission — every field must
@@ -198,10 +201,14 @@ pub enum SelfCheckMode {
     Strict,
 }
 
-/// One [`self_check`] call's result.
+/// One [`check_page`] call's result: a keyset page of the comparison.
+///
+/// The job ([`super::self_check_job`]) reads the comparison's own fields; the
+/// rest is what `check_page`, the page on its own, adds for the tests of it.
+#[cfg_attr(not(any(test, feature = "internals")), allow(dead_code))]
 #[derive(Debug, Clone)]
-pub struct SelfCheckReport {
-    /// The audited target's bare table name (as passed to [`self_check`]).
+pub struct SelfCheckPage {
+    /// The audited target's bare table name (as passed to [`check_page`]).
     pub target: String,
     /// The watermark token this report's [`SelfCheckOutcome`] was checked
     /// through — the LSN [`converge::await_converged`] confirmed the target
@@ -262,10 +269,10 @@ pub struct SelfCheckReport {
     pub unindexed_joins: Vec<UnindexedJoin>,
 }
 
-/// What [`self_check`] found — see the module doc comment's "Quiescence"
+/// What `self_check` found — see the module doc comment's "Quiescence"
 /// section for why [`SelfCheckOutcome::NotCaughtUp`] is a distinct outcome
 /// from [`SelfCheckOutcome::Diverged`] rather than folded into it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfCheckOutcome {
     /// No divergence — every comparable cell, row, and column matched (under
     /// [`SelfCheckMode::Standard`], this also covers a divergence that
@@ -290,9 +297,9 @@ pub enum SelfCheckOutcome {
     NotLive(TransformStatus),
 }
 
-/// One divergence [`self_check`] found: ADR-0013's four kinds, plus a
+/// One divergence `self_check` found: ADR-0013's four kinds, plus a
 /// broken capture.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Divergence {
     /// A row exists on both sides, but `column`'s value differs.
     Cell {
@@ -324,19 +331,19 @@ pub enum Divergence {
     /// Trellis role (#745), which would filter its reads, this audit's too
     /// (or the target's does, which would filter its writes, #765),
     /// or a logical-replication subscription replicates into it (#751). Its
-    /// changes may not be reaching the target at all, so [`self_check`] reports these before, and instead
+    /// changes may not be reaching the target at all, so `self_check` reports these before, and instead
     /// of, a recompute comparison.
     Capture(CaptureFault),
 }
 
-/// Why a [`self_check`] call failed outright (as opposed to reporting a
+/// Why a [`check_page`] call failed outright (as opposed to reporting a
 /// [`SelfCheckOutcome::Diverged`], which is a successful audit that found a
 /// problem, not a failure of the audit itself).
 #[derive(Debug)]
 pub enum SelfCheckError {
     /// No transform is registered under this target table name.
     TargetNotFound(String),
-    /// [`self_check`] only audits a [`KeySpace::OneToOne`] target this issue
+    /// `self_check` only audits a [`KeySpace::OneToOne`] target this issue
     /// — see the module doc comment's "Scope" section.
     UnsupportedKeySpace {
         target: String,
@@ -354,6 +361,12 @@ pub enum SelfCheckError {
     UnsupportedExpr {
         target: String,
         detail: String,
+    },
+    /// A page of a `self_check` job ran past its budget
+    /// ([`super::self_check_job::page_budget`]) and the server stopped it.
+    /// The job fails with this; a new `self_check` starts over.
+    PageTimedOut {
+        budget: Duration,
     },
     Ddl(DdlError),
     Catalog(CatalogError),
@@ -374,6 +387,7 @@ impl SelfCheckError {
             SelfCheckError::UnsupportedKeySpace { .. }
             | SelfCheckError::UnsupportedExpr { .. }
             | SelfCheckError::InvalidScope { .. } => ErrorCode::Validation,
+            SelfCheckError::PageTimedOut { .. } => ErrorCode::Timeout,
             SelfCheckError::Ddl(err) => err.code(),
             SelfCheckError::Catalog(err) => err.code(),
             SelfCheckError::Staging(err) => err.code(),
@@ -397,6 +411,10 @@ impl fmt::Display for SelfCheckError {
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")
             }
+            SelfCheckError::PageTimedOut { budget } => write!(
+                f,
+                "a self_check page ran past its {budget:?} budget, and the server stopped it"
+            ),
             SelfCheckError::InvalidScope { limit } => write!(
                 f,
                 "self_check needs a positive SelfCheckScope::limit; got {limit}"
@@ -424,6 +442,7 @@ impl std::error::Error for SelfCheckError {
             SelfCheckError::TargetNotFound(_)
             | SelfCheckError::UnsupportedKeySpace { .. }
             | SelfCheckError::UnsupportedExpr { .. }
+            | SelfCheckError::PageTimedOut { .. }
             | SelfCheckError::InvalidScope { .. } => None,
         }
     }
@@ -459,21 +478,99 @@ impl From<crate::error::Error> for SelfCheckError {
     }
 }
 
-/// Audits `target_table` — see the module doc comment for the full design.
-/// `pool` is threaded straight through from [`crate::app::Trellis::pool`];
-/// this is the function [`crate::app::Trellis::self_check`] is a thin facade
-/// over.
-pub async fn self_check(
+/// Audits one keyset page of `target_table` — see the module doc comment for
+/// the full design. The background job ([`super::self_check_job`]) runs this
+/// once per pass of its worker, each from where the last ended; it is
+/// not reached from a public call.
+#[cfg(any(test, feature = "internals"))]
+pub async fn check_page(
     pool: &Pool,
     target_table: &str,
     scope: SelfCheckScope,
     mode: SelfCheckMode,
     timeout: Duration,
-) -> Result<SelfCheckReport, SelfCheckError> {
-    if scope.limit <= 0 {
-        return Err(SelfCheckError::InvalidScope { limit: scope.limit });
+) -> Result<SelfCheckPage, SelfCheckError> {
+    let def = comparable_definition(pool, target_table).await?;
+    let mut page = audit(pool, &def, target_table, scope, mode, timeout).await?;
+    // Read once the audit is done, so a key poisoned while it waited or
+    // compared is reported too.
+    let found = findings(pool, &def).await?;
+    page.held_keys = found.held_keys;
+    page.drain_failures = found.drain_failures;
+    page.unindexed_joins =
+        super::unindexed_joins::for_definition(&**pool.get().await?, &def.source_table, &def.def)
+            .await?;
+    Ok(page)
+}
+
+/// [`check_page`] through a [`crate::Trellis`] handle, for the tests of the
+/// page-level comparison (its keyset paging, collation and report fields),
+/// which `Trellis::self_check`'s background job no longer exposes.
+#[cfg(any(test, feature = "internals"))]
+pub trait CheckPageExt {
+    /// One page of the comparison of `target_table`, as the job's worker runs
+    /// it, plus the findings a report carries.
+    fn self_check_page(
+        &self,
+        target_table: &str,
+        scope: SelfCheckScope,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<SelfCheckPage, crate::TrellisError>> + Send;
+
+    /// `Trellis::self_check` run to its end: the job it starts, with every
+    /// page run by hand ([`super::self_check_job::run_to_end`]), and its
+    /// report, for the tests that want the verdict.
+    fn self_check_to_end(
+        &self,
+        target_table: &str,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> impl std::future::Future<
+        Output = Result<super::self_check_job::SelfCheckReport, crate::TrellisError>,
+    > + Send;
+}
+
+#[cfg(any(test, feature = "internals"))]
+impl CheckPageExt for crate::Trellis {
+    async fn self_check_page(
+        &self,
+        target_table: &str,
+        scope: SelfCheckScope,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> Result<SelfCheckPage, crate::TrellisError> {
+        check_page(self.pool(), target_table, scope, mode, timeout)
+            .await
+            .map_err(crate::TrellisError::SelfCheck)
     }
 
+    async fn self_check_to_end(
+        &self,
+        target_table: &str,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> Result<super::self_check_job::SelfCheckReport, crate::TrellisError> {
+        let options = super::self_check_job::WorkerOptions::new(Duration::from_secs(30));
+        let job =
+            super::self_check_job::run_to_end(self, target_table, mode, timeout, &options).await?;
+        match job.report {
+            Some(report) => Ok(report),
+            None => panic!(
+                "the self_check job did not finish with a report: {:?} {:?}",
+                job.state, job.error
+            ),
+        }
+    }
+}
+
+/// The definition registered under `target_table`, if it is one `self_check`
+/// can compare: a 1-1 target, whose fields render ([`render_leaf`]). Refused
+/// with what is wrong otherwise.
+pub(crate) async fn comparable_definition(
+    pool: &Pool,
+    target_table: &str,
+) -> Result<Definition, SelfCheckError> {
     let def = catalog::definition_by_target(pool, target_table)
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
@@ -483,28 +580,52 @@ pub async fn self_check(
             target: target_table.to_string(),
         });
     }
-
-    let mut report = audit(pool, &def, target_table, scope, mode, timeout).await?;
-    // Read once the audit is done, so a key poisoned while it waited or
-    // compared is reported too.
-    let client = pool.get().await?;
-    report.held_keys = quarantine::held_keys(&**client, def.id).await?;
-    report.drain_failures = holdup::open(&**client).await?;
-    report.unindexed_joins =
-        unindexed_joins::for_definition(&**client, &def.source_table, &def.def).await?;
-    Ok(report)
+    Ok(def)
 }
 
-/// [`self_check`]'s audit of `def`, the definition registered under
-/// `target_table`, with no [`SelfCheckReport::held_keys`] yet.
-async fn audit(
+/// Refuses a definition with a field [`render_leaf`] can't render (a
+/// relationship path), which the comparison would otherwise refuse only once
+/// it got that far.
+pub(crate) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
+    for field in &def.def.fields {
+        render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
+            target: def.def.target.clone(),
+            detail,
+        })?;
+    }
+    Ok(())
+}
+
+/// What a report says about the instance and the definition, whatever its
+/// outcome: read live, when the report is made.
+pub(crate) struct Findings {
+    pub(crate) held_keys: Option<HeldKeys>,
+    pub(crate) drain_failures: Vec<DrainFailure>,
+}
+
+/// [`Findings`] for `def`.
+pub(crate) async fn findings(pool: &Pool, def: &Definition) -> Result<Findings, SelfCheckError> {
+    let client = pool.get().await?;
+    Ok(Findings {
+        held_keys: quarantine::held_keys(&**client, def.id).await?,
+        drain_failures: holdup::open(&**client).await?,
+    })
+}
+
+/// [`check_page`]'s audit of `def`, the definition registered under
+/// `target_table`, with no [`SelfCheckPage::held_keys`] yet.
+pub(crate) async fn audit(
     pool: &Pool,
     def: &Definition,
     target_table: &str,
     scope: SelfCheckScope,
     mode: SelfCheckMode,
     timeout: Duration,
-) -> Result<SelfCheckReport, SelfCheckError> {
+) -> Result<SelfCheckPage, SelfCheckError> {
+    if scope.limit <= 0 {
+        return Err(SelfCheckError::InvalidScope { limit: scope.limit });
+    }
+
     // #622 C9: a table whose capture is broken may not be feeding the target
     // at all, so that is reported first, and alone. A recompute comparison
     // would only show the symptom, and the convergence wait before it would
@@ -521,7 +642,7 @@ async fn audit(
         }
     };
     if let Some((faults, read_at)) = capture {
-        return Ok(SelfCheckReport {
+        return Ok(SelfCheckPage {
             target: target_table.to_string(),
             checked_through: read_at,
             rows_compared: 0,
@@ -543,7 +664,7 @@ async fn audit(
     // state.
     if def.status != TransformStatus::Live {
         let client = pool.get().await?;
-        return Ok(SelfCheckReport {
+        return Ok(SelfCheckPage {
             target: target_table.to_string(),
             checked_through: converge::watermark_token(&**client).await?,
             rows_compared: 0,
@@ -565,7 +686,7 @@ async fn audit(
 
     let pass1 = match await_then_compare(pool, def, &pk, &scope, &paused, timeout).await? {
         AwaitOutcome::NotCaughtUp { attempted } => {
-            return Ok(SelfCheckReport {
+            return Ok(SelfCheckPage {
                 target: target_table.to_string(),
                 checked_through: attempted,
                 rows_compared: 0,
@@ -583,7 +704,7 @@ async fn audit(
     divergences.extend(pass1.divergences);
 
     if divergences.is_empty() {
-        return Ok(SelfCheckReport {
+        return Ok(SelfCheckPage {
             target: target_table.to_string(),
             checked_through: pass1.checked_through,
             rows_compared: pass1.rows_compared,
@@ -596,7 +717,7 @@ async fn audit(
     }
 
     if mode == SelfCheckMode::Strict {
-        return Ok(SelfCheckReport {
+        return Ok(SelfCheckPage {
             target: target_table.to_string(),
             checked_through: pass1.checked_through,
             rows_compared: pass1.rows_compared,
@@ -614,7 +735,7 @@ async fn audit(
     // from scratch, behind a brand-new watermark token/await.
     let pass2 = match await_then_compare(pool, def, &pk, &scope, &paused, timeout).await? {
         AwaitOutcome::NotCaughtUp { attempted } => {
-            return Ok(SelfCheckReport {
+            return Ok(SelfCheckPage {
                 target: target_table.to_string(),
                 checked_through: attempted,
                 rows_compared: 0,
@@ -638,7 +759,7 @@ async fn audit(
         SelfCheckOutcome::Diverged(stable)
     };
 
-    Ok(SelfCheckReport {
+    Ok(SelfCheckPage {
         target: target_table.to_string(),
         checked_through: pass2.checked_through,
         rows_compared: pass2.rows_compared,
@@ -1053,7 +1174,7 @@ fn diff_page(
     }
 }
 
-/// Every column [`self_check`] must currently exclude from comparison for
+/// Every column `self_check` must currently exclude from comparison for
 /// `transform_table` — deliberately a fresh copy of the identical one-line
 /// query [`crate::staging::quarantine::paused_columns_for`] already runs
 /// (that helper is `pub(super)`, scoped to `staging::quarantine`'s own
@@ -1083,9 +1204,9 @@ async fn paused_columns(
 /// primary key, plus every calculated field) vs. what it actually has —
 /// [`Divergence::MissingColumn`]/[`Divergence::ExtraColumn`], ADR-0013's
 /// schema-drift divergence kind. Cheap (one `pg_attribute` read), checked
-/// once per [`self_check`] call rather than per comparison pass — schema
+/// once per `self_check` call rather than per comparison pass — schema
 /// drift isn't something a convergence race could produce or resolve, so it
-/// doesn't participate in the re-check dance [`self_check`] runs for
+/// doesn't participate in the re-check dance `self_check` runs for
 /// row-level divergences.
 async fn check_schema(
     pool: &Pool,

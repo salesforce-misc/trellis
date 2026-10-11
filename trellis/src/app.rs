@@ -69,11 +69,11 @@
 //! the call is made, a wait for a pooled connection included. What it started
 //! on the server is stopped by the server's own `statement_timeout`, not
 //! abandoned, and its transaction rolls back; the caller gets
-//! [`TrellisError::CallTimeout`], whose code is [`ErrorCode::Timeout`]. Two
-//! methods run outside it: [`Trellis::shutdown`], which ends background work
-//! rather than serving a request, and [`Trellis::self_check`], a full
-//! comparison that is to become a background job polled through
-//! [`Trellis::status`]. [`Trellis::connect`], [`Trellis::pool`],
+//! [`TrellisError::CallTimeout`], whose code is [`ErrorCode::Timeout`]. One
+//! method runs outside it: [`Trellis::shutdown`], which ends background work
+//! rather than serving a request. [`Trellis::self_check`], a full comparison
+//! of a target, is inside it because it only starts a background job, which
+//! [`Trellis::self_check_job`] polls. [`Trellis::connect`], [`Trellis::pool`],
 //! [`Trellis::config`] and [`Trellis::metrics`] make no call to the database
 //! that could wait.
 //!
@@ -132,7 +132,8 @@ use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::holdup::DrainFailure;
 use crate::staging::quarantine::{self, HeldKeys};
-use crate::staging::self_check::{SelfCheckError, SelfCheckMode, SelfCheckReport, SelfCheckScope};
+use crate::staging::self_check::{SelfCheckError, SelfCheckMode};
+use crate::staging::self_check_job::{self, SelfCheckJob};
 use crate::staging::unindexed_joins::{self, UnindexedJoin};
 use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registry};
 
@@ -252,8 +253,8 @@ impl Trellis {
 
     /// Runs one public call: under this instance's name in the log, and
     /// within its deadline (issue #599, `crate::deadline`). The wrapper of
-    /// every public method that touches the database except the two
-    /// documented on [`Trellis::shutdown`] and [`Trellis::self_check`].
+    /// every public method that touches the database except the one
+    /// documented on [`Trellis::shutdown`].
     fn call<'a, T: 'a>(
         &'a self,
         call: impl std::future::Future<Output = Result<T, TrellisError>> + Send + 'a,
@@ -1480,63 +1481,88 @@ impl Trellis {
         .await
     }
 
-    /// Audits one target's persisted rows against an independently-rendered
-    /// Postgres recompute — issue #174, ADR-0013's production recompute
-    /// audit. Read-only.
+    /// Starts a check of one target's persisted rows against an
+    /// independently-rendered Postgres recompute — issue #174, ADR-0013's
+    /// production recompute audit — and returns the job at once. Read-only.
+    ///
+    /// The comparison is a background job (#1023, #599): this call registers
+    /// it and returns, and a process that runs drain workers
+    /// (`drain_threads > 0`, any process of the fleet) walks the target a
+    /// keyset page at a time on a task beside them, saving
+    /// its progress as it goes. Poll [`Trellis::self_check_job`] with the
+    /// returned job's `id` until its state is finished
+    /// ([`SelfCheckJobState::is_finished`](crate::SelfCheckJobState::is_finished)); [`SelfCheckJob::report`](crate::SelfCheckJob::report) is then
+    /// the verdict. With no drain worker anywhere the job stays
+    /// [`Queued`](crate::SelfCheckJobState::Queued), as a define does. Nothing in this call
+    /// reads the target's rows.
     ///
     /// `target_table` names a registered transform, same convention as
     /// [`Trellis::status`]/[`Trellis::quarantine_status`] (its bare target
-    /// table name). `scope` bounds this call to one keyset page — there is
-    /// no unbounded "check everything" convenience method here; a
-    /// fleet-wide sweep is a caller-side loop over
-    /// [`Trellis::definitions`] and repeated `self_check` calls chained by
-    /// [`SelfCheckReport::next_after`]. `mode` picks
+    /// table name). An unknown one, an aggregate target
+    /// ([`SelfCheckError::UnsupportedKeySpace`]) and one that reads through a
+    /// relationship ([`SelfCheckError::UnsupportedExpr`]) are refused here,
+    /// wrapped in [`TrellisError::SelfCheck`]. A fleet-wide sweep is a
+    /// caller-side loop over [`Trellis::definitions`]. `mode` picks
     /// [`SelfCheckMode::Standard`] (safe under live load: a divergence must
     /// survive a re-check behind a fresh await before it's reported) or
     /// [`SelfCheckMode::Strict`] (skips the re-check — sound only once the
     /// caller has itself stopped writes to the audited tables). `timeout`
-    /// bounds each convergence await this call makes (one under
-    /// [`SelfCheckMode::Strict`], up to two under
+    /// (at most an hour) bounds each convergence await a page of the job makes (one per page
+    /// under [`SelfCheckMode::Strict`], up to two under
     /// [`SelfCheckMode::Standard`]) — see [`Trellis::await_converged`]'s own
     /// doc comment for how to size it; a target that's merely still
-    /// catching up reports [`crate::staging::self_check::SelfCheckOutcome::NotCaughtUp`],
-    /// never a divergence.
+    /// catching up reports
+    /// [`crate::staging::self_check::SelfCheckOutcome::NotCaughtUp`], never a
+    /// divergence.
     ///
-    /// Only a `live` definition is compared: any other reports
-    /// [`crate::staging::self_check::SelfCheckOutcome::NotLive`] with its
+    /// **One job per target at a time.** A target whose job is still
+    /// `queued` or `running` gets that job back, whatever `mode` and
+    /// `timeout` this call passed, so a second caller (or a retry) joins the
+    /// check in progress instead of starting another. A finished job stays
+    /// until the next call for its target replaces it.
+    ///
+    /// Only a `live` definition is compared: any other ends the job with
+    /// [`crate::staging::self_check::SelfCheckOutcome::NotLive`] and its
     /// status, and nothing is awaited or compared (#625 F7). A rebuild
     /// ([`Trellis::request_backfill`]) is `backfilling` from the call's
-    /// return, so "poll `live`, then check" checks after the repair.
-    ///
-    /// Only a [`crate::defs::ast::KeySpace::OneToOne`] target is supported
-    /// this issue (see the module doc comment on
-    /// [`crate::staging::self_check`]); an aggregate target's audit errors
-    /// with [`SelfCheckError::UnsupportedKeySpace`], wrapped in
-    /// [`TrellisError::SelfCheck`].
+    /// return, so "poll `live`, then check" checks after the repair. A job
+    /// whose target stops being live, or whose capture breaks, partway ends
+    /// there and reports what it had found, `truncated`.
     ///
     /// A currently-paused column (`docs/decisions/0003-quarantine-storage-and-api.md`)
     /// is excluded from the comparison entirely — its persisted value is
     /// deliberately stale, so comparing it would report a false divergence.
     ///
-    /// Every report carries the keys the definition holds in quarantine
-    /// ([`SelfCheckReport::held_keys`], #759), whatever the outcome, so a
-    /// held key isn't hidden behind a `Converged` page that didn't reach it
-    /// or a `NotCaughtUp` its parked changes cause.
+    /// The report carries the keys the definition holds in quarantine
+    /// ([`SelfCheckReport::held_keys`](crate::SelfCheckReport::held_keys), #759), read when it is polled
+    /// whatever the outcome, so a held key isn't hidden behind a `Converged`
+    /// job that didn't reach it or a `NotCaughtUp` its parked changes cause.
     ///
-    /// Outside the call deadline (issue #599): a page's comparison can take
-    /// longer than 30 seconds, and `timeout` bounds only each convergence wait
-    /// it makes. #599 decides it becomes a background job whose progress comes
-    /// back through [`Trellis::status`]; until it does, it runs unbounded by
-    /// the deadline.
+    /// The job ends when its transform is dropped (and a poll then finds
+    /// nothing) and when the worker running it shuts down (it is then
+    /// [`Cancelled`](crate::SelfCheckJobState::Cancelled)).
     pub async fn self_check(
         &self,
         target_table: &str,
-        scope: SelfCheckScope,
         mode: SelfCheckMode,
         timeout: Duration,
-    ) -> Result<SelfCheckReport, TrellisError> {
-        crate::instance_log::scoped(self.instance.clone(), async {
-            crate::staging::self_check::self_check(&self.pool, target_table, scope, mode, timeout)
+    ) -> Result<SelfCheckJob, TrellisError> {
+        self.call(async {
+            self_check_job::start(&self.pool, target_table, mode, timeout)
+                .await
+                .map_err(TrellisError::SelfCheck)
+        })
+        .await
+    }
+
+    /// The `self_check` job `id` ([`SelfCheckJob::id`](crate::SelfCheckJob::id), from
+    /// [`Trellis::self_check`]): its state, how many keys it has compared so
+    /// far, and, once it is [`Done`](crate::SelfCheckJobState::Done), its report. `None`
+    /// when there is no such job: a newer `self_check` of its target replaced
+    /// it, or its transform was dropped.
+    pub async fn self_check_job(&self, id: i64) -> Result<Option<SelfCheckJob>, TrellisError> {
+        self.call(async {
+            self_check_job::get(&self.pool, id)
                 .await
                 .map_err(TrellisError::SelfCheck)
         })

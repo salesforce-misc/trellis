@@ -471,12 +471,11 @@ for summary in trellis.definitions().await? {
 }
 ```
 
-`self_check` carries the same list on the reports it returns, but it refuses a
-target that reads a relationship once it reaches the comparison
-([observability](observability.md#transform-status-lifecycle)), so read the
-warning from `status`. In `trellis-embed`, `PlainDefinitionStatus` and
-`PlainSelfCheckReport` carry it as `unindexed_joins`, each entry with
-`relationship`, `table`, `column` and the `fix` sentence. The CLI's
+`self_check` refuses a target that reads a relationship
+([observability](observability.md#transform-status-lifecycle)), so the warning
+is read from `status`. In `trellis-embed`, `PlainDefinitionStatus` carries it
+as `unindexed_joins`, each entry with `relationship`, `table`, `column` and the
+`fix` sentence. The CLI's
 `trellis status` prints each entry as a warning line under its definition.
 
 ## Migrations and transactions
@@ -692,7 +691,9 @@ it, and the reply is dropped.
 
 Heavy work isn't done inside a call. `apply` registers a definition and
 returns, and the build runs in the background, so a caller that needs the
-result polls `status` ([below](#poll-to-live-dont-wait)). One statement
+result polls `status` ([below](#poll-to-live-dont-wait)). `self_check` is the
+same: it starts a background job and returns, and the caller polls the job
+([below](#self_check-is-a-background-job)). One statement
 still reads table rows inside the call: a to-one relationship's declaration
 (or a transform reading through one) seeds the relationship's projection from
 its to-side table, and on a large enough table it runs out of time and
@@ -700,8 +701,6 @@ registers nothing.
 
 An `await_converged` timeout longer than the deadline is cut to what is left
 of it. To wait longer, call again: each call is one bounded wait.
-`self_check` is the exception for now: it runs outside the deadline, and its
-`timeout` argument bounds each convergence wait it makes, not the whole call.
 
 A `BlockingTrellis` runs its calls in parallel, so a call stuck on a lock
 doesn't hold up the calls made after it. A caller's own calls stay in order,
@@ -900,11 +899,66 @@ then taking a token, covers the repair. Any other reader of the table reports
 `catching_up` until its catch-up has run.
 
 `self_check` follows the same rule: it compares only a `live` transform. For
-any other it returns the outcome `not_live` (Rust's
+any other its job ends with the outcome `not_live` (Rust's
 `SelfCheckOutcome::NotLive(status)`, Elixir's and Ruby's `:not_live`) with
 the status in the report's `status`, and compares and waits for nothing. Poll
 for `live`, then check again. Like `not_caught_up`, the outcome is not a
 verdict on correctness.
+
+### `self_check` is a background job
+
+Comparing a whole target with a recompute of it can take far longer than a
+call may, so `self_check` doesn't do it. It registers a job and returns the job
+at once, and a process that runs drain workers (`drain_threads > 0`, any
+process of the fleet) walks the target a page of keys at a time, on a task of
+its own so the drains the check waits on go on. The caller polls the job by its id
+until it is finished, and reads the verdict from the report:
+
+```rust
+let job = trellis.self_check("order_totals", SelfCheckMode::Standard, Duration::from_secs(30)).await?;
+let report = loop {
+    let job = trellis.self_check_job(job.id).await?.expect("no one dropped the transform");
+    match job.state {
+        SelfCheckJobState::Done => break job.report.expect("a done job has its report"),
+        SelfCheckJobState::Failed | SelfCheckJobState::Cancelled => {
+            panic!("the check ended {:?}: {:?}", job.state, job.error);
+        }
+        // Queued: no drain worker has taken it. Running: `rows_compared` is its progress.
+        _ => tokio::time::sleep(Duration::from_secs(1)).await,
+    }
+};
+```
+
+* **States.** `queued` (registered; with no drain worker anywhere in the fleet
+  it stays so, as a define does), `running` (a worker holds it;
+  `rows_compared` moves), then `done` (`report` is the verdict), `failed`
+  (`error` says why: a page ran past its budget, or the database failed it) or
+  `cancelled` (the worker running it shut down).
+* **One job per target.** A second `self_check` of a target whose job is
+  `queued` or `running` returns that job, whatever mode and timeout it passed,
+  so a retry joins the check in progress. A finished job stays until the next
+  `self_check` of its target replaces it; polling the replaced id, or the id of
+  a job whose transform was dropped, returns nothing.
+* **What the job holds.** Nothing between pages. A page only reads, its
+  comparison one statement under one snapshot, bounded on the server like a
+  call is, so a stuck page fails the job rather than sit on a connection, and
+  a worker that stops mid-page (a shutdown, a crash) leaves a job another
+  worker resumes or the poll shows cancelled. `timeout` bounds each convergence wait a page
+  makes, not the job.
+* **The report** covers the whole target: `rows_compared`, every divergence
+  found (up to 1,000, after which `truncated` is set and the job stops), and,
+  read when the job is polled, the keys the transform holds in quarantine and
+  the drain failures open on the instance. A job that finds its transform no
+  longer live, its target no longer caught up, or its capture broken partway
+  ends there with what it had found, `truncated`.
+* **A target `self_check` can't compare**
+  ([known gap 16](known-correctness-gaps.md#16-self_check-audits-1-1-targets-only)),
+  or an unknown name, is refused by the call that would start the job.
+
+In Ruby the job is a `Trellis::SelfCheckJob` (`finished?` says whether to stop
+polling) and its report a `Trellis::SelfCheckReport`; in Elixir a
+`Trellis.SelfCheckJob` and `Trellis.SelfCheckReport`, read with
+`Trellis.self_check_job/2`.
 
 ## What a transform can do
 
@@ -916,5 +970,6 @@ which column types play which role are in
 [transforms](transforms.md) and the [type-support matrix](type-support.md).
 Whatever the shape, what you can rely on is the status lifecycle and the `live`
 plus `await_converged` contract above. `self_check` audits a target against a
-recompute from its source ([known correctness gaps](known-correctness-gaps.md)
-lists what it doesn't cover).
+recompute from its source, as a [background job](#self_check-is-a-background-job)
+([known correctness gaps](known-correctness-gaps.md) lists what it doesn't
+cover).

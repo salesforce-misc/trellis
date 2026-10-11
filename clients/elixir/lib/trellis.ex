@@ -21,7 +21,7 @@ defmodule Trellis do
   - **Operations:** `request_backfill/2`, `has_live_drain_workers/1`,
     `has_live_staging_worker/1`, the read-your-writes pair
     `watermark_token/1` and `await_converged/3`, and the audit
-    `self_check/3`.
+    `self_check/3`, a background job that `self_check_job/2` reads back.
   - **Observability:** `Trellis.Metrics.render_prometheus/0` for a scrape
     route the host serves, and `Trellis.LogBridge`, which forwards the
     engine's log lines to `Logger` from the moment `:trellis_pg` starts.
@@ -51,8 +51,7 @@ defmodule Trellis do
   - A quarantine target is an address string: a transform's bare target
     table name (`"order_totals"`) or `"transform.column"`
     (`"order_totals.total"`), exactly as `quarantined/1` reports it.
-  - `sample_quarantined/3`'s and `self_check/3`'s cursors and
-    `watermark_token/1`'s token are opaque: pass back what the previous call
+  - `sample_quarantined/3`'s cursor and `watermark_token/1`'s token are opaque: pass back what the previous call
     returned.
   - Every atom in a result comes from a closed set allocated when the NIF
     loads; none is ever built from a string the database returned.
@@ -122,7 +121,7 @@ defmodule Trellis do
     QuarantineEntry,
     RelationshipSummary,
     SamplePage,
-    SelfCheckReport,
+    SelfCheckJob,
     Status
   }
 
@@ -181,6 +180,7 @@ defmodule Trellis do
   # `u64` millisecond count); anything larger is refused as `:validation`
   # rather than failing to decode in the NIF.
   @max_limit 9_223_372_036_854_775_807
+  @min_job_id -9_223_372_036_854_775_808
   @max_timeout_ms 18_446_744_073_709_551_615
 
   @defaults %{
@@ -229,7 +229,7 @@ defmodule Trellis do
   time, as it would on the handle, which runs one call at a time anyway.
   Only the owning process waits on a dirty IO scheduler, and the callers
   wait in its mailbox. A caller's call has no timeout of its own, so a
-  call made behind a long `await_converged/3` or `self_check/3` waits for it.
+  call made behind a long `await_converged/3` waits for it.
 
   `shutdown/1` refuses the process's name: its supervisor stops it. The
   child spec gives it 30 seconds to shut down, since `shutdown/1` waits for
@@ -573,67 +573,85 @@ defmodule Trellis do
   @typedoc """
   Options for `self_check/3`:
 
-  - `:limit` (required): the most keys to audit in this call.
-  - `:timeout_ms` (required): how long to wait for the target to catch up,
-    per wait. A `:standard` check waits up to twice, a `:strict` one once.
-  - `:after`: the `next_after` of the previous report. Default `nil`, the
-    first page.
+  - `:timeout_ms` (required): how long a page of the job waits for the
+    target to catch up, per wait. A `:standard` check waits up to twice per
+    page, a `:strict` one once.
   - `:mode`: `:standard` (default) re-checks anything that differs after a
     fresh wait, so a change still in flight isn't reported; it is safe while
     the source is being written. `:strict` skips the re-check, and is only
     sound once writes to the audited tables have stopped.
   """
   @type self_check_option ::
-          {:limit, pos_integer()}
-          | {:timeout_ms, non_neg_integer()}
-          | {:after, SelfCheckReport.cursor() | nil}
+          {:timeout_ms, non_neg_integer()}
           | {:mode, :standard | :strict}
 
   @doc """
-  Audits one page of `target_table` against a fresh recompute of its
-  definition from the source tables, and reports what differs. See
-  `t:self_check_option/0` and `Trellis.SelfCheckReport`.
+  Starts a background check of `target_table` against a fresh recompute of
+  its definition from the source tables, and returns the `Trellis.SelfCheckJob`
+  at once. See `t:self_check_option/0`.
 
-  Only a one-row-per-source-key transform can be audited; an aggregate
-  target is a `:validation` error, and an unknown one `:not_found`. A
-  column that is paused is left out of the comparison.
+  The comparison is a drain worker's, a page of keys at a time (with no
+  drain worker anywhere in the fleet the job stays `:queued`, as a define
+  does). Poll `self_check_job/2` with the job's `id` until it is finished
+  (`Trellis.SelfCheckJob.finished?/1`); its `Trellis.SelfCheckReport` is then
+  the verdict:
 
-  To sweep a whole target, chain calls through `next_after`:
+      {:ok, job} = Trellis.self_check(trellis, "order_totals", timeout_ms: 30_000)
+      {:ok, %Trellis.SelfCheckJob{state: :done, report: report}} = Trellis.self_check_job(trellis, job.id)
 
-      {:ok, report} = Trellis.self_check(trellis, "order_totals", limit: 1_000, timeout_ms: 30_000)
-      {:ok, next} = Trellis.self_check(trellis, "order_totals", limit: 1_000, timeout_ms: 30_000, after: report.next_after)
+  A target whose job is still `:queued` or `:running` gets that job back,
+  whatever options this call passed; a finished job stays until the next
+  `self_check/3` of its target replaces it. Only a one-row-per-source-key
+  transform that reads no relationship can be audited; an aggregate or
+  relationship-reading target is a `:validation` error, and an unknown one
+  `:not_found`. A column that is paused is left out of the comparison.
 
-  The handle runs one call at a time, and this one can hold it for up to
-  `:timeout_ms` per wait (twice under `:standard`) plus the comparison of
-  up to `:limit` keys. Every other call on the handle, from any process,
-  waits behind it, each parking one of the BEAM's dirty IO schedulers while
-  it does. To sweep a large target alongside live traffic, give the audit a
-  handle of its own, connected with the defaults so it runs no background
-  work.
+  The call reads nothing of the target, so it returns well inside the
+  30-second call limit.
   """
   @spec self_check(trellis(), String.t(), [self_check_option()]) ::
-          {:ok, SelfCheckReport.t()} | {:error, Error.t()}
+          {:ok, SelfCheckJob.t()} | {:error, Error.t()}
   def self_check(trellis, target_table, options)
       when is_trellis(trellis) and is_binary(target_table) and is_list(options) do
     with {:ok, opts} <- self_check_options(options),
-         {:ok, report} <-
+         {:ok, job} <-
            native(
              run(trellis, :self_check, [
                target_table,
-               opts.after,
-               opts.limit,
                Atom.to_string(opts.mode),
                opts.timeout_ms
              ])
            ) do
-      {:ok, SelfCheckReport.from_native(report)}
+      {:ok, SelfCheckJob.from_native(job)}
     end
   end
 
   @doc "Like `self_check/3`, but raises `Trellis.Error`."
-  @spec self_check!(trellis(), String.t(), [self_check_option()]) :: SelfCheckReport.t()
+  @spec self_check!(trellis(), String.t(), [self_check_option()]) :: SelfCheckJob.t()
   def self_check!(trellis, target_table, options),
     do: bang(self_check(trellis, target_table, options))
+
+  @doc """
+  The `Trellis.SelfCheckJob` that `self_check/3` returned with this `id`, as
+  it stands now: its state, how many keys it has compared so far, and, once
+  it is `:done`, its report. `nil` when there is none: a newer `self_check/3`
+  of its target replaced it, or its transform was dropped.
+  """
+  @spec self_check_job(trellis(), integer()) ::
+          {:ok, SelfCheckJob.t() | nil} | {:error, Error.t()}
+  def self_check_job(trellis, id) when is_trellis(trellis) and is_integer(id) do
+    if id in @min_job_id..@max_limit//1 do
+      with {:ok, job} <- native(run(trellis, :self_check_job, [id])) do
+        {:ok, job && SelfCheckJob.from_native(job)}
+      end
+    else
+      invalid("the job id is out of range, got: #{inspect(id)}")
+    end
+  end
+
+  @doc "Like `self_check_job/2`, but raises `Trellis.Error`."
+  @spec self_check_job!(trellis(), integer()) :: SelfCheckJob.t() | nil
+  def self_check_job!(trellis, id), do: bang(self_check_job(trellis, id))
 
   @doc """
   Stops the handle's background work and waits for its threads to exit. Any
@@ -724,7 +742,7 @@ defmodule Trellis do
     end
   end
 
-  @self_check_keys [:limit, :timeout_ms, :after, :mode]
+  @self_check_keys [:timeout_ms, :mode]
 
   defp self_check_options(options) do
     case Keyword.split(options, @self_check_keys) do
@@ -734,21 +752,14 @@ defmodule Trellis do
         )
 
       {known, []} ->
-        opts = Map.merge(%{after: nil, mode: :standard}, Map.new(known))
-        limit = Map.get(opts, :limit)
+        opts = Map.merge(%{mode: :standard}, Map.new(known))
         timeout_ms = Map.get(opts, :timeout_ms)
 
         cond do
-          not (is_integer(limit) and limit in 1..@max_limit) ->
-            invalid(":limit is required and must be a positive integer, got: #{inspect(limit)}")
-
           not (is_integer(timeout_ms) and timeout_ms in 0..@max_timeout_ms) ->
             invalid(
               ":timeout_ms is required and must be a non-negative integer, got: #{inspect(timeout_ms)}"
             )
-
-          not (is_nil(opts.after) or is_binary(opts.after)) ->
-            invalid(":after must be a cursor from a previous report, got: #{inspect(opts.after)}")
 
           opts.mode not in [:standard, :strict] ->
             invalid(":mode must be :standard or :strict, got: #{inspect(opts.mode)}")

@@ -25,6 +25,8 @@ defmodule Trellis.Parity do
   def word_set("quarantine_state"), do: words(Trellis.Native.quarantine_state_names())
   def word_set("cardinality"), do: words(Trellis.Native.cardinality_names())
   def word_set("applied_kind"), do: words(Trellis.Native.applied_kinds())
+  def word_set("self_check_mode"), do: words(Trellis.Native.self_check_modes())
+  def word_set("self_check_state"), do: words(Trellis.Native.self_check_states())
   def word_set("self_check_outcome"), do: words(Trellis.Native.self_check_outcomes())
   def word_set("divergence_kind"), do: words(Trellis.Native.divergence_kinds())
   def word_set("capture_failure_kind"), do: words(Trellis.Native.capture_failure_kinds())
@@ -68,6 +70,7 @@ defmodule Trellis.Parity do
       "self_check" => fn handle, args, opts, fun ->
         call(handle, args ++ [Map.to_list(opts)], fun)
       end,
+      "self_check_job" => plain,
       "shutdown" => plain
     }
   end
