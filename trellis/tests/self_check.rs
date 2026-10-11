@@ -2227,26 +2227,23 @@ async fn a_stale_claimants_late_save_changes_nothing_and_its_job_is_taken_over()
     )
     .await
     .expect("age the claim");
+    // The takeover runs one page of one key and leaves the job running.
     assert!(
-        work_once(&db.pool, "fast", &worker(100))
+        work_once(&db.pool, "fast", &worker(1))
             .await
             .expect("takeover"),
         "the stale job is taken over"
     );
-    let done = trellis
+    let taken = trellis
         .self_check_job(job.id)
         .await
         .expect("poll")
         .expect("job");
-    assert_eq!(done.state, SelfCheckJobState::Done);
-    let found = match done.report.expect("report").outcome {
-        SelfCheckOutcome::Diverged(found) => found,
-        other => panic!("expected Diverged, got {other:?}"),
-    };
-    assert_eq!(found.len(), 1);
+    assert_eq!(taken.state, SelfCheckJobState::Running);
+    assert_eq!(taken.rows_compared, 1);
 
-    // The slow worker's page ends now. Its save is conditional on a claim it
-    // no longer has.
+    // The slow worker's page ends now, and would finish the whole job from
+    // its stale claim. Its save is conditional on a claim it no longer has.
     gate.execute("select pg_advisory_unlock($1)", &[&PAUSE_LOCK])
         .await
         .expect("release the pause lock");
@@ -2256,8 +2253,11 @@ async fn a_stale_claimants_late_save_changes_nothing_and_its_job_is_taken_over()
         .await
         .expect("poll")
         .expect("job");
-    assert_eq!(still.state, SelfCheckJobState::Done);
-    assert_eq!(still.rows_compared, 3, "not rewritten by the late save");
+    assert_eq!(
+        (still.state, still.rows_compared),
+        (SelfCheckJobState::Running, 1),
+        "not rewritten by the late save"
+    );
     let claimant: String = raw
         .query_one(
             "select claimed_by from self_check_jobs where id = $1",
@@ -2267,6 +2267,25 @@ async fn a_stale_claimants_late_save_changes_nothing_and_its_job_is_taken_over()
         .expect("read")
         .get(0);
     assert_eq!(claimant, "fast");
+
+    // The new claimant finishes from the cursor it saved.
+    while work_once(&db.pool, "fast", &worker(1))
+        .await
+        .expect("fast worker")
+    {}
+    let done = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done);
+    let report = done.report.expect("report");
+    assert_eq!(report.rows_compared, 3);
+    let found = match report.outcome {
+        SelfCheckOutcome::Diverged(found) => found,
+        other => panic!("expected Diverged, got {other:?}"),
+    };
+    assert_eq!(found.len(), 1);
 
     trellis.shutdown().await.expect("shutdown");
 }
@@ -2307,6 +2326,59 @@ async fn a_job_another_worker_is_running_is_not_taken_over_before_it_is_stale() 
             .expect("worker"),
         "a silent one is not"
     );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `timeout` too long to do arithmetic on (a binding hands over a u64 of
+/// milliseconds) is cut to an hour when the job is started, so the worker's
+/// claim and a page's budget never overflow.
+#[tokio::test]
+async fn an_enormous_timeout_is_capped_so_the_job_still_runs() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 2).await;
+
+    let job = trellis
+        .self_check(
+            "widget_totals",
+            SelfCheckMode::Strict,
+            Duration::from_millis(u64::MAX),
+        )
+        .await
+        .expect("start");
+    // Another worker holds it, so this worker's claim works out whether that
+    // claim has gone stale, from the job's timeout.
+    raw.execute(
+        "update self_check_jobs set state = 'running', claimed_by = 'other', claimed_at = now() \
+         where id = $1",
+        &[&job.id],
+    )
+    .await
+    .expect("another worker holds it");
+    assert!(
+        !work_once(&db.pool, "me", &worker(100))
+            .await
+            .expect("the staleness arithmetic doesn't overflow"),
+    );
+    raw.execute(
+        "update self_check_jobs set claimed_at = now() - interval '1 day' where id = $1",
+        &[&job.id],
+    )
+    .await
+    .expect("age the claim");
+    assert!(
+        work_once(&db.pool, "me", &worker(100))
+            .await
+            .expect("worker")
+    );
+    let done = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done, "{:?}", done.error);
+    assert_eq!(done.rows_compared, 2);
 
     trellis.shutdown().await.expect("shutdown");
 }
