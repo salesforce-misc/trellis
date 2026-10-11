@@ -72,6 +72,12 @@ impl ApplyAudit {
             .max_by(|a, b| a.secs.total_cmp(&b.secs))
     }
 
+    /// How many statements failed. A failed statement is a measurement that
+    /// did not happen, so the scenario fails on any (#1022).
+    pub fn failed(&self) -> usize {
+        self.statements.iter().filter(|t| t.error.is_some()).count()
+    }
+
     pub fn to_json(&self) -> String {
         let statements: Vec<String> = self
             .statements
@@ -94,8 +100,9 @@ impl ApplyAudit {
                 .unwrap_or_else(|| "null".into())
         };
         format!(
-            "{{\"max_secs\":{},\"slowest\":{},\"alter_add_built_secs\":{},\
+            "{{\"failed\":{},\"max_secs\":{},\"slowest\":{},\"alter_add_built_secs\":{},\
              \"alter_alter_built_secs\":{},\"resume_column_built_secs\":{},\"statements\":[{}]}}",
+            self.failed(),
             opt(self.slowest().map(|t| t.secs)),
             self.slowest()
                 .map(|t| format!("\"{}\"", t.name))
@@ -365,5 +372,29 @@ mod tests {
         // A short build timeout never lowers it below the stock deadline.
         let short = long_call_options(Duration::from_secs(5));
         assert_eq!(short.call_deadline, Some(trellis::DEFAULT_CALL_BUDGET));
+    }
+
+    #[test]
+    fn a_failed_statement_is_counted_and_reported() {
+        let timed = |name, error: Option<&str>| Timed {
+            name,
+            statement: String::new(),
+            secs: 0.1,
+            error: error.map(str::to_string),
+        };
+        let audit = ApplyAudit {
+            statements: vec![
+                timed("define_one", None),
+                timed("alter_add", Some("refused")),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(audit.failed(), 1);
+        assert!(
+            audit.to_json().starts_with("{\"failed\":1,"),
+            "{}",
+            audit.to_json()
+        );
+        assert_eq!(ApplyAudit::default().failed(), 0);
     }
 }

@@ -478,7 +478,12 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                     result.oracle_mismatched_groups
                 );
             }
-            Some(result.oracle_ok && result.writes.errors == 0)
+            // A failed audited statement is a measurement that did not happen.
+            let audit_failed = result.apply.as_ref().map_or(0, |a| a.failed());
+            if audit_failed > 0 {
+                eprintln!("APPLY AUDIT FAILURE: {audit_failed} audited statement(s) failed");
+            }
+            Some(result.oracle_ok && result.writes.errors == 0 && audit_failed == 0)
         }
 
         "write-tax" => {
