@@ -104,13 +104,14 @@ method blocks on a database round trip — far past what either host VM tolerate
 scheduler thread.
 
 * **Elixir:** a call on a handle runs on a normal scheduler and never waits on
-  one. The BEAM can't interrupt a NIF on a dirty scheduler, so a killed caller
-  would not exit until its call returned, and calls stuck on the database
-  would hold the node's few dirty IO schedulers. So each NIF submits the call
-  through `BlockingTrellis`'s `start_*` twin and returns a reference at once;
-  the engine sends the result to the calling process as a message, from one
-  thread that waits for every pending call (not one per call), and the
-  wrapper `receive`s it with a backstop a few seconds past the 30-second
+  one. The BEAM can't interrupt a NIF on a dirty scheduler: killing its
+  caller ends the process, but the NIF keeps the scheduler until it returns,
+  so calls stuck on the database would hold the node's few dirty IO
+  schedulers, which the VM's own file IO runs on too. So each NIF submits
+  the call through `BlockingTrellis`'s `start_*` twin and returns a reference
+  at once; the engine sends the result to the calling process as a message,
+  from one thread that waits for every pending call (not one per call), and
+  the wrapper `receive`s it with a backstop a few seconds past the 30-second
   deadline. A reply to a process that has exited is dropped. The public API
   stays synchronous. The NIFs that touch no handle (the constant lookups) and
   the handle's `connect` and `shutdown` run on dirty IO schedulers; the two

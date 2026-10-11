@@ -248,7 +248,9 @@ defmodule Trellis do
 
   The process only keeps the handle's lifecycle. A call made through its
   name asks it for the handle and then runs in the caller's own process, so
-  callers don't wait on each other.
+  callers don't wait on each other. The caller has to be on the process's
+  node: a handle works only on the node that connected it, and a call from
+  another node returns a `:validation` error.
 
   `shutdown/1` refuses the process's name: its supervisor stops it, which
   cancels the calls still in flight (their callers get a `:validation`
@@ -293,7 +295,7 @@ defmodule Trellis do
   @spec config(trellis()) :: {:ok, Config.t()} | {:error, Error.t()}
   def config(trellis) when is_trellis(trellis) do
     # Read from memory by a NIF that returns the term itself.
-    with {:ok, config} <- native(Native.config(handle_ref(trellis))) do
+    with {:ok, config} <- native(with({:ok, ref} <- handle_ref(trellis), do: Native.config(ref))) do
       {:ok, Config.from_native(config)}
     end
   end
@@ -797,10 +799,24 @@ defmodule Trellis do
   # A native call on a handle, or on the handle a supervised Trellis owns,
   # run in the calling process: it submits the call and waits for the reply
   # (`Native.call/3`).
-  defp run(trellis, function, args), do: Native.call(handle_ref(trellis), function, args)
+  defp run(trellis, function, args) do
+    with {:ok, ref} <- handle_ref(trellis), do: Native.call(ref, function, args)
+  end
 
-  defp handle_ref(%__MODULE__{ref: ref}), do: ref
-  defp handle_ref(server), do: Trellis.Owner.handle_ref(server)
+  # The handle's NIF resource, which only the node that connected it can use:
+  # on another node it is a plain reference, which the NIF would refuse as a
+  # bad argument.
+  defp handle_ref(%__MODULE__{ref: ref}), do: local_ref(ref)
+  defp handle_ref(server), do: local_ref(Trellis.Owner.handle_ref(server))
+
+  defp local_ref(ref) when node(ref) == node(), do: {:ok, ref}
+
+  defp local_ref(ref) do
+    {:error,
+     {"validation",
+      "this Trellis handle was connected on node #{node(ref)}; " <>
+        "a handle works only on the node that connected it, so call it there"}}
+  end
 
   defp list(reply, from_native) do
     with {:ok, items} <- native(reply) do

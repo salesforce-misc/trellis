@@ -9,8 +9,8 @@ defmodule Trellis.Native do
   # sends `{call_ref, result}` to the calling process when the call ends
   # (the NIF crate's module docs have the rest). `call/3` is the `receive`
   # for that message. Nothing then holds a scheduler while the database
-  # answers, and a killed caller exits at once instead of when its NIF
-  # returns. The NIFs that touch no handle, and `connect` and `shutdown`,
+  # answers (a NIF on a dirty scheduler keeps it until it returns, even once
+  # its caller has been killed). The NIFs that touch no handle, and `connect` and `shutdown`,
   # run on dirty IO schedulers; the NIF crate's module docs list the rest.
   #
   # A host gets the NIF precompiled: rustler_precompiled downloads the build

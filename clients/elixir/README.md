@@ -148,7 +148,8 @@ threads, or no definition ever reaches `:live`.
   call on a normal scheduler and returns a reference at once; the engine
   sends the result to the calling process, which waits for it in a `receive`.
   The function is synchronous to its caller, a process killed during a call
-  exits at once, and a call stuck on the database costs the VM nothing.
+  exits at once, and a call stuck on the database holds no scheduler or
+  thread of its own.
   `connect/1` and `shutdown/1` run on dirty IO schedulers, as do the NIFs
   that touch no handle; `Trellis.Metrics.render_prometheus/0` runs on a
   dirty CPU scheduler.
@@ -192,8 +193,9 @@ children = [
 ```
 
 Each call runs in the process that makes it, in parallel with every other,
-so no process queues behind another's call. `shutdown/1` refuses the name;
-the supervisor stops it, which cancels the calls still in flight.
+so no process queues behind another's call. The caller has to be on the same
+node: a handle works only on the node that connected it. `shutdown/1` refuses
+the name; the supervisor stops it, which cancels the calls still in flight.
 
 Define transforms in Ecto migrations with `Trellis.Migration`. Trellis never
 joins a migration's transaction, so a migration that uses it must set

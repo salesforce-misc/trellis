@@ -6,10 +6,11 @@
 //! deliberately narrow:
 //!
 //! - **A call on a handle never holds a scheduler while it waits** (issue
-//!   #599). The BEAM can't interrupt a NIF running on a dirty scheduler, so a
-//!   killed caller would not exit until its call returned, and every call
-//!   stuck on the database would hold one of the node's few dirty IO
-//!   schedulers. So each handle NIF runs on a **normal** scheduler and only
+//!   #599). The BEAM can't interrupt a NIF running on a dirty scheduler:
+//!   killing its caller ends the process, but the NIF keeps the scheduler
+//!   until it returns, so every call stuck on the database would hold one of
+//!   the node's few dirty IO schedulers, which the VM's file IO also runs on.
+//!   Instead, each handle NIF runs on a **normal** scheduler and only
 //!   *submits* the call through its `BlockingTrellis::start_*` twin, which
 //!   queues a job and returns at once. It returns `{:ok, call_ref}`, and the
 //!   engine sends `{call_ref, reply}` to the calling process when the call
@@ -160,6 +161,11 @@ impl Handle {
         let call_ref = env.make_ref();
         let mut reply_env = OwnedEnv::new();
         let saved_ref = reply_env.save(call_ref);
+        // The task holds only the call's reply, not the handle: a handle dropped
+        // or shut down meanwhile still answers it (with the result, or the
+        // cancellation). The encoders return errors rather than panic; one
+        // that did would end the task unsent, and the caller would get
+        // `Trellis.Native.call/3`'s backstop `timeout`.
         reply_runtime().spawn(async move {
             let result = pending.await;
             // A caller that has exited can't be sent to: its reply is dropped.

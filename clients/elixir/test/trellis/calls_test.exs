@@ -98,28 +98,23 @@ defmodule Trellis.CallsTest do
     release
   end
 
-  # Returns once `count` backends are waiting on a lock, which is when that
-  # many calls have reached the server and are stuck on it.
+  # Returns once `count` backends are waiting on the held lock, which is when
+  # that many calls have reached the server and are stuck on it.
   defp await_lock_waiters!(observer, count) do
     eventually("#{count} call(s) stuck on the lock", fn ->
-      %{rows: [[waiting]]} =
-        Postgrex.query!(
-          observer,
-          "select count(*) from pg_stat_activity " <>
-            "where datname = current_database() and wait_event_type = 'Lock'",
-          []
-        )
-
+      waiting = lock_waiters(observer)
       if waiting >= count, do: {:done, waiting}, else: {:waiting, waiting}
     end)
   end
 
+  # The backends waiting for the lock `hold_lock!/0` holds, and only those:
+  # a lock wait anywhere else in the database isn't counted.
   defp lock_waiters(observer) do
     %{rows: [[waiting]]} =
       Postgrex.query!(
         observer,
-        "select count(*) from pg_stat_activity " <>
-          "where datname = current_database() and wait_event_type = 'Lock'",
+        "select count(*) from pg_locks " <>
+          "where not granted and relation = '#{@schema}.#{@locked_table}'::regclass",
         []
       )
 
@@ -267,6 +262,27 @@ defmodule Trellis.CallsTest do
     assert message =~ "no reply"
 
     assert %Error{code: :timeout} = Error.from_native({"timeout", message})
+  end
+
+  test "a handle from another node is refused with a validation error, not a bad argument" do
+    # A reference made on node `elsewhere@nohost` (NEWER_REFERENCE_EXT), as
+    # a handle another node connected arrives here: a plain reference that is
+    # no NIF resource on this node.
+    node = "elsewhere@nohost"
+
+    foreign =
+      :erlang.binary_to_term(
+        <<131, 90, 3::16, 119, byte_size(node), node::binary, 1::32, 1::32, 2::32, 3::32>>
+      )
+
+    assert node(foreign) == :elsewhere@nohost
+    elsewhere = %Trellis{ref: foreign}
+
+    assert {:error, %Error{code: :validation, message: message}} =
+             Trellis.status(elsewhere, "no_such_target")
+
+    assert message =~ "elsewhere@nohost"
+    assert {:error, %Error{code: :validation}} = Trellis.config(elsewhere)
   end
 
   test "a call leaves nothing in the caller's mailbox" do
