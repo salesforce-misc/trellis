@@ -64,6 +64,7 @@
 //! current and peak RSS. Run it under a memory cap on a shared box:
 //! `systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 bench ...`.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::pin::pin;
 use std::sync::Arc;
@@ -89,6 +90,42 @@ use crate::streaming::tuning::EngineTuning;
 const SOURCE: &str = "agg_src";
 /// The definition's target table (its bare name).
 const TARGET: &str = "agg_totals";
+/// The source table's columns, as `create table` spells them; [`source_columns`]
+/// declares the same types to the definition.
+const SOURCE_COLUMNS_DDL: &str = "id bigint not null, grp integer not null, amt bigint not null";
+
+/// The source table's own types ([`SOURCE_COLUMNS_DDL`]), as `Trellis::apply`
+/// would read them off the catalog.
+fn source_columns() -> HashMap<String, trellis::dev::defs::ValueType> {
+    use trellis::IntWidth::{Int4, Int8};
+    use trellis::dev::defs::ValueType::Integer;
+    HashMap::from([
+        ("id".to_string(), Integer(Int8)),
+        ("grp".to_string(), Integer(Int4)),
+        ("amt".to_string(), Integer(Int8)),
+    ])
+}
+
+/// The types `agg_totals` is installed against.
+///
+/// `--apply-latency` declares the table's own ([`source_columns`]): its
+/// `ALTER TRANSFORM ... ADD amt + 1` validates the merged definition against
+/// the live source columns, and since #980 refuses a field over a column whose
+/// live type differs from the recorded one, so an `amt` recorded as `numeric`
+/// over a `bigint` column failed it and the three statements after it (#1022).
+///
+/// Every other mode keeps declaring all three `numeric`, as it always has, so
+/// its numbers stay comparable with the ones already recorded: the declared
+/// types reach the target's DDL (`grp`, `dbl`, `lo`, `hi` are `numeric` here
+/// and `integer`/`bigint` over the real types) and the ledger's contribution
+/// column, so changing them changes what those modes measure.
+fn declared_columns(apply_latency: bool) -> HashMap<String, trellis::dev::defs::ValueType> {
+    if apply_latency {
+        source_columns()
+    } else {
+        numeric_columns(&["id", "grp", "amt"])
+    }
+}
 const LOAD_BATCH_ROWS: u64 = 1_000_000;
 const COPY_BUFFER_BYTES: usize = 1 << 20;
 const MONITOR_POLL: Duration = Duration::from_millis(100);
@@ -944,8 +981,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     // Loaded index-less, then keyed: the usual bulk-load order, and it keeps
     // the load's rows/s about the COPY rather than about btree inserts.
     raw.batch_execute(&format!(
-        "create table public.{SOURCE} (id bigint not null, grp integer not null, \
-             amt bigint not null)"
+        "create table public.{SOURCE} ({SOURCE_COLUMNS_DDL})"
     ))
     .await
     .expect("create source table");
@@ -1016,7 +1052,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         .collect();
     tokio::time::sleep(cfg.pre_define).await;
 
-    let columns = numeric_columns(&["id", "grp", "amt"]);
+    let columns = declared_columns(cfg.apply_latency);
     let source_text = cfg.definition();
     let xmin_stop = Arc::new(AtomicBool::new(false));
     let xmin_task = tokio::spawn(sample_xmin(connect_raw(db.dsn()).await, xmin_stop.clone()));
@@ -1196,6 +1232,40 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The definition is installed against the types the table has: a column
+    /// declared differently is recorded as that type, and `ALTER TRANSFORM`
+    /// refuses an edit over it once the live type disagrees (#1022).
+    #[test]
+    fn declared_source_types_match_the_tables() {
+        use trellis::IntWidth::{Int4, Int8};
+        use trellis::dev::defs::ValueType::Integer;
+        let from_ddl: HashMap<String, _> = SOURCE_COLUMNS_DDL
+            .split(',')
+            .map(|column| {
+                let mut words = column.split_whitespace();
+                let name = words.next().expect("column name").to_string();
+                let ty = match words.next().expect("column type") {
+                    "bigint" => Integer(Int8),
+                    "integer" => Integer(Int4),
+                    other => panic!("{name}: no ValueType mapped for {other}"),
+                };
+                (name, ty)
+            })
+            .collect();
+        assert_eq!(source_columns(), from_ddl);
+    }
+
+    /// Only `--apply-latency` declares the real types; the other modes keep
+    /// the all-`numeric` declaration their recorded numbers were taken with.
+    #[test]
+    fn only_apply_latency_declares_the_tables_types() {
+        assert_eq!(declared_columns(true), source_columns());
+        assert_eq!(
+            declared_columns(false),
+            numeric_columns(&["id", "grp", "amt"])
+        );
+    }
 
     #[test]
     fn oracle_backoff_is_the_floor_or_twice_the_last_check() {
