@@ -26,10 +26,6 @@ use trellis::{Config, ErrorCode, SelfCheckMode, Trellis, TrellisError, TrellisOp
 /// The shortened call deadline.
 const DEADLINE: Duration = Duration::from_millis(700);
 
-/// `trellis::deadline::BACKSTOP_GRACE`: a call that returns sooner than this
-/// past its deadline was ended by the server, not by the client-side backstop.
-const BACKSTOP_GRACE: Duration = Duration::from_secs(1);
-
 async fn raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
     tokio::spawn(async move {
@@ -149,6 +145,7 @@ impl Fixture {
         call: impl for<'a> FnOnce(&'a Trellis) -> BoxFuture<'a, T>,
     ) {
         let started = Instant::now();
+        let backstops = trellis::backstop_fires();
         // Boxed, so the engine's large futures live on the heap rather than in
         // this test's own (a debug build overflows the stack otherwise).
         let outcome = call(&self.trellis).await;
@@ -159,10 +156,12 @@ impl Fixture {
             elapsed >= DEADLINE - Duration::from_millis(50),
             "{what} returned after {elapsed:?}, before its deadline: {err}"
         );
-        assert!(
-            elapsed < DEADLINE + BACKSTOP_GRACE,
-            "{what} took {elapsed:?}: the server's timeout should end it at {DEADLINE:?}, \
-             before the client-side backstop does: {err}"
+        // Ended by the server's 57014, not the client-side backstop. Counted
+        // rather than timed: a loaded box stretches the wall clock (#1029).
+        assert_eq!(
+            trellis::backstop_fires(),
+            backstops,
+            "{what}: the client-side backstop ended the call, not the server: {err}"
         );
         assert_eq!(
             self.lock_waiters().await,
@@ -262,6 +261,7 @@ async fn the_wait_for_a_pooled_connection_counts() {
 
     for what in ["watermark_token", "has_live_staging_worker"] {
         let started = Instant::now();
+        let backstops = trellis::backstop_fires();
         let err = match what {
             "watermark_token" => trellis.watermark_token().await.map(|_| ()),
             _ => trellis.has_live_staging_worker().await.map(|_| ()),
@@ -277,7 +277,11 @@ async fn the_wait_for_a_pooled_connection_counts() {
             elapsed >= DEADLINE - Duration::from_millis(50),
             "{what}: {elapsed:?}"
         );
-        assert!(elapsed < DEADLINE + BACKSTOP_GRACE, "{what}: {elapsed:?}");
+        assert_eq!(
+            trellis::backstop_fires(),
+            backstops,
+            "{what}: the backstop ended the call, not the pool wait"
+        );
     }
 
     drop(only);

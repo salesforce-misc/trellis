@@ -35,6 +35,7 @@
 //! [`within`].
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio_postgres::error::SqlState;
@@ -49,6 +50,17 @@ pub const DEFAULT_CALL_BUDGET: Duration = Duration::from_secs(30);
 /// connection that has stopped delivering anything at all (a network stall)
 /// ever reaches it. The same grace as `staging::converge`'s #596 poll.
 pub const BACKSTOP_GRACE: Duration = Duration::from_secs(1);
+
+/// How many calls the client-side backstop has ended in this process. A call
+/// the server's `statement_timeout` ended is not counted, so a test can tell
+/// the two apart without bounding wall-clock time, which a loaded box stretches.
+static BACKSTOP_FIRES: AtomicU64 = AtomicU64::new(0);
+
+/// Calls ended by the client-side backstop so far (see [`BACKSTOP_FIRES`]).
+#[doc(hidden)]
+pub fn backstop_fires() -> u64 {
+    BACKSTOP_FIRES.load(Ordering::Relaxed)
+}
 
 /// One public call's deadline, in scope for everything the call awaits.
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +150,10 @@ pub(crate) async fn bounded<T>(
                     Err(TrellisError::CallTimeout { budget })
                 }
                 Ok(result) => result,
-                Err(_) => Err(TrellisError::CallTimeout { budget }),
+                Err(_) => {
+                    BACKSTOP_FIRES.fetch_add(1, Ordering::Relaxed);
+                    Err(TrellisError::CallTimeout { budget })
+                }
             }
         })
         .await
@@ -245,6 +260,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_never_answers_times_out_at_the_backstop() {
         let started = Instant::now();
+        let before = backstop_fires();
         let err = bounded(started, Duration::from_millis(50), async {
             std::future::pending::<Result<(), TrellisError>>().await
         })
@@ -252,6 +268,7 @@ mod tests {
         .expect_err("times out");
         assert!(matches!(err, TrellisError::CallTimeout { .. }), "{err}");
         assert!(started.elapsed() >= Duration::from_millis(50) + BACKSTOP_GRACE);
+        assert!(backstop_fires() > before);
     }
 
     #[tokio::test]
