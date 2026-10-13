@@ -3275,12 +3275,16 @@ async fn superseded_to_side(
 
 /// Issue #531: each of `relationship_ids`' refresh stamp
 /// (`relationship_projections.refreshed_lsn`), keyed by `relationship_id`,
-/// read under a `for share` lock taken in `relationship_id` order. A
-/// relationship never refreshed has no entry. No query at all when
+/// read under a `for share` lock taken in `relationship_id` order, or `for
+/// update` when `for_update` (the page stamps a truncate's clear, issue #886;
+/// taking the stronger lock at once, in the same order, rather than upgrading
+/// later, keeps two pages from deadlocking on it). A relationship never
+/// refreshed has no entry. No query at all when
 /// `relationship_ids` is empty.
 async fn relationship_refresh_stamps(
     txn: &Transaction<'_>,
     relationship_ids: impl Iterator<Item = i64>,
+    for_update: bool,
 ) -> Result<HashMap<i64, PgLsn>, ApplyError> {
     let mut ids: Vec<i64> = relationship_ids.collect();
     if ids.is_empty() {
@@ -3288,10 +3292,13 @@ async fn relationship_refresh_stamps(
     }
     ids.sort_unstable();
     ids.dedup();
+    let lock = if for_update { "update" } else { "share" };
     let rows = txn
         .query(
-            "select relationship_id, refreshed_lsn from relationship_projections \
-             where relationship_id = any($1) order by relationship_id for share",
+            &format!(
+                "select relationship_id, refreshed_lsn from relationship_projections \
+                 where relationship_id = any($1) order by relationship_id for {lock}"
+            ),
             &[&ids],
         )
         .await?;
@@ -3483,7 +3490,7 @@ pub(crate) async fn release_to_one_projections(
         return Ok(());
     }
     relationships.sort_by_key(|rel| rel.id);
-    relationship_refresh_stamps(txn, relationships.iter().map(|rel| rel.id)).await?;
+    relationship_refresh_stamps(txn, relationships.iter().map(|rel| rel.id), false).await?;
     let lsn: PgLsn = txn
         .query_one("select pg_current_wal_insert_lsn()", &[])
         .await?
@@ -10542,12 +10549,13 @@ pub(crate) async fn apply_page(
     // 2 to 3b), the order the discharge takes the same kinds of row in (its
     // orphan sweep, then the refresh). One keyed read per batch with reverse
     // records or projection clears, none without.
-    let refresh_stamps = relationship_refresh_stamps(
+    let mut refresh_stamps = relationship_refresh_stamps(
         txn,
         plan.relationship_reverses
             .iter()
             .map(|r| r.shape.id)
             .chain(plan.relationship_projection_clears.keys().copied()),
+        !plan.relationship_projection_clears.is_empty(),
     )
     .await?;
 
@@ -10571,6 +10579,22 @@ pub(crate) async fn apply_page(
         }
         txn.execute(&format!("delete from {}", clear.qualified_projection), &[])
             .await?;
+        // Issue #886: the clear is a refresh of the projection from the
+        // to-side, which has no rows at `lsn`. Stamp it as one, so a reverse
+        // record staged before the truncate and draining after it (a
+        // deferral's retry, or a page that lost the race) is checked against
+        // the live row ([`superseded_to_side`]) instead of putting its older
+        // image back.
+        if let Some(lsn) = clear.lsn {
+            txn.execute(
+                "update relationship_projections \
+                 set refreshed_lsn = greatest(refreshed_lsn, $2) where relationship_id = $1",
+                &[relationship_id, &lsn],
+            )
+            .await?;
+            let stamp = refresh_stamps.entry(*relationship_id).or_insert(lsn);
+            *stamp = (*stamp).max(lsn);
+        }
     }
 
     // Before 3c and 3d, issue #848: every projection row the generation

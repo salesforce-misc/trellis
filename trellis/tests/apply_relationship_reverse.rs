@@ -1202,6 +1202,141 @@ async fn a_deferred_parent_delete_retries_as_a_delete() {
     assert_eq!(totals.get("db"), Some(&(Some("2".to_string()), None)));
 }
 
+/// Issue #886: a deferred reverse must not put a parent back into the
+/// projection after a `TRUNCATE` of the to-side cleared it. Guard (a) defers
+/// an update of post 1; the truncate (a later commit, so a higher lsn) drains
+/// and clears the projection first; the retry then replays its older image.
+/// With no refresh stamp the retry took the image unchecked, so the projection
+/// served a row the to-side no longer has, and every child read it forever.
+/// Deterministic: the truncate's segment is applied before the deferred
+/// update's.
+#[tokio::test]
+async fn a_deferred_parent_update_does_not_outlive_a_later_truncate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    assert!(projection_row_exists(&client, &projection_table, 1).await);
+
+    // The update, deferred by guard (a) against a watermark that never moves.
+    client
+        .execute("update posts set word_count = 999 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    let base = staging_base(&client).await;
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":999}"),
+        base + 100,
+    )
+    .await;
+    let update_seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, update_seg, "worker_a").await;
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        update_seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &StagedWatermark::new(),
+    )
+    .await
+    .expect("apply (rejected internally by guard (a))");
+    txn.commit().await.expect("commit");
+    assert_eq!(
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "guard (a) must defer the update"
+    );
+    // Sealed apart from the truncate, so the truncate's segment drains first.
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    let deferred_seg = seal_active_segment(&mut client).await;
+
+    // The truncate commits after the update, and drains before its retry.
+    client
+        .execute("delete from post_tags", &[])
+        .await
+        .expect("empty the from-side");
+    client
+        .execute("truncate posts", &[])
+        .await
+        .expect("truncate the to-side");
+    let base = staging_base(&client).await;
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        trellis::staging::TRUNCATE_SENTINEL_KEY,
+        "truncate",
+        None,
+        None,
+        base + 100,
+    )
+    .await;
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    let truncate_seg = seal_active_segment(&mut client).await;
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        truncate_seg,
+        "reverse_test",
+        1,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+    assert!(
+        !projection_row_exists(&client, &projection_table, 1).await,
+        "the truncate cleared the projection"
+    );
+
+    while apply::drain_once(
+        &db.pool,
+        deferred_seg,
+        "reverse_test",
+        1,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert!(
+        !projection_row_exists(&client, &projection_table, 1).await,
+        "the deferred update's retry put post 1 back into the projection after the truncate"
+    );
+}
+
 /// Guard (b) (plan doc §2; ablation 82/3000): a reverse record whose
 /// captured `prev_gen` no longer matches the projection row's current
 /// `__trellis_gen`, re-read under `FOR UPDATE` in Phase 3, must not apply —
