@@ -597,17 +597,15 @@ through a relationship (entry 16).
 * #886. The relationship projection's own row for the parent keeps the
   superseded value once everything has drained (61, while the parent holds
   `NULL`), so every child read through it gets that value: a parent
-  change's advance of the projection is lost. One cause is fixed: a
-  `TRUNCATE` of the parent table cleared the projection, and then a parent
-  change committed before the truncate, which a reverse guard had deferred
-  for a retry, drained after it and wrote its older image back, so the
-  projection served a row the table no longer had. The clear now stamps the
-  relationship like a refresh does, so that retry reads the live row
-  instead. This was the cause of the generated `steady_load 30:6` case
-  (4 of 4 runs pass, 10 of 10 failed before). Whether it is the cause of
-  the other cases listed on #886 and #920, which the fix hasn't been
-  replayed against, is open: a lost advance with no `TRUNCATE` in the
-  program, if one shows up, is still this entry.
+  change's advance of the projection is lost. A parent change that a
+  reverse guard deferred until after a later `TRUNCATE` of the parent table
+  doesn't do this: the truncate's clear of the projection stamps the
+  relationship the way a refresh does, so the retry writes the projection
+  from the live row rather than its own older image. Whether the other
+  generated cases on #886 and #920 have that cause isn't known: they haven't
+  been replayed against it. It isn't the shape of #763's to-one projection
+  ordering holes (an orphaned or missing projection key), and it needs no
+  resume or build.
 * #892, the second cause. A child's read of the projection doesn't wait for
   a page that has advanced the parent's row and not yet committed. The fix
   needs a design call: the page would lock the parents its rows join before

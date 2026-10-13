@@ -1868,7 +1868,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
 /// Positive case: an ordinary parent update where all four guards
 /// genuinely pass — including guard (a), proven with a real
 /// [`StagedWatermark`] advanced to (not merely defaulted past) the current
-/// `pg_current_wal_lsn()`, not [`StagedWatermark::saturated`]. The record is
+/// `pg_current_wal_insert_lsn()`, not [`StagedWatermark::saturated`]. The record is
 /// processed (the projection's lsn advances to this record's own lsn), and,
 /// the target being on the ledger (#623 D5), each of post 1's children is
 /// staged for a Re-derive, which reads the new parent once it drains.
@@ -1912,12 +1912,14 @@ async fn all_four_guards_pass_and_the_children_are_rederived_in_the_ordinary_cas
     let plan = claim_fold_compute(&db.pool, seg, "worker_a").await;
 
     // Guard (a) genuinely passes here: seeded at LSN 0, then advanced to
-    // the real current `pg_current_wal_lsn()` — strictly past whatever `X`
-    // Phase 2 captured a moment ago, since nothing else has committed on
-    // this connection since.
+    // the real current `pg_current_wal_insert_lsn()`, at or past the `X`
+    // Phase 2 captured a moment ago with the same function. Not
+    // `pg_current_wal_lsn()`: that is the write position, which trails the
+    // insert position while other tests on the shared cluster have WAL in
+    // the buffers, so under load it can sit below `X` and guard (a) defers.
     let watermark = StagedWatermark::new();
     let now: PgLsn = client
-        .query_one("select pg_current_wal_lsn()", &[])
+        .query_one("select pg_current_wal_insert_lsn()", &[])
         .await
         .expect("read the current wal lsn")
         .get(0);
