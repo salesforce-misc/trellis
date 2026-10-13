@@ -35,7 +35,6 @@
 //! [`within`].
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio_postgres::error::SqlState;
@@ -50,17 +49,6 @@ pub const DEFAULT_CALL_BUDGET: Duration = Duration::from_secs(30);
 /// connection that has stopped delivering anything at all (a network stall)
 /// ever reaches it. The same grace as `staging::converge`'s #596 poll.
 pub const BACKSTOP_GRACE: Duration = Duration::from_secs(1);
-
-/// How many calls the client-side backstop has ended in this process. A call
-/// the server's `statement_timeout` ended is not counted, so a test can tell
-/// the two apart without bounding wall-clock time, which a loaded box stretches.
-static BACKSTOP_FIRES: AtomicU64 = AtomicU64::new(0);
-
-/// Calls ended by the client-side backstop so far (see [`BACKSTOP_FIRES`]).
-#[doc(hidden)]
-pub fn backstop_fires() -> u64 {
-    BACKSTOP_FIRES.load(Ordering::Relaxed)
-}
 
 /// One public call's deadline, in scope for everything the call awaits.
 #[derive(Debug, Clone, Copy)]
@@ -147,13 +135,16 @@ pub(crate) async fn bounded<T>(
             let backstop = tokio::time::Instant::from_std(deadline.at + BACKSTOP_GRACE);
             match tokio::time::timeout_at(backstop, call).await {
                 Ok(Err(err)) if deadline.passed() && is_budget_error(&err) => {
-                    Err(TrellisError::CallTimeout { budget })
+                    Err(TrellisError::CallTimeout {
+                        budget,
+                        abandoned: false,
+                    })
                 }
                 Ok(result) => result,
-                Err(_) => {
-                    BACKSTOP_FIRES.fetch_add(1, Ordering::Relaxed);
-                    Err(TrellisError::CallTimeout { budget })
-                }
+                Err(_) => Err(TrellisError::CallTimeout {
+                    budget,
+                    abandoned: true,
+                }),
             }
         })
         .await
@@ -260,15 +251,46 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_never_answers_times_out_at_the_backstop() {
         let started = Instant::now();
-        let before = backstop_fires();
         let err = bounded(started, Duration::from_millis(50), async {
             std::future::pending::<Result<(), TrellisError>>().await
         })
         .await
         .expect_err("times out");
-        assert!(matches!(err, TrellisError::CallTimeout { .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                TrellisError::CallTimeout {
+                    abandoned: true,
+                    ..
+                }
+            ),
+            "{err}"
+        );
         assert!(started.elapsed() >= Duration::from_millis(50) + BACKSTOP_GRACE);
-        assert!(backstop_fires() > before);
+    }
+
+    /// A budget error that arrives once the deadline has passed is the
+    /// server's (or the pool's) answer, so the call was not abandoned.
+    #[tokio::test]
+    async fn a_budget_error_past_the_deadline_is_not_abandoned() {
+        let err = bounded(Instant::now(), Duration::from_millis(20), async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Err::<(), _>(TrellisError::Engine(crate::Error::Pool(
+                deadpool_postgres::PoolError::Timeout(deadpool_postgres::TimeoutType::Wait),
+            )))
+        })
+        .await
+        .expect_err("times out");
+        assert!(
+            matches!(
+                err,
+                TrellisError::CallTimeout {
+                    abandoned: false,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test]

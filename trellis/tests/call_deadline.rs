@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use testkit::crash::OpenTransaction;
 use testkit::{TestCluster, TestDatabase};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::{Config, ErrorCode, SelfCheckMode, Trellis, TrellisError, TrellisOptions};
@@ -39,6 +40,18 @@ fn options(call_deadline: Duration) -> TrellisOptions {
         call_deadline: Some(call_deadline),
         ..Default::default()
     }
+}
+
+/// The SQLSTATE of the first Postgres error in `err`'s source chain.
+fn sqlstate(err: &(dyn std::error::Error + 'static)) -> Option<SqlState> {
+    let mut link = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return pg.code().cloned();
+        }
+        link = err.source();
+    }
+    None
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TrellisError>> + 'a>>;
@@ -139,13 +152,22 @@ impl Fixture {
 
     /// Runs `call` and asserts it ended at the deadline with the timeout
     /// error, and that nothing is left waiting on the server.
+    ///
+    /// Nothing here bounds how late the call returned, or asks which side
+    /// ended it (#1029). A host stalled for a second around the deadline
+    /// makes the client-side backstop return first even though the server
+    /// stopped the statement on time, and on this box that has happened
+    /// (1.701 s against a 1.7 s backstop). What the deadline promises is that
+    /// the server stopped the work, and `pg_stat_activity` shows that
+    /// directly: a statement whose `statement_timeout` was missing or too long
+    /// would still be queued behind the lock, which is held until the test
+    /// ends.
     async fn expect_timeout<T: Debug>(
         &self,
         what: &str,
         call: impl for<'a> FnOnce(&'a Trellis) -> BoxFuture<'a, T>,
     ) {
         let started = Instant::now();
-        let backstops = trellis::backstop_fires();
         // Boxed, so the engine's large futures live on the heap rather than in
         // this test's own (a debug build overflows the stack otherwise).
         let outcome = call(&self.trellis).await;
@@ -155,13 +177,6 @@ impl Fixture {
         assert!(
             elapsed >= DEADLINE - Duration::from_millis(50),
             "{what} returned after {elapsed:?}, before its deadline: {err}"
-        );
-        // Ended by the server's 57014, not the client-side backstop. Counted
-        // rather than timed: a loaded box stretches the wall clock (#1029).
-        assert_eq!(
-            trellis::backstop_fires(),
-            backstops,
-            "{what}: the client-side backstop ended the call, not the server: {err}"
         );
         assert_eq!(
             self.lock_waiters().await,
@@ -261,26 +276,30 @@ async fn the_wait_for_a_pooled_connection_counts() {
 
     for what in ["watermark_token", "has_live_staging_worker"] {
         let started = Instant::now();
-        let backstops = trellis::backstop_fires();
         let err = match what {
             "watermark_token" => trellis.watermark_token().await.map(|_| ()),
             _ => trellis.has_live_staging_worker().await.map(|_| ()),
         }
         .expect_err("no connection");
         let elapsed = started.elapsed();
+        // The pool's wait ended it, not the client-side backstop a second
+        // later (#1029: asked of the error, not timed). Load can't flip this:
+        // the pool's timer is due first, and the backstop polls the call
+        // before checking its own.
         assert!(
-            matches!(err, TrellisError::CallTimeout { .. }),
+            matches!(
+                err,
+                TrellisError::CallTimeout {
+                    abandoned: false,
+                    ..
+                }
+            ),
             "{what}: {err}"
         );
         assert_eq!(err.code(), ErrorCode::Timeout);
         assert!(
             elapsed >= DEADLINE - Duration::from_millis(50),
             "{what}: {elapsed:?}"
-        );
-        assert_eq!(
-            trellis::backstop_fires(),
-            backstops,
-            "{what}: the backstop ended the call, not the pool wait"
         );
     }
 
@@ -337,12 +356,16 @@ async fn a_shorter_session_timeout_is_kept() {
         ))
         .await;
 
-    let started = Instant::now();
     let err = trellis.definitions().await.expect_err("blocked");
-    // The session's 50 ms ended it long before the call's 30 s, and since
-    // that is not the call's deadline it stays the database's own error.
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // The session's 50 ms ended it, not the call's 30 s (which would be a
+    // `CallTimeout`), and since that is not the call's deadline it stays the
+    // database's own `57014`. Asked of the error, not timed (#1029).
     assert!(!matches!(err, TrellisError::CallTimeout { .. }), "{err}");
+    assert_eq!(
+        sqlstate(&err),
+        Some(SqlState::QUERY_CANCELED),
+        "not the server's statement timeout: {err}"
+    );
     drop(observer);
     holder.rollback().await;
 }

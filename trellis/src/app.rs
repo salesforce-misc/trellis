@@ -2396,6 +2396,16 @@ pub enum TrellisError {
     CallTimeout {
         /// The deadline the call had.
         budget: Duration,
+        /// `false` when the call heard back: the server's `statement_timeout`
+        /// (or a lock wait, or the wait for a pooled connection) ended it,
+        /// and what it had running was stopped and rolled back. `true` when
+        /// nothing had answered a second past the deadline
+        /// (`deadline::BACKSTOP_GRACE`) and the call stopped waiting: a
+        /// connection that stopped delivering, or a host too loaded to read
+        /// the server's answer in time. What it left running is still
+        /// bounded by the same `statement_timeout` and rolls back when that
+        /// fires, but the call did not see it happen.
+        abandoned: bool,
     },
 }
 
@@ -2500,10 +2510,23 @@ impl std::fmt::Display for TrellisError {
             ),
             TrellisError::Staging(err) => write!(f, "{err}"),
             TrellisError::SelfCheck(err) => write!(f, "{err}"),
-            TrellisError::CallTimeout { budget } => write!(
+            TrellisError::CallTimeout {
+                budget,
+                abandoned: false,
+            } => write!(
                 f,
                 "the call did not finish within its {}s deadline; the work it started on the \
                  server was stopped and rolled back",
+                budget.as_secs_f64()
+            ),
+            TrellisError::CallTimeout {
+                budget,
+                abandoned: true,
+            } => write!(
+                f,
+                "the call did not finish within its {}s deadline and the database had not \
+                 answered a second later; the server's statement timeout stops and rolls back \
+                 the work it started",
                 budget.as_secs_f64()
             ),
         }
