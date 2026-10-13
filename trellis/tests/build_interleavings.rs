@@ -784,6 +784,42 @@ async fn a_fold_reads_the_entry_a_page_changed_after_its_chunk() {
     assert_oracle(&mut d, &plan, flavour).await;
 }
 
+/// A page folds into a stored extreme that a pending chunk delta has made
+/// stale, and the merge of that delta, which says a value left the group,
+/// re-reads it (#698). Group 1 holds keys 1 (10), 2 (5) and 3 (4), merged.
+/// Key 1 drops to 1 past capture, and a chunk re-derives it: its delta row
+/// carries `__out`, pending. A page then moves key 2 from 5 to 6, which
+/// leaves from inside the stored 4..10, so the page folds: the group still
+/// shows 4..10, which no entry holds. The merge recomputes it to 1..6. A
+/// fold can't make the stored value stale on its own: whatever took the
+/// holder of the extreme out of the group is followed by a re-read, the
+/// page's own (a tie) or the merge of the chunk's `__out`.
+#[tokio::test]
+async fn a_page_folds_into_an_extreme_a_pending_chunk_delta_will_reread() {
+    let flavour = Flavour::MinMax;
+    let (mut d, plan) = start_build(flavour, &[(1, 1, 10), (2, 1, 5), (3, 1, 4)]).await;
+    d.chunk(&plan, None, "3").await;
+    d.merge_all(&plan).await;
+    assert_eq!(min_max(&d, 1).await, mm(4, 10, 3));
+    write_uncaptured(&d, "update public.src set v = 1 where id = 1").await;
+    d.chunk(&plan, None, "1").await;
+    let user = d.user().await;
+    user.batch_execute("update public.src set v = 6 where id = 2")
+        .await
+        .expect("the page's update");
+    let batch = d.seal().await;
+    d.drain(batch, "page").await;
+    assert_eq!(
+        min_max(&d, 1).await,
+        mm(4, 10, 3),
+        "the page folded 6 into the stored 4..10; the chunk's __out is still owed"
+    );
+    let merged = merge_every(&d, &plan).await;
+    assert_eq!((merged.folded, merged.recomputed), (0, 1));
+    assert_eq!(min_max(&d, 1).await, mm(1, 6, 3));
+    assert_oracle(&mut d, &plan, flavour).await;
+}
+
 /// F1's review note (B5): a page can bring a group's accumulators to 0 while
 /// the group still has live entries, because a delta it is owed is pending.
 /// The row is deleted, and the merge that owes it creates it again: that

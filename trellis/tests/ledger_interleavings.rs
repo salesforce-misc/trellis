@@ -1880,6 +1880,117 @@ async fn a_pages_fold_keeps_the_stored_extreme_and_a_leaving_extreme_rereads() {
     );
 }
 
+/// A page decides whether to fold against the stored extreme a concurrent
+/// page committed, not the one its own statement's snapshot saw (#698).
+/// Page a deletes group 1's `MAX` (10) and is frozen after its re-read,
+/// holding the group's row: its uncommitted max is key 2's 5. Page b moves
+/// key 2 from 5 to 3 and queues behind a. Against a's 5 the leaving 5 is a
+/// tie, so b re-reads: 4. Against the 10 b's snapshot saw it would fold 3
+/// into a's 5, and the group would show 5, which no entry holds.
+#[tokio::test]
+async fn a_page_decides_its_fold_against_the_extreme_a_concurrent_page_committed() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v integer); \
+         insert into public.src values (1, 1, 10), (2, 1, 5), (3, 1, 4)",
+        &[("id", int4), ("g", int4), ("v", int4)],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT MAX(v) AS hi, COUNT(*) AS n"],
+        &[SRC],
+    )
+    .await;
+    write(&d, "delete from public.src where id = 1").await;
+    let first = d.seal().await;
+    write(&d, "update public.src set v = 3 where id = 2").await;
+    let second = d.seal().await;
+    let mut a = d
+        .drain_frozen(first, "a", &[(PausePoint::AfterGroupUpsert, "public.agg")])
+        .await;
+    let frozen = a.reached(PausePoint::AfterGroupUpsert).await;
+    let b = d.drain_frozen(second, "b", &[]).await;
+    d.wait_blocked_behind(frozen.backend_pid).await;
+    d.release(&mut a, PausePoint::AfterGroupUpsert).await;
+    a.finish().await;
+    b.finish().await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select g, hi, n from public.agg order by g").await,
+        d.rows("select g, max(v), count(*) from public.src group by g order by g")
+            .await
+    );
+}
+
+/// One page in which a value leaves a group and comes back, or moves past
+/// the extreme while the extreme's holder moves inside it (#698): the page
+/// nets each key's moves into one, so what left is each key's value before
+/// the page, and the fold or re-read decides on that.
+#[tokio::test]
+async fn a_pages_net_moves_fold_or_reread_a_groups_min_max() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v integer); \
+         insert into public.src values (1, 1, 10), (2, 1, 5), (3, 1, 4), (4, 2, 1)",
+        &[("id", int4), ("g", int4), ("v", int4)],
+        &["TRANSFORM agg FROM public.src GROUP BY g \
+           SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
+        &[SRC],
+    )
+    .await;
+    assert_steps_match(
+        &mut d,
+        "select g, lo, hi, n from public.agg order by g",
+        "select g, min(v), max(v), count(*) from public.src group by g order by g",
+        &[
+            // The max's holder is deleted and inserted again lower.
+            "delete from public.src where id = 1; insert into public.src values (1, 1, 6)",
+            // One statement: the holder moves inside, another key past it.
+            "update public.src set v = case id when 1 then 3 when 2 then 11 end \
+             where id in (1, 2)",
+            // The max's holder leaves for group 2 and comes back lower.
+            "update public.src set g = 2 where id = 2; \
+             update public.src set g = 1, v = 7 where id = 2",
+            // A key leaves for group 2 above its max, whose holder moves
+            // inside it.
+            "update public.src set g = 2, v = 100 where id = 3; \
+             update public.src set v = 0 where id = 4",
+        ],
+        (1, &["1", "2"]),
+    )
+    .await;
+}
+
+/// A text `MIN`/`MAX` over a source column with its own collation (#698):
+/// the ledger's argument column keeps the source's collation and the
+/// target's field column has the database default, so the fold's
+/// comparison of the two takes the ledger's (a non-default collation wins
+/// over the default) and is the order the field's own aggregate uses.
+#[tokio::test]
+async fn a_page_folds_a_text_min_max_under_the_sources_collation() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v text collate \"C\"); \
+         insert into public.src values (1, 1, 'a'), (2, 1, 'B'), (3, 1, 'b')",
+        &[("id", int4), ("g", int4), ("v", ValueType::Text)],
+        &["TRANSFORM agg FROM public.src GROUP BY g \
+           SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n"],
+        &[SRC],
+    )
+    .await;
+    assert_steps_match(
+        &mut d,
+        "select g, lo, hi, n from public.agg order by g",
+        "select g, min(v), max(v), count(*) from public.src group by g order by g",
+        &[
+            "insert into public.src values (4, 1, 'A')",
+            "delete from public.src where id = 1",
+            "update public.src set v = 'Z' where id = 4",
+            "update public.src set v = 'c' where id = 2",
+            "delete from public.src where id = 3",
+        ],
+        (2, &["2"]),
+    )
+    .await;
+}
+
 /// `MIN`/`MAX` recomputed from the ledger over a two-column `GROUP BY` with
 /// `NULL` keys: a group with one `NULL` column, one with both, and fully
 /// keyed groups beside them, each recomputed from its own entries only (the
