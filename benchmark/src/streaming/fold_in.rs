@@ -288,7 +288,8 @@ async fn folded_rows(raw: &RawClient, terminal: &str) -> i64 {
     folded.unwrap_or(0)
 }
 
-/// One probe: installs a single `SUM`/`COUNT` aggregate over a fresh source
+/// One probe: installs a single `COUNT` aggregate with `aggregate` (`SUM`, or
+/// `MAX` for #698's recomputed-field path) of `val` over a fresh source
 /// table, offers `target_rows_per_sec` for `offer.duration` from
 /// `offer.connections` writers, spread across `groups` group keys, then waits
 /// up to `offer.grace` for the target to fold in every row.
@@ -300,6 +301,7 @@ async fn folded_rows(raw: &RawClient, terminal: &str) -> i64 {
 /// target's own state, so the target is the authoritative signal.
 pub async fn run_probe(
     groups: usize,
+    aggregate: &str,
     target_rows_per_sec: f64,
     offer: Offer,
     tuning: &EngineTuning,
@@ -325,7 +327,7 @@ pub async fn run_probe(
     let columns: HashMap<_, _> = numeric_columns(&["id", GROUP_COLUMN, "val"]);
     let source_text = format!(
         "TRANSFORM agg_totals FROM public.{SOURCE_TABLE} GROUP BY {GROUP_COLUMN} \
-         SELECT {GROUP_COLUMN} AS {GROUP_COLUMN}, SUM(val) AS val, COUNT(*) AS row_count"
+         SELECT {GROUP_COLUMN} AS {GROUP_COLUMN}, {aggregate}(val) AS val, COUNT(*) AS row_count"
     );
     let def = trellis::dev::defs::install_definition(&db.pool, &source_text, &columns, "public")
         .await
@@ -496,7 +498,7 @@ pub async fn run_sweep(
     let mut results = Vec::with_capacity(ratios.len());
     for &ratio in ratios {
         let groups = groups_for_ratio(ratio, target_rows_per_sec);
-        results.push(run_probe(groups, target_rows_per_sec, offer, tuning).await);
+        results.push(run_probe(groups, "SUM", target_rows_per_sec, offer, tuning).await);
     }
     results
 }

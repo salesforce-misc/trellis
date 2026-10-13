@@ -1760,6 +1760,126 @@ async fn composed_fields_and_expression_arguments_equal_postgres() {
     .await;
 }
 
+/// A page folds what entered into a group's stored `MIN`/`MAX` (and
+/// `BOOL_AND`/`BOOL_OR`) when nothing that left could have been the extreme,
+/// and re-reads the group otherwise (#698). Each step here is one of the
+/// cases that decide it, checked against Postgres over the source: a tie for
+/// the extreme leaving (the other holder stays, then goes), the sole holder
+/// of an extreme deleted, updated to a value inside the range, and moved past
+/// it, `NULL`s entering and leaving, a value moved to another group, and a
+/// group that loses its last non-`NULL` value.
+#[tokio::test]
+async fn a_page_folds_or_rereads_a_groups_min_max_by_what_left_it() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v integer, b boolean); \
+         insert into public.src values (1, 1, 10, true), (2, 1, 10, true), (3, 1, 5, true), \
+             (4, 2, 1, false), (5, 2, null, null)",
+        &[
+            ("id", int4),
+            ("g", int4),
+            ("v", int4),
+            ("b", ValueType::Boolean),
+        ],
+        &["TRANSFORM agg FROM public.src GROUP BY g \
+           SELECT MIN(v) AS lo, MAX(v) AS hi, BOOL_AND(b) AS allb, BOOL_OR(b) AS anyb, \
+                  COUNT(*) AS n"],
+        &[SRC],
+    )
+    .await;
+    assert_steps_match(
+        &mut d,
+        "select g, lo, hi, allb, anyb, n from public.agg order by g",
+        "select g, min(v), max(v), bool_and(b), bool_or(b), count(*) \
+         from public.src group by g order by g",
+        &[
+            // Enters inside the range, and below it, and NULLs enter.
+            "insert into public.src values (6, 1, 7, true), (7, 1, 3, true), (8, 1, null, null)",
+            // One of the tie for the max leaves: the other holds it.
+            "delete from public.src where id = 1",
+            // The other leaves: the max falls to 7.
+            "delete from public.src where id = 2",
+            // The min leaves, and an interior value and a NULL.
+            "delete from public.src where id in (7, 6, 8)",
+            // A value moves from the extreme to inside the range.
+            "insert into public.src values (9, 1, 8, false); \
+             update public.src set v = 6 where id = 9",
+            // A value moves past the max, and another past the min.
+            "update public.src set v = 20 where id = 3; \
+             update public.src set v = -4, b = true where id = 9",
+            // A boolean tie breaks: the only false leaves, then the only true.
+            "update public.src set b = true where id = 9",
+            "update public.src set b = false where id = 3",
+            // To NULL: the extreme holder becomes a NULL.
+            "update public.src set v = null where id = 3",
+            // To another group, which then holds the extremes.
+            "update public.src set g = 2 where id = 9; insert into public.src values (10, 2, 50, true)",
+            // A group loses its last non-NULL value.
+            "delete from public.src where id in (4, 9, 10)",
+            "insert into public.src values (11, 1, 2, null)",
+        ],
+        (3, &["3", "9"]),
+    )
+    .await;
+}
+
+/// Writes `sql` and drains it as one sealed page named `w`.
+async fn step(d: &mut Driver, sql: &str, w: &str) {
+    write(d, sql).await;
+    let b = d.seal().await;
+    d.drain(b, w).await;
+    d.settle().await;
+}
+
+/// A page's fold leaves a stored extreme it can't contradict alone, and its
+/// re-read replaces one it must (#698): the stored value is set to something
+/// the entries never held, and each page shows which path it took.
+#[tokio::test]
+async fn a_pages_fold_keeps_the_stored_extreme_and_a_leaving_extreme_rereads() {
+    let int4 = ValueType::Integer(trellis::integer::IntWidth::Int4);
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, v integer); \
+         insert into public.src values (1, 1, 10), (2, 1, 5), (3, 1, 4)",
+        &[("id", int4), ("g", int4), ("v", int4)],
+        &["TRANSFORM agg FROM public.src GROUP BY g SELECT MAX(v) AS hi, COUNT(*) AS n"],
+        &[SRC],
+    )
+    .await;
+    // Stored 99, which no entry holds. A value enters: the page folds into it.
+    write(&d, "update public.agg set hi = 99 where g = 1").await;
+    step(&mut d, "insert into public.src values (4, 1, 7)", "w0").await;
+    assert_eq!(
+        d.rows("select hi from public.agg").await,
+        d.rows("select 99").await
+    );
+    // A value leaves from inside the range, and one changes inside it: still folded.
+    step(
+        &mut d,
+        "delete from public.src where id = 3; update public.src set v = 6 where id = 2",
+        "w1",
+    )
+    .await;
+    assert_eq!(
+        d.rows("select hi from public.agg").await,
+        d.rows("select 99").await
+    );
+    // Stored 8, below the entry with 10: that entry leaves, so the group is
+    // re-read, and the max is what the entries hold.
+    write(&d, "update public.agg set hi = 8 where g = 1").await;
+    step(&mut d, "update public.src set v = 1 where id = 1", "w2").await;
+    assert_eq!(
+        d.rows("select hi from public.agg").await,
+        d.rows("select 7").await
+    );
+    // Stored 7 is the max and ties with the leaving value: re-read.
+    write(&d, "update public.agg set hi = 7 where g = 1").await;
+    step(&mut d, "delete from public.src where id = 4", "w3").await;
+    assert_eq!(
+        d.rows("select hi from public.agg").await,
+        d.rows("select 6").await
+    );
+}
+
 /// `MIN`/`MAX` recomputed from the ledger over a two-column `GROUP BY` with
 /// `NULL` keys: a group with one `NULL` column, one with both, and fully
 /// keyed groups beside them, each recomputed from its own entries only (the

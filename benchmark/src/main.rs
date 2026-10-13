@@ -39,6 +39,7 @@
 //! # issue #277: fold rate and lock-wait attribution by group count x drain workers
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,100,400,4000,40000
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 400 --threads 1,2,4,8,16
+//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,400 --aggregate max
 //! # the write-path tax and the capture ceiling (#622 C4; #565 E1/E2), and V-IDLE
 //! cargo run -p benchmark --features engine-access --release -- write-tax --shapes 1x1,1000x16,orm100x1 --reps 3
 //! cargo run -p benchmark --features engine-access --release -- write-tax --variants none,trigger,trigger+exception --shapes orm100x16+hold

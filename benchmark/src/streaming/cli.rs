@@ -437,6 +437,13 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 
         "group-contention" => {
             let groups = usize_list(args, "--groups", CONTENTION_DEFAULT_GROUPS);
+            // `--aggregate max` measures a recomputed field (#698); the
+            // default `sum` is the incremental path.
+            let aggregate = match flag(args, "--aggregate").unwrap_or("sum") {
+                "sum" => "SUM",
+                "max" => "MAX",
+                other => panic!("--aggregate is sum or max, not {other}"),
+            };
             let threads = usize_list(
                 args,
                 "--threads",
@@ -456,8 +463,13 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                         application_threads,
                         ..tuning.clone()
                     };
-                    let result =
-                        runtime.block_on(fold_in::run_probe(g, target_rate, offer, &tuning));
+                    let result = runtime.block_on(fold_in::run_probe(
+                        g,
+                        aggregate,
+                        target_rate,
+                        offer,
+                        &tuning,
+                    ));
                     ok &= report_fold_in(std::slice::from_ref(&result), name);
                     report_contention(&result);
                 }

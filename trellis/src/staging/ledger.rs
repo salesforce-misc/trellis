@@ -77,8 +77,10 @@
 //!    - a placeholder step 1 gave an Apply at or below the truncate floor is
 //!      deleted (#774): nothing writes it, and the tombstone GC collects only
 //!      tombstones.
-//! 4. The recomputed fields of every group the page kept are rewritten from
-//!    its live entries.
+//! 4. The recomputed fields of every group the page kept are rewritten
+//!    ([`recompute_written`]): folded from the keys that moved when nothing
+//!    that left could have been the extreme ([`page_folds`], #698), else
+//!    from all of its live entries.
 //! 5. Groups whose every accumulator reached 0 are deleted.
 //!
 //! Every written or deleted group reaches the target-mutation seam with its
@@ -775,6 +777,58 @@ fn moves_and_deltas(plan: &LedgerTargetPlan, build: bool) -> String {
     )
 }
 
+/// The `d` column holding field `i`'s aggregate over the values that left
+/// the group ([`deltas_cte`]).
+fn leaving_column(i: usize) -> String {
+    format!("__lv{i}")
+}
+
+/// Whether a page's recomputed fields may be folded rather than re-read from
+/// all of the group's entries (#698), as a SQL boolean over `d` (the
+/// increments, with each folded field's leaving aggregate) and `up` (the
+/// upserted row, whose recomputed fields still hold their old values).
+///
+/// A field is its aggregate over the group's live entries. What entered is
+/// folded into the old value, which is exact unless a value that left could
+/// have been the extreme. It could not, when everything that left sorts
+/// strictly inside the old extreme: below the old `MAX` (or `BOOL_OR`), above
+/// the old `MIN` (or `BOOL_AND`), as the type's own btree orders it, `NaN`
+/// above every number. A tie could be the only holder of the extreme, so it
+/// does not qualify, and neither does any non-null value leaving a group
+/// whose stored value is `NULL`, where the comparison is `NULL`. A group
+/// that lost only `NULL`s, or nothing, qualifies. `false` for a target with a
+/// field that doesn't fold.
+fn page_folds(shape: &LedgerShape) -> String {
+    if !shape.recomputes() || !shape.folds() {
+        return "false".to_string();
+    }
+    let checks: Vec<String> = shape
+        .fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, field)| {
+            let LedgerField::Recompute {
+                column,
+                fold: Some(fold),
+                ..
+            } = field
+            else {
+                return None;
+            };
+            let op = if matches!(*fold, "max" | "bool_or") {
+                "<"
+            } else {
+                ">"
+            };
+            let (lv, stored) = (leaving_column(i), format!("up.{}", quote_ident(column)));
+            Some(format!(
+                "(d.{lv} is null or coalesce(d.{lv} {op} {stored}, false))"
+            ))
+        })
+        .collect();
+    checks.join(" and ")
+}
+
 /// [`moves_and_deltas`]' `d` CTE alone, over a preceding `moves` CTE: one
 /// row per move, with the entry's values, `__sign` (1 into the group, -1 out
 /// of it), `__k` (its key) and `__rc` (whether its values changed).
@@ -792,6 +846,20 @@ fn deltas_cte(plan: &LedgerTargetPlan, build: bool) -> String {
     // shows whichever spelling it picks.
     if shape.recomputes() {
         nonzero.push("bool_or(m.__rc)".to_string());
+        if !build && shape.folds() {
+            // What left the group, per folded field (#698): the field's own
+            // aggregate over the values of the entries that moved out of the
+            // group with their values changed. [`page_folds`] compares it
+            // with the stored value.
+            for (i, field) in shape.fields.iter().enumerate() {
+                if let LedgerField::Recompute { sql, .. } = field {
+                    deltas.push(format!(
+                        "{sql} filter (where m.__sign < 0 and m.__rc) as {}",
+                        leaving_column(i)
+                    ));
+                }
+            }
+        }
         if build {
             deltas.push(format!(
                 "bool_or(m.__sign < 0 and m.__rc) as {}",
@@ -1273,7 +1341,7 @@ fn ledger_statement(
     } else {
         ""
     };
-    let upsert = group_upsert_sql(plan, image_columns, racing, "false");
+    let upsert = group_upsert_sql(plan, image_columns, racing, &page_folds(shape));
 
     format!(
         "with {ctes}, \
@@ -2040,16 +2108,6 @@ impl WrittenGroup {
     }
 }
 
-/// The groups a statement kept, by `ctid`: those with some accumulator not
-/// 0. [`recompute_statement`] rewrites their recomputed fields.
-fn kept_ctids(groups: &[WrittenGroup]) -> Vec<&str> {
-    groups
-        .iter()
-        .filter(|g| !g.empty)
-        .map(|g| g.ctid.as_str())
-        .collect()
-}
-
 /// Deletes the written groups whose every accumulator is 0 (#625 F1's B5),
 /// each already locked by the upsert that wrote it, and hands every written
 /// or deleted group to the seam with its prior image (none for a group the
@@ -2622,12 +2680,7 @@ async fn write_page(
         .filter_map(|row| WrittenGroup::from_row(row, 0))
         .collect();
     // 4. The recomputed fields of every group the page kept.
-    if let Some(recompute) = recompute_statement(plan) {
-        let kept = kept_ctids(&groups);
-        if !kept.is_empty() {
-            txn.execute(&recompute, &[&kept]).await?;
-        }
-    }
+    recompute_written(txn, plan, &groups).await?;
     // Test-only pause point (#623 D1). See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
