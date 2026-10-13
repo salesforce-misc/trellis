@@ -1402,7 +1402,7 @@ async fn plan_waiting_builds(
 
     let rows = client
         .query(
-            "select id, definition_text from transform_definitions \
+            "select id, definition_text, grammar_version from transform_definitions \
              where source_table = $1 and status = $2 \
                and ($3::bigint[] is null or id = any($3)) \
              order by id",
@@ -1413,7 +1413,7 @@ async fn plan_waiting_builds(
     for row in rows {
         let id: i64 = row.get(0);
         let text: String = row.get(1);
-        let def = crate::defs::parse(&text).map_err(CatalogError::from)?;
+        let def = crate::defs::grammar::load(&text, row.get(2)).map_err(CatalogError::from)?;
         if rederive.contains(&id) {
             continue;
         }

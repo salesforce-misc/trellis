@@ -81,6 +81,14 @@ pub enum ParseError {
         address: String,
         detail: String,
     },
+    /// A stored definition was written under a grammar version older than the
+    /// oldest this binary reads (ADR-0018). The fix is to drop the transform
+    /// and define it again.
+    GrammarVersionTooOld { stored: i32, oldest: i32 },
+    /// A stored definition was written under a grammar version newer than
+    /// this binary knows (ADR-0018): a downgrade, or an older binary running
+    /// beside a newer one. Nothing is read or written.
+    GrammarVersionTooNew { stored: i32, current: i32 },
 }
 
 impl ParseError {
@@ -95,6 +103,17 @@ impl ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ParseError::GrammarVersionTooOld { stored, oldest } => write!(
+                f,
+                "the stored definition was written under grammar version {stored}, and this \
+                 binary reads grammar versions {oldest} and later; drop the transform and \
+                 define it again"
+            ),
+            ParseError::GrammarVersionTooNew { stored, current } => write!(
+                f,
+                "the stored definition was written under grammar version {stored}, newer than \
+                 the {current} this binary reads; run a binary that reads grammar version {stored}"
+            ),
             ParseError::UnexpectedChar { found } => {
                 write!(f, "unexpected character '{found}' in transform definition")
             }

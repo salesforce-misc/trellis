@@ -195,6 +195,18 @@ pub(crate) async fn pause_for_capture_failure(
     pause_with_record(txn, id, source_table, columns, error, "capture", caused_by).await
 }
 
+/// Pauses definition `id` because it was written under a grammar version
+/// outside this binary's window (ADR-0018), recording `error` as its
+/// `capture_failure`. Returns whether this call paused it.
+pub(crate) async fn pause_for_grammar_version(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    error: &str,
+) -> Result<bool, CatalogError> {
+    pause_with_record(txn, id, source_table, &[], error, "capture", None).await
+}
+
 /// [`pause_for_capture_failure`] for a drain's halt (#663,
 /// `staging::halt`): pauses definition `id` because a page failed with a
 /// halting error on `source_table` that it reads, directly, through a
@@ -663,14 +675,14 @@ async fn dependency_blockers(
     // of only "something reads this table."
     let column_detail = match txn
         .query_opt(
-            "select definition_text from transform_definitions where id = $1",
+            "select definition_text, grammar_version from transform_definitions where id = $1",
             &[&definition_id],
         )
         .await?
     {
         Some(row) => {
             let text: String = row.get(0);
-            match super::parse(&text) {
+            match super::grammar::load(&text, row.get(1)) {
                 Ok(def) => {
                     let mut detail = Vec::new();
                     for field in &def.fields {
@@ -791,7 +803,7 @@ async fn relationship_readers(
 ) -> Result<Vec<String>, CatalogError> {
     let rows = txn
         .query(
-            "select definition_text from transform_definitions \
+            "select definition_text, grammar_version from transform_definitions \
              where source_table = $1 order by id",
             &[&qualified_from],
         )
@@ -800,7 +812,7 @@ async fn relationship_readers(
     let mut readers = Vec::new();
     for row in rows {
         let text: String = row.get(0);
-        let def = super::parse(&text)?;
+        let def = super::grammar::load(&text, row.get(1))?;
         if exclude == Some(def.target.as_str()) {
             continue;
         }

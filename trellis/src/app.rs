@@ -718,7 +718,7 @@ impl Trellis {
             let row = txn
                 .query_opt(
                     &format!(
-                        "select d.status, d.id, d.source_table, d.definition_text, \
+                        "select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, \
                             pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                             pb.last_error as backfill_last_error, \
                             pb.next_attempt_at as backfill_next_attempt_at, \
@@ -776,11 +776,15 @@ impl Trellis {
                         &*txn,
                         row.get("source_table"),
                         row.get("definition_text"),
+                        row.get("grammar_version"),
                     )
                     .await?;
                 }
                 // #973: a stored definition always parses.
-                if let Ok(def) = crate::defs::parse(row.get("definition_text")) {
+                if let Ok(def) = crate::defs::grammar::load(
+                    row.get("definition_text"),
+                    row.get("grammar_version"),
+                ) {
                     unindexed =
                         unindexed_joins::for_definition(&*txn, row.get("source_table"), &def)
                             .await?;

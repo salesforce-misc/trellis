@@ -414,8 +414,8 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
     let catalog = load_catalog(&txn, schema).await?;
     let rows = txn
         .query(
-            "select id, source_table, definition_text from transform_definitions \
-             where status = $1 order by id",
+            "select id, source_table, definition_text, grammar_version \
+             from transform_definitions where status = $1 order by id",
             &[&TransformStatus::WaitingToBackfill.as_str()],
         )
         .await?;
@@ -429,7 +429,7 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
     let mut waiting = Vec::with_capacity(rows.len());
     for row in rows {
         let source: String = row.get(1);
-        let def = crate::defs::parse(row.get::<_, &str>(2))
+        let def = crate::defs::grammar::load(row.get::<_, &str>(2), row.get(3))
             .map_err(|e| CaptureError::Catalog(e.into()))?;
         let to_sides = to_sides_read(&catalog, &source, &def);
         waiting.push((row.get(0), source, to_sides));

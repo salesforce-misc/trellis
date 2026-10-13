@@ -55,6 +55,11 @@ async fn attach(pg_client: &mut tokio_postgres::Client, config: &Config) -> Resu
 
     run_migrations(pg_client).await?;
 
+    // ADR-0018: before anything reads a stored definition, refuse an attach
+    // over definitions this binary can't read and pause the ones outside the
+    // support window.
+    crate::defs::grammar::check_stored_versions(pg_client).await?;
+
     // Always seed/reconcile the marker, not just on a "fresh attach" — see
     // `identity::seed_marker` for why: it's an idempotent upsert, so a
     // clean re-attach, a resumed crash between the runner creating

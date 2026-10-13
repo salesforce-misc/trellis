@@ -266,11 +266,13 @@ pub(crate) async fn open(
 /// from `source_table` reads: the source itself, or the to-side of a
 /// relationship its fields read through. `definition_text` is the
 /// definition's, to tell which of its source's relationships it reads
-/// through. The caller decides whether the definition is unfrozen.
+/// through, and `grammar_version` the grammar it was written under. The
+/// caller decides whether the definition is unfrozen.
 pub(crate) async fn for_definition(
     client: &impl GenericClient,
     source_table: &str,
     definition_text: &str,
+    grammar_version: i32,
 ) -> Result<Option<DrainFailure>, tokio_postgres::Error> {
     // `drain_holdups` holds a row per failing segment, so it's empty, or
     // nearly so, and read whole. `through` names the source's relationships
@@ -303,12 +305,14 @@ pub(crate) async fn for_definition(
             continue;
         }
         let names = read_through.get_or_insert_with(|| {
-            crate::defs::parse(definition_text).ok().map(|def| {
-                crate::defs::eval::relationship_references(&def)
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect()
-            })
+            crate::defs::grammar::load(definition_text, grammar_version)
+                .ok()
+                .map(|def| {
+                    crate::defs::eval::relationship_references(&def)
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect()
+                })
         });
         let reads = match names {
             Some(names) => through.iter().any(|name| names.contains(name)),

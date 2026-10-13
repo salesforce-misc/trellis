@@ -292,7 +292,7 @@ use crate::defs::catalog::{CatalogError, relationship_by_name_in};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::RelationshipCardinality;
 use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
-use crate::defs::{TransformStatus, parse};
+use crate::defs::{TransformStatus, grammar};
 use crate::pool::quote_ident;
 use crate::staging::apply::bounds_keyset_by_array;
 use crate::staging::target_mutations::{SeamStats, TargetMutations};
@@ -470,7 +470,7 @@ impl Sweep {
         }
         let defs = txn
             .query(
-                "select id, definition_text, target_table, source_table \
+                "select id, definition_text, target_table, source_table, grammar_version \
                  from transform_definitions where id = any($1) and status = $2 order by id",
                 &[&ids, &status.as_str()],
             )
@@ -482,7 +482,7 @@ impl Sweep {
             let source_table: String = row.get(3);
             // Issue #518: an error, like every other discharge-time reader
             // of the catalog, so the marker fails and backs off (#407).
-            let def = parse(&text).map_err(CatalogError::from)?;
+            let def = grammar::load(&text, row.get(4)).map_err(CatalogError::from)?;
             let target_ident = ddl::qualified_target_table_ident(&target);
             let key_cols = ddl::identity_key_columns(txn, &target).await?;
             if key_cols.is_empty() {

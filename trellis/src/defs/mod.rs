@@ -35,6 +35,7 @@ pub(crate) mod copies;
 pub mod ddl;
 pub mod error;
 pub mod eval;
+pub mod grammar;
 pub mod hierarchy;
 pub mod invertibility;
 pub(crate) mod key_types;
@@ -64,7 +65,11 @@ pub use error::ParseError;
 pub use model::{
     Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
 };
-pub use parser::{parse, parse_statement, statement_kind};
+pub use parser::{parse_statement, statement_kind};
+// Stored text loads through `grammar::load`; the integration tests parse
+// fresh text directly.
+#[cfg(any(test, feature = "internals", feature = "test-util"))]
+pub use parser::parse;
 pub use pg_type::PgType;
 // The crate validates through `validate::validate`; the integration tests
 // reach it here.
