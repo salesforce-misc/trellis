@@ -72,6 +72,7 @@ enum Job {
     Apply(String, oneshot::Sender<Result<Applied, TrellisError>>),
     Definitions(oneshot::Sender<Result<Vec<DefinitionSummary>, TrellisError>>),
     Relationships(oneshot::Sender<Result<Vec<RelationshipSummary>, TrellisError>>),
+    DumpDefinitionsSql(oneshot::Sender<Result<String, TrellisError>>),
     RequestBackfill(String, oneshot::Sender<Result<(), TrellisError>>),
     PoisonedSince(
         SystemTime,
@@ -271,6 +272,17 @@ impl BlockingTrellis {
     /// Submits [`BlockingTrellis::relationships`] and returns without waiting for it.
     pub fn start_relationships(&self) -> PendingCall<Vec<RelationshipSummary>> {
         self.start(Job::Relationships)
+    }
+
+    /// SQL that loads this instance's definitions into a database built from
+    /// a schema-only dump. See [`Trellis::dump_definitions_sql`].
+    pub fn dump_definitions_sql(&self) -> Result<String, TrellisError> {
+        self.start_dump_definitions_sql().wait()
+    }
+
+    /// Submits [`BlockingTrellis::dump_definitions_sql`] and returns without waiting for it.
+    pub fn start_dump_definitions_sql(&self) -> PendingCall<String> {
+        self.start(Job::DumpDefinitionsSql)
     }
 
     /// Re-reads `source_table` for every definition applying from it, as a
@@ -690,6 +702,11 @@ async fn run(
             Job::Relationships(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
                 Box::pin(async move { t.submitted(at, t.relationships()).await })
             }),
+            Job::DumpDefinitionsSql(reply) => {
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.dump_definitions_sql()).await })
+                })
+            }
             Job::RequestBackfill(table, reply) => {
                 calls.spawn(trellis, submitted, reply, move |t, at| {
                     Box::pin(async move { t.submitted(at, t.request_backfill(&table)).await })

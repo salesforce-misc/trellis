@@ -1,0 +1,434 @@
+//! Issue #644: `dump_definitions_sql` appends a schema-only `pg_dump` with the
+//! rows that say what is defined, the way Rails appends `schema_migrations`.
+//!
+//! The round trip is hand-driven and deterministic (#297): no live pipeline,
+//! and the one build step the loaded database needs is run through the same
+//! engine functions the drain worker calls.
+//!
+//! - the dump plus the appendix loads into a fresh database as "defined, not
+//!   built", with every runtime table empty
+//!   (`a_dump_loads_as_defined_not_built`)
+//! - the loaded database builds its definitions from the source rows and gets
+//!   the same targets (`a_loaded_database_builds_its_definitions`)
+//! - every table in the Trellis schema is classified
+//!   (`every_trellis_table_is_classified`)
+
+use std::process::Command;
+use std::time::Duration;
+
+use testkit::TestCluster;
+use tokio_postgres::{Client, NoTls};
+use trellis::defs::chunk_queue;
+use trellis::dump::{CLASSIFICATION, Class, is_projection_table};
+use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+use trellis::{Config, Trellis, TrellisOptions};
+
+const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    client
+}
+
+async fn facade(dsn: &str) -> Trellis {
+    Trellis::connect(
+        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis")
+}
+
+/// Runs every queued build to completion by hand: the stand-in for a drain
+/// worker (`pause_and_drop.rs`'s helper of the same name).
+async fn build_everything(pool: &trellis::Pool) {
+    trellis::intake::markers::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, "dump_test", 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            trellis::staging::build::settle_builds(pool).await;
+            trellis::intake::markers::discharge_registrations(pool)
+                .await
+                .expect("discharge the go-live catch-ups");
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                "dump_test",
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, "dump_test")
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
+
+/// Loads `schema_sql` plus the appendix into `dsn`'s empty database, the way
+/// `psql -f structure.sql` does. The dump creates `public` itself.
+fn load(dsn: &str, schema_sql: &str, appendix: &str) {
+    run(
+        Command::new("psql")
+            .args(["-q", "-c", "drop schema public cascade"])
+            .arg(dsn),
+        "drop the empty database's public schema",
+    );
+    let file = tempfile_dir().join(format!("structure_{}.sql", dsn.rsplit('=').next().unwrap()));
+    std::fs::write(&file, format!("{schema_sql}\n{appendix}")).expect("write dump");
+    run(
+        Command::new("psql")
+            .args(["-v", "ON_ERROR_STOP=1", "-q", "-f"])
+            .arg(&file)
+            .arg(dsn),
+        "psql load",
+    );
+}
+
+/// Seals and drains the ring through the engine's own apply path until
+/// nothing is pending: the stand-in for the maintenance loop and drain workers.
+async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        while apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "dump_test",
+            1,
+            "dump_test_wake",
+            &watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
+}
+
+fn run(cmd: &mut Command, what: &str) -> String {
+    let out = cmd.output().unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert!(
+        out.status.success(),
+        "{what} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("utf8")
+}
+
+async fn rows_json(raw: &Client, sql: &str) -> Vec<String> {
+    raw.query(&format!("select j::text from ({sql}) q(j)"), &[])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+async fn count(raw: &Client, sql: &str) -> i64 {
+    raw.query_one(sql, &[]).await.expect("count").get(0)
+}
+
+const SOURCE_DDL: &str = "\
+    create table public.cats (id bigint primary key, name text); \
+    create table public.orders (id bigint primary key, g bigint, a bigint, cat_id bigint); \
+    insert into public.cats values (1, 'tom'), (2, 'kit'); \
+    insert into public.orders values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 1)";
+
+/// A 1-1 transform, an aggregate chained off it, and a 1-1 reading through a
+/// relationship, all built, with the capture triggers installed.
+async fn define_and_build(t: &Trellis, raw: &mut Client) {
+    raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
+    t.apply("RELATIONSHIP cat FROM orders.cat_id TO cats.id")
+        .await
+        .expect("relationship");
+    t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b")
+        .await
+        .expect("o1");
+    build_everything(t.pool()).await;
+    t.apply("TRANSFORM tot FROM o1 GROUP BY g SELECT g AS g, SUM(b) AS total")
+        .await
+        .expect("tot");
+    t.apply("TRANSFORM oc FROM orders SELECT cat.name AS cat_name")
+        .await
+        .expect("oc");
+    build_everything(t.pool()).await;
+    trellis::client::reconcile_pass(
+        raw,
+        t.pool(),
+        SCHEMA,
+        "dump_test_wake",
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("capture pass");
+    build_everything(t.pool()).await;
+    drain_to_quiescence(t.pool(), raw).await;
+    build_everything(t.pool()).await;
+}
+
+/// The ledger is the runtime state the issue names; it must exist in the
+/// source for the "never dumped" assertions to mean anything.
+async fn ledger_rows(raw: &Client) -> i64 {
+    count(raw, "select count(*) from public.tot__ledger").await
+}
+
+const STATUSES: &str =
+    "select target_table || ' ' || status from transform_definitions order by id";
+
+#[tokio::test]
+async fn a_dump_loads_as_defined_not_built() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(source.dsn()).await;
+    let t = facade(source.dsn()).await;
+    define_and_build(&t, &mut raw).await;
+    assert!(ledger_rows(&raw).await > 0, "the source has runtime state");
+    assert!(
+        rows_json(&raw, STATUSES)
+            .await
+            .iter()
+            .all(|s| s.ends_with(" live")),
+        "{:?}",
+        rows_json(&raw, STATUSES).await
+    );
+
+    let schema_sql = run(
+        Command::new("pg_dump")
+            .args([
+                "--schema-only",
+                "--no-owner",
+                "--schema",
+                SCHEMA,
+                "--schema",
+                "public",
+            ])
+            .arg(source.dsn()),
+        "pg_dump",
+    );
+    let appendix = t.dump_definitions_sql().await.expect("dump definitions");
+
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &schema_sql, &appendix);
+    let after = connect_raw(loaded.dsn()).await;
+
+    // The catalog rows match, apart from the build progress a define resets.
+    for sql in [
+        "select to_jsonb(t) - 'created_at' from relationship_definitions t order by id",
+        "select to_jsonb(t) - 'created_at' - 'refreshed_lsn' from relationship_projections t order by id",
+        "select to_jsonb(t) - 'created_at' from schema_nodes t order by id",
+        "select to_jsonb(t) - 'created_at' from schema_edges t order by id",
+        "select to_jsonb(t) from source_table_versions t order by source_table",
+        "select to_jsonb(t) from definition_key_types t order by transform_id",
+        "select to_jsonb(t) from trellis_instance t",
+        "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
+        "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'build_marker_generation' - 'fuse_rearmed_at' from transform_definitions t order by id",
+    ] {
+        let want = rows_json(&raw, sql).await;
+        assert!(!want.is_empty(), "{sql} has rows to compare");
+        assert_eq!(rows_json(&after, sql).await, want, "{sql}");
+    }
+
+    // Every definition is defined, not built.
+    let statuses = rows_json(&after, STATUSES).await;
+    assert_eq!(statuses.len(), 3);
+    assert!(
+        statuses.iter().all(|s| s.ends_with(" waiting_to_backfill")),
+        "{statuses:?}"
+    );
+
+    // Every runtime table is empty, and the seed rows match a migrated database.
+    for (table, class) in CLASSIFICATION {
+        if matches!(class, Class::Runtime) {
+            assert_eq!(
+                count(&after, &format!("select count(*) from {SCHEMA}.{table}")).await,
+                0,
+                "{table} loads empty"
+            );
+        }
+    }
+    let projections = rows_json(
+        &after,
+        &format!(
+            "select relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = '{SCHEMA}' and c.relkind = 'r' and relname like '_trellis_rel_projection_%'"
+        ),
+    )
+    .await;
+    assert_eq!(projections.len(), 1);
+    for p in projections {
+        assert_eq!(
+            count(&after, &format!("select count(*) from {SCHEMA}.{p}")).await,
+            0
+        );
+    }
+    for t in ["o1", "tot", "oc"] {
+        assert_eq!(
+            count(&after, &format!("select count(*) from public.{t}")).await,
+            0
+        );
+        assert_eq!(
+            count(&after, &format!("select count(*) from public.{t}__ledger")).await,
+            0
+        );
+    }
+    let fresh = cluster.create_isolated_database().await;
+    let fresh = connect_raw(fresh.dsn()).await;
+    for (table, class) in CLASSIFICATION {
+        if matches!(class, Class::Seed { .. }) {
+            let sql = format!("select to_jsonb(t) - 'created_at' from {SCHEMA}.{table} t");
+            assert_eq!(
+                rows_json(&after, &sql).await,
+                rows_json(&fresh, &sql).await,
+                "{table} loads its migration's seed row"
+            );
+        }
+    }
+
+    // The capture triggers came with the dump.
+    let triggers = "select tgname::text from pg_trigger \
+                    where tgrelid = 'public.orders'::regclass and not tgisinternal order by 1";
+    let want = rows_json(&raw, triggers).await;
+    assert!(!want.is_empty(), "the source has capture triggers");
+    assert_eq!(rows_json(&after, triggers).await, want);
+
+    // The migration history is current, so migrate does nothing.
+    let t2 = facade(loaded.dsn()).await;
+    t2.migrate().await.expect("migrate on the loaded database");
+    assert_eq!(
+        count(&after, "select count(*) from refinery_schema_history").await,
+        count(&raw, "select count(*) from refinery_schema_history").await
+    );
+
+    // Identity sequences continue past the loaded rows.
+    t2.apply("TRANSFORM later FROM cats SELECT name AS n")
+        .await
+        .expect("a define after the load");
+    assert!(count(&after, "select max(id) from transform_definitions").await > 3);
+    assert_eq!(
+        count(&after, "select count(distinct id) from schema_nodes").await,
+        count(&after, "select count(*) from schema_nodes").await
+    );
+}
+
+#[tokio::test]
+async fn a_loaded_database_builds_its_definitions() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(source.dsn()).await;
+    let t = facade(source.dsn()).await;
+    define_and_build(&t, &mut raw).await;
+
+    let schema_sql = run(
+        Command::new("pg_dump")
+            .args([
+                "--schema-only",
+                "--no-owner",
+                "--schema",
+                SCHEMA,
+                "--schema",
+                "public",
+            ])
+            .arg(source.dsn()),
+        "pg_dump",
+    );
+    let appendix = t.dump_definitions_sql().await.expect("dump definitions");
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &schema_sql, &appendix);
+    let after = connect_raw(loaded.dsn()).await;
+    after
+        .batch_execute(
+            "insert into public.cats values (1, 'tom'), (2, 'kit'); \
+             insert into public.orders values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 1)",
+        )
+        .await
+        .expect("load source rows");
+
+    let t2 = facade(loaded.dsn()).await;
+    // The loaded rows reach the ring through the dump's capture triggers,
+    // so the builds are followed by the drain the worker would run.
+    let mut worker = connect_raw(loaded.dsn()).await;
+    for _ in 0..3 {
+        build_everything(t2.pool()).await;
+        drain_to_quiescence(t2.pool(), &mut worker).await;
+    }
+
+    let statuses = rows_json(&after, STATUSES).await;
+    assert!(
+        statuses.iter().all(|s| s.ends_with(" live")),
+        "{statuses:?}"
+    );
+    for sql in [
+        "select to_jsonb(t) from public.o1 t order by 1::text",
+        "select to_jsonb(t) from public.tot t order by 1::text",
+        "select to_jsonb(t) from public.oc t order by 1::text",
+    ] {
+        let want = rows_json(&raw, &sql.replace(" order by 1::text", "")).await;
+        assert!(!want.is_empty(), "the source's {sql} has rows");
+        let mut want = want;
+        want.sort();
+        let mut got = rows_json(&after, &sql.replace(" order by 1::text", "")).await;
+        got.sort();
+        assert_eq!(got, want, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn every_trellis_table_is_classified() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let mut actual: Vec<String> = rows_json(
+        &raw,
+        &format!(
+            "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = '{SCHEMA}' and c.relkind in ('r', 'p') order by 1"
+        ),
+    )
+    .await
+    .into_iter()
+    .filter(|t| !is_projection_table(t))
+    .collect();
+    actual.sort();
+    let mut classified: Vec<String> = CLASSIFICATION.iter().map(|(t, _)| t.to_string()).collect();
+    classified.sort();
+    assert_eq!(
+        actual, classified,
+        "every table in the Trellis schema is listed in trellis::dump::CLASSIFICATION as a \
+         definition, a seed or runtime state, and no listed table is gone"
+    );
+}
+
+fn tempfile_dir() -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("trellis_dump_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}

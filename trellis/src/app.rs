@@ -668,6 +668,23 @@ impl Trellis {
         .await
     }
 
+    /// SQL that loads this instance's definitions into a database built from
+    /// a schema-only dump (issue #644): `INSERT`s for the Trellis migration
+    /// history, the instance marker and the transform and relationship
+    /// definitions with the catalog rows they need, and for nothing else.
+    /// Append it to a schema-only `pg_dump` of the Trellis schema and the
+    /// schemas it maintains, the way Rails appends `schema_migrations`.
+    ///
+    /// Every definition loads "defined, not built": the state a define
+    /// commits. Runtime state (the ledger, the ring, build chunks,
+    /// quarantine, claims) is never dumped, because it describes rows a
+    /// schema-only dump doesn't carry. The worker that starts on the loaded
+    /// database builds the definitions.
+    pub async fn dump_definitions_sql(&self) -> Result<String, TrellisError> {
+        self.call(crate::dump::dump_definitions_sql(&self.pool, &self.config))
+            .await
+    }
+
     /// One registered transform definition's current [`TransformStatus`]
     /// (issue #55), by target table name — the read a host-language embedder
     /// polls after [`apply`](Trellis::apply) registers a definition, per

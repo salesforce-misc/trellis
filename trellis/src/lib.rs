@@ -77,6 +77,10 @@ pub mod blocking;
 pub mod client;
 pub mod config;
 pub(crate) mod deadline;
+#[cfg(not(feature = "internals"))]
+pub(crate) mod dump;
+#[cfg(feature = "internals")]
+pub mod dump;
 pub mod error;
 pub mod error_code;
 pub mod float;
