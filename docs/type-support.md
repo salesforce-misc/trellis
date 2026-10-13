@@ -322,9 +322,10 @@ column stops being recognized and later fails introspection. Checked in
 
 ## `array_agg` and `string_agg`
 
-`ARRAY_AGG(<text>)` and `STRING_AGG(<text>, '<separator>')` take a `text` or
-`varchar` argument and are recompute-only: no delta maintenance is sound for
-an order-sensitive fold, since the state is the whole ordered contents.
+`ARRAY_AGG(<text>)` and `STRING_AGG(<text>, '<separator>')` take a `text`,
+`varchar` or `char(n)` argument (a `char(n)` value loses its trailing spaces,
+as in a cast to `text`) and are recompute-only: a delta would need the
+group's whole input, not a summary of it.
 `ARRAY_AGG` produces `text[]` and keeps a `NULL` row as a `NULL` element.
 `STRING_AGG` skips `NULL` rows and is `NULL` when none remain. The separator
 must be a string literal, and neither aggregate is accepted over a to-many

@@ -520,11 +520,11 @@ pub enum ValidationError {
         rel: String,
     },
     /// `ARRAY_AGG`/`STRING_AGG` over a to-many relationship path (issue
-    /// #293). Both are recompute-only with no order guarantee; a to-many
-    /// relationship enrichment folds in the Rust evaluator with no live
-    /// connection, and the fold's element order would not agree with a
-    /// server-side recompute. A `GROUP BY` definition's own call is
-    /// unaffected.
+    /// #293). A to-many enrichment is folded by the Rust evaluator
+    /// (`eval::eval_to_many_aggregate`) and built by its SQL twin
+    /// (`backfill`), and neither has an arm for these two; without this
+    /// refusal the evaluator would fall through to the numeric fold. A
+    /// `GROUP BY` definition's own call is unaffected.
     ListAggregateOverToManyRelationshipUnsupported {
         field: String,
         function: String,
@@ -1130,10 +1130,8 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "calculated field '{field}': {function}('{rel}.<column>') over a to-many \
-                 relationship is not supported — the aggregate has no ORDER BY, and a fold \
-                 over related rows cannot match the element order of a server-side recompute \
-                 (issue #293); a GROUP BY definition's own {function}(<text column>) is \
-                 unaffected"
+                 relationship is not supported (issue #293); a GROUP BY definition's own \
+                 {function}(<text column>) is supported"
             ),
             ValidationError::StringAggSeparatorNotLiteral { field } => write!(
                 f,
@@ -3848,6 +3846,53 @@ mod tests {
                 rel: "items".to_string(),
             }
         );
+    }
+
+    /// Issue #293: `ARRAY_AGG`/`STRING_AGG` over a to-many relationship path
+    /// are refused; the to-many fold has no arm for them.
+    #[test]
+    fn list_aggregates_over_a_to_many_relationship_are_refused() {
+        let path = Expr::RelationshipPath {
+            rel: "items".to_string(),
+            column: "label".to_string(),
+        };
+        let relationships = HashMap::from([(
+            "items".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToMany,
+                to_table: "items".to_string(),
+                to_col: "order_id".to_string(),
+                from_col: String::new(),
+                qualified_to_table: "items".to_string(),
+                column_types: HashMap::from([("label".to_string(), ValueType::Text)]),
+            },
+        )]);
+        for (function, args) in [
+            ("ARRAY_AGG", vec![path.clone()]),
+            (
+                "STRING_AGG",
+                vec![path.clone(), Expr::StringLiteral(",".to_string())],
+            ),
+        ] {
+            let d = def(vec![FieldDef {
+                name: "labels".to_string(),
+                expr: Expr::FunctionCall {
+                    name: function.to_string(),
+                    args,
+                },
+            }]);
+            assert_eq!(
+                validate(&d, &HashMap::new(), &relationships),
+                Err(
+                    ValidationError::ListAggregateOverToManyRelationshipUnsupported {
+                        field: "labels".to_string(),
+                        function: function.to_string(),
+                        rel: "items".to_string(),
+                    }
+                ),
+                "{function}"
+            );
+        }
     }
 
     /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<text column>)` —

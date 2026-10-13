@@ -570,7 +570,7 @@ mod tests {
 
     /// Every [`PgType`] variant, so the tests below stay exhaustive by
     /// construction.
-    const ALL: [PgType; 22] = [
+    const ALL: [PgType; 23] = [
         PgType::Oid,
         PgType::Bytea,
         PgType::Date,
@@ -591,6 +591,7 @@ mod tests {
         PgType::Xml,
         PgType::TsVector,
         PgType::TsQuery,
+        PgType::TextArray,
         DEMO_ENUM,
         PgType::Unrecognized,
     ];
