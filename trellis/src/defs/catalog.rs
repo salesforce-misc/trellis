@@ -4426,6 +4426,10 @@ pub(crate) async fn relationships_from_table_in(
 /// Definitions in every status count. A table is captured from the moment
 /// something registers a reader of it, before that reader builds, and a
 /// paused or quarantined reader still needs its columns when it resumes.
+/// The exception is a definition older than the grammar window (ADR-0018):
+/// attaching paused it, it never resumes, and its fix is a drop and a fresh
+/// define, so it reads nothing and is left out. A definition newer than the
+/// window fails the read, since its columns can't be known.
 #[allow(clippy::type_complexity)]
 pub(crate) async fn capture_readers(
     client: &impl GenericClient,
@@ -4446,14 +4450,10 @@ pub(crate) async fn capture_readers(
         )
         .await?
         .into_iter()
-        .map(|row| {
-            Ok((
-                row.get(0),
-                row.get(1),
-                grammar::load(row.get(2), row.get(5))?,
-                row.get(3),
-                row.get(4),
-            ))
+        .filter_map(|row| match grammar::load(row.get(2), row.get(5)) {
+            Ok(def) => Some(Ok((row.get(0), row.get(1), def, row.get(3), row.get(4)))),
+            Err(ParseError::GrammarVersionTooOld { .. }) => None,
+            Err(e) => Some(Err(e.into())),
         })
         .collect::<Result<Vec<_>, CatalogError>>()?;
     let relationships = client
@@ -8628,8 +8628,26 @@ async fn column_dependents_via(
         // skip rather than fail this best-effort lineage scan on the
         // unexpected chance it doesn't, rather than let one bad row prevent
         // cascading a pause to every other, healthy dependent.
-        let Ok(def) = grammar::load(&text, row.get(4)) else {
-            continue;
+        //
+        // The exception is a definition written under a newer grammar
+        // (ADR-0018) that could read the upstream table, directly or through
+        // a relationship. For the drop refusal this scan is the whole check,
+        // and whether that definition reads the column can't be known here,
+        // so the drop is refused rather than allowed past it. A definition
+        // older than the window is paused for good and redefined from
+        // scratch, so it doesn't hold a drop up.
+        let def = match grammar::load(&text, row.get(4)) {
+            Ok(def) => def,
+            Err(e @ ParseError::GrammarVersionTooNew { .. })
+                if !only_one_to_one
+                    && (qualified_source == qualified_upstream
+                        || rel_to_table.iter().any(|((from, _), to)| {
+                            *from == qualified_source && *to == qualified_upstream
+                        })) =>
+            {
+                return Err(e.into());
+            }
+            Err(_) => continue,
         };
         if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
@@ -9892,5 +9910,114 @@ mod table_not_accessible_tests {
             assert!(message.ends_with(doc), "{message}");
         }
         assert_eq!(not_accessible(true, true).code(), ErrorCode::Validation);
+    }
+}
+
+/// ADR-0018: the catalog scans that read every definition handle one outside
+/// this binary's grammar window as that window's rules require.
+#[cfg(test)]
+mod grammar_window_tests {
+    use super::*;
+
+    /// Seeds `public.t` over `public.s`, `public.chained` reading `t.a`,
+    /// and `public.other` over the unrelated `public.u`, then stamps the
+    /// grammar versions given for `chained` and `other`.
+    async fn seed(client: &impl GenericClient, chained: i32, other: i32) {
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.t', 1), ('public.u', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values \
+                 ('public.t', 'public.s', 1, 'TRANSFORM t FROM s SELECT a AS a', 'live'), \
+                 ('public.chained', 'public.t', 1, \
+                  'TRANSFORM chained FROM t SELECT a AS a_copy', 'paused'), \
+                 ('public.other', 'public.u', 1, \
+                  'TRANSFORM other FROM u SELECT a AS a', 'paused')",
+            )
+            .await
+            .expect("seed definitions");
+        for (target, version) in [("public.chained", chained), ("public.other", other)] {
+            client
+                .execute(
+                    "update transform_definitions set grammar_version = $2 \
+                     where target_table = $1",
+                    &[&target, &version],
+                )
+                .await
+                .expect("stamp");
+        }
+    }
+
+    /// A definition older than the window is left out of the capture
+    /// readers, so it can't stop capture for every other one; a newer one
+    /// fails the read.
+    #[tokio::test]
+    async fn capture_readers_leave_out_a_too_old_definition_and_refuse_a_too_new_one() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        let old = grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION - 1;
+        seed(&**client, old, CURRENT_GRAMMAR_VERSION).await;
+
+        let (definitions, _) = capture_readers(&**client).await.expect("capture readers");
+        let targets: Vec<&str> = definitions.iter().map(|d| d.4.as_str()).collect();
+        assert_eq!(targets, ["public.t", "public.other"]);
+
+        client
+            .execute(
+                "update transform_definitions set grammar_version = $1 \
+                 where target_table = 'public.chained'",
+                &[&(CURRENT_GRAMMAR_VERSION + 1)],
+            )
+            .await
+            .expect("stamp newer");
+        match capture_readers(&**client).await {
+            Err(CatalogError::Parse(ParseError::GrammarVersionTooNew { .. })) => {}
+            other => panic!("expected GrammarVersionTooNew, got {other:?}"),
+        }
+    }
+
+    /// Dropping a field is refused while a definition this binary can't read
+    /// could read it; a newer definition over an unrelated table, or a
+    /// too-old one, doesn't hold it up, and the pause cascade skips both.
+    #[tokio::test]
+    async fn a_field_drop_is_refused_past_a_newer_definition_that_could_read_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        let newer = CURRENT_GRAMMAR_VERSION + 1;
+        seed(&**client, newer, newer).await;
+
+        match column_dependents_any_keyspace(&**client, "t", "a").await {
+            Err(CatalogError::Parse(ParseError::GrammarVersionTooNew { stored, .. })) => {
+                assert_eq!(stored, newer);
+            }
+            other => panic!("expected GrammarVersionTooNew, got {other:?}"),
+        }
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        )
+        .expect("pool");
+        assert_eq!(
+            column_dependents(&pool, "t", "a").await.expect("cascade"),
+            Vec::<(String, String)>::new()
+        );
+
+        client
+            .execute(
+                "update transform_definitions set grammar_version = $1 \
+                 where target_table = 'public.chained'",
+                &[&(grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION - 1)],
+            )
+            .await
+            .expect("stamp too old");
+        assert_eq!(
+            column_dependents_any_keyspace(&**client, "t", "a")
+                .await
+                .expect("an unrelated newer definition and a too-old one don't refuse"),
+            Vec::<(String, String)>::new()
+        );
     }
 }

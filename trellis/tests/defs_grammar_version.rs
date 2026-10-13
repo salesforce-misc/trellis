@@ -194,4 +194,7 @@ async fn attaching_pauses_a_definition_older_than_the_window_and_names_the_fix()
         })) => {}
         other => panic!("expected GrammarVersionTooOld, got {other:?}"),
     }
+    trellis::dev::capture::load_catalog(&raw, DEFAULT_SCHEMA)
+        .await
+        .expect("capture keeps working beside the paused definition");
 }
