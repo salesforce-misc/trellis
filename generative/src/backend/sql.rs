@@ -634,8 +634,8 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 /// covers work the other can't see:
 ///
 /// - **Live status.** A direct-build definition's backfill runs through
-///   `defs::chunk_queue`, entirely outside the ring (ADR-0002's
-///   amendment), and a marker-driven one sits in
+///   `defs::chunk_queue`, entirely outside the ring (ADR-0002),
+///   and a marker-driven one sits in
 ///   `waiting_to_backfill`/`backfilling` until its enumeration commits. A
 ///   finished build, or a `live` definition given a catch-up of its own,
 ///   reports `catching_up` until that catch-up's discharge has run (#476).

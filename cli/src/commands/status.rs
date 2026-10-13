@@ -23,7 +23,7 @@
 //! (`unindexed_joins`, issue #973) — and every
 //! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
-//! "Decision 5" and the amendment to
+//! decision 5 and
 //! docs/decisions/0003-quarantine-storage-and-api.md) is implemented on the
 //! engine (`Trellis::quarantined`/`quarantine_status`/`sample_quarantined`)
 //! but not yet surfaced by this command — still a real gap, just a smaller

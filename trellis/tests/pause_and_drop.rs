@@ -1484,8 +1484,8 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
 // Capture
 // ---------------------------------------------------------------------
 
-/// ADR-0014's capture set shrinks by reconciliation, as ADR-0002 amends it
-/// (issue #427) and #622 C5 restates it for trigger capture: a drop only
+/// ADR-0014's capture set shrinks by reconciliation, which ADR-0002's
+/// staging worker runs from the catalog alone (issue #427) and #622 C5 restates it for trigger capture: a drop only
 /// removes catalog rows and never touches the source's capture triggers, so
 /// the process applying it needs no privilege on the source. The staging
 /// worker's next reconcile pass uninstalls them from the catalog;

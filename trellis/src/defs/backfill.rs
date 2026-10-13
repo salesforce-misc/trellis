@@ -727,8 +727,8 @@ async fn paused_columns_for(
 /// One `(lo, hi]` PK-range chunk's write — the body [`backfill_one_to_one`]'s
 /// loop runs for every range in one call, and the durable chunk queue's
 /// [`execute_one_to_one_chunk`] runs for exactly one range claimed off
-/// `backfill_chunks` (ADR-0002's "A build is Re-derive over chunks, and applies from its first chunk"
-/// amendment). `substituted` is the caller's already-computed
+/// `backfill_chunks` (ADR-0002's "A build is Re-derive over chunks, and
+/// applies from its first chunk"). `substituted` is the caller's already-computed
 /// [`substitute_all_fields`] output, so a queue-driven caller charged the
 /// `Unsupported`-detecting cost once at plan time doesn't pay it again per
 /// chunk beyond re-deriving the (cheap, pure) substitution itself.
@@ -823,8 +823,8 @@ async fn write_one_to_one_range(
     Ok(())
 }
 
-/// The read-only "planning" half of [`backfill_one_to_one`] (ADR-0002's
-/// amendment): fails fast with [`BackfillError::Unsupported`] exactly as
+/// The read-only "planning" half of [`backfill_one_to_one`] (ADR-0002):
+/// fails fast with [`BackfillError::Unsupported`] exactly as
 /// `backfill_one_to_one` would (same [`substitute_all_fields`] call), then
 /// returns the same `(lo, hi]` PK-range boundaries its loop would have
 /// walked — without writing a single row of the target. The backfill
@@ -877,7 +877,7 @@ pub(crate) struct PlannedRanges {
 /// chunk — the durable-queue counterpart of [`backfill_one_to_one`]'s loop
 /// body, claimed and run by a drain worker
 /// (`trellis::client`'s `app_worker_loop`) rather than an in-call loop.
-/// Idempotent overwrite, like every chunk write in this module ADR-0002): a
+/// Idempotent overwrite, like every chunk write in this module (ADR-0002): a
 /// worker that reclaims this chunk after a peer died mid-write redoes it
 /// safely.
 #[allow(clippy::too_many_arguments)]

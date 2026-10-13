@@ -1167,8 +1167,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = failures.check("reclaim_stale", reclaimed).is_err();
             }
             if !failed {
-                // Backfill chunks' own reclaim-stale sweep (ADR-0002's
-                // amendment): a drain worker that died mid-chunk leaves a
+                // Backfill chunks' own reclaim-stale sweep (ADR-0002):
+                // a drain worker that died mid-chunk leaves a
                 // stale claim here, freed the same way a stale `seg_claims`
                 // row is above.
                 let reclaimed = chunk_queue::reclaim_stale_chunks(c, reclaim_ttl).await;

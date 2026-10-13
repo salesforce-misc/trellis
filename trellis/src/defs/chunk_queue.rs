@@ -1,6 +1,6 @@
-//! The durable, claimable backfill-chunk work queue (ADR-0002's
-//! "A build is Re-derive over chunks, and applies from its first chunk" and `docs/decisions/0008-public-api-design.md`'s
-//! decision 1).
+//! The durable, claimable backfill-chunk work queue (ADR-0002's "A build
+//! is Re-derive over chunks, and applies from its first chunk" and
+//! `docs/decisions/0008-public-api-design.md`'s decision 1).
 //!
 //! A plain (non-relationship) 1-1 definition's PK-range chunks are not run
 //! back-to-back in one call: once the definition's capture point has passed,
@@ -28,7 +28,7 @@
 //! An aggregate or relationship-enriched 1-1 definition isn't split into
 //! ranges: its build materializes connection-scoped `TEMP TABLE` staging,
 //! which doesn't survive being read by independent drain workers on separate
-//! connections (the open problem ADR-0002 calls out). The discharge
+//! connections. The discharge
 //! enqueues its whole direct build as one job instead ([`dispatch_direct_build`],
 //! issue #419), a row with no bounds ([`ChunkWork::DirectBuild`]) that one
 //! drain worker runs start to finish. Everything above applies to it
@@ -212,7 +212,7 @@ pub enum ChunkWork {
     /// one.
     Range { lo: Option<String>, hi: String },
     /// An aggregate or relationship-enriched 1-1 definition's whole direct
-    /// set-based build ADR-0002), run as one job (issue #419; the row's
+    /// set-based build (ADR-0002), run as one job (issue #419; the row's
     /// `hi` is null). See [`dispatch_direct_build`].
     DirectBuild,
     /// A Re-derive build's plan job (#625 F2, `staging::build`): walks the
@@ -355,7 +355,7 @@ async fn start_backfilling(
 }
 
 /// Dispatches an aggregate or relationship-enriched 1-1 definition's direct
-/// set-based build ADR-0002) as one background job, inside the backfill
+/// set-based build (ADR-0002) as one background job, inside the backfill
 /// discharge's own transaction (ADR-0002, issue #419): moves `definition_id`
 /// `waiting_to_backfill` -> `backfilling` and persists the job as a
 /// [`ChunkWork::DirectBuild`] row, so the status and the work that drives it

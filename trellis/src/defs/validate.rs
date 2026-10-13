@@ -370,8 +370,8 @@ pub enum ValidationError {
     /// ADR-0005 forbids Trellis from assuming a column exists rather than
     /// checking, even though it never issues DDL against the table itself.
     UnknownRelationshipColumn { table: String, column: String },
-    /// A relationship's `from_col`/`to_col` (issue #27, ADR-0006's "type-check
-    /// the join") differ in type, type modifier or collation (issue #590):
+    /// A relationship's `from_col`/`to_col` (issue #27, ADR-0006's endpoint
+    /// requirements) differ in type, type modifier or collation (issue #590):
     /// `integer` against `bigint`, `text` against `character varying`,
     /// `varchar(50)` against `varchar(255)`, or two collations. Trellis joins
     /// only columns Postgres can compare as-is and never casts a join key.

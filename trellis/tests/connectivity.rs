@@ -42,7 +42,7 @@ async fn migrate_up_is_idempotent() {
         // bare-keyed `schema_nodes`/`schema_edges` rows now stale under the
         // qualified-identity keying — see that migration's own doc comment
         // for why this is a destructive, assume-empty migration rather than
-        // ADR-0011's alternative of canonicalizing in place). Issue #54
+        // canonicalizing in place). Issue #54
         // (epic #49) added V25 (`metric_rollup`); later removed (metric
         // history/aggregation is left to an operator's own Prometheus
         // stack — see docs/observability.md's "Retention" section), so V25

@@ -896,8 +896,9 @@ impl Trellis {
     /// applying. Its plan re-derives every row the table has, and its sweep
     /// deletes what the table no longer backs, and then it is `live` again.
     ///
-    /// Every other reader gets a go-live catch-up (issue #522, ADR-0002's
-    /// "A re-read table's readers"): it reports `catching_up` from this call
+    /// Every other reader gets a go-live catch-up (issue #522; ADR-0002's
+    /// "A build is Re-derive over chunks, and applies from its first chunk"
+    /// keeps it for the builds still on the one-pass path): it reports `catching_up` from this call
     /// until the staging worker has discharged the marker. The discharge
     /// re-derives every row the table still has, deletes each reader's
     /// target rows the table no longer backs (a delete that never reached the
@@ -997,11 +998,11 @@ impl Trellis {
     }
 
     /// Every currently paused/quarantined target, across every transform —
-    /// `docs/decisions/0003-quarantine-storage-and-api.md`'s
-    /// "The client API is three reads, separated by cost, and one release," read 1.
-    /// Cheap: reads `transform_definitions`' lifecycle status plus the small, sparse `column_status` table, no
-    /// join against poisoned-row detail. The read a dashboard/health-check
-    /// polls.
+    /// `docs/decisions/0003-quarantine-storage-and-api.md`'s "The client API
+    /// is three reads, separated by cost, and one release," read 1. Cheap:
+    /// reads `transform_definitions`' lifecycle status plus the small, sparse
+    /// `column_status` table, no join against poisoned-row detail. The read a
+    /// dashboard/health-check polls.
     pub async fn quarantined(&self) -> Result<Vec<QuarantineEntry>, TrellisError> {
         self.call(async {
             let client = self.pool.get().await?;
@@ -1054,7 +1055,7 @@ impl Trellis {
     }
 
     /// The current state of one target (`transform` or `transform.column`,
-    /// per ADR-0003 addressing scheme) — read 2. Errors with
+    /// per ADR-0003's addressing scheme) — read 2. Errors with
     /// [`TrellisError::TransformNotFound`] if the named transform doesn't
     /// exist at all; a `transform.column` address for a real transform whose
     /// named column simply isn't paused reports [`QuarantineState::Live`],
@@ -2145,7 +2146,7 @@ pub struct PoisonEntry {
 }
 
 /// A quarantine/status address (`docs/decisions/0003-quarantine-storage-and-api.md`'s
-/// amendment, "Addressing"): either a whole transform (its whole keyspace,
+/// "The client API is three reads, separated by cost, and one release"): either a whole transform (its whole keyspace,
 /// from the transform-wide lifecycle/fuse) or one of its columns (from the
 /// column-status table). Reuses the `table.column` shape the grammar already
 /// has elsewhere for qualified column references, rather than inventing a

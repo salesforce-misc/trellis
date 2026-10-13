@@ -23,8 +23,7 @@ use trellis::defs::{
 /// tests below reuse the same bare name both as a real source table here and
 /// later as a chained definition's bare `TRANSFORM <name> ...` target; a
 /// target always resolves against `Config::target_schema` (`public` by
-/// default — a config-time decision, never a `search_path` walk, per
-/// ADR-0011), so this table needs to actually live there too or
+/// default — a config-time decision, never a `search_path` walk), so this table needs to actually live there too or
 /// the two roles now resolve to two different qualified nodes instead of one
 /// — before #74's qualified `schema_nodes` keying, the bare graph couldn't
 /// tell the difference either way.

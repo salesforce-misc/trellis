@@ -66,7 +66,7 @@ use super::watermark::StagedWatermark;
 pub const DEFAULT_DEATH_THRESHOLD: i32 = 5;
 
 /// The column-fuse's threshold (`docs/decisions/0003-quarantine-storage-and-api.md`'s
-/// amendment, "Undecided" -> now decided): a sibling of
+/// "Fuse: per-column, then transform-wide"): a sibling of
 /// [`DEFAULT_DEATH_THRESHOLD`], same value, named separately because the two
 /// fuses count different things and are meant to stay independently
 /// tunable if either is ever wired to real config — [`DEFAULT_DEATH_THRESHOLD`]
@@ -2478,7 +2478,7 @@ async fn quarantine_if_crossed(
 
 // ---------------------------------------------------------------------
 // Column-level fuse (docs/decisions/0003-quarantine-storage-and-api.md's
-// 2026-09-12 amendment)
+// "Fuse: per-column, then transform-wide")
 // ---------------------------------------------------------------------
 //
 // Everything below is a second, independent fuse tier, finer-grained than
@@ -2497,7 +2497,7 @@ async fn quarantine_if_crossed(
 // are never attributed here and can never be paused by the automatic fuse —
 // the aggregate ledger (`staging::ledger`) has no notion of "skip this one
 // column and keep accumulating the others," and inventing one is a materially bigger
-// project than this amendment. An aggregate transform's overall lifecycle
+// project than the column fuse. An aggregate transform's overall lifecycle
 // status (the existing whole-transform fuse) is completely unaffected by
 // this scope cut.
 

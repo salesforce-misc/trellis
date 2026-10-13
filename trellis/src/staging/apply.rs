@@ -8463,8 +8463,7 @@ pub(super) async fn compute_page(
             // doesn't keep reproducing the same failure on every batch).
             // Empty for every definition with nothing currently paused —
             // the overwhelmingly common case — so this is a cheap,
-            // indexed no-op read then, behavior-identical to before this
-            // amendment.
+            // indexed no-op read then.
             let paused = quarantine::paused_columns_for(pool, &def.def).await?;
             let (field_names, field_types): (Vec<String>, Vec<ValueType>) = if paused.is_empty() {
                 (field_names, field_types)

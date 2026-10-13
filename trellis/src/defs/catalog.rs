@@ -3794,8 +3794,9 @@ fn reject_relationship_named_after_from_table(
 /// Every requirement on the endpoints and join columns is checked first, in
 /// one place, before any catalog write: see [`validate_relationship`]
 /// (issue #429). Cardinality ([`RelationshipCardinality`]) is derived there
-/// and persisted, not rejected on: ADR-0006's "a to-many reference must be
-/// aggregate-wrapped" rule is checked where a relationship is *used*.
+/// and persisted, not rejected on: ADR-0006's rule that a to-many path is
+/// referenceable only wrapped in an aggregate is checked where a
+/// relationship is *used*.
 ///
 /// Node-kind resolution: a relationship's endpoints may each be "a source
 /// table or a transform target, in any combination" (ADR-0006), and nothing
@@ -5061,10 +5062,8 @@ async fn validate_for_define(
 /// re-derive a different answer, and so every physical SQL builder among them
 /// emits the qualified identity rather than a bare `def.source` left to the
 /// executing connection's own `search_path` — the gap a reviewer flagged
-/// against issue #76's own new explicit-schema grammar (ADR-0011's whole
-/// point: "every generated statement emits qualified names... never a bare
-/// name resolved against whatever search_path the executing session happens
-/// to carry").
+/// against issue #76's own new explicit-schema grammar (ADR-0011, clause 3:
+/// "Every generated statement emits qualified names").
 ///
 /// `create_definition_inner` (further below) computes its *own* copy inside
 /// its own transaction rather than receiving this one as a parameter — see
@@ -8326,8 +8325,8 @@ pub(crate) async fn definition_by_id_in(
 
 /// Reads back one definition by its target table name — [`definition_by_id`]
 /// keyed the other way, for callers that only have the address a `Trellis`
-/// caller would use (`docs/decisions/0003-quarantine-storage-and-api.md`'s
-/// amendment: a quarantine target is `transform` or `transform.column`,
+/// caller would use (`docs/decisions/0003-quarantine-storage-and-api.md`:
+/// a quarantine target is `transform` or `transform.column`,
 /// where `transform` is this crate's `target_table`). Used by
 /// `staging::quarantine`'s column-resume path to reconstruct the
 /// [`super::ast::TransformDef`] whose column it's re-deriving.

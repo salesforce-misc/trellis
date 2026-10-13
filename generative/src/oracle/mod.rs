@@ -23,7 +23,8 @@
 //! language). Comparing the other two *against it* localizes a divergence:
 //! `target ≠ SQL` is a pipeline / apply / fold / ordering bug;
 //! `evaluator ≠ SQL` is an eval-layer drift bug — the direct test of the
-//! "engine mirrors Postgres" claim.
+//! ADR-0004 claim that expression semantics are an immutable subset of
+//! Postgres's.
 //!
 //! # DB access
 //!
@@ -254,8 +255,8 @@ impl fmt::Display for Divergence {
 pub struct ThreeWayReport {
     /// `persisted target ≠ SQL oracle` — a pipeline/apply/fold/ordering bug.
     pub target_vs_sql: Vec<Divergence>,
-    /// `evaluator ≠ SQL oracle` — an eval-layer drift bug (the ADR-0004
-    /// "engine mirrors Postgres" claim, tested directly).
+    /// `evaluator ≠ SQL oracle` — an eval-layer drift bug (ADR-0004's
+    /// "immutable subset of Postgres's" semantics, tested directly).
     pub evaluator_vs_sql: Vec<Divergence>,
     /// Whether the evaluator leg ran at all (issue #34). `false` for a
     /// relationship-reading definition, where the engine's evaluator-driven

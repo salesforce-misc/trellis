@@ -401,8 +401,8 @@ pub(crate) async fn park_catch_up(
 /// lock (#622 plan, finding 1). The marker commits exactly when the feed
 /// does, so a fence taken after reading the committed marker postdates it,
 /// and every such writer still open is behind it. That holds with no window
-/// to recover from after a crash. Every marker is fenced this way (ADR-0002,
-/// "The join fence").
+/// to recover from after a crash. Every marker is fenced this way
+/// (docs/staging-and-claiming/01-capture-by-triggers.md, "The join fence").
 ///
 /// # A repeat park
 ///
