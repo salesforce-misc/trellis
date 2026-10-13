@@ -143,10 +143,21 @@ async fn evaluator_fold_matches_a_server_side_aggregate() {
         &[Some("a"), None, Some("b")],
         &[None, None],
         &[Some("only")],
+        &[
+            Some(" lead"),
+            Some("tab\tx"),
+            Some("v\u{0b}t"),
+            Some("nb\u{a0}sp"),
+            Some("em\u{2003}sp"),
+            Some("NuLl"),
+            Some("a\"b\\c{d}e,f"),
+            Some("é"),
+        ],
     ];
     let def = parse(
         "TRANSFORM t FROM s GROUP BY grp SELECT grp AS grp, ARRAY_AGG(tag) AS tags, \
-         STRING_AGG(tag, ', ') AS names",
+         STRING_AGG(tag, ', ') AS names, STRING_AGG(tag, '') AS joined, \
+         STRING_AGG(tag, 'it''s') AS quoted",
     )
     .expect("parses");
     let columns = columns();
@@ -164,7 +175,8 @@ async fn evaluator_fold_matches_a_server_side_aggregate() {
         let server = client
             .query_one(
                 &format!(
-                    "select array_agg(v)::text, string_agg(v, ', ') \
+                    "select array_agg(v)::text, string_agg(v, ', '), string_agg(v, ''), \
+                     string_agg(v, 'it''s') \
                      from (values {values_sql}) t(v)"
                 ),
                 &[],
@@ -173,6 +185,8 @@ async fn evaluator_fold_matches_a_server_side_aggregate() {
             .unwrap_or_else(|e| panic!("server aggregate over {group:?}: {e}"));
         let server_tags: Option<String> = server.get(0);
         let server_names: Option<String> = server.get(1);
+        let server_joined: Option<String> = server.get(2);
+        let server_quoted: Option<String> = server.get(3);
 
         let rows: Vec<Row> = group
             .iter()
@@ -195,6 +209,16 @@ async fn evaluator_fold_matches_a_server_side_aggregate() {
             result["names"],
             server_names.map(Value::Text),
             "STRING_AGG over {group:?}"
+        );
+        assert_eq!(
+            result["joined"],
+            server_joined.map(Value::Text),
+            "STRING_AGG with an empty separator over {group:?}"
+        );
+        assert_eq!(
+            result["quoted"],
+            server_quoted.map(Value::Text),
+            "STRING_AGG with a quoted separator over {group:?}"
         );
     }
 }

@@ -1806,9 +1806,14 @@ fn fold_array_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
 fn array_element_text(text: &str) -> String {
     let needs_quotes = text.is_empty()
         || text.eq_ignore_ascii_case("null")
-        || text
-            .chars()
-            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
+        // `array_out` quotes on `array_isspace`'s ASCII set only, not
+        // Unicode whitespace (`char::is_whitespace` would quote U+00A0).
+        || text.chars().any(|c| {
+            matches!(
+                c,
+                '{' | '}' | ',' | '"' | '\\' | ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C'
+            )
+        });
     if !needs_quotes {
         return text.to_string();
     }
