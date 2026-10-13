@@ -2179,29 +2179,68 @@ pub async fn work_once(
 /// once it discharges.
 async fn building(pool: &Pool) -> Result<Vec<(i64, String, bool)>, ChunkQueueError> {
     let client = pool.get().await?;
+    let params = building_params();
     Ok(client
         .query(
             &format!(
                 "select d.id, d.target_table, {} from transform_definitions d \
-                 where (d.build = $1 and d.status = $2) \
-                    or (d.status = $3 and exists ( \
-                        select 1 from backfill_chunks bc \
-                        where bc.definition_id = d.id and not bc.done \
-                          and bc.fields is not null and not ({}))) \
-                 order by d.id",
+                 where {} order by d.id",
                 deltas_exist_sql("d.target_table"),
-                chunk_queue::STALE,
+                building_predicate(),
             ),
-            &[
-                &BUILD_REDERIVE,
-                &TransformStatus::Backfilling.as_str(),
-                &TransformStatus::CatchingUp.as_str(),
-            ],
+            &[&params.0, &params.1, &params.2],
         )
         .await?
         .into_iter()
         .map(|row| (row.get(0), row.get(1), row.get(2)))
         .collect())
+}
+
+/// The `where` of [`building`], over `transform_definitions d`, with `$1..$3`
+/// bound by [`building_params`].
+fn building_predicate() -> String {
+    format!(
+        "(d.build = $1 and d.status = $2) \
+         or (d.status = $3 and exists ( \
+             select 1 from backfill_chunks bc \
+             where bc.definition_id = d.id and not bc.done \
+               and bc.fields is not null and not ({})))",
+        chunk_queue::STALE,
+    )
+}
+
+fn building_params() -> (&'static str, &'static str, &'static str) {
+    (
+        BUILD_REDERIVE,
+        TransformStatus::Backfilling.as_str(),
+        TransformStatus::CatchingUp.as_str(),
+    )
+}
+
+/// Whether a drain worker's build step could find anything to do, in one
+/// prepared statement (one transaction): a chunk of any kind that is undone,
+/// unclaimed and not backing off ([`chunk_queue::claim_chunks_of`]'s
+/// candidates before its definition-status gates), or a definition a
+/// Re-derive build is running for ([`building`] is not empty). It is a
+/// superset of both probes the step used to make on every idle wake
+/// (`claim_chunks`, then `building`), so a `false` means each of them would
+/// have found nothing, and a `true` only means they are worth running (#273).
+pub async fn work_may_exist(pool: &Pool) -> Result<bool, ChunkQueueError> {
+    let client = pool.get().await?;
+    let sql = format!(
+        "select exists ( \
+             select 1 from backfill_chunks bc \
+             where not bc.done and bc.claimed_by is null \
+               and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
+         ) or exists (select 1 from transform_definitions d where {})",
+        building_predicate(),
+    );
+    let statement = client.prepare_cached(&sql).await?;
+    let params = building_params();
+    Ok(client
+        .query_one(&statement, &[&params.0, &params.1, &params.2])
+        .await?
+        .get(0))
 }
 
 /// SQL over a `transform_definitions` row: whether the target `column`
@@ -3202,6 +3241,11 @@ impl MergeFailures {
         let delay = chunk_queue::retry_delay(failure.attempts, chunk_queue::REDERIVE_RETRY_CAP);
         failure.retry_at = Instant::now() + delay;
         (*failure, delay)
+    }
+
+    /// Forgets every definition's failures: nothing is building.
+    pub(crate) fn clear(&mut self) {
+        self.by_definition.clear();
     }
 
     /// Forgets definition `id`'s failures: its merge succeeded, or it was

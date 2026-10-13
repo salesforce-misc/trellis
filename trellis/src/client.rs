@@ -1942,6 +1942,13 @@ async fn build_step(
     build_options: &staging::build::WorkerOptions,
     merge_failures: &mut staging::build::MergeFailures,
 ) -> bool {
+    // One probe when there is nothing to do (#273): the two steps below
+    // would each look, on every idle wake. An error is not "nothing": run
+    // the steps, which report their own.
+    if matches!(staging::build::work_may_exist(pool).await, Ok(false)) {
+        merge_failures.clear();
+        return false;
+    }
     let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
     let rederive = rederive_build_step(pool, claimed_by, build_options, merge_failures).await;
     old || rederive
