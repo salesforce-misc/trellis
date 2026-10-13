@@ -467,8 +467,8 @@ built, so those frameworks' schema loads are still affected until they are.
   targets were restored.
 * For a schema-loaded database, drop the target tables and run the defining
   migrations ([embedding](embedding.md)). A dump that has
-  `dump_definitions_sql` appended loads with its definitions, which build
-  from the loaded source rows.
+  `dump_definitions_sql` appended loads with its definitions, and the worker
+  builds them from the source rows.
 
 ## 15. A from-side change pending across a to-side `TRUNCATE`
 

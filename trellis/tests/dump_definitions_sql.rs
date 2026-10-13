@@ -8,10 +8,13 @@
 //! - the dump plus the appendix loads into a fresh database as "defined, not
 //!   built", with every runtime table empty
 //!   (`a_dump_loads_as_defined_not_built`)
-//! - the loaded database builds its definitions from the source rows and gets
-//!   the same targets (`a_loaded_database_builds_its_definitions`)
+//! - the staging worker's reconcile pass starts the loaded definitions'
+//!   builds, which build from the source rows and get the same targets
+//!   (`a_loaded_database_builds_its_definitions`)
 //! - every table in the Trellis schema is classified
 //!   (`every_trellis_table_is_classified`)
+//! - a schema name with `%` or `'` in it dumps
+//!   (`a_schema_name_with_percent_and_quote_dumps`)
 
 use std::process::Command;
 use std::time::Duration;
@@ -263,6 +266,30 @@ async fn a_dump_loads_as_defined_not_built() {
         statuses.iter().all(|s| s.ends_with(" waiting_to_backfill")),
         "{statuses:?}"
     );
+    // The build progress the source recorded is cleared, as a define leaves
+    // it: the source's builds left it set, so the reset is what clears it.
+    let progress = "select count(*) from transform_definitions \
+                    where build is not null or build_seg is not null \
+                       or build_marker_generation is not null or fuse_rearmed_at is not null";
+    assert!(
+        count(&raw, progress).await > 0,
+        "the source has build progress"
+    );
+    assert_eq!(
+        count(&after, progress).await,
+        0,
+        "build progress loads cleared"
+    );
+    let refreshed = "select count(*) from relationship_projections where refreshed_lsn is not null";
+    assert!(
+        count(&raw, refreshed).await > 0,
+        "the source refreshed its projection"
+    );
+    assert_eq!(
+        count(&after, refreshed).await,
+        0,
+        "projections load unrefreshed"
+    );
 
     // Every runtime table is empty, and the seed rows match a migrated database.
     for (table, class) in CLASSIFICATION {
@@ -372,9 +399,27 @@ async fn a_loaded_database_builds_its_definitions() {
         .expect("load source rows");
 
     let t2 = facade(loaded.dsn()).await;
+    let mut worker = connect_raw(loaded.dsn()).await;
+    // The staging worker's own reconcile pass, not the test harness, finds
+    // the loaded definitions and starts their builds: the loaded catalog
+    // has no `pending_backfill` markers, and the dump's capture triggers
+    // must count as current capture.
+    trellis::client::reconcile_pass(
+        &mut worker,
+        t2.pool(),
+        SCHEMA,
+        "dump_test_wake",
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("reconcile pass on the loaded database");
+    let started = rows_json(&after, STATUSES).await;
+    assert!(
+        started.iter().all(|s| !s.ends_with(" waiting_to_backfill")),
+        "the worker's reconcile pass starts every loaded build: {started:?}"
+    );
     // The loaded rows reach the ring through the dump's capture triggers,
     // so the builds are followed by the drain the worker would run.
-    let mut worker = connect_raw(loaded.dsn()).await;
     for _ in 0..3 {
         build_everything(t2.pool()).await;
         drain_to_quiescence(t2.pool(), &mut worker).await;
@@ -398,6 +443,31 @@ async fn a_loaded_database_builds_its_definitions() {
         got.sort();
         assert_eq!(got, want, "{sql}");
     }
+}
+
+/// A schema name is any identifier, `%` and `'` included, and neither may
+/// reach a format template or a string literal unescaped.
+#[tokio::test]
+async fn a_schema_name_with_percent_and_quote_dumps() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let schema = "dump%s'test";
+    let t = Trellis::connect(
+        Config::with_schema(db.dsn().to_string(), schema).expect("valid schema"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    t.migrate().await.expect("migrate");
+    let appendix = t.dump_definitions_sql().await.expect("dump definitions");
+    assert!(
+        appendix.contains(r#"insert into "dump%s'test"."refinery_schema_history""#),
+        "{appendix}"
+    );
+    assert!(
+        appendix.contains(r#"setval('"dump%s''test".ring_slot_mirror'"#),
+        "{appendix}"
+    );
 }
 
 #[tokio::test]

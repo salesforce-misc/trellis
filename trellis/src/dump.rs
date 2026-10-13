@@ -176,17 +176,23 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
                 }
             }
             Class::Definition { reset } => {
+                // The table name goes in as a `%s` argument, not into the
+                // template, where a `%` in the schema name would be read as
+                // a format specifier.
                 let row: String = txn
                     .query_one(
                         &format!(
                             "select coalesce(format( \
-                                 'insert into {qualified_lit} overriding system value \
-                                  select * from jsonb_populate_recordset(null::{qualified_lit}, %L::jsonb);', \
+                                 'insert into %s overriding system value \
+                                  select * from jsonb_populate_recordset(null::%s, %L::jsonb);', \
+                                 $2::text, $2::text, \
                                  jsonb_agg(to_jsonb(t) || $1::text::jsonb)) , '') \
                              from {qualified} t",
-                            qualified_lit = qualified.replace('\'', "''"),
                         ),
-                        &[reset],
+                        &[
+                            reset as &(dyn tokio_postgres::types::ToSql + Sync),
+                            &qualified,
+                        ],
                     )
                     .await?
                     .get(0);
