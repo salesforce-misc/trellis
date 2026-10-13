@@ -372,12 +372,17 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
         // `RecomputeOnly` routing does *not* resolve (tracked toward #120).
         ("JSONB_AGG", AggregateArg::Column(_)) => Some(Verdict::recompute_only()),
 
+        // Issue #293: bare `array_agg`/`string_agg` are recompute-only for
+        // `jsonb_agg`'s reason: the state a delta would need is the input
+        // multiset itself, not a summary of it.
+        ("ARRAY_AGG" | "STRING_AGG", AggregateArg::Column(_)) => Some(Verdict::recompute_only()),
+
         // Shapes the grammar could never produce: COUNT with a column-typed
         // arg description, or a non-COUNT aggregate with a `*` arg.
         ("COUNT", AggregateArg::Column(_)) => None,
         (
             "SUM" | "AVG" | "MIN" | "MAX" | "BOOL_AND" | "BOOL_OR" | "BIT_AND" | "BIT_OR"
-            | "JSONB_AGG",
+            | "JSONB_AGG" | "ARRAY_AGG" | "STRING_AGG",
             AggregateArg::Count(_),
         ) => None,
 

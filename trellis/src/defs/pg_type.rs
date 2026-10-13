@@ -82,6 +82,11 @@ pub enum PgType {
     Xml,
     TsVector,
     TsQuery,
+    /// `text[]` — the result type of `ARRAY_AGG` over a `text` argument
+    /// (issue #293). It is never read off a source column: introspection
+    /// classifies an array column as [`PgType::Unrecognized`], so this
+    /// family exists only as an aggregate target's declared type.
+    TextArray,
     /// A user-defined enum type (`CREATE TYPE ... AS ENUM (...)`, issue
     /// #117) — the one variant here that is not a single, universal
     /// Postgres family. Every other [`PgType`] variant names exactly one
@@ -201,6 +206,7 @@ impl PgType {
             PgType::Xml => "xml",
             PgType::TsVector => "tsvector",
             PgType::TsQuery => "tsquery",
+            PgType::TextArray => "text[]",
             // Issue #117: already the exact persisted token — see
             // `PgType::Enum`'s own doc comment and `ENUM_TOKEN_PREFIX`.
             PgType::Enum(token) => token,
@@ -312,6 +318,7 @@ impl PgType {
             "xml" => PgType::Xml,
             "tsvector" => PgType::TsVector,
             "tsquery" => PgType::TsQuery,
+            "text[]" => PgType::TextArray,
             "unrecognized" => PgType::Unrecognized,
             _ => return None,
         })

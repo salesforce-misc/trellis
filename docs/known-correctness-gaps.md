@@ -107,7 +107,7 @@ These are the tools the entries refer to:
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #624, test ignored |
 | 16 | `self_check` audits 1-1 targets only | yes | n/a | none filed |
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
-| 18 | `jsonb_agg` element order differs between recomputes | yes | no | none filed |
+| 18 | `jsonb_agg`, `array_agg` and `string_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
 | 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886, #892 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
@@ -525,9 +525,10 @@ table disappearing from under a live definition.
 
 **Repair:** `DROP TRANSFORM` and define it again against the new schema.
 
-## 18. `jsonb_agg` element order
+## 18. `jsonb_agg`, `array_agg` and `string_agg` element order
 
-**Trigger:** an aggregate field `JSONB_AGG(...)`.
+**Trigger:** an aggregate field `JSONB_AGG(...)`, `ARRAY_AGG(...)` or
+`STRING_AGG(...)`.
 
 **Effect:** the call has no `ORDER BY`, so two recomputes of the same group
 aren't guaranteed to agree on element order, though the set of elements is

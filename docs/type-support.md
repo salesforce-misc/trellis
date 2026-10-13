@@ -46,7 +46,7 @@ filter role.
 | `real` `double precision` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` (recompute) |
 | `boolean` | yes | no | yes | no | yes | `bool_and` `bool_or` (recompute) |
 | `uuid` | yes | yes | yes | yes | yes | no `MIN`/`MAX` |
-| `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | `MIN` `MAX` (recompute) |
+| `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | `MIN` `MAX` `array_agg` `string_agg` (recompute) |
 | `bytea` | yes | yes | yes | yes | typed literal | no `MIN`/`MAX` |
 | `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | `MIN` `MAX` |
 | `interval` | yes | no | no | no | yes | `SUM` (recompute); no `MIN`/`MAX` |
@@ -320,14 +320,26 @@ A `DROP TYPE` of an enum a live definition references is not handled: the
 column stops being recognized and later fails introspection. Checked in
 `trellis/tests/defs_enum.rs`.
 
+## `array_agg` and `string_agg`
+
+`ARRAY_AGG(<text>)` and `STRING_AGG(<text>, '<separator>')` take a `text` or
+`varchar` argument and are recompute-only: no delta maintenance is sound for
+an order-sensitive fold, since the state is the whole ordered contents.
+`ARRAY_AGG` produces `text[]` and keeps a `NULL` row as a `NULL` element.
+`STRING_AGG` skips `NULL` rows and is `NULL` when none remain. The separator
+must be a string literal, and neither aggregate is accepted over a to-many
+relationship path. The grammar has no `ORDER BY` inside the call, so element
+order isn't guaranteed across recomputes ([known correctness gaps, entry
+18](known-correctness-gaps.md#18-jsonb_agg-array_agg-and-string_agg-element-order)).
+A later transform that reads a `text[]` target column sees an unrecognized
+type. Checked in `trellis/tests/defs_list_aggregates.rs`.
+
 ## Aggregates that are not supported
 
-`array_agg` and `string_agg` are not in the registry. No delta maintenance is
-sound for an order-sensitive fold (the state is the whole ordered contents),
-so any future support would be recompute-only, with `ORDER BY` inside the
-aggregate call needing new grammar. `jsonb_agg` over a non-`jsonb` argument,
-`MIN`/`MAX` of `jsonb`, `uuid`, `bytea`, `cidr`, `macaddr` and `bit` are
-likewise absent (the last five because Postgres has no such aggregate).
+`jsonb_agg` over a non-`jsonb` argument, `array_agg` and `string_agg` over a
+non-text argument, and `MIN`/`MAX` of `jsonb`, `uuid`, `bytea`, `cidr`,
+`macaddr` and `bit` are absent (the last five because Postgres has no such
+aggregate).
 
 ## Typed literals and casts
 

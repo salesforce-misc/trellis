@@ -1527,7 +1527,7 @@ fn eval_aggregate_expr(
         {
             fold_aggregate(
                 name,
-                &args[0],
+                args,
                 field_name,
                 rows,
                 source_columns,
@@ -1630,7 +1630,7 @@ fn aggregate_argument_scope<'a>(
 /// argument to source-only columns, so the evaluator must not either.
 fn fold_aggregate(
     name: &str,
-    arg_expr: &Expr,
+    args: &[Expr],
     field_name: &str,
     rows: &[Row],
     source_columns: &HashMap<String, ValueType>,
@@ -1640,6 +1640,8 @@ fn fold_aggregate(
     // The aggregate path does not wire relationships (issue #29 handles a
     // to-many relationship's aggregate-wrapped enrichment); a bare path in an
     // aggregate argument therefore errors as unknown, defense-in-depth.
+    let arg_expr = &args[0];
+    let extra_args = &args[1..];
     let relationships = RelationshipContext::default();
     let fields_by_name = &aggregate_argument_scope(fields_by_name);
 
@@ -1651,7 +1653,7 @@ fn fold_aggregate(
     // `evaluate_aggregate`'s own assertion — so this never folds to `NULL`
     // the way the to-many relationship path's genuinely-empty `related` set
     // can).
-    if name == "JSONB_AGG" {
+    if matches!(name, "JSONB_AGG" | "ARRAY_AGG" | "STRING_AGG") {
         let mut row_values: Vec<Option<Value>> = Vec::with_capacity(rows.len());
         for row in rows {
             let mut per_row_cache = HashMap::new();
@@ -1669,7 +1671,21 @@ fn fold_aggregate(
             )?;
             row_values.push(value);
         }
-        return Ok(fold_jsonb_agg(row_values));
+        return Ok(match name {
+            "JSONB_AGG" => fold_jsonb_agg(row_values),
+            "ARRAY_AGG" => fold_array_agg(row_values),
+            _ => {
+                let Some(Expr::StringLiteral(separator)) = extra_args.first() else {
+                    // Defense-in-depth: the validator refuses a non-literal
+                    // separator (`StringAggSeparatorNotLiteral`).
+                    return Err(EvalError::MissingColumn {
+                        field: field_name.to_string(),
+                        column: "STRING_AGG separator".to_string(),
+                    });
+                };
+                fold_string_agg(row_values, separator)
+            }
+        });
     }
 
     let mut values: Vec<Value> = Vec::new();
@@ -1759,6 +1775,72 @@ fn fold_jsonb_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
     }
     text.push(']');
     Some(Value::Other(PgType::Jsonb, text))
+}
+
+/// Folds `ARRAY_AGG` over a group's per-row `text` values into the `text[]`
+/// `array_agg` itself builds: a `NULL` row is a `NULL` element, and zero rows
+/// fold to SQL `NULL`. Elements render as Postgres's `array_out` does: bare
+/// unless empty, `NULL`-spelled, or holding a brace, comma, quote, backslash
+/// or whitespace, in which case double-quoted with `\` escapes. Element
+/// order is the group's own row order, which a server-side recompute does
+/// not promise to reproduce (known-correctness gap 18).
+#[cfg(any(test, feature = "test-util"))]
+fn fold_array_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
+    if row_values.is_empty() {
+        return None;
+    }
+    let elements: Vec<String> = row_values
+        .iter()
+        .map(|value| match value {
+            Some(Value::Text(text)) => array_element_text(text),
+            _ => "NULL".to_string(),
+        })
+        .collect();
+    Some(Value::Other(
+        PgType::TextArray,
+        format!("{{{}}}", elements.join(",")),
+    ))
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn array_element_text(text: &str) -> String {
+    let needs_quotes = text.is_empty()
+        || text.eq_ignore_ascii_case("null")
+        || text
+            .chars()
+            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
+    if !needs_quotes {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if matches!(c, '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Folds `STRING_AGG` over a group's per-row `text` values: `NULL` rows are
+/// skipped, the rest join with `separator`, and no non-`NULL` row folds to
+/// SQL `NULL`. Element order is the group's own row order (see
+/// [`fold_array_agg`]).
+#[cfg(any(test, feature = "test-util"))]
+fn fold_string_agg(row_values: Vec<Option<Value>>, separator: &str) -> Option<Value> {
+    let parts: Vec<&str> = row_values
+        .iter()
+        .filter_map(|value| match value {
+            Some(Value::Text(text)) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(Value::Text(parts.join(separator)))
 }
 
 /// Reduces the collected non-`NULL` exact-numeric values of

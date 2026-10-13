@@ -246,6 +246,8 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
     "BIT_AND",
     "BIT_OR",
     "JSONB_AGG",
+    "ARRAY_AGG",
+    "STRING_AGG",
 ];
 
 /// The aggregate functions an [`super::ast::KeySpace::Aggregate`] definition
@@ -373,6 +375,24 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         name: "JSONB_AGG",
         arg_types: &[ValueType::Other(PgType::Jsonb)],
         return_type: ValueType::Other(PgType::Jsonb),
+    },
+    // Issue #293: bare (no `ORDER BY`) `array_agg`/`string_agg`, recompute-only
+    // like `JSONB_AGG`, with the same element-order caveat (known-correctness
+    // gap 18). Both are `IMMUTABLE` and take a `text` argument only: `text[]`
+    // is the one array family modelled (`PgType::TextArray`), and a `text`
+    // element has no GUC-dependent rendering. `STRING_AGG`'s second argument
+    // is the separator, which must be a string literal (the validator
+    // refuses anything else) so the ledger's contribution column stays the
+    // first argument alone.
+    FunctionSpec {
+        name: "ARRAY_AGG",
+        arg_types: &[ValueType::Text],
+        return_type: ValueType::Other(PgType::TextArray),
+    },
+    FunctionSpec {
+        name: "STRING_AGG",
+        arg_types: &[ValueType::Text, ValueType::Text],
+        return_type: ValueType::Text,
     },
 ];
 
@@ -595,6 +615,10 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     if let ValueType::Text = arg {
         return match name {
             "MIN" | "MAX" => Some(arg),
+            // Issue #293: `array_agg(text)` is `text[]`, `string_agg(text,
+            // text)` is `text`.
+            "ARRAY_AGG" => Some(ValueType::Other(PgType::TextArray)),
+            "STRING_AGG" => Some(ValueType::Text),
             _ => None,
         };
     }

@@ -364,11 +364,13 @@ pub(crate) fn contribution_pg_type(value_type: ValueType) -> String {
     super::ddl::pg_type_name(declared).into_owned()
 }
 
-/// An aggregate call with one argument: a leaf whose argument becomes a
-/// contribution column. (`COUNT(*)` has none, and the validator refuses an
-/// aggregate nested in another's argument.)
+/// An aggregate call with one value argument: a leaf whose first argument
+/// becomes a contribution column. (`COUNT(*)` has none, and the validator
+/// refuses an aggregate nested in another's argument.) `STRING_AGG` also
+/// carries its literal separator, which stays in the call.
 fn is_aggregate_leaf(name: &str, args: &[Expr]) -> bool {
-    args.len() == 1 && lookup_aggregate_function(name).is_some()
+    let arity = if name == "STRING_AGG" { 2 } else { 1 };
+    args.len() == arity && lookup_aggregate_function(name).is_some()
 }
 
 /// `expr` (a field's substituted expression) rewritten to read the ledger
@@ -392,9 +394,11 @@ pub(crate) fn over_ledger(
                 .unwrap_or_else(|| {
                     panic!("no ledger contribution for {name}'s argument {:?}", args[0])
                 });
+            let mut rewritten = vec![Expr::Column(column)];
+            rewritten.extend(args[1..].iter().cloned());
             Expr::FunctionCall {
                 name: name.clone(),
-                args: vec![Expr::Column(column)],
+                args: rewritten,
             }
         }
         _ if group_by.iter().any(|k| k.as_expr() == *expr) => {

@@ -519,6 +519,21 @@ pub enum ValidationError {
         function: String,
         rel: String,
     },
+    /// `ARRAY_AGG`/`STRING_AGG` over a to-many relationship path (issue
+    /// #293). Both are recompute-only with no order guarantee; a to-many
+    /// relationship enrichment folds in the Rust evaluator with no live
+    /// connection, and the fold's element order would not agree with a
+    /// server-side recompute. A `GROUP BY` definition's own call is
+    /// unaffected.
+    ListAggregateOverToManyRelationshipUnsupported {
+        field: String,
+        function: String,
+        rel: String,
+    },
+    /// `STRING_AGG`'s separator is not a string literal (issue #293). The
+    /// separator is fixed per definition so the ledger's contribution column
+    /// is the value argument alone.
+    StringAggSeparatorNotLiteral { field: String },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -1107,6 +1122,22 @@ impl fmt::Display for ValidationError {
                  a column collation this crate does not track, which cannot be resolved without \
                  a live connection this fold has no way to reach (issue #120); a GROUP BY \
                  definition's own {function}(<text column>) is unaffected"
+            ),
+            ValidationError::ListAggregateOverToManyRelationshipUnsupported {
+                field,
+                function,
+                rel,
+            } => write!(
+                f,
+                "calculated field '{field}': {function}('{rel}.<column>') over a to-many \
+                 relationship is not supported — the aggregate has no ORDER BY, and a fold \
+                 over related rows cannot match the element order of a server-side recompute \
+                 (issue #293); a GROUP BY definition's own {function}(<text column>) is \
+                 unaffected"
+            ),
+            ValidationError::StringAggSeparatorNotLiteral { field } => write!(
+                f,
+                "calculated field '{field}': STRING_AGG's separator must be a string literal"
             ),
         }
     }
@@ -2627,6 +2658,25 @@ fn infer_expr(
                     });
                 }
                 arg_types.push(arg_t);
+            }
+            if name == "STRING_AGG" && !matches!(args.get(1), Some(Expr::StringLiteral(_))) {
+                return Err(ValidationError::StringAggSeparatorNotLiteral {
+                    field: field_name.to_string(),
+                });
+            }
+            if matches!(name.as_str(), "ARRAY_AGG" | "STRING_AGG")
+                && let Some(Expr::RelationshipPath { rel, .. }) = args.first()
+                && relationships
+                    .get(rel)
+                    .is_some_and(|r| r.cardinality == RelationshipCardinality::ToMany)
+            {
+                return Err(
+                    ValidationError::ListAggregateOverToManyRelationshipUnsupported {
+                        field: field_name.to_string(),
+                        function: name.clone(),
+                        rel: rel.clone(),
+                    },
+                );
             }
             if name == "REGEXP_COUNT"
                 && let Some(pattern_arg) = args.get(1)

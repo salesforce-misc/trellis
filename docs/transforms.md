@@ -94,7 +94,8 @@ removing, or changing a source row can insert, delete, or update a target row.
 
 Grouping-key columns may be referenced directly; any other source column must be
 wrapped in exactly one aggregate: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`,
-`BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR` or `JSONB_AGG`. `COUNT(*)` counts
+`BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR`, `JSONB_AGG`, `ARRAY_AGG` or
+`STRING_AGG`. `COUNT(*)` counts
 rows in the group, and `COUNT(<expr>)` counts the rows where `<expr>`
 isn't null. Which column types each aggregate accepts is in the
 [type-support matrix](type-support.md).
