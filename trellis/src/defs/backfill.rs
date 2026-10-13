@@ -14,7 +14,7 @@
 //! directly with server-side `INSERT … SELECT` statements, chunked by key
 //! range so each statement is one bounded transaction. The ring is then left
 //! to carry only live CDC deltas that land *after* the build (see the fence
-//! discussion below). The backfill discharge (ADR-0016) dispatches it by
+//! discussion below). The backfill discharge (ADR-0002) dispatches it by
 //! shape instead of a ring enumeration: a plain 1-1 definition's primary-key
 //! ranges as durable chunks ([`plan_one_to_one_chunks`]), and an aggregate's
 //! or relationship-enriched 1-1 definition's whole build
@@ -40,7 +40,7 @@
 //!    already relies on: live CDC isn't applied to the definition until the
 //!    build has finished and flipped it `live`, and any genuine post-build
 //!    delta the ring later applies lands on a fully-built row. The build runs
-//!    as a background job after its source's capture was installed (ADR-0016,
+//!    as a background job after its source's capture was installed (ADR-0002,
 //!    issue #419), so a commit it read can also be captured and drain after
 //!    the flip; for an aggregate, each ledger entry's basis (the snapshot that
 //!    read its row) makes such a delta skip a commit the build already
@@ -114,7 +114,7 @@ pub enum BackfillError {
     /// relationship-enriched 1-1 definition, whose target the direct build
     /// can't render without the LEFT JOIN/correlated-subquery machinery the
     /// ring path uses. The backfill discharge builds such a definition by ring
-    /// enumeration instead (ADR-0016's dispatch by shape).
+    /// enumeration instead (ADR-0002's dispatch by shape).
     Unsupported(String),
     /// Staging a changed row's downstream propagation through the
     /// target-mutation seam failed (issue #315), wrapped where a backfill
@@ -217,7 +217,7 @@ impl From<ddl::DdlError> for BackfillError {
 /// [`super::ddl::create_aggregate_target_table`]) — this only writes rows, it
 /// does not create the table. `target_schema` and `source_columns` are the
 /// same values those DDL calls were given. `source_table` is `def.source`'s
-/// fully-qualified `"schema.table"` identity (issue #76, ADR-0007) — the
+/// fully-qualified `"schema.table"` identity (issue #76, ADR-0011) — the
 /// caller's own already-resolved value (`catalog::resolve_source_for_install`,
 /// or [`super::model::Definition::source_table`] for a durable chunk-queue
 /// caller) — threaded through every read of the live source below instead of
@@ -697,7 +697,7 @@ pub(crate) fn range_params<'a>(
 /// live CDC has paused one of this definition's columns in the meantime, a
 /// (re-)executed chunk must not silently overwrite that column's frozen
 /// value with a freshly (mis)computed one — that would undo the freeze that
-/// is the entire point of column-level quarantine (ADR-0003's amendment).
+/// is the entire point of column-level quarantine (ADR-0003).
 /// Not a call to `staging::quarantine::paused_columns_for` itself: that
 /// function takes a `&Pool`, every call site here already holds a `&Client`,
 /// and `defs` sits below `staging` in this crate's layering
@@ -727,7 +727,7 @@ async fn paused_columns_for(
 /// One `(lo, hi]` PK-range chunk's write — the body [`backfill_one_to_one`]'s
 /// loop runs for every range in one call, and the durable chunk queue's
 /// [`execute_one_to_one_chunk`] runs for exactly one range claimed off
-/// `backfill_chunks` (docs/decisions/0007's "Backgrounding and resumability"
+/// `backfill_chunks` (ADR-0002's "A build is Re-derive over chunks, and applies from its first chunk"
 /// amendment). `substituted` is the caller's already-computed
 /// [`substitute_all_fields`] output, so a queue-driven caller charged the
 /// `Unsupported`-detecting cost once at plan time doesn't pay it again per
@@ -748,7 +748,7 @@ async fn write_one_to_one_range(
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let pk_col_list = pk_idents.join(", ");
 
-    // ADR-0003's amendment (column-level quarantine): exclude any column
+    // ADR-0003 (column-level quarantine): exclude any column
     // this definition currently has paused from both the computed column
     // list and the `ON CONFLICT` update set — see `paused_columns_for`'s doc
     // comment for why a durable, re-executable chunk write can't skip this.
@@ -823,12 +823,12 @@ async fn write_one_to_one_range(
     Ok(())
 }
 
-/// The read-only "planning" half of [`backfill_one_to_one`] (docs/decisions/0007's
+/// The read-only "planning" half of [`backfill_one_to_one`] (ADR-0002's
 /// amendment): fails fast with [`BackfillError::Unsupported`] exactly as
 /// `backfill_one_to_one` would (same [`substitute_all_fields`] call), then
 /// returns the same `(lo, hi]` PK-range boundaries its loop would have
 /// walked — without writing a single row of the target. The backfill
-/// discharge (`intake::markers::run_pending_backfills`, ADR-0016) calls
+/// discharge (`intake::markers::run_pending_backfills`, ADR-0002) calls
 /// this for a plain (non-relationship) 1-1 definition once its capture point
 /// has passed, and persists the boundaries as durable `backfill_chunks` work
 /// items that drain threads execute.
@@ -877,7 +877,7 @@ pub(crate) struct PlannedRanges {
 /// chunk — the durable-queue counterpart of [`backfill_one_to_one`]'s loop
 /// body, claimed and run by a drain worker
 /// (`trellis::client`'s `app_worker_loop`) rather than an in-call loop.
-/// Idempotent overwrite, like every chunk write in this module (ADR-0007): a
+/// Idempotent overwrite, like every chunk write in this module ADR-0002): a
 /// worker that reclaims this chunk after a peer died mid-write redoes it
 /// safely.
 #[allow(clippy::too_many_arguments)]
@@ -1446,7 +1446,7 @@ fn to_one_joins(
 /// otherwise. Reads only the catalog, never a source row.
 ///
 /// The backfill discharge asks this before it dispatches a direct-build job
-/// (ADR-0016, issue #419), so a shape the build can't render goes to the ring
+/// (ADR-0002, issue #419), so a shape the build can't render goes to the ring
 /// enumeration inside the discharge instead. It runs the same shape checks as
 /// the builds, through the same helpers, on the discharge's own connection.
 /// One step a build takes is left out: the aggregate build's resolution of
@@ -2665,7 +2665,7 @@ async fn backfill_relationship_one_to_one(
         rel_stage.insert(rel.clone(), stage);
     }
 
-    // ADR-0003's amendment (column-level quarantine): exclude any column
+    // ADR-0003 (column-level quarantine): exclude any column
     // this definition currently has paused, same as `write_one_to_one_range`
     // — see that function's `paused_columns_for` doc comment.
     let paused = paused_columns_for(&**client, def).await?;

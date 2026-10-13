@@ -1,6 +1,6 @@
 //! Integration tests for `defs::catalog::install_definition` (issue #63 C1):
 //! the front door that creates a definition's target table once, then
-//! records it for the backfill discharge (ADR-0016, #418, #419), which builds
+//! records it for the backfill discharge (ADR-0002, #418, #419), which builds
 //! it by shape: a plain 1-1 definition's chunks, an aggregate's or
 //! relationship-enriched 1-1 definition's direct-build job
 //! (`backfill::backfill_definition`), or the ring enumeration for a shape the
@@ -34,7 +34,7 @@ use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
 /// Claims and executes every pending direct-build backfill chunk
-/// (`trellis::defs::chunk_queue`, docs/decisions/0007's amendment) until none
+/// (`trellis::defs::chunk_queue`, ADR-0002) until none
 /// remain — the test-harness stand-in for a running `application_threads`
 /// drain worker, since `install_definition` no longer runs a plain
 /// (non-relationship) 1-1 definition's backfill in-call: it now returns as
@@ -46,7 +46,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// harness helpers (`drain_to_quiescence`) — a chunk-execution failure here
 /// means the test itself is broken, not something to retry past.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await
@@ -136,7 +136,7 @@ async fn staged_count_for_source(client: &Client, src_table: &str) -> i64 {
 /// real CDC producer always stages a fully-qualified `src_table` (issue
 /// #76), and `compute`'s forward-propagation lookup
 /// (`catalog::transforms_for_source`) now requires that exact qualified
-/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0007).
+/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0011).
 /// Already-qualified input (containing a `.`) passes through unchanged.
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {
@@ -245,7 +245,7 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     .expect("install_definition via the fast path");
 
     // The direct build's chunk work is now enumerated and persisted, not
-    // executed in-call (docs/decisions/0007's amendment) — drive it to
+    // executed in-call (ADR-0002) — drive it to
     // completion the way a running `application_threads` drain worker would
     // before asserting on the target's contents. Only the build: its go-live
     // catch-up (#476) re-reads the source into the ring by design.
@@ -346,7 +346,7 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
     .await
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
-    // ADR-0016 (#418): the discharge plans and enqueues the chunks.
+    // ADR-0002 (#418): the discharge plans and enqueues the chunks.
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the build");
@@ -499,7 +499,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
     );
 
     // The fast path's chunk work is enumerated, not executed in-call
-    // (docs/decisions/0007's amendment) — drive it to completion the way a
+    // (ADR-0002) — drive it to completion the way a
     // real drain worker would.
     drain_backfill_chunks(&db.pool).await;
 
@@ -533,7 +533,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
     );
 }
 
-/// Issue #76 / ADR-0007 grammar clause 4, through the real front door: an
+/// Issue #76 / ADR-0011, through the real front door: an
 /// explicitly-qualified `TRANSFORM <schema>.<target>` must override the
 /// `target_schema` argument this function is called with, for *every* step —
 /// the physical `CREATE TABLE` DDL, the direct-build `INSERT`s, and the
@@ -652,7 +652,7 @@ async fn install_definition_fast_path_ends_up_live() {
     .await
     .expect("install_definition via the fast path");
 
-    // ADR-0016 (#418): `install_definition` returns once the definition is
+    // ADR-0002 (#418): `install_definition` returns once the definition is
     // recorded, before its build is even dispatched — so the definition it
     // hands back (and the persisted row) must still be `WaitingToBackfill`
     // right here.
@@ -745,7 +745,7 @@ async fn install_definition_ring_fallback_ends_up_live() {
     assert_eq!(
         def.status,
         TransformStatus::WaitingToBackfill,
-        "the ring-fallback path waits for the discharge too (ADR-0016, #418)"
+        "the ring-fallback path waits for the discharge too (ADR-0002, #418)"
     );
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
@@ -887,7 +887,7 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     )
     .await
     .expect("install_definition builds the aggregate alias chain directly");
-    // ADR-0016 (#419): the direct build runs as a background job the
+    // ADR-0002 (#419): the direct build runs as a background job the
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
@@ -965,7 +965,7 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     )
     .await
     .expect("install_definition builds a bare alias of a SUM field declared before it");
-    // ADR-0016 (#419): the direct build runs as a background job the
+    // ADR-0002 (#419): the direct build runs as a background job the
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
@@ -1035,7 +1035,7 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     )
     .await
     .expect("install_definition shares one count column across several SUM aliases");
-    // ADR-0016 (#419): the direct build runs as a background job the
+    // ADR-0002 (#419): the direct build runs as a background job the
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
@@ -1303,7 +1303,7 @@ async fn install_definition_fast_path_builds_a_relationship_cross_field_alias_ch
     )
     .await
     .expect("install_definition builds the relationship alias chain directly");
-    // ADR-0016 (#419): the direct build runs as a background job the
+    // ADR-0002 (#419): the direct build runs as a background job the
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
@@ -1391,7 +1391,7 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
     )
     .await
     .expect("install_definition builds a coalesce-wrapped aggregate directly");
-    // ADR-0016 (#419): the direct build runs as a background job the
+    // ADR-0002 (#419): the direct build runs as a background job the
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
@@ -1479,7 +1479,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
     )
     .await
     .expect("install_definition builds the nested coalesce alias chain directly");
-    // ADR-0016 (#419): the direct build runs as a background job the
+    // ADR-0002 (#419): the direct build runs as a background job the
     // discharge dispatches; run it before reading the target. Only the
     // build: its go-live catch-up re-reads the source into the ring by
     // design (#468, #485).
@@ -1709,7 +1709,7 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
     );
 }
 
-/// ADR-0016 (#418): registration reads no source rows. It succeeds while
+/// ADR-0002 (#418): registration reads no source rows. It succeeds while
 /// another session holds the source `ACCESS EXCLUSIVE` (which blocks every
 /// read of it) — for a plain 1-1 definition, and for a shape the direct build
 /// can't render, whose ring fallback used to enumerate the source inside
@@ -1804,7 +1804,7 @@ async fn registration_reads_no_source_rows() {
     );
 }
 
-/// ADR-0016 (#419): the direct set-based build of an aggregate and of a
+/// ADR-0002 (#419): the direct set-based build of an aggregate and of a
 /// relationship-enriched 1-1 definition runs as a background job the
 /// discharge dispatches, not inside registration. Registering each succeeds
 /// while another session holds the source and the to-many relationship's

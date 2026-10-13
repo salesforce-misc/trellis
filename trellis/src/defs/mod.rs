@@ -827,7 +827,7 @@ mod tests {
         }
     }
 
-    // Issue #76 / ADR-0007 grammar clause 4: `TRANSFORM`/`FROM` accept an
+    // Issue #76 / ADR-0011: `TRANSFORM`/`FROM` accept an
     // explicit `schema.table` spelling, in addition to the bare `<table>`
     // form these tests exercised above.
 

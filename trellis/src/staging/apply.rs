@@ -601,7 +601,7 @@ impl From<crate::error::Error> for ApplyError {
 
 /// Resolves `src_table` to the fully-qualified identity
 /// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] now require
-/// (issue #74, ADR-0007: `schema_nodes` keys on qualified identity, so a
+/// (issue #74, ADR-0011: `schema_nodes` keys on qualified identity, so a
 /// bare lookup there silently finds nothing rather than erroring).
 ///
 /// A no-op for the common case — `src_table` already contains a `.` — which
@@ -2165,7 +2165,7 @@ async fn build_reverse_relationship_shape(
         }
     };
     // `transforms_for_source` matches `schema_nodes.table_name` exactly
-    // (ADR-0007's fully-qualified keying) and every SQL-emitting site below
+    // (ADR-0011's fully-qualified keying) and every SQL-emitting site below
     // (`from_side_rows_for_trigger_txn`'s `ddl::qualified_source_table`) documents the same requirement, so this
     // shape stores the qualified form of `from_table` throughout — the
     // relationship's own recorded one (issue #288), never `rel.def.from_table`
@@ -4032,7 +4032,7 @@ struct TargetPlan {
     field_types: Vec<ValueType>,
     records: Vec<OneToOneRecord>,
     /// The persisted, fully-qualified `"schema.table"` identity of this
-    /// target (issue #73's `Definition::target_table`, ADR-0007) —
+    /// target (issue #73's `Definition::target_table`, ADR-0011) —
     /// carried alongside the bare `def.def.target` this plan is keyed by
     /// (see [`ApplyPlan::targets`]'s doc comment on why the map key itself
     /// stays bare) so [`apply_target`] can bind the *right* physical table
@@ -7914,7 +7914,7 @@ pub(super) async fn compute_page(
         versions.entry(source_key.clone()).or_insert(version);
 
         // The source identity this batch's own CDC producer staged (issue
-        // #76, ADR-0007) — the ring's own spelling of `change.src_table`,
+        // #76, ADR-0011) — the ring's own spelling of `change.src_table`,
         // which `SourceTableDropped` below must echo back verbatim. Every
         // change in this bucket resolves to the same canonical `source_key`
         // by construction (`by_source` grouped on it, issue #380), so any one
@@ -7952,7 +7952,7 @@ pub(super) async fn compute_page(
 
         // `qualified_source` (via `qualified_schema_node_key`):
         // `schema_nodes`/`schema_edges` key on qualified identity (issue #74,
-        // ADR-0007), so `transforms_for_source` (a thin `dependents_of`
+        // ADR-0011), so `transforms_for_source` (a thin `dependents_of`
         // wrapper) needs an exact qualified match here. `qualified_source` is
         // usually already fully-qualified (real CDC/backfill), but a
         // downstream-propagation hop's `src_table` is a bare target name
@@ -8453,7 +8453,7 @@ pub(super) async fn compute_page(
             )
             .await?;
 
-            // ADR-0003's amendment (column-level quarantine): a column
+            // ADR-0003 (column-level quarantine): a column
             // the fuse has paused is excluded from both this plan's
             // column list (so `apply_target`'s generated SQL never
             // mentions it at all — decision: freeze at the last
@@ -8958,7 +8958,7 @@ pub(super) async fn compute_page(
         HashMap::new();
     for target in all_targets {
         // `target` is bare (`def.def.target`) — `schema_nodes` now keys on
-        // qualified identity (issue #74, ADR-0007), so a bare lookup here
+        // qualified identity (issue #74, ADR-0011), so a bare lookup here
         // would silently find nothing and permanently disable downstream
         // propagation for every chained transform.
         // `qualified_schema_node_key` resolves it the same way it resolves
@@ -9996,7 +9996,7 @@ async fn apply_target(
         let rows_per_chunk = (MAX_WRITE_PARAMS_PER_STATEMENT / cols_per_row).max(1);
 
         // Every one of this target's calculated columns can be paused at
-        // once (ADR-0003's amendment) — a single-field definition whose lone
+        // once (ADR-0003) — a single-field definition whose lone
         // column's fuse has tripped is the simplest such case. There is then
         // nothing for a conflicting key to update at all: `do update set`
         // with an empty set list is invalid SQL, and an empty-tuple `is

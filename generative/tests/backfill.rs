@@ -183,8 +183,8 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 
 /// public-api-design review gap: [`ManualBackend::quiesce`] used to only
 /// await CDC-ring convergence — it had no awareness of a still-`Backfilling`
-/// direct-build definition's `defs::chunk_queue` work at all (docs/decisions/0007's
-/// "Backgrounding and resumability" amendment put that work entirely outside
+/// direct-build definition's `defs::chunk_queue` work at all (ADR-0002's
+/// "A build is Re-derive over chunks, and applies from its first chunk" put that work entirely outside
 /// the ring). Every other test in this file only happened to pass because a
 /// large, unrelated convergence stall (issue #452's keepalive throttle, since
 /// fixed) gave a real running drain worker enough wall-clock time to finish a small backfill before `quiesce`

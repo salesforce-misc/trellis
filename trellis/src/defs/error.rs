@@ -41,7 +41,7 @@ pub enum ParseError {
     UnsupportedPredicate { detail: String },
     /// `COALESCE` called with zero arguments.
     AtLeastOneArgumentRequired { name: String },
-    /// A `TRANSFORM`/`FROM` table reference (issue #76, ADR-0007 grammar
+    /// A `TRANSFORM`/`FROM` table reference (issue #76, ADR-0011 grammar
     /// clause 4) had more than the two `<schema>.<table>` components this
     /// grammar accepts — e.g. `a.b.c`.
     TooManyQualifiedNameParts { reference: String },

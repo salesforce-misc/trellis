@@ -127,7 +127,7 @@ const COLUMN_PAUSE_LOCK_CLASS: i32 = 922;
 
 /// The advisory lock key of `schema`'s column-pause lock, the one lock every
 /// read-to-decide and every write of that instance's column-pause state takes
-/// (#922, ADR-0014 "Locking"): `column_status` rows, the cascade edges
+/// (#922, ADR-0014, "One lock orders every column-pause write and read"): `column_status` rows, the cascade edges
 /// (`column_pause_cascades`) and the pending marks on them.
 ///
 /// Advisory locks are keyed by `(database, key)` and know nothing of schemas,

@@ -74,7 +74,7 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
 /// `create table` in this file's own fixtures actually lands, since
 /// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
 /// qualifies its own DDL. Matches `apply.rs`'s own `qualify_fixture_table`
-/// (issue #74, ADR-0007): a CDC-staged `src_table`, and everything keyed off
+/// (issue #74, ADR-0011): a CDC-staged `src_table`, and everything keyed off
 /// it downstream (`poison`/`poison_held`/`key_deaths`, and `schema_nodes`'s
 /// own lookups via `transforms_for_source`), must be fully qualified to
 /// match what a real CDC producer stages (issue #76) and what the

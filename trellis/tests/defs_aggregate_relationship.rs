@@ -70,7 +70,7 @@ async fn active_seg_table(client: &Client) -> String {
 /// real CDC producer always stages a fully-qualified `src_table` (issue
 /// #76), and `compute`'s forward-propagation lookup
 /// (`catalog::transforms_for_source`) now requires that exact qualified
-/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0007).
+/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0011).
 /// Already-qualified input (containing a `.`) passes through unchanged.
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {

@@ -137,7 +137,7 @@ async fn insert_cdc_row(
 /// Runs any dispatched backfill chunks, then seals and drains repeatedly
 /// until nothing is pending anywhere in the ring — the same harness
 /// `defs_install_definition.rs` uses. A plain 1-1 definition's discharge
-/// dispatches chunks rather than a ring enumeration (ADR-0016, #418), so the
+/// dispatches chunks rather than a ring enumeration (ADR-0002, #418), so the
 /// chunks run first.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     drain_backfill_chunks(pool).await;
@@ -182,7 +182,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// the one thing this test actually cares about — the target reaching live
 /// again — already happened.
 async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &str) {
-    // A chunked rebuild goes live from its last chunk (ADR-0016, #418).
+    // A chunked rebuild goes live from its last chunk (ADR-0002, #418).
     drain_backfill_chunks(pool).await;
     if status_of(client, target).await == TransformStatus::Live {
         return;
@@ -220,7 +220,7 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
 /// remain — the harness stand-in for a running drain worker, matching
 /// `defs_install_definition.rs`'s `drain_backfill_chunks`.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await
@@ -433,7 +433,7 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     straggler.execute("select txid_current()").await;
 
     // Registration always leaves the definition `waiting_to_backfill`
-    // (ADR-0016); what this pins is that the discharge doesn't build it
+    // (ADR-0002); what this pins is that the discharge doesn't build it
     // until the straggler has ended.
     let cols = numeric(&["a"]);
     let def = install_definition(
@@ -1109,7 +1109,7 @@ async fn every_backfill_mechanism_still_reaches_live_with_no_unsettled_marker() 
     assert_eq!(
         agg.status,
         TransformStatus::WaitingToBackfill,
-        "the direct/set-based path registers without building (ADR-0016, #419)"
+        "the direct/set-based path registers without building (ADR-0002, #419)"
     );
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
@@ -1187,7 +1187,7 @@ async fn backfill_failures_listed(
         .collect()
 }
 
-/// Issue #407 (ADR-0016): a definition whose source's backfill keeps failing
+/// Issue #407 (ADR-0002): a definition whose source's backfill keeps failing
 /// stays `waiting_to_backfill`, and `Trellis::status` says why: the marker's
 /// attempt count, last error and next attempt. Once the cause is fixed, a
 /// fresh `request_backfill` resets the backoff, the next attempt goes through

@@ -21,7 +21,7 @@ use crate::integer::IntWidth;
 ///
 /// **`target`/`source` are always bare table names, never a dotted
 /// `schema.table` spelling — even when the definition explicitly qualified
-/// one (issue #76, ADR-0007 grammar clause 4).** That's a deliberate split,
+/// one (issue #76, ADR-0011).** That's a deliberate split,
 /// not an oversight: a huge number of call sites (`backfill.rs`, `oracle.rs`,
 /// `ddl.rs`, `apply.rs`, `ledger.rs`, `quarantine.rs`) pass
 /// `&def.source`/`&def.target` straight into `quote_ident`, which quotes its

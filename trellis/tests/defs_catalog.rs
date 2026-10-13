@@ -17,7 +17,7 @@ use trellis::defs::{
 /// plain 1-1 over a captured table is the Re-derive build's, which this runs
 /// to `live` once the chunks are done.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await
@@ -60,7 +60,7 @@ fn columns(names: &[&str]) -> HashMap<String, ValueType> {
 /// `create_bare_source_table`/`create_authors_and_posts` actually land a
 /// bare `create table` (the pool's ambient `search_path`, Trellis schema
 /// first). `transforms_for_source` now requires its argument already
-/// fully-qualified (issue #74, ADR-0007); a bare name silently matches
+/// fully-qualified (issue #74, ADR-0011); a bare name silently matches
 /// nothing rather than erroring.
 fn qualified(name: &str) -> String {
     format!("{DEFAULT_SCHEMA}.{name}")
@@ -122,7 +122,7 @@ async fn valid_definition_is_stored_and_retrievable() {
     assert_eq!(subscribers[0].def.target, "order_totals");
 }
 
-/// Issue #72 / ADR-0007: `transform_definitions.source_table` (and its
+/// Issue #72 / ADR-0011: `transform_definitions.source_table` (and its
 /// `source_table_versions` counterpart) must persist the *fully-qualified*
 /// `schema.table` identity a bare `FROM` clause resolves to — not the bare
 /// spelling the definition text names. `posts` is created explicitly in
@@ -186,7 +186,7 @@ async fn source_table_is_persisted_fully_qualified() {
     assert_eq!(version, 1);
 }
 
-/// Issue #73 / ADR-0007's mirror of `source_table_is_persisted_fully_qualified`
+/// Issue #73 / ADR-0011's mirror of `source_table_is_persisted_fully_qualified`
 /// above, for the target side: `transform_definitions.target_table` must
 /// persist `def.target` resolved to `{Config::target_schema}.{def.target}`,
 /// not the bare spelling the definition text names. Unlike the source side,
@@ -305,7 +305,7 @@ async fn a_definitions_target_table_matches_a_chained_definitions_source_table()
     );
 }
 
-/// Issue #76 / ADR-0007 grammar clause 4: an explicit `FROM <schema>.<source>`
+/// Issue #76 / ADR-0011: an explicit `FROM <schema>.<source>`
 /// resolves to *that exact relation*, never a `search_path` walk. Proven
 /// here by deliberately creating two same-named `orders` tables — one that
 /// bare resolution would win (landed in the Trellis-pinned schema, first on
@@ -1188,7 +1188,7 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
 
 /// Issue #65, case 1: with no relationships declared at all, `all_source_tables`
 /// must still behave exactly as it did pre-#65 — just the anchor
-/// `source_table` of each registered transform. Issue #75, ADR-0007:
+/// `source_table` of each registered transform. Issue #75, ADR-0011:
 /// fully-qualified, not the bare suffix this returned before.
 #[tokio::test]
 async fn all_source_tables_with_no_relationships_returns_only_anchor_tables() {
@@ -1300,7 +1300,7 @@ async fn all_source_tables_does_not_leak_relationships_unreachable_from_any_tran
     assert_eq!(tables, vec![qualified("z")]);
 }
 
-/// Issue #75, ADR-0007: `all_source_tables` must return each source's own
+/// Issue #75, ADR-0011: `all_source_tables` must return each source's own
 /// *actual* persisted qualified name, not a bare suffix a caller then has to
 /// re-guess against one assumed schema. Before this fix it returned the bare
 /// `split_part(source_table, '.', 2)` suffix, and its one production caller

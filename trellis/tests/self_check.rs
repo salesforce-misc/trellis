@@ -912,7 +912,7 @@ async fn self_check_refuses_a_non_positive_limit_rather_than_vacuously_convergin
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// ADR-0013's "1-1 first, then aggregates and relationships": an aggregate
+/// ADR-0013's "Scope: 1-1 targets": an aggregate
 /// target is out of scope for this slice, and `self_check` must *refuse* it
 /// rather than silently run a plain keyset comparison that would mis-audit
 /// the group-key space (every group would read as a divergence). A tool that

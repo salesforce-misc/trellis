@@ -435,7 +435,7 @@ pub enum ValidationError {
     /// define time, as #590 decided for join and key columns.
     NondeterministicCollationTextFunction(Box<NondeterministicCollationTextFunction>),
     /// An explicitly-qualified `FROM <schema>.<table>` source reference
-    /// (issue #76, ADR-0007 grammar clause 4) named a schema that does not
+    /// (issue #76, ADR-0011) named a schema that does not
     /// actually contain a table by that name, as introspected live against
     /// `information_schema.tables`
     /// ([`super::catalog::confirm_qualified_source`]). Distinct
@@ -1075,13 +1075,13 @@ impl fmt::Display for ValidationError {
                 f,
                 "FROM names '{schema}.{table}' explicitly, but schema '{schema}' has no table \
                  named '{table}'; an explicit schema.table spelling resolves to that exact \
-                 relation, not a search_path walk (ADR-0007), so this is checked as written"
+                 relation, not a search_path walk (ADR-0011), so this is checked as written"
             ),
             ValidationError::QualifiedTargetTableNotFound { schema, table } => write!(
                 f,
                 "TRANSFORM names '{schema}.{table}' explicitly, but schema '{schema}' has no \
                  table named '{table}'; an explicit schema.table spelling resolves to that exact \
-                 relation, not the configured target schema (ADR-0007), so this is checked as \
+                 relation, not the configured target schema (ADR-0011), so this is checked as \
                  written"
             ),
             ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
@@ -1116,7 +1116,7 @@ impl std::error::Error for ValidationError {}
 
 /// A non-fatal caveat surfaced alongside an otherwise-successful definition —
 /// distinct from [`ValidationError`], which rejects the definition outright.
-/// Per ADR-0005's "correctness vs. performance" split: a missing correctness
+/// Per ADR-0005's split between a missing correctness prerequisite (rejected) and a missing performance one (warned): a missing correctness
 /// prerequisite is a hard rejection, but a missing *performance* prerequisite
 /// (this type's only variant so far) still leaves the definition correct, so
 /// it's surfaced as guidance instead of an error.

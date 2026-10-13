@@ -20,7 +20,7 @@
 //! read, no update/delete.
 //!
 //! **Source and target identity are both fully-qualified (issues #72/#73,
-//! ADR-0007).** `transform_definitions.source_table`/`target_table` and
+//! ADR-0011).** `transform_definitions.source_table`/`target_table` and
 //! `source_table_versions.source_table` hold `def.source`/`def.target`
 //! resolved to their `schema.table` identity exactly once, at
 //! definition-acceptance time (`create_definition_inner`'s
@@ -46,7 +46,7 @@
 //! qualified column directly.
 //!
 //! **`schema_nodes`/`schema_edges` key on qualified identity too (issue
-//! #74, ADR-0007).** `public.posts` and `archive.posts` are distinct nodes
+//! #74, ADR-0011).** `public.posts` and `archive.posts` are distinct nodes
 //! with independent edges — `resolve_node_in_txn`/`resolve_node` and
 //! `reject_if_table_cycle` all require an already-qualified `table_name`
 //! now (see [`resolve_graph_identity_in_txn`]'s doc comment for how a bare
@@ -907,7 +907,7 @@ impl From<crate::intake::IntakeError> for CatalogError {
 /// Test fixture: registers a definition exactly as [`install_definition`]
 /// registers every one (`waiting_to_backfill`, no source read), then stands
 /// in for the backfill discharge's ring fallback
-/// (`intake::markers::run_pending_backfills`, ADR-0016) in-call: it
+/// (`intake::markers::run_pending_backfills`, ADR-0002) in-call: it
 /// enumerates the source into the ring as image-less `Recompute` rows and
 /// flips the definition `live` in one transaction. `source_columns` maps the
 /// source table's known columns to their [`ValueType`] (see
@@ -969,7 +969,7 @@ pub async fn create_definition(
 /// any kind, for a test or benchmark that builds the target itself (with
 /// `defs::backfill::backfill_definition`, issue #63 M3's set-based build) or
 /// needs none. No production path calls this: every real definition is
-/// built through the backfill discharge (ADR-0016).
+/// built through the backfill discharge (ADR-0002).
 #[cfg(any(test, feature = "test-util"))]
 pub async fn create_definition_without_backfill(
     pool: &Pool,
@@ -1002,7 +1002,7 @@ pub async fn create_definition_without_backfill(
 /// `DROP` would later drop it (ADR-0014). No build path creates the target
 /// itself.
 ///
-/// **Registration reads no source rows (ADR-0016, issues #418, #419).** Every
+/// **Registration reads no source rows (ADR-0002, issues #418, #419).** Every
 /// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
 /// returns, so its latency doesn't depend on the size of any table the
 /// definition reads. Its build runs in the background: the staging worker's
@@ -1041,7 +1041,7 @@ pub async fn install_definition(
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
 
-    // Issue #76 / ADR-0007 grammar clause 4: an explicit schema on either
+    // Issue #76 / ADR-0011: an explicit schema on either
     // side is trusted outright rather than resolved — checked here, before
     // any DDL work runs, so a bogus explicit spelling fails fast with a
     // friendly `ValidationError` instead of surfacing as a confusing DDL
@@ -1106,7 +1106,7 @@ pub async fn install_definition(
     // exists (issue #440) inside the transaction that creates it.
     let target_schema = effective_target_schema(&def, target_schema);
 
-    // Issue #76, ADR-0007: resolved once, here, and threaded through every
+    // Issue #76, ADR-0011: resolved once, here, and threaded through every
     // DDL/direct-build step below — see [`resolve_source_for_install`]'s own
     // doc comment for why this function needs its own copy rather than
     // waiting for `create_definition_inner`'s later, authoritative one.
@@ -1160,7 +1160,7 @@ pub async fn install_definition(
         }
     };
 
-    // ADR-0016 (issues #418, #419): registration reads no source rows. The
+    // ADR-0002 (issues #418, #419): registration reads no source rows. The
     // definition waits for the backfill discharge, which dispatches its build
     // by shape.
     //
@@ -1254,7 +1254,7 @@ async fn catch_up_if_backfilling(
 /// [`TransformStatus::CatchingUp`] and parks its go-live catch-up markers —
 /// the "every chunk done" completion event `chunk_queue::finish_chunk` calls
 /// once every `backfill_chunks` row for `definition_id` is done
-/// (docs/decisions/0007's amendment). Runs inside the caller's transaction,
+/// (ADR-0002). Runs inside the caller's transaction,
 /// which must already hold a `for update` lock on `definition_id`'s
 /// `transform_definitions` row (see `finish_chunk`) — that lock is what
 /// makes two workers finishing different chunks of the same definition
@@ -1274,7 +1274,7 @@ async fn catch_up_if_backfilling(
 /// may be missing those deltas, and a watermark token wouldn't wait for
 /// them, so the definition reports `catching_up`: applied exactly as a
 /// `live` one is, flipped `live` by the discharge of its last catch-up
-/// (`intake::markers::go_live_caught_up`). ADR-0016, "What `live`
+/// (`intake::markers::go_live_caught_up`). ADR-0002, "What `live`
 /// promises".
 ///
 /// Completes every build that runs through `backfill_chunks`: a plain 1-1
@@ -1304,7 +1304,7 @@ pub(crate) async fn complete_direct_backfill(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
 ) -> Result<TransformStatus, CatalogError> {
-    // Issue #72 / ADR-0007: `transform_definitions.source_table` is already
+    // Issue #72 / ADR-0011: `transform_definitions.source_table` is already
     // the fully-qualified `schema.table` identity persisted at
     // definition-acceptance time (`create_definition_inner`) — read it back
     // and use it as-is. It must *not* be re-resolved through
@@ -1518,7 +1518,7 @@ fn referenced_relationships(def: &TransformDef) -> Vec<String> {
 }
 
 /// Every definition's status as an operator reads it (`Trellis::status`,
-/// `Trellis::definitions`), by id (issue #497, ADR-0016's "What `live`
+/// `Trellis::definitions`), by id (issue #497, ADR-0002's "What `live`
 /// promises"): its persisted status, except that a `live` definition reading
 /// an upstream that isn't `live` reports [`TransformStatus::CatchingUp`].
 ///
@@ -3175,7 +3175,7 @@ async fn target_column_type_oid_via(
 /// Validates `source_text` and persists it as a definition in `status`, with
 /// its schema-graph nodes and edge and a `source_table_versions` bump, in one
 /// transaction. Reads the source's catalog shape (its key), never its rows
-/// (ADR-0016, issue #418): whoever builds the target does that later.
+/// (ADR-0002, issue #418): whoever builds the target does that later.
 ///
 /// `target_ddl` is [`install_definition`]'s rendered `create table` for the
 /// target, run in this same transaction after refusing a target name that
@@ -3201,7 +3201,7 @@ async fn create_definition_inner(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    // Issue #72 / #76, ADR-0007: resolve `def.source` — always a bare table
+    // Issue #72 / #76, ADR-0011: resolve `def.source` — always a bare table
     // name (see [`super::ast::TransformDef`]'s own doc comment for why the
     // dotted spelling never lands in this field) — to its fully-qualified
     // `schema.table` identity exactly once, here, at definition-acceptance
@@ -3212,7 +3212,7 @@ async fn create_definition_inner(
     //   <schema>.<source>` explicitly, so `schema` is trusted outright —
     //   [`confirm_qualified_source`] checks that *exact*
     //   relation is real, never walking `search_path` the way the bare case
-    //   does (ADR-0007 grammar clause 4: a qualified spelling resolves to
+    //   does (ADR-0011: a qualified spelling resolves to
     //   that one relation, full stop).
     // * `None` (bare, the far more common case): [`resolve_graph_identity_in_txn`]
     //   — issue #72's plain `search_path` walk, extended by issue #74 with a
@@ -3289,7 +3289,7 @@ async fn create_definition_inner(
     )
     .await?;
 
-    // Issue #73 / #76, ADR-0007: resolve `def.target` — likewise always bare
+    // Issue #73 / #76, ADR-0011: resolve `def.target` — likewise always bare
     // — to its fully-qualified identity exactly once, here, mirroring
     // `qualified_source` immediately above. Unlike the source side,
     // `def.target`'s schema was never search-path-resolved even before issue
@@ -3389,7 +3389,7 @@ async fn create_definition_inner(
     // catalog writes below rather than a change to `TransformDef`'s shape,
     // per the issue's "prefer the smaller change" guidance.
     //
-    // Keyed on `qualified_source`/`qualified_target` (issue #74, ADR-0007),
+    // Keyed on `qualified_source`/`qualified_target` (issue #74, ADR-0011),
     // not the bare `def.source`/`def.target` issue #72/#73 left this on:
     // `schema_nodes`/`schema_edges` now key on the exact same qualified
     // identity `transform_definitions` does, closing the node-splitting gap
@@ -3432,7 +3432,7 @@ async fn create_definition_inner(
     // matching on `transform_definitions.source_table` string equality.
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
 
-    // Reviewer follow-up to issue #73 / ADR-0007: reject this definition if
+    // Reviewer follow-up to issue #73 / ADR-0011: reject this definition if
     // `qualified_target` shares a bare table-name suffix with a *different*
     // qualified spelling some other still-persisted definition already
     // uses. Before #73, `target_table` stored the bare name and its own
@@ -3461,7 +3461,7 @@ async fn create_definition_inner(
     // explicit qualification from a resolved-bare one, and still rejects the
     // collision either way. That's deliberate, not an oversight: every
     // `split_part(target_table, '.', 2)`-keyed read site named above is
-    // still bare-suffix-keyed — issue #74 (ADR-0007) qualified the
+    // still bare-suffix-keyed — issue #74 (ADR-0011) qualified the
     // `schema_nodes`/`schema_edges` graph (and, with it, [`dependents_of`],
     // which no longer needs `split_part` at all — see its own doc comment),
     // but deliberately left `column_status`'s addressing scheme and the
@@ -3817,7 +3817,7 @@ pub async fn create_relationship(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    // Issue #74, ADR-0007: resolve both endpoints to their fully-qualified
+    // Issue #74, ADR-0011: resolve both endpoints to their fully-qualified
     // identity via the same [`resolve_graph_identity_in_txn`]
     // [`create_definition_inner`] uses for a transform's source/target,
     // *before* touching `schema_nodes`/`schema_edges` — or, per the reviewer
@@ -3972,7 +3972,7 @@ struct ValidatedRelationship {
 ///    each one's type is on the join-key allowlist
 ///    ([`assert_join_key_type_supported`]; the engine matches join keys as
 ///    text), they have the same type, type modifier and collation
-///    ([`assert_joinable_as_is`], ADR-0006's "type-check the join", made
+///    ([`assert_joinable_as_is`], ADR-0006's join-endpoint rules, made
 ///    exact by #590), and that collation, if any, is deterministic
 ///    ([`assert_deterministic_join_collation`]). The allowlist runs first so
 ///    a type that can never be a join key is named as such, rather than
@@ -4587,7 +4587,7 @@ pub(crate) async fn resolve_relationships_for_new_definition(
 /// `is_target`-based guess.
 ///
 /// **Only ever call this on a *bare* name freshly parsed from a
-/// definition's own source text** (ADR-0007) — `def.source`, never a value
+/// definition's own source text** (ADR-0011) — `def.source`, never a value
 /// read back from `transform_definitions.source_table`/
 /// `source_table_versions.source_table`. Those columns hold the *qualified*
 /// result this function already produced once, at the definition's own
@@ -4615,7 +4615,7 @@ async fn resolve_source_schema_in_txn(
 
 /// Resolves a *bare* table name to its fully-qualified `schema.table`
 /// identity for the `schema_nodes`/`schema_edges` graph (issue #74,
-/// ADR-0007) — the single resolution [`create_definition_inner`] and
+/// ADR-0011) — the single resolution [`create_definition_inner`] and
 /// [`create_relationship`] now both call, early, before touching the graph
 /// at all: its two `resolve_node_in_txn` calls, [`reject_if_table_cycle`],
 /// and (for [`create_definition_inner`] specifically) the row persisted to
@@ -4796,7 +4796,7 @@ pub(crate) async fn resolve_graph_identity(
     }
 }
 
-/// The target schema `def` actually resolves against (issue #76, ADR-0007
+/// The target schema `def` actually resolves against (issue #76, ADR-0011
 /// grammar clause 4): an explicit `TRANSFORM <schema>.<target>` spelling
 /// ([`TransformDef::explicit_target_schema`]) overrides `target_schema`
 /// (`Config::target_schema`, or the caller's own override) outright — a
@@ -5054,14 +5054,14 @@ async fn validate_for_define(
 }
 
 /// The fully-qualified source [`install_definition`]'s own DDL steps read
-/// from (issue #76, ADR-0007 grammar clause 4) — computed once, early in
+/// from (issue #76, ADR-0011) — computed once, early in
 /// that function, exactly like `target_schema`/[`effective_target_schema`]
 /// immediately above it, and threaded through every one of those steps
 /// (`ddl::source_primary_key`, `ddl::target_table_ddl`) so none of them can independently
 /// re-derive a different answer, and so every physical SQL builder among them
 /// emits the qualified identity rather than a bare `def.source` left to the
 /// executing connection's own `search_path` — the gap a reviewer flagged
-/// against issue #76's own new explicit-schema grammar (ADR-0007's whole
+/// against issue #76's own new explicit-schema grammar (ADR-0011's whole
 /// point: "every generated statement emits qualified names... never a bare
 /// name resolved against whatever search_path the executing session happens
 /// to carry").
@@ -5106,7 +5106,7 @@ pub(crate) async fn resolve_source_for_install(
     }
 }
 
-/// Whether `schema.table` is a real relation (issue #76, ADR-0007 grammar
+/// Whether `schema.table` is a real relation (issue #76, ADR-0011 grammar
 /// clause 4): the existence check an explicitly-qualified `FROM`/`TRANSFORM`
 /// reference gets *instead of* [`resolve_source_schema_in_txn`]'s
 /// `search_path` walk. A qualified spelling names its schema directly, so
@@ -7478,7 +7478,7 @@ pub(crate) async fn relationships_to_refresh(
 /// see [`super::model::NodeKind`]'s doc comment) merges into one node with
 /// both flags set, rather than erroring.
 ///
-/// **`table_name` must already be fully-qualified (issue #74, ADR-0007)** —
+/// **`table_name` must already be fully-qualified (issue #74, ADR-0011)** —
 /// `public.posts` and `archive.posts` resolve to distinct nodes; this
 /// function never resolves a bare name itself (see
 /// [`resolve_graph_identity_in_txn`] for the one place that does, ahead of
@@ -7589,7 +7589,7 @@ async fn persist_edge_in_txn(
 /// pulling in a graph crate for a problem this small.
 ///
 /// **`source_table`/`target_table` must already be fully-qualified** (issue
-/// #74, ADR-0007) — `schema_nodes.table_name` is, so comparing a bare name
+/// #74, ADR-0011) — `schema_nodes.table_name` is, so comparing a bare name
 /// against it would simply never match anything, silently defeating cycle
 /// detection rather than erroring. See [`resolve_graph_identity_in_txn`] for
 /// how every caller here gets a qualified value before calling this.
@@ -7668,7 +7668,7 @@ fn find_table_path_from(
 
 /// The [`SchemaNode`] already resolved for `table_name`, or `None` if
 /// nothing has ever referenced it as a source or a target. `table_name`
-/// must already be fully-qualified (issue #74, ADR-0007).
+/// must already be fully-qualified (issue #74, ADR-0011).
 #[cfg(any(test, feature = "internals"))]
 pub async fn node_for_table(
     pool: &Pool,
@@ -7699,7 +7699,7 @@ pub async fn node_for_table(
 /// [`relationship_by_name`]). Returns raw edges rather than joining onto any
 /// definition table, so it works for any [`EdgeKind`] without needing a
 /// kind-specific query. `node_table` must already be fully-qualified (issue
-/// #74, ADR-0007) — matched exactly against `schema_nodes.table_name`.
+/// #74, ADR-0011) — matched exactly against `schema_nodes.table_name`.
 #[cfg(any(test, feature = "internals"))]
 pub async fn edges_from(
     pool: &Pool,
@@ -7823,7 +7823,7 @@ struct PendingDefinition {
 ///
 /// **Applying definitions only** ([`super::model::APPLYING_SQL`]:
 /// `live` or `catching_up`, or `backfilling` under a Re-derive build, which
-/// applies from its start, #625 F2; the public API design's ADR-0007 amendment,
+/// applies from its start, #625 F2; ADR-0002,
 /// closing the CDC race commit 1fa8570 reopened): a `waiting_to_backfill`/
 /// `backfilling`/`quarantined` definition's target may not yet reflect every
 /// pre-existing source row (the direct-build chunk queue, or a
@@ -7843,7 +7843,7 @@ struct PendingDefinition {
 /// skipped delete removed, so the same discharge also deletes every target
 /// row no source row backs any more (issue #485, `intake::resume_orphans`).
 ///
-/// `node_table` ($1) must already be fully-qualified (issue #74, ADR-0007)
+/// `node_table` ($1) must already be fully-qualified (issue #74, ADR-0011)
 /// — matched exactly against `schema_nodes.table_name`, which is now always
 /// qualified too, so `public.posts` and `archive.posts` resolve to
 /// disjoint dependent sets rather than colliding. The join from `to_node`
@@ -7935,7 +7935,7 @@ pub async fn dependents_of(
 /// The transform definitions currently subscribed to `source_table`. A thin
 /// wrapper over [`dependents_of`] filtered to [`EdgeKind::Source`], the only
 /// edge kind persisted today. `source_table` must already be fully-qualified
-/// (issue #74, ADR-0007) — see [`dependents_of`]'s doc comment.
+/// (issue #74, ADR-0011) — see [`dependents_of`]'s doc comment.
 pub async fn transforms_for_source(
     pool: &Pool,
     source_table: &str,
@@ -7973,7 +7973,7 @@ pub async fn transforms_for_source(
 /// against a table it hasn't seen before, so it can install that table's
 /// capture and discharge its backfill without waiting for a restart.
 ///
-/// Returns **fully-qualified** `"schema.table"` names (issue #75, ADR-0007)
+/// Returns **fully-qualified** `"schema.table"` names (issue #75, ADR-0011)
 /// — a change from this function's pre-#75 contract, which returned bare
 /// suffixes and left both callers to re-qualify them by re-guessing a single
 /// assumed schema (see git history for the details of that bug). Walks
@@ -8406,7 +8406,7 @@ pub async fn definition_by_target(
 /// relationship-enriched field's `<rel>.<column>` path). This is column-level
 /// lineage, deliberately *not* [`dependents_of`]'s table-level
 /// `schema_edges` walk: that graph answers "does transform X read table Y at
-/// all," which is too coarse for ADR-0003's amendment — cascading a paused
+/// all," which is too coarse for ADR-0003 — cascading a paused
 /// *column* must not pause a downstream transform's *other* fields that don't
 /// actually reference it. Scanning every definition's own field expressions
 /// (rather than a persisted edge) is what makes this precise.

@@ -628,13 +628,13 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 /// that could still change a target (issue #432). Shared by both backends'
 /// `Backend::quiesce`.
 ///
-/// A two-way check, the same one an operator makes (ADR-0016, "What `live`
+/// A two-way check, the same one an operator makes (ADR-0002, "What `live`
 /// promises"): every definition reports `live` (or a terminal `paused` /
 /// `quarantined`), then the convergence wait on a fresh token returns. Each
 /// covers work the other can't see:
 ///
 /// - **Live status.** A direct-build definition's backfill runs through
-///   `defs::chunk_queue`, entirely outside the ring (docs/decisions/0007's
+///   `defs::chunk_queue`, entirely outside the ring (ADR-0002's
 ///   amendment), and a marker-driven one sits in
 ///   `waiting_to_backfill`/`backfilling` until its enumeration commits. A
 ///   finished build, or a `live` definition given a catch-up of its own,

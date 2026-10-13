@@ -2,7 +2,7 @@
 //! not lose a source change that drains while the build is still running.
 //!
 //! The backfill discharge dispatches these shapes' build as one background job
-//! (ADR-0016, #419), which a drain worker runs while the definition sits
+//! (ADR-0002, #419), which a drain worker runs while the definition sits
 //! `backfilling`, and the apply path skips any definition still being built
 //! (`catalog::dependents_of`). A change to an already-captured source that
 //! commits after the build's read and drains before the build finishes is
@@ -338,7 +338,7 @@ async fn relate_sales_to_skus(pool: &trellis::Pool, client: &Client) {
 }
 
 /// Registers `sku_totals` over `public.sales` and runs its direct build to
-/// completion, as the discharge and a drain thread would (ADR-0016, #419),
+/// completion, as the discharge and a drain thread would (ADR-0002, #419),
 /// leaving it `catching_up` with its go-live catch-up parked (#476).
 async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
     let definition = install_definition(

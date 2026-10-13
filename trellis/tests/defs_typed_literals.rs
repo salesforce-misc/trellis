@@ -152,7 +152,7 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 /// `defs_install_definition.rs`), then runs the Re-derive builds to `live`
 /// (#625 F8a: a plain 1-1 over a captured table is the Re-derive build's).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await

@@ -168,7 +168,7 @@ async fn reading_without_quiesce_can_observe_state_that_has_not_caught_up_yet() 
 /// the write lands on the *related* row, not on the row whose derived value
 /// changes. Trellis has to resolve — from the dependency graph — which
 /// definitions read the changed table, find the referencing rows by join
-/// key, and re-derive them (ADR-0006's "reverse" direction), all
+/// key, and re-derive them (ADR-0006's reverse propagation), all
 /// asynchronously. So `quiesce()`'s promise here covers a write the client
 /// never made against the target's own source table at all.
 ///

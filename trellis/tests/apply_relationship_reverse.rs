@@ -3563,7 +3563,7 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
     )
     .await
     .expect("a reader through the relationship");
-    // The discharge dispatches the build as a background job (ADR-0016, #419).
+    // The discharge dispatches the build as a background job (ADR-0002, #419).
     trellis::intake::markers::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let projection_table = projection_table_for(&db.pool, relationship.id).await;

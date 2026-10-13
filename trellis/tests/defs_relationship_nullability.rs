@@ -242,7 +242,7 @@ async fn to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappear
         .expect("install the to-one enrichment definition through the front door");
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
-        .expect("the discharge enumerates the source (ADR-0016)");
+        .expect("the discharge enumerates the source (ADR-0002)");
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Initial derivation: no matching category -> NULL enrichment, but the

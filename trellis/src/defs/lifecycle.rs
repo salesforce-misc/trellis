@@ -60,7 +60,7 @@
 //!
 //! **A drop never touches a source table.** It only removes catalog rows.
 //! The staging worker's reconcile pass uninstalls capture from the catalog,
-//! its only source of truth for what to capture (ADR-0016, issue #427), so
+//! its only source of truth for what to capture (ADR-0002, issue #427), so
 //! a process that drops a transform needs no privileges on the source
 //! tables.
 

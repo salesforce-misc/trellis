@@ -109,7 +109,7 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// it writes with `pg_current_wal_insert_lsn()`, and every row a drain derives
 /// for a downstream transform inherits the earliest origin of the changes that
 /// produced it (unknown if any was). Rows of genuinely unknown origin stay
-/// `NULL`: a backfill enumeration's `Recompute`s (ADR-0016's "What `live`
+/// `NULL`: a backfill enumeration's `Recompute`s (ADR-0002's "What `live`
 /// promises" relies on them gating every token) and the propagation of a write
 /// made outside a drain. A missing origin can only make a wait longer, never
 /// let it return early.

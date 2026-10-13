@@ -35,7 +35,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 const TEST_NAME: &str = "aggregate_target_catchup_marker_test";
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await

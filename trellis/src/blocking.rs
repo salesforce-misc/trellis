@@ -37,7 +37,7 @@
 //! [`BlockingTrellis::apply`] is exactly as fast (or slow) as
 //! [`Trellis::apply`] (see `app`'s module doc), which only registers: a new
 //! definition is built in the background from `waiting_to_backfill`
-//! (ADR-0016), and an `ALTER TRANSFORM` or a column resume starts a
+//! (ADR-0002), and an `ALTER TRANSFORM` or a column resume starts a
 //! background field build (#666, #625 F8b). The one statement that still
 //! reads table rows inside the call is a to-one relationship's declaration
 //! (or a transform reading through one), which seeds the relationship's

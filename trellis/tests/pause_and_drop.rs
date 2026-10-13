@@ -129,7 +129,7 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 /// of the same name). A chunked 1-1 target reaches `live` this way with no
 /// running pipeline and nothing to wait for.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await
@@ -1484,7 +1484,7 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
 // Capture
 // ---------------------------------------------------------------------
 
-/// ADR-0014's capture set shrinks by reconciliation, as ADR-0016 amends it
+/// ADR-0014's capture set shrinks by reconciliation, as ADR-0002 amends it
 /// (issue #427) and #622 C5 restates it for trigger capture: a drop only
 /// removes catalog rows and never touches the source's capture triggers, so
 /// the process applying it needs no privilege on the source. The staging

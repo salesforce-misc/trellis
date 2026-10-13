@@ -72,7 +72,7 @@ async fn active_seg_table(client: &Client) -> String {
 /// real CDC producer always stages a fully-qualified `src_table` (issue
 /// #76), and `compute`'s forward-propagation lookup
 /// (`catalog::transforms_for_source`) now requires that exact qualified
-/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0007) —
+/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0011) —
 /// an unqualified `src_table` here silently finds no subscribed definitions
 /// rather than erroring. Already-qualified input (containing a `.`) passes
 /// through unchanged.

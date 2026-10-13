@@ -376,7 +376,7 @@ impl Pool {
     }
 
     /// The [`Config::target_schema`] this pool was built with (issue #73,
-    /// ADR-0007) — the same value baked into every connection's own
+    /// ADR-0011) — the same value baked into every connection's own
     /// `search_path` by [`session_bootstrap`] above, and the same value
     /// every real caller of [`crate::defs::install_definition`] already
     /// passes as its own `target_schema` argument (that argument and this

@@ -20,7 +20,7 @@
 //!   runs, each independently claiming and draining sealed batches. Zero is
 //!   legal: a staging-only client stages and seals but drains nothing.
 //!
-//! **Which tables to capture** (issue #427, ADR-0016, issue #622): the
+//! **Which tables to capture** (issue #427, ADR-0002, issue #622): the
 //! staging worker derives them from the catalog alone
 //! ([`defs::tables_to_capture`]), at startup and on every reconcile pass
 //! ([`capture::reconcile`]). There is no caller-supplied list: a table's
@@ -1167,7 +1167,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = failures.check("reclaim_stale", reclaimed).is_err();
             }
             if !failed {
-                // Backfill chunks' own reclaim-stale sweep (docs/decisions/0007's
+                // Backfill chunks' own reclaim-stale sweep (ADR-0002's
                 // amendment): a drain worker that died mid-chunk leaves a
                 // stale claim here, freed the same way a stale `seg_claims`
                 // row is above.
@@ -1606,7 +1606,7 @@ const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 /// discharges the pending markers. Re-run periodically, so a transform
 /// registered while this client runs is picked up without a restart.
 ///
-/// Issue #427, ADR-0016: the catalog is the only input. A table's capture is
+/// Issue #427, ADR-0002: the catalog is the only input. A table's capture is
 /// uninstalled on the first pass after its last reader is dropped, and this
 /// is the only place that happens: a `DROP` removes catalog rows and nothing
 /// more.
@@ -1718,7 +1718,7 @@ struct AppWorkerConfig {
 /// One application-worker task: registers itself as a drainer, runs an
 /// out-of-band heartbeat daemon for its ring-segment claims, then loops
 /// claiming and draining sealed batches *and* claiming and executing pending
-/// direct-build backfill chunks (docs/decisions/0007's amendment) until
+/// direct-build backfill chunks (ADR-0002) until
 /// shutdown — both kinds of claimable work share this one loop/worker pool,
 /// per `docs/decisions/0008-public-api-design.md`'s decision 1 ("it's `application_threads`
 /// that finishes transform work, backfill included").
@@ -2128,7 +2128,7 @@ async fn worker_upkeep_pass(pool: &Pool, worker_id: &str, reclaim_ttl: Duration)
 }
 
 /// Claims one pending direct-build backfill chunk (`defs::chunk_queue`,
-/// docs/decisions/0007's amendment) and executes it, marking it done
+/// ADR-0002) and executes it, marking it done
 /// (flipping its definition `backfilling` -> `live` once every chunk is done
 /// — see `chunk_queue::finish_chunk`) or, on a write error, giving it up at
 /// once through `chunk_queue::fail_chunk`, which records and logs the
@@ -3886,7 +3886,7 @@ mod backfill_shutdown_tests {
 
 #[cfg(test)]
 mod reconcile_tests {
-    //! Issue #427, ADR-0016, restated for trigger capture (issue #622 C5):
+    //! Issue #427, ADR-0002, restated for trigger capture (issue #622 C5):
     //! the staging worker's reconcile pass is the only thing that installs
     //! or uninstalls capture, and the catalog is its only source of truth for
     //! what to capture. These call [`reconcile_source_tables`] directly

@@ -1635,7 +1635,7 @@ async fn isolate_and_evict_probing(
             FailureClass::Halting => return Err(err),
             FailureClass::Isolate => {
                 if let [change] = records {
-                    // ADR-0003's amendment, layered alongside (not instead
+                    // ADR-0003, layered alongside (not instead
                     // of) the row-level charge below: a probe failure that's
                     // specifically an evaluator error names the calculated
                     // field it broke on
@@ -2131,7 +2131,7 @@ async fn evict_for(
 
 /// Resolves a ring row's raw `src_table` to the fully-qualified identity
 /// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] require
-/// (issue #74, ADR-0007: `schema_nodes` keys on qualified identity, so a bare
+/// (issue #74, ADR-0011: `schema_nodes` keys on qualified identity, so a bare
 /// lookup there silently finds *nothing* rather than erroring) — this
 /// module's counterpart to `super::apply`'s own `qualified_schema_node_key`,
 /// which every `apply.rs` call site already goes through.
@@ -3145,7 +3145,7 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// exposed through the grammar as `PAUSE TRANSFORM <target>.<column>` (issue
 /// #227; issue #228, decision 2).
 ///
-/// ADR-0014's pause is "one state, two triggers", and that is as true at
+/// ADR-0014's pause is one freeze with several triggers, and that is as true at
 /// column granularity as at whole-transform granularity: this writes the same
 /// `column_status` row the fuse writes and runs the same [`cascade_pause`]
 /// over dependent readers, so a paused column freezes at its current value, is
@@ -3946,7 +3946,7 @@ async fn reads_paused_sibling(
 /// ([`crate::intake::markers::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
 /// #330, `intake::resume_orphans`) and dispatches the rebuild by shape
-/// (ADR-0016): chunks or a direct-build job that drain threads run, or, for
+/// (ADR-0002): chunks or a direct-build job that drain threads run, or, for
 /// a shape the direct build can't render, an enumeration of every current
 /// source row for the drain to re-derive. The discharge respects the marker's `xmin`
 /// fence, never re-deriving the target without waiting out a concurrent
@@ -5555,7 +5555,7 @@ pub(crate) fn held_keys_from(count: i64, oldest: Option<SystemTime>) -> Option<H
 /// time) therefore still survives a purge keyed on the qualified ring spelling —
 /// exactly the pre-#283 behavior, since that delete was single-spelling too.
 /// Stripping to the bare suffix here would fix that only by reintroducing the
-/// ambiguity #74/ADR-0007 exists to prevent: a purge of `archive.orders` would
+/// ambiguity #74/ADR-0011 exists to prevent: a purge of `archive.orders` would
 /// delete a bare `orders` row that may belong to `public.orders`. Tracked as its
 /// own question rather than guessed at.
 pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), ApplyError> {

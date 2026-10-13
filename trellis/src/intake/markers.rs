@@ -1,4 +1,4 @@
-//! Backfill markers and their discharge (ADR-0016): see
+//! Backfill markers and their discharge (ADR-0002): see
 //! docs/staging-and-claiming/01-capture-by-triggers.md.
 //!
 //! - [`park_marker`] and its callers park a `pending_backfill` marker on a
@@ -61,8 +61,7 @@ fn split_qualified(name: &str) -> Result<(&str, &str), IntakeError> {
 
 /// Parks a `pending_backfill` marker on every source of a
 /// `waiting_to_backfill` definition that has no marker yet, provided the
-/// source is in `captured` or is another definition's target (ADR-0016's
-/// "Who parks the marker"). Test harness only: it stands in for the staging
+/// source is in `captured` or is another definition's target (ADR-0002). Test harness only: it stands in for the staging
 /// worker's [`park_ready_registration_markers`] in a test that captures
 /// nothing by triggers, where every source is taken as captured
 /// ([`discharge_registrations`]).
@@ -327,7 +326,7 @@ async fn is_relationship_to_side(
 
 /// Parks a go-live catch-up marker on each of `tables` for the definitions
 /// `ids`, and moves each of those that is `live` to `catching_up` (issue
-/// #476, ADR-0016's "What `live` promises"). A catch-up re-reads a table
+/// #476, ADR-0002's "What `live` promises"). A catch-up re-reads a table
 /// because a definition reading it may be missing changes it didn't apply,
 /// so that definition can't honestly report its steady state until the
 /// catch-up has run. It stays applying meanwhile: `catching_up` is
@@ -402,7 +401,7 @@ pub(crate) async fn park_catch_up(
 /// lock (#622 plan, finding 1). The marker commits exactly when the feed
 /// does, so a fence taken after reading the committed marker postdates it,
 /// and every such writer still open is behind it. That holds with no window
-/// to recover from after a crash. Every marker is fenced this way (ADR-0016,
+/// to recover from after a crash. Every marker is fenced this way (ADR-0002,
 /// "The join fence").
 ///
 /// # A repeat park
@@ -419,7 +418,7 @@ pub(crate) async fn park_catch_up(
 ///
 /// The park also clears the fence, so the new generation is fenced afresh
 /// after its own commit, and clears the marker's retry state (issue #407,
-/// ADR-0016): the new generation is due at once, whatever the last
+/// ADR-0002): the new generation is due at once, whatever the last
 /// discharge's failures had backed it off to.
 ///
 /// Returns the bare Postgres error so [`crate::Trellis::request_backfill`]
@@ -620,7 +619,7 @@ async fn fetch_pending_backfills(
 const DISCHARGE_RETRY_BASE: Duration = Duration::from_secs(10);
 
 /// The longest a failing marker waits between attempts. There is no
-/// quarantine (ADR-0016): a marker that fails forever is retried at this
+/// quarantine (ADR-0002): a marker that fails forever is retried at this
 /// interval forever, so a fixed cause is picked up within this long.
 const DISCHARGE_RETRY_CAP: Duration = Duration::from_secs(300);
 
@@ -868,7 +867,7 @@ pub(super) async fn fetch_read(
                 src_changed: None,
                 prior_image: None,
                 // Unknown, so it gates every convergence token until it
-                // drains: ADR-0016's "What `live` promises" leans on that.
+                // drains: ADR-0002's "What `live` promises" leans on that.
                 origin_lsn: None,
             });
         }
@@ -904,7 +903,7 @@ pub(super) async fn fetch_read(
 /// `catch_up_timeout`. Later passes check the recorded fence without waiting.
 /// A park since the read leaves the marker unfenced for the next pass.
 ///
-/// # Dispatch by shape (ADR-0016, issues #418, #419)
+/// # Dispatch by shape (ADR-0002, issues #418, #419)
 ///
 /// The discharge is the one capture path every definition's build goes
 /// through: a fresh registration, a resumed definition's rebuild, and a
@@ -926,7 +925,7 @@ pub(super) async fn fetch_read(
 ///   (`defs::chunk_queue::dispatch_direct_build`), after a catalog-only check
 ///   that the direct build can render it
 ///   ([`crate::defs::backfill::check_direct_build`]). A drain thread runs the
-///   whole ADR-0007 build, and finishing it moves the definition to
+///   whole ADR-0002 build, and finishing it moves the definition to
 ///   `catching_up` and parks its go-live catch-ups, as for the last chunk.
 /// - **The `Unsupported` fallback** goes through the ring enumeration below,
 ///   and flips `waiting_to_backfill` -> `live` as the last statement of the
@@ -1368,7 +1367,7 @@ enum Discharge {
 }
 
 /// The build [`discharge_marker`] dispatches for one `waiting_to_backfill`
-/// definition (ADR-0016's dispatch by shape; see [`run_pending_backfills`]).
+/// definition (ADR-0002's dispatch by shape; see [`run_pending_backfills`]).
 enum Build {
     /// A plain 1-1 definition: these `(lo, hi]` primary-key chunk
     /// boundaries, enqueued as `backfill_chunks` rows.
@@ -2070,7 +2069,7 @@ pub(crate) async fn is_held_out_of_the_rederive_build(
 }
 
 /// Test stand-in for the staging worker's maintenance pass over newly
-/// registered definitions (ADR-0016), for a test with no staging worker and no
+/// registered definitions (ADR-0002), for a test with no staging worker and no
 /// capture triggers: starts the Re-derive build of every `waiting_to_backfill`
 /// definition it takes (`staging::build::start_ready_builds`, #625 F3), parks
 /// a marker on every other one's source (treating every source as captured),
@@ -2789,7 +2788,7 @@ mod catch_up_tests {
         );
     }
 
-    /// Issue #407 (ADR-0016): a marker whose discharge always fails doesn't
+    /// Issue #407 (ADR-0002): a marker whose discharge always fails doesn't
     /// stop the healthy marker behind it in the same pass. The failure is
     /// recorded on the marker with a backoff, the marker isn't retried
     /// before its next-attempt time, each retry that fails again backs off
@@ -4562,7 +4561,7 @@ mod catch_up_tests {
     }
 }
 
-/// Issue #418 (ADR-0016): registration's marker comes from the reconcile
+/// Issue #418 (ADR-0002): registration's marker comes from the reconcile
 /// pass, and the discharge dispatches each waiting definition's build by
 /// shape. These drive the pieces directly rather than waiting on a running
 /// staging worker (#297).
@@ -4678,7 +4677,7 @@ mod dispatch_tests {
         .expect("discharge");
     }
 
-    /// ADR-0016's "Who parks the marker": a waiting definition's source gets
+    /// ADR-0002: a waiting definition's source gets
     /// its marker from the reconcile pass that installs its capture (the join
     /// marker), from a later pass once it is already captured, or at once
     /// when it is another definition's target. A source this pass doesn't

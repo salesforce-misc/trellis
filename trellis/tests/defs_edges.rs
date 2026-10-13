@@ -17,14 +17,14 @@ use trellis::defs::{
 /// column references against the passed-in `source_columns` map, not the
 /// live schema.
 ///
-/// Explicitly under `public` (issue #74, ADR-0007) — not left to land
+/// Explicitly under `public` (issue #74, ADR-0011) — not left to land
 /// wherever the pool's ambient `search_path` happens to put a bare `CREATE
 /// TABLE` (`trellis`, per `pool::session_bootstrap`), as before #74. Several
 /// tests below reuse the same bare name both as a real source table here and
 /// later as a chained definition's bare `TRANSFORM <name> ...` target; a
 /// target always resolves against `Config::target_schema` (`public` by
 /// default — a config-time decision, never a `search_path` walk, per
-/// ADR-0007 decision (1)), so this table needs to actually live there too or
+/// ADR-0011), so this table needs to actually live there too or
 /// the two roles now resolve to two different qualified nodes instead of one
 /// — before #74's qualified `schema_nodes` keying, the bare graph couldn't
 /// tell the difference either way.
@@ -447,7 +447,7 @@ async fn a_shortcut_edge_across_an_existing_path_is_not_a_cycle() {
     .expect("a -> c is a shortcut across an existing path, not a cycle");
 }
 
-/// The actual point of issue #74 (ADR-0007): `public.posts` and
+/// The actual point of issue #74 (ADR-0011): `public.posts` and
 /// `archive.posts` — the same bare table name, in two different schemas —
 /// must resolve to two independent `schema_nodes` rows with two
 /// independent sets of dependent edges, not collide into one node the way

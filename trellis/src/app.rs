@@ -9,7 +9,7 @@
 //! callers never have to stitch those together themselves — and, critically,
 //! never accidentally pick the wrong path: definition registration always
 //! goes through [`defs::install_definition`], which creates the target and
-//! leaves the build to the staging worker's backfill discharge (ADR-0016),
+//! leaves the build to the staging worker's backfill discharge (ADR-0002),
 //! rather than the lower-level primitives it's built from.
 //!
 //! The individual `defs::*`/`intake::*`/`staging::*` items remain public for
@@ -37,8 +37,8 @@
 //!
 //! **[`apply`](Trellis::apply)ing a definition doesn't block on backfill.** Per
 //! `docs/decisions/0008-public-api-design.md`'s decision 1 and
-//! [ADR-0007's amendment](../../docs/decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment),
-//! and ADR-0016, a transform's initial backfill runs in the background:
+//! [ADR-0002](../../docs/decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk),
+//! a transform's initial backfill runs in the background:
 //! `apply()` returns once the definition is registered, with
 //! [`TransformStatus::WaitingToBackfill`], having read no source rows. The
 //! staging worker's backfill discharge then dispatches the build by shape: a
@@ -533,7 +533,7 @@ impl Trellis {
 
     /// [`Statement::Drop`](defs::Statement::Drop)'s half of
     /// [`apply`](Trellis::apply). Only removes catalog rows: it never touches
-    /// a source table (issue #427, ADR-0016). The staging worker's next
+    /// a source table (issue #427, ADR-0002). The staging worker's next
     /// reconcile pass uninstalls the capture triggers of a table nothing reads
     /// any more, so the process applying a `DROP` needs no privileges on the
     /// source tables.
@@ -675,7 +675,7 @@ impl Trellis {
     /// until live").
     ///
     /// [`TransformStatus::Live`] means the transform is in its steady state
-    /// (ADR-0016, "What `live` promises"): from then on, a
+    /// (ADR-0002, "What `live` promises"): from then on, a
     /// [`Trellis::watermark_token`] taken after a commit and awaited with
     /// [`Trellis::await_converged`] guarantees its target reflects that
     /// commit. A transform whose build has finished but whose go-live
@@ -896,7 +896,7 @@ impl Trellis {
     /// applying. Its plan re-derives every row the table has, and its sweep
     /// deletes what the table no longer backs, and then it is `live` again.
     ///
-    /// Every other reader gets a go-live catch-up (issue #522, ADR-0016's
+    /// Every other reader gets a go-live catch-up (issue #522, ADR-0002's
     /// "A re-read table's readers"): it reports `catching_up` from this call
     /// until the staging worker has discharged the marker. The discharge
     /// re-derives every row the table still has, deletes each reader's
@@ -997,9 +997,9 @@ impl Trellis {
     }
 
     /// Every currently paused/quarantined target, across every transform —
-    /// `docs/decisions/0003-quarantine-storage-and-api.md`'s amendment,
-    /// "Client library API" read 1. Cheap: reads `transform_definitions`'
-    /// lifecycle status plus the small, sparse `column_status` table, no
+    /// `docs/decisions/0003-quarantine-storage-and-api.md`'s
+    /// "The client API is three reads, separated by cost, and one release," read 1.
+    /// Cheap: reads `transform_definitions`' lifecycle status plus the small, sparse `column_status` table, no
     /// join against poisoned-row detail. The read a dashboard/health-check
     /// polls.
     pub async fn quarantined(&self) -> Result<Vec<QuarantineEntry>, TrellisError> {
@@ -1054,7 +1054,7 @@ impl Trellis {
     }
 
     /// The current state of one target (`transform` or `transform.column`,
-    /// per ADR-0003's amendment addressing scheme) — read 2. Errors with
+    /// per ADR-0003 addressing scheme) — read 2. Errors with
     /// [`TrellisError::TransformNotFound`] if the named transform doesn't
     /// exist at all; a `transform.column` address for a real transform whose
     /// named column simply isn't paused reports [`QuarantineState::Live`],
@@ -1449,7 +1449,7 @@ impl Trellis {
     /// [`TransformStatus::CatchingUp`]) may still be missing rows after this
     /// returns. Check [`Trellis::status`] for that. Once it reports `live`,
     /// a token taken after a commit and awaited here covers that commit
-    /// (ADR-0016, "What `live` promises"). That includes a repair that
+    /// (ADR-0002, "What `live` promises"). That includes a repair that
     /// rebuilds a definition ([`Trellis::request_backfill`]): the definition
     /// reads `backfilling` from the call's return, so polling for `live`
     /// first waits out the rebuild (#625 F7).
@@ -1778,7 +1778,7 @@ pub struct DefinitionStatus {
     ///   gets past (a missing table or column, say). Fix the cause and resume
     ///   it, which rebuilds it and clears this;
     /// - or the backfill marker parked on the definition's source table
-    ///   keeps failing to discharge (issue #407, ADR-0016), or carries the
+    ///   keeps failing to discharge (issue #407, ADR-0002), or carries the
     ///   error of a direct build that failed and was handed back to it
     ///   (issue #419). That discharge runs every build of a
     ///   `waiting_to_backfill` definition on the table and the catch-up of

@@ -1,4 +1,4 @@
-//! Issue #476: `live` means steady state (ADR-0016, "What `live` promises").
+//! Issue #476: `live` means steady state (ADR-0002, "What `live` promises").
 //!
 //! Once a definition reports `live`, a watermark token taken after a commit
 //! and awaited with `Trellis::await_converged` guarantees the target reflects

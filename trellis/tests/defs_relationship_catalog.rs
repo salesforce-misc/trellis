@@ -160,7 +160,7 @@ async fn a_relationship_appears_as_a_typed_edge_in_the_resolver() {
     .expect("valid relationship should be stored");
 
     // "trellis" (`Config::schema`, the default `TRELLIS_SCHEMA`), not
-    // "public" — issue #74, ADR-0007: `edges_from`/`node_for_table` now
+    // "public" — issue #74, ADR-0011: `edges_from`/`node_for_table` now
     // require a fully-qualified name, and `posts`/`users` above land under
     // whatever schema is first in the pool's ambient `search_path` for a
     // bare `CREATE TABLE`, which `pool::session_bootstrap` pins to the
@@ -320,7 +320,7 @@ async fn an_unparseable_relationship_is_rejected_and_leaves_no_row() {
     assert!(missing.is_none());
 }
 
-/// ADR-0006's "type-check the join": a from-side column and to-side column
+/// ADR-0006's join-endpoint rules: a from-side column and to-side column
 /// with incompatible types (here `integer` vs `text`) is rejected at
 /// `create_relationship` time with an actionable message, not silently
 /// stored.
@@ -1212,7 +1212,7 @@ async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
 
     match err {
         CatalogError::Validate(ValidationError::TableCycle { cycle }) => {
-            // "trellis.a"/"trellis.b" (issue #74, ADR-0007): `a`/`b` above
+            // "trellis.a"/"trellis.b" (issue #74, ADR-0011): `a`/`b` above
             // land under the Trellis schema, the first entry in a bare
             // `CREATE TABLE`'s ambient `search_path` — see
             // `a_relationship_appears_as_a_typed_edge_in_the_resolver`'s

@@ -103,7 +103,7 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
 /// (b): `BlockingTrellis::apply`ing a `TRANSFORM` statement must return before
 /// a plain (non-relationship) 1-1 transform's backfill actually runs — per
 /// `docs/decisions/0008-public-api-design.md`'s
-/// decision 1 and ADR-0016, registering a definition only records it; a
+/// decision 1 and ADR-0002, registering a definition only records it; a
 /// running staging worker dispatches its build and some running drain
 /// (`application_threads`) worker elsewhere in the fleet executes it.
 ///
@@ -159,7 +159,7 @@ fn define_returns_before_backfill_completes() {
         status.status,
         TransformStatus::WaitingToBackfill,
         "apply() must return before any staging worker (of which there are none here) could \
-         possibly have dispatched the build (ADR-0016)"
+         possibly have dispatched the build (ADR-0002)"
     );
 
     trellis.shutdown().expect("shutdown (sync)");

@@ -426,7 +426,7 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 /// `::regclass` cast (`to_regclass($1)`) rather than string-interpolating the
 /// table name into the query. `source_table` is the unquoted `schema.table`
 /// identity, quoted for the lookup by [`regclass_arg`] (issue #561), which
-/// `to_regclass` resolves exactly (issue #76, ADR-0007) — every real caller
+/// `to_regclass` resolves exactly (issue #76, ADR-0011) — every real caller
 /// now passes one (`Definition::source_table`, or
 /// `catalog::resolve_source_for_install`'s equivalent at definition-acceptance
 /// time), so this no longer depends on the connection's `search_path`
@@ -1443,7 +1443,7 @@ pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
 pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
 
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
-/// ADR-0007): quotes an already-qualified `"schema.table"` name — as read
+/// ADR-0011): quotes an already-qualified `"schema.table"` name — as read
 /// back from [`super::model::Definition::source_table`]
 /// (`transform_definitions.source_table`), or freshly resolved by
 /// `catalog::resolve_source_for_install`/`create_definition_inner`'s own
@@ -1455,7 +1455,7 @@ pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
 /// `quote_ident(source_key)`, which would otherwise leave the schema to
 /// resolve against whatever `search_path` the executing session happens to
 /// carry (`pool::session_bootstrap`'s pinned `Config::schema`/
-/// `Config::target_schema`/`"public"`) — exactly the bug class ADR-0007
+/// `Config::target_schema`/`"public"`) — exactly the bug class ADR-0011
 /// exists to close.
 ///
 /// Splits on the first `.`, matching `intake::markers::qualify`'s sole
@@ -1626,7 +1626,7 @@ fn quote_qualified_ident(qualified: &str) -> String {
 /// rather than relying on `search_path`.
 ///
 /// `source_table` is `def.source`'s fully-qualified `"schema.table"` identity
-/// (issue #76, ADR-0007) — the caller's own already-resolved
+/// (issue #76, ADR-0011) — the caller's own already-resolved
 /// `catalog::resolve_source_for_install` result — used below (via
 /// [`qualified_source_table`]) to introspect a passthrough field's concrete
 /// source column type, rather than the bare `def.source` left to

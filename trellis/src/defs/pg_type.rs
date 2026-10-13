@@ -115,7 +115,7 @@ pub enum PgType {
     ///   way it guarantees a *name* survives. A restart that silently
     ///   remapped a persisted OID to a *different*, wrong (or dangling) enum
     ///   type would be a far worse failure mode than anything `ALTER TYPE`
-    ///   can cause. The schema-qualified *name* (the same identity ADR-0007
+    ///   can cause. The schema-qualified *name* (the same identity ADR-0011
     ///   already uses for every table this crate tracks) has no such gap.
     ///
     /// Interning keeps this variant, and therefore [`PgType`] and

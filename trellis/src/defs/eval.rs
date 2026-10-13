@@ -516,7 +516,7 @@ impl EvalError {
     }
 
     /// The calculated-field name this failure is attributed to — every
-    /// variant carries one (see each variant's `field`). ADR-0003's amendment
+    /// variant carries one (see each variant's `field`). ADR-0003
     /// (column-level quarantine) uses this to attribute a failure to a
     /// `(transform, column)` pair: `staging::quarantine`'s isolate-before-
     /// blaming probe knows which [`TransformDef`] it just evaluated, and
@@ -731,7 +731,7 @@ pub fn evaluate_with_relationships(
 /// NULL." `excluded` is normally empty (every existing caller stays on this
 /// behavior via [`evaluate_with_relationships`]/[`evaluate`]); it's non-empty
 /// only when the caller has already looked up which of this definition's
-/// columns are currently paused (ADR-0003's amendment).
+/// columns are currently paused (ADR-0003).
 ///
 /// `excluded` must be closed over alias readers ([`AliasReaders::close`],
 /// issue #748): a field left in that reads an excluded one by alias would

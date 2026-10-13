@@ -695,7 +695,7 @@ async fn combined_add_drop_alter_in_one_statement() {
 /// no running `Client`. This is the hand-driven stand-in for a drain worker
 /// that `defs_install_definition.rs` uses.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await

@@ -1,6 +1,6 @@
 //! Multi-hop transform chains fed by real CDC for their root source, rather
 //! than the direct/ring-bypassing backfill path (`backfill_definition`,
-//! ADR-0007) or a hand-staged CDC row.
+//! ADR-0002) or a hand-staged CDC row.
 //!
 //! A chain's intermediate hop (`h1` in `src -> h1 -> h2`) is two things at
 //! once: the *target* of the upstream definition and a *source* of the

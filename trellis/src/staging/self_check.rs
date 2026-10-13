@@ -91,7 +91,7 @@
 //! [`SelfCheckError::UnsupportedExpr`]) — extending [`render_leaf`] to
 //! relationship paths, and [`compare_once`] to bound a group-key space
 //! instead of a plain keyset, is the natural next step, not a rewrite (see
-//! ADR-0013, "Scope: 1-1 first, then aggregates and relationships").
+//! ADR-0013, "Scope: 1-1 targets").
 //!
 //! # One page at a time
 //!
@@ -918,7 +918,7 @@ async fn compare_once(
         .collect();
 
     // One statement reads both sides, so both read the same snapshot
-    // (ADR-0013's "reads the target and runs the recompute" under one
+    // (ADR-0013, comparison under one
     // snapshot), and it trims both pages to the same bound.
     let client = pool.get().await?;
     let collation = page_collation(&client, pk).await?;

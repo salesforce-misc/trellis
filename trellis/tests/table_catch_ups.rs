@@ -1,6 +1,6 @@
 //! Issue #522: a marker that re-reads a table because its applying readers
 //! may have missed changes to it is a go-live catch-up for every one of them
-//! (issue #476, ADR-0016's "What `live` promises"): an explicit
+//! (issue #476, ADR-0002's "What `live` promises"): an explicit
 //! `Trellis::request_backfill` and a table whose capture triggers are
 //! installed (issue #533)
 //! (`intake::markers::park_table_catch_ups`).

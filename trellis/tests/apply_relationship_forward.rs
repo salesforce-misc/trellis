@@ -727,7 +727,7 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
     // A bare to-one path isn't a shape the direct build renders, so the
     // definition falls back to the ring's enumeration of its existing rows,
     // which the backfill discharge stages (`install_definition`'s
-    // `Unsupported` arm, ADR-0016); run it, then drain.
+    // `Unsupported` arm, ADR-0002); run it, then drain.
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
         .expect("discharge the registration");

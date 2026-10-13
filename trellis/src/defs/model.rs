@@ -32,7 +32,7 @@ pub struct Definition {
     ///
     /// **This is the identity every physical SQL-builder that reads the live
     /// source table at backfill/CDC-apply/quarantine-recompute time must use**
-    /// (ADR-0007) — never `def.source` alone, which is always bare (see
+    /// (ADR-0011) — never `def.source` alone, which is always bare (see
     /// [`super::ast::TransformDef`]'s own doc comment) and, left unqualified
     /// in emitted SQL, would silently resolve against whichever schema the
     /// executing session's pinned `search_path` (`Config::schema`,
@@ -79,7 +79,7 @@ pub fn applying_sql(alias: &str) -> String {
 /// documents the full state machine this mirrors. Registration
 /// ([`super::catalog::install_definition`]) persists
 /// [`TransformStatus::WaitingToBackfill`], and the backfill discharge
-/// (ADR-0016) moves it on: to [`TransformStatus::Backfilling`] together with
+/// (ADR-0002) moves it on: to [`TransformStatus::Backfilling`] together with
 /// the chunks or job that build it, then [`TransformStatus::CatchingUp`] when
 /// the last one finishes (or its direct-build job does, for an aggregate or
 /// relationship-enriched 1-1 definition), and [`TransformStatus::Live`] once
@@ -97,10 +97,10 @@ pub fn applying_sql(alias: &str) -> String {
 ///
 /// Apply maintains a definition that is [`TransformStatus::is_applying`]:
 /// `live` or `catching_up`. Only `live` tells an operator the target is in
-/// its steady state (ADR-0016, "What `live` promises").
+/// its steady state (ADR-0002, "What `live` promises").
 ///
 /// [`TransformStatus::Quarantined`] and [`TransformStatus::Paused`] are the
-/// two triggers of ADR-0014's single "frozen" state: the poison fuse trips
+/// two triggers of ADR-0014's one freeze with several triggers: the poison fuse trips
 /// the first, an operator [`PAUSE`](crate::Trellis::apply) sets the
 /// second, and nothing else distinguishes them — neither is applying, which
 /// is the one gate the claim-time fold has ever honored (the status
@@ -405,7 +405,7 @@ pub enum NodeKind {
 pub struct SchemaNode {
     pub id: i64,
     /// The fully-qualified `"schema.table"` identity this node is keyed on
-    /// (issue #74, ADR-0007). `public.posts` and `archive.posts` are
+    /// (issue #74, ADR-0011). `public.posts` and `archive.posts` are
     /// distinct rows with independent `is_source`/`is_target` flags and
     /// independent `schema_edges` — before issue #74 this held the bare
     /// table name, so same-named tables in different schemas collided into

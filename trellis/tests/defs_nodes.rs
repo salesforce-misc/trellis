@@ -12,7 +12,7 @@ use trellis::defs::{NodeKind, ValueType, create_definition, node_for_table, reso
 /// column references against the passed-in `source_columns` map, not the
 /// live schema.
 ///
-/// Explicitly under `public` (issue #74, ADR-0007), not wherever a bare
+/// Explicitly under `public` (issue #74, ADR-0011), not wherever a bare
 /// `CREATE TABLE` would land via the pool's ambient `search_path` —
 /// `a_definitions_target_matching_an_existing_source_node_merges_roles`
 /// below reuses "orders" both as a real source table here and as a later

@@ -1,12 +1,11 @@
-//! The durable, claimable backfill-chunk work queue (public API design's
-//! ADR-0007 amendment — see `docs/decisions/0007-direct-set-based-backfill.md`'s
-//! "Backgrounding and resumability" section and `docs/decisions/0008-public-api-design.md`'s
+//! The durable, claimable backfill-chunk work queue (ADR-0002's
+//! "A build is Re-derive over chunks, and applies from its first chunk" and `docs/decisions/0008-public-api-design.md`'s
 //! decision 1).
 //!
 //! A plain (non-relationship) 1-1 definition's PK-range chunks are not run
 //! back-to-back in one call: once the definition's capture point has passed,
 //! the backfill discharge (`intake::markers::run_pending_backfills`,
-//! ADR-0016) plans the same boundaries [`super::backfill::plan_one_to_one_chunks`]
+//! ADR-0002) plans the same boundaries [`super::backfill::plan_one_to_one_chunks`]
 //! always computed and [`dispatch_one_to_one`] persists each as a row in the
 //! `backfill_chunks` table (`V20__backfill_chunks.sql`), in the discharge's own
 //! transaction. That applies to a fresh registration and to a resumed
@@ -29,7 +28,7 @@
 //! An aggregate or relationship-enriched 1-1 definition isn't split into
 //! ranges: its build materializes connection-scoped `TEMP TABLE` staging,
 //! which doesn't survive being read by independent drain workers on separate
-//! connections (the open problem the ADR amendment calls out). The discharge
+//! connections (the open problem ADR-0002 calls out). The discharge
 //! enqueues its whole direct build as one job instead ([`dispatch_direct_build`],
 //! issue #419), a row with no bounds ([`ChunkWork::DirectBuild`]) that one
 //! drain worker runs start to finish. Everything above applies to it
@@ -213,7 +212,7 @@ pub enum ChunkWork {
     /// one.
     Range { lo: Option<String>, hi: String },
     /// An aggregate or relationship-enriched 1-1 definition's whole direct
-    /// set-based build (ADR-0007), run as one job (issue #419; the row's
+    /// set-based build ADR-0002), run as one job (issue #419; the row's
     /// `hi` is null). See [`dispatch_direct_build`].
     DirectBuild,
     /// A Re-derive build's plan job (#625 F2, `staging::build`): walks the
@@ -261,7 +260,7 @@ pub const KIND_SWEEP: &str = "sweep";
 pub const OLD_BUILD_KINDS: [&str; 2] = [KIND_RANGE, KIND_DIRECT];
 
 /// Dispatches a plain (non-relationship) 1-1 definition's build onto the
-/// durable queue, inside the backfill discharge's own transaction (ADR-0016):
+/// durable queue, inside the backfill discharge's own transaction (ADR-0002):
 /// moves `definition_id` `waiting_to_backfill` -> `backfilling` and persists
 /// `planned`'s ranges (from [`backfill::plan_one_to_one_chunks`]) as its
 /// `backfill_chunks` rows, so the status and the work that drives it commit
@@ -356,8 +355,8 @@ async fn start_backfilling(
 }
 
 /// Dispatches an aggregate or relationship-enriched 1-1 definition's direct
-/// set-based build (ADR-0007) as one background job, inside the backfill
-/// discharge's own transaction (ADR-0016, issue #419): moves `definition_id`
+/// set-based build ADR-0002) as one background job, inside the backfill
+/// discharge's own transaction (ADR-0002, issue #419): moves `definition_id`
 /// `waiting_to_backfill` -> `backfilling` and persists the job as a
 /// [`ChunkWork::DirectBuild`] row, so the status and the work that drives it
 /// commit together (issue #404's rule) or not at all.
@@ -876,7 +875,7 @@ pub enum ChunkFailure {
 ///   [`MAX_CHARGED_ATTEMPTS`]th charge pauses the definition instead.
 ///
 /// A [`ChunkWork::DirectBuild`] job **hands its build back to the backfill
-/// discharge** (ADR-0016, issue #419), in one transaction: the job row is
+/// discharge** (ADR-0002, issue #419), in one transaction: the job row is
 /// deleted, the definition moves `backfilling` -> `waiting_to_backfill`, and
 /// its source's marker is re-parked carrying the failure as its retry state
 /// (`intake::markers::park_failed_build`). The marker's backoff (issue
@@ -1493,7 +1492,7 @@ pub async fn run_claimed_chunk(
 }
 
 /// Runs a [`ChunkWork::DirectBuild`] job: the whole direct set-based build
-/// of `definition` (ADR-0007, [`backfill::backfill_definition`]).
+/// of `definition` (ADR-0002, [`backfill::backfill_definition`]).
 ///
 /// Moving the definition on to `catching_up` is [`finish_chunk`]'s job, as
 /// for every chunk.

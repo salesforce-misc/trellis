@@ -113,7 +113,7 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
     assert_eq!(
         definition.status,
         TransformStatus::WaitingToBackfill,
-        "registration returns before the build (ADR-0016)"
+        "registration returns before the build (ADR-0002)"
     );
 
     // PAUSE TRANSFORM — freezes it.

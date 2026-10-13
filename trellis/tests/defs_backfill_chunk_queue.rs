@@ -1,6 +1,6 @@
 //! Integration tests for the durable backfill-chunk work queue
-//! (`trellis::defs::chunk_queue`, docs/decisions/0007's "Backgrounding and
-//! resumability" amendment): the claim/reclaim-stale idiom a drain worker
+//! (`trellis::defs::chunk_queue`, ADR-0002's "A build is
+//! Re-derive over chunks, and applies from its first chunk"): the claim/reclaim-stale idiom a drain worker
 //! uses to finish a plain (non-relationship) 1-1 direct-build definition's
 //! backfill in the background (over a seam-fed source since #625 F8a: see
 //! `install_and_dispatch`), and the CDC-race closure that makes excluding
@@ -22,7 +22,7 @@ use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
 /// `install_definition`, then the discharge that dispatches a plain 1-1
-/// definition's chunked build (ADR-0016, #418): this file tests the chunk
+/// definition's chunked build (ADR-0002, #418): this file tests the chunk
 /// queue, which only fills once the discharge has run. Returns the definition
 /// with its status as of then.
 ///
@@ -758,7 +758,7 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
     assert_eq!(status, "catching_up");
 }
 
-/// The CDC race docs/decisions/0007's amendment closes: a delta arriving on
+/// The CDC race ADR-0002 closes: a delta arriving on
 /// a source table shared by a `live` definition and a still-`backfilling`
 /// one must apply normally to the `live` definition while being excluded
 /// from the `backfilling` one — not corrupting/pre-populating it with a
@@ -831,7 +831,7 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
     // until explicitly finished below. This is deliberately the harder case:
     // even though this row's own chunk has already committed, the
     // *definition* is still non-`live`, and the exclusion is definition-
-    // scoped (docs/decisions/0007's amendment: parked per-definition, not
+    // scoped (ADR-0002: parked per-definition, not
     // per-chunk/per-row).
     install_and_dispatch(
         &db.pool,

@@ -1045,7 +1045,7 @@ async fn two_overlapping_group_writers_serialize_via_ascending_lock_order_not_de
     assert_eq!(total20, "5.00");
 }
 
-/// Issue #77 / ADR-0007's same-named-decoy regression for the *aggregate*
+/// Issue #77 / ADR-0011's same-named-decoy regression for the *aggregate*
 /// CDC-apply path — a distinct code path from the plain 1-1 case
 /// `apply.rs`'s `explicitly_qualified_source_reads_the_right_table_on_a_live_refetch`
 /// covers. The aggregate's live read (the old path's probes, now the ledger

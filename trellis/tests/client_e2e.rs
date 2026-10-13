@@ -500,7 +500,7 @@ fn comments_calc_custom_schema_def() -> TransformDef {
     }
 }
 
-/// Issue #75, ADR-0007's regression case: `client::reconcile_source_tables`
+/// Issue #75, ADR-0011's regression case: `client::reconcile_source_tables`
 /// (the same issue #14 periodic re-derivation the test above exercises) must
 /// reconcile capture against each newly-registered source's own
 /// *actual* persisted qualified name — not a bare suffix re-guessed against
@@ -704,7 +704,7 @@ async fn staging_and_application_threads_are_independent_knobs() {
     client.shutdown().await.expect("clean shutdown");
 }
 
-/// docs/decisions/0007's "Backgrounding and resumability" amendment, proven
+/// ADR-0002's "A build is Re-derive over chunks, and applies from its first chunk", proven
 /// end-to-end through the real `Client` runtime rather than by manually
 /// calling `defs::chunk_queue`'s primitives (see `defs_backfill_chunk_queue.rs`
 /// for that lower-level coverage): `install_definition` on a plain
@@ -764,7 +764,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         "install_definition must return before its build is even dispatched"
     );
     // No staging worker here (`staging_worker: false`): stand in for its
-    // discharge, which dispatches the chunked build (ADR-0016, #418). It
+    // discharge, which dispatches the chunked build (ADR-0002, #418). It
     // retries a fence pinned by another transaction for only a few seconds
     // and then returns without dispatching, so check that it did: a missing
     // chunk would otherwise surface as the wait below timing out.

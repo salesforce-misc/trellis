@@ -9,7 +9,7 @@
 //! target table's creation and [`trellis::dev::defs::backfill_definition`]'s
 //! direct build (relationship creation is untimed setup). Registering through
 //! `install_definition` builds nothing: the staging worker's backfill
-//! discharge dispatches the same build to a drain thread later (ADR-0016), so
+//! discharge dispatches the same build to a drain thread later (ADR-0002), so
 //! a registration's own latency says nothing about the build.
 
 use std::collections::HashMap;

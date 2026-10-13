@@ -603,7 +603,7 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
 /// Issue #56's backfill status transition events (#55's lifecycle):
 /// `waiting_to_backfill` -> `backfilling` from the staging worker's
 /// reconcile pass (`trellis::client::reconcile_pass`) dispatching the
-/// definition's build (ADR-0016), then `backfilling` -> `catching_up` from
+/// definition's build (ADR-0002), then `backfilling` -> `catching_up` from
 /// the build finishing and `catching_up` -> `live` from its go-live
 /// catch-up's discharge (issue #476) — mirrors `transform_status_lifecycle.rs`'s
 /// `a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live`'s straggler

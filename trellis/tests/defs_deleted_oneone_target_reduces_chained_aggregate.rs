@@ -42,7 +42,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// Claims and executes every pending direct-build backfill chunk until none
 /// remain — the test-harness stand-in for a running drain worker, since
 /// `install_definition` no longer runs a plain (non-relationship) 1-1
-/// definition's backfill in-call (docs/decisions/0007's amendment): it
+/// definition's backfill in-call (ADR-0002): it
 /// returns as soon as the chunk work is enumerated and persisted,
 /// `Backfilling` until a drain worker actually claims and finishes each
 /// chunk. Both `order_view` (this file's 1-1 mirror) and `customer_totals`
@@ -51,7 +51,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// #625 F8a: `order_view`, a plain 1-1 over a captured table, is the
 /// Re-derive build's, which this runs to `live` once the chunks are done.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
+    // ADR-0002 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
     trellis::intake::markers::discharge_registrations(pool)
         .await

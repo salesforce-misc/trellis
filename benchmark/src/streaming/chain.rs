@@ -77,8 +77,8 @@ pub async fn create_chain_source_table(raw: &RawClient, prefix: &str) -> String 
 /// Must be called with a `Client` (staging worker, at least one application
 /// thread) already running against `pool`'s database: with no source rows
 /// yet, each hop's backfill enumerates zero chunks, but flipping
-/// `Backfilling` -> `Live` (ADR-0007's "Backgrounding and resumability"
-/// amendment) still needs a running drain worker to claim and finish that
+/// `Backfilling` -> `Live` (ADR-0002's "A build is Re-derive over
+/// chunks, and applies from its first chunk") still needs a running drain worker to claim and finish that
 /// empty chunk queue — there is no synchronous fallback path.
 ///
 /// Waits for each hop to go live before registering the next one on top of

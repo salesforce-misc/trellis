@@ -9,7 +9,7 @@
 //! [WHERE <predicate>]
 //! ```
 //!
-//! `<target>` and `<source>` (issue #76, ADR-0007 grammar clause 4) each
+//! `<target>` and `<source>` (issue #76, ADR-0011) each
 //! accept either a bare `<table>` (resolved once, later, via `search_path` —
 //! issues #72/#73) or an explicit `<schema>.<table>` spelling that names its
 //! schema directly and skips that resolution — see [`Self::parse_table_ref`]
@@ -329,7 +329,7 @@ impl Parser {
         Ok((table, column))
     }
 
-    /// Parses a `TRANSFORM`/`FROM` table reference (issue #76, ADR-0007
+    /// Parses a `TRANSFORM`/`FROM` table reference (issue #76, ADR-0011
     /// grammar clause 4): either a bare `<table>` — today's only form,
     /// returned as `(table, None)` — or an explicit `<schema>.<table>`
     /// spelling, returned as `(table, Some(schema))`. Rejects a third

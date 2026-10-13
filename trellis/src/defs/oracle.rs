@@ -96,7 +96,7 @@ impl From<EvalError> for OracleError {
 pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 
 /// The `FROM`-clause identifier this test/benchmark-only oracle module
-/// should read `def`'s source through (issue #76, ADR-0007 grammar clause
+/// should read `def`'s source through (issue #76, ADR-0011 grammar clause
 /// 4): `"schema"."table"`, each component quoted independently, when `def`
 /// wrote an explicit `FROM <schema>.<source>`
 /// ([`TransformDef::explicit_source_schema`]); the plain `"table"` quoted
@@ -108,7 +108,7 @@ pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 /// its rendered SQL against the same connection/`search_path` the definition
 /// itself was accepted under, so the bare branch can't drift the way the
 /// real backfill/apply/quarantine paths' pinned-`search_path` reads could
-/// (`docs/decisions/0007`) — only the explicit-schema case needed a real fix
+/// (`docs/decisions/0011`) — only the explicit-schema case needed a real fix
 /// here, and it needs no database round trip: the schema is already right on
 /// `def`.
 #[cfg(any(test, feature = "test-util"))]

@@ -89,7 +89,7 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
 /// `create table` in this file's own fixtures actually lands, since
 /// `connect_raw` pins `search_path` to `trellis, public` and never qualifies
 /// its own DDL. Matches `tests/quarantine.rs`'s (and `tests/apply.rs`'s) own
-/// `qualify_fixture_table` (issue #74, ADR-0007): a CDC-staged `src_table`
+/// `qualify_fixture_table` (issue #74, ADR-0011): a CDC-staged `src_table`
 /// must be fully qualified to match what a real CDC producer stages (issue
 /// #76) and what the dependency graph now keys on (issue #74), or
 /// `catalog::transforms_for_source` silently finds nothing and this whole
@@ -1560,7 +1560,7 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
 //     column untouched (must-fix 1).
 // ---------------------------------------------------------------------
 
-/// A durable backfill chunk (`defs::chunk_queue`, ADR-0007's amendment) is
+/// A durable backfill chunk (`defs::chunk_queue`, ADR-0002) is
 /// claimable and crash-recoverable: a chunk whose worker wrote it and died
 /// before finishing it is reclaimed and re-executed by another worker (see
 /// `trellis/tests/defs_backfill_chunk_queue.rs`'s own reclaim-and-redo
@@ -1608,7 +1608,7 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
     assert_eq!(
         def.status,
         TransformStatus::WaitingToBackfill,
-        "registration only records the definition (ADR-0016)"
+        "registration only records the definition (ADR-0002)"
     );
     trellis::intake::markers::discharge_registrations(&db.pool)
         .await
@@ -2734,7 +2734,7 @@ async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &
 ///
 /// `attribute_column_failure` used to pass its raw `src_table` straight to
 /// `catalog::transforms_for_source`, which requires an already-qualified name
-/// (issue #74, ADR-0007) and answers a bare one with an *empty* candidate set
+/// (issue #74, ADR-0011) and answers a bare one with an *empty* candidate set
 /// rather than an error. The lookup therefore matched no definition, the
 /// function fell out through its "no candidate" arm, and the failure went
 /// completely unattributed — indistinguishable, from the outside, from the
@@ -2778,7 +2778,7 @@ async fn a_bare_src_table_failure_is_still_attributed_to_its_column() {
 
 // ---------------------------------------------------------------------
 // (g) The operator-driven half of a column pause — issue #227, ADR-0014's
-//     "one state, two triggers" at column granularity, reached through the
+//     one freeze with several triggers, at column granularity, reached through the
 //     unified `PAUSE TRANSFORM <target>.<column>` grammar rather than by a
 //     fuse tripping.
 // ---------------------------------------------------------------------
