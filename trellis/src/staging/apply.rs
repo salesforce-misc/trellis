@@ -3261,15 +3261,21 @@ async fn superseded_to_side(
     new_key: &Option<String>,
 ) -> Result<bool, ApplyError> {
     let shape = &record.shape;
-    if !shape.to_side.seam_fed
-        && record.retry_count == 0
-        && !overtaken_by_refresh(record.lsn, refresh_stamps.get(&shape.id).copied())
-    {
+    let must_check = shape.to_side.seam_fed
+        || overtaken_by_refresh(record.lsn, refresh_stamps.get(&shape.id).copied());
+    if !must_check && record.retry_count == 0 {
         return Ok(false);
     }
     let columns = cached_row_columns(txn, row_columns_cache, &shape.to_side.identity)
         .await?
         .to_vec();
+    // A retry whose to-side no longer has `to_col` (renamed or dropped, which
+    // pauses the relationship's readers) has no live row to be checked
+    // against: the keyed read would fail its page on every attempt. It
+    // applies its images, as it did before the retry was checked.
+    if !must_check && !columns.contains(&shape.to_col) {
+        return Ok(false);
+    }
     to_side_superseded(
         txn,
         shape,

@@ -3947,3 +3947,85 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
         "order 10's account no longer carries code 5"
     );
 }
+
+/// Review follow-up to #886: a deferred reverse's retry is checked against
+/// the live to-side row by its `to_col`. A retry still pending when that
+/// column is renamed (which pauses the relationship's readers) has no live
+/// row to read by it, and must not fail every drain of its page.
+#[tokio::test]
+async fn a_deferred_parent_update_retries_after_its_key_column_is_renamed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    let base = staging_base(&client).await;
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        base + 100,
+    )
+    .await;
+    let first_seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, first_seg, "worker_a").await;
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        first_seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &StagedWatermark::new(),
+    )
+    .await
+    .expect("apply (rejected internally by guard (a))");
+    txn.commit().await.expect("commit");
+    drop(phase3);
+    assert_eq!(
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "guard (a) must defer the update"
+    );
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    let deferred_seg = seal_active_segment(&mut client).await;
+
+    client
+        .batch_execute("alter table posts rename column id to post_id")
+        .await
+        .expect("rename the relationship's to-side key column");
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        deferred_seg,
+        "reverse_test",
+        1,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("the retry drains after its to_col is renamed")
+    .is_some()
+    {}
+}
