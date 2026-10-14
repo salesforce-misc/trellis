@@ -2232,8 +2232,9 @@ pub struct WorkProbe {
 
 /// Whether a drain worker's build step could find anything to do, in one
 /// prepared statement (one transaction): a chunk of any kind that is undone,
-/// unclaimed and not backing off ([`chunk_queue::claim_chunks_of`]'s
-/// candidates before its definition-status gates), or a definition a
+/// unclaimed and not backing off, of a definition in a dispatchable status
+/// ([`chunk_queue::claim_chunks_of`]'s candidates, minus its kind and sweep
+/// filters), or a definition a
 /// Re-derive build is running for ([`building`] is not empty). It is a
 /// superset of both probes the step used to make on every idle wake
 /// (`claim_chunks`, then `building`), so a `false` means each of them would
@@ -2250,18 +2251,25 @@ pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
         "select p.may_exist, case when not p.may_exist then ( \
                 select extract(epoch from min(bc.next_attempt_at) - now())::float8 \
                 from backfill_chunks bc \
-                where not bc.done and bc.claimed_by is null and bc.next_attempt_at > now()) end \
+                where not bc.done and bc.claimed_by is null and bc.next_attempt_at > now() \
+                  and {gate}) end \
          from (select exists ( \
                    select 1 from backfill_chunks bc \
                    where not bc.done and bc.claimed_by is null \
                      and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
-               ) or exists (select 1 from transform_definitions d where {}) as may_exist) p",
-        building_predicate(),
+                     and {gate} \
+               ) or exists (select 1 from transform_definitions d where {building}) as may_exist) p",
+        gate = chunk_queue::dispatchable_gate_sql("$4"),
+        building = building_predicate(),
     );
     let statement = client.prepare_cached(&sql).await?;
     let params = building_params();
+    let dispatchable = TransformStatus::dispatchable();
     let row = client
-        .query_one(&statement, &[&params.0, &params.1, &params.2])
+        .query_one(
+            &statement,
+            &[&params.0, &params.1, &params.2, &dispatchable],
+        )
         .await?;
     let next_due: Option<f64> = row.get(1);
     Ok(WorkProbe {

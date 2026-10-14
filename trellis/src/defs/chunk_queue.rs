@@ -568,6 +568,18 @@ pub async fn claim_chunks(
     claim_chunks_of(client, claimed_by, limit, &OLD_BUILD_KINDS).await
 }
 
+/// SQL over a `backfill_chunks bc` row: its definition is in a status a
+/// chunk may be handed out in (`param` binds [`TransformStatus::dispatchable`]
+/// as a `text[]`). One predicate for the claim ([`claim_chunks_of`]) and for
+/// the idle probe (`staging::build::work_probe`), so the probe stays a
+/// superset of the claim and the two cannot drift (#1047).
+pub(crate) fn dispatchable_gate_sql(param: &str) -> String {
+    format!(
+        "exists (select 1 from transform_definitions d \
+                 where d.id = bc.definition_id and d.status = any({param}))"
+    )
+}
+
 /// [`claim_chunks`] for the rows whose `kind` is one of `kinds`.
 pub async fn claim_chunks_of(
     client: &impl GenericClient,
@@ -614,14 +626,12 @@ pub async fn claim_chunks_of(
             // A Re-derive build's sweep (#625 F3) waits for its build's plan
             // job and every chunk: it re-derives what they didn't, so it
             // reads their bases. A row held across a resume doesn't hold it.
-            "with candidate as ( \
+            &format!(
+                "with candidate as ( \
                  select bc.id from backfill_chunks bc \
                  where not bc.done and bc.claimed_by is null and bc.kind = any($4) \
                    and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
-                   and exists ( \
-                       select 1 from transform_definitions d \
-                       where d.id = bc.definition_id and d.status = any($3) \
-                   ) \
+                   and {dispatchable_gate} \
                    and (bc.kind <> 'sweep' or not exists ( \
                        select 1 from backfill_chunks o \
                        join transform_definitions od on od.id = o.definition_id \
@@ -639,6 +649,8 @@ pub async fn claim_chunks_of(
              where c.id = candidate.id \
              returning c.id, c.definition_id, c.lo, c.hi, c.kind, c.fields, \
                        c.key_collations",
+                dispatchable_gate = dispatchable_gate_sql("$3"),
+            ),
             &[&claimed_by, &limit, &dispatchable, &kinds],
         )
         .await?;

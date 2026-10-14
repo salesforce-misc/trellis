@@ -221,13 +221,53 @@ async fn a_definition_entering_a_build_state_announces_itself() {
     f.sql("update transform_definitions set build = 'rederive'")
         .await;
     assert_eq!(f.listener.heard().await, 1, "build changed");
-    // Leaving the build states, or any other column, is not an edge.
+    // Every status a chunk is handed out in announces entering it (a resume
+    // or an unfreeze makes the definition's existing chunks claimable
+    // without touching a chunk row, #1047); a frozen status is no edge.
+    for status in trellis::defs::TransformStatus::ALL {
+        f.sql("update transform_definitions set status = 'paused'")
+            .await;
+        f.listener.heard().await;
+        f.sql(&format!(
+            "update transform_definitions set status = '{}'",
+            status.as_str()
+        ))
+        .await;
+        let dispatchable =
+            trellis::defs::TransformStatus::dispatchable().contains(&status.as_str());
+        assert_eq!(
+            f.listener.heard().await,
+            usize::from(dispatchable),
+            "paused -> {}",
+            status.as_str()
+        );
+    }
     f.sql("update transform_definitions set status = 'live'")
         .await;
-    assert_eq!(f.listener.heard().await, 0, "-> live");
+    f.listener.heard().await;
     f.sql("update transform_definitions set status = 'live'")
         .await;
     assert_eq!(f.listener.heard().await, 0, "unchanged");
+}
+
+/// Resuming a paused definition holding an undone chunk: the probe is false
+/// while paused and true after, and the resume sent the wake (#1047).
+#[tokio::test]
+async fn resuming_a_paused_definition_with_a_chunk_wakes_workers() {
+    let mut f = Fixture::new().await;
+    f.add_chunk().await;
+    f.listener.heard().await;
+    let probe = || async {
+        build::work_probe(&f.db.pool)
+            .await
+            .expect("probe")
+            .may_exist
+    };
+    assert!(!probe().await, "paused");
+    f.sql("update transform_definitions set status = 'waiting_to_backfill'")
+        .await;
+    assert_eq!(f.listener.heard().await, 1, "resume woke the workers");
+    assert!(probe().await, "resumed");
 }
 
 /// The one edge nothing announces: a backing-off chunk coming due. The probe
@@ -235,6 +275,9 @@ async fn a_definition_entering_a_build_state_announces_itself() {
 #[tokio::test]
 async fn the_probe_reports_when_a_backing_off_chunk_comes_due() {
     let f = Fixture::new().await;
+    // A definition chunks are handed out in (the fixture pauses it).
+    f.sql("update transform_definitions set status = 'backfilling', build = null")
+        .await;
     let probe = || async { build::work_probe(&f.db.pool).await.expect("probe") };
     assert_eq!(probe().await.next_due, None, "no chunk");
 

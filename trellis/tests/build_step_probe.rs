@@ -193,11 +193,11 @@ async fn the_probe_ignores_claimed_backing_off_and_done_chunks() {
     )
     .await
     .expect("reconcile pass");
-    // Freeze the definition's build so only the chunk conditions matter.
+    // A plain backfill (no Re-derive build) so only the chunk conditions matter.
     f.raw
-        .batch_execute("update transform_definitions set status = 'paused'")
+        .batch_execute("update transform_definitions set status = 'backfilling', build = null")
         .await
-        .expect("pause");
+        .expect("backfilling");
     assert!(f.may_exist().await, "an unclaimed, undone chunk");
 
     f.raw
@@ -242,4 +242,84 @@ async fn the_probe_finds_an_old_build_chunk_nothing_else_announces() {
         .expect("claim");
     assert_eq!(claimed.len(), 1, "the old claim hands it out");
     assert!(!f.may_exist().await, "held by a worker, nothing is left");
+}
+
+/// The probe gates a chunk on its definition's status with the claim's own
+/// allowlist (#1047): a frozen definition's undone, unclaimed, due chunk
+/// hands out nothing, so it must not keep an idle worker awake; every
+/// dispatchable status does. The claim is asked too, so the probe cannot
+/// drift from it.
+#[tokio::test]
+async fn the_probe_follows_the_claims_definition_status_gate() {
+    let mut f = Fixture::new().await;
+    trellis::client::reconcile_pass(
+        &mut f.raw,
+        &f.db.pool,
+        DEFAULT_SCHEMA,
+        WAKE,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("reconcile pass");
+    let dispatchable = trellis::defs::TransformStatus::dispatchable();
+    for status in trellis::defs::TransformStatus::ALL {
+        f.raw
+            .batch_execute(&format!(
+                "update transform_definitions set build = null, status = '{}'",
+                status.as_str()
+            ))
+            .await
+            .expect("set status");
+        let claimable = dispatchable.contains(&status.as_str());
+        let probe = build::work_probe(&f.db.pool).await.expect("probe");
+        assert_eq!(probe.may_exist, claimable, "probe at {}", status.as_str());
+        let claimed = chunk_queue::claim_chunks_of(&f.raw, "w", 100, &["range", "direct", "plan"])
+            .await
+            .expect("claim");
+        assert_eq!(
+            !claimed.is_empty(),
+            claimable,
+            "claim at {}",
+            status.as_str()
+        );
+        f.raw
+            .batch_execute("update backfill_chunks set claimed_by = null, claimed_at = null")
+            .await
+            .expect("release");
+    }
+}
+
+/// A frozen definition's chunk backing off is not a clock to wake for either:
+/// the resume announces itself.
+#[tokio::test]
+async fn a_paused_definitions_backing_off_chunk_schedules_no_wake() {
+    let mut f = Fixture::new().await;
+    trellis::client::reconcile_pass(
+        &mut f.raw,
+        &f.db.pool,
+        DEFAULT_SCHEMA,
+        WAKE,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("reconcile pass");
+    f.raw
+        .batch_execute(
+            "update backfill_chunks set next_attempt_at = now() + interval '1 hour'; \
+             update transform_definitions set status = 'paused'",
+        )
+        .await
+        .expect("back off and pause");
+    let probe = build::work_probe(&f.db.pool).await.expect("probe");
+    assert_eq!((probe.may_exist, probe.next_due), (false, None));
+    f.raw
+        .batch_execute("update transform_definitions set status = 'backfilling', build = null")
+        .await
+        .expect("resume");
+    let probe = build::work_probe(&f.db.pool).await.expect("probe");
+    assert!(!probe.may_exist);
+    assert!(
+        probe.next_due.is_some(),
+        "the resumed chunk's backoff is a clock again"
+    );
 }
