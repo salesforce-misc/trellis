@@ -316,6 +316,58 @@ async fn a_source_recreated_in_a_hierarchy_pauses_its_readers_and_gets_no_captur
     }
 }
 
+/// ADR-0017: a source recreated as a partitioned root whose shape the
+/// aggregate could read (partitioned by its `GROUP BY` column) still pauses
+/// its readers, and `RESUME` is refused with
+/// `PartitionedSourceNotCaptured`, since capture can't yet cover the tree.
+#[tokio::test]
+async fn a_resume_onto_a_servable_partitioned_source_is_refused_until_capture_covers_it() {
+    let cluster = TestCluster::start();
+    let mut it = instance(
+        &cluster,
+        &["TRANSFORM c_sums FROM public.c GROUP BY pid SELECT SUM(amount) AS total"],
+    )
+    .await;
+    assert_live(&it.trellis, "c_sums").await;
+    it.raw
+        .batch_execute(
+            "drop table public.c; \
+             create table public.c (id int not null, pid int not null, amount int, \
+                 primary key (pid, id)) partition by hash (pid); \
+             create table public.c_0 partition of public.c \
+                 for values with (modulus 1, remainder 0)",
+        )
+        .await
+        .expect("recreate the source as a partitioned root");
+    capture_pass(&mut it.raw, &it.db.pool).await;
+    assert_paused(
+        &it.trellis,
+        "c_sums",
+        "public.c",
+        "public.c is a partitioned table",
+    )
+    .await;
+    let err = it
+        .trellis
+        .apply("RESUME TRANSFORM c_sums")
+        .await
+        .expect_err("a resume onto a partitioned source is refused");
+    assert!(
+        matches!(
+            &err,
+            TrellisError::Apply(ApplyError::ResumeRefused { reason, .. })
+                if matches!(**reason, CatalogError::PartitionedSourceNotCaptured { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        status(&it.trellis, "c_sums").await.status,
+        TransformStatus::Paused
+    );
+    assert_eq!(triggers(&it.raw, "public.c").await, Vec::<String>::new());
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
 /// The false-positive gate: hierarchy membership is a catalog fact that only
 /// DDL naming the hierarchy changes. Routine maintenance that rewrites the
 /// heap or its indexes, and Trellis's own widen, narrow and repair of the

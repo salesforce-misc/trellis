@@ -25,8 +25,10 @@
 //! - [`PartitionTree::refusal`] returns the first [`PartitionRefusal`], in a
 //!   fixed order: server version, leaf count, then each level top-down (an
 //!   expression key, an unsupported type, a non-default operator class, a
-//!   nondeterministic collation, a column missing from the key).
+//!   nondeterministic collation), then each level top-down again for a
+//!   column missing from the key.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use tokio_postgres::GenericClient;
@@ -405,8 +407,11 @@ pub async fn read_partition_tree(
         });
         parents.push(row.get(2));
     }
+    // By oid, so a tree well over the leaf limit is still read in linear time
+    // before `refusal` turns it away.
+    let index: HashMap<u32, usize> = nodes.iter().enumerate().map(|(i, n)| (n.oid, i)).collect();
     for (i, parent) in parents.into_iter().enumerate() {
-        nodes[i].parent = parent.and_then(|p| nodes.iter().position(|n| n.oid as i64 == p));
+        nodes[i].parent = parent.and_then(|p| index.get(&(p as u32)).copied());
     }
 
     let oids: Vec<i64> = nodes
@@ -437,7 +442,7 @@ pub async fn read_partition_tree(
     let mut levels: Vec<PartitionLevel> = Vec::new();
     for row in &key_rows {
         let oid = row.get::<_, i64>(0) as u32;
-        let Some(node) = nodes.iter().position(|n| n.oid == oid) else {
+        let Some(&node) = index.get(&oid) else {
             continue;
         };
         let strategy = match row.get::<_, &str>(1) {

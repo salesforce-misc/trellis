@@ -323,8 +323,8 @@ async fn a_non_default_opclass_and_a_nondeterministic_collation_name_the_column(
          create table public.t_a partition of public.t for values from ('a') to ('b'); \
          create collation public.ci (provider = icu, locale = 'und-u-ks-level2', \
             deterministic = false); \
-         create table public.c (k text collate public.ci not null, id int not null) \
-            partition by list (k); \
+         create table public.c (k text collate public.ci not null, id int not null, \
+            primary key (k, id)) partition by list (k); \
          create table public.c_a partition of public.c for values in ('a');",
     )
     .await;
@@ -335,17 +335,12 @@ async fn a_non_default_opclass_and_a_nondeterministic_collation_name_the_column(
         PartitionRefusal::NonDefaultOpclass { .. }
     ));
 
-    // The source has no primary key to carry the collation, so the shape
-    // check is exercised through the tree.
-    let tree = tree(&it, "public.c").await;
-    let refused = tree
-        .refusal(170_000, KeyRole::GroupBy, &["k".to_string()])
-        .expect("refused");
+    let err = refusal(&it, &aggregate("public.c", "k")).await;
+    let refused = assert_refused_naming(&err, "\"k\"");
     assert!(matches!(
         refused,
         PartitionRefusal::NondeterministicCollation { .. }
     ));
-    assert!(refused.to_string().contains("\"k\""), "{refused}");
 }
 
 #[tokio::test]
@@ -473,6 +468,35 @@ async fn a_to_many_to_side_follows_the_same_rules() {
             "RELATIONSHIP owner FROM order_line_items.order_id TO orders.id"
         )
         .await,
+        CatalogError::RelationshipEndpointNotChangeKeyed { .. }
+    ));
+    let _ = &it.db;
+}
+
+/// A partitioned root is held to the plain-table rule's primary key: one
+/// keyed only by a unique index on not-null columns, which
+/// `ddl::source_primary_key` would take, is refused before its shape is
+/// read, as a source and as a to-many to-side.
+#[tokio::test]
+async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
+    let cluster = TestCluster::start();
+    let it = instance(
+        &cluster,
+        "create table public.lines (id bigint not null, order_id bigint not null, \
+            amount int, unique (order_id, id)) partition by hash (order_id); \
+         create table public.lines_0 partition of public.lines \
+            for values with (modulus 1, remainder 0); \
+         create table public.orders (id bigint primary key);",
+    )
+    .await;
+    match refusal(&it, &aggregate("public.lines", "order_id")).await {
+        CatalogError::SourceNotChangeKeyed { source_table } => {
+            assert_eq!(source_table, "public.lines")
+        }
+        other => panic!("expected SourceNotChangeKeyed, got {other:?}"),
+    }
+    assert!(matches!(
+        refusal(&it, "RELATIONSHIP lines FROM orders.id TO lines.order_id").await,
         CatalogError::RelationshipEndpointNotChangeKeyed { .. }
     ));
     let _ = &it.db;

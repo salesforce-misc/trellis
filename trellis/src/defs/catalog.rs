@@ -6581,6 +6581,22 @@ async fn to_col_cardinality_in_txn(
 /// every shape check, so a refusal for the shape still names its column.
 const PARTITIONED_SOURCES_CAPTURED: bool = false;
 
+/// Whether `qualified` (an unquoted `schema.table`) has a primary key, the
+/// part of [`change_keyed`]'s rule a partitioned root is held to as well.
+async fn has_primary_key(
+    client: &impl GenericClient,
+    qualified: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(client
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_index i \
+                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary)",
+            &[&ddl::regclass_arg(qualified)],
+        )
+        .await?
+        .get(0))
+}
+
 /// The last check on a partitioned root of a servable shape: refuses it
 /// unless [`PARTITIONED_SOURCES_CAPTURED`].
 fn accept_partitioned(table: &str) -> Result<(), CatalogError> {
@@ -6665,6 +6681,14 @@ async fn reject_unkeyed_source(
     };
     if let Some(tree) = super::partition_tree::read_partition_tree(client, qualified_source).await?
     {
+        // The plain-table rule's primary key holds for a partitioned root
+        // too: `ddl::source_primary_key` also takes a qualifying unique
+        // index, which [`change_keyed`] doesn't.
+        if !has_primary_key(client, qualified_source).await? {
+            return Err(CatalogError::SourceNotChangeKeyed {
+                source_table: qualified_source.to_string(),
+            });
+        }
         let refusal = match &def.key_space {
             KeySpace::OneToOne => Some(super::partition_tree::PartitionRefusal::OneToOneFrom {
                 table: qualified_source.to_string(),
@@ -6763,6 +6787,12 @@ async fn reject_unkeyed_relationship_endpoint(
         && let Some(tree) =
             super::partition_tree::read_partition_tree(client, qualified_endpoint).await?
     {
+        if !has_primary_key(client, qualified_endpoint).await? {
+            return Err(CatalogError::RelationshipEndpointNotChangeKeyed {
+                side,
+                endpoint: qualified_endpoint.to_string(),
+            });
+        }
         let refusal = match to_side.cardinality {
             RelationshipCardinality::ToOne => {
                 Some(super::partition_tree::PartitionRefusal::ToOneToSide {
