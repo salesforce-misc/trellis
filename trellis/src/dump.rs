@@ -178,16 +178,22 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
             Class::Definition { reset } => {
                 // The table name goes in as a `%s` argument, not into the
                 // template, where a `%` in the schema name would be read as
-                // a format specifier.
-                let row: String = txn
-                    .query_one(
+                // a format specifier. The rows are ordered by their dumped
+                // text, not left in heap order, so two reads of unchanged
+                // definitions give the same SQL even after a runtime update
+                // (a build moving a status) has moved a row: a hook that
+                // compares reads taken around its pg_dump relies on it. An
+                // empty table gives no row, and no statement.
+                let Some(row) = txn
+                    .query_opt(
                         &format!(
-                            "select coalesce(format( \
+                            "select format( \
                                  'insert into %s overriding system value \
                                   select * from jsonb_populate_recordset(null::%s, %L::jsonb);', \
                                  $2::text, $2::text, \
-                                 jsonb_agg(to_jsonb(t) || $1::text::jsonb)) , '') \
-                             from {qualified} t",
+                                 jsonb_agg(to_jsonb(t) || $1::text::jsonb \
+                                           order by (to_jsonb(t) || $1::text::jsonb)::text)) \
+                             from {qualified} t having count(*) > 0",
                         ),
                         &[
                             reset as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -195,10 +201,10 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
                         ],
                     )
                     .await?
-                    .get(0);
-                if row.is_empty() {
+                else {
                     continue;
-                }
+                };
+                let row: String = row.get(0);
                 sql.push_str(&row);
                 sql.push('\n');
                 // The dump creates the table's sequences at 1 and carries no

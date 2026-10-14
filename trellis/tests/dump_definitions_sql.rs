@@ -249,7 +249,7 @@ async fn a_dump_loads_as_defined_not_built() {
         "select to_jsonb(t) - 'created_at' from schema_nodes t order by id",
         "select to_jsonb(t) - 'created_at' from schema_edges t order by id",
         "select to_jsonb(t) from source_table_versions t order by source_table",
-        "select to_jsonb(t) from definition_key_types t order by transform_id",
+        "select to_jsonb(t) from definition_key_types t order by transform_id, table_name, column_name",
         "select to_jsonb(t) from trellis_instance t",
         "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
         "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'build_marker_generation' - 'fuse_rearmed_at' from transform_definitions t order by id",
@@ -443,6 +443,37 @@ async fn a_loaded_database_builds_its_definitions() {
         got.sort();
         assert_eq!(got, want, "{sql}");
     }
+}
+
+/// Two reads of unchanged definitions give the same SQL, even when a runtime
+/// update (a build moving a status) has moved a row in the heap between them.
+/// The Rails hook reads the definitions on both sides of its `pg_dump` and
+/// redoes the dump when the reads differ, so heap order leaking into the SQL
+/// would make a dump taken while a worker builds fail.
+#[tokio::test]
+async fn a_runtime_update_leaves_the_dump_unchanged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    let t = facade(db.dsn()).await;
+    raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
+    t.apply("TRANSFORM o1 FROM orders SELECT g AS g")
+        .await
+        .expect("o1");
+    t.apply("TRANSFORM o2 FROM orders SELECT a AS a")
+        .await
+        .expect("o2");
+    let before = t.dump_definitions_sql().await.expect("dump definitions");
+    // A status the dump resets, written back to the first row: a new tuple,
+    // after the second row in the heap.
+    raw.batch_execute(
+        "update transform_definitions set status = 'paused' where id = (select min(id) from transform_definitions); \
+         update schema_nodes set is_source = is_source where id = (select min(id) from schema_nodes)",
+    )
+    .await
+    .expect("move rows");
+    let after = t.dump_definitions_sql().await.expect("dump definitions");
+    assert_eq!(after, before);
 }
 
 /// A schema name is any identifier, `%` and `'` included, and neither may
