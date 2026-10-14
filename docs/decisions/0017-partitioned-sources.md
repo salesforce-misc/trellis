@@ -1,6 +1,6 @@
 ---
 status: draft
-date: 2026-10-09
+date: 2026-10-14
 deciders: Michael Ries
 ---
 
@@ -14,10 +14,10 @@ one table of a partition tree miss writes named on the others. Partition
 maintenance (`ATTACH`, `DETACH`, `DROP`, a leaf `TRUNCATE`, a new leaf written
 directly) also changes the parent's rows without firing any trigger on it.
 
-The bar for supporting them: counts may be wrong for about one reconcile pass
-only when Trellis then detects the change and corrects it by itself, with no
-operator step, and every supported operation has a documented path that avoids
-the window altogether.
+The bar for supporting them: counts may be wrong for about one reconcile pass,
+plus the work of correcting the node the change touched, only when Trellis then
+detects the change and corrects it by itself, with no operator step, and every
+supported operation has a documented path that avoids the window altogether.
 
 This ADR extends [ADR-0002](0002-async-data-flow.md)'s capture and truncate
 decisions to partitioned sources. It settles which partition trees an aggregate
@@ -128,9 +128,9 @@ hosts don't offer one, and I found it fires neither for an interrupted
 
 The pass records each leaf's `pg_get_partition_constraintdef` text with the key
 columns' types and collations, fetching only for new or changed leaves and for a
-`DEFAULT` whose siblings changed. Cleanup routes a target row to a node by
-evaluating that text over the row, each group column cast to the source key
-column's type and collation. Every fetch and evaluation runs under
+`DEFAULT` whose siblings changed. A correction routes a group to a node by
+evaluating that text over the group key, each group column cast to the source
+key column's type and collation. Every fetch and evaluation runs under
 `search_path = pg_catalog, pg_temp`, `DateStyle ISO, YMD` and `TimeZone UTC`, in
 short transactions under a short `lock_timeout` that retry on a lock timeout.
 
@@ -149,12 +149,12 @@ leaves only.
 
 ### Each changed node is corrected in the pass that sees it, with no full rescan
 
-- A new, attached or re-attached leaf: install capture, then correct the
-  groups routing to it and re-aggregate that leaf alone.
+- A new, attached or re-attached leaf: install capture, then correct that leaf
+  alone.
 - A `DEFAULT` whose sibling set changed: treated as new.
-- A dropped or detached subtree: correct the groups routing to its topmost gone
-  node, by that node's recorded text. A detach-pending leaf is cleaned up only
-  once its `pg_inherits` row is gone and the ring has been folded.
+- A dropped or detached subtree: correct its topmost gone node, routing by that
+  node's recorded text. A detach-pending leaf is cleaned up only once its
+  `pg_inherits` row is gone and the ring has been folded.
 - Then the no-leaf sweep below.
 
 On an aggregate, a node's correction is a Re-derive of a key set through the
@@ -183,14 +183,14 @@ every window closed within 5.2 s under load. Those figures show the routing is
 exact, not what a correction costs. On the real path the work scales with the
 node's rows: I extrapolate from a build's throughput (10M rows in 65 s on 8
 workers) and from the primary-key reads of a join on `unnest`: a leaf of 1M rows
-takes about 7 s, and a retention `DROP` of 100M rows about 11 minutes plus roughly
-10 GB of tombstone WAL, then the ledger's deletes. These are
-extrapolations, not measurements. Rows an operation adds are undercounted until
-its correction drains, rows it removes are overcounted, and writes through the
-parent have no window at all. For a to-many target, deleting rows lost them for
-good in 180 of 189 trials; recomputing the routed parents reached zero diff in
-every cell, kept parents with no children left at a count of 0, and closed
-within 2.4-3.6 s.
+takes about 7 s, and a retention `DROP` of 100M rows about 11 minutes plus
+roughly 10 GB of tombstone WAL, then the garbage collector's deletes of those
+tombstones. These are extrapolations, not measurements. Rows an operation adds
+are undercounted until its correction drains, rows it removes are overcounted,
+and writes through the parent have no window at all. For a to-many target,
+deleting rows lost them for good in 180 of 189 trials; recomputing the routed
+parents reached zero diff in every cell, kept parents with no children left at a
+count of 0, and closed within 2.4–3.6 s.
 
 Why not tombstone the routed entries without reading the source when the gone
 bound is uncovered? It saves only the primary-key lookups, since the writes are
@@ -207,12 +207,13 @@ leaf's per-group totals inside the DDL's own transaction cost about 100 ms per
 ### A definition under correction reports `backfilling`, with a `correcting` field
 
 From the pass that detects a lifecycle change until the correction's key set has
-drained, the definition reports `backfilling`, as it does while a rebuild is
-requested, then returns to `live`. `status()` carries a `correcting` field with
-one entry per node being corrected: `node` (schema-qualified), `since` (when the
-pass queued it) and `keys_remaining`. In the interval of at most one pass between
-the DDL and its detection the status still reads `live`. A restart in the middle
-of a correction resumes it and reports `backfilling` again.
+drained, the definition reports `backfilling`, as it does while
+`request_backfill` re-derives it, then returns to `live`. `status()` carries a
+`correcting` field with one entry per node being corrected: `node`
+(schema-qualified), `since` (when the pass queued it) and `keys_remaining`. In
+the interval of at most one pass between the DDL and its detection the status
+still reads `live`. A restart in the middle of a correction resumes it and
+reports `backfilling` again.
 
 Staying `live` with only the field would make the `live` guarantee exclude
 partition maintenance for every caller, so a correction is reported as the
@@ -225,12 +226,13 @@ For `HASH` the sweep finds target groups over the missing remainders; for
 `pg_get_expr(relpartbound)` and ordered by the key column's collation. A
 `DEFAULT` under the root means no statement. The full routing form runs, limited
 to the groups the fold changed since the last successful check, only on a pass
-where a recorded node is gone and its text is unusable. The keys of the groups
-it finds are re-derived through the normal page path, as a node's correction is.
-The sweep's detector runs in its own `READ COMMITTED` transaction: the pass reads
-the lifecycle catalog before the constraint texts, re-reads it in a new
-statement after the detector's hits, and rolls back and retries if the leaf set
-changed.
+where a recorded node is gone and its text is unusable. On an aggregate, the
+keys of the live ledger entries in the groups it finds are corrected through the
+normal page path, as a node's are; on a to-many target, those parents are
+recomputed. The sweep runs in its own `READ COMMITTED` transaction: the pass
+reads the lifecycle catalog before the constraint texts, re-reads it in a new
+statement after queuing the hits' correction, and rolls back and retries if the
+leaf set changed.
 
 The sweep catches a leaf created and dropped between two passes, which no
 fingerprint sees. Its full routing form cost 4.1–7.3 s per pass at 1,000 leaves
@@ -239,11 +241,12 @@ and about 1M target rows, nearly the whole interval. The complement forms cost
 under 1 ms for `RANGE`, and 4–8 ms for `LIST`; reading the gaps took 1.9 ms. The
 changed-group fallback brought a never-recorded leaf's groups to zero diff, but
 only when the changed set survives a skipped check and the pass clears only the
-ids it read. Against the model target, without the re-read a leaf created between
-the catalog read and the cleanup lost its rows for a pass; under about 20 DDL
-statements a second I counted 264–308 wrongful deletes a minute without it and
-none in about 2,000 passes with it. Reading the constraint texts before the lifecycle catalog lost
-rows even with the re-read, so the order is part of the decision.
+ids it read. Against the model target, without the re-read a leaf created
+between the catalog read and the cleanup lost its rows for a pass; under about
+20 DDL statements a second I counted 264–308 wrongful deletes a minute without
+it and none in about 2,000 passes with it. Reading the constraint texts before
+the lifecycle catalog lost rows even with the re-read, so the order is part of
+the decision.
 
 ### A leaf or middle `TRUNCATE` queues that node's correction
 
@@ -254,7 +257,7 @@ that node's correction, with no floor and no barrier, so the other nodes' entrie
 and groups are untouched. A root `TRUNCATE` is unchanged: it clears the whole
 target, once.
 
-### `pg_upgrade` re-baselines the recorded state without re-aggregating
+### `pg_upgrade` re-baselines the recorded state; a restore pauses for a rebuild
 
 A changed `system_identifier` makes the pass compare the recorded nodes by oid
 and bound. When every recorded oid is present with the same bound it is
@@ -327,15 +330,16 @@ grouped `BY product_id` is refused at define, naming `order_id`.
   capture costing no more per write than on a plain table.
 - Partition maintenance needs no operator step, but counts can be wrong for
   about one interval plus a correction that costs O(rows in the node), not
-  O(groups): about 7 s for a leaf of 1M rows, and about 11 minutes and 10 GB of
-  tombstone WAL for a retention `DROP` of 100M. An operator who needs
-  exact counts throughout moves rows with DML through the parent instead, which
-  I measured at about 4–5 s and 0.5–0.6 GB of WAL per 1M-row leaf; creating an
-  empty leaf and writing through the parent costs nothing.
+  O(groups): by extrapolation, about 7 s for a leaf of 1M rows, and about 11
+  minutes and 10 GB of tombstone WAL for a retention `DROP` of 100M rows. An
+  operator who needs exact counts throughout moves rows with DML through the
+  parent instead, which I measured at about 4–5 s and 0.5–0.6 GB of WAL per
+  1M-row leaf; creating an empty leaf and writing through the parent costs
+  nothing.
 - The reconcile pass carries per-source catalog state (recorded nodes and two
-  fingerprints) and correction work, a few milliseconds per pass at 1,000
-  leaves, and capture gains one catalog call per statement on a partitioned
-  source.
+  fingerprints), a few milliseconds per pass at 1,000 leaves, and a durable
+  queue of pending corrections, and capture gains one catalog call per
+  statement on a partitioned source.
 - Installing capture stalls writers up to about 50 ms, or, on a tree of more
   than 100 nodes, takes about twice as long node by node.
 - Build statements don't prune, so their planning and locking grow with the
@@ -344,9 +348,9 @@ grouped `BY product_id` is refused at define, naming `order_id`.
   key, or an untested key type, is refused rather than handled slowly.
 - A retention `DROP` takes the definition out of `live` for as long as its
   correction runs, which can be minutes for a large leaf.
-- After a dump and restore the pass detects the new oids and pauses every
-  definition on a partitioned source, holding stale values until an operator
-  runs `RESUME`, which rebuilds.
+- After a dump and restore into another cluster the pass detects the new oids
+  and pauses every definition on a partitioned source, holding stale values
+  until an operator runs `RESUME`, which rebuilds.
 - Three cases are left as [known correctness gaps](../known-correctness-gaps.md)
   rather than designed around, because no capture shape or fingerprint sees
   them: "A `MERGE` that moves a row to another partition", "A `DEFAULT`

@@ -694,8 +694,9 @@ that is still changing.
   before every later one, and the fold voids the batch's own earlier rows, so
   the floor is a second line of defence: any change from before the truncate
   that still reaches a page is refused, the way Postgres's own lock orders
-  them. A truncate of one node of a partitioned source sets no floor; see
-  [ADR-0017](0017-partitioned-sources.md#a-leaf-or-middle-truncate-queues-that-nodes-correction).
+  them. A truncate of a leaf or middle of a partitioned source resets
+  nothing and sets no floor or barrier: it queues that node's correction
+  ([ADR-0017](0017-partitioned-sources.md#a-leaf-or-middle-truncate-queues-that-nodes-correction)).
 - Source `ALTER TABLE` on a read column follows the schema-changed marker
   and regeneration rule; on any other column it is invisible.
 - Dropping the last definition on a table drops its triggers on the next
