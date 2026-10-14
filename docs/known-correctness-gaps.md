@@ -109,7 +109,7 @@ These are the tools the entries refer to:
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg`, `array_agg` and `string_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
-| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886, #892 |
+| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886, #920, #892 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
@@ -580,14 +580,14 @@ while the column is paused.
 (`author.name AS author_name`), and concurrent writes to both tables: child
 rows inserted, deleted and inserted again while their parent's value changes
 several times. No pause, resume, build or other action is involved. It is
-rare and depends on load: one generated case, under the steady-load tier's
-page and build chunk stalls, fails a few times in 100 runs while other
-processes load the machine, and didn't fail in 200 runs on a quiet one.
+rare: one generated case, under the steady-load tier's page and build
+chunk stalls, fails about once in 100 runs.
 
-**Effect:** every child of one parent kept a value the parent held only
-briefly, after two later updates replaced it (61, then 17, then `NULL`; the
-children kept 61). This is silent. Writing a child again doesn't correct it,
-since the write reads the same stale projection.
+**Effect:** a parent's children keep a value the parent held only briefly,
+after later updates replaced it (61, then 17, then `NULL`; the children keep
+61). This is silent. When the stale value is in the relationship projection
+(below), writing a child again doesn't correct it, since the write reads the
+same stale projection.
 
 A second cause gives one child the same symptom: a child that joins a parent
 (inserted under it, or moved onto it) while a page is applying that
@@ -602,21 +602,20 @@ through a relationship (entry 16).
 
 **Planned work:**
 
-* #886. The relationship projection's own row for the parent keeps the
-  superseded value once everything has drained (61, while the parent holds
-  `NULL`), so every child read through it gets that value: a parent
-  change's advance of the projection is lost. A parent change that a
-  reverse guard deferred until after a later `TRUNCATE` of the parent table
-  doesn't do this: the truncate's clear of the projection stamps the
-  relationship the way a refresh does, so the retry writes the projection
-  from the live row rather than its own older image. Nor does a parent
-  change that a reverse guard deferred while a later change to the same
-  parent (an update or a delete) drained first: a deferred change's retry is
-  out of order with its parent's later changes, so it is checked against the
-  live row the same way rather than writing its older image. That was the
-  cause of most generated cases on #886 and #920. It isn't the shape of
-  #763's to-one projection ordering holes (an orphaned or missing projection
-  key), and it needs no resume or build.
+* #886 and #920. The relationship projection's own row for the parent
+  keeps the superseded value once everything has drained (61, while the
+  parent holds `NULL`), so every child read through it gets that value: a
+  parent change's advance of the projection is lost. A parent change that a
+  reverse guard deferred doesn't do this when a later change to the same
+  parent drains before its retry. After a later `TRUNCATE` of the parent
+  table, the truncate's clear of the projection stamps the relationship the
+  way a refresh does. After a later update or delete, the retry finds the
+  live row no longer matches its image. Either way the retry writes the projection from the live
+  row rather than its own older image. One generated case (#920's
+  `steady_load` 7:1) still fails about once in 100 runs with one child
+  holding the stale value, and its cause isn't known: it may be #892's. It
+  isn't the shape of #763's to-one projection ordering holes (an orphaned
+  or missing projection key), and it needs no resume or build.
 * #892, the second cause. A child's read of the projection doesn't wait for
   a page that has advanced the parent's row and not yet committed. The fix
   needs a design call: the page would lock the parents its rows join before
