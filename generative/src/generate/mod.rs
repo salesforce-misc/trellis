@@ -6,7 +6,7 @@
 //! Today's scope is the *trivial* generator (issue #6): every source table is
 //! shaped `(numeric pk, numeric c1, numeric c2)` and every definition is a
 //! 1-1 numeric-`+`, each with a seed-before-mutate op stream. Improvement-plan
-//! task **B3** (`local_docs/generative-suite-improvement-plan.md`) widened
+//! task **B3** widened
 //! this from *exactly* one table/one definition to **1-3 tables and 1-3
 //! definitions**, each definition independently drawing one of the tables as
 //! its source — see [`build_program_multi`] and [`TableSpec`]. The proptest
@@ -57,8 +57,7 @@
 //! real odds of emptying one out entirely — the single hardest edge in
 //! aggregate maintenance (`docs/generative-test-suite.md` §4 calls the
 //! aggregate delta path "the hardest guarantee": the only non-idempotent
-//! maintenance in the engine), per `local_docs/generative-suite-improvement-plan.md`'s
-//! task B4.
+//! maintenance in the engine); improvement-plan task B4.
 //!
 //! **The domain *is* now "0, 1, 2, plus `NULL`"**, matching the improvement
 //! plan's original text (issue #128). It wasn't always: a `NULL` grouping

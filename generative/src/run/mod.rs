@@ -250,9 +250,7 @@ pub async fn run_convergence<B: Backend>(
     // Improvement-plan workstream C, task C2: opt-in per-call timing around
     // each phase of the loop below, to find out where the suite's wall-clock
     // time actually goes (install, apply, snapshot, oracle recompute) rather
-    // than guessing — see `local_docs/generative-suite-improvement-plan.md`
-    // "C2" and its companion §1.3's cautionary tale about tuning before
-    // instrumenting. Same convention as C1's `GENERATIVE_QUIESCE_TIMING` in
+    // than guessing: measure before tuning. Same convention as C1's `GENERATIVE_QUIESCE_TIMING` in
     // `crate::backend::manual::ManualBackend::quiesce`: an independent env
     // var (`GENERATIVE_COST_TIMING`), checked once per call site, silent and
     // free unless set.

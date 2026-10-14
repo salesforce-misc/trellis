@@ -126,7 +126,7 @@ proptest! {
     }
 }
 
-/// D2 item 3 (`local_docs/generative-suite-improvement-plan.md`): a coverage
+/// D2 item 3 (improvement plan): a coverage
 /// floor confirming the generator actually produces programs where
 /// `reordered_by_commute_groups` does something non-trivial often enough for
 /// the property above to be non-vacuous. If every generated program had only

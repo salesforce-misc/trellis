@@ -4,9 +4,8 @@
 //! alongside every table (`generative::run::run_convergence`'s only behavior
 //! before this task).
 //!
-//! **Explicitly out of scope, per the rescoping** (see
-//! `local_docs/generative-suite-improvement-plan.md`'s workstream E and this
-//! branch's own task description): "redefine" (altering an existing
+//! **Explicitly out of scope, per the rescoping** (improvement-plan
+//! workstream E): "redefine" (altering an existing
 //! definition) and "remove" (dropping one) are not attempted here.
 //! `defs::catalog` has no drop/alter-definition API today — only
 //! `create_definition`/`create_definition_without_backfill`/`install_definition`

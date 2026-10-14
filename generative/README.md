@@ -17,8 +17,7 @@ properties actually ran, not just the meta-tests. Each proptest case round-trips
 cluster (`testkit`), so a healthy run at the design doc §9 case-count band
 (12–24 per property) takes real wall-clock time. A suite that reports green
 too fast to have done that work is a bug in the harness, not a fast pass —
-see `docs/generative-test-suite.md` §6 and `generative/tests/meta.rs`. As of
-`local_docs/generative-suite-improvement-plan.md`'s workstream A, this
+see `docs/generative-test-suite.md` §6 and `generative/tests/meta.rs`. This
 wall-clock heuristic is backed by `run::Coverage`'s floor assertions
 (`tests/coverage.rs`) for the fast, DB-free half of "did it actually run" —
 this note stays as a smell to notice, not the only check.
@@ -39,8 +38,8 @@ entirely, that stall, not test-harness overhead; see the git history for
 measurement writeup.
 
 That stall was an engine bug, issue #452, not the seal age gate
-(`SealConfig::age_gate`) that `local_docs/transit-comparison.md` §3.3
-suspected: a convergence wait whose token landed past the last decoded
+(`SealConfig::age_gate`) that an earlier
+diagnosis suspected: a convergence wait whose token landed past the last decoded
 change waited for the then-replication intake's keepalive-driven persist,
 throttled to once per 10s. Fixing that dropped the fast-lane binaries'
 serial time from 385s to 174s (fifteen binaries, measured 2026-09-24), and

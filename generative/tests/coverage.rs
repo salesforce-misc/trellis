@@ -446,7 +446,7 @@ fn duplicate_insert_is_a_distinct_mutate_from_update_and_delete() {
     assert!(matches!(program.ops[1], Op::Insert { .. }));
 }
 
-/// A2 (`local_docs/generative-suite-improvement-plan.md`): the [`Coverage`]
+/// A2 (improvement-plan task): the [`Coverage`]
 /// accumulator's floors — no database, no `Harness`, just the default
 /// strategy sampled many times, same as every other test in this file. This
 /// is the fast half of A2's payoff: if the generator's own machinery ever

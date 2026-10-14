@@ -23,7 +23,7 @@ use super::error::StagingError;
 use super::seal::fenced_window;
 
 /// Sorts the fold's ordered aggregates in memory rather than spilling to
-/// disk on a large batch (docs/.../04-claiming-and-the-fold.md, "Practical
+/// disk on a large batch (docs/staging-and-claiming/04-claiming-and-the-fold.md, "Practical
 /// notes on the fold"). `LOCAL` scopes it to the caller's transaction —
 /// [`fold`] takes a `Transaction` rather than any `GenericClient` precisely
 /// so this can't evaporate before the query below it runs.
@@ -31,7 +31,7 @@ const FOLD_WORK_MEM: &str = "SET LOCAL work_mem = '64MB'";
 
 /// `route % bucket_count = ANY(buckets)` — the **one** bucket definition,
 /// applied inside the fenced window so a key never folds across a boundary
-/// its worker doesn't own (docs/.../04-claiming-and-the-fold.md, "Partitioning
+/// its worker doesn't own (docs/staging-and-claiming/04-claiming-and-the-fold.md, "Partitioning
 /// a batch across workers"). This struct carries no claim state; it is pure
 /// SQL parameterization. [`BucketFilter::all`] selects the whole batch
 /// (`bucket_count = 1`, `buckets = [0]`), which is the only constructor this
@@ -317,7 +317,7 @@ impl ToColumns {
 
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
 /// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
-/// window. See the module doc and docs/.../04-claiming-and-the-fold.md for
+/// window. See the module doc and docs/staging-and-claiming/04-claiming-and-the-fold.md for
 /// the rules this SQL encodes.
 ///
 /// Takes a `&Transaction` rather than any `GenericClient` so `SET LOCAL
@@ -616,7 +616,7 @@ fn fold_sql(
     let to_tables_idx = fence_param_count + 3;
     let to_columns_idx = fence_param_count + 4;
 
-    // The discriminator (docs/.../04-claiming-and-the-fold.md, "The two
+    // The discriminator (docs/staging-and-claiming/04-claiming-and-the-fold.md, "The two
     // kinds of missing image"): "does this row carry any image at all", not
     // "is this image column null". Scoping both arg-extremes to
     // `image_bearing` rows is what lets a born-in-batch insert's honest

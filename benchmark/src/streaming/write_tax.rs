@@ -15,8 +15,7 @@
 //!   `regexp_count(val::text, '[13579]')`. They put the capture numbers next to
 //!   costs application engineers already accept.
 //! - The logical-replication path before #622 C5 (`slot`) is gone with
-//!   intake (C7). C4's baseline (`local_docs/bench/622-baseline.md`) holds
-//!   its numbers.
+//!   intake (C7). C4's baseline holds its numbers.
 //! - `trigger`: the capture triggers, installed through the real installer
 //!   ([`trellis::dev::capture::install`]), with the capture spec computed
 //!   from the catalog the way the staging worker's reconcile does.

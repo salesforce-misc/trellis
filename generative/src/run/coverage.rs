@@ -1,7 +1,7 @@
 //! A green run is currently a single bit: nobody can see that a `Delete` op
 //! stopped being drawn, or that a run drew zero mutates, or that the
 //! op-outcome paths added in A1 (`OpOutcome::Fails`/`AffectsNoRows`) stopped
-//! occurring at all (`local_docs/generative-suite-improvement-plan.md` §A2).
+//! occurring at all (`docs/generative-test-suite.md` §6).
 //! [`Coverage`] is the accumulator that makes a run report what it actually
 //! exercised: it walks a [`crate::model::Program`]'s plain-data structure —
 //! no database access — so the exact same accounting works both against

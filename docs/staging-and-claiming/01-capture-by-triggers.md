@@ -410,7 +410,7 @@ neighbouring keys then form the read-write conflict chains Postgres cancels
 with `40001`. Every insert of an auto-increment id lands on the rightmost
 leaf, so with an unconditional re-read 50% of single-row serializable
 inserts failed at 4 writers and 87% at 8 and 16, where none fail without
-capture (`benchmark` scenario `ssi-tax`; `local_docs/pr/623-d8a.md`).
+capture (`benchmark` scenario `ssi-tax`).
 
 So capture re-reads only when the live row can differ from the transition
 row: when some other write to the same table changed it after the
@@ -445,7 +445,7 @@ has the argument.
 The capture runs inside the application's transaction, so the writer pays for
 it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
-WAL per row (`local_docs/bench/622-baseline.md`). The begin
+WAL per row (the `benchmark` `write_tax` scenarios). The begin
 trigger and the span bookkeeping add about 4.4 µs per statement,
 and nothing per row. An update's repeated-key check adds about 2.7 µs per
 statement and 0.3 µs per row (a rough in-transaction measurement, not

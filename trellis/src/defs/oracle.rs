@@ -108,7 +108,7 @@ pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 /// its rendered SQL against the same connection/`search_path` the definition
 /// itself was accepted under, so the bare branch can't drift the way the
 /// real backfill/apply/quarantine paths' pinned-`search_path` reads could
-/// (`docs/decisions/0011`) — only the explicit-schema case needed a real fix
+/// (`docs/decisions/0011-fully-qualified-names.md`) — only the explicit-schema case needed a real fix
 /// here, and it needs no database round trip: the schema is already right on
 /// `def`.
 #[cfg(any(test, feature = "test-util"))]

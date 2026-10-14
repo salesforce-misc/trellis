@@ -38,7 +38,7 @@ use trellis::{Config, Pool};
 /// One tokio runtime and one shared, initdb-once cluster for a test thread's
 /// proptest cases. See the module doc comment for why this is thread-local.
 ///
-/// `coverage` (A2, `local_docs/generative-suite-improvement-plan.md`)
+/// `coverage` (improvement-plan task A2, `docs/generative-test-suite.md` §6)
 /// accumulates every program `run_one` drives, pass or fail, so the property
 /// can report what it actually exercised instead of a single green/red bit —
 /// see [`Harness`]'s `Drop` impl below.
@@ -75,8 +75,7 @@ thread_local! {
             // expensive one-time cost the shared thread-local harness pays.
             // Silent and free unless `GENERATIVE_COST_TIMING` is set, same
             // convention as C1's `GENERATIVE_QUIESCE_TIMING` in
-            // `generative/src/backend/manual.rs` (see
-            // `local_docs/generative-suite-improvement-plan.md` "C2").
+            // `generative/src/backend/manual.rs` (improvement-plan task C2).
             let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
             let start = timing_enabled.then(std::time::Instant::now);
             let cluster = TestCluster::start();
