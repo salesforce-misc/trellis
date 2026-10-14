@@ -581,7 +581,7 @@ while the column is paused.
 rows inserted, deleted and inserted again while their parent's value changes
 several times. No pause, resume, build or other action is involved. It is
 rare: one generated case, under the steady-load tier's page and build
-chunk stalls, fails about once in 100 runs.
+chunk stalls, failed once in 200 runs.
 
 **Effect:** a parent's children keep a value the parent held only briefly,
 after later updates replaced it (61, then 17, then `NULL`; the children keep
@@ -612,7 +612,7 @@ through a relationship (entry 16).
   way a refresh does. After a later update or delete, the retry finds the
   live row no longer matches its image. Either way the retry writes the projection from the live
   row rather than its own older image. One generated case (#920's
-  `steady_load` 7:1) still fails about once in 100 runs with one child
+  `steady_load` 7:1) still failed once in 200 runs, with one child
   holding the stale value, and its cause isn't known: it may be #892's. It
   isn't the shape of #763's to-one projection ordering holes (an orphaned
   or missing projection key), and it needs no resume or build.
