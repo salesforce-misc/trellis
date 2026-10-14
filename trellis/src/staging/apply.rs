@@ -3393,6 +3393,10 @@ async fn apply_projection_from_live(
         &shape.to_col,
     )
     .await?;
+    // A projected column the to-side no longer has (renamed or dropped while
+    // the definition reading it is paused) is written `NULL`, as the image
+    // path's `jsonb_populate_record` writes a column the image lacks.
+    let live_columns = live_row_columns(txn, &to_side.identity).await?;
     let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
     let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
     let mut insert_cols = vec![key_ident.clone()];
@@ -3401,7 +3405,11 @@ async fn apply_projection_from_live(
     for col in &data_columns {
         let ident = quote_ident(col);
         insert_cols.push(ident.clone());
-        select_exprs.push(format!("t.{ident}"));
+        if live_columns.contains(col) {
+            select_exprs.push(format!("t.{ident}"));
+        } else {
+            select_exprs.push("null".to_string());
+        }
         update_sets.push(format!("{ident} = excluded.{ident}"));
     }
     insert_cols.push(gen_ident);
