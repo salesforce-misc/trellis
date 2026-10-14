@@ -273,3 +273,67 @@ async fn the_probe_reports_when_a_backing_off_chunk_comes_due() {
     .await;
     assert_eq!(probe().await.next_due, None);
 }
+
+/// The work channel is cut to Postgres's 63-byte limit on a character
+/// boundary, and the triggers' baked-in name is the one `work_wake_channel()`
+/// hands the workers: for a schema whose name fills the limit, a multi-byte
+/// one that has to be cut mid-name, and one that needs quoting.
+#[tokio::test]
+async fn a_long_or_quoted_schemas_triggers_notify_the_channel_its_workers_listen_on() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    for schema in ["s".repeat(63), "é".repeat(31), "Inst \"B\" x".to_string()] {
+        let config =
+            trellis::Config::with_schema(db.dsn().to_string(), schema.as_str()).expect("schema");
+        let handle = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+            .await
+            .expect("connect");
+        handle.migrate().await.expect("migrate");
+        handle.shutdown().await.expect("shutdown");
+
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let quoted = format!("\"{}\"", schema.replace('"', "\"\""));
+        let channel: String = raw
+            .query_one(&format!("select {quoted}.work_wake_channel()"), &[])
+            .await
+            .expect("channel")
+            .get(0);
+        assert!(channel.len() <= 63, "{channel:?}");
+        assert!(channel.ends_with("_work"), "{channel:?}");
+        let cut = channel.strip_suffix("_work").expect("suffix");
+        assert!(
+            schema.starts_with(cut),
+            "{channel:?} is cut from {schema:?}"
+        );
+        assert!(
+            schema.len() + "_work".len() <= 63 || channel.len() > 63 - "é".len(),
+            "{channel:?} is cut no shorter than it has to be"
+        );
+
+        let mut listener = Listener::open(db.dsn(), &channel.replace('"', "\"\"")).await;
+        raw.batch_execute(&format!(
+            "create temp table t (x integer); \
+             create trigger chunk after insert on t \
+                 for each row execute function {quoted}.announce_chunk_work(); \
+             create trigger definition after update on t \
+                 for each row execute function {quoted}.announce_definition_work(); \
+             insert into t values (1)"
+        ))
+        .await
+        .expect("fire the chunk trigger");
+        assert_eq!(listener.heard().await, 1, "chunk trigger in {schema:?}");
+        raw.batch_execute("update t set x = 2")
+            .await
+            .expect("fire the definition trigger");
+        assert_eq!(
+            listener.heard().await,
+            1,
+            "definition trigger in {schema:?}"
+        );
+    }
+}

@@ -1110,3 +1110,119 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
 
     client.shutdown().await.expect("clean shutdown");
 }
+
+/// Issue #273: an idle drain worker backs off its wake, so every edge that
+/// makes work claimable must wake it. Here every wait a drain worker can
+/// make (`poll_interval`, `idle_wake_cap`) is an hour, far past this test's
+/// budget, so the build and the drain move only on notifications: a seal's,
+/// a discharge's, an apply's, and the database's own on the work channel
+/// (migration V86). A new definition is built through its plan job,
+/// re-derive chunks, sweep and merges to `live`, then a source insert and
+/// update drain into it. An edge nothing announces stalls the test until
+/// its budget runs out.
+#[tokio::test]
+async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_alone() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    raw.batch_execute(
+        "create table public.src (id integer primary key, g integer, v bigint); \
+         insert into public.src select i, i % 7, i from generate_series(1, 500) i",
+    )
+    .await
+    .expect("seed src");
+
+    let hour = Duration::from_secs(3600);
+    let options = ClientOptions {
+        staging_worker: true,
+        application_threads: 2,
+        poll_interval: hour,
+        idle_wake_cap: hour,
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    // Both workers' `LISTEN`s are in place (the last statement of a wake
+    // listener's session), so a notification from here on reaches them.
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(20),
+        "the drain workers' wake listeners never came up",
+        async || {
+            let listening: i64 = raw
+                .query_one(
+                    "select count(*) from pg_stat_activity \
+                     where query like 'listen %'",
+                    &[],
+                )
+                .await
+                .expect("count listeners")
+                .get(0);
+            listening == 2
+        },
+    )
+    .await;
+
+    let columns = [
+        (
+            "id".to_string(),
+            ValueType::Integer(trellis::IntWidth::Int4),
+        ),
+        ("g".to_string(), ValueType::Integer(trellis::IntWidth::Int4)),
+        ("v".to_string(), ValueType::Integer(trellis::IntWidth::Int8)),
+    ]
+    .into_iter()
+    .collect();
+    install_definition(
+        &db.pool,
+        "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+
+    let mismatches = async || -> i64 {
+        raw.query_one(
+            "select count(*) from ( \
+                 select g, sum(v) as total from public.src group by g) o \
+             full join public.agg t on t.g = o.g \
+             where t.g is null or o.g is null or t.total is distinct from o.total",
+            &[],
+        )
+        .await
+        .expect("compare agg with its oracle")
+        .get(0)
+    };
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        "the aggregate never went live built right with every drain worker waiting an hour",
+        async || {
+            let status: String = raw
+                .query_one("select status from transform_definitions", &[])
+                .await
+                .expect("read status")
+                .get(0);
+            status == "live" && mismatches().await == 0
+        },
+    )
+    .await;
+
+    raw.batch_execute(
+        "insert into public.src select i, i % 9, i from generate_series(501, 520) i; \
+         update public.src set v = v + 1000 where id <= 10",
+    )
+    .await
+    .expect("change src");
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        "a source change never drained with every drain worker waiting an hour",
+        async || mismatches().await == 0,
+    )
+    .await;
+
+    client.shutdown().await.expect("clean shutdown");
+}
