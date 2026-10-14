@@ -41,6 +41,9 @@
 //!   bench idle-cost --statements
 //! ```
 //!
+//! `--definitions N` installs a chain of N transforms instead of one, to read
+//! what each extra definition costs while idle (#273).
+//!
 //! `--no-staging-worker` and `--application-threads 0` split the idle cost
 //! into its halves. A definition only goes live with a staging worker *and* a
 //! drain thread, so for either the install runs under a full client first and
@@ -153,6 +156,7 @@ pub async fn run(
     duration: Duration,
     tuning: &EngineTuning,
     statements: bool,
+    definitions: usize,
 ) -> IdleCostResult {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -169,7 +173,7 @@ pub async fn run(
     };
     let mut client =
         trellis::Client::start(db.dsn(), setup.client_options()).expect("client start");
-    let chain = install_chain_hops(&db.pool, &source, 1).await;
+    let chain = install_chain_hops(&db.pool, &source, definitions).await;
     wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;
     if !tuning.staging_worker || tuning.application_threads == 0 {
         client.shutdown().await.expect("setup client shutdown");

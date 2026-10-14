@@ -572,8 +572,17 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             let tuning = throughput_tuning(args);
 
             let statements = args.iter().any(|a| a == "--statements");
+            let definitions = number(args, "--definitions")
+                .map_or(1, |n| n as usize)
+                .max(1);
 
-            let result = runtime().block_on(idle_cost::run(warmup, duration, &tuning, statements));
+            let result = runtime().block_on(idle_cost::run(
+                warmup,
+                duration,
+                &tuning,
+                statements,
+                definitions,
+            ));
             println!("{}", result.to_json());
             if let Some(rows) = &result.statements_json {
                 println!("{rows}");
