@@ -680,6 +680,29 @@ async fn reverse_recompute_to_many_stages_from_side_recomputes() {
         vec!["2".to_string()],
         "comment delete re-derives its article"
     );
+
+    // Truncate the to-side -> recompute every article, found in Phase 2
+    // (`ReverseTrigger::WholeKeyspace`). A to-many relationship has no
+    // projection, so it keeps that lookup rather than a to-one projection's
+    // Phase 3 read after the clear (issue #920).
+    client
+        .batch_execute("truncate comments")
+        .await
+        .expect("truncate comments");
+    stage_cdc(
+        &client,
+        "comments",
+        TRUNCATE_SENTINEL_KEY,
+        "truncate",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        reverse_keys_for_to_side_change(&db.pool, &mut client, "articles").await,
+        vec!["1".to_string(), "2".to_string()],
+        "a to-side truncate re-derives every article"
+    );
 }
 
 // ---------------------------------------------------------------------

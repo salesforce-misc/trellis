@@ -109,7 +109,7 @@ These are the tools the entries refer to:
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
 | 18 | `jsonb_agg`, `array_agg` and `string_agg` element order differs between recomputes | yes | no | none filed |
 | 19 | A paused column doesn't pause the aggregates that read it | yes | on the upstream only | none filed |
-| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #886, #920, #892 |
+| 21 | A to-one relationship field keeps a superseded parent value under concurrent writes (rare) | yes | no | #892 |
 | 22 | A column read only as a field moved to another type family (`integer` → `double precision`, `numeric` ↔ `double precision`) | a value rounded into the old type is silent; other writes fail | at failure; `self_check` (1-1 targets only) | none filed |
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
@@ -579,62 +579,34 @@ while the column is paused.
 ## 21. A to-one relationship field keeps a superseded parent value under concurrent writes
 
 **Trigger:** a 1-1 definition with a field read through a to-one relationship
-(`author.name AS author_name`), and concurrent writes to both tables: child
-rows inserted, deleted and inserted again while their parent's value changes
-several times. No pause, resume, build or other action is involved. It is
-rare: one generated case, under the steady-load tier's page and build
-chunk stalls, failed once in 200 runs.
+(`author.name AS author_name`), and concurrent writes to both tables: a child
+joins a parent (inserted under it, inserted again after a delete, or moved
+onto it) while a page is applying a change to that parent, and a page or a
+build chunk writes the child before that page commits. The parent change can
+be an update, a delete or a `TRUNCATE` of the parent table. It is rare: no
+generated case is known to fail on it.
 
-**Effect:** a parent's children keep a value the parent held only briefly,
-after later updates replaced it (61, then 17, then `NULL`; the children keep
-61). This is silent. When the stale value is in the relationship projection
-(below), writing a child again doesn't correct it, since the write reads the
-same stale projection.
-
-A second cause gives one child the same symptom: a child that joins a parent
-(inserted under it, or moved onto it) while a page is applying that
-parent's change, after the page found the parent's children and before it
-commits. The child's write reads the parent's value from before the change,
-and the page's recompute of the parent's children doesn't include the
-child. Here the projection holds the new value, so writing the child again
-corrects it.
+**Effect:** the child keeps the value its parent held before the change
+(after a `TRUNCATE`, the truncated parent's value). This is silent. The
+relationship projection holds the parent's new value, so any later write to
+the child corrects it.
 
 **Detected?** No. `self_check` doesn't compare a 1-1 target with a field read
 through a relationship (entry 16).
 
-**Planned work:**
+**Planned work:** #892. The page finds the parent's children to re-derive
+before it commits (for a `TRUNCATE`, in its own transaction just after it
+clears the projection). A child that joins the parent after that read is not
+among them, and its own write reads the projection without waiting for the
+page, so it reads the value from before the change. The fix needs a design
+call: the page would lock the parents its rows join before it evaluates
+them, or check the parent's row there and stage the child again when it
+moved. Milestone E (#624) replaces the relationship projection a 1-1
+target reads its to-one values from.
 
-* #886 and #920. The relationship projection's own row for the parent
-  keeps the superseded value once everything has drained (61, while the
-  parent holds `NULL`), so every child read through it gets that value: a
-  parent change's advance of the projection is lost. A parent change that a
-  reverse guard deferred doesn't do this when a later change to the same
-  parent drains before its retry. After a later `TRUNCATE` of the parent
-  table, the truncate's clear of the projection stamps the relationship the
-  way a refresh does. After a later update or delete, the retry finds the
-  live row no longer matches its image. Either way the retry writes the projection from the live
-  row rather than its own older image. A `TRUNCATE` of the parent table
-  re-derives every child it finds pointing at a parent, and it finds them
-  after it clears the projection, so a child that comes back (inserted
-  again, or moved back onto a parent) while the truncate is being applied
-  is re-derived too, even when a build or a page wrote it from the
-  projection before the clear (#920's `steady_load` 7:1).
-* #892, the second cause. A child's read of the projection doesn't wait for
-  a page that has advanced the parent's row and not yet committed. The fix
-  needs a design call: the page would lock the parents its rows join before
-  it evaluates them, or check the parent's row there and stage the child
-  again when it moved.
-
-Milestone E (#624) replaces the relationship projection a 1-1 target reads
-its to-one values from.
-
-**Repair:** `request_backfill` the parent table. Its catch-up refreshes the
-relationship projection from the table, then re-derives every child from it.
-`PAUSE`/`RESUME` of the transform repairs it only when every other
-transform on the child table that reads the same relationship is paused too:
-a resume refreshes the projection only when no unpaused transform reads it,
-and otherwise its rebuild reads the same stale projection. For the second
-cause alone, any later write to the child repairs it.
+**Repair:** any later write to the child. `request_backfill` of the parent
+table also repairs it: its catch-up refreshes the relationship projection
+from the table, then re-derives every child from it.
 
 ## 22. A column read only as a field moved to another type family
 
