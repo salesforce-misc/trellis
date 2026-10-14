@@ -2225,7 +2225,8 @@ pub struct WorkProbe {
     /// How long until the soonest unclaimed, undone chunk stops backing off
     /// (`next_attempt_at`). That edge is a clock, not a row change, so nothing
     /// announces it; an idle worker schedules its own wake for it. `None`
-    /// when no such chunk exists.
+    /// when no such chunk exists, and when `may_exist` (the worker isn't
+    /// idle, so it isn't asked).
     pub next_due: Option<Duration>,
 }
 
@@ -2241,13 +2242,20 @@ pub struct WorkProbe {
 /// change announces.
 pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
     let client = pool.get().await?;
+    // Both answers stop early: `exists` at the first row, and the soonest
+    // retry is only looked for when nothing is claimable (an uncorrelated
+    // subquery in a `case` branch not taken never runs), so a build with
+    // many chunks pending doesn't scan them all on every pass.
     let sql = format!(
-        "select coalesce(bool_or(bc.next_attempt_at is null or bc.next_attempt_at <= now()), false) \
-                    or exists (select 1 from transform_definitions d where {}), \
-                extract(epoch from min(bc.next_attempt_at - now()) \
-                    filter (where bc.next_attempt_at > now()))::float8 \
-         from backfill_chunks bc \
-         where not bc.done and bc.claimed_by is null",
+        "select p.may_exist, case when not p.may_exist then ( \
+                select extract(epoch from min(bc.next_attempt_at) - now())::float8 \
+                from backfill_chunks bc \
+                where not bc.done and bc.claimed_by is null and bc.next_attempt_at > now()) end \
+         from (select exists ( \
+                   select 1 from backfill_chunks bc \
+                   where not bc.done and bc.claimed_by is null \
+                     and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
+               ) or exists (select 1 from transform_definitions d where {}) as may_exist) p",
         building_predicate(),
     );
     let statement = client.prepare_cached(&sql).await?;
