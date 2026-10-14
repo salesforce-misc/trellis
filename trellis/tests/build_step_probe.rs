@@ -216,3 +216,27 @@ async fn the_probe_ignores_claimed_backing_off_and_done_chunks() {
         .expect("done");
     assert!(!f.may_exist().await, "done");
 }
+
+/// An old build's chunk (a 1-1 `range` or a `direct` build job) is the one
+/// kind of work `building` does not list: its definition is `backfilling`
+/// with no Re-derive build. The probe's chunk clause alone must find it, or
+/// an idle worker would never claim it.
+#[tokio::test]
+async fn the_probe_finds_an_old_build_chunk_nothing_else_announces() {
+    let f = Fixture::new().await;
+    f.raw
+        .batch_execute(
+            "update transform_definitions set status = 'backfilling', build = null; \
+             insert into backfill_chunks (definition_id, kind, lo, hi, fuse_rearmed_at) \
+             select id, 'direct', null, null, fuse_rearmed_at from transform_definitions",
+        )
+        .await
+        .expect("enqueue a direct build job");
+    assert!(f.may_exist().await, "an old build's job is work");
+    let client = f.db.pool.get().await.expect("pool");
+    let claimed = chunk_queue::claim_chunks(&**client, "worker", 1)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "the old claim hands it out");
+    assert!(!f.may_exist().await, "held by a worker, nothing is left");
+}
