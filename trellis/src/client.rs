@@ -1848,7 +1848,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
 
         let seg_seqs = match seg_seqs {
             Ok(seqs) if !seqs.is_empty() => seqs,
-            Ok(_) | Err(_) => {
+            listed => {
                 // No claimable segment this tick (or the lookup itself
                 // failed): build work comes next (#625 B6). Only actually
                 // wait if it made no progress — otherwise loop straight
@@ -1862,20 +1862,15 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     &mut merge_failures,
                 )
                 .await;
-                // Only here is the worker idle: no segment to look at and,
-                // when the probe is answered, no build work either. Anything
-                // else is a peer's work in flight, which finishes with its
-                // own `NOTIFY` or is waited on at the poll floor.
-                let wait = match step {
-                    BuildStep::Progress => {
-                        backoff.reset();
-                        continue;
-                    }
-                    BuildStep::Idle { next_due } => backoff.idle_wait(wake.is_up(), next_due),
-                    BuildStep::Waiting => {
-                        backoff.reset();
-                        poll_interval
-                    }
+                // Only here is the worker idle: no segment to look at (a
+                // lookup that failed found nothing out, so it isn't "none")
+                // and, when the probe is answered, no build work either.
+                // Anything else is a peer's work in flight, which finishes
+                // with its own `NOTIFY`, or a failure, and is waited on at
+                // the poll floor.
+                let Some(wait) = backoff.after_build_step(&step, listed.is_ok(), wake.is_up())
+                else {
+                    continue;
                 };
                 match wait_for_wake(&mut wake, &mut shutdown_rx, wait).await {
                     WakeEnd::Shutdown => break,
@@ -2038,6 +2033,29 @@ impl IdleBackoff {
 
     fn reset(&mut self) {
         self.streak = 0;
+    }
+
+    /// The wait after a pass that found no segment to drain and took `step`
+    /// of build work, or `None` to loop straight back. `listed` is whether
+    /// the segment lookup answered: one that failed says nothing about the
+    /// ring, so the pass isn't idle and waits at the floor.
+    fn after_build_step(
+        &mut self,
+        step: &BuildStep,
+        listed: bool,
+        listener_up: bool,
+    ) -> Option<Duration> {
+        match step {
+            BuildStep::Progress => {
+                self.reset();
+                None
+            }
+            BuildStep::Idle { next_due } if listed => Some(self.idle_wait(listener_up, *next_due)),
+            BuildStep::Idle { .. } | BuildStep::Waiting => {
+                self.reset();
+                Some(self.floor)
+            }
+        }
     }
 
     /// The wait after an idle pass. `next_due` shortens it to the moment a
@@ -2666,6 +2684,26 @@ mod wake_listener_tests {
         }
         assert_eq!(backoff.idle_wait(true, Some(ms(300))), ms(301));
         assert_eq!(backoff.idle_wait(true, Some(ms(90_000))), ms(1500));
+        // Only a pass that listed no segment and found no build work backs
+        // off: work in flight, a failed segment lookup and progress don't.
+        backoff.reset();
+        let idle = BuildStep::Idle { next_due: None };
+        assert_eq!(backoff.after_build_step(&idle, true, true), Some(ms(200)));
+        assert_eq!(backoff.after_build_step(&idle, true, true), Some(ms(400)));
+        assert_eq!(backoff.after_build_step(&idle, false, true), Some(ms(200)));
+        assert_eq!(backoff.after_build_step(&idle, true, true), Some(ms(200)));
+        backoff.idle_wait(true, None);
+        assert_eq!(
+            backoff.after_build_step(&BuildStep::Waiting, true, true),
+            Some(ms(200))
+        );
+        assert_eq!(backoff.after_build_step(&idle, true, true), Some(ms(200)));
+        backoff.idle_wait(true, None);
+        assert_eq!(
+            backoff.after_build_step(&BuildStep::Progress, true, true),
+            None
+        );
+        assert_eq!(backoff.after_build_step(&idle, true, true), Some(ms(200)));
         // A cap under the floor is the floor: the backoff is off.
         let mut off = IdleBackoff::new(ms(200), ms(10));
         assert_eq!(off.idle_wait(true, None), ms(200));
