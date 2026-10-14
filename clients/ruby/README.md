@@ -424,7 +424,11 @@ source rows; a test database has none, so that is immediate. Runtime state
 - The hook applies to one database config, `config.trellis.dump_database`
   (default `"primary"`): the one `config.trellis.connect` and
   `config.trellis.instances` point at. Other databases dump as Rails dumps
-  them.
+  them. The dump raises `Trellis::ValidationError`, writing nothing, when
+  `config.trellis.connect` or an instance points at a different database than
+  that config. They are compared by host, port and database name as libpq
+  resolves them (a URL or keyword string on either side; spellings are not
+  equated, so `localhost` is not `127.0.0.1`).
 - `pg_dump` and `dump_definitions_sql` read separate snapshots. The hook reads
   the definitions before and after the `pg_dump` and redoes the dump when they
   differ (three attempts, then `Trellis::ConflictError`), so a define or drop
