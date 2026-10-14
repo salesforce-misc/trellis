@@ -1,8 +1,8 @@
 defmodule Trellis.StructureDumpTest do
-  # `mix ecto.dump` + `mix trellis.dump` + `mix ecto.load`, the way a host
-  # runs them: the adapter's own structure_dump and structure_load around
-  # `Trellis.StructureDump.append/2`, against a cluster of its own. No
-  # polling: the loaded database is read, not waited on.
+  # `mix trellis.dump` (which runs `mix ecto.dump`) + `mix ecto.load`, the
+  # way a host runs them, against a cluster of its own; `dump/2`'s redo with
+  # a dump function that races a define deterministically. No polling: the
+  # loaded database is read, not waited on.
   use ExUnit.Case, async: false
 
   alias Trellis.{Status, StructureDump, TestCluster, TestRepo}
@@ -35,11 +35,16 @@ defmodule Trellis.StructureDumpTest do
     )
 
     config = TestRepo.config()
-    {:ok, path} = Ecto.Adapters.Postgres.structure_dump(dir, config)
+    # The mix task runs `ecto.dump` itself, with its own arguments, and
+    # appends; a second append replaces the appendix rather than loading it
+    # twice. `--prefix public` makes pg_dump write `CREATE SCHEMA public`.
+    path = Path.join(dir, "structure.sql")
+
+    Mix.Tasks.Trellis.Dump.run(
+      ~w(-r Trellis.TestRepo --dump-path #{path} --prefix public --prefix trellis --quiet)
+    )
+
     assert {:ok, ^path} = StructureDump.append(TestRepo)
-    # A second run, through the mix task, replaces the appendix rather than
-    # loading it twice.
-    Mix.Tasks.Trellis.Dump.run(["-r", "Trellis.TestRepo", "--dump-path", path, "--quiet"])
 
     text = File.read!(path)
     assert length(String.split(text, "-- Trellis definitions (")) == 2
@@ -62,8 +67,7 @@ defmodule Trellis.StructureDumpTest do
     # definition is there, defined and not built.
     assert :ok = Trellis.migrate(copy)
     assert %Status{status: :waiting_to_backfill} = Trellis.status!(copy, "dump_widget_prices")
-    assert [definition] = Trellis.definitions!(copy)
-    assert definition.target_table == "public.dump_widget_prices"
+    assert "public.dump_widget_prices" in Enum.map(Trellis.definitions!(copy), & &1.target_table)
   end
 
   test "a dump_prefixes without the Trellis schema is refused naming it" do
@@ -91,12 +95,97 @@ defmodule Trellis.StructureDumpTest do
     Trellis.migrate!(source)
 
     path = Path.join(dir, "structure.sql")
-    File.write!(path, "create table t ();\n-- Trellis definitions (stale)\ninsert stale;\n")
+    File.write!(path, "create table t ();\n-- Trellis definitions (stale)\ninsert into stale;\n")
 
     assert {:ok, ^path} = StructureDump.append(TestRepo)
     text = File.read!(path)
     assert String.starts_with?(text, "create table t ();\n-- Trellis definitions (trellis::")
     refute text =~ "stale"
+  end
+
+  test "a define that commits during the pg_dump redoes the dump", %{pg: pg, tmp_dir: dir} do
+    Postgrex.query!(pg, "create table dump_raced (id integer primary key, price integer)", [])
+    {:ok, source} = Trellis.connect(url: TestRepo.config()[:trellis][:url])
+    on_exit(fn -> Trellis.shutdown(source) end)
+    Trellis.migrate!(source)
+    runs = :counters.new(1, [])
+
+    # The define commits right after the first pg_dump, which so misses its
+    # target table; the definitions read after the dump then differ from
+    # those read before it.
+    dump = fn ->
+      {:ok, _} = Ecto.Adapters.Postgres.structure_dump(dir, TestRepo.config())
+      :counters.add(runs, 1, 1)
+
+      if :counters.get(runs, 1) == 1 do
+        Trellis.define!(
+          source,
+          "TRANSFORM dump_raced_prices FROM dump_raced SELECT price AS price"
+        )
+      end
+    end
+
+    assert {:ok, [path]} = StructureDump.dump([{TestRepo, []}], dump)
+    assert :counters.get(runs, 1) == 2
+    text = File.read!(path)
+    [dumped, appendix] = String.split(text, "-- Trellis definitions (")
+    assert dumped =~ "CREATE TABLE public.dump_raced_prices"
+    assert appendix =~ "dump_raced_prices"
+  end
+
+  test "definitions that change during every dump are refused", %{pg: pg, tmp_dir: dir} do
+    Postgrex.query!(pg, "create table dump_churn (id integer primary key, price integer)", [])
+    {:ok, source} = Trellis.connect(url: TestRepo.config()[:trellis][:url])
+    on_exit(fn -> Trellis.shutdown(source) end)
+    Trellis.migrate!(source)
+    runs = :counters.new(1, [])
+
+    dump = fn ->
+      {:ok, _} = Ecto.Adapters.Postgres.structure_dump(dir, TestRepo.config())
+      :counters.add(runs, 1, 1)
+      n = :counters.get(runs, 1)
+      Trellis.define!(source, "TRANSFORM dump_churn_#{n} FROM dump_churn SELECT price AS price")
+    end
+
+    assert {:error, message} = StructureDump.dump([{TestRepo, []}], dump)
+    assert message =~ "changed during each of 3 dumps"
+    assert :counters.get(runs, 1) == 3
+  end
+
+  test "append refuses a structure file that isn't there", %{tmp_dir: dir} do
+    missing = Path.join(dir, "missing.sql")
+    assert {:error, message} = StructureDump.append(TestRepo, dump_path: missing)
+    assert message =~ "run `mix ecto.dump` first"
+    refute File.exists?(missing)
+  end
+
+  test "an appendix starts a line of its own, and a marker line in the dump is kept", %{
+    tmp_dir: dir
+  } do
+    {:ok, source} = Trellis.connect(url: TestRepo.config()[:trellis][:url])
+    on_exit(fn -> Trellis.shutdown(source) end)
+    Trellis.migrate!(source)
+    path = Path.join(dir, "structure.sql")
+
+    # No trailing newline: the second append still finds the first's
+    # appendix at the start of a line, and replaces it.
+    File.write!(path, "create table t ();")
+    assert {:ok, ^path} = StructureDump.append(TestRepo)
+    assert {:ok, ^path} = StructureDump.append(TestRepo)
+    text = File.read!(path)
+    assert String.starts_with?(text, "create table t ();\n-- Trellis definitions (trellis::")
+    assert length(String.split(text, "-- Trellis definitions (")) == 2
+
+    # The marker's text inside the dump (a function body) is not an appendix.
+    body =
+      "create function f() returns int language sql as $$\n-- Trellis definitions (x)\nselect 1\n$$;\n"
+
+    File.write!(path, body)
+    assert {:ok, ^path} = StructureDump.append(TestRepo)
+    assert {:ok, ^path} = StructureDump.append(TestRepo)
+    text = File.read!(path)
+    assert String.starts_with?(text, body <> "-- Trellis definitions (trellis::")
+    assert length(String.split(text, "-- Trellis definitions (")) == 3
   end
 
   # The repo reads its configuration, `:trellis` included, from the

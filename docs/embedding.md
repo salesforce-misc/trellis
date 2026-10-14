@@ -702,14 +702,15 @@ the source rows.
   empty database or change it to `CREATE SCHEMA IF NOT EXISTS public`, as the
   Rails hook does.
 
-In Elixir, `mix trellis.dump` appends the definitions to the structure file
-that `mix ecto.dump` wrote, so `mix ecto.load` builds a database that has its
-transforms: they load defined and not built, and the worker builds them. Add
-the alias `"ecto.dump": ["ecto.dump", "trellis.dump"]` to `mix.exs`, and the
-Trellis schema to the repo's `:dump_prefixes` if it sets that.
-`Trellis.dump_definitions_sql/1` returns the same SQL for a caller that
-assembles its own dump. `pg_dump` and the definitions are read separately, so
-don't dump while a migration is defining; a paused or quarantined transform
+In Elixir, `mix trellis.dump` runs `mix ecto.dump` and appends the
+definitions to the structure file it wrote, so `mix ecto.load` builds a
+database that has its transforms: they load defined and not built, and the
+worker builds them. Add the alias `"ecto.dump": "trellis.dump"` to `mix.exs`,
+and the Trellis schema to the dump's `--prefix` list or the repo's
+`:dump_prefixes` if either names schemas. The task reads the definitions
+before and after the `pg_dump` and redoes the dump when a define or drop
+committed in between. `Trellis.dump_definitions_sql/1` returns the same SQL
+for a caller that assembles its own dump. A paused or quarantined transform
 loads `waiting_to_backfill`.
 
 ## Every call returns within 30 seconds
