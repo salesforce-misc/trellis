@@ -2217,6 +2217,18 @@ fn building_params() -> (&'static str, &'static str, &'static str) {
     )
 }
 
+/// What [`work_probe`] found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkProbe {
+    /// Whether a build step could find anything to do (see [`work_probe`]).
+    pub may_exist: bool,
+    /// How long until the soonest unclaimed, undone chunk stops backing off
+    /// (`next_attempt_at`). That edge is a clock, not a row change, so nothing
+    /// announces it; an idle worker schedules its own wake for it. `None`
+    /// when no such chunk exists.
+    pub next_due: Option<Duration>,
+}
+
 /// Whether a drain worker's build step could find anything to do, in one
 /// prepared statement (one transaction): a chunk of any kind that is undone,
 /// unclaimed and not backing off ([`chunk_queue::claim_chunks_of`]'s
@@ -2225,22 +2237,29 @@ fn building_params() -> (&'static str, &'static str, &'static str) {
 /// superset of both probes the step used to make on every idle wake
 /// (`claim_chunks`, then `building`), so a `false` means each of them would
 /// have found nothing, and a `true` only means they are worth running (#273).
-pub async fn work_may_exist(pool: &Pool) -> Result<bool, ChunkQueueError> {
+/// It also reports when the soonest backing-off chunk comes due, which no row
+/// change announces.
+pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
     let client = pool.get().await?;
     let sql = format!(
-        "select exists ( \
-             select 1 from backfill_chunks bc \
-             where not bc.done and bc.claimed_by is null \
-               and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
-         ) or exists (select 1 from transform_definitions d where {})",
+        "select coalesce(bool_or(bc.next_attempt_at is null or bc.next_attempt_at <= now()), false) \
+                    or exists (select 1 from transform_definitions d where {}), \
+                extract(epoch from min(bc.next_attempt_at - now()) \
+                    filter (where bc.next_attempt_at > now()))::float8 \
+         from backfill_chunks bc \
+         where not bc.done and bc.claimed_by is null",
         building_predicate(),
     );
     let statement = client.prepare_cached(&sql).await?;
     let params = building_params();
-    Ok(client
+    let row = client
         .query_one(&statement, &[&params.0, &params.1, &params.2])
-        .await?
-        .get(0))
+        .await?;
+    let next_due: Option<f64> = row.get(1);
+    Ok(WorkProbe {
+        may_exist: row.get(0),
+        next_due: next_due.map(|secs| Duration::from_secs_f64(secs.max(0.0))),
+    })
 }
 
 /// SQL over a `transform_definitions` row: whether the target `column`

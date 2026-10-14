@@ -143,6 +143,19 @@ pub struct ClientOptions {
     /// delivery, and the only wake source while the listener connection is
     /// down: the worker reopens it in the background with backoff).
     pub poll_interval: Duration,
+    /// The longest an idle app-worker task sits between looks at the queue
+    /// (#273). A worker that finds nothing claimable, and nothing building,
+    /// doubles its wait from [`Self::poll_interval`] up to this, because every
+    /// change that makes work claimable wakes it: a seal, a discharge and an
+    /// apply `NOTIFY` the wake channel, and the database announces build work
+    /// (a chunk created, released, reclaimed or retried, a definition
+    /// entering `backfilling`) on its own channel with triggers. The one edge
+    /// nothing announces is a chunk's `next_attempt_at` coming due, which the
+    /// worker schedules itself. So this bounds only a missed notification,
+    /// and it applies only while the worker's `LISTEN` is up; with the
+    /// listener down the worker polls every `poll_interval`. Set equal to
+    /// `poll_interval` to turn the backoff off.
+    pub idle_wake_cap: Duration,
     /// The most folded records one drain batch holds at once (issue #620,
     /// ADR-0002): a segment share larger than this drains in pages of at most
     /// this many, each its own compute-and-apply transaction, so a worker's
@@ -186,6 +199,7 @@ impl Default for ClientOptions {
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
+            idle_wake_cap: Duration::from_secs(5),
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
             build_chunk_rows: staging::build::DEFAULT_CHUNK_ROWS,
             worker_threads: None,
@@ -774,6 +788,7 @@ async fn run(
             drainer_window: options.drainer_window,
             heartbeat_config: options.heartbeat.clone(),
             poll_interval: options.poll_interval,
+            idle_wake_cap: options.idle_wake_cap,
             reclaim_ttl: options.reclaim_ttl,
             alive,
             watermark: watermark.clone(),
@@ -1724,6 +1739,8 @@ struct AppWorkerConfig {
     drainer_window: Duration,
     heartbeat_config: HeartbeatDaemonConfig,
     poll_interval: Duration,
+    /// [`ClientOptions::idle_wake_cap`].
+    idle_wake_cap: Duration,
     /// How long a backfill-chunk claim may sit unrefreshed before it's swept
     /// as stale — the same value [`MaintenanceConfig::reclaim_ttl`] uses for
     /// the ring's own claims. Passed here too (issue: chunk-reclaim sweep
@@ -1779,6 +1796,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         drainer_window,
         heartbeat_config,
         poll_interval,
+        idle_wake_cap,
         reclaim_ttl,
         alive: _alive,
         watermark,
@@ -1803,6 +1821,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     let mut drain_failures = DrainFailures::default();
     // The group-delta merges that failed on this worker, backing off (#901).
     let mut merge_failures = staging::build::MergeFailures::default();
+    let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1834,7 +1853,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                 // failed): build work comes next (#625 B6). Only actually
                 // wait if it made no progress — otherwise loop straight
                 // back around without an idle wait.
-                let build_progress = build_step(
+                let step = build_step(
                     &pool,
                     &claimed_by,
                     chunk_heartbeat_interval,
@@ -1843,10 +1862,25 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     &mut merge_failures,
                 )
                 .await;
-                if !build_progress
-                    && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await
-                {
-                    break;
+                // Only here is the worker idle: no segment to look at and,
+                // when the probe is answered, no build work either. Anything
+                // else is a peer's work in flight, which finishes with its
+                // own `NOTIFY` or is waited on at the poll floor.
+                let wait = match step {
+                    BuildStep::Progress => {
+                        backoff.reset();
+                        continue;
+                    }
+                    BuildStep::Idle { next_due } => backoff.idle_wait(wake.is_up(), next_due),
+                    BuildStep::Waiting => {
+                        backoff.reset();
+                        poll_interval
+                    }
+                };
+                match wait_for_wake(&mut wake, &mut shutdown_rx, wait).await {
+                    WakeEnd::Shutdown => break,
+                    WakeEnd::Notified | WakeEnd::ListenerChanged => backoff.reset(),
+                    WakeEnd::Elapsed => {}
                 }
                 continue;
             }
@@ -1913,27 +1947,46 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // that drained loops straight back to the ring; one that won nothing
         // there takes build work instead.
         let build_progress = !drained
-            && build_step(
-                &pool,
-                &claimed_by,
-                chunk_heartbeat_interval,
-                reclaim_ttl,
-                &build_options,
-                &mut merge_failures,
-            )
-            .await;
+            && matches!(
+                build_step(
+                    &pool,
+                    &claimed_by,
+                    chunk_heartbeat_interval,
+                    reclaim_ttl,
+                    &build_options,
+                    &mut merge_failures,
+                )
+                .await,
+                BuildStep::Progress
+            );
+        backoff.reset();
         let made_progress = drained || build_progress;
-        if !made_progress && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await {
+        if !made_progress
+            && wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await == WakeEnd::Shutdown
+        {
             break;
         }
     }
 }
 
+/// What a drain worker's build work for one pass came to.
+#[derive(Debug, PartialEq)]
+enum BuildStep {
+    /// A step did work: loop straight back.
+    Progress,
+    /// Nothing is claimable and nothing is building. `next_due` is how long
+    /// until a chunk now backing off may be claimed (nothing announces that
+    /// edge), when there is one.
+    Idle { next_due: Option<Duration> },
+    /// Work exists but this pass did none of it (a peer holds it, or an
+    /// ordering gate is closed): look again at the poll floor.
+    Waiting,
+}
+
 /// A drain worker's build work for one pass of its loop, after its segments
 /// (#625 B6, global since F3): one old-build chunk (a plain 1-1 range or a
 /// direct-build job, [`drain_backfill_chunks`]), then one step of the
-/// Re-derive builds' work ([`rederive_build_step`]). Returns whether either
-/// did work.
+/// Re-derive builds' work ([`rederive_build_step`]).
 async fn build_step(
     pool: &Pool,
     claimed_by: &str,
@@ -1941,17 +1994,69 @@ async fn build_step(
     reclaim_ttl: Duration,
     build_options: &staging::build::WorkerOptions,
     merge_failures: &mut staging::build::MergeFailures,
-) -> bool {
+) -> BuildStep {
     // One probe when there is nothing to do (#273): the two steps below
     // would each look, on every idle wake. An error is not "nothing": run
     // the steps, which report their own.
-    if matches!(staging::build::work_may_exist(pool).await, Ok(false)) {
+    if let Ok(probe) = staging::build::work_probe(pool).await
+        && !probe.may_exist
+    {
         merge_failures.clear();
-        return false;
+        return BuildStep::Idle {
+            next_due: probe.next_due,
+        };
     }
     let old = drain_backfill_chunks(pool, claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
     let rederive = rederive_build_step(pool, claimed_by, build_options, merge_failures).await;
-    old || rederive
+    if old || rederive {
+        BuildStep::Progress
+    } else {
+        BuildStep::Waiting
+    }
+}
+
+/// How an idle drain worker's wait grows (#273): from the poll floor, doubling
+/// for each wait that ended with nothing to do, up to the cap, and back to the
+/// floor on a wake, on work, and whenever the wake listener is down (a
+/// notification sent while it is down is lost, so only the floor is safe).
+/// Pure, so the schedule is tested without a database or a clock.
+struct IdleBackoff {
+    floor: Duration,
+    cap: Duration,
+    /// Idle waits since the last reset.
+    streak: u32,
+}
+
+impl IdleBackoff {
+    fn new(floor: Duration, cap: Duration) -> Self {
+        Self {
+            floor,
+            cap: cap.max(floor),
+            streak: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.streak = 0;
+    }
+
+    /// The wait after an idle pass. `next_due` shortens it to the moment a
+    /// backing-off chunk becomes claimable (a millisecond past, so the probe
+    /// sees it due).
+    fn idle_wait(&mut self, listener_up: bool, next_due: Option<Duration>) -> Duration {
+        let mut wait = if listener_up {
+            let doubled = self.floor.saturating_mul(1u32 << self.streak.min(30));
+            self.streak = self.streak.saturating_add(1);
+            doubled.min(self.cap)
+        } else {
+            self.streak = 0;
+            self.floor
+        };
+        if let Some(due) = next_due {
+            wait = wait.min(due + Duration::from_millis(1));
+        }
+        wait
+    }
 }
 
 /// The task that runs `self_check` jobs (#1023) in a process that runs drain
@@ -2269,7 +2374,7 @@ async fn drain_backfill_chunks(
 }
 
 /// Waits for a wake notification, the poll-interval floor, or shutdown —
-/// whichever comes first. Returns `true` if shutdown fired.
+/// whichever comes first.
 ///
 /// Issue #313: a closed wake channel is *not* a wake. It used to be read as
 /// one — `recv()` on a closed channel returns `None` immediately — so an idle
@@ -2281,19 +2386,39 @@ async fn drain_backfill_chunks(
 async fn wait_for_wake(
     wake: &mut WakeListener,
     shutdown_rx: &mut watch::Receiver<bool>,
-    poll_interval: Duration,
-) -> bool {
+    wait: Duration,
+) -> WakeEnd {
     let notified = async {
         if wake.rx.recv().await.is_none() {
             std::future::pending::<()>().await;
         }
     };
+    let listener_changed = async {
+        // A sender that is gone changes nothing: it must not read as a change.
+        if wake.up.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
 
     tokio::select! {
-        _ = shutdown_rx.changed() => true,
-        _ = tokio::time::sleep(poll_interval) => false,
-        _ = notified => false,
+        _ = shutdown_rx.changed() => WakeEnd::Shutdown,
+        _ = tokio::time::sleep(wait) => WakeEnd::Elapsed,
+        _ = notified => WakeEnd::Notified,
+        () = listener_changed => WakeEnd::ListenerChanged,
     }
+}
+
+/// How [`wait_for_wake`] ended.
+#[derive(Debug, PartialEq)]
+enum WakeEnd {
+    Shutdown,
+    /// The wait ran out.
+    Elapsed,
+    /// A notification arrived (or the listener's catch-up wake).
+    Notified,
+    /// The `LISTEN` went up or down, so the wait that was sized for the old
+    /// state is wrong.
+    ListenerChanged,
 }
 
 /// First delay before reopening a wake listener's `LISTEN` connection after
@@ -2318,19 +2443,29 @@ const WAKE_REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// `tokio_postgres::Client` and so closes the connection.
 struct WakeListener {
     rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    /// Whether a `LISTEN` is in place right now. An idle worker lengthens its
+    /// wait only while it is (#273): a notification sent while it is down is
+    /// lost.
+    up: watch::Receiver<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl WakeListener {
     fn spawn(dsn: String, schema: String, channel: String) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (up_tx, up) = watch::channel(false);
         let task = tokio::spawn(keep_listening(
             move |tx| open_wake_session(dsn.clone(), schema.clone(), channel.clone(), tx),
             tx,
+            up_tx,
             WAKE_REOPEN_BACKOFF_BASE,
             WAKE_REOPEN_BACKOFF_MAX,
         ));
-        Self { rx, task }
+        Self { rx, up, task }
+    }
+
+    fn is_up(&self) -> bool {
+        *self.up.borrow()
     }
 }
 
@@ -2352,10 +2487,13 @@ impl Drop for WakeListener {
 /// That wake is sent only after the `LISTEN` has committed, so a commit that
 /// lands between the two is still caught by its own notification.
 ///
+/// `up` is true from the moment an open succeeds until its session ends.
+///
 /// Returns once the receiving side is gone.
 async fn keep_listening<Open, OpenFut, Session, E>(
     mut open: Open,
     tx: tokio::sync::mpsc::UnboundedSender<()>,
+    up: watch::Sender<bool>,
     base: Duration,
     max: Duration,
 ) where
@@ -2369,8 +2507,10 @@ async fn keep_listening<Open, OpenFut, Session, E>(
         match open(tx.clone()).await {
             Ok(session) => {
                 delay = base;
+                up.send_replace(true);
                 let _ = tx.send(());
                 session.await;
+                up.send_replace(false);
                 crate::instance_log::warn!(
                     retry_in = ?delay,
                     "wake listener's LISTEN connection closed; polling until it reopens"
@@ -2414,14 +2554,26 @@ async fn open_wake_session(
         }
     });
 
-    if let Err(err) = client
-        .batch_execute(&format!(
-            "{}; listen {}",
-            crate::pool::dedicated_session_setup(&schema),
-            quote_ident(&channel)
-        ))
-        .await
-    {
+    // The database announces build work on a channel of its own
+    // (`work_wake_channel()`, migration V86), beside the one the engine
+    // notifies.
+    let listening = async {
+        client
+            .batch_execute(&crate::pool::dedicated_session_setup(&schema))
+            .await?;
+        let work_channel: String = client
+            .query_one("select work_wake_channel()", &[])
+            .await?
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "listen {}; listen {}",
+                quote_ident(&channel),
+                quote_ident(&work_channel)
+            ))
+            .await
+    };
+    if let Err(err) = listening.await {
         driver.abort();
         return Err(err.into());
     }
@@ -2449,8 +2601,10 @@ mod wake_listener_tests {
     async fn a_closed_wake_channel_waits_out_the_poll_floor() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         drop(tx);
+        let (_up_tx, up) = watch::channel(false);
         let mut wake = WakeListener {
             rx,
+            up,
             task: tokio::spawn(async {}),
         };
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -2458,7 +2612,10 @@ mod wake_listener_tests {
 
         let started = tokio::time::Instant::now();
         for _ in 0..3 {
-            assert!(!wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await);
+            assert_eq!(
+                wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await,
+                WakeEnd::Elapsed
+            );
         }
         assert_eq!(
             started.elapsed(),
@@ -2470,16 +2627,49 @@ mod wake_listener_tests {
     #[tokio::test(start_paused = true)]
     async fn a_notification_still_ends_the_wait_early() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (_up_tx, up) = watch::channel(false);
         let mut wake = WakeListener {
             rx,
+            up,
             task: tokio::spawn(async {}),
         };
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         tx.send(()).unwrap();
 
         let started = tokio::time::Instant::now();
-        assert!(!wait_for_wake(&mut wake, &mut shutdown_rx, Duration::from_secs(60)).await);
+        assert_eq!(
+            wait_for_wake(&mut wake, &mut shutdown_rx, Duration::from_secs(60)).await,
+            WakeEnd::Notified
+        );
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// The idle wait doubles from the floor to the cap, restarts on a reset,
+    /// stays at the floor while the listener is down, and is cut short to a
+    /// backing-off chunk's due time.
+    #[test]
+    fn idle_backoff_doubles_to_the_cap_and_restarts() {
+        let ms = Duration::from_millis;
+        let mut backoff = IdleBackoff::new(ms(200), ms(1500));
+        let waits: Vec<_> = (0..5).map(|_| backoff.idle_wait(true, None)).collect();
+        assert_eq!(waits, [ms(200), ms(400), ms(800), ms(1500), ms(1500)]);
+        backoff.reset();
+        assert_eq!(backoff.idle_wait(true, None), ms(200));
+        assert_eq!(backoff.idle_wait(true, None), ms(400));
+        // Listener down: the floor, and the streak starts over.
+        assert_eq!(backoff.idle_wait(false, None), ms(200));
+        assert_eq!(backoff.idle_wait(true, None), ms(200));
+        // A retry that comes due sooner than the wait wakes the worker for it.
+        backoff.reset();
+        for _ in 0..4 {
+            backoff.idle_wait(true, None);
+        }
+        assert_eq!(backoff.idle_wait(true, Some(ms(300))), ms(301));
+        assert_eq!(backoff.idle_wait(true, Some(ms(90_000))), ms(1500));
+        // A cap under the floor is the floor: the backoff is off.
+        let mut off = IdleBackoff::new(ms(200), ms(10));
+        assert_eq!(off.idle_wait(true, None), ms(200));
+        assert_eq!(off.idle_wait(true, None), ms(200));
     }
 
     /// The supervisor reopens a closed session after `base`, backs off
@@ -2491,6 +2681,7 @@ mod wake_listener_tests {
         let max = Duration::from_millis(400);
         let opens = Arc::new(AtomicUsize::new(0));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (up_tx, up) = watch::channel(false);
 
         // Open #1 succeeds, but its connection dies at once. Opens #2-#4 fail.
         // Open #5 succeeds and stays up.
@@ -2505,7 +2696,7 @@ mod wake_listener_tests {
                 }
             }
         };
-        let supervisor = tokio::spawn(keep_listening(open, tx, base, max));
+        let supervisor = tokio::spawn(keep_listening(open, tx, up_tx, base, max));
 
         // Opens land at t = 0 (ok, closes), 100 (fail), 200 (fail),
         // 400 (fail), 800 (ok, stays up): sleeps of base after the closed
@@ -2533,6 +2724,9 @@ mod wake_listener_tests {
                 wakes, want_wakes,
                 "wakes delivered in the window ending {at_ms}ms"
             );
+            // Up from a successful open until its session ends: the first
+            // session is already over by 50ms, the fifth is up and stays.
+            assert_eq!(*up.borrow(), at_ms == 850, "listener up at {at_ms}ms");
         }
 
         // The healthy session holds: no further opens, however long we wait.
@@ -4286,6 +4480,46 @@ mod wake_channel_tests {
                 .expect("notify");
             next_wake().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod work_channel_tests {
+    use super::*;
+
+    /// Issue #273: the listener hears the database's work channel
+    /// (`work_wake_channel()`) as well as the engine's wake channel, and
+    /// reports itself up once both `LISTEN`s are in place.
+    #[tokio::test]
+    async fn the_listener_hears_the_work_channel_and_reports_up() {
+        use crate::config::DEFAULT_SCHEMA;
+
+        let hang_guard = Duration::from_secs(30);
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let notifier = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("connect");
+        let mut wake = WakeListener::spawn(
+            db.dsn().to_string(),
+            DEFAULT_SCHEMA.to_string(),
+            default_wake_channel(DEFAULT_SCHEMA),
+        );
+        assert!(!wake.is_up(), "down until the LISTEN commits");
+        // The catch-up wake, sent once the LISTENs have committed.
+        tokio::time::timeout(hang_guard, wake.rx.recv())
+            .await
+            .expect("the catch-up wake")
+            .expect("open");
+        assert!(wake.is_up());
+        notifier
+            .execute("select pg_notify(work_wake_channel(), '')", &[])
+            .await
+            .expect("notify");
+        tokio::time::timeout(hang_guard, wake.rx.recv())
+            .await
+            .expect("a wake from the work channel")
+            .expect("open");
     }
 }
 

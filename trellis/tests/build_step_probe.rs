@@ -1,5 +1,5 @@
 //! The drain workers' idle build probe (issue #273): `build_step` asks one
-//! question, [`build::work_may_exist`], instead of claiming an old-build
+//! question, [`build::work_probe`], instead of claiming an old-build
 //! chunk and then listing the Re-derive builds on every idle wake. A `false`
 //! must never hide a step the old probes would have found.
 //!
@@ -69,7 +69,10 @@ impl Fixture {
     }
 
     async fn may_exist(&self) -> bool {
-        build::work_may_exist(&self.db.pool).await.expect("probe")
+        build::work_probe(&self.db.pool)
+            .await
+            .expect("probe")
+            .may_exist
     }
 
     /// What the two probes the step used to make find, by running them.
