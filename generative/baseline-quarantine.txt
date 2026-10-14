@@ -14,4 +14,3 @@
 #   other programs. Re-sweep the tier and redo its entries.
 #
 # tier        case    issue  what fails
-steady_load   7:1     #920   1-1 t3.rel_enrich keeps a superseded parent value (rare)

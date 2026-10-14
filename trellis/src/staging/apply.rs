@@ -7227,6 +7227,35 @@ struct RelationshipProjectionClear {
     /// the relationship's refresh stamp is one the refresh already read, so
     /// the clear is skipped ([`truncate_overtaken_by_refresh`]).
     lsn: Option<PgLsn>,
+    /// The from-side rows to re-derive, found in Phase 3 after the clear
+    /// rather than here (issue #920), or `None` when the from-side's key
+    /// can't be read ([`from_side_key`]).
+    rederive: Option<TruncateRederive>,
+}
+
+/// The from-side recompute a to-side `TRUNCATE` stages for a to-one
+/// relationship with a projection: every from-side row whose `from_col` is
+/// not `NULL`, read in the page's own transaction just after the
+/// projection clear (issue #920).
+///
+/// Found in Phase 2, on the pool, the set missed a row that joined one of
+/// the truncated parents (inserted under it, or moved onto it) between
+/// Phase 2 and this page's commit. A Re-derive of that row in that gap, by
+/// a build chunk or by this page's own step 3, reads the projection as it
+/// was before the clear, and I2 then refuses the row's own changes, which
+/// that Re-derive's read saw, so nothing re-derived it after the clear
+/// (`steady_load` 7:1). Read after the clear and after step 3, the set
+/// holds every row that existed then. A row that joins after this read and
+/// is re-derived before the page commits is still missed: that is #892's
+/// window, as for a row-driven parent change's recompute (step 3d).
+#[derive(Debug, Clone)]
+struct TruncateRederive {
+    /// The from-side table, qualified.
+    from_table: String,
+    from_col: String,
+    from_pk: Vec<PrimaryKeyColumn>,
+    hop_gen: i32,
+    provenance: Provenance,
 }
 
 /// Every join value `change`'s raw ring rows gave a to-side's `to_col`,
@@ -8897,6 +8926,9 @@ pub(super) async fn compute_page(
         // `reverse_recomputes` accumulator the row-driven path uses, so it's
         // deduped the same way (issue #79) and drained through the same
         // `Recompute` pipeline below — no separate emission path needed.
+        // A to-one relationship with a projection is the exception (issue
+        // #920): its from-side rows are read in Phase 3, after the clear
+        // (`TruncateRederive`).
         // Image-less, unless an aggregate groups by the relationship (issue
         // #520, below).
         let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
@@ -8924,15 +8956,19 @@ pub(super) async fn compute_page(
             // still resolves via a live `LEFT JOIN` every time —
             // `build_relationship_context`'s own doc comment), so nothing
             // to clear there.
-            if rel.cardinality == RelationshipCardinality::ToOne
-                && let Some(projection) = catalog::relationship_projection(pool, rel.id).await?
-            {
+            let projection = if rel.cardinality == RelationshipCardinality::ToOne {
+                catalog::relationship_projection(pool, rel.id).await?
+            } else {
+                None
+            };
+            if let Some(projection) = &projection {
                 relationship_projection_clears
                     .entry(rel.id)
                     .and_modify(|clear| clear.lsn = clear.lsn.max(change.lsn))
                     .or_insert(RelationshipProjectionClear {
                         qualified_projection: projection.qualified_table(),
                         lsn: change.lsn,
+                        rederive: None,
                     });
             }
             // Issue #267: canonicalized to qualified identity for the same
@@ -8949,6 +8985,33 @@ pub(super) async fn compute_page(
             else {
                 continue;
             };
+            let hop = change.hop_gen + 1;
+            // Issue #920: a projection's readers are found in Phase 3, just
+            // after its clear. See `TruncateRederive`.
+            if projection.is_some()
+                && let Some(clear) = relationship_projection_clears.get_mut(&rel.id)
+            {
+                let provenance = (change.src_changed, change.origin_lsn);
+                match &mut clear.rederive {
+                    Some(rederive) => {
+                        rederive.hop_gen = rederive.hop_gen.max(hop);
+                        rederive.provenance = (
+                            earliest_src_changed(rederive.provenance.0, provenance.0),
+                            earliest_origin(rederive.provenance.1, provenance.1),
+                        );
+                    }
+                    None => {
+                        clear.rederive = Some(TruncateRederive {
+                            from_table: qualified_from_table,
+                            from_col: rel.def.from_col.clone(),
+                            from_pk,
+                            hop_gen: hop,
+                            provenance,
+                        });
+                    }
+                }
+                continue;
+            }
             // #623 D5: an aggregate on the from-table keeps each row's group
             // on its ledger entry, so the recompute needs no prior image.
             let from_keys = from_side_keys(
@@ -8959,7 +9022,6 @@ pub(super) async fn compute_page(
                 &ReverseTrigger::WholeKeyspace,
             )
             .await?;
-            let hop = change.hop_gen + 1;
             for (from_key, _) in from_keys {
                 reverse_recomputes
                     .entry((qualified_from_table.clone(), from_key))
@@ -10586,7 +10648,7 @@ pub(crate) async fn apply_page(
     // for this relationship just vanished along with the to-side's. No
     // downstream propagation of its own — the projection is not a target
     // table, and the from-side recompute this same truncate
-    // stages via `ApplyPlan::reverse_recomputes` is what actually reaches a
+    // stages (just below, issue #920) is what actually reaches a
     // definition; the projection is only ever read by
     // `build_relationship_context`/the reverse-guard machinery, never a
     // definition's own downstream consumer. Run after the target writes
@@ -10594,27 +10656,49 @@ pub(crate) async fn apply_page(
     // precedes it. Issue #531: a truncate at or below the relationship's
     // refresh stamp is one the refresh already read, so emptying the
     // projection would drop the rows the refresh found written after it.
+    //
+    // Issue #920: then, in this transaction, every from-side row that reads
+    // the projection, for a recompute staged at step 4 (see
+    // `TruncateRederive`), whether or not the clear was skipped, as Phase 2
+    // used to stage it.
+    let mut truncate_recomputes: Vec<DerivedRecompute> = Vec::new();
     for (relationship_id, clear) in &plan.relationship_projection_clears {
-        if truncate_overtaken_by_refresh(clear.lsn, refresh_stamps.get(relationship_id).copied()) {
-            continue;
+        if !truncate_overtaken_by_refresh(clear.lsn, refresh_stamps.get(relationship_id).copied()) {
+            txn.execute(&format!("delete from {}", clear.qualified_projection), &[])
+                .await?;
+            // Issue #886: the clear is a refresh of the projection from the
+            // to-side, which has no rows at `lsn`. Stamp it as one, so a reverse
+            // record staged before the truncate and draining after it (a
+            // deferral's retry, or a page that lost the race) is checked against
+            // the live row ([`superseded_to_side`]) instead of putting its older
+            // image back.
+            if let Some(lsn) = clear.lsn {
+                txn.execute(
+                    "update relationship_projections \
+                     set refreshed_lsn = greatest(refreshed_lsn, $2) where relationship_id = $1",
+                    &[relationship_id, &lsn],
+                )
+                .await?;
+                let stamp = refresh_stamps.entry(*relationship_id).or_insert(lsn);
+                *stamp = (*stamp).max(lsn);
+            }
         }
-        txn.execute(&format!("delete from {}", clear.qualified_projection), &[])
-            .await?;
-        // Issue #886: the clear is a refresh of the projection from the
-        // to-side, which has no rows at `lsn`. Stamp it as one, so a reverse
-        // record staged before the truncate and draining after it (a
-        // deferral's retry, or a page that lost the race) is checked against
-        // the live row ([`superseded_to_side`]) instead of putting its older
-        // image back.
-        if let Some(lsn) = clear.lsn {
-            txn.execute(
-                "update relationship_projections \
-                 set refreshed_lsn = greatest(refreshed_lsn, $2) where relationship_id = $1",
-                &[relationship_id, &lsn],
-            )
-            .await?;
-            let stamp = refresh_stamps.entry(*relationship_id).or_insert(lsn);
-            *stamp = (*stamp).max(lsn);
+        if let Some(rederive) = &clear.rederive {
+            let sql = format!(
+                "select {pk} from {tbl} where {col} is not null",
+                pk = ddl::pk_key_sql_expr(&rederive.from_pk, None),
+                col = quote_ident(&rederive.from_col),
+                tbl = ddl::qualified_source_table(&rederive.from_table),
+            );
+            for row in txn.query(&sql, &[]).await? {
+                truncate_recomputes.push((
+                    rederive.from_table.clone(),
+                    row.get(0),
+                    rederive.hop_gen,
+                    rederive.provenance.0,
+                    rederive.provenance.1,
+                ));
+            }
         }
     }
 
@@ -10935,8 +11019,12 @@ pub(crate) async fn apply_page(
     }
 
     // Issue #131: the same recompute staging, for step 3d's own fallback:
-    // every from-side row a parent change reaches, image-less (#623 D5).
-    for (from_table, key, hop_gen, src_changed, origin_lsn) in relationship_reverse_fallback {
+    // every from-side row a parent change reaches, image-less (#623 D5), and
+    // for step 2c's truncate clears (#920).
+    for (from_table, key, hop_gen, src_changed, origin_lsn) in relationship_reverse_fallback
+        .into_iter()
+        .chain(truncate_recomputes)
+    {
         if hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table);
             worst_hop_gen = worst_hop_gen.max(hop_gen);

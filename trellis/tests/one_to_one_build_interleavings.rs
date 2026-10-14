@@ -1846,6 +1846,47 @@ async fn a_page_rederive_joining_a_parent_outside_its_generation_bump_is_harmles
     );
 }
 
+/// Issue #920 (`steady_load` 7:1): a to-side `TRUNCATE`'s page finds the
+/// kids to re-derive in its Phase 2, on the pool, long before its Phase 3
+/// clears the projection. Kid 1 leaves (deleted) before that Phase 2 and
+/// comes back under parent 1 after it, so the truncate's recompute doesn't
+/// name it. A field build's chunk then re-derives kid 1 under its entry lock
+/// while the projection still holds parent 1, writing parent 1's value, and
+/// its snapshot saw kid 1's delete and re-insert, so I2 refuses both their
+/// Applies. The truncate's page then clears the projection. Nothing
+/// re-derives kid 1 after that, so it keeps the truncated parent's value.
+#[tokio::test]
+async fn a_kid_that_rejoins_after_a_truncates_enumeration_does_not_keep_the_old_parent() {
+    let mut d = start_kid_field_build().await;
+    d.settle().await;
+    let user = d.user().await;
+    user.batch_execute("truncate public.par")
+        .await
+        .expect("the to-side truncate");
+    let truncate_batch = d.seal().await;
+    user.batch_execute("delete from public.kid where id = 1")
+        .await
+        .expect("kid 1 leaves");
+    // The truncate's Phase 2: kid 1 is gone, so its recompute misses it.
+    let truncate_plan = compute_page(&d, truncate_batch, "truncate").await;
+    user.batch_execute("insert into public.kid values (1, 5, 1)")
+        .await
+        .expect("kid 1 comes back under parent 1");
+    // The field chunk re-derives kid 1 from the projection, not yet cleared.
+    assert_eq!(
+        build_step(d.pool(), "chunk").await,
+        trellis::staging::build::Step::Chunk
+    );
+    apply_computed_page(&d, truncate_batch, "truncate", &truncate_plan).await;
+    trellis::staging::build::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows(KID_ACTUAL).await,
+        d.rows(KID_EXPECTED).await,
+        "kid 1 kept the value of a parent the truncate removed"
+    );
+}
+
 /// A page's Phase 1 and Phase 2 for `batch` on worker `worker`: the claim
 /// and fold, committed, then `compute` on the pool. The page holds no
 /// transaction until [`apply_computed_page`] runs its Phase 3, so the ring

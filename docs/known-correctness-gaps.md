@@ -613,11 +613,12 @@ through a relationship (entry 16).
   table, the truncate's clear of the projection stamps the relationship the
   way a refresh does. After a later update or delete, the retry finds the
   live row no longer matches its image. Either way the retry writes the projection from the live
-  row rather than its own older image. One generated case (#920's
-  `steady_load` 7:1) still failed once in 200 runs, with one child
-  holding the stale value, and its cause isn't known: it may be #892's. It
-  isn't the shape of #763's to-one projection ordering holes (an orphaned
-  or missing projection key), and it needs no resume or build.
+  row rather than its own older image. A `TRUNCATE` of the parent table
+  re-derives every child it finds pointing at a parent, and it finds them
+  after it clears the projection, so a child that comes back (inserted
+  again, or moved back onto a parent) while the truncate is being applied
+  is re-derived too, even when a build or a page wrote it from the
+  projection before the clear (#920's `steady_load` 7:1).
 * #892, the second cause. A child's read of the projection doesn't wait for
   a page that has advanced the parent's row and not yet committed. The fix
   needs a design call: the page would lock the parents its rows join before
