@@ -448,8 +448,9 @@ issue is filed.
   handling (#236).
 * A schema load is loud. A plain dump carries the target tables but not their
   definitions, so nothing maintains them, and defining again fails with a
-  `conflict` error because the target exists. A Rails app on `structure.sql`
-  isn't affected: the dump carries the definitions. Ecto's still is.
+  `conflict` error because the target exists. A Rails app isn't affected:
+  its `structure.sql` carries the definitions, and it refuses to dump a
+  `schema.rb`. An Ecto app still is.
 
 **Detected?** A partial restore isn't detected by Trellis (`self_check` can tell on 1-1
 targets only). A schema load of a dump without the definitions is detected when you define again.

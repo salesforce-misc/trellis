@@ -27,7 +27,7 @@ class SchemaDumpTest < Minitest::Test
     @admin = TestCluster.pg
     @id = self.class.next_id
     @databases = []
-    @saved = { db_dir: Tasks.db_dir, dump_schemas: ActiveRecord.dump_schemas }
+    @saved = { db_dir: Tasks.db_dir, dump_schemas: ActiveRecord.dump_schemas, schema_format: ActiveRecord.schema_format }
     Tasks.db_dir = @dir
     # Rails' dump runs on a temporary pool and restores the app's own after.
     ActiveRecord::Base.establish_connection(db_config(TestCluster.info.fetch("dbname")))
@@ -39,6 +39,7 @@ class SchemaDumpTest < Minitest::Test
     TrellisTestApp.config.trellis.dump_database = "primary"
     Tasks.db_dir = @saved.fetch(:db_dir)
     ActiveRecord.dump_schemas = @saved.fetch(:dump_schemas)
+    ActiveRecord.schema_format = @saved.fetch(:schema_format)
     @databases.each { |name| @admin.exec("drop database if exists #{name} with (force)") }
     @admin.close
     FileUtils.rm_rf(@dir)
@@ -49,7 +50,10 @@ class SchemaDumpTest < Minitest::Test
     source = database("src")
     define_in(source)
 
-    Tasks.dump_schema(db_config(source), :sql)
+    # No format argument, as db:prepare's dump calls it: the format is the
+    # app's config.active_record.schema_format.
+    ActiveRecord.schema_format = :sql
+    Tasks.dump_schema(db_config(source))
     structure = File.read(File.join(@dir, "structure.sql"))
     assert_includes structure, "CREATE SCHEMA trellis"
     assert_includes structure, "trellis.transform_definitions"
@@ -120,11 +124,12 @@ class SchemaDumpTest < Minitest::Test
     end
   end
 
-  def test_a_ruby_format_dump_warns_that_it_cannot_carry_trellis
+  def test_a_ruby_format_dump_raises_rather_than_write_a_schema_without_definitions
     source = database("ruby")
     define_in(source)
-    _, err = capture_io { Tasks.dump_schema(db_config(source), :ruby) }
-    assert_match(/schema_format = :sql/, err)
+    error = assert_raises(Trellis::ValidationError) { Tasks.dump_schema(db_config(source), :ruby) }
+    assert_match(/schema_format = :sql/, error.message)
+    refute File.exist?(File.join(@dir, "schema.rb"))
   end
 
   def test_the_trellis_and_target_schemas_join_the_dump_s_schema_flags

@@ -678,8 +678,9 @@ the file needs no Trellis step: every definition loads as
 `waiting_to_backfill`, as a `define` leaves it, and the worker builds it from
 the source rows.
 
-* **Rails** does this itself. With `config.active_record.schema_format =
-  :sql`, `db:migrate`'s dump and `db:schema:dump` append the definitions of
+* **Rails** does this itself, and refuses to dump a `schema.rb`, which can't
+  carry them. With `config.active_record.schema_format = :sql`,
+  `db:migrate`'s dump and `db:schema:dump` append the definitions of
   `config.trellis.connect` and `config.trellis.instances`, and add their
   schemas and target schemas to the `pg_dump`. `db:schema:load`, `db:prepare`
   and `maintain_test_schema!` then load them with the tables. See the

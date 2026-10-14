@@ -13,8 +13,9 @@ module Trellis
   # definitions unbuilt and builds them (issue #644, ADR-0010).
   #
   # Needs `config.active_record.schema_format = :sql`: a `schema.rb` can't
-  # carry another schema's tables or triggers. With `:ruby`, the dump warns
-  # and writes what Rails would.
+  # carry another schema's tables or triggers. With `:ruby`, the dump raises
+  # Trellis::ValidationError and writes nothing: a `schema.rb` would load
+  # into a database with target tables and no definitions.
   #
   # It hooks the two places Rails offers no extension point for (both the
   # `db:schema:dump` task and the dump after `db:migrate` call them):
@@ -122,13 +123,19 @@ module Trellis
 
     # Prepended to ActiveRecord::Tasks::DatabaseTasks's singleton.
     module DatabaseTasksHook
-      def dump_schema(db_config, format = db_config.schema_format)
+      # Rails 8.1 defaults format to db_config.schema_format, earlier
+      # versions to ActiveRecord.schema_format: the default is left to Rails'
+      # own signature, which an unconfigured database goes straight to.
+      def dump_schema(db_config, *args)
         return super unless SchemaDump.applies?(db_config) && db_config.schema_dump
 
+        format = args.first ||
+                 (db_config.respond_to?(:schema_format) ? db_config.schema_format : ::ActiveRecord.schema_format)
+
         unless format.to_sym == :sql
-          warn "trellis: #{db_config.name}'s schema dump is #{format}, which can't carry Trellis's " \
-               "tables, triggers or definitions: set config.active_record.schema_format = :sql"
-          return super
+          raise Trellis::ValidationError,
+                "#{db_config.name}'s schema dump is #{format}, which can't carry Trellis's " \
+                "tables, triggers or definitions: set config.active_record.schema_format = :sql"
         end
 
         filename = schema_dump_path(db_config, format)

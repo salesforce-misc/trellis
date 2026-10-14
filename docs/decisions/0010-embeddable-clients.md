@@ -220,7 +220,7 @@ same after `pg_dump`), and Trellis does the same:
   and redoes the dump when they differ, because the two read separate
   snapshots.
 * **A Rails app uses `structure.sql`.** `schema.rb` can't carry another
-  schema's tables or triggers. The Rails hook (`Trellis::SchemaDump`) wraps
+  schema's tables or triggers, so the Rails hook refuses to dump one. The hook (`Trellis::SchemaDump`) wraps
   `DatabaseTasks.dump_schema` and `PostgreSQLDatabaseTasks#structure_dump`,
   the points `db:migrate` and `db:schema:dump` both go through, and applies to
   the one database config `config.trellis.dump_database` names.

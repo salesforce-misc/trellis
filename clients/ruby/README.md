@@ -397,8 +397,9 @@ migrating.
 A Rails app that uses Trellis dumps its schema as `structure.sql`
 (`config.active_record.schema_format = :sql`), and the dump carries Trellis's
 definitions, the way it carries `schema_migrations`. `schema.rb` can't carry
-another schema's tables or triggers; the dump warns and writes what Rails
-would.
+another schema's tables or triggers, so with `schema_format = :ruby` the dump
+(`db:migrate`'s and `db:schema:dump`) raises `Trellis::ValidationError` and
+writes nothing.
 
 ```ruby
 # config/application.rb
