@@ -1337,6 +1337,186 @@ async fn a_deferred_parent_update_does_not_outlive_a_later_truncate() {
     );
 }
 
+/// Issue #886/#920: a deferred reverse's retry must not put its older image
+/// over a newer change to the same parent that applied while it waited. The
+/// retry re-captures guard (d)'s `prev_lsn` from the projection as it is now
+/// (the newer change's, or none after a delete), so guard (d) passes, and the
+/// retry used to write its own image: the projection went back to a value
+/// the parent no longer has (or a parent that no longer exists), and every
+/// child read through it kept that value. Deterministic: the newer change's
+/// segment is drained before the deferred retry's.
+#[derive(Clone, Copy, Debug)]
+enum NewerChange {
+    /// `word_count` 400 -> 700.
+    Update,
+    /// Post 1 deleted.
+    Delete,
+}
+
+async fn a_deferred_parent_update_retried_after(newer: NewerChange) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    trellis::intake::markers::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    let projected_words = async |client: &Client| -> Option<Option<String>> {
+        client
+            .query_opt(
+                &format!("select word_count::text from {projection_table} where id = 1"),
+                &[],
+            )
+            .await
+            .expect("read the projection")
+            .map(|row| row.get(0))
+    };
+
+    // The first update (100 -> 400), deferred by guard (a) against a
+    // watermark that never moves.
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    let base = staging_base(&client).await;
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        base + 100,
+    )
+    .await;
+    let first_seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, first_seg, "worker_a").await;
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        first_seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &StagedWatermark::new(),
+    )
+    .await
+    .expect("apply (rejected internally by guard (a))");
+    txn.commit().await.expect("commit");
+    drop(phase3);
+    assert_eq!(
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "guard (a) must defer the first update"
+    );
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    let deferred_seg = seal_active_segment(&mut client).await;
+
+    // The newer change commits after the first update and drains before
+    // the first update's retry.
+    let expected = match newer {
+        NewerChange::Update => {
+            client
+                .execute("update posts set word_count = 700 where id = 1", &[])
+                .await
+                .expect("update the related post again");
+            stage_cdc_at_lsn(
+                &client,
+                "posts",
+                "1",
+                "update",
+                Some("{\"id\":1,\"word_count\":400}"),
+                Some("{\"id\":1,\"word_count\":700}"),
+                base + 200,
+            )
+            .await;
+            Some(Some("700".to_string()))
+        }
+        NewerChange::Delete => {
+            client
+                .execute("delete from posts where id = 1", &[])
+                .await
+                .expect("delete the related post");
+            stage_cdc_at_lsn(
+                &client,
+                "posts",
+                "1",
+                "delete",
+                Some("{\"id\":1,\"word_count\":400}"),
+                None,
+                base + 200,
+            )
+            .await;
+            None
+        }
+    };
+    let newer_seg = seal_active_segment(&mut client).await;
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        newer_seg,
+        "reverse_test",
+        1,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+    assert_eq!(
+        projected_words(&client).await,
+        expected,
+        "the newer change ({newer:?}) advanced the projection"
+    );
+
+    while apply::drain_once(
+        &db.pool,
+        deferred_seg,
+        "reverse_test",
+        1,
+        "trellis_reverse_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        projected_words(&client).await,
+        expected,
+        "the deferred first update's retry put its older image (400) back over \
+         the newer change ({newer:?})"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_parent_update_does_not_overwrite_a_newer_update() {
+    a_deferred_parent_update_retried_after(NewerChange::Update).await;
+}
+
+#[tokio::test]
+async fn a_deferred_parent_update_does_not_bring_back_a_deleted_parent() {
+    a_deferred_parent_update_retried_after(NewerChange::Delete).await;
+}
+
 /// Guard (b) (plan doc §2; ablation 82/3000): a reverse record whose
 /// captured `prev_gen` no longer matches the projection row's current
 /// `__trellis_gen`, re-read under `FOR UPDATE` in Phase 3, must not apply —

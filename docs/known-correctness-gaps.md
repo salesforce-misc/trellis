@@ -609,11 +609,14 @@ through a relationship (entry 16).
   reverse guard deferred until after a later `TRUNCATE` of the parent table
   doesn't do this: the truncate's clear of the projection stamps the
   relationship the way a refresh does, so the retry writes the projection
-  from the live row rather than its own older image. Whether the other
-  generated cases on #886 and #920 have that cause isn't known: they haven't
-  been replayed against it. It isn't the shape of #763's to-one projection
-  ordering holes (an orphaned or missing projection key), and it needs no
-  resume or build.
+  from the live row rather than its own older image. Nor does a parent
+  change that a reverse guard deferred while a later change to the same
+  parent (an update or a delete) drained first: a deferred change's retry is
+  out of order with its parent's later changes, so it is checked against the
+  live row the same way rather than writing its older image. That was the
+  cause of most generated cases on #886 and #920. It isn't the shape of
+  #763's to-one projection ordering holes (an orphaned or missing projection
+  key), and it needs no resume or build.
 * #892, the second cause. A child's read of the projection doesn't wait for
   a page that has advanced the parent's row and not yet committed. The fix
   needs a design call: the page would lock the parents its rows join before

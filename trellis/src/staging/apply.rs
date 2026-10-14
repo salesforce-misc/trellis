@@ -3243,8 +3243,15 @@ fn required_column<'r>(
 
 /// Whether [`to_side_superseded`] finds `record`'s images stale, checked
 /// only for a record that may be stale: every record on a seam-fed to-side,
-/// and one on a source to-side at or below its relationship's refresh stamp
-/// in `refresh_stamps` ([`overtaken_by_refresh`]).
+/// a deferred record's retry, and one on a source to-side at or below its
+/// relationship's refresh stamp in `refresh_stamps` ([`overtaken_by_refresh`]).
+///
+/// Issue #886: a retry is out of order with its parent's later changes. They
+/// drain while it waits, so by the time it applies the projection may hold a
+/// newer change's image, or none, after a later delete. Guard (d) can't tell:
+/// the retry captures `prev_lsn` afresh, from the projection as the newer
+/// change left it. Applied from its own images, the retry would put an older
+/// value back with nothing after it to correct it.
 async fn superseded_to_side(
     txn: &Transaction<'_>,
     row_columns_cache: &mut HashMap<String, Vec<String>>,
@@ -3255,6 +3262,7 @@ async fn superseded_to_side(
 ) -> Result<bool, ApplyError> {
     let shape = &record.shape;
     if !shape.to_side.seam_fed
+        && record.retry_count == 0
         && !overtaken_by_refresh(record.lsn, refresh_stamps.get(&shape.id).copied())
     {
         return Ok(false);
