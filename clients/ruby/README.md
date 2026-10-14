@@ -426,9 +426,15 @@ source rows; a test database has none, so that is immediate. Runtime state
   `config.trellis.instances` point at. Other databases dump as Rails dumps
   them. The dump raises `Trellis::ValidationError`, writing nothing, when
   `config.trellis.connect` or an instance points at a different database than
-  that config. They are compared by host, port and database name as libpq
-  resolves them (a URL or keyword string on either side; spellings are not
-  equated, so `localhost` is not `127.0.0.1`).
+  that config. They are compared by host, port and database name: the Rails
+  config's as libpq resolves them (`PGHOST`, `PGPORT` and `PGDATABASE`
+  included), Trellis's `url` from the url alone (port 5432, database the
+  user's name). A config with no host uses libpq's local socket, which
+  matches a local Trellis host (`localhost`, `127.0.0.1`, `::1` or a socket
+  directory). Other host spellings are not equated, so `localhost` is not
+  `127.0.0.1`. `db:prepare` in development also dumps the test database
+  after migrating it; that dump is checked against development's config of
+  the same name, which `config.trellis.connect` points at.
 - `pg_dump` and `dump_definitions_sql` read separate snapshots. The hook reads
   the definitions before and after the `pg_dump` and redoes the dump when they
   differ (three attempts, then `Trellis::ConflictError`), so a define or drop

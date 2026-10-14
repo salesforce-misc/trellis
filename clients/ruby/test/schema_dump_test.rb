@@ -137,6 +137,69 @@ class SchemaDumpTest < Minitest::Test
     assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
   end
 
+  # Rails' generated database.yml names no host: libpq connects to its local
+  # socket. Trellis needs a host, and any local one matches.
+  def test_a_rails_config_with_no_host_matches_a_local_trellis_host
+    config = ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary",
+                                                                   { adapter: "postgresql", database: "app" })
+    with_env("PGHOST" => nil, "PGPORT" => nil) do
+      ["host=localhost dbname=app", "postgres://127.0.0.1/app", "host=/var/run/postgresql dbname=app"].each do |url|
+        TrellisTestApp.config.trellis.connect = { url: }
+        SchemaDump.verify_same_database!(config)
+      end
+      TrellisTestApp.config.trellis.connect = { url: "host=db.example dbname=app" }
+      assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+    end
+  end
+
+  # Trellis reads nothing from the environment: a url with no port is 5432,
+  # one with no dbname is the user's database, whatever PGPORT says.
+  def test_a_trellis_url_is_resolved_without_the_environment
+    config = ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary",
+                                                                   { adapter: "postgresql", host: "h", database: "app" })
+    with_env("PGPORT" => "5433") do
+      TrellisTestApp.config.trellis.connect = { url: "host=h dbname=app" }
+      assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+    end
+    with_env("PGPORT" => nil) do
+      TrellisTestApp.config.trellis.connect = { url: "host=h user=app" }
+      SchemaDump.verify_same_database!(config)
+    end
+  end
+
+  def test_a_url_that_does_not_parse_is_refused_without_quoting_it
+    config = db_config(TestCluster.info.fetch("dbname"))
+    ["postgres://u:hunter2@h/app?pool=5", "host=h password=hunter2 xyzzy"].each do |url|
+      TrellisTestApp.config.trellis.connect = { url: }
+      error = assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(config) }
+      assert_includes error.message, "config.trellis.connect"
+      refute_includes error.message, "hunter2"
+    end
+  end
+
+  # `db:prepare` in development migrates and dumps the test database too,
+  # with development's config.trellis.connect: that dump is checked against
+  # development's config of the same name.
+  def test_another_environments_dump_is_checked_against_the_current_one
+    saved = { env: Tasks.env, configurations: ActiveRecord::Base.configurations }
+    info = TestCluster.info
+    base = { "adapter" => "postgresql", "host" => info.fetch("host"), "port" => info.fetch("port") }
+    ActiveRecord::Base.configurations = {
+      "development" => { "primary" => base.merge("database" => "app_development") },
+      "test" => { "primary" => base.merge("database" => "app_test") }
+    }
+    Tasks.env = "development"
+    test_config = ActiveRecord::Base.configurations.configs_for(env_name: "test", name: "primary")
+    where = "host=#{info.fetch("host")} port=#{info.fetch("port")}"
+    TrellisTestApp.config.trellis.connect = { url: "#{where} dbname=app_development" }
+    SchemaDump.verify_same_database!(test_config)
+    TrellisTestApp.config.trellis.connect = { url: "#{where} dbname=app_test" }
+    assert_raises(Trellis::ValidationError) { SchemaDump.verify_same_database!(test_config) }
+  ensure
+    Tasks.env = saved.fetch(:env)
+    ActiveRecord::Base.configurations = saved.fetch(:configurations)
+  end
+
   def test_a_mismatch_against_another_database_of_the_app_is_not_checked
     source = database("multi")
     TrellisTestApp.config.trellis.connect = { url: dsn(database("multi_other")) }
@@ -209,6 +272,14 @@ class SchemaDumpTest < Minitest::Test
     @admin.exec("create database #{name}")
     @databases << name
     name
+  end
+
+  def with_env(vars)
+    saved = vars.keys.to_h { |key| [key, ENV.fetch(key, nil)] }
+    vars.each { |key, value| ENV[key] = value }
+    yield
+  ensure
+    saved&.each { |key, value| ENV[key] = value }
   end
 
   def dsn(database)
