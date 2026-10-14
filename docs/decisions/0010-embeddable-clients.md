@@ -225,7 +225,7 @@ same after `pg_dump`), and Trellis does the same:
   | Binding | Hook | Notes |
   |---|---|---|
   | Ruby | `Trellis::SchemaDump` wraps `DatabaseTasks.dump_schema` and `PostgreSQLDatabaseTasks#structure_dump`, the points `db:migrate` and `db:schema:dump` both go through, and applies to the one database config `config.trellis.dump_database` names | A Rails app uses `structure.sql`: `schema.rb` can't carry another schema's tables or triggers, so the hook refuses to dump one. Redoes the dump when the definitions changed during `pg_dump`, up to 3 attempts, then raises `ConflictError`. |
-  | Elixir | `mix trellis.dump` (`Trellis.StructureDump`) runs `ecto.dump` itself between two reads of the definitions and appends to its file; the app wires it with the alias `"ecto.dump": "trellis.dump"` | Same redo, up to 3 attempts, then `ConflictError`. Rewrites `pg_dump` 17's `CREATE SCHEMA public;` to `IF NOT EXISTS`, which `mix ecto.load` into a created database would otherwise stop at. |
+  | Elixir | `mix trellis.dump` (`Trellis.StructureDump`) runs `ecto.dump` itself between two reads of the definitions and appends to its file; the app wires it with the alias `"ecto.dump": "trellis.dump"` | Same redo, up to 3 attempts, then the task fails. Rewrites `pg_dump` 17's `CREATE SCHEMA public;` to `IF NOT EXISTS`, which `mix ecto.load` into a created database would otherwise stop at. |
 
 ## Consequences
 
