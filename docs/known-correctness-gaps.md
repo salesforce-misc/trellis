@@ -103,7 +103,7 @@ These are the tools the entries refer to:
 | 10 | `REGEXP_COUNT` on `"C"`-collated data or with Postgres-only regex syntax | yes | `self_check` (1-1 targets only) | #643, with #575 |
 | 11 | Row-level security applying to a role Trellis runs as | only capture, for the ring owner, until the next reconcile pass; elsewhere reads and writes fail | drain, discharge, catch-up and build merge: pause what they reach; one the catalog can't pin shows on `drain_failure` (drain) or `backfill_failure` (discharge, catch-up), or, for a build merge, pauses on its fifth charge with the error on `capture_failure`; build chunk: `backfill_failure` | none |
 | 12 | A crash empties an unlogged source table | yes | no | none filed |
-| 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define | #644 (Rails and Ecto hooks) |
+| 13 | Partial restore, or a schema-only load (`db:schema:load`, `ecto.load`) | partial restore silent; schema load loud | schema load: on define (Ecto only) | #644 (Ecto hook) |
 | 15 | A from-side change pending across a to-side `TRUNCATE` | yes | no | #624, test ignored |
 | 16 | `self_check` audits 1-1 targets only | yes | n/a | none filed |
 | 17 | `DROP TYPE` of an enum a live definition references | no (later introspection fails) | at failure only | none filed |
@@ -446,27 +446,28 @@ issue is filed.
   to come from the same point as the sources. A whole-database or
   whole-cluster restore keeps them consistent and needs no special
   handling (#236).
-* A schema load is loud. The dump carries the target tables but not their
+* A schema load is loud. A plain dump carries the target tables but not their
   definitions, so nothing maintains them, and defining again fails with a
-  `conflict` error because the target exists.
+  `conflict` error because the target exists. A Rails app on `structure.sql`
+  isn't affected: the dump carries the definitions. Ecto's still is.
 
 **Detected?** A partial restore isn't detected by Trellis (`self_check` can tell on 1-1
-targets only). A schema load is detected when you define again.
+targets only). A schema load of a dump without the definitions is detected when you define again.
 
 **Planned work:** #644 dumps the definitions with the schema, the way Rails
-dumps `schema_migrations`. The engine's `dump_definitions_sql` (Rust
-`Trellis` and `BlockingTrellis`) returns the `INSERT`s to append to a
-schema-only `pg_dump` of the Trellis schema and the schemas it maintains. A
-loaded definition is defined and not built, and the worker builds it. The Rails
-and Ecto hooks that append it to `structure.sql` and `mix ecto.dump` aren't
-built, so those frameworks' schema loads are still affected until they are.
+dumps `schema_migrations`. The engine's `dump_definitions_sql` returns the
+`INSERT`s to append to a schema-only `pg_dump` of the Trellis schema and the
+schemas it maintains. A loaded definition is defined and not built, and the
+worker builds it. The Rails hook appends it to `structure.sql` (the Ruby
+README's "Schema dumps"). The Ecto hook for `mix ecto.dump` isn't built, so
+Ecto's schema loads are still affected until it is.
 
 **Repair:**
 
 * After a partial restore, `PAUSE`/`RESUME` every transform whose sources or
   targets were restored.
-* For a schema-loaded database, drop the target tables and run the defining
-  migrations ([embedding](embedding.md)). A dump that has
+* For a schema-loaded database without the definitions, drop the target tables
+  and run the defining migrations ([embedding](embedding.md)). A dump that has
   `dump_definitions_sql` appended loads with its definitions, and the worker
   builds them from the source rows.
 

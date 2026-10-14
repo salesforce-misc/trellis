@@ -242,6 +242,13 @@ impl Handle {
         array(ruby, summaries, relationship_summary_hash)
     }
 
+    /// The SQL to append to a schema-only dump of the database, so a load
+    /// of the dump carries this instance's definitions
+    /// ([`BlockingTrellis::dump_definitions_sql`]).
+    fn dump_definitions_sql(ruby: &Ruby, rb_self: &Self) -> Result<String, Error> {
+        rb_self.call(ruby, BlockingTrellis::start_dump_definitions_sql)
+    }
+
     /// Re-reads `source_table` for its applying readers: a rebuild, or a
     /// go-live catch-up for the staging worker.
     fn request_backfill(ruby: &Ruby, rb_self: &Self, source_table: String) -> Result<(), Error> {
@@ -1309,6 +1316,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     handle.define_method("status", method!(Handle::status, 1))?;
     handle.define_method("definitions", method!(Handle::definitions, 0))?;
     handle.define_method("relationships", method!(Handle::relationships, 0))?;
+    handle.define_method(
+        "dump_definitions_sql",
+        method!(Handle::dump_definitions_sql, 0),
+    )?;
     handle.define_method("request_backfill", method!(Handle::request_backfill, 1))?;
     handle.define_method("release_key", method!(Handle::release_key, 3))?;
     handle.define_method("poisoned_since", method!(Handle::poisoned_since, 1))?;

@@ -22,7 +22,8 @@ class GvlTest < Minitest::Test
     Trellis.connect(url: TestCluster.dsn)
     {
       "status" => -> { assert_nil Trellis.status("no_such_target") },
-      "definitions" => -> { assert_kind_of Array, Trellis.definitions }
+      "definitions" => -> { assert_kind_of Array, Trellis.definitions },
+      "dump_definitions_sql" => -> { assert_kind_of String, Trellis.dump_definitions_sql }
     }.each do |name, call|
       holder, release = hold_lock(CATALOG, seconds: 1.0)
       begin

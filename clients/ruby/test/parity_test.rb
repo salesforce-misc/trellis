@@ -91,7 +91,7 @@ class ParityTest < Minitest::Test
   # operations, `connect` as a class method and `connected?` besides.
   def test_an_instance_has_every_fixture_operation_and_nothing_else
     calls = Trellis::Instance.public_instance_methods(false).map(&:to_s) - %w[inspect to_s]
-    calls = calls.map { |name| name.delete_suffix("?") }
+    calls = calls.map { |name| name.delete_suffix("?") } - Parity::NOT_OPERATIONS.keys
     assert_equal (Parity::OPERATIONS.keys - ["connect"] + ["connected"]).sort, calls.sort
     assert_equal %w[connect connected shutdown_all], Trellis::Instance.singleton_methods(false).map(&:to_s).sort
   end

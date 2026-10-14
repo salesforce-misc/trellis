@@ -661,14 +661,45 @@ for a target that already exists is an `ALTER TRANSFORM`
 ([Changing a definition](transforms.md#changing-a-definition)), in a
 migration of its own, not a second define.
 
-A schema dump doesn't carry a definition. Rails' `db/schema.rb` and
-`structure.sql`, and Ecto's `structure.sql`, record the target table and
-mark the defining migration as run, but a definition is a row in Trellis's
-own tables, which no schema dump holds. A database loaded from the dump
-(`db:schema:load`, `db:prepare` on a new database, Rails' test database,
-`mix ecto.load`) has the target tables but no transforms, and defining one
-then fails with a `conflict` error because its table exists. Build a
-database that needs its transforms by running the migrations.
+A schema dump carries a definition only when the dump appends it. `pg_dump
+--schema-only` writes the Trellis schema, the capture triggers and the target
+tables, but a definition is a row in Trellis's own tables, which it doesn't
+write. A database loaded from such a dump would have target tables and no
+transforms, and defining one would fail with a `conflict` error because its
+table exists. So a dump appends the rows after the `pg_dump` output, the way
+Rails and Ecto append the `schema_migrations` rows.
+`dump_definitions_sql` (Rust `Trellis` and `BlockingTrellis`, Ruby
+`Trellis::Instance#dump_definitions_sql`) returns them as SQL: Trellis's
+migration history, the instance marker, the transform and relationship
+definitions and the seed rows capture needs. Runtime state (the ledger, ring,
+build chunks, quarantine, claims and statuses) is never in it, because it
+describes source and target rows a schema-only dump doesn't carry. Loading
+the file needs no Trellis step: every definition loads as
+`waiting_to_backfill`, as a `define` leaves it, and the worker builds it from
+the source rows.
+
+* **Rails** does this itself. With `config.active_record.schema_format =
+  :sql`, `db:migrate`'s dump and `db:schema:dump` append the definitions of
+  `config.trellis.connect` and `config.trellis.instances`, and add their
+  schemas and target schemas to the `pg_dump`. `db:schema:load`, `db:prepare`
+  and `maintain_test_schema!` then load them with the tables. See the
+  [Ruby README](../clients/ruby/README.md#schema-dumps).
+* **Ecto** doesn't append them yet: build a database that needs its
+  transforms by running the migrations (`mix ecto.migrate`).
+* **Your own dump** appends `dump_definitions_sql` to a `pg_dump --schema-only`
+  of the Trellis schema and the schemas it maintains. `pg_dump` and
+  `dump_definitions_sql` read separate snapshots, so a define or drop that
+  commits between them leaves the file's tables and definitions disagreeing.
+  Read the SQL before and after the `pg_dump` and redo the dump if the two
+  reads differ, as the Rails hook does, or dump from a step no define runs
+  alongside.
+* A definition that was paused or quarantined where the dump was taken loads
+  as `waiting_to_backfill`: the pause is runtime state, and the loaded
+  database builds it.
+* A dump that includes `public` has `CREATE SCHEMA public` (`pg_dump` 17),
+  which fails to load into a database that already has one. Load it into an
+  empty database or change it to `CREATE SCHEMA IF NOT EXISTS public`, as the
+  Rails hook does.
 
 ## Every call returns within 30 seconds
 

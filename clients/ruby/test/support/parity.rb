@@ -56,7 +56,10 @@ module Parity
     # The handle lives in the module here and in a variable in Elixir, so
     # only Ruby has a call that asks whether there is one.
     "connected?" => "Ruby's module-held handle",
-    "default_instance" => "Ruby's module-held default instance, for code that takes a Trellis::Instance"
+    "default_instance" => "Ruby's module-held default instance, for code that takes a Trellis::Instance",
+    # Its result is SQL text for a dump hook, not a flattened record, so the
+    # shared fixture has nothing to shape; test/schema_dump_test.rb runs it.
+    "dump_definitions_sql" => "SQL text for the schema-dump hook, tested by test/schema_dump_test.rb"
   }.freeze
 
   # The Rails integration's public calls outside the migration helpers, none

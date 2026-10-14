@@ -65,7 +65,7 @@ module Trellis
   #   TRANSFORM, DROP RELATIONSHIP, ALTER TRANSFORM) and reports what it did
   #   as an Applied. define is the one guarded convenience: an apply that
   #   refuses anything but a TRANSFORM statement before applying it.
-  # - Reads: status, definitions, relationships.
+  # - Reads: status, definitions, relationships, dump_definitions_sql.
   # - Quarantine: quarantined, quarantine_status, sample_quarantined,
   #   poisoned_since, release_key. Pausing and resuming are statements:
   #   instance.apply("RESUME TRANSFORM order_totals.total").
@@ -295,6 +295,23 @@ module Trellis
     # values.
     def relationships
       handle.relationships.map { |hash| RelationshipSummary.from_native(hash) }
+    end
+
+    # The SQL that carries this instance's definitions in a schema-only dump
+    # of its database: Trellis's migration history, instance marker,
+    # transform and relationship definitions, and the seed rows capture
+    # needs. Append it to the output of `pg_dump --schema-only` (with the
+    # instance's schema and target schema in scope) and a database loaded
+    # from the file has every definition, each at :waiting_to_backfill, as
+    # `define` leaves it; the worker builds them. Runtime state (the ledger,
+    # ring, chunks, quarantine, claims and statuses) is never in it.
+    #
+    # Read from one snapshot, but a different one from the pg_dump's: a
+    # define or drop that commits between the two leaves them disagreeing.
+    # The Rails hook (Trellis::SchemaDump) reads it on both sides of the
+    # pg_dump and retries when the two differ.
+    def dump_definitions_sql
+      handle.dump_definitions_sql
     end
 
     # Asks the staging worker to re-read source_table (a bare table name,

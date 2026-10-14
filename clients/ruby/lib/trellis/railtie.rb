@@ -30,6 +30,10 @@ module Trellis
   #     reports: { url: ENV.fetch("REPORTS_DATABASE_URL"), schema: "reports" }
   #   }
   #
+  # With `config.active_record.schema_format = :sql`, the same config puts
+  # the definitions in `structure.sql` (Trellis::SchemaDump). The database
+  # they dump into is config.trellis.dump_database, "primary" by default.
+  #
   # When either is set, the app's handles connect in an after_initialize hook,
   # except in these two cases:
   #
@@ -62,6 +66,7 @@ module Trellis
     config.trellis.connect = nil
     config.trellis.instances = {}
     config.trellis.connect_on_boot = true
+    config.trellis.dump_database = "primary"
 
     rake_tasks do
       namespace :trellis do
@@ -73,7 +78,10 @@ module Trellis
     end
 
     initializer "trellis.migration" do
-      ActiveSupport.on_load(:active_record) { require "trellis/migration" }
+      ActiveSupport.on_load(:active_record) do
+        require "trellis/migration"
+        require "trellis/schema_dump"
+      end
     end
 
     config.after_initialize { Trellis::Railtie.instance.send(:boot) }

@@ -372,16 +372,8 @@ end
   The guard checks the target's name, not its definition. A changed
   statement for a target that exists is an `ALTER TRANSFORM`, in a
   migration of its own.
-- **Schema dumps don't carry Trellis's definitions.** `db/schema.rb` (or
-  `structure.sql`) records a transform's target table as a plain table and
-  its migration as run, but not the definition, which is a row in Trellis's
-  own tables. A database built from the dump rather than the migrations
-  (`db:schema:load`, `db:prepare` or `db:setup` on a new database, or the
-  test database that `maintain_test_schema!` loads) has the target tables
-  and no transforms: nothing ever writes them, and a define of one fails
-  with `ConflictError`, since its table exists. Build a database that needs
-  its transforms by running the migrations (`bin/rails db:create
-  db:migrate`).
+- **Schema dumps carry the definitions** (see "Schema dumps" below), when the
+  app uses `structure.sql`.
 
 `rails trellis:migrate` creates or upgrades Trellis's own tables the same
 way. The helpers run it whenever a migration defines something; run it in
@@ -399,6 +391,54 @@ instance and every instance of `config.trellis.instances`. Neither it nor
 `trellis:migrate` needs ActiveRecord.
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
+
+## Schema dumps
+
+A Rails app that uses Trellis dumps its schema as `structure.sql`
+(`config.active_record.schema_format = :sql`), and the dump carries Trellis's
+definitions, the way it carries `schema_migrations`. `schema.rb` can't carry
+another schema's tables or triggers; the dump warns and writes what Rails
+would.
+
+```ruby
+# config/application.rb
+config.active_record.schema_format = :sql
+config.trellis.connect = { url: ENV.fetch("DATABASE_URL") }
+```
+
+Nothing else is set up. After `pg_dump`, `db:migrate`'s dump and
+`db:schema:dump` append `Trellis::Instance#dump_definitions_sql` for
+`config.trellis.connect` and each of `config.trellis.instances`: Trellis's
+migration history, the instance marker, the transform and relationship
+definitions and the seed rows capture needs. The Railtie also adds each
+instance's `schema` and `target_schema` to the `--schema` flags Rails passes
+`pg_dump` (nothing is added when Rails dumps every schema), so the Trellis
+tables, the target tables and the capture triggers are in the file.
+`db:schema:load`, `db:prepare`, `db:setup` and the test database
+`maintain_test_schema!` loads then build a database with every definition in
+place. Each loads as `waiting_to_backfill`, and the worker builds it from the
+source rows; a test database has none, so that is immediate. Runtime state
+(ledger, ring, build chunks, quarantine, claims, statuses) is never dumped.
+
+- The hook applies to one database config, `config.trellis.dump_database`
+  (default `"primary"`): the one `config.trellis.connect` and
+  `config.trellis.instances` point at. Other databases dump as Rails dumps
+  them.
+- `pg_dump` and `dump_definitions_sql` read separate snapshots. The hook reads
+  the definitions before and after the `pg_dump` and redoes the dump when they
+  differ (three attempts, then `Trellis::ConflictError`), so a define or drop
+  that races a dump can't leave tables and definitions disagreeing.
+- A definition that was paused or quarantined where the dump was taken loads
+  as `waiting_to_backfill`: the pause is runtime state.
+- `pg_dump` 17 writes `CREATE SCHEMA public`, which a database made by
+  `db:create` already has; the hook writes `CREATE SCHEMA IF NOT EXISTS
+  public` instead.
+- The dump connects through `Trellis::Railtie.with_handle`, so it migrates
+  Trellis's tables first if the database lacks them, and starts no worker.
+- It hooks `ActiveRecord::Tasks::DatabaseTasks.dump_schema` and
+  `PostgreSQLDatabaseTasks#structure_dump`, which Rails marks `:nodoc:` and
+  offers no extension point for. A Rails upgrade that renames them fails the
+  test suite's round trip (`test/schema_dump_test.rb`).
 
 ## Layout
 

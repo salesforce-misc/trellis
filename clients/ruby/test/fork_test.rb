@@ -19,6 +19,7 @@ class ForkTest < Minitest::Test
     "apply" => -> { Trellis.apply("PAUSE TRANSFORM t") },
     "config" => -> { Trellis.config },
     "definitions" => -> { Trellis.definitions },
+    "dump_definitions_sql" => -> { Trellis.dump_definitions_sql },
     "relationships" => -> { Trellis.relationships },
     "request_backfill" => -> { Trellis.request_backfill("t") },
     "release_key" => -> { Trellis.release_key("t", "s", "1") },
