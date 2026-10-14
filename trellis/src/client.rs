@@ -106,7 +106,9 @@ pub struct ClientOptions {
     /// under that interval reclaims claims out from under workers that are
     /// still running them.
     pub reclaim_ttl: Duration,
-    /// How often the maintenance loop (seal/recover/reclaim) ticks.
+    /// How often the maintenance loop ticks. Every tick seals and checks for
+    /// a backfill waiting to be discharged; the rest of its work runs every
+    /// [`Self::housekeeping_interval`].
     pub maintenance_interval: Duration,
     /// How often the maintenance loop runs its housekeeping (#273): stuck-seal
     /// recovery, the stale-claim, stale-worker and stale-drainer reclaims,
@@ -117,10 +119,13 @@ pub struct ClientOptions {
     /// `housekeeping_interval` later than its age gate, a dead worker's claim
     /// is reclaimed that much later than `reclaim_ttl`, and a tombstone, a
     /// drained segment's ring slot and the gauge lag by that much. A full ring
-    /// does not wait for it: a refused seal retires drained segments itself.
-    /// The effective interval is at most a sixth of `reclaim_ttl`
-    /// ([`housekeeping_interval`]), so a short TTL keeps its proportions.
-    /// The first tick runs the housekeeping at once.
+    /// does not wait for it: a refused seal retires drained segments itself,
+    /// and the housekeeping still runs on schedule while the ring stays full.
+    /// Nor does a tombstone backlog: while a collection pass may have stopped
+    /// at its per-ledger cap, the next tick collects again. The effective
+    /// interval is at most a sixth of `reclaim_ttl`, so a short TTL keeps its
+    /// proportions. The first tick runs the housekeeping at once, and a pass
+    /// that fails is retried on the next tick.
     pub housekeeping_interval: Duration,
     /// How often the maintenance loop re-derives the desired source-table
     /// set from the catalog (issue #14) and re-runs the capture reconcile
@@ -1207,6 +1212,9 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         housekeeping_interval_option,
         reclaim_ttl,
     ));
+    // Whether the last tombstone collection may have stopped at its
+    // per-ledger cap ([`staging::retire::may_leave_backlog`]).
+    let mut tombstone_backlog = false;
     // Due immediately on the very first tick rather than waiting a full
     // `reconcile_interval` after startup — `setup_staging` already ran one
     // reconciliation pass at that point, but this makes the loop's own
@@ -1230,7 +1238,14 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         if let Some(held) = session.as_mut() {
             let c = held.client_mut();
             let sealed = staging::seal_if_active_nonempty(c, &wake_channel).await;
-            let mut failed = failures.check("seal", sealed).is_err();
+            // A refused seal (`RingFull`, after its own retirement retry) is
+            // backpressure on a working connection, not a failure of it: the
+            // rest of the tick still runs. The housekeeping pass is what
+            // reclaims a dead claimant's hold on the oldest segment, the one
+            // thing that can keep retirement from freeing a slot, so skipping
+            // it here would keep the ring full for good.
+            let ring_full = matches!(sealed, Err(StagingError::RingFull { .. }));
+            let mut failed = failures.check("seal", sealed).is_err() && !ring_full;
             // Issue #273: everything but the seal and the discharge check
             // runs on the housekeeping cadence, not every tick. See
             // [`HousekeepingSchedule`] for what each step's added latency is.
@@ -1287,7 +1302,10 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 }
                 if !failed {
                     let collected = staging::collect_tombstones(c).await;
-                    failed = failures.check("collect_tombstones", collected).is_err();
+                    match failures.check("collect_tombstones", collected) {
+                        Ok(n) => tombstone_backlog = staging::retire::may_leave_backlog(n),
+                        Err(_) => failed = true,
+                    }
                 }
                 if !failed {
                     // ADR-0009 decision 5's staging_segments{state} gauge: cheap
@@ -1302,8 +1320,16 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     }
                 }
                 // A failed pass is retried on the next tick, not a cadence later.
-                if !failed {
-                    housekeeping.ran(Instant::now());
+                housekeeping.finished(Instant::now(), !failed);
+            } else if !failed && tombstone_backlog {
+                // A pass capped per ledger keeps collecting every tick until
+                // it runs dry, so a delete-heavy workload's tombstones are
+                // collected at the rate they were before the cadence, not
+                // capped at one pass per housekeeping interval.
+                let collected = staging::collect_tombstones(c).await;
+                match failures.check("collect_tombstones", collected) {
+                    Ok(n) => tombstone_backlog = staging::retire::may_leave_backlog(n),
+                    Err(_) => failed = true,
                 }
             }
             if !failed && early_pass && Instant::now() < next_reconcile {
@@ -1427,7 +1453,7 @@ fn early_pass_allowed(last_pass: Duration, catch_up_timeout: Duration) -> bool {
 /// The housekeeping interval [`maintenance_loop`] runs at: the configured
 /// one, but at most a sixth of `reclaim_ttl`, so a stale claim is reclaimed
 /// within `reclaim_ttl` plus a sixth of it however short a test sets the TTL.
-/// Never zero: the loop's own tick is the floor.
+/// A zero interval runs the housekeeping on every tick.
 fn housekeeping_interval(configured: Duration, reclaim_ttl: Duration) -> Duration {
     configured.min(reclaim_ttl / 6)
 }
@@ -1437,9 +1463,9 @@ fn housekeeping_interval(configured: Duration, reclaim_ttl: Duration) -> Duratio
 /// segment gauge. Pure over an injected `now`, so the schedule is tested
 /// without a database or a clock.
 ///
-/// Due on the first tick. A pass that completes ([`Self::ran`]) pushes the
-/// next one a whole interval out; a pass that failed leaves it due, so the
-/// next tick retries. Worst case, a step runs `interval` plus one tick after
+/// Due on the first tick. A pass that completes ([`Self::finished`]) pushes
+/// the next one a whole interval out; a pass that failed leaves it due, so
+/// the next tick retries. Worst case, a step runs `interval` plus one tick after
 /// its condition arose, where it used to run one tick after.
 struct HousekeepingSchedule {
     interval: Duration,
@@ -1458,8 +1484,10 @@ impl HousekeepingSchedule {
         self.next.is_none_or(|next| now >= next)
     }
 
-    fn ran(&mut self, now: Instant) {
-        self.next = Some(now + self.interval);
+    fn finished(&mut self, now: Instant, completed: bool) {
+        if completed {
+            self.next = Some(now + self.interval);
+        }
     }
 }
 
@@ -3026,7 +3054,7 @@ mod maintenance_failure_tests {
         let tick = Duration::from_millis(300);
         let mut schedule = HousekeepingSchedule::new(Duration::from_secs(5));
         assert!(schedule.due(start), "due on the first tick");
-        schedule.ran(start);
+        schedule.finished(start, true);
 
         // Every tick up to the interval is a skip: that is the saving.
         let mut skipped = 0;
@@ -3043,8 +3071,9 @@ mod maintenance_failure_tests {
 
         // A failed pass leaves it due, tick after tick, until one completes.
         assert!(schedule.due(at));
+        schedule.finished(at, false);
         assert!(schedule.due(at + tick));
-        schedule.ran(at + tick);
+        schedule.finished(at + tick, true);
         assert!(!schedule.due(at + tick * 2));
     }
 
@@ -3103,7 +3132,7 @@ mod maintenance_failure_tests {
             // Simulate a condition that arose the instant after a pass.
             let start = Instant::now();
             let mut schedule = HousekeepingSchedule::new(interval);
-            schedule.ran(start);
+            schedule.finished(start, true);
             let mut at = start + contract;
             while !schedule.due(at) {
                 at += tick;
@@ -3244,6 +3273,184 @@ mod maintenance_failure_tests {
                     "the seal failure was never logged"
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            shutdown_tx.send(true).expect("signal shutdown");
+        };
+        tokio::join!(maintenance_loop(config, shutdown_rx), watcher);
+    }
+
+    /// A full ring whose oldest segment a dead drain worker still claims:
+    /// retirement cannot free a slot until that claim is reclaimed, and only
+    /// the housekeeping pass reclaims it. A refused seal (`RingFull`) is
+    /// backpressure, not a broken connection, so it must not skip that pass,
+    /// or the ring stays full for good.
+    #[tokio::test]
+    async fn a_full_ring_still_reclaims_a_dead_claim() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let schema = crate::config::DEFAULT_SCHEMA;
+        let (mut raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!("set search_path to {schema}, public"))
+            .await
+            .expect("set search_path");
+        // Segments 1-3 sealed into slots 0-2; segment 4 is active in slot 3,
+        // and non-empty, so every tick tries to seal it into slot 0.
+        for _ in 0..3 {
+            let outcome = staging::seal_phase1(&mut raw).await.expect("seal phase 1");
+            staging::seal_phase2(&raw, outcome.sealed_seg_seq, "wake")
+                .await
+                .expect("seal phase 2");
+        }
+        raw.batch_execute(
+            "insert into seg_3 (src_table, key, op, hop_gen) values ('orders', 'k', 'recompute', 0); \
+             update segments set state = 'draining' where seg_seq = 1; \
+             insert into seg_claims (seg_seq, bucket, claimed_by, claimed_at) \
+             values (1, 0, 'dead-worker', now() - interval '1 hour')",
+        )
+        .await
+        .expect("fill the ring behind a dead claim");
+
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
+        )
+        .expect("build a same-crate pool");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = MaintenanceConfig {
+            dsn: db.dsn().to_string(),
+            schema: schema.to_string(),
+            pool,
+            session: ProducerSession::connect(db.dsn(), schema)
+                .await
+                .expect("take the staging-worker singleton"),
+            wake_channel: "wake".to_string(),
+            interval: Duration::from_millis(20),
+            housekeeping_interval: Duration::from_secs(5),
+            reclaim_ttl: Duration::from_secs(30),
+            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
+            reconcile_interval: Duration::from_secs(3600),
+            watermark: staging::StagedWatermark::new(),
+            backfill_catch_up_timeout: Duration::from_secs(1),
+        };
+        let watcher = async {
+            // An event, not a convergence budget: the bound only turns a
+            // hang into a failure. The first tick's pass reclaims it.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let claims: i64 = raw
+                    .query_one("select count(*) from seg_claims", &[])
+                    .await
+                    .expect("count claims")
+                    .get(0);
+                if claims == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the dead claim behind a full ring was never reclaimed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            shutdown_tx.send(true).expect("signal shutdown");
+        };
+        tokio::join!(maintenance_loop(config, shutdown_rx), watcher);
+    }
+
+    /// A tombstone backlog bigger than one collection pass's per-ledger cap
+    /// is worked off on the following ticks, not one pass per housekeeping
+    /// interval, which would cap collection at 4,000 tombstones a second per
+    /// ledger. The interval here is an hour: only the backlog rule can
+    /// collect the rest.
+    #[tokio::test]
+    async fn a_tombstone_backlog_is_collected_tick_after_tick() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let schema = crate::config::DEFAULT_SCHEMA;
+        let (mut raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!("set search_path to {schema}, public"))
+            .await
+            .expect("set search_path");
+        raw.batch_execute(
+            r#"
+            create schema gc;
+            create table gc."target__ledger" (
+                "__from_key" text primary key,
+                "__applied_lsn" pg_lsn,
+                "__applied_seg" bigint,
+                "__basis" pg_snapshot,
+                "__tombstone" boolean not null default false
+            );
+            create index on gc."target__ledger" ("__from_key") where "__tombstone";
+            insert into gc."target__ledger" ("__from_key", "__applied_seg", "__tombstone")
+            select 'k' || i, 1, true from generate_series(1, 50000) i;
+            insert into source_table_versions (source_table, version)
+            values ('public.src', 1);
+            insert into transform_definitions
+                (target_table, source_table, source_version, definition_text)
+            values ('gc.target', 'public.src', 1, 'n/a');
+            "#,
+        )
+        .await
+        .expect("a ledger holding more tombstones than one pass collects");
+        let outcome = staging::seal_phase1(&mut raw).await.expect("seal phase 1");
+        staging::seal_phase2(&raw, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        raw.execute(
+            "update segments set state = 'drained' where seg_seq = $1",
+            &[&outcome.sealed_seg_seq],
+        )
+        .await
+        .expect("drain segment 1");
+
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
+        )
+        .expect("build a same-crate pool");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = MaintenanceConfig {
+            dsn: db.dsn().to_string(),
+            schema: schema.to_string(),
+            pool,
+            session: ProducerSession::connect(db.dsn(), schema)
+                .await
+                .expect("take the staging-worker singleton"),
+            wake_channel: "wake".to_string(),
+            interval: Duration::from_millis(20),
+            housekeeping_interval: Duration::from_secs(3600),
+            reclaim_ttl: Duration::from_secs(6 * 3600),
+            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
+            reconcile_interval: Duration::from_secs(3600),
+            watermark: staging::StagedWatermark::new(),
+            backfill_catch_up_timeout: Duration::from_secs(1),
+        };
+        let watcher = async {
+            // An event, not a convergence budget: the bound only turns a
+            // hang into a failure.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let left: i64 = raw
+                    .query_one(r#"select count(*) from gc."target__ledger""#, &[])
+                    .await
+                    .expect("count tombstones")
+                    .get(0);
+                if left == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{left} tombstones were left for the next housekeeping pass"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
             shutdown_tx.send(true).expect("signal shutdown");
         };

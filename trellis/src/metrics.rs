@@ -507,10 +507,11 @@ pub fn increment_changes_applied(transform: &str, rows: u64) {
 
 /// Sets [`STAGING_SEGMENTS_METRIC`] for `state` to `count` — ADR-0009
 /// decision 5's cheap segment-state gauge, refreshed on-demand (today: once
-/// per [`crate::client`]'s maintenance tick) rather than incremented on the
+/// per [`crate::client`]'s housekeeping pass, every
+/// `ClientOptions::housekeeping_interval`) rather than incremented on the
 /// hot append/fold path. The count is also kept for
 /// [`refresh_instance_gauges`], which keeps the series alive while the
-/// instance runs but its maintenance tick is not reaching this call (a
+/// instance runs but its housekeeping is not reaching this call (a
 /// reconcile pass that takes longer than [`GAUGE_IDLE_TIMEOUT`], say).
 pub fn set_staging_segments(state: &str, count: u64) {
     ensure_installed();

@@ -62,21 +62,27 @@ re-claims instead is a halt that pauses nothing (see 05).
 
 ## Who runs the sweeps
 
-The maintenance pass runs on the **idle tick** of every drain loop and of the
-worker pool's sweep (default 5 s). It:
+The staging worker's maintenance loop seals on every tick (300 ms) and runs the
+**housekeeping pass** every `housekeeping_interval` (5 s, and at most a sixth of
+the reclaim TTL), whether or not the drain is busy. The pass:
 
 1. recovers any crashed mid-seal batch's fence ([03](03-sealing-and-the-fence.md));
 2. reclaims claims older than the reclaim window (default 30 s);
-3. retires eligible drained batches.
+3. retires eligible drained batches;
+4. collects the tombstones no change can still need.
 
-It is also the **liveness unblock for a saturated ring**: a worker that gets
-`RingFull` from a seal runs the pass and retries once — else a ring full of
-drained-but-not-yet-retired slots wedges the drain forever.
+So a crashed seal is recovered within its 10 s age gate plus about 5 s, and a dead
+claimant's buckets are freed within the reclaim TTL plus about 5 s. A full ring
+does not change that: a refused seal still lets the pass run, and the pass is what
+frees a dead claimant's hold on the oldest batch. A tombstone collection that
+stopped at its per-ledger cap runs again on the next tick rather than 5 s later.
 
-Recovery from a dead claimant is bounded by *reaching an idle tick*, so under
-never-idle load its batch waits until the queue drains. This stays sound: every
-pending predicate counts non-`drained` batches, so a deferred reclaim adds
-latency, never false convergence.
+The seal itself is the **liveness unblock for a saturated ring**: a seal that gets
+`RingFull` runs retirement and retries once, so a ring full of
+drained-but-not-yet-retired slots never waits for the pass.
+
+A deferred reclaim stays sound: every pending predicate counts non-`drained`
+batches, so it adds latency, never false convergence.
 
 ## Quarantine: when a change deterministically kills its worker
 

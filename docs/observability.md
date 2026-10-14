@@ -90,7 +90,8 @@ below, and the histograms above, also carries the `trellis_instance` label
   one call with a retryable error; nothing is retried in a loop.
 * `staging_segments{state}` — a cheap system-level gauge counting segments by
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
-  chosen over a per-transform depth gauge for lower cost.
+  chosen over a per-transform depth gauge for lower cost. The staging worker
+  counts them every 5 s (`housekeeping_interval`).
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#transform-status-lifecycle), a small enumerable state.

@@ -48,7 +48,8 @@ third of the window, from one task of its own, not on each thread's wake. A thre
 busy in a long drain or build chunk keeps its row fresh that way, and a thread
 whose loop has exited or panicked is left out of the statement, so its row ages
 out of the count within the window. Rows nothing has refreshed for the window (or
-the reclaim TTL, if longer) are deleted by the staging worker's maintenance tick.
+the reclaim TTL, if longer) are deleted by the staging worker's housekeeping, every
+5 s.
 
 **Exclusivity is the primary key**, not a lock:
 

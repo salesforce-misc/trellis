@@ -179,8 +179,21 @@ const LEDGER_TABLES_SQL: &str = "\
 const TOMBSTONE_BATCH: i64 = 5_000;
 
 /// The most GC transactions one pass runs per ledger, so a backlog is worked
-/// off over several maintenance ticks rather than holding one up.
+/// off over several passes rather than holding one up. While a pass may have
+/// left one ([`may_leave_backlog`]), the maintenance loop runs the next pass
+/// on its next tick, not a housekeeping interval later (#273).
 const TOMBSTONE_BATCHES_PER_PASS: usize = 4;
+
+/// Whether a [`collect_tombstones`] pass that collected `collected`
+/// tombstones may have stopped at a ledger's per-pass cap with more left.
+/// Below the cap, every ledger it reached ran dry (or was skipped on a lock,
+/// a build or a missing index, which waiting out does not change). At or
+/// above it, one may not have, so the caller runs another pass soon: with
+/// the cap at 20,000 a ledger and passes 5 s apart, collection would top out
+/// at 4,000 tombstones a second per ledger, under a delete-heavy write rate.
+pub(crate) fn may_leave_backlog(collected: u64) -> bool {
+    collected >= TOMBSTONE_BATCH as u64 * TOMBSTONE_BATCHES_PER_PASS as u64
+}
 
 /// Deletes the tombstones no change can still need (#623 D7): in every
 /// ledger, each `__tombstone` entry whose `__applied_seg` is at or below the

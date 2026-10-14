@@ -67,8 +67,9 @@
 //! segment's slot is freed for reuse by retirement (stage 06,
 //! `docs/staging-and-claiming/06-cleanup-and-reclaim.md`,
 //! `staging::retire_drained_segments`), run both as
-//! `staging::seal_if_active_nonempty`'s one-retry-on-`RingFull` step and on
-//! every maintenance tick ([`client::ClientOptions::maintenance_interval`]).
+//! `staging::seal_if_active_nonempty`'s one-retry-on-`RingFull` step and in
+//! the maintenance loop's housekeeping
+//! ([`client::ClientOptions::housekeeping_interval`]).
 //! Quarantine, stage 06's other half, is not yet implemented.
 
 // Tier 1 (the facade) and tier 2 (composable primitives) — see ADR-0012.
