@@ -15,7 +15,7 @@
 //!   `regexp_count(val::text, '[13579]')`. They put the capture numbers next to
 //!   costs application engineers already accept.
 //! - The logical-replication path before #622 C5 (`slot`) is gone with
-//!   intake (C7). C4's baseline holds its numbers.
+//!   intake (C7).
 //! - `trigger`: the capture triggers, installed through the real installer
 //!   ([`trellis::dev::capture::install`]), with the capture spec computed
 //!   from the catalog the way the staging worker's reconcile does.
@@ -23,7 +23,7 @@
 //!   columns in the empty-statement guard's query (Q2(c)), so this is C4's
 //!   `trigger+column-check-guard`. C4's benchmark-only Q2 variants
 //!   (`trigger+exception`, `trigger+column-check`, `-guard`, `-txn`) went
-//!   with the decision; the baseline holds their numbers.
+//!   with the decision.
 //! - `trigger+to-side`: `trigger` on a table that is also a relationship's
 //!   to-side, joined on a non-key column: `wt_src` gains `grp bigint
 //!   generated always as (id % 1024) stored`, and `RELATIONSHIP wt_rel FROM

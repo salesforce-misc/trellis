@@ -14,13 +14,13 @@
 //! hypothetical future backend that doesn't expose a raw connection at all.
 //! [`super::run_convergence`] itself is completely untouched by this file.
 //!
-//! Both tasks are "bucket 1" (improvement-plan
-//! workstream E): neither is meant to perturb a tracked program's
-//! oracle-verified convergence at all, so [`run_convergence_with_noise`]
-//! below reuses [`super::check_program`] unchanged and asserts the exact
-//! same thing [`super::run_convergence`] does after every op — the only
-//! difference is that a [`crate::model::NoisePlan`]'s events are free to fire
-//! at the positions it names, interleaved with the real ops.
+//! Both tasks are "bucket 1" (improvement-plan workstream E): neither is meant
+//! to perturb a tracked program's oracle-verified convergence at all, so
+//! [`run_convergence_with_noise`] below reuses [`super::check_program`]
+//! unchanged and asserts the exact same thing [`super::run_convergence`] does
+//! after every op — the only difference is that a [`crate::model::NoisePlan`]'s
+//! events are free to fire at the positions it names, interleaved with the real
+//! ops.
 
 use trellis::Pool;
 

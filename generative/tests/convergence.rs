@@ -38,7 +38,7 @@ use trellis::{Config, Pool};
 /// One tokio runtime and one shared, initdb-once cluster for a test thread's
 /// proptest cases. See the module doc comment for why this is thread-local.
 ///
-/// `coverage` (improvement-plan task A2, `docs/generative-test-suite.md` §6)
+/// `coverage` (improvement-plan task A2, `docs/generative-test-suite.md` §3)
 /// accumulates every program `run_one` drives, pass or fail, so the property
 /// can report what it actually exercised instead of a single green/red bit —
 /// see [`Harness`]'s `Drop` impl below.

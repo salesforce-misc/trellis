@@ -126,13 +126,12 @@ proptest! {
     }
 }
 
-/// D2 item 3 (improvement plan): a coverage
-/// floor confirming the generator actually produces programs where
-/// `reordered_by_commute_groups` does something non-trivial often enough for
-/// the property above to be non-vacuous. If every generated program had only
-/// one op, or every op shared one target key, the property would hold
-/// trivially (both "orderings" would literally be the same sequence) without
-/// ever exercising the reordering logic at all.
+/// Improvement-plan task D2 item 3: a coverage floor confirming the generator
+/// actually produces programs where `reordered_by_commute_groups` does
+/// something non-trivial often enough for the property above to be non-vacuous.
+/// If every generated program had only one op, or every op shared one target
+/// key, the property would hold trivially (both "orderings" would literally be
+/// the same sequence) without ever exercising the reordering logic at all.
 #[test]
 fn trivial_program_sometimes_has_ops_with_genuinely_distinct_target_keys() {
     use proptest::strategy::{Strategy, ValueTree};

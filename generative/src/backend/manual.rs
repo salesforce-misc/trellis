@@ -1148,9 +1148,9 @@ impl super::Backend for ManualBackend {
         // Improvement-plan workstream C, task C1: opt-in per-call timing
         // around the whole quiesce (since #432, the settle and catch-up
         // waits as well as the watermark -> converge round trip), to test the
-        // hypothesis that the convergence property's wall-clock variance came from a
-        // ~10s pipeline stall. It did: issue #452's keepalive throttle, first
-        // blamed on the seal age gate. Silent and free unless
+        // hypothesis that the convergence property's wall-clock variance came
+        // from a ~10s pipeline stall. It did: issue #452's keepalive
+        // throttle, first blamed on the seal age gate. Silent and free unless
         // `GENERATIVE_QUIESCE_TIMING` is set: the env lookup happens once per
         // call so the default (unset) path pays exactly one `var_os` check
         // and no clock reads.

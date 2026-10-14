@@ -4,16 +4,15 @@
 //! pipeline.
 //!
 //! Today's scope is the *trivial* generator (issue #6): every source table is
-//! shaped `(numeric pk, numeric c1, numeric c2)` and every definition is a
-//! 1-1 numeric-`+`, each with a seed-before-mutate op stream. Improvement-plan
-//! task **B3** widened
-//! this from *exactly* one table/one definition to **1-3 tables and 1-3
-//! definitions**, each definition independently drawing one of the tables as
-//! its source — see [`build_program_multi`] and [`TableSpec`]. The proptest
-//! [`Strategy`]s that draw these live behind the `proptest` feature (see
-//! `Cargo.toml`); the pure builders they map onto ([`build_program`],
-//! [`build_program_multi`]) are always available so a hand-built pin can
-//! reuse the exact same shape without pulling in proptest.
+//! shaped `(numeric pk, numeric c1, numeric c2)` and every definition is a 1-1
+//! numeric-`+`, each with a seed-before-mutate op stream. Improvement-plan task
+//! **B3** widened this from *exactly* one table/one definition to **1-3 tables
+//! and 1-3 definitions**, each definition independently drawing one of the
+//! tables as its source — see [`build_program_multi`] and [`TableSpec`]. The
+//! proptest [`Strategy`]s that draw these live behind the `proptest` feature
+//! (see `Cargo.toml`); the pure builders they map onto ([`build_program`],
+//! [`build_program_multi`]) are always available so a hand-built pin can reuse
+//! the exact same shape without pulling in proptest.
 //!
 //! `build_program` is kept as a single-table/single-def convenience
 //! wrapper around [`build_program_multi`] (rather than changing its

@@ -445,7 +445,7 @@ has the argument.
 The capture runs inside the application's transaction, so the writer pays for
 it: about 16 µs per single-row statement on tmpfs, and 1.3–1.7× one
 expression index's CPU per row for batched writes, with about 300 bytes of
-WAL per row (the `benchmark` `write_tax` scenarios). The begin
+WAL per row (`benchmark` scenario `write-tax`). The begin
 trigger and the span bookkeeping add about 4.4 µs per statement,
 and nothing per row. An update's repeated-key check adds about 2.7 µs per
 statement and 0.3 µs per row (a rough in-transaction measurement, not

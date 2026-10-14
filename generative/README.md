@@ -38,9 +38,9 @@ entirely, that stall, not test-harness overhead; see the git history for
 measurement writeup.
 
 That stall was an engine bug, issue #452, not the seal age gate
-(`SealConfig::age_gate`) that an earlier
-diagnosis suspected: a convergence wait whose token landed past the last decoded
-change waited for the then-replication intake's keepalive-driven persist,
+(`SealConfig::age_gate`) that an earlier diagnosis suspected: a convergence
+wait whose token landed past the last decoded change waited for the
+then-replication intake's keepalive-driven persist,
 throttled to once per 10s. Fixing that dropped the fast-lane binaries'
 serial time from 385s to 174s (fifteen binaries, measured 2026-09-24), and
 trigger capture (#622) removed the wait altogether. The figures above

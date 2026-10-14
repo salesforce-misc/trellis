@@ -32,7 +32,8 @@
 //! comment for exactly why re-resolving a qualified value fails outright
 //! rather than merely being redundant. A handful of read sites deliberately
 //! stay bare regardless — `column_dependents`, `definition_by_target`, and
-//! every `app.rs` read reachable through `docs/decisions/0003-quarantine-storage-and-api.md`'s
+//! every `app.rs` read reachable through
+//! `docs/decisions/0003-quarantine-storage-and-api.md`'s
 //! `transform.column` addressing scheme — because their callers only ever
 //! have the bare name that addressing scheme itself accepts (issue #76
 //! taught the *grammar* an explicit `schema.table` spelling for `TRANSFORM`/
@@ -8347,8 +8348,9 @@ pub(crate) async fn definition_by_id_in(
 /// name every caller here actually has: a `Trellis` API consumer only ever
 /// knows the bare name their `TRANSFORM <name> FROM ...` text declared (the
 /// grammar has no qualified-target syntax yet — issue #76), and
-/// `docs/decisions/0003-quarantine-storage-and-api.md`'s `transform.column` addressing scheme parses on the
-/// first `.` (`app::QuarantineTarget::parse`) — a qualified address here
+/// `docs/decisions/0003-quarantine-storage-and-api.md`'s `transform.column`
+/// addressing scheme parses on the first `.`
+/// (`app::QuarantineTarget::parse`) — a qualified address here
 /// would misparse as a column reference the moment a target table lived
 /// outside the default schema. Matched against `target_table`'s bare
 /// table-name suffix (`split_part`), not the qualified column directly,

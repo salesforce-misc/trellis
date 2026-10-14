@@ -1031,13 +1031,15 @@ impl Trellis {
 
             // Issue #73: read back the bare table-name suffix, not the persisted
             // fully-qualified `target_table` — `QuarantineTarget::Transform`
-            // round-trips through `docs/decisions/0003-quarantine-storage-and-api.md`'s `transform.column`
-            // addressing scheme elsewhere in this API (`quarantine_status`,
-            // `resume_column`, `sample_quarantined`, all keyed on the bare name
-            // the grammar accepts back), which parses an address on its first
-            // `.` — handing it a qualified `"schema.table"` spelling here would
-            // make every entry in this list misparse as a column address the
-            // moment a target table lived outside the default schema.
+            // round-trips through
+            // `docs/decisions/0003-quarantine-storage-and-api.md`'s
+            // `transform.column` addressing scheme elsewhere in this API
+            // (`quarantine_status`, `resume_column`, `sample_quarantined`, all
+            // keyed on the bare name the grammar accepts back), which parses an
+            // address on its first `.` — handing it a qualified
+            // `"schema.table"` spelling here would make every entry in this
+            // list misparse as a column address the moment a target table
+            // lived outside the default schema.
             let quarantined_transforms = client
                 .query(
                     "select split_part(target_table, '.', 2) from transform_definitions \
