@@ -736,7 +736,7 @@ async fn a_partitioned_source_is_refused_at_define_time() {
         .await
         .expect_err("a partitioned source is refused");
     assert_eq!(err.code(), trellis::ErrorCode::Validation, "{err}");
-    assert!(err.to_string().contains("not partitioned"), "{err}");
+    assert!(err.to_string().contains("1-1 transform"), "{err}");
 }
 
 /// Options for a running client whose staging worker reconciles often, so an

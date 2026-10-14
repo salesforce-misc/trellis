@@ -325,6 +325,16 @@ pub enum CatalogError {
     /// reach their readers in the writing transaction rather than through
     /// capture.
     SourceNotChangeKeyed { source_table: String },
+    /// ADR-0017: a partitioned root can't be read as the definition asks
+    /// ([`super::partition_tree::PartitionRefusal`]; every message names the
+    /// column or the limit).
+    PartitionedSource(super::partition_tree::PartitionRefusal),
+    /// ADR-0017: a partitioned root of a servable shape. Capture is installed
+    /// on the root alone, and a statement trigger fires only for the table a
+    /// statement names, so a write aimed at a partition would go unseen; the
+    /// definition is refused until capture covers every node of the tree
+    /// ([`PARTITIONED_SOURCES_CAPTURED`]).
+    PartitionedSourceNotCaptured { table: String },
     /// Issue #375: a relationship endpoint that isn't one of this instance's
     /// targets fails [`change_keyed`]. The relationship walk in
     /// [`all_source_tables`] captures it, so it is held to the same rule as a
@@ -514,6 +524,8 @@ impl CatalogError {
             CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
             CatalogError::TargetTableExists { .. } => ErrorCode::Conflict,
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
+            CatalogError::PartitionedSource(_) => ErrorCode::Validation,
+            CatalogError::PartitionedSourceNotCaptured { .. } => ErrorCode::Validation,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RowSecurityApplies(_) => ErrorCode::Validation,
             CatalogError::Subscribed(_) => ErrorCode::Validation,
@@ -731,6 +743,13 @@ impl fmt::Display for CatalogError {
                  target, define this transform in that instance instead: \
                  an instance propagates writes to its own targets without capturing them"
             ),
+            CatalogError::PartitionedSource(refusal) => write!(f, "{refusal}"),
+            CatalogError::PartitionedSourceNotCaptured { table } => write!(
+                f,
+                "partitioned table {table} has a shape Trellis can read, but capture is \
+                 installed on the partitioned table alone, so a write aimed at one of its \
+                 partitions would go unseen. Use a plain table"
+            ),
             CatalogError::RelationshipEndpointNotChangeKeyed { side, endpoint } => write!(
                 f,
                 "Trellis can't capture {side} relationship endpoint \"{endpoint}\"'s changes: it \
@@ -846,6 +865,8 @@ impl std::error::Error for CatalogError {
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
+            CatalogError::PartitionedSource(_) => None,
+            CatalogError::PartitionedSourceNotCaptured { .. } => None,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => None,
             CatalogError::RowSecurityApplies(_) => None,
             CatalogError::Subscribed(_) => None,
@@ -1135,7 +1156,7 @@ pub async fn install_definition(
             let pk = ddl::source_primary_key(pool, &qualified_source)
                 .await
                 .map_err(CatalogError::Ddl)?;
-            reject_unkeyed_source(&**pool.get().await?, &qualified_source).await?;
+            reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
             ddl::target_table_ddl(
                 pool,
                 &def,
@@ -1155,7 +1176,7 @@ pub async fn install_definition(
             ddl::source_primary_key(pool, &qualified_source)
                 .await
                 .map_err(CatalogError::Ddl)?;
-            reject_unkeyed_source(&**pool.get().await?, &qualified_source).await?;
+            reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
             ddl::aggregate_target_table_ddl(pool, &def, target_schema, source_columns)
                 .await
                 .map_err(CatalogError::Ddl)?
@@ -4021,9 +4042,21 @@ async fn validate_relationship(
     qualified_to: &str,
 ) -> Result<ValidatedRelationship, CatalogError> {
     let to_type = validate_join_pair(txn, def, qualified_from, qualified_to, true).await?;
+    let cardinality = to_col_cardinality_in_txn(txn, qualified_to, &def.to_col).await?;
 
-    validate_relationship_endpoint(txn, &def.name, RelationshipSide::From, qualified_from).await?;
-    validate_relationship_endpoint(txn, &def.name, RelationshipSide::To, qualified_to).await?;
+    validate_relationship_endpoint(txn, &def.name, RelationshipSide::From, qualified_from, None)
+        .await?;
+    validate_relationship_endpoint(
+        txn,
+        &def.name,
+        RelationshipSide::To,
+        qualified_to,
+        Some(ToSide {
+            join_col: &def.to_col,
+            cardinality,
+        }),
+    )
+    .await?;
 
     // Issues #285/#288/#372: each endpoint's resolved schema is persisted
     // alongside its bare name, and `(from_schema, from_table, name)` is the
@@ -4071,7 +4104,6 @@ async fn validate_relationship(
     // relationship dependents.
     reject_if_table_cycle(txn, qualified_to, qualified_from).await?;
 
-    let cardinality = to_col_cardinality_in_txn(txn, qualified_to, &def.to_col).await?;
     let mut warnings = Vec::new();
     // The same definition of "indexed" the planner setting reads
     // ([`ddl::key_column_in`], #972, #973). It only informs the warning:
@@ -4124,8 +4156,9 @@ async fn validate_relationship_endpoint(
     name: &str,
     side: RelationshipSide,
     qualified_endpoint: &str,
+    to_side: Option<ToSide<'_>>,
 ) -> Result<(), CatalogError> {
-    validate_relationship_endpoint_keys(txn, name, side, qualified_endpoint).await?;
+    validate_relationship_endpoint_keys(txn, name, side, qualified_endpoint, to_side).await?;
     reject_non_live_upstream(txn, qualified_endpoint).await
 }
 
@@ -4137,8 +4170,9 @@ async fn validate_relationship_endpoint_keys(
     name: &str,
     side: RelationshipSide,
     qualified_endpoint: &str,
+    to_side: Option<ToSide<'_>>,
 ) -> Result<(), CatalogError> {
-    reject_unkeyed_relationship_endpoint(txn, side, qualified_endpoint).await?;
+    reject_unkeyed_relationship_endpoint(txn, side, qualified_endpoint, to_side).await?;
     match ddl::source_primary_key_in_txn(txn, qualified_endpoint).await {
         // Issue #638: the same key, matched by its exact text, so it needs a
         // deterministic collation too.
@@ -5436,7 +5470,7 @@ pub(crate) async fn validate_live_schema(
         .map_err(CatalogError::Ddl)?;
     assert_deterministic_definition_keys(txn, def, qualified_source, &source_key).await?;
     assert_collation_safe_text_functions(txn, def, qualified_source, None).await?;
-    reject_unkeyed_source(txn, qualified_source).await?;
+    reject_unkeyed_source(txn, qualified_source, def).await?;
 
     let mut names: Vec<&String> = relationships.keys().collect();
     names.sort();
@@ -5453,6 +5487,10 @@ pub(crate) async fn validate_live_schema(
                 &rel.def.name,
                 RelationshipSide::To,
                 &qualified_to,
+                Some(ToSide {
+                    join_col: &rel.def.to_col,
+                    cardinality: rel.cardinality,
+                }),
             )
             .await?;
         }
@@ -6533,6 +6571,27 @@ async fn to_col_cardinality_in_txn(
     })
 }
 
+/// Whether a definition may read a partitioned root whose shape passed
+/// [`super::partition_tree::PartitionTree::refusal`] (ADR-0017). It may once
+/// capture is installed on every node of the tree, staging under the root's
+/// identity. Until then a statement trigger on the root alone misses a write
+/// aimed at a partition, so such a definition would run on incomplete
+/// capture. While this is `false`, [`accept_partitioned`] refuses every
+/// servable tree with [`CatalogError::PartitionedSourceNotCaptured`], after
+/// every shape check, so a refusal for the shape still names its column.
+const PARTITIONED_SOURCES_CAPTURED: bool = false;
+
+/// The last check on a partitioned root of a servable shape: refuses it
+/// unless [`PARTITIONED_SOURCES_CAPTURED`].
+fn accept_partitioned(table: &str) -> Result<(), CatalogError> {
+    if PARTITIONED_SOURCES_CAPTURED {
+        return Ok(());
+    }
+    Err(CatalogError::PartitionedSourceNotCaptured {
+        table: table.to_string(),
+    })
+}
+
 /// Whether trigger capture can key `schema.table`'s changes (issue #622 C5):
 /// it is a plain table (`relkind = 'r'`) with a primary key. Every ring row a
 /// capture trigger writes is keyed by the primary key, so a table without
@@ -6594,6 +6653,7 @@ pub(crate) async fn change_keyed(
 async fn reject_unkeyed_source(
     client: &impl GenericClient,
     qualified_source: &str,
+    def: &TransformDef,
 ) -> Result<(), CatalogError> {
     if is_definition_target(client, qualified_source).await? {
         return Ok(());
@@ -6603,6 +6663,32 @@ async fn reject_unkeyed_source(
             qualified_source.to_string(),
         ));
     };
+    if let Some(tree) = super::partition_tree::read_partition_tree(client, qualified_source).await?
+    {
+        let refusal = match &def.key_space {
+            KeySpace::OneToOne => Some(super::partition_tree::PartitionRefusal::OneToOneFrom {
+                table: qualified_source.to_string(),
+            }),
+            KeySpace::Aggregate { group_by } => {
+                let columns: Vec<String> = group_by
+                    .iter()
+                    .filter_map(|key| match key {
+                        GroupByKey::Column(column) => Some(column.clone()),
+                        GroupByKey::RelationshipPath { .. } => None,
+                    })
+                    .collect();
+                tree.refusal(
+                    super::partition_tree::server_version_num(client).await?,
+                    super::partition_tree::KeyRole::GroupBy,
+                    &columns,
+                )
+            }
+        };
+        if let Some(refusal) = refusal {
+            return Err(CatalogError::PartitionedSource(refusal));
+        }
+        return accept_partitioned(qualified_source);
+    }
     if change_keyed(client, schema, table).await? {
         return Ok(());
     }
@@ -6666,9 +6752,33 @@ async fn reject_unkeyed_relationship_endpoint(
     client: &impl GenericClient,
     side: RelationshipSide,
     qualified_endpoint: &str,
+    to_side: Option<ToSide<'_>>,
 ) -> Result<(), CatalogError> {
     if is_definition_target(client, qualified_endpoint).await? {
         return Ok(());
+    }
+    // ADR-0017: only a to-many relationship's to-side can be a partitioned
+    // root; any other endpoint role falls through to the plain-table rule.
+    if let Some(to_side) = to_side
+        && let Some(tree) =
+            super::partition_tree::read_partition_tree(client, qualified_endpoint).await?
+    {
+        let refusal = match to_side.cardinality {
+            RelationshipCardinality::ToOne => {
+                Some(super::partition_tree::PartitionRefusal::ToOneToSide {
+                    table: qualified_endpoint.to_string(),
+                })
+            }
+            RelationshipCardinality::ToMany => tree.refusal(
+                super::partition_tree::server_version_num(client).await?,
+                super::partition_tree::KeyRole::JoinKey,
+                &[to_side.join_col.to_string()],
+            ),
+        };
+        if let Some(refusal) = refusal {
+            return Err(CatalogError::PartitionedSource(refusal));
+        }
+        return accept_partitioned(qualified_endpoint);
     }
     let keyed = match qualified_endpoint.split_once('.') {
         Some((schema, table)) => change_keyed(client, schema, table).await?,
@@ -6681,6 +6791,15 @@ async fn reject_unkeyed_relationship_endpoint(
         side,
         endpoint: qualified_endpoint.to_string(),
     })
+}
+
+/// A relationship's to-side endpoint, as far as the partitioned-source rules
+/// need it (ADR-0017): its join column and whether the relationship is
+/// to-many.
+#[derive(Clone, Copy)]
+struct ToSide<'a> {
+    join_col: &'a str,
+    cardinality: RelationshipCardinality,
 }
 
 /// A to-one relationship's settled parent projection (issue #129, epic

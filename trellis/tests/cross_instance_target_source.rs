@@ -386,7 +386,6 @@ async fn a_plain_source_is_held_to_the_same_keying_rule() {
     for source in [
         "unique_no_pk",
         "unique_index",
-        "parted",
         "parted_a",
         "inh_parent",
         "inh_child",
@@ -404,6 +403,22 @@ async fn a_plain_source_is_held_to_the_same_keying_rule() {
             }
             other => panic!("expected SourceNotChangeKeyed for {source}, got {other:?}"),
         }
+    }
+
+    // A partitioned root is held to its own rules (ADR-0017); as a 1-1
+    // transform's FROM it is refused for that.
+    match install_definition(
+        &db.pool,
+        "TRANSFORM parted_copy FROM parted SELECT amount AS amount_copy",
+        &coded,
+        "public",
+    )
+    .await
+    {
+        Err(CatalogError::PartitionedSource(
+            trellis::defs::partition_tree::PartitionRefusal::OneToOneFrom { table },
+        )) => assert_eq!(table, "public.parted"),
+        other => panic!("expected OneToOneFrom for parted, got {other:?}"),
     }
 
     install_definition(

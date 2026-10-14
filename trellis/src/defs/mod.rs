@@ -45,6 +45,7 @@ pub mod lifecycle;
 pub mod model;
 pub mod oracle;
 mod parser;
+pub mod partition_tree;
 pub mod pg_type;
 pub mod registry;
 pub mod row_security;
