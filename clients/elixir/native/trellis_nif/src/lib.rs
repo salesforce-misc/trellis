@@ -761,6 +761,17 @@ fn definitions<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'
     })
 }
 
+/// The SQL that loads this instance's definitions into a database built from
+/// a schema-only dump (`dump_definitions_sql`), as a binary.
+#[rustler::nif]
+fn dump_definitions_sql<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(
+        env,
+        BlockingTrellis::start_dump_definitions_sql,
+        |_, sql| Ok(sql),
+    )
+}
+
 /// Every registered relationship, oldest first.
 #[rustler::nif]
 fn relationships<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {

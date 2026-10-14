@@ -9,3 +9,4 @@ erl_crash.dump
 /LICENSE.txt
 /checksum-Elixir.Trellis.Native.exs
 /native/trellis_nif/Cargo.lock
+/tmp

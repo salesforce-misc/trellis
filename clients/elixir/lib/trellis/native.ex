@@ -97,6 +97,7 @@ defmodule Trellis.Native do
   def status(_handle, _target_table), do: :erlang.nif_error(:nif_not_loaded)
   def definitions(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def relationships(_handle), do: :erlang.nif_error(:nif_not_loaded)
+  def dump_definitions_sql(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def request_backfill(_handle, _source_table), do: :erlang.nif_error(:nif_not_loaded)
   def poisoned_since(_handle, _watermark_micros), do: :erlang.nif_error(:nif_not_loaded)
   def quarantined(_handle), do: :erlang.nif_error(:nif_not_loaded)

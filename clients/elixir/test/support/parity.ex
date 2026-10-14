@@ -82,11 +82,16 @@ defmodule Trellis.Parity do
   supervisor owns a handle only on the BEAM; `supervised_test.exs` covers
   these, and the fixture's operations run through a supervised handle there
   too.
+
+  `dump_definitions_sql` is here until the Ruby binding has its counterpart
+  (#644 part ii): then it becomes a fixture operation and leaves this list.
+  `structure_dump_test.exs` covers it meanwhile.
   """
   def not_operations do
     %{
       "child_spec" => "`{Trellis, options}` in a supervision tree",
-      "start_link" => "`{Trellis, options}` in a supervision tree"
+      "start_link" => "`{Trellis, options}` in a supervision tree",
+      "dump_definitions_sql" => "Ruby's counterpart is #644 part (ii)"
     }
   end
 

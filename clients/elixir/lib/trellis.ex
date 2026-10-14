@@ -14,7 +14,8 @@ defmodule Trellis do
     `ALTER TRANSFORM`) and reports what it did as a `t:Trellis.Applied.t/0`.
     `define/2` is the one guarded convenience: an `apply/2` that refuses
     anything but a `TRANSFORM` statement before applying it.
-  - **Reads:** `status/2`, `definitions/1`, `relationships/1`.
+  - **Reads:** `status/2`, `definitions/1`, `relationships/1`, and
+    `dump_definitions_sql/1`, the definitions as SQL to append to a schema dump.
   - **Quarantine:** `quarantined/1`, `quarantine_status/2`,
     `sample_quarantined/3`, `poisoned_since/2`. Pausing and resuming are
     statements: `apply(trellis, "RESUME TRANSFORM order_totals.total")`.
@@ -395,6 +396,30 @@ defmodule Trellis do
   @doc "Like `relationships/1`, but raises `Trellis.Error`."
   @spec relationships!(trellis()) :: [RelationshipSummary.t()]
   def relationships!(trellis), do: bang(relationships(trellis))
+
+  @doc """
+  The SQL that loads this instance's definitions into a database built from
+  a schema-only dump (`pg_dump --schema-only`, `mix ecto.dump`). Append it
+  to the dump; `mix trellis.dump` does.
+
+  It holds `INSERT`s for the rows that say what is defined (Trellis's
+  migration history, its instance marker, the transform and relationship
+  definitions and the catalog rows they need), and nothing else: the ledger,
+  the ring, backfill progress, quarantine and claims describe rows a
+  schema-only dump doesn't carry. Every definition loads as "defined, not
+  built" (`:waiting_to_backfill`), the state a `define/2` commits, including
+  one that was paused or quarantined where it was dumped. The rows are one
+  repeatable-read snapshot of the database. `migrate/1` on the loaded
+  database does nothing.
+  """
+  @spec dump_definitions_sql(trellis()) :: {:ok, String.t()} | {:error, Error.t()}
+  def dump_definitions_sql(trellis) when is_trellis(trellis) do
+    native(run(trellis, :dump_definitions_sql, []))
+  end
+
+  @doc "Like `dump_definitions_sql/1`, but raises `Trellis.Error`."
+  @spec dump_definitions_sql!(trellis()) :: String.t()
+  def dump_definitions_sql!(trellis), do: bang(dump_definitions_sql(trellis))
 
   @doc """
   Asks the staging worker to re-read `source_table` (a bare table name,

@@ -87,6 +87,9 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
 - `start_link/1`, as `{Trellis, options}` in a supervision tree: a process
   that owns the handle, so every function above also takes its name.
 - `Trellis.Migration`: `define`, `apply` and `status` in an Ecto migration.
+- `dump_definitions_sql/1`, `mix trellis.dump` and `Trellis.StructureDump`:
+  the definitions as SQL appended to the structure file (see
+  [Schema dumps](#schema-dumps)).
 - `Trellis.Metrics.render_prometheus/0`: the process-wide metrics registry
   as Prometheus text, for a `/metrics` route the host already serves (the
   binding opens no port). It needs no handle. Every series carries the
@@ -229,6 +232,42 @@ make it so: Ecto's `schema_migrations` runs each migration once. See
 
 Add `import_deps: [:trellis_pg]` to the app's `.formatter.exs` to keep
 `define` and `apply` free of parentheses, like Ecto's own commands.
+
+## Schema dumps
+
+`mix ecto.dump` writes a schema-only `pg_dump`, which carries the Trellis
+schema, the target tables and the capture triggers but no rows, so a
+database `mix ecto.load` builds from it has targets and no transforms.
+`mix trellis.dump` appends the definitions the way Ecto appends
+`schema_migrations`. Add an alias to `mix.exs`:
+
+```elixir
+defp aliases do
+  ["ecto.dump": ["ecto.dump", "trellis.dump"]]
+end
+```
+
+The repo needs its `:trellis` configuration (as for `Trellis.Migration`), and
+if it sets `:dump_prefixes` the list has to include the Trellis schema
+(`dump_prefixes: ["public", "trellis"]`); the task refuses a list that
+doesn't. `mix ecto.load` then runs the file and nothing else: the worker that
+starts on the loaded database finds definitions that aren't built and builds
+them. Only definitions are dumped; the ledger, backfill progress, quarantine
+and claims are runtime state, and a paused or quarantined transform loads
+`:waiting_to_backfill`.
+
+Limits:
+
+- `pg_dump` and the definitions are read separately, so a define or drop that
+  commits between them leaves a file whose DDL and definitions disagree.
+  Don't dump while a migration is running.
+- The task rewrites `pg_dump` 17's `CREATE SCHEMA public;` to
+  `CREATE SCHEMA IF NOT EXISTS public;`, which `mix ecto.load` into a
+  database `mix ecto.create` made would otherwise stop at.
+- A second run replaces the first's appendix.
+
+`Trellis.dump_definitions_sql/1` returns the same SQL for a caller that
+assembles its own dump.
 
 ## Layout
 
