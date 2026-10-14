@@ -90,7 +90,8 @@ defmodule Trellis.StructureDump do
   """
   @spec append(module(), keyword()) :: {:ok, Path.t()} | {:error, String.t()}
   def append(repo, options \\ []) when is_atom(repo) and is_list(options) do
-    with {:ok, [plan]} <- plans([{repo, options}]) do
+    with {:ok, [plan]} <- plans([{repo, options}]),
+         :ok <- readable(plan.path) do
       with_handles([plan], fn [handle] ->
         with {:ok, sql} <- read(handle),
              :ok <- write(plan.path, sql) do
@@ -98,6 +99,25 @@ defmodule Trellis.StructureDump do
         end
       end)
     end
+  end
+
+  # Checked before connecting, so a missing file is refused the same way
+  # whatever state the database is in.
+  defp readable(path) do
+    case File.read(path) do
+      {:ok, _} -> :ok
+      {:error, reason} -> read_error(path, reason)
+    end
+  end
+
+  defp read_error(path, :enoent) do
+    {:error,
+     "no structure file at #{path}: run `mix ecto.dump` first, or `mix trellis.dump`, " <>
+       "which runs it"}
+  end
+
+  defp read_error(path, reason) do
+    {:error, "could not read the structure file #{path}: #{:file.format_error(reason)}"}
   end
 
   defp plans(repos) do
@@ -236,13 +256,8 @@ defmodule Trellis.StructureDump do
         File.write!(copy, text <> sql)
         File.rename!(copy, path)
 
-      {:error, :enoent} ->
-        {:error,
-         "no structure file at #{path}: run `mix ecto.dump` first, or `mix trellis.dump`, " <>
-           "which runs it"}
-
       {:error, reason} ->
-        {:error, "could not read the structure file #{path}: #{:file.format_error(reason)}"}
+        read_error(path, reason)
     end
   end
 
