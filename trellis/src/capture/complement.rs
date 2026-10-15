@@ -338,6 +338,22 @@ pub fn qualified_collation(recorded: &str) -> String {
     }
 }
 
+/// `key`'s column under the node's own key collation. Levels of one tree can
+/// partition the same column under different collations, and the search
+/// presents each column once, so each comparison names the collation of the
+/// level whose bound it reads.
+fn collated(key: &KeyColumn) -> String {
+    if key.collation.is_empty() {
+        quote_ident(&key.name)
+    } else {
+        format!(
+            "({} collate {})",
+            quote_ident(&key.name),
+            qualified_collation(&key.collation)
+        )
+    }
+}
+
 /// A literal of `key`'s type.
 fn literal(value: &str, key: &KeyColumn) -> String {
     format!("'{}'::{}", value.replace('\'', "''"), key.pg_type)
@@ -550,7 +566,7 @@ fn list_member(values: &[Datum], keys: &[KeyColumn]) -> Pred {
     let Some(key) = keys.first() else {
         return Pred::False;
     };
-    let column = quote_ident(&key.name);
+    let column = collated(key);
     let literals: Vec<String> = values
         .iter()
         .filter_map(|v| match v {
@@ -611,7 +627,7 @@ fn split_bound(bound: &[Datum]) -> (usize, Option<&Datum>) {
 
 /// `(columns) op (values)` over the first `n` key columns.
 fn compare(keys: &[KeyColumn], bound: &[Datum], n: usize, op: &str) -> Pred {
-    let columns: Vec<String> = keys[..n].iter().map(|k| quote_ident(&k.name)).collect();
+    let columns: Vec<String> = keys[..n].iter().map(collated).collect();
     let values: Vec<String> = bound[..n]
         .iter()
         .zip(keys)
@@ -1275,5 +1291,212 @@ mod tests {
              select 1, v, pg_catalog.dense_rank() over (order by ((v)::text)) \
              from pg_catalog.unnest($2::text[]) as v"
         );
+    }
+
+    /// Whether each probe row (a query over the source's columns) is in the
+    /// complement the sweep computes for `public.items`, as the sweep reads
+    /// and presents it, and whether Postgres finds no partition for it.
+    async fn disagreements(client: &mut Client, ddl: &str, probes: &str) -> Vec<String> {
+        client
+            .batch_execute(&format!("drop table if exists public.items cascade; {ddl}"))
+            .await
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&partitions::pinned_settings())
+            .await
+            .expect("pinned");
+        let nodes = read_tree(&txn, "public.items")
+            .await
+            .expect("read")
+            .expect("readable");
+        let ranks = read_ranks(&txn, &rank_requests(&nodes))
+            .await
+            .expect("ranks");
+        let pred = complement(&nodes, &ranks).expect("a complement");
+        let presented: Vec<String> = key_columns(&nodes)
+            .iter()
+            .map(|k| {
+                format!(
+                    "{} as {}",
+                    typed(&format!("p.{}", quote_ident(&k.name)), k),
+                    quote_ident(&k.name)
+                )
+            })
+            .collect();
+        let rows: Vec<(String, bool)> = txn
+            .query(
+                &format!(
+                    "select pg_catalog.row_to_json(p)::text, \
+                       (select ({}) is not distinct from true from (select {}) as __route) \
+                     from ({probes}) as p",
+                    pred.sql(),
+                    presented.join(", ")
+                ),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", pred.sql()))
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        txn.commit().await.expect("commit");
+        let mut wrong = Vec::new();
+        for (json, in_complement) in rows {
+            let routed = client
+                .batch_execute(&format!(
+                    "begin; insert into public.items \
+                     select * from json_populate_record(null::public.items, '{}'); rollback",
+                    json.replace('\'', "''")
+                ))
+                .await;
+            let nowhere = match routed {
+                Ok(()) => false,
+                Err(e) => {
+                    client.batch_execute("rollback").await.expect("rollback");
+                    let message = e.as_db_error().map(|d| d.message().to_string());
+                    assert!(
+                        message
+                            .as_deref()
+                            .is_some_and(|m| m.contains("no partition")),
+                        "{json}: {e}"
+                    );
+                    true
+                }
+            };
+            if nowhere != in_complement {
+                wrong.push(format!(
+                    "{json}: complement {in_complement}, no partition {nowhere} in {}",
+                    pred.sql()
+                ));
+            }
+        }
+        wrong
+    }
+
+    /// The complement agrees with Postgres's own routing, row by row, over
+    /// every shape the sweep forms: multi-column `RANGE` with `MINVALUE` and
+    /// `MAXVALUE`, a `"C"` text key, `timestamptz` and `numeric` bounds, `LIST`
+    /// with and without `NULL`, `HASH` across mixed moduli, middles (`HASH`,
+    /// `LIST` beside a `DEFAULT`, a partitioned `DEFAULT`), and levels that
+    /// partition one column under different collations.
+    #[tokio::test]
+    async fn the_complement_holds_exactly_the_rows_postgres_routes_nowhere() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute("set timezone = 'UTC'; set datestyle = 'ISO, YMD'")
+            .await
+            .expect("settings");
+        let cases = [
+            (
+                "create table public.items (a int, b int) partition by range (a, b); \
+                 create table public.i0 partition of public.items \
+                     for values from (minvalue, minvalue) to (-1, 2); \
+                 create table public.i1 partition of public.items \
+                     for values from (1, minvalue) to (1, 5); \
+                 create table public.i2 partition of public.items \
+                     for values from (1, 7) to (2, maxvalue); \
+                 create table public.i3 partition of public.items \
+                     for values from (3, 3) to (3, 9); \
+                 create table public.i4 partition of public.items \
+                     for values from (4, minvalue) to (maxvalue, maxvalue);",
+                "select a, b from generate_series(-2, 12) a, generate_series(-2, 12) b \
+                 union all select null, 3 union all select 3, null",
+            ),
+            (
+                "create table public.items (a int, t text) \
+                     partition by range (a, t collate \"C\"); \
+                 create table public.i1 partition of public.items \
+                     for values from (1, 'A') to (1, 'a'); \
+                 create table public.i2 partition of public.items \
+                     for values from (1, 'b') to (1, 'z'); \
+                 create table public.i3 partition of public.items \
+                     for values from (2, minvalue) to (3, 'M');",
+                "select a, t from generate_series(0, 4) a, \
+                 unnest(array['A', 'B', 'Z', 'a', 'b', 'c', 'm', 'M', 'z', 'zz', '', ' ', null]) t",
+            ),
+            (
+                "create table public.items (ts timestamptz) partition by range (ts); \
+                 create table public.i1 partition of public.items \
+                     for values from ('2024-01-01 00:00+00') to ('2024-02-01 00:00+05'); \
+                 create table public.i2 partition of public.items \
+                     for values from ('2024-03-01') to (maxvalue);",
+                "select ts from generate_series('2023-12-31'::timestamptz, '2024-03-02', \
+                 '6 hours') ts union all select null",
+            ),
+            (
+                "create table public.items (n numeric) partition by range (n); \
+                 create table public.i1 partition of public.items \
+                     for values from (-10.5) to (-1); \
+                 create table public.i2 partition of public.items \
+                     for values from (2.25) to (100);",
+                "select (x / 4.0)::numeric as n from generate_series(-50, 420) x \
+                 union all select null",
+            ),
+            (
+                "create table public.items (t text) partition by list (t); \
+                 create table public.i1 partition of public.items for values in ('a', 'it''s'); \
+                 create table public.i2 partition of public.items for values in ('b', null);",
+                "select unnest(array['a', 'b', 'c', 'it''s', 'A', null]) as t",
+            ),
+            (
+                "create table public.items (t text) partition by list (t); \
+                 create table public.i1 partition of public.items for values in ('a', 'it''s');",
+                "select unnest(array['a', 'b', 'c', 'it''s', 'A', null]) as t",
+            ),
+            (
+                "create table public.items (f boolean) partition by list (f); \
+                 create table public.i1 partition of public.items for values in (true);",
+                "select unnest(array[true, false, null]) as f",
+            ),
+            (
+                "create table public.items (a int, t text) partition by hash (a, t); \
+                 create table public.i1 partition of public.items \
+                     for values with (modulus 8, remainder 0); \
+                 create table public.i2 partition of public.items \
+                     for values with (modulus 4, remainder 2); \
+                 create table public.i3 partition of public.items \
+                     for values with (modulus 2, remainder 1);",
+                "select a, t from generate_series(0, 40) a, unnest(array['x', 'y', null]) t",
+            ),
+            (
+                "create table public.items (a int, b int, c text) partition by range (a); \
+                 create table public.m1 partition of public.items \
+                     for values from (0) to (10) partition by hash (b); \
+                 create table public.m1_0 partition of public.m1 \
+                     for values with (modulus 2, remainder 0); \
+                 create table public.m2 partition of public.items \
+                     for values from (10) to (20) partition by list (c); \
+                 create table public.m2_x partition of public.m2 for values in ('x'); \
+                 create table public.m2_d partition of public.m2 default; \
+                 create table public.m3 partition of public.items \
+                     for values from (30) to (40) partition by list (c); \
+                 create table public.m3_x partition of public.m3 for values in ('x', null); \
+                 create table public.md partition of public.items default \
+                     partition by list (c); \
+                 create table public.md_y partition of public.md for values in ('y');",
+                "select a, b, c from \
+                 unnest(array[-1, 0, 5, 9, 10, 15, 20, 25, 30, 35, 40, null]) a, \
+                 generate_series(0, 5) b, unnest(array['x', 'y', 'z', null]) c",
+            ),
+            (
+                "create table public.items (t text collate \"C\") \
+                     partition by range (t collate \"C\"); \
+                 create table public.m1 partition of public.items \
+                     for values from ('A') to ('z') partition by range (t collate \"en-US-x-icu\"); \
+                 create table public.m1_0 partition of public.m1 for values from ('a') to ('c');",
+                "select unnest(array['A', 'B', 'a', 'b', 'C', 'c', 'Z', 'y', null]) as t",
+            ),
+        ];
+        for (ddl, probes) in cases {
+            let wrong = disagreements(&mut client, ddl, probes).await;
+            assert!(wrong.is_empty(), "{ddl}\n{}", wrong.join("\n"));
+        }
     }
 }
