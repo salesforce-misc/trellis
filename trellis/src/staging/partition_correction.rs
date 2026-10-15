@@ -261,16 +261,20 @@ fn qualified_collation(recorded: &str) -> String {
 
 /// The route of `correction`, given the source's recorded tree.
 fn route_of(correction: &PendingCorrection, recorded: Option<&Recorded>) -> Route {
-    let text = if correction.kind == partitions::Kind::GoneNode.as_str() {
-        correction.constraint.clone()
+    // A node in the tree routes by what the record says of it now. A
+    // `truncated` correction, queued by the seal, carries neither.
+    let (text, is_default) = if correction.kind == partitions::Kind::GoneNode.as_str() {
+        (correction.constraint.clone(), correction.node_default)
     } else {
-        recorded
-            .and_then(|r| r.nodes.iter().find(|n| n.oid == correction.node_oid))
-            .and_then(|n| n.constraint.clone())
+        let node = recorded.and_then(|r| r.nodes.iter().find(|n| n.oid == correction.node_oid));
+        (
+            node.and_then(|n| n.constraint.clone()),
+            correction.node_default || node.is_some_and(|n| n.is_default),
+        )
     };
     match text {
         Some(text) => Route::Text(text),
-        None if correction.node_default => Route::Every,
+        None if is_default => Route::Every,
         None => Route::Unusable,
     }
 }
@@ -1182,6 +1186,54 @@ mod tests {
             route_of(&correction, None),
             Route::Text("(a = 1)".to_string())
         );
+    }
+
+    #[test]
+    fn a_truncated_node_routes_by_its_record() {
+        let node = |oid: u32, constraint: Option<&str>, is_default: bool| partitions::Node {
+            oid,
+            parent: Some(1),
+            name: format!("public.t_{oid}"),
+            partitioned: false,
+            is_default,
+            bound: Some("DEFAULT".to_string()),
+            inherits_xmin: Some("1".to_string()),
+            constraint: constraint.map(str::to_string),
+        };
+        let recorded = Recorded {
+            nodes: vec![
+                partitions::Node {
+                    parent: None,
+                    bound: None,
+                    inherits_xmin: None,
+                    ..node(1, None, false)
+                },
+                node(7, None, true),
+                node(8, Some("(a = 1)"), false),
+            ],
+            keys: Vec::new(),
+        };
+        // What the seal queues: no text and no `DEFAULT` flag of its own.
+        let mut correction = PendingCorrection {
+            id: 1,
+            table: "public.t".to_string(),
+            kind: partitions::Kind::Truncated.as_str().to_string(),
+            node_oid: 7,
+            node_name: "public.t_7".to_string(),
+            cause: partitions::Cause::Truncated.as_str().to_string(),
+            constraint: None,
+            node_default: false,
+            parent_oid: None,
+            queued_lsn: "0/1".to_string(),
+        };
+        assert_eq!(route_of(&correction, Some(&recorded)), Route::Every);
+        correction.node_oid = 8;
+        assert_eq!(
+            route_of(&correction, Some(&recorded)),
+            Route::Text("(a = 1)".to_string())
+        );
+        correction.node_oid = 9;
+        assert_eq!(route_of(&correction, Some(&recorded)), Route::Unusable);
     }
 
     #[test]

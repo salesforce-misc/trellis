@@ -23,6 +23,7 @@ use super::append::{self, RING_SIZE, ring_table_name};
 use super::claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS};
 use super::error::StagingError;
 use super::state::SegmentState;
+use crate::capture::partitions;
 
 /// The age gate on crash recovery (docs/staging-and-claiming/
 /// 03-sealing-and-the-fence.md, "Crash recovery"): a `sealed` segment with
@@ -311,6 +312,15 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// can never observe this notify before the fence it announces is durably
 /// visible, and a raced no-op call (the `with` clause returns zero rows) never
 /// notifies at all.
+///
+/// The same statement queues a `truncated` partition correction
+/// (`capture::partitions::Kind::Truncated`) for each node a
+/// `node_truncate` marker in the window names (ADR-0017 P5; see
+/// `capture::sql::NODE_TRUNCATE_OP`), gated on the publishing `update` like
+/// the notify, so each marker is read once. It adds none for a node with an
+/// unstarted `new_leaf` or `truncated` correction queued, which re-derives
+/// the same keys after the truncate anyway. A started one may have walked
+/// past the rows the truncate removed, so it gets another.
 pub async fn seal_phase2(
     client: &Client,
     seg_seq: i64,
@@ -342,15 +352,30 @@ pub async fn seal_phase2(
         return Ok(());
     };
     let ring_slot: i16 = row.get(0);
-    let (window, params) = window_over_fence(client, seg_seq, ring_slot, fence, "op").await?;
+    let (window, params) = window_over_fence(
+        client,
+        seg_seq,
+        ring_slot,
+        fence,
+        "op, src_table, new_image",
+    )
+    .await?;
     let seg_seq_param = params.len() + 1;
     let channel_param = params.len() + 2;
+    let (marker, new_leaf, truncated, truncated_cause) = (
+        crate::capture::sql::NODE_TRUNCATE_OP,
+        partitions::Kind::NewLeaf.as_str(),
+        partitions::Kind::Truncated.as_str(),
+        partitions::Cause::Truncated.as_str(),
+    );
     let sql = format!(
         "with batch as ({window}), \
          decided as ( \
              select count(*) as row_count, \
                     coalesce(bool_or(op = 'truncate'), false) as has_truncate, \
-                    coalesce(bool_or(op = 'schema_changed'), false) as has_schema_change \
+                    coalesce(bool_or(op = 'schema_changed'), false) as has_schema_change, \
+                    coalesce(jsonb_agg(jsonb_build_object('src', src_table) || new_image) \
+                        filter (where op = '{marker}'), '[]') as node_truncates \
              from batch \
          ), \
          published as ( \
@@ -367,6 +392,20 @@ pub async fn seal_phase2(
               where s.seg_seq = ${seg_seq_param} and s.state = 'sealed' \
                 and s.fence_snapshot is null \
               returning s.seg_seq \
+         ), \
+         queued as ( \
+             insert into partition_corrections (table_name, kind, node_oid, node_name, cause) \
+             select distinct on (t.src, t.oid) t.src, '{truncated}', t.oid, t.node, \
+                    '{truncated_cause}' \
+             from published, decided d, \
+                  jsonb_to_recordset(d.node_truncates) as t(src text, node text, oid bigint) \
+             where not exists ( \
+                 select 1 from partition_corrections c \
+                 where c.table_name = t.src and c.node_oid = t.oid \
+                   and c.kind in ('{new_leaf}', '{truncated}') \
+                   and not exists (select 1 from partition_correction_progress p \
+                                   where p.correction_id = c.id)) \
+             order by t.src, t.oid \
          ) \
          select pg_notify(${channel_param}, '') from published"
     );

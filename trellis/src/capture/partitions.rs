@@ -70,6 +70,11 @@
 //! A node queued again before the engine takes it adds nothing, unless it left the
 //! tree under another recorded text: its groups route by each.
 //!
+//! A leaf or middle `TRUNCATE` is no catalog change: the node's truncate
+//! trigger stages a `node_truncate` marker, and the seal, not the pass,
+//! queues its [`Kind::Truncated`] correction (ADR-0017 P5,
+//! `staging::seal::seal_phase2`).
+//!
 //! # A renamed root
 //!
 //! Capture's guard names the root, so a renamed root stages nothing under the
@@ -163,6 +168,14 @@ pub enum Kind {
     /// Correct the groups that route to this node by its recorded constraint
     /// text: it was dropped or detached, and every node under it with it.
     GoneNode,
+    /// Correct the groups that route to this node by its recorded constraint
+    /// text and the groups of its current rows: a `TRUNCATE` emptied it
+    /// (ADR-0017 P5). The seal queues it from the node's `node_truncate`
+    /// ring marker (`staging::seal`), not the pass, and only when no
+    /// unstarted `new_leaf` or `truncated` correction of the node is queued:
+    /// one that has started may have walked past the rows the truncate
+    /// removed.
+    Truncated,
 }
 
 impl Kind {
@@ -170,6 +183,7 @@ impl Kind {
         match self {
             Kind::NewLeaf => "new_leaf",
             Kind::GoneNode => "gone_node",
+            Kind::Truncated => "truncated",
         }
     }
 }
@@ -189,6 +203,8 @@ pub enum Cause {
     Renamed,
     /// A recorded node that is gone.
     Gone,
+    /// A leaf or middle a `TRUNCATE` emptied.
+    Truncated,
 }
 
 impl Cause {
@@ -199,6 +215,7 @@ impl Cause {
             Cause::DefaultSiblings => "default_siblings",
             Cause::Renamed => "renamed",
             Cause::Gone => "gone",
+            Cause::Truncated => "truncated",
         }
     }
 }
@@ -787,7 +804,8 @@ async fn write_state(
                   parent_oid) \
              values ($1, $2, $3, $4, $5, $6, $7, $8) \
              on conflict (table_name, kind, node_oid, \
-                          (md5(coalesce(constraint_text, '')))) do nothing",
+                          (md5(coalesce(constraint_text, '')))) \
+                 where kind <> 'truncated' do nothing",
             &[
                 &table,
                 &correction.kind.as_str(),

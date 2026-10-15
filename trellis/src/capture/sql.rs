@@ -69,7 +69,9 @@ use std::collections::BTreeSet;
 
 use crate::defs::ddl::composite_key_escape_sql;
 use crate::pool::{DETERMINISTIC_TEXT_OUTPUT_GUCS, quote_ident};
-use crate::staging::append::{RING_SIZE, SCHEMA_CHANGED_SENTINEL_KEY, TRUNCATE_SENTINEL_KEY};
+use crate::staging::append::{
+    NODE_TRUNCATE_SENTINEL_KEY, RING_SIZE, SCHEMA_CHANGED_SENTINEL_KEY, TRUNCATE_SENTINEL_KEY,
+};
 
 use super::CaptureError;
 
@@ -79,6 +81,16 @@ use super::CaptureError;
 /// names, sorted>], "key_missing": <bool>}`, and it has no `old_image` or
 /// `group_key`.
 pub const SCHEMA_CHANGED_OP: &str = "schema_changed";
+
+/// The ring `op` of the marker a partitioned source's truncate function
+/// writes when the table truncated is a leaf or middle of the tree rather
+/// than the root (ADR-0017 P5), keyed by [`NODE_TRUNCATE_SENTINEL_KEY`]
+/// under the root's `src_table`. Its `new_image` names the node: `{"node":
+/// "<schema>.<table>", "oid": <oid>}`, unquoted as `src_table` is. It has no
+/// `old_image` or `group_key`. It is no `truncate`: it raises no truncate
+/// floor and is no barrier, and the fold leaves it out. The seal queues the
+/// node's correction from it (`staging::seal`).
+pub const NODE_TRUNCATE_OP: &str = "node_truncate";
 
 /// The transition-table names the insert, update and delete triggers
 /// declare with `REFERENCING`.
@@ -711,9 +723,16 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
             "    present bigint;\n    have text[];\n    st bigint[];\n    reread boolean;\n",
         );
     }
+    let node_truncate = spec.partitioned && event == CaptureEvent::Truncate;
+    if node_truncate {
+        body.push_str("    st bigint[];\n    tr bigint[];\n    node boolean;\n");
+    }
     body.push_str("begin\n");
     if spec.partitioned {
         body.push_str(&root_guard(spec));
+    }
+    if node_truncate {
+        body.push_str(&node_truncate_prelude(schema, spec, &span_state));
     }
     if let Some(rows) = rows {
         body.push_str(&format!(
@@ -806,6 +825,66 @@ fn root_guard(spec: &CaptureSpec) -> String {
          = pg_catalog.to_regclass({root}), false) then\n        \
          return null;\n    end if;\n"
     )
+}
+
+/// The partitioned source's truncate function's second statement, after the
+/// [`root_guard`]: decide what the truncate stages (ADR-0017 P5).
+///
+/// # A node's truncate names the node
+///
+/// A `TRUNCATE` names tables, and Postgres fires the truncate trigger of
+/// every table it empties: the one named and every partition under it. All
+/// of them call the root's function. The root's truncate stages the
+/// `truncate` sentinel as a plain table's does: it empties the whole target
+/// once. A leaf's or middle's stages a [`NODE_TRUNCATE_OP`] marker naming
+/// itself instead, so the seal queues that node's correction and the other
+/// nodes' entries and groups are untouched.
+///
+/// # A node under a table already truncated stages nothing
+///
+/// Each instance keeps, per source, a transaction-local setting
+/// ([`truncate_setting`]) holding `{seq, oid, …}`: the oids of the tables of
+/// the tree this transaction truncated since its capture last staged a row,
+/// with `seq` the span state's count of capture calls that staged rows (see
+/// "The live re-read is conditional" on [`function_body`]) when the list
+/// started. A list whose `seq` is not the current one is stale and starts
+/// again. A node with an ancestor (or itself) on a current list stages
+/// nothing: that table was emptied, nothing captured has been written to the
+/// source since, so the node has no row its truncate could have removed that
+/// the earlier truncate's correction or clearing doesn't already cover.
+///
+/// Postgres fires the named tables' truncate triggers before those of the
+/// partitions it adds, a parent before its children, so a root `TRUNCATE`
+/// stages one sentinel and a middle's one marker, not one per table. Naming
+/// a leaf and its root in one statement stages the leaf's marker first,
+/// which is only a correction too many. A subtransaction that rolls back
+/// restores the list with the truncate it undid.
+fn node_truncate_prelude(schema: &str, spec: &CaptureSpec, span_state: &str) -> String {
+    let setting = text_expr(&truncate_setting(schema, &spec.table));
+    let root =
+        text_expr(&quoted_table(&spec.table).expect("CaptureSpec::new checked the table name"));
+    format!(
+        "    -- ADR-0017 P5: a node's truncate names the node, and a node under a table\n    \
+         -- truncated since capture last staged a row stages nothing.\n    \
+         st := {span_state};\n    \
+         tr := coalesce(nullif(pg_catalog.current_setting({setting}, true), ''), '{{}}')::bigint[];\n    \
+         if tr[1] is distinct from st[1] then\n        tr := array[st[1]];\n    end if;\n    \
+         node := tg_relid <> pg_catalog.to_regclass({root});\n    \
+         if node and exists (select 1 from pg_catalog.pg_partition_ancestors(tg_relid) a\n            \
+         where a.relid::pg_catalog.oid::bigint = any (tr[2:])) then\n        \
+         return null;\n    end if;\n    \
+         perform pg_catalog.set_config({setting},\n        \
+         cast(tr || tg_relid::pg_catalog.oid::bigint as text), true);\n"
+    )
+}
+
+/// The transaction-local setting holding instance `schema`'s list of the
+/// tables of `table`'s tree truncated since capture last staged a row (see
+/// [`node_truncate_prelude`]): `trellis_capture.t_<hash>`, the hash
+/// [`span_setting`]'s. Two sources whose hashes collide share one list, which
+/// holds distinct oids, so the only cost is a list restarted more often.
+pub(crate) fn truncate_setting(schema: &str, table: &str) -> String {
+    span_setting(schema, table).replacen(".s_", ".t_", 1)
 }
 
 /// The transaction-local setting holding instance `schema`'s statement-span
@@ -1215,6 +1294,16 @@ fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) ->
                 update_changed_filter(spec, render),
             )
         }
+        CaptureEvent::Truncate if spec.partitioned => format!(
+            "{indent}values ({src},\n{indent}    case when node then {} else {} end,\n\
+             {indent}    case when node then '{NODE_TRUNCATE_OP}' else 'truncate' end, {l}, null,\n\
+             {indent}    case when node then pg_catalog.jsonb_build_object('node',\n\
+             {indent}        tg_table_schema || '.' || tg_table_name,\n\
+             {indent}        'oid', tg_relid::pg_catalog.oid::bigint) end,\n\
+             {indent}    {l}, {ts}, null)",
+            text_expr(NODE_TRUNCATE_SENTINEL_KEY),
+            text_expr(TRUNCATE_SENTINEL_KEY),
+        ),
         CaptureEvent::Truncate => format!(
             "{indent}values ({src}, {}, 'truncate', {l}, null, null, {l}, {ts}, null)",
             text_expr(TRUNCATE_SENTINEL_KEY)
@@ -1989,6 +2078,60 @@ mod tests {
             ),
             "{sql}"
         );
+        assert!(!sql.contains(NODE_TRUNCATE_OP), "a plain table has no node");
+        assert!(!sql.contains("trellis_capture.t_"), "{sql}");
+    }
+
+    #[test]
+    fn a_partitioned_sources_truncate_names_the_node_unless_it_is_the_root() {
+        let sql = function_source(
+            "trellis",
+            &spec().with_partitioned(true),
+            CaptureEvent::Truncate,
+        );
+        let setting = truncate_setting("trellis", "public.orders");
+        assert_eq!(
+            setting,
+            span_setting("trellis", "public.orders").replace(".s_", ".t_")
+        );
+        // The list is read and written under its own setting, and checked
+        // against the node and its ancestors before anything is staged.
+        let skip = sql
+            .find("pg_catalog.pg_partition_ancestors(tg_relid)")
+            .expect("the ancestor check");
+        assert!(sql.contains(&format!("current_setting('{setting}', true)")));
+        assert!(sql.contains(&format!("set_config('{setting}',")));
+        assert!(skip < sql.find("insert into").expect("an insert"), "{sql}");
+        assert!(
+            sql.contains("node := tg_relid <> pg_catalog.to_regclass('\"public\".\"orders\"');"),
+            "{sql}"
+        );
+        // One row per call: the root's sentinel, or the node's marker with
+        // its name and oid.
+        assert!(
+            sql.contains(
+                "case when node then (chr(31) || 'trellis-node-truncate') \
+                 else (chr(31) || 'trellis-truncate-sentinel') end"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("case when node then 'node_truncate' else 'truncate' end"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("'oid', tg_relid::pg_catalog.oid::bigint) end"),
+            "{sql}"
+        );
+        // Only the truncate function changes.
+        for event in [
+            CaptureEvent::Insert,
+            CaptureEvent::Update,
+            CaptureEvent::Delete,
+        ] {
+            let source = function_source("trellis", &spec().with_partitioned(true), event);
+            assert!(!source.contains("trellis_capture.t_"), "{event:?}");
+        }
     }
 
     #[test]

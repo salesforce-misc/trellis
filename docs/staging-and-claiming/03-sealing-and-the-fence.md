@@ -223,6 +223,13 @@ statement writes the fence and the sizing, whoever sees one sees the other, and 
 raced phase 2 writes neither. `bucket_count` comes from the row count and
 configuration alone, never from the live-worker registry.
 
+The same statement queues a `truncated` partition correction for each
+`node_truncate` marker in the window (a leaf or middle of a partitioned source
+truncated, [01](01-capture-by-triggers.md#a-partitioned-sources-truncate)),
+unless an unstarted correction of the node is already queued. The fence is
+published once, so each marker is read once, and a raced phase 2 queues
+nothing.
+
 > **Invariant:** a batch's `row_count`, `has_truncate` and `bucket_count` are
 > decided over its fenced window, in the statement that publishes its fence.
 

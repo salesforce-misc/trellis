@@ -322,7 +322,7 @@ pub async fn table_changes_pending_through(
     table: &str,
     gate: PgLsn,
 ) -> Result<bool, StagingError> {
-    const IMAGED: &str = "op not in ('recompute', 'truncate', 'schema_changed')";
+    const IMAGED: &str = "op not in ('recompute', 'truncate', 'schema_changed', 'node_truncate')";
     let arms = per_ring_table(" union all ", |slot, ring| {
         format!(
             "select 1 from {ring} r \

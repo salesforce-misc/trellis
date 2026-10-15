@@ -333,24 +333,96 @@ async fn an_update_that_moves_a_row_between_partitions_stages_a_delete_and_an_in
 }
 
 /// A `TRUNCATE` cascades to every partition under the table it names and
-/// fires each one's statement trigger, so it stages one sentinel per table
-/// of the subtree, all under the root's identity. The seal reads
-/// `bool_or(op = 'truncate')`, so the repeats are harmless.
+/// fires each one's statement trigger, all calling the root's function. The
+/// root's stages the `truncate` sentinel; a leaf's or middle's stages a
+/// `node_truncate` marker naming itself (ADR-0017 P5); a table under one
+/// already truncated, with nothing captured since, stages nothing.
 #[tokio::test]
-async fn truncate_stages_one_sentinel_per_table_of_the_subtree_under_the_roots_identity() {
+async fn a_truncate_stages_one_row_for_the_table_it_names_under_the_roots_identity() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = tree(&db).await;
-    for (sql, n) in [
-        ("truncate public.m2_0", 1),
-        ("truncate public.m1", 3),
-        ("truncate public.r", 7),
+    for (sql, staged, nodes) in [
+        (
+            "truncate public.m2_0",
+            "node_truncate=1",
+            vec!["public.m2_0"],
+        ),
+        ("truncate public.m1", "node_truncate=1", vec!["public.m1"]),
+        ("truncate public.r", "truncate=1", vec![]),
+        // Several nodes named: one marker each.
+        (
+            "truncate public.m1_0, public.m2",
+            "node_truncate=2",
+            vec!["public.m1_0", "public.m2"],
+        ),
+        // Under a table this transaction already truncated, with nothing
+        // captured since: nothing more.
+        (
+            "begin; truncate public.r; truncate public.m2_0; commit",
+            "truncate=1",
+            vec![],
+        ),
+        (
+            "begin; truncate public.m2; truncate public.m2_1; truncate public.m2; commit",
+            "node_truncate=1",
+            vec!["public.m2"],
+        ),
+        // A captured write in between starts the list again.
+        (
+            "begin; truncate public.m2; insert into public.r values (9, 1, 'x'); \
+             truncate public.m2_1; commit",
+            "node_truncate=2",
+            vec!["public.m2", "public.m2_1"],
+        ),
     ] {
         let before = ring_counts(&client).await;
+        let markers = marker_count(&client).await;
         client.batch_execute(sql).await.expect(sql);
-        let delta = subtract(&ring_counts(&client).await, &before);
-        assert_eq!(delta, [format!("public.r:truncate={n}")], "{sql}");
+        let mut delta = subtract(&ring_counts(&client).await, &before);
+        delta.retain(|e| !e.contains(":insert="));
+        assert_eq!(delta, [format!("public.r:{staged}")], "{sql}");
+        assert_eq!(markers_since(&client, markers).await, nodes, "{sql}");
     }
+}
+
+async fn marker_count(client: &Client) -> i64 {
+    client
+        .query_one(
+            &format!("select count(*) from {RING} s where op = 'node_truncate'"),
+            &[],
+        )
+        .await
+        .expect("markers")
+        .get(0)
+}
+
+/// The nodes the `node_truncate` markers after the first `skip` name, in
+/// staging order, checking each one's oid and key.
+async fn markers_since(client: &Client, skip: i64) -> Vec<String> {
+    client
+        .query(
+            &format!(
+                "select new_image ->> 'node', \
+                        (new_image ->> 'oid')::bigint = to_regclass(new_image ->> 'node')::oid::bigint, \
+                        key = chr(31) || 'trellis-node-truncate', old_image is null, \
+                        group_key is null \
+                 from {RING} s where op = 'node_truncate' \
+                 order by lsn, change_id offset $1"
+            ),
+            &[&skip],
+        )
+        .await
+        .expect("markers")
+        .into_iter()
+        .map(|row| {
+            let node: String = row.get(0);
+            assert!(row.get::<_, bool>(1), "{node}: the oid is the node's");
+            assert!(row.get::<_, bool>(2), "{node}: the marker's key");
+            assert!(row.get::<_, bool>(3) && row.get::<_, bool>(4), "{node}");
+            node
+        })
+        .collect()
 }
 
 /// Every ring row staged so far, whatever its `src_table`.

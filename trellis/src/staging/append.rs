@@ -86,6 +86,13 @@ pub const TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-truncate-sentinel";
 /// (`capture::sql::SCHEMA_CHANGED_OP`'s doc has the shape).
 pub const SCHEMA_CHANGED_SENTINEL_KEY: &str = "\u{1f}trellis-schema-changed";
 
+/// The ring key of a partitioned source's `node_truncate` marker (ADR-0017
+/// P5): the row a leaf's or middle's truncate writes in place of the root's
+/// truncate sentinel. Key-less like [`TRUNCATE_SENTINEL_KEY`], and with the
+/// same collision caveat. Its `new_image` names the node
+/// (`capture::sql::NODE_TRUNCATE_OP`'s doc has the shape).
+pub const NODE_TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-node-truncate";
+
 /// One raw change to append into the active ring segment.
 ///
 /// `old_image`/`new_image` are raw JSON text (serialized by the caller):

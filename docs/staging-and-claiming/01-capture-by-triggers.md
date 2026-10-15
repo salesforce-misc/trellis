@@ -84,6 +84,39 @@ segment with one `INSERT … SELECT`:
   so the seal's fence ([03](03-sealing-and-the-fence.md)) holds for
   application writers at every isolation level, prepared transactions
   included.
+- **Truncate** stages one image-less `truncate` row keyed by the sentinel
+  `\x1ftrellis-truncate-sentinel`. The seal records it
+  (`segments.has_truncate`), and the drain empties the table's ledgers and
+  targets and raises their truncate floor.
+
+### A partitioned source's truncate
+
+Every node of a partitioned source's tree carries the root's triggers, which
+call the root's functions, so every row stages under the root's
+`src_table` ([ADR-0017](../decisions/0017-partitioned-sources.md)). A
+`TRUNCATE` fires the truncate trigger of each table it empties: the tables it
+names, then the partitions under them, a parent before its children.
+
+- **The root's truncate** stages the `truncate` sentinel, as a plain table's
+  does: the target is cleared once.
+- **A leaf's or middle's truncate** stages a `node_truncate` marker instead
+  (key `\x1ftrellis-node-truncate`, `new_image` `{"node":
+  "<schema>.<table>", "oid": <oid>}`, no `old_image` or `group_key`). It
+  raises no truncate floor, is no barrier, and the fold leaves it out. The
+  seal queues a `truncated` correction of the node for each marker in the
+  segment's fenced window, in the statement that publishes the fence
+  ([03](03-sealing-and-the-fence.md)), unless an unstarted correction of the
+  node is already queued. The correction re-derives the keys whose group
+  routes to the node and those of its current rows
+  (`staging::partition_correction`), so other nodes' groups are untouched.
+- **A table under one already truncated stages nothing.** The function keeps
+  a transaction-local list of the tables of the tree truncated since capture
+  last staged a row (`trellis_capture.t_<hash>`, next to the statement-span
+  state). A node whose ancestor, or itself, is on the list stages nothing:
+  nothing captured has been written to the source since that truncate. So a
+  root `TRUNCATE` stages one sentinel and a middle's one marker, not one row
+  per table. A `TRUNCATE` naming several nodes, or emptying several by
+  `CASCADE`, stages one marker per node.
 
 The functions are `SECURITY DEFINER`, owned by the role that owns the ring (the
 role that ran the migrations), with `search_path` pinned. That need not be the
