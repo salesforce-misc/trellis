@@ -853,12 +853,14 @@ fn root_guard(spec: &CaptureSpec) -> String {
 /// source since, so the node has no row its truncate could have removed that
 /// the earlier truncate's correction or clearing doesn't already cover.
 ///
-/// Postgres fires the named tables' truncate triggers before those of the
-/// partitions it adds, a parent before its children, so a root `TRUNCATE`
-/// stages one sentinel and a middle's one marker, not one per table. Naming
-/// a leaf and its root in one statement stages the leaf's marker first,
-/// which is only a correction too many. A subtransaction that rolls back
-/// restores the list with the truncate it undid.
+/// Postgres fires each named table's truncate trigger before those of the
+/// partitions it adds under it, a parent before its children, so a root
+/// `TRUNCATE` stages one sentinel and a middle's one marker, not one per
+/// table. A leaf can still fire before its root: when the statement names the
+/// leaf first, or when `CASCADE` reaches the tree through a foreign key the
+/// root's partitions inherit, which adds the tables in oid order. The leaf's
+/// marker is then only a correction too many. A subtransaction that rolls
+/// back restores the list with the truncate it undid.
 fn node_truncate_prelude(schema: &str, spec: &CaptureSpec, span_state: &str) -> String {
     let setting = text_expr(&truncate_setting(schema, &spec.table));
     let root =

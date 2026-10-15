@@ -94,8 +94,8 @@ segment with one `INSERT … SELECT`:
 Every node of a partitioned source's tree carries the root's triggers, which
 call the root's functions, so every row stages under the root's
 `src_table` ([ADR-0017](../decisions/0017-partitioned-sources.md)). A
-`TRUNCATE` fires the truncate trigger of each table it empties: the tables it
-names, then the partitions under them, a parent before its children.
+`TRUNCATE` fires the truncate trigger of each table it empties: each table it
+names, then the partitions under that table, a parent before its children.
 
 - **The root's truncate** stages the `truncate` sentinel, as a plain table's
   does: the target is cleared once.
@@ -116,7 +116,10 @@ names, then the partitions under them, a parent before its children.
   nothing captured has been written to the source since that truncate. So a
   root `TRUNCATE` stages one sentinel and a middle's one marker, not one row
   per table. A `TRUNCATE` naming several nodes, or emptying several by
-  `CASCADE`, stages one marker per node.
+  `CASCADE`, stages one marker per node. A leaf whose trigger fires before
+  its root's (the leaf named first, or a `CASCADE` through a foreign key the
+  root's partitions inherit, which adds the tables in oid order) stages its
+  marker as well as the root's sentinel: one correction too many, no more.
 
 The functions are `SECURITY DEFINER`, owned by the role that owns the ring (the
 role that ran the migrations), with `search_path` pinned. That need not be the
