@@ -611,6 +611,13 @@ impl LedgerTargetPlan {
         &self.ledger_ident
     }
 
+    /// The `GROUP BY` columns read from the source row under their own
+    /// names (the ledger's column of that name), in `GROUP BY` order: every
+    /// one but a relationship path.
+    pub(super) fn plain_group_cols(&self) -> Vec<&str> {
+        self.shape.plain_group_cols().map(String::as_str).collect()
+    }
+
     /// The source's primary key.
     pub(super) fn source_pk(&self) -> &[PrimaryKeyColumn] {
         &self.source_pk

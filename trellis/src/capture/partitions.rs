@@ -54,19 +54,20 @@
 //! fingerprints and the corrections in one transaction. The fingerprints are
 //! therefore stored once the corrections are queued, not once they have
 //! drained, and a restart finds the queue. A correction that is only
-//! queued is a request: the correction engine (P4) consumes
+//! queued is a request: the correction engine
+//! ([`crate::staging::partition_correction`]) consumes
 //! [`pending_corrections`] and calls [`complete_correction`] once a node's
-//! groups are corrected, and only after the ring is folded through the
-//! row's `queued_lsn`. A `gone_node` whose `pg_inherits` row is still
-//! detach-pending needs more: a writer with an older snapshot can still
-//! write through the parent into the leaf, and the root's trigger stages
-//! that after `queued_lsn`, until the detach completes. So P4 corrects such
-//! a node only once that row is gone, folding through a WAL position read
-//! after that. A `gone_node`'s text is `None` for a `DEFAULT` with no
-//! siblings (its constraint is empty: every group routes to it) and for a
-//! node detached between the tree read and the fetch.
+//! groups are corrected. A `gone_node` whose `pg_inherits` row is still
+//! detach-pending waits: a writer with an older snapshot can still write
+//! through the parent into the leaf, and the root's trigger stages that
+//! after `queued_lsn`, until the detach completes. The engine starts such a
+//! node only once that row is gone, and stamps the ring position after that
+//! (its `build_seg`). A `gone_node`'s text is `None` for a `DEFAULT` with no
+//! siblings (its constraint is empty: every group routes to it, and
+//! `node_default` says so) and for a node detached between the tree read and
+//! the fetch (no usable text, which routes nothing).
 //!
-//! A node queued again before P4 takes it adds nothing, unless it left the
+//! A node queued again before the engine takes it adds nothing, unless it left the
 //! tree under another recorded text: its groups route by each.
 //!
 //! # A renamed root
@@ -212,6 +213,11 @@ pub struct Correction {
     /// For a [`Kind::GoneNode`], the constraint text recorded while the node
     /// was in the tree.
     pub constraint: Option<String>,
+    /// Whether the node is a `DEFAULT` partition, which a `None` text then
+    /// means every group routes to (no siblings), not that no text is usable.
+    pub is_default: bool,
+    /// For a [`Kind::GoneNode`], the node's parent when it left the tree.
+    pub parent: Option<u32>,
 }
 
 /// What a deep check works out from the recorded and the live tree.
@@ -303,6 +309,8 @@ pub fn plan(prev: Option<&Recorded>, live: &Recorded, renamed: bool) -> Plan {
                 name: node.name.clone(),
                 cause,
                 constraint: None,
+                is_default: node.is_default,
+                parent: None,
             });
         }
     }
@@ -322,6 +330,8 @@ pub fn plan(prev: Option<&Recorded>, live: &Recorded, renamed: bool) -> Plan {
             name: old.name.clone(),
             cause: Cause::Gone,
             constraint: old.constraint.clone(),
+            is_default: old.is_default,
+            parent: old.parent,
         });
     }
     Plan { corrections, fetch }
@@ -773,8 +783,9 @@ async fn write_state(
     for correction in &record.corrections {
         txn.execute(
             "insert into partition_corrections \
-                 (table_name, kind, node_oid, node_name, cause, constraint_text) \
-             values ($1, $2, $3, $4, $5, $6) \
+                 (table_name, kind, node_oid, node_name, cause, constraint_text, node_default, \
+                  parent_oid) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8) \
              on conflict (table_name, kind, node_oid, \
                           (md5(coalesce(constraint_text, '')))) do nothing",
             &[
@@ -784,6 +795,8 @@ async fn write_state(
                 &correction.name,
                 &correction.cause.as_str(),
                 &correction.constraint,
+                &correction.is_default,
+                &correction.parent.map(i64::from),
             ],
         )
         .await?;
@@ -876,7 +889,7 @@ async fn read_tree_once(
 }
 
 /// The `SET LOCAL`s of every catalog read of a node's bound.
-fn pinned_settings() -> String {
+pub fn pinned_settings() -> String {
     format!(
         "set local lock_timeout = '{FETCH_LOCK_TIMEOUT}'; \
          set local search_path = pg_catalog, pg_temp; \
@@ -1025,6 +1038,13 @@ pub struct PendingCorrection {
     pub node_name: String,
     pub cause: String,
     pub constraint: Option<String>,
+    /// The node is a `DEFAULT` partition: with no text, every group routes
+    /// to it.
+    pub node_default: bool,
+    /// For a `gone_node`, its parent when it left the tree. A `HASH` text
+    /// embeds the parent's oid, so a node whose parent has since been dropped
+    /// cannot be routed by its own text: the parent's correction covers it.
+    pub parent_oid: Option<u32>,
     /// The WAL position when the pass queued it, `X/X`.
     pub queued_lsn: String,
 }
@@ -1037,7 +1057,7 @@ pub async fn pending_corrections(
     let rows = client
         .query(
             "select id, table_name, kind, node_oid, node_name, cause, constraint_text, \
-                    queued_lsn::text \
+                    node_default, parent_oid, queued_lsn::text \
              from partition_corrections where table_name = $1 order by id",
             &[&table],
         )
@@ -1052,7 +1072,9 @@ pub async fn pending_corrections(
             node_name: r.get(4),
             cause: r.get(5),
             constraint: r.get(6),
-            queued_lsn: r.get(7),
+            node_default: r.get(7),
+            parent_oid: r.get::<_, Option<i64>>(8).map(|o| o as u32),
+            queued_lsn: r.get(9),
         })
         .collect())
 }

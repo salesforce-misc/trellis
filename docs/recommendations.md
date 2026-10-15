@@ -19,7 +19,9 @@ more often checkpoints run, the more of the WAL is full-page images.
 
 The share depends on the target's shape. An aggregate's ledger keeps a
 `GROUP BY` index when the aggregate has a recomputed field (`MIN`, `MAX`, a
-float `SUM`, a composed field) or a relationship feeds it. A build inserts
+float `SUM`, a composed field), a relationship feeds it, or its source is a
+partitioned table (a partition correction finds the entries of a node's groups
+through the index). A build inserts
 into that index at random positions, so once the index outgrows what a
 checkpoint interval leaves clean, almost every insert logs a full page. An
 invertible aggregate built by the Re-derive build keeps no such index, and

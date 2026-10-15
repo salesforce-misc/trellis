@@ -1265,7 +1265,7 @@ async fn walk_pk_ranges(
 /// (Postgres parses a single parenthesized expression as that expression, not
 /// a one-element row constructor), so this is byte-identical SQL to the
 /// pre-#121 single-column form there.
-fn pk_row_cmp(
+pub(crate) fn pk_row_cmp(
     pk_idents: &[String],
     pk: &[PrimaryKeyColumn],
     op: &str,
@@ -1871,13 +1871,14 @@ async fn backfill_aggregate(
     // one's load, over whatever the latest load left. The `GROUP BY` index
     // is among them only where the ledger's DDL puts it
     // (`staging::build::ledger_indexes_groups`, #723).
+    let partitioned = super::partition_tree::is_partitioned_root(&**client, source_table).await?;
     let rebuild = format!(
         "alter table {ledger} add primary key ({}){}",
         quote_ident(super::ledger::KEY_COLUMN),
         super::ledger::aggregate_ledger_index_ddl(
             &ledger,
             &group_idents,
-            crate::staging::build::ledger_indexes_groups(def, source_columns),
+            crate::staging::build::ledger_indexes_groups(def, source_columns, partitioned),
         ),
     );
     {

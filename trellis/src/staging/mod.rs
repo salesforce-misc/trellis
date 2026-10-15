@@ -75,6 +75,7 @@ pub(crate) mod ledger;
 pub mod liveness;
 pub(crate) mod one_to_one_ledger;
 pub(crate) mod page;
+pub mod partition_correction;
 pub mod quarantine;
 pub mod retire;
 pub(crate) mod schema_change;

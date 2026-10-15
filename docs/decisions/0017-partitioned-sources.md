@@ -153,8 +153,8 @@ leaves only.
   alone.
 - A `DEFAULT` whose sibling set changed: treated as new.
 - A dropped or detached subtree: correct its topmost gone node, routing by that
-  node's recorded text. A detach-pending leaf is cleaned up only once its
-  `pg_inherits` row is gone and the ring has been folded.
+  node's recorded text. A detach-pending leaf's correction starts only once its
+  `pg_inherits` row is gone.
 - Then the no-leaf sweep below.
 
 On an aggregate, a node's correction is a Re-derive of a key set through the
@@ -169,7 +169,20 @@ the entries live, and deleting entries would drop the tombstones that refuse a
 ring change staged before the DDL, which would then resurrect the row. A
 partitioned source's aggregate always has the ledger's `GROUP BY` index. The
 pending correction is durable, so a restart resumes it, and the pass records its
-fingerprints once the correction is queued, not once it has drained.
+fingerprints once the correction is queued, not once it has drained. A
+correction works in pages of one build chunk's size, each page one transaction
+that commits its keys' entries and its progress together, so a restart resumes
+after the last committed page: the ledger walk in `(group, key)` order, then the
+node's rows in primary-key order.
+
+A change staged before the DDL can still be in the ring when the correction
+runs. The correction starts by stamping the definition's `build_seg`, as a
+rebuild does: a page with a batch at or below it re-derives its keys from the
+source instead of applying their changes, so an unapplied insert into a dropped
+leaf becomes a tombstone rather than a row. It then waits for the transactions
+open at the stamp to end, so no page that read the old `build_seg` can still
+write a key the walk has no entry for. Waiting for the ring to fold through a
+position would never finish on a busy ring, whose active segment is never empty.
 
 For a to-many target, the correction is "recompute the routed parents" through
 the normal Recompute path: no target row is ever deleted.

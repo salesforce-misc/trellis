@@ -2095,12 +2095,23 @@ pub(crate) async fn aggregate_target_table_ddl(
         })
         .collect();
     // #723: without its `GROUP BY` index when the Re-derive build takes it
-    // and nothing it reads needs one (`ledger_indexes_groups`).
+    // and nothing it reads needs one (`ledger_indexes_groups`). A partitioned
+    // source's ledger always has it: a partition correction finds the keys of
+    // the groups that route to a node through it (ADR-0017).
+    let partitioned = match super::catalog::resolve_source_for_install(pool, def).await {
+        Ok(qualified) => {
+            let client = pool.get().await?;
+            super::partition_tree::is_partitioned_root(&**client, &qualified).await?
+        }
+        // A source that doesn't resolve (a fixture rendering DDL before it
+        // creates its source) isn't partitioned.
+        Err(_) => false,
+    };
     sql.push_str(&super::ledger::aggregate_ledger_ddl(
         &super::ledger::qualified_ledger_table(target_schema, &def.target),
         &group_columns,
         &contribution_columns,
-        crate::staging::build::ledger_indexes_groups(def, source_columns),
+        crate::staging::build::ledger_indexes_groups(def, source_columns, partitioned),
     ));
     // #625 F1: a target Apply maintains on the ledger also gets its group
     // deltas, which a Re-derive build's chunks write instead of the groups.

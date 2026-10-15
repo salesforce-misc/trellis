@@ -316,6 +316,11 @@ pub struct BuildPlan {
 }
 
 impl BuildPlan {
+    /// The ledger target this plan builds.
+    pub(super) fn ledger(&self) -> &LedgerTargetPlan {
+        &self.ledger
+    }
+
     /// The plan for the definition whose target is `target` (its bare
     /// name, as `TRANSFORM <target>` names it), or `None` when there is no
     /// such definition or its target isn't one a Re-derive build serves yet
@@ -606,6 +611,37 @@ async fn lock_sweep_entries(
     locked
 }
 
+/// Re-derives the entries of `keys` in `txn` (`read committed`; the caller
+/// commits): locks them ([`lock_sweep_entries`], a placeholder for a key
+/// with no entry), then reads each key's source row afresh, rewrites its
+/// entry from it (a key with no row becomes a tombstone) and appends the
+/// moves' per-group increments to the group deltas
+/// ([`ledger::sweep_statement`], one per pattern of `NULL` parts among the
+/// keys, #625 F6). Returns the delta rows it appended. It touches no group
+/// row, and never deletes an entry or a target row. A rebuild's sweep and a
+/// partition correction (`super::partition_correction`) both re-derive a key
+/// set this way.
+pub(super) async fn rederive_keys(
+    txn: &Transaction<'_>,
+    ledger: &LedgerTargetPlan,
+    keys: &[&str],
+) -> Result<i64, ApplyError> {
+    lock_sweep_entries(txn, ledger, keys).await?;
+    let mut delta_rows = 0;
+    for group in ledger::sweep_groups(ledger, keys)? {
+        let started = Instant::now();
+        let row = ledger::query_one_by_entry_key(
+            txn,
+            &ledger::sweep_statement(ledger, &group.nulls),
+            &group.params(),
+        )
+        .await?;
+        metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
+        delta_rows += row.get::<_, i64>(1);
+    }
+    Ok(delta_rows)
+}
+
 /// What one [`sweep_batch`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepOutcome {
@@ -702,19 +738,7 @@ pub async fn sweep_batch(
         });
     }
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    lock_sweep_entries(txn, ledger, &key_refs).await?;
-    let mut delta_rows = 0;
-    for group in ledger::sweep_groups(ledger, &key_refs)? {
-        let started = Instant::now();
-        let row = ledger::query_one_by_entry_key(
-            txn,
-            &ledger::sweep_statement(ledger, &group.nulls),
-            &group.params(),
-        )
-        .await?;
-        metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
-        delta_rows += row.get::<_, i64>(1);
-    }
+    let delta_rows = rederive_keys(txn, ledger, &key_refs).await?;
     crate::instance_log::debug!(
         target_table = %ledger.target,
         scanned,
@@ -1138,7 +1162,11 @@ fn shape_of(
 pub(crate) fn ledger_indexes_groups(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
+    partitioned: bool,
 ) -> bool {
+    if partitioned {
+        return true;
+    }
     match shape_of(def, source_columns) {
         Some(shape) => shape.recomputes(),
         None => true,
@@ -3694,7 +3722,7 @@ mod tests {
         .into_iter()
         .map(|(c, t)| (c.to_string(), t))
         .collect();
-        ledger_indexes_groups(&def, &columns)
+        ledger_indexes_groups(&def, &columns, false)
     }
 
     /// #723: a target the Re-derive build takes, with only maintained

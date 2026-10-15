@@ -378,6 +378,25 @@ impl fmt::Display for PartitionRefusal {
     }
 }
 
+/// Whether `table` (an unquoted `schema.table`) is a partitioned table: a
+/// root or a middle. A ledger of a definition reading one carries its
+/// `GROUP BY` index whatever the definition's fields are, since a partition
+/// correction finds the entries of the groups that route to a node through
+/// it.
+pub async fn is_partitioned_root(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(client
+        .query_one(
+            "select coalesce((select c.relkind = 'p' from pg_catalog.pg_class c \
+                              where c.oid = pg_catalog.to_regclass($1)), false)",
+            &[&regclass_arg(table)],
+        )
+        .await?
+        .get(0))
+}
+
 /// Reads the partition tree under `table` (an unquoted `schema.table`). `None`
 /// when it isn't a partitioned root: it doesn't exist, isn't partitioned, is
 /// itself a partition, or is in an inheritance hierarchy.
