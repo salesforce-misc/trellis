@@ -855,11 +855,7 @@ async fn run(
     if options.application_threads > 0 {
         app_worker_tasks.push(tokio::spawn(self_check_loop(
             pool.clone(),
-            WakeListener::spawn(
-                dsn.clone(),
-                config.schema().to_string(),
-                wake_channel.clone(),
-            ),
+            WakeListener::spawn_work_only(dsn.clone(), config.schema().to_string()),
             format!("{client_id}-self-check"),
             options.reclaim_ttl,
             options.poll_interval,
@@ -2229,7 +2225,9 @@ impl IdleBackoff {
 /// wait by itself: a `self_check` call inserts the row and the database
 /// announces it on the work channel (migration V90). Only a job a dead
 /// worker left `running` is found by the clock, within the cap past its
-/// reclaim TTL.
+/// reclaim TTL. Its listener hears the work channel alone: a seal or an
+/// apply never makes a job claimable, and under steady writes they would
+/// wake it several times a second to find nothing.
 ///
 /// It is its own task, not a step of the drain workers' loop, because a page
 /// waits for the target to converge before it compares, and convergence is
@@ -2265,8 +2263,8 @@ async fn self_check_loop(
         let wait = backoff.idle_wait(wake.is_up(), None);
         match wait_for_wake(&mut wake, &mut shutdown_rx, wait).await {
             WakeEnd::Shutdown => break,
-            // A wake that is not a job (a seal shares the channel) finds
-            // nothing at the claim and the wait goes on growing.
+            // A wake that is not a job (build work shares the work channel)
+            // finds nothing at the claim and the wait goes on growing.
             WakeEnd::Notified | WakeEnd::Elapsed => {}
             WakeEnd::ListenerChanged => backoff.reset(),
         }
@@ -2630,7 +2628,20 @@ struct WakeListener {
 }
 
 impl WakeListener {
+    /// Hears the engine's `channel` (seals, discharges, applies) and the
+    /// database's work channel (migration V86).
     fn spawn(dsn: String, schema: String, channel: String) -> Self {
+        Self::spawn_on(dsn, schema, Some(channel))
+    }
+
+    /// Hears the work channel alone: for a worker whose work no seal,
+    /// discharge or apply makes claimable, so a steady stream of those would
+    /// only wake it to find nothing (the `self_check` worker, #1075).
+    fn spawn_work_only(dsn: String, schema: String) -> Self {
+        Self::spawn_on(dsn, schema, None)
+    }
+
+    fn spawn_on(dsn: String, schema: String, channel: Option<String>) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (up_tx, up) = watch::channel(false);
         let task = tokio::spawn(keep_listening(
@@ -2717,7 +2728,7 @@ async fn keep_listening<Open, OpenFut, Session, E>(
 async fn open_wake_session(
     dsn: String,
     schema: String,
-    channel: String,
+    channel: Option<String>,
     tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Result<impl std::future::Future<Output = ()>, crate::error::Error> {
     let (client, mut connection) = crate::pool::connect_dedicated(&dsn).await?;
@@ -2744,13 +2755,15 @@ async fn open_wake_session(
             .query_one("select work_wake_channel()", &[])
             .await?
             .get(0);
-        client
-            .batch_execute(&format!(
+        let listen = match &channel {
+            Some(channel) => format!(
                 "listen {}; listen {}",
-                quote_ident(&channel),
+                quote_ident(channel),
                 quote_ident(&work_channel)
-            ))
-            .await
+            ),
+            None => format!("listen {}", quote_ident(&work_channel)),
+        };
+        client.batch_execute(&listen).await
     };
     if let Err(err) = listening.await {
         driver.abort();
@@ -5006,6 +5019,52 @@ mod work_channel_tests {
             .await
             .expect("a wake from the work channel")
             .expect("open");
+    }
+
+    /// Issue #1075: the `self_check` worker's listener hears the work channel
+    /// and not the engine's, which every seal and apply notifies: under steady
+    /// writes those would wake it several times a second to find no job.
+    /// Notifications reach a listener in commit order, so once the work
+    /// channel's wake is in, an engine wake it heard would already be too;
+    /// the bounded wait after it is only for a wake that should not exist.
+    #[tokio::test]
+    async fn the_work_only_listener_does_not_hear_the_engine_channel() {
+        use crate::config::DEFAULT_SCHEMA;
+
+        let hang_guard = Duration::from_secs(30);
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let notifier = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("connect");
+        let mut wake =
+            WakeListener::spawn_work_only(db.dsn().to_string(), DEFAULT_SCHEMA.to_string());
+        tokio::time::timeout(hang_guard, wake.rx.recv())
+            .await
+            .expect("the catch-up wake")
+            .expect("open");
+        assert!(wake.is_up());
+        notifier
+            .execute(
+                "select pg_notify($1, '')",
+                &[&default_wake_channel(DEFAULT_SCHEMA)],
+            )
+            .await
+            .expect("notify the engine channel");
+        notifier
+            .execute("select pg_notify(work_wake_channel(), '')", &[])
+            .await
+            .expect("notify the work channel");
+        tokio::time::timeout(hang_guard, wake.rx.recv())
+            .await
+            .expect("a wake from the work channel")
+            .expect("open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), wake.rx.recv())
+                .await
+                .is_err(),
+            "the engine channel's notification woke the work-only listener"
+        );
     }
 }
 
