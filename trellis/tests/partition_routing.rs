@@ -650,3 +650,183 @@ async fn an_enum_key_and_a_collation_in_public_route_exactly() {
         );
     }
 }
+
+/// Each leaf of `table` against its recorded text, with `columns` naming
+/// the group's key columns (each presented as `m.<name>`): the rows that
+/// route differently than Postgres placed them, summed over the leaves.
+async fn wrong_over_leaves(client: &mut Client, table: &str, keys: &[(&str, &str)]) -> i64 {
+    let mut recorded = Vec::new();
+    for (level, column) in keys {
+        recorded.push((
+            column.to_string(),
+            recorded_key(client, level, column).await,
+        ));
+    }
+    let columns: Vec<RouteColumn> = recorded
+        .iter()
+        .map(|(name, key)| RouteColumn {
+            name: name.clone(),
+            value: format!("m.{name}"),
+            key: Some(key.clone()),
+        })
+        .collect();
+    let mut wrong = 0;
+    for (leaf, oid) in leaves(client, table).await {
+        let text = constraint_text(client, oid).await;
+        let route = text.map_or(Route::Every, Route::Text);
+        wrong += disagreements(client, table, &leaf, &route, &columns)
+            .await
+            .unwrap_or_else(|e| panic!("{table}, {leaf}: {e:?}"));
+    }
+    wrong
+}
+
+/// Review of #1062: the cases the type matrix leaves out. `NULL` keys (a
+/// `DEFAULT` takes them under `RANGE`, a `NULL` list value or a `DEFAULT`
+/// under `LIST`, and `HASH` places them by remainder), multi-column `RANGE`
+/// and `HASH` keys, infinite and BC `timestamptz` and `date` values, numerics
+/// of another scale than a bound's, and a `RANGE` over text whose bounds
+/// order differently under the key's collation than under `C`.
+#[tokio::test]
+async fn nulls_multi_column_keys_edge_values_and_collation_ordering_route_exactly() {
+    let cluster = TestCluster::start();
+    let (_db, mut client) = connect(&cluster).await;
+    client
+        .batch_execute(
+            "select setseed(0.31); \
+             create table nr (k integer, v int) partition by range (k); \
+             create table nr0 partition of nr for values from (minvalue) to (50); \
+             create table nr1 partition of nr for values from (50) to (maxvalue); \
+             create table nrd partition of nr default; \
+             insert into nr select case when g % 7 = 0 then null else g end, 0 \
+                 from generate_series(1, 200) g; \
+             create table nl (k text, v int) partition by list (k); \
+             create table nl0 partition of nl for values in (null, 'a'); \
+             create table nl1 partition of nl for values in ('b', 'c'); \
+             create table nld partition of nl default; \
+             insert into nl select (array[null, 'a', 'b', 'c', 'd', 'A'])[1 + g % 6], 0 \
+                 from generate_series(1, 300) g; \
+             create table nl2 (k integer, v int) partition by list (k); \
+             create table nl2a partition of nl2 for values in (1, 2); \
+             create table nl2d partition of nl2 default; \
+             insert into nl2 select case when g % 5 = 0 then null else g % 4 end, 0 \
+                 from generate_series(1, 200) g; \
+             create table nh (k bigint, v int) partition by hash (k); \
+             create table nh0 partition of nh for values with (modulus 3, remainder 0); \
+             create table nh1 partition of nh for values with (modulus 3, remainder 1); \
+             create table nh2 partition of nh for values with (modulus 3, remainder 2); \
+             insert into nh select case when g % 9 = 0 then null else g * 1000003 end, 0 \
+                 from generate_series(1, 900) g; \
+             create table mr (a integer not null, b text not null, v int) \
+                 partition by range (a, b); \
+             create table mr0 partition of mr for values from (minvalue, minvalue) to (3, 'm'); \
+             create table mr1 partition of mr for values from (3, 'm') to (6, 'c'); \
+             create table mr2 partition of mr for values from (6, 'c') to (maxvalue, maxvalue); \
+             insert into mr select g % 9, (array['a', 'c', 'l', 'm', 'n', 'z'])[1 + g % 6], 0 \
+                 from generate_series(1, 540) g; \
+             create table mh (a integer not null, b uuid, v int) partition by hash (a, b); \
+             create table mh0 partition of mh for values with (modulus 4, remainder 0); \
+             create table mh1 partition of mh for values with (modulus 4, remainder 1); \
+             create table mh2 partition of mh for values with (modulus 4, remainder 2); \
+             create table mh3 partition of mh for values with (modulus 4, remainder 3); \
+             insert into mh select g % 11, case when g % 13 = 0 then null \
+                 else md5(g::text)::uuid end, 0 from generate_series(1, 1000) g; \
+             create table tz (k timestamptz not null, v int) partition by range (k); \
+             create table tz0 partition of tz for values from (minvalue) \
+                 to ('2020-03-08 10:00:00+00'); \
+             create table tz1 partition of tz for values from ('2020-03-08 10:00:00+00') \
+                 to ('infinity'); \
+             create table tz2 partition of tz for values from ('infinity') to (maxvalue); \
+             insert into tz values ('-infinity', 0), ('infinity', 0), \
+                 ('0044-03-15 12:00:00+00 BC', 0), ('2020-03-08 09:59:59.999999+00', 0), \
+                 ('2020-03-08 10:00:00+00', 0), ('2020-03-08 02:00:00-08', 0), \
+                 ('2020-03-08 03:00:00-07', 0), ('294276-12-31 23:59:59+00', 0); \
+             create table dt (k date not null, v int) partition by list (k); \
+             create table dt0 partition of dt for values in ('-infinity', '0001-01-01 BC'); \
+             create table dt1 partition of dt for values in ('infinity', '2020-02-29'); \
+             create table dtd partition of dt default; \
+             insert into dt values ('-infinity', 0), ('0001-01-01 BC', 0), ('infinity', 0), \
+                 ('2020-02-29', 0), ('2020-03-01', 0), ('0001-01-01', 0); \
+             create table nu (k numeric not null, v int) partition by range (k); \
+             create table nu0 partition of nu for values from (minvalue) to (1.5); \
+             create table nu1 partition of nu for values from (1.50) to (2.000); \
+             create table nu2 partition of nu for values from (2) to (maxvalue); \
+             insert into nu values (1.4999999999999999999, 0), (1.5, 0), (1.50, 0), \
+                 (1.500000, 0), (1.99999, 0), (2.0, 0), (2.00, 0), (-0.0, 0), ('NaN', 0), \
+                 (1e20, 0), (-1e-20, 0);",
+        )
+        .await
+        .expect("edge trees");
+    for (table, keys) in [
+        ("nr", &[("nr", "k")][..]),
+        ("nl", &[("nl", "k")][..]),
+        ("nl2", &[("nl2", "k")][..]),
+        ("nh", &[("nh", "k")][..]),
+        ("mr", &[("mr", "a"), ("mr", "b")][..]),
+        ("mh", &[("mh", "a"), ("mh", "b")][..]),
+        ("tz", &[("tz", "k")][..]),
+        ("dt", &[("dt", "k")][..]),
+        ("nu", &[("nu", "k")][..]),
+    ] {
+        assert_eq!(
+            wrong_over_leaves(&mut client, table, keys).await,
+            0,
+            "{table}"
+        );
+    }
+    // The NULLs were placed somewhere the check saw: a DEFAULT, a NULL list
+    // value, a hash remainder.
+    for (leaf, nulls) in [("nrd", 28), ("nl0", 50), ("nl2d", 40)] {
+        let have: i64 = client
+            .query_one(&format!("select count(*) from {leaf} where k is null"), &[])
+            .await
+            .expect("nulls")
+            .get(0);
+        assert_eq!(have, nulls, "{leaf}");
+    }
+
+    let icu: i64 = client
+        .query_one(
+            "select count(*) from pg_catalog.pg_collation where collname = 'und-x-icu'",
+            &[],
+        )
+        .await
+        .expect("icu")
+        .get(0);
+    if icu == 0 {
+        eprintln!("no ICU collations in this build: the collation ordering case is skipped");
+        return;
+    }
+    // Under `und-x-icu` 'a' < 'B' < 'b'; under `C` 'B' < 'a'. The bounds put
+    // rows in leaves that only the key's collation agrees with.
+    client
+        .batch_execute(
+            "create table co (k text collate \"und-x-icu\" not null, v int) \
+                 partition by range (k); \
+             create table co0 partition of co for values from (minvalue) to ('B'); \
+             create table co1 partition of co for values from ('B') to ('c'); \
+             create table co2 partition of co for values from ('c') to (maxvalue); \
+             insert into co select w, 0 from unnest(array['a', 'A', 'b', 'B', 'ab', 'Ba', \
+                 'bZ', 'C', 'c', '_x', 'Z', 'z', '1', 'é', 'E']) w;",
+        )
+        .await
+        .expect("collation tree");
+    assert_eq!(
+        wrong_over_leaves(&mut client, "co", &[("co", "k")]).await,
+        0
+    );
+    // The data is placed by the ICU order, not by `C`'s: 'a' sorts below
+    // 'B' only under the key's collation.
+    let placed: String = client
+        .query_one("select tableoid::regclass::text from co where k = 'a'", &[])
+        .await
+        .expect("placement")
+        .get(0);
+    assert_eq!(placed, "co0");
+    // A text over a non-default collation names it, so the comparison is
+    // made under it whatever the presented value's collation (an implicit
+    // one, from the subquery) is.
+    let co1 = leaves(&client, "co").await[1].1;
+    let text = constraint_text(&mut client, co1).await.expect("text");
+    assert!(text.contains("COLLATE \"und-x-icu\""), "{text}");
+}
