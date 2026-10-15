@@ -1365,4 +1365,26 @@ async fn a_failing_correction_holds_up_no_other_definition_and_pauses_its_own() 
             && r.3.as_deref().is_some_and(|e| e.contains("no_tombstones"))),
         "the row is the record of why: {kept:?}"
     );
+
+    // The resume deletes the row and rebuilds the definition from the
+    // source, which releases the correction: it leaves the queue, and the
+    // definition ends `live` and right.
+    fx.exec(&format!(
+        "alter table {ledger} drop constraint no_tombstones"
+    ))
+    .await;
+    trellis::staging::quarantine::resume_transform(fx.d.pool(), "agg")
+        .await
+        .expect("resume");
+    for _ in 0..3 {
+        fx.full_pass().await;
+        fx.settle_builds().await;
+    }
+    assert_eq!(fx.status_of("agg").await, "live");
+    assert!(
+        fx.queue().await.is_empty(),
+        "the resume released the correction"
+    );
+    assert!(fx.rows().await.is_empty());
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
 }

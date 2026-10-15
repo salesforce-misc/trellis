@@ -848,28 +848,22 @@ async fn readers(
     client: &impl GenericClient,
     source_table: &str,
 ) -> Result<(Vec<i64>, bool), CorrectionError> {
-    let ids = client
-        .query(
-            &format!(
-                "select id from transform_definitions \
-                 where source_table = $1 and {APPLYING_SQL} order by id"
-            ),
-            &[&source_table],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    let held = client
+    // One statement, so both answers come from one snapshot: an old-path
+    // build that moves to `catching_up` between two reads would be in
+    // neither, and a correction completed then would never re-derive it.
+    let row = client
         .query_one(
-            "select exists (select 1 from transform_definitions \
-                            where source_table = $1 and status = $2 \
-                              and build is distinct from 'rederive')",
+            &format!(
+                "select coalesce(array_agg(id order by id) filter (where {APPLYING_SQL}), \
+                                 '{{}}'::bigint[]), \
+                        coalesce(bool_or(status = $2 and build is distinct from 'rederive'), \
+                                 false) \
+                 from transform_definitions where source_table = $1"
+            ),
             &[&source_table, &TransformStatus::Backfilling.as_str()],
         )
-        .await?
-        .get(0);
-    Ok((ids, held))
+        .await?;
+    Ok((row.get(0), row.get(1)))
 }
 
 /// What one call of [`correct`] left.
