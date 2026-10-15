@@ -518,23 +518,30 @@ pub async fn installed_tables(
         .collect();
     Ok(client
         .query(
-            "select c.j ->> 'table' from ( \
-                 select d.description::jsonb as j \
-                 from pg_catalog.pg_proc p \
-                 join pg_catalog.pg_description d \
-                   on d.objoid = p.oid \
-                  and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
-                  and d.objsubid = 0 \
-                 where p.pronamespace = ( \
-                     select oid from pg_catalog.pg_namespace where nspname = $1) \
-                   and d.description like '{\"trellis_capture\":1,%') c \
-             where c.j ->> 'table' is not null \
+            "with recorded as ( \
+                 select c.j ->> 'table' as name from ( \
+                     select d.description::jsonb as j \
+                     from pg_catalog.pg_proc p \
+                     join pg_catalog.pg_description d \
+                       on d.objoid = p.oid \
+                      and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                      and d.objsubid = 0 \
+                     where p.pronamespace = ( \
+                         select oid from pg_catalog.pg_namespace where nspname = $1) \
+                       and d.description like '{\"trellis_capture\":1,%') c \
+                 where c.j ->> 'table' is not null) \
+             select name from recorded \
              union \
              select n.nspname::text || '.' || r.relname::text \
              from pg_catalog.pg_trigger t \
              join pg_catalog.pg_class r on r.oid = t.tgrelid \
              join pg_catalog.pg_namespace n on n.oid = r.relnamespace \
-             where t.tgname = any($2) and not t.tgisinternal",
+             where t.tgname = any($2) and not t.tgisinternal \
+               and not (r.relispartition and exists ( \
+                   select 1 from recorded x \
+                   join pg_catalog.pg_class k on k.oid = pg_catalog.pg_partition_root(r.oid) \
+                   join pg_catalog.pg_namespace kn on kn.oid = k.relnamespace \
+                   where x.name = kn.nspname::text || '.' || k.relname::text))",
             &[&schema, &triggers],
         )
         .await?

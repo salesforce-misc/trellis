@@ -305,6 +305,37 @@ pub fn install_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<String
     Ok(statements)
 }
 
+/// The five triggers (and their `ENABLE ALWAYS`) on `node`, a table of the
+/// partition tree rooted at `spec.table()`, each calling the root's
+/// function ([`trigger_ddl_on`]). A statement trigger isn't copied to a
+/// partition, so each node of the tree needs its own.
+pub fn node_trigger_statements(
+    schema: &str,
+    spec: &CaptureSpec,
+    node: &str,
+) -> Result<Vec<String>, CaptureError> {
+    let mut statements = Vec::with_capacity(CaptureEvent::ALL.len() * 2);
+    for event in CaptureEvent::ALL {
+        statements.extend(trigger_ddl_on(schema, spec, node, event)?);
+    }
+    Ok(statements)
+}
+
+/// `DROP TRIGGER IF EXISTS` for each of the instance's five capture triggers
+/// on `node`.
+pub fn drop_node_trigger_statements(schema: &str, node: &str) -> Result<Vec<String>, CaptureError> {
+    let quoted = quoted_table(node)?;
+    Ok(CaptureEvent::ALL
+        .iter()
+        .map(|event| {
+            format!(
+                "drop trigger if exists {} on {quoted}",
+                quote_ident(&trigger_name(schema, *event))
+            )
+        })
+        .collect())
+}
+
 /// Every statement that replaces `spec`'s capture functions without touching
 /// the triggers, in order: per event, the function, the revoke of `PUBLIC`'s
 /// `EXECUTE` and the comment. A widen or narrow runs these (C3,
@@ -459,7 +490,21 @@ pub fn trigger_ddl(
     spec: &CaptureSpec,
     event: CaptureEvent,
 ) -> Result<Vec<String>, CaptureError> {
-    let table = quoted_table(&spec.table)?;
+    trigger_ddl_on(schema, spec, &spec.table, event)
+}
+
+/// [`trigger_ddl`] for `node`, a table of the partition tree rooted at
+/// `spec.table()` (ADR-0017): the trigger on the node calls the *root's*
+/// function, so every node of the tree stages under the root's identity.
+/// The function bodies name columns rather than numbering them, so one
+/// function set serves nodes whose attribute numbers differ.
+pub fn trigger_ddl_on(
+    schema: &str,
+    spec: &CaptureSpec,
+    node: &str,
+    event: CaptureEvent,
+) -> Result<Vec<String>, CaptureError> {
+    let table = quoted_table(node)?;
     let trigger = quote_ident(&trigger_name(schema, event));
     let function = qualified_function(schema, spec, event)?;
     let timing = match event {
