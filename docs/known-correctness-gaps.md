@@ -114,6 +114,7 @@ These are the tools the entries refer to:
 | 23 | A value padded with spaces past a widened `varchar`'s old length, drained before Trellis re-types its copy | yes | `self_check` (1-1 targets only) | none filed |
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
 | 25 | A `MERGE` moving a row to another partition, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | none; reported to Postgres (#942) |
+| 26 | A partitioned source renamed away and back within one pass, once partitioned sources are supported (#897) | yes | no | none filed |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -748,6 +749,33 @@ findings and the upstream report.
 **Workaround:** change the partition key with `UPDATE`, or with `DELETE` and
 `INSERT`, not with a `MERGE`. A `MERGE` with both `DELETE` and `INSERT`
 actions isn't a safe form: it's wrong before 15.6 and 16.2.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it.
+
+## 26. A partitioned source renamed away and back within one pass
+
+**Trigger:** `ALTER TABLE orders RENAME TO orders_old` and, before the
+staging worker's next reconcile pass, `ALTER TABLE orders_old RENAME TO
+orders`, on a partitioned source. It applies once partitioned sources are
+supported (epic #897). A rename that spans a pass is seen: the pass finds the
+recorded root under another name and, when the name resolves again, queues a
+correction of every leaf.
+
+**Effect:** silent. Each capture function of a partitioned source stages
+nothing unless the table's root is the table the source's name resolves to,
+so every write made while the root had another name is not staged, and
+nothing in the catalog differs afterwards: neither fingerprint of the pass
+covers the root's `pg_class.xmin`, which a `GRANT`, an owner change or a
+`VACUUM FULL` would move too. The groups the missed writes touched stay as
+they were.
+
+**Detected?** No.
+
+**Planned work:** none.
+
+**Workaround:** rename a source only while its transforms are paused, then
+resume them.
 
 **Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
 `request_backfill` it.

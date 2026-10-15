@@ -213,7 +213,7 @@ fn own_columns(def: &TransformDef) -> BTreeSet<String> {
 
 /// Whether `def` reads a column through `rel` (a definition names a
 /// relationship of its own source).
-fn reads_through(def: &TransformDef, rel: &RelationshipDefinition) -> bool {
+pub(super) fn reads_through(def: &TransformDef, rel: &RelationshipDefinition) -> bool {
     crate::defs::eval::relationship_references(def)
         .iter()
         .any(|(name, _)| *name == rel.def.name)

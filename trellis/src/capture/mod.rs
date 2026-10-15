@@ -56,6 +56,7 @@
 
 pub mod columns;
 pub mod install;
+pub mod partitions;
 pub mod reconcile;
 pub mod sql;
 

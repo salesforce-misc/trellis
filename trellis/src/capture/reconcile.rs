@@ -16,6 +16,13 @@
 //! that table's capture as it is. Define refuses such a table, but it can
 //! join a hierarchy later, or be dropped and recreated as one.
 //!
+//! Once partitioned sources are served (`defs::catalog`'s
+//! `PARTITIONED_SOURCES_CAPTURED`), a partitioned root is not "in a
+//! hierarchy": the pass fingerprints its tree, pauses the readers it stopped
+//! complying for, and records the tree and the corrections for its partition
+//! maintenance once capture covers every node ([`super::partitions`], ADR-0017
+//! P3). While that gate is closed, the check above pauses its readers.
+//!
 //! Before it regenerates a table's functions, the pass pauses every
 //! definition that reads a column the table no longer has (#622 C6,
 //! [`crate::staging::schema_change::pause_readers_of_missing`]), or reads a
@@ -109,6 +116,7 @@ use tokio_postgres::{Client, GenericClient};
 use super::CaptureError;
 use super::columns::{CaptureCatalog, capture_spec, load_catalog};
 use super::install::{self, CaptureAction, LockWait, Progress};
+use super::partitions;
 use super::sql::{CaptureEvent, trigger_name};
 use crate::defs::TransformStatus;
 
@@ -127,6 +135,10 @@ pub struct PassOutcome {
     /// reason (no primary key, a missing column, a failed statement), with
     /// the error. The pass goes on with the other tables.
     pub failed: Vec<(String, CaptureError)>,
+    /// Each partitioned source whose tree the pass read in full because a
+    /// fingerprint changed, none was stored, the process had not yet checked
+    /// it, or it was non-compliant (ADR-0017, [`super::partitions`]).
+    pub partition_deep_checks: Vec<String>,
 }
 
 /// One pass: brings every table in `desired` (the tables some definition
@@ -167,15 +179,36 @@ pub async fn reconcile(
         // #707: a table that joined a partition or inheritance hierarchy
         // after define, or was recreated as one, can't be captured: its
         // readers pause, and its capture is left as it is.
-        match crate::staging::schema_change::pause_readers_in_hierarchy(
-            client,
-            &snapshot.catalog,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => continue,
+        //
+        // ADR-0017 P3: a partitioned root that is no partition and in no
+        // inheritance hierarchy is not "in a hierarchy". The pass fingerprints
+        // its tree instead, pauses the readers it stopped complying for, and
+        // records what it found once capture covers every node.
+        let mut partitioned = None;
+        match partitions::begin(client, instance, &snapshot.catalog, table).await {
+            Ok(partitions::Begin::Held) => continue,
+            Ok(partitions::Begin::Proceed(proceed)) => {
+                if proceed.deep {
+                    outcome.partition_deep_checks.push(table.clone());
+                }
+                partitioned = Some(proceed);
+            }
+            Ok(partitions::Begin::NotPartitioned) => {
+                match crate::staging::schema_change::pause_readers_in_hierarchy(
+                    client,
+                    &snapshot.catalog,
+                    table,
+                )
+                .await
+                {
+                    Ok(false) => {}
+                    Ok(true) => continue,
+                    Err(err) => {
+                        outcome.failed.push((table.clone(), err));
+                        continue;
+                    }
+                }
+            }
             Err(err) => {
                 outcome.failed.push((table.clone(), err));
                 continue;
@@ -254,6 +287,20 @@ pub async fn reconcile(
             Ok(Progress::Done(action)) => {
                 if action != CaptureAction::Unchanged {
                     crate::instance_log::info!(table = %table, action = ?action, "capture reconciled");
+                }
+                // Every node carries capture now, so a new leaf's rows are
+                // corrected from here on: record the tree and queue them.
+                if let Some(proceed) = partitioned {
+                    match partitions::commit(client, instance, proceed).await {
+                        Ok(queued) if queued > 0 => {
+                            crate::instance_log::info!(table = %table, corrections = queued, "partition maintenance detected; corrections queued");
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            outcome.failed.push((table.clone(), err));
+                            continue;
+                        }
+                    }
                 }
                 forget_report(instance, table);
                 outcome.captured.insert(table.clone());
@@ -387,6 +434,9 @@ pub async fn reconcile(
             &[&held],
         )
         .await?;
+
+    // A source nothing reads any more has no recorded tree to keep.
+    partitions::forget_except(&*client, desired).await?;
 
     let gated = gated_marker_tables(&*client).await?;
     outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);

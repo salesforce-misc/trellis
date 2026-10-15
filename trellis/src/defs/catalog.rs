@@ -6578,13 +6578,16 @@ async fn to_col_cardinality_in_txn(
 /// not enough to serve a definition: `ATTACH`, `DETACH` and `DROP` of a
 /// partition change the root's rows without a write the triggers see, and a
 /// leaf or middle `TRUNCATE` stages the root's truncate sentinel, which
-/// empties the whole target. The reconcile pass that detects and corrects
-/// them is not in place, so the definition would count wrongly until a
-/// rebuild.
+/// empties the whole target. The reconcile pass detects the lifecycle changes
+/// and queues a correction request for each ([`crate::capture::partitions`],
+/// P3), but nothing consumes the queue yet (the correction engine, P4, and the
+/// node-named `TRUNCATE`), so the definition would count wrongly until a
+/// rebuild. Until then the pass still treats a partitioned root as a table in
+/// a hierarchy and pauses its readers.
 /// While this is `false`, [`accept_partitioned`] refuses every servable tree
 /// with [`CatalogError::PartitionedSourceNotCaptured`], after every shape
 /// check, so a refusal for the shape still names its column.
-const PARTITIONED_SOURCES_CAPTURED: bool = false;
+pub(crate) const PARTITIONED_SOURCES_CAPTURED: bool = false;
 
 /// Whether `qualified` (an unquoted `schema.table`) has a primary key, the
 /// part of [`change_keyed`]'s rule a partitioned root is held to as well.
@@ -6605,7 +6608,7 @@ async fn has_primary_key(
 /// The last check on a partitioned root of a servable shape: refuses it
 /// unless [`PARTITIONED_SOURCES_CAPTURED`].
 fn accept_partitioned(table: &str) -> Result<(), CatalogError> {
-    if PARTITIONED_SOURCES_CAPTURED {
+    if PARTITIONED_SOURCES_CAPTURED || super::partition_tree::gate_opened_for_tests() {
         return Ok(());
     }
     Err(CatalogError::PartitionedSourceNotCaptured {

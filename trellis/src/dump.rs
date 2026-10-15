@@ -115,6 +115,8 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("engine_bootstrap", Class::Runtime),
     ("key_deaths", Class::Runtime),
     ("ledger_truncate_floor", Class::Runtime),
+    ("partition_corrections", Class::Runtime),
+    ("partition_sources", Class::Runtime),
     ("pending_backfill", Class::Runtime),
     ("poison", Class::Runtime),
     ("poison_held", Class::Runtime),

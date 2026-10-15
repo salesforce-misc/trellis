@@ -1393,7 +1393,7 @@ fn unpaused_writers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
 
 /// Every definition that reads `table` at all, as its source or a
 /// relationship's to-side, and isn't paused for a capture failure yet.
-fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
+pub(crate) fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64> {
     readers_of(catalog, table, &BTreeSet::new(), true)
         .into_iter()
         .filter(|id| {

@@ -40,6 +40,24 @@ use crate::defs::ddl::regclass_arg;
 /// table runs out for one statement somewhere above this.
 pub const MAX_LEAVES: usize = 1_000;
 
+static GATE_OPENED_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Opens the partitioned-source gate ([`crate::defs::catalog`]'s
+/// `PARTITIONED_SOURCES_CAPTURED`) for the rest of the process, so a test
+/// can define a transform on a partitioned root and run the reconcile pass
+/// over it. Production code never calls it.
+#[doc(hidden)]
+#[cfg_attr(not(feature = "internals"), allow(dead_code))]
+pub fn open_gate_for_tests() {
+    GATE_OPENED_FOR_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether [`open_gate_for_tests`] was called.
+pub(crate) fn gate_opened_for_tests() -> bool {
+    GATE_OPENED_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The oldest server a partitioned source is read on.
 pub const MIN_SERVER_VERSION_NUM: i32 = 150_000;
 

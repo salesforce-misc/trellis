@@ -115,8 +115,8 @@ install. The lifecycle fingerprint alone misses a source that joins a hierarchy
 or gains a level two deep, which the compliance fingerprint sees.
 `pg_inherits.xmin` is what reveals a table detached and re-attached under the
 same bound within one pass; without it, every trial of a detach, modify and
-re-attach with the triggers dropped ended wrong. Persisting them means a restart
-can't forget a change. Adding the source's own `pg_class.xmin` would also fire
+re-attach with the triggers dropped ended wrong. Persisting them means a
+restart can't forget a change. Adding the source's own `pg_class.xmin` would also fire
 on a `GRANT`, an owner change, a reloption, `VACUUM FULL` or `CLUSTER`, and each
 firing would force a full rebuild.
 
@@ -351,9 +351,9 @@ grouped `BY product_id` is refused at define, naming `order_id`.
 - After a dump and restore into another cluster the pass detects the new oids
   and pauses every definition on a partitioned source, holding stale values
   until an operator runs `RESUME`, which rebuilds.
-- Three cases are left as [known correctness gaps](../known-correctness-gaps.md)
+- Four cases are left as [known correctness gaps](../known-correctness-gaps.md)
   rather than designed around, because no capture shape or fingerprint sees
   them: "A `MERGE` that moves a row to another partition", "A `DEFAULT`
-  partition beside a leaf created and dropped within one pass" and "A
+  partition beside a leaf created and dropped within one pass", "A
   partitioned source attached under another table and detached within one
-  pass".
+  pass" and "A partitioned source renamed away and back within one pass".
