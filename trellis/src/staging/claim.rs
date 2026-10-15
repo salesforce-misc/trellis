@@ -96,18 +96,17 @@ pub async fn reclaim_stale_drainers(
 ) -> Result<u64, StagingError> {
     let older_than_secs = older_than.as_secs_f64();
     let n = client
-        .query_typed(
+        .execute_typed(
             "with dead as ( \
                  select drainer_id from drainers \
                  where last_seen < now() - (interval '1 second' * $1) \
                  for update skip locked \
              ) \
-             delete from drainers where drainer_id in (select drainer_id from dead) \
-             returning 1",
+             delete from drainers where drainer_id in (select drainer_id from dead)",
             &[(&older_than_secs, Type::FLOAT8)],
         )
         .await?;
-    Ok(n.len() as u64)
+    Ok(n)
 }
 
 /// Counts drainers seen within `window` of now — the share denominator

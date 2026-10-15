@@ -383,7 +383,7 @@ pub async fn reconcile(
         .chain(outcome.failed.iter().map(|(table, _)| table.as_str()))
         .collect();
     client
-        .query_typed(
+        .execute_typed(
             "delete from capture_holdups where table_name <> all($1)",
             &[(&held, Type::TEXT_ARRAY)],
         )

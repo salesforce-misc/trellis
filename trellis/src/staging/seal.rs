@@ -74,18 +74,23 @@ async fn active_pointer(client: &impl GenericClient) -> Result<(i64, i16), Stagi
 /// [`active_pointer`] and whether the active ring slot holds a row, as one
 /// statement: this is what the staging worker asks every tick, and two
 /// autocommit statements cost two transactions on an idle database (#273).
-/// The `case` evaluates only the active slot's `exists`.
+/// The `case` evaluates only the active slot's `exists` (each arm is an
+/// initplan, run on first use), though planning takes `AccessShareLock` on
+/// every ring table for the statement's duration. A slot outside the ring
+/// fails as [`ring_table_name`] does, as the two-statement read did, rather
+/// than reading as empty.
 async fn active_pointer_and_nonempty(
     client: &impl GenericClient,
 ) -> Result<(i64, bool), StagingError> {
-    let mut sql = String::from("select active_seq, case ring_slot");
+    let mut sql = String::from("select active_seq, ring_slot, case ring_slot");
     for slot in 0..RING_SIZE {
         let table = ring_table_name(slot)?;
         sql.push_str(&format!(" when {slot} then exists (select 1 from {table})"));
     }
     sql.push_str(" end from segment_pointer");
     let row = client.query_typed_one(&sql, &[]).await?;
-    Ok((row.get(0), row.get::<_, Option<bool>>(1).unwrap_or(false)))
+    ring_table_name(row.get(1))?;
+    Ok((row.get(0), row.get(2)))
 }
 
 /// The seal gate (docs/staging-and-claiming/03-sealing-and-the-fence.md):

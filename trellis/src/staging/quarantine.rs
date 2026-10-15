@@ -5389,7 +5389,7 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
     let requests = {
         let client = pool.get().await?;
         client
-            .query_typed(
+            .execute_typed(
                 "delete from retype_releases r where not exists \
                  (select 1 from transform_definitions d where d.id = r.transform_id)",
                 &[],

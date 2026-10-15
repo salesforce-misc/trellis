@@ -270,6 +270,25 @@ async fn an_empty_active_segment_still_seals_to_catch_a_stranded_straggler() {
     assert_claimed_exactly_once(&sealer, &[1, 2], "stranded").await;
 }
 
+/// The idle check reads the pointer and the active slot's emptiness in one
+/// statement (#273); a pointer naming no ring slot must still fail as
+/// `InvalidRingSlot`, not read as an empty slot and skip the seal.
+#[tokio::test]
+async fn an_out_of_range_active_slot_fails_the_idle_seal_check() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+    sealer
+        .batch_execute("update segment_pointer set ring_slot = 7")
+        .await
+        .expect("corrupt the pointer");
+
+    match seal::seal_if_active_nonempty(&mut sealer, "wake").await {
+        Err(StagingError::InvalidRingSlot(7)) => {}
+        other => panic!("expected InvalidRingSlot(7), got {other:?}"),
+    }
+}
+
 /// The companion negative control: an empty active segment whose
 /// predecessor has nothing unfenced left in its slot (the ordinary idle-tail
 /// case — every real system reaches this state at the end of any burst of

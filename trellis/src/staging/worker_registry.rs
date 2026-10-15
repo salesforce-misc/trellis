@@ -111,8 +111,7 @@ const RECLAIM_STALE_WORKERS_SQL: &str = "\
         where last_seen < now() - (interval '1 second' * $1) \
         for update skip locked \
     ) \
-    delete from worker_registry where worker_id in (select worker_id from dead) \
-    returning 1";
+    delete from worker_registry where worker_id in (select worker_id from dead)";
 
 /// Runs `RECLAIM_STALE_WORKERS_SQL`: sweeps every worker row whose
 /// `last_seen` is older than `ttl`, returning how many it removed. Purely
@@ -132,7 +131,7 @@ pub async fn reclaim_stale_workers(
 ) -> Result<u64, StagingError> {
     let ttl_secs = ttl.as_secs_f64();
     let n = client
-        .query_typed(RECLAIM_STALE_WORKERS_SQL, &[(&ttl_secs, Type::FLOAT8)])
+        .execute_typed(RECLAIM_STALE_WORKERS_SQL, &[(&ttl_secs, Type::FLOAT8)])
         .await?;
-    Ok(n.len() as u64)
+    Ok(n)
 }
