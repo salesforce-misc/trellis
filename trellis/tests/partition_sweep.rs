@@ -581,3 +581,178 @@ async fn measure_the_sweep_at_a_thousand_list_leaves() {
     let fx = measure("list", &thousand_leaves("list")).await;
     measure_full_routing_form(&fx, "list").await;
 }
+
+/// Blanks the recorded text of `name`, as a text fetch that raced the node's
+/// detach leaves it.
+async fn blank_text(fx: &Fx, name: &str) {
+    fx.exec(&format!(
+        "update partition_sources set nodes = jsonb_set(nodes, \
+             array['nodes', (select (i - 1)::text from jsonb_array_elements(nodes->'nodes') \
+                             with ordinality as e(n, i) \
+                             where n->>'name' = '{name}'), 'constraint'], \
+             'null'::jsonb)"
+    ))
+    .await;
+}
+
+/// Two passes, each followed by the engine: the second finds what the first
+/// pass's corrections left. The target was wrong before and is right after.
+async fn converge_twice(fx: &mut Fx, what: &str) {
+    assert!(
+        !fx.wrong_groups().await.is_empty(),
+        "{what}: rows to correct"
+    );
+    fx.pass().await;
+    fx.correct().await;
+    fx.pass().await;
+    fx.correct().await;
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new(), "{what}");
+    assert!(fx.queue().await.is_empty(), "{what}");
+}
+
+/// The cases below each take a gone node without a usable text, or a
+/// short-lived node, through a shape the sweep or a `DEFAULT`'s own
+/// correction must cover, with no full routing form.
+///
+/// A `HASH` modulus change: a recorded `(2, 1)` leaf without a usable text is
+/// dropped and replaced by `(4, 1)`, and a `(4, 3)` leaf is created, written
+/// and dropped in the same interval, so its remainder routes nowhere.
+#[tokio::test]
+async fn a_hash_modulus_change_around_a_gone_node_without_a_usable_text_converges() {
+    let mut fx = Fx::start(
+        "create table public.items (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)) partition by hash (g); \
+         create table public.items_a partition of public.items \
+             for values with (modulus 2, remainder 0); \
+         create table public.items_b partition of public.items \
+             for values with (modulus 2, remainder 1); \
+         insert into public.items select i, i % 16, i from generate_series(1, 160) i;",
+        ValueType::Numeric,
+    )
+    .await;
+    blank_text(&fx, "public.items_b").await;
+    fx.exec(
+        "drop table public.items_b; \
+         create table public.items_b1 partition of public.items \
+             for values with (modulus 4, remainder 1); \
+         create table public.items_b3 partition of public.items \
+             for values with (modulus 4, remainder 3); \
+         insert into public.items select 5000 + i, i % 16, 3 from generate_series(1, 160) i \
+             where not satisfies_hash_partition('public.items'::regclass, 2, 0, i % 16);",
+    )
+    .await;
+    fx.d.settle().await;
+    fx.exec("drop table public.items_b3").await;
+    converge_twice(&mut fx, "hash modulus change").await;
+}
+
+/// A middle whose children are partly gone: one child without a usable text
+/// dropped, and a sibling leaf created, written and dropped.
+#[tokio::test]
+async fn a_middle_whose_children_are_partly_gone_converges() {
+    let mut fx = Fx::start(
+        "create table public.items (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)) partition by range (g); \
+         create table public.items_lo partition of public.items for values from (0) to (4); \
+         create table public.items_m partition of public.items for values from (4) to (12) \
+             partition by list (g); \
+         create table public.items_m1 partition of public.items_m for values in (4, 5, 6, 7); \
+         create table public.items_m2 partition of public.items_m for values in (8, 9); \
+         insert into public.items select i, i % 10, i from generate_series(1, 100) i;",
+        ValueType::Numeric,
+    )
+    .await;
+    blank_text(&fx, "public.items_m2").await;
+    fx.exec(
+        "drop table public.items_m2; \
+         create table public.items_m3 partition of public.items_m for values in (10, 11); \
+         insert into public.items select 5000 + i, 10 + i % 2, 1 from generate_series(1, 20) i;",
+    )
+    .await;
+    fx.d.settle().await;
+    fx.exec("drop table public.items_m3").await;
+    converge_twice(&mut fx, "middle partly gone").await;
+}
+
+/// Two operations in one interval beside a `DEFAULT`: a recorded leaf without
+/// a usable text dropped, and a leaf created over part of its range, written
+/// and dropped. The `DEFAULT`'s siblings changed, so its own correction walks
+/// the whole range.
+#[tokio::test]
+async fn two_operations_in_one_pass_beside_a_default_converge() {
+    let (ddl, _) = tree("range");
+    let mut fx = Fx::start(
+        &format!("{ddl} create table public.items_d partition of public.items default;"),
+        ValueType::Numeric,
+    )
+    .await;
+    blank_text(&fx, "public.items_p1").await;
+    fx.exec(
+        "drop table public.items_p1; \
+         create table public.items_z partition of public.items for values from (4) to (6); \
+         insert into public.items select 5000 + i, 4 + i % 4, 1 from generate_series(1, 40) i;",
+    )
+    .await;
+    fx.d.settle().await;
+    fx.exec("drop table public.items_z").await;
+    converge_twice(&mut fx, "default beside two operations").await;
+}
+
+/// A `DEFAULT` created in the interval a leaf is created, written and
+/// dropped: the new `DEFAULT`'s own correction walks its range.
+#[tokio::test]
+async fn a_default_created_as_a_short_lived_leaf_is_dropped_converges() {
+    let (ddl, missing) = tree("range");
+    let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
+    fx.exec(&format!(
+        "create table public.items_new partition of public.items {missing}"
+    ))
+    .await;
+    fx.exec(WRITE_MISSING).await;
+    fx.d.settle().await;
+    fx.exec(
+        "drop table public.items_new; \
+         create table public.items_d partition of public.items default;",
+    )
+    .await;
+    converge_twice(&mut fx, "default created with the leaf gone").await;
+}
+
+/// A `DEFAULT` created, written and dropped between two passes: its range is
+/// the complement.
+#[tokio::test]
+async fn a_default_created_written_and_dropped_between_two_passes_converges() {
+    let (ddl, _) = tree("list");
+    let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
+    fx.exec(
+        "create table public.items_d partition of public.items default; \
+         insert into public.items select 5000 + i, 20 + i % 5, 1 from generate_series(1, 50) i;",
+    )
+    .await;
+    fx.d.settle().await;
+    fx.exec("drop table public.items_d").await;
+    converge_twice(&mut fx, "default created and dropped").await;
+}
+
+/// A leaf attached with rows, written through the parent, detached and
+/// dropped between two passes.
+#[tokio::test]
+async fn a_leaf_attached_written_and_dropped_between_two_passes_converges() {
+    let (ddl, _) = tree("range");
+    let mut fx = Fx::start(&ddl, ValueType::Numeric).await;
+    fx.exec(
+        "create table public.items_x (like public.items including all); \
+         insert into public.items_x select 9000 + i, 12 + i % 4, 1 from generate_series(1, 8) i; \
+         alter table public.items attach partition public.items_x for values from (12) to (16);",
+    )
+    .await;
+    fx.exec("insert into public.items select 7000 + i, 12 + i % 4, 2 from generate_series(1, 8) i")
+        .await;
+    fx.d.settle().await;
+    fx.exec(
+        "alter table public.items detach partition public.items_x; \
+         drop table public.items_x;",
+    )
+    .await;
+    converge_twice(&mut fx, "attached and dropped").await;
+}
