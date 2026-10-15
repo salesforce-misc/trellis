@@ -57,8 +57,17 @@
 //! queued is a request: the correction engine (P4) consumes
 //! [`pending_corrections`] and calls [`complete_correction`] once a node's
 //! groups are corrected, and only after the ring is folded through the
-//! row's `queued_lsn` (a writer with an older snapshot can still stage rows
-//! for a detach-pending leaf until its detach completes).
+//! row's `queued_lsn`. A `gone_node` whose `pg_inherits` row is still
+//! detach-pending needs more: a writer with an older snapshot can still
+//! write through the parent into the leaf, and the root's trigger stages
+//! that after `queued_lsn`, until the detach completes. So P4 corrects such
+//! a node only once that row is gone, folding through a WAL position read
+//! after that. A `gone_node`'s text is `None` for a `DEFAULT` with no
+//! siblings (its constraint is empty: every group routes to it) and for a
+//! node detached between the tree read and the fetch.
+//!
+//! A node queued again before P4 takes it adds nothing, unless it left the
+//! tree under another recorded text: its groups route by each.
 //!
 //! # A renamed root
 //!
@@ -381,7 +390,8 @@ pub fn live_from(
 /// first reason (the P1 checks, [`PartitionTree::refusal`]): an aggregate
 /// whose `GROUP BY` lacks a partition-key column, a to-many relationship's
 /// to-side whose join column isn't the key, a 1-1 transform's `FROM` or a
-/// to-one to-side. Only definitions not already paused count.
+/// to-one to-side. A definition already paused counts too: one the pass
+/// paused for this tree keeps the source held until the tree complies.
 pub fn reader_refusals(
     catalog: &CaptureCatalog,
     table: &str,
@@ -389,7 +399,7 @@ pub fn reader_refusals(
     server_version_num: i32,
 ) -> Vec<(i64, PartitionRefusal)> {
     let mut out = Vec::new();
-    for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
+    for reader in &catalog.definitions {
         if let Some(refusal) = refusal_for(catalog, reader, table, tree, server_version_num) {
             out.push((reader.id, refusal));
         }
@@ -585,9 +595,10 @@ pub(crate) enum Begin {
     /// an inheritance table, a table that doesn't exist): the hierarchy check
     /// and the plain-table path decide.
     NotPartitioned,
-    /// The source stopped complying and every reader is paused: install
-    /// nothing, leave its capture as it is.
-    Held,
+    /// The source stopped complying and every reader is paused, or the tree
+    /// changed under the read: install nothing, leave its capture as it is.
+    /// `deep` says whether a deep check ran.
+    Held { deep: bool },
     /// Install capture, then [`commit`] what the check found.
     Proceed(Proceed),
 }
@@ -625,6 +636,8 @@ pub(crate) async fn begin(
         return Ok(Begin::NotPartitioned);
     };
     if !fingerprints.servable {
+        // Another table may hold the name while the recorded root is away.
+        observe_missing(&*client, table).await?;
         return Ok(Begin::NotPartitioned);
     }
     let stored = load_state(&*client, table).await?;
@@ -656,17 +669,25 @@ pub(crate) async fn begin(
     };
     let Some((tree, version, live)) = read else {
         // Raced a DDL; the next pass reads it again.
-        return Ok(Begin::Held);
+        return Ok(Begin::Held { deep: false });
     };
+    // Every reader the tree doesn't comply for, paused or not: one paused by
+    // an earlier pass (or by this check before a crash) still holds the
+    // source, so the pass keeps checking and installs nothing.
     let refusals = reader_refusals(catalog, table, &tree, version);
-    if !refusals.is_empty() {
-        pause_noncompliant(client, table, &refusals).await?;
+    let unpaused: HashSet<i64> = crate::staging::schema_change::unpaused_readers(catalog, table)
+        .into_iter()
+        .collect();
+    let to_pause: Vec<(i64, PartitionRefusal)> = refusals
+        .iter()
+        .filter(|(id, _)| unpaused.contains(id))
+        .cloned()
+        .collect();
+    if !to_pause.is_empty() {
+        pause_noncompliant(client, table, &to_pause).await?;
     }
     let refused: HashSet<i64> = refusals.iter().map(|(id, _)| *id).collect();
-    let remaining = crate::staging::schema_change::unpaused_readers(catalog, table)
-        .into_iter()
-        .filter(|id| !refused.contains(id))
-        .count();
+    let remaining = unpaused.iter().filter(|id| !refused.contains(id)).count();
 
     let prev = stored.as_ref().map(|s| &s.recorded);
     let renamed = stored.as_ref().is_some_and(|s| s.stale);
@@ -685,7 +706,7 @@ pub(crate) async fn begin(
         };
         write_state(client, table, &record, true).await?;
         mark_checked(instance, table);
-        return Ok(Begin::Held);
+        return Ok(Begin::Held { deep: true });
     }
     let Some(fetched) = fetch_constraints(client, &plan.fetch).await? else {
         return Ok(deferred());
@@ -754,7 +775,8 @@ async fn write_state(
             "insert into partition_corrections \
                  (table_name, kind, node_oid, node_name, cause, constraint_text) \
              values ($1, $2, $3, $4, $5, $6) \
-             on conflict (table_name, kind, node_oid) do nothing",
+             on conflict (table_name, kind, node_oid, \
+                          (md5(coalesce(constraint_text, '')))) do nothing",
             &[
                 &table,
                 &correction.kind.as_str(),
@@ -792,9 +814,11 @@ async fn pause_noncompliant(
     Ok(())
 }
 
-/// A source that doesn't resolve by name any more: if the recorded root is
-/// alive under another name, it was renamed, and nothing staged under its old
-/// name meanwhile, so the next deep check corrects every leaf.
+/// A source whose name doesn't resolve to a servable root (to nothing, or to
+/// another table): if the recorded root is alive under another name, it was
+/// renamed, and nothing staged under its old name meanwhile, so the next deep
+/// check corrects every leaf. A recorded root that is still the table the
+/// name resolves to (it joined a hierarchy) is not marked.
 async fn observe_missing(
     client: &impl GenericClient,
     table: &str,
@@ -803,8 +827,9 @@ async fn observe_missing(
         .execute(
             "update partition_sources set stale = true \
              where table_name = $1 and not stale \
+               and pg_catalog.to_regclass($2) is distinct from root_oid::oid \
                and exists (select 1 from pg_catalog.pg_class c where c.oid = root_oid::oid)",
-            &[&table],
+            &[&table, &regclass_arg(table)],
         )
         .await?;
     Ok(())

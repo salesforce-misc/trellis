@@ -26,6 +26,8 @@ create table partition_sources (
 -- route by. `queued_lsn` is the WAL position when the pass queued it: a
 -- consumer corrects only once the ring is folded through it. The row is
 -- committed with the fingerprints that detected it, so a restart resumes it.
+-- A node queued again before the consumer takes it adds nothing, unless it
+-- left the tree under another recorded text: its groups route by each.
 create table partition_corrections (
     id bigint generated always as identity primary key,
     table_name text not null,
@@ -35,6 +37,8 @@ create table partition_corrections (
     cause text not null,
     constraint_text text,
     queued_lsn pg_lsn not null default pg_current_wal_insert_lsn(),
-    queued_at timestamptz not null default now(),
-    unique (table_name, kind, node_oid)
+    queued_at timestamptz not null default now()
 );
+
+create unique index partition_corrections_once on partition_corrections
+    (table_name, kind, node_oid, (md5(coalesce(constraint_text, ''))));

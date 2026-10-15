@@ -186,7 +186,12 @@ pub async fn reconcile(
         // records what it found once capture covers every node.
         let mut partitioned = None;
         match partitions::begin(client, instance, &snapshot.catalog, table).await {
-            Ok(partitions::Begin::Held) => continue,
+            Ok(partitions::Begin::Held { deep }) => {
+                if deep {
+                    outcome.partition_deep_checks.push(table.clone());
+                }
+                continue;
+            }
             Ok(partitions::Begin::Proceed(proceed)) => {
                 if proceed.deep {
                     outcome.partition_deep_checks.push(table.clone());

@@ -337,6 +337,47 @@ async fn a_gone_subtree_queues_its_topmost_node_with_the_recorded_text() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
+/// A node that leaves the tree twice before the consumer takes the first
+/// correction, under two bounds, queues a correction for each recorded text:
+/// the groups its rows reached under the second bound route only by that one.
+#[tokio::test]
+async fn a_node_gone_twice_under_two_bounds_queues_both_texts() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, TREE).await;
+    it.raw
+        .batch_execute("alter table public.items detach partition public.items_b")
+        .await
+        .expect("detach");
+    clean_pass(&mut it).await;
+    it.raw
+        .batch_execute("alter table public.items attach partition public.items_b for values in (6)")
+        .await
+        .expect("attach under another bound");
+    clean_pass(&mut it).await;
+    it.raw
+        .batch_execute("drop table public.items_b")
+        .await
+        .expect("drop");
+    clean_pass(&mut it).await;
+
+    let gone: Vec<Option<String>> = corrections(&it.raw)
+        .await
+        .into_iter()
+        .filter(|c| c.kind == "gone_node" && c.node_name == "public.items_b")
+        .map(|c| c.constraint)
+        .collect();
+    assert_eq!(gone.len(), 2, "{gone:?}");
+    assert!(
+        gone[0].as_deref().is_some_and(|t| t.contains('3')),
+        "{gone:?}"
+    );
+    assert!(
+        gone[1].as_deref().is_some_and(|t| t.contains('6')),
+        "{gone:?}"
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
 /// A leaf detached, modified and attached again under the same bound between
 /// two passes is a re-attached leaf, which only the `pg_inherits` row's
 /// `xmin` shows.
@@ -375,6 +416,26 @@ async fn a_leaf_detached_and_attached_again_under_the_same_bound_is_found() {
             entry("new_leaf", "public.items_a0", "reattached"),
             entry("new_leaf", "public.items_a1", "reattached"),
         ]
+    );
+
+    // Two levels down, only the lifecycle fingerprint's `xmin` shows it: the
+    // compliance fingerprint covers the root's own `pg_inherits` rows alone,
+    // and the bound's text is the same.
+    drain(&it.raw).await;
+    it.raw
+        .batch_execute(
+            "alter table public.items_a detach partition public.items_a0; \
+             insert into public.items_a0 values (8, 2, 8); \
+             alter table public.items_a attach partition public.items_a0 \
+                for values with (modulus 2, remainder 0)",
+        )
+        .await
+        .expect("re-attach a leaf under the middle");
+    let outcome = clean_pass(&mut it).await;
+    assert_eq!(outcome.partition_deep_checks, [SOURCE]);
+    assert_eq!(
+        queued(&it.raw).await,
+        [entry("new_leaf", "public.items_a0", "reattached")]
     );
     it.trellis.shutdown().await.expect("shutdown");
 }
@@ -641,9 +702,18 @@ async fn a_sub_level_outside_the_group_key_pauses_the_reader() {
         "{err:?}"
     );
 
-    // The pass looks again every pass while the source doesn't comply.
-    let outcome = clean_pass(&mut it).await;
-    assert_eq!(outcome.partition_deep_checks, [SOURCE]);
+    // The pass looks again every pass while the source doesn't comply, and
+    // leaves capture as it is: the non-complying sub-level gets none.
+    for _ in 0..2 {
+        let outcome = clean_pass(&mut it).await;
+        assert_eq!(outcome.partition_deep_checks, [SOURCE]);
+        assert!(
+            !tables_with_triggers(&it.raw)
+                .await
+                .contains(&"public.items_d0".to_string()),
+            "a held source gets no capture"
+        );
+    }
 
     // Once the sub-level is gone, a resume rebuilds.
     it.raw
@@ -727,6 +797,32 @@ async fn a_renamed_root_is_noticed_and_a_replaced_one_is_a_new_tree() {
     );
     drain(&it.raw).await;
 
+    // Renamed away while a plain table holds the name for a pass: the same.
+    it.raw
+        .batch_execute(
+            "alter table public.items rename to items_old; \
+             create table public.items (id int not null, order_id int not null, \
+                amount int not null default 0, primary key (order_id, id, amount))",
+        )
+        .await
+        .expect("rename away, a plain table takes the name");
+    pass(&mut it.raw, &it.db.pool).await;
+    it.raw
+        .batch_execute(
+            "drop table public.items; \
+             alter table public.items_old rename to items",
+        )
+        .await
+        .expect("rename back");
+    clean_pass(&mut it).await;
+    assert_eq!(
+        queued(&it.raw).await.len(),
+        4,
+        "every leaf again: {:?}",
+        queued(&it.raw).await
+    );
+    drain(&it.raw).await;
+
     // Replaced: the old tree moves aside, a new one takes the name.
     it.raw
         .batch_execute(
@@ -799,13 +895,22 @@ async fn routine_maintenance_on_a_thousand_leaves_is_never_a_deep_check() {
     assert!(queued(&it.raw).await.is_empty());
 
     // Freezing the catalog's own `pg_inherits` rows leaves their `xmin` as it
-    // was (the column reports the raw value; freezing sets a flag).
-    it.raw
-        .batch_execute("vacuum (freeze) pg_catalog.pg_inherits")
-        .await
-        .expect("freeze the catalog");
-    let outcome = clean_pass(&mut it).await;
-    assert!(outcome.partition_deep_checks.is_empty());
+    // was (the column reports the raw value; freezing sets a flag), and so
+    // does rewriting it.
+    for sql in [
+        "vacuum (freeze) pg_catalog.pg_inherits",
+        "vacuum (full, freeze) pg_catalog.pg_inherits",
+    ] {
+        it.raw
+            .batch_execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let outcome = clean_pass(&mut it).await;
+        assert!(
+            outcome.partition_deep_checks.is_empty(),
+            "{sql} caused a deep check"
+        );
+    }
     assert!(queued(&it.raw).await.is_empty());
     it.trellis.shutdown().await.expect("shutdown");
 }

@@ -924,7 +924,8 @@ refusing them up front:
   never seen, which is entry 5. Capture's
   window before the pass sees row-level security is entry 11. Once
   partitioned sources are supported (#897), a `MERGE` that moves a row
-  between partitions is entry 25.
+  between partitions is entry 25, and a partitioned source renamed away and
+  back between two passes is entry 26.
 * **A capture function's privilege revoked, or the function made
   `SECURITY INVOKER`.** This is loud rather than silent: every write to the
   captured table fails, naming the capture function, so no change is lost.
