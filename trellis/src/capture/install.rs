@@ -642,7 +642,7 @@ async fn install_tree(
     deadline: Option<Instant>,
 ) -> Result<Progress<()>, CaptureError> {
     let nodes = descendants(&*client, spec.table()).await?;
-    if 1 + nodes.len() <= SINGLE_TRANSACTION_TABLES {
+    if nodes.len() < SINGLE_TRANSACTION_TABLES {
         let op = Op::Install {
             spec,
             scope: Scope::All,
@@ -740,7 +740,7 @@ pub async fn uninstall(
         return Ok(Progress::Done(false));
     }
     let nodes = descendants(&*client, table).await?;
-    if 1 + nodes.len() <= SINGLE_TRANSACTION_TABLES {
+    if nodes.len() < SINGLE_TRANSACTION_TABLES {
         return Ok(run(
             client,
             schema,
