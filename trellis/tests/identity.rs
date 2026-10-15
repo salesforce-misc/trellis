@@ -382,15 +382,15 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // #938 V80 (`transform_definitions.build_marker_generation`), #625 F6
     // V81 (`backfill_chunks.fence_xid`, a seam-fed build's fence), #894
     // V82 (`resume_requests.timeout_cancels`), and #877 V83
-    // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), and #861 V89 (`retry_attempts` on `poison` and `key_deaths`).
-    // V73 is unused.
+    // (`trellis_instance.target_schema`), #1023 V84 (`self_check_jobs`), #864 V85 (`grammar_version`), #273 V86 (the work-wake triggers), #1047 V87 (they also announce a definition entering `waiting_to_backfill` or `live`), #1061 V88 (`partition_sources`, `partition_corrections`), #861 V89 (`retry_attempts` on `poison` and `key_deaths`), and #1062 V91 (`partition_correction_progress`, `partition_corrections.node_default` and `parent_oid`).
+    // V73 is unused; V90 belongs to another open PR.
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
             27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49,
             50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 67, 68, 69, 70, 71, 72, 74, 75, 76,
-            77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+            77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 91,
         ]
     );
 }
