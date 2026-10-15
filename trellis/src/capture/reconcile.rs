@@ -539,7 +539,8 @@ pub async fn installed_tables(
              where t.tgname = any($2) and not t.tgisinternal \
                and not (r.relispartition and exists ( \
                    select 1 from recorded x \
-                   join pg_catalog.pg_class k on k.oid = pg_catalog.pg_partition_root(r.oid) \
+                   join pg_catalog.pg_partition_ancestors(r.oid) a on true \
+                   join pg_catalog.pg_class k on k.oid = a.relid \
                    join pg_catalog.pg_namespace kn on kn.oid = k.relnamespace \
                    where x.name = kn.nspname::text || '.' || k.relname::text))",
             &[&schema, &triggers],

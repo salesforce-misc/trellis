@@ -460,9 +460,9 @@ async fn an_uninstall_removes_capture_from_every_node_and_the_reconcile_pass_kee
     );
 }
 
-/// A table detached from the tree and attached again is attached without
-/// capture triggers (PostgreSQL 16 refuses to attach one that carries them),
-/// and the next install gives it its triggers back.
+/// A table detached from the tree, stripped of its capture triggers and
+/// attached again is a bare node, and the next install gives it its triggers
+/// back.
 #[tokio::test]
 async fn a_leaf_detached_stripped_and_reattached_gets_its_triggers_back() {
     let cluster = TestCluster::start();
@@ -550,4 +550,115 @@ async fn measure_writer_stall_during_a_one_hundred_table_install() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let worst = writer.await.expect("writer");
     println!("install {took:?}; worst writer commit {worst:?}");
+}
+
+/// A source root attached under another table (its readers pause, and its
+/// capture is left as it is, #707) keeps its nodes out of the installed
+/// tables: they're still the captured root's, not orphans to uninstall.
+#[tokio::test]
+async fn the_nodes_of_a_root_attached_under_another_table_are_not_installed_tables() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client.batch_execute(TWO_LEVEL).await.expect("tree");
+    landed(
+        install::install(&mut client, DEFAULT_SCHEMA, &spec("public.r"), None)
+            .await
+            .expect("install"),
+    );
+    client
+        .batch_execute(
+            "create table public.x (id int, region int, v text, primary key (id, region)) \
+                 partition by range (id); \
+             alter table public.x attach partition public.r for values from (0) to (1000)",
+        )
+        .await
+        .expect("attach the root under another table");
+    let tables = trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA)
+        .await
+        .expect("installed tables");
+    assert_eq!(
+        tables.into_iter().collect::<Vec<_>>(),
+        vec!["public.r".to_string()]
+    );
+}
+
+/// A leaf detached from the tree keeps its capture triggers, which call the
+/// root's functions. Uninstalling the root drops them too, rather than
+/// failing on the functions' dependents, and the reconcile pass lists the
+/// detached leaf as a table to uninstall until then.
+#[tokio::test]
+async fn uninstalling_a_root_drops_the_triggers_of_a_leaf_detached_since() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client.batch_execute(&flat(4)).await.expect("tree");
+    landed(
+        install::install(&mut client, DEFAULT_SCHEMA, &spec("public.r"), None)
+            .await
+            .expect("install"),
+    );
+    client
+        .batch_execute("alter table public.r detach partition public.r_2")
+        .await
+        .expect("detach");
+    let mut tables: Vec<String> =
+        trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA)
+            .await
+            .expect("installed tables")
+            .into_iter()
+            .collect();
+    tables.sort();
+    assert_eq!(
+        tables,
+        vec!["public.r".to_string(), "public.r_2".to_string()]
+    );
+    assert!(landed(
+        install::uninstall(&mut client, DEFAULT_SCHEMA, "public.r", None)
+            .await
+            .expect("uninstall")
+    ));
+    assert!(trigger_map(&client).await.is_empty());
+}
+
+/// A writer that names a leaf locks only the leaf, but a one-transaction
+/// install's `LOCK TABLE` of the root waits for it: the wait report names it.
+#[tokio::test]
+async fn a_whole_tree_install_waiting_on_a_leaf_writer_reports_that_writer() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client.batch_execute(&flat(4)).await.expect("tree");
+    let writer = connect(db.dsn()).await;
+    writer
+        .batch_execute("begin; lock table public.r_1 in row exclusive mode")
+        .await
+        .expect("hold the leaf as a writer does");
+    let pid: i32 = writer
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    let progress = install::install(
+        &mut client,
+        DEFAULT_SCHEMA,
+        &spec("public.r"),
+        Some(Instant::now() + Duration::from_millis(300)),
+    )
+    .await
+    .expect("install");
+    let wait = match progress {
+        Progress::Waiting(wait) => wait,
+        Progress::Done(_) => panic!("the install can't land past a leaf writer"),
+    };
+    assert_eq!(wait.table, "public.r");
+    let pids: Vec<Option<i32>> = wait.blockers.iter().map(|b| b.pid).collect();
+    assert_eq!(pids, vec![Some(pid)], "{wait}");
+    assert!(trigger_map(&client).await.is_empty(), "nothing installed");
+    // A plain table's report is unchanged by the tree lookup.
+    let plain = install::blockers(&client, "public.r_1", &["RowExclusiveLock"])
+        .await
+        .expect("blockers");
+    assert_eq!(plain.len(), 1);
+    writer.batch_execute("rollback").await.expect("release");
 }

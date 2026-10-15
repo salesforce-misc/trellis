@@ -206,10 +206,13 @@
 //! large tree drops the nodes' triggers first and the root's last, so an
 //! interrupted one is found again the same way.
 //!
-//! PostgreSQL 16 refuses `ATTACH PARTITION` of a table that still carries
-//! these triggers (the one version difference in ADR-0017's tests), so a
-//! table that is detached and attached again must have its capture triggers
-//! dropped between the two.
+//! A table attached to the tree later gets no triggers from `ATTACH
+//! PARTITION`, which clones only row triggers, so it reads as a bare node
+//! and the next install adds its five. A table detached from the tree keeps
+//! its triggers, which still call the root's functions: [`uninstall`] drops
+//! them along with the nodes' ([`bearers`]), and the reconcile pass lists
+//! such a table as installed in its own right, so it drops them while the
+//! root stays captured (ADR-0017's cleanup).
 //!
 //! # What is installed
 //!
@@ -336,9 +339,10 @@ fn narrows(installed: &CaptureSpec, desired: &CaptureSpec) -> bool {
 /// `schema.table` identity) from `pg_trigger`, `pg_proc` and the functions'
 /// comments.
 ///
-/// One statement reads all four events, so a read racing an install or
-/// uninstall sees it either whole or not at all, never a spurious
-/// [`Installed::Partial`].
+/// One statement reads all five events and, for a partitioned root, every
+/// node's triggers, so a read racing a one-transaction install or uninstall
+/// sees it either whole or not at all, never a spurious
+/// [`Installed::Partial`]. (A node-by-node one is partial in between.)
 pub async fn installed(
     client: &impl GenericClient,
     schema: &str,
@@ -355,7 +359,8 @@ pub async fn installed(
     // failing the cast.
     let rows = client
         .query(
-            "select p.oid is not null, p.prosrc, \
+            &format!(
+                "select p.oid is not null, p.prosrc, \
                     c.j ->> 'table', c.j ->> 'event', \
                     case when c.j is not null then array( \
                         select pg_catalog.jsonb_array_elements_text(c.j -> 'key')) end, \
@@ -364,15 +369,17 @@ pub async fn installed(
                     case when c.j is not null then array( \
                         select pg_catalog.jsonb_array_elements_text(c.j -> 'group_key')) end, \
                     t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid, \
-                    (select r.relkind = 'p' from pg_catalog.pg_class r \
-                     where r.oid = pg_catalog.to_regclass($3)) \
+                    case when e.ord = 1 and exists ( \
+                        select 1 from pg_catalog.pg_class r \
+                        where r.oid = pg_catalog.to_regclass($3) and r.relkind = 'p') \
+                    then array({NODES_MISSING_CAPTURE}) end \
              from unnest($2::text[], $4::text[]) with ordinality as e(function, trigger, ord) \
              left join pg_catalog.pg_proc p \
                on p.proname = e.function and p.pronargs = 0 \
               and p.pronamespace = ( \
                   select oid from pg_catalog.pg_namespace where nspname = $1) \
              left join lateral ( \
-                 select case when d.description like '{\"trellis_capture\":1,%' \
+                 select case when d.description like '{{\"trellis_capture\":1,%' \
                              then d.description::jsonb end as j \
                  from pg_catalog.pg_description d \
                  where d.objoid = p.oid \
@@ -381,7 +388,8 @@ pub async fn installed(
              left join pg_catalog.pg_trigger t \
                on t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = e.trigger \
               and not t.tgisinternal \
-             order by e.ord",
+             order by e.ord"
+            ),
             &[&schema, &functions, &regclass, &triggers],
         )
         .await?;
@@ -446,15 +454,18 @@ pub async fn installed(
     if !present {
         return Ok(Installed::Absent);
     }
-    if rows.first().and_then(|row| row.get::<_, Option<bool>>(10)) == Some(true) {
-        let missing = nodes_missing_capture(client, schema, table, &functions, &triggers).await?;
-        if !missing.is_empty() {
-            faults.push(format!(
-                "{} of {table}'s partition tree lack(s) the capture triggers: {}",
-                missing.len(),
-                missing.join(", ")
-            ));
-        }
+    // Read by the same statement, so a racing install or uninstall can't
+    // show the root whole and a node bare.
+    let missing = rows
+        .first()
+        .and_then(|row| row.get::<_, Option<Vec<String>>>(10))
+        .unwrap_or_default();
+    if !missing.is_empty() {
+        faults.push(format!(
+            "{} of {table}'s partition tree lack(s) the capture triggers: {}",
+            missing.len(),
+            missing.join(", ")
+        ));
     }
     if faults.is_empty() && specs.windows(2).any(|pair| pair[0] != pair[1]) {
         faults.push(format!(
@@ -492,6 +503,25 @@ pub async fn descendants(
         .collect())
 }
 
+/// The query behind [`nodes_missing_capture`], which [`installed`] also
+/// embeds: `$1` the instance schema, `$2` the root's functions, `$3` the
+/// root's regclass text and `$4` the triggers, in [`CaptureEvent::ALL`] order.
+const NODES_MISSING_CAPTURE: &str = "select n.nspname::text || '.' || c.relname::text \
+     from pg_catalog.pg_partition_tree(pg_catalog.to_regclass($3)) d \
+     join pg_catalog.pg_class c on c.oid = d.relid \
+     join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+     where d.level > 0 and exists ( \
+         select 1 from unnest($2::text[], $4::text[]) as e(function, trigger) \
+         where not exists ( \
+             select 1 from pg_catalog.pg_trigger t \
+             join pg_catalog.pg_proc p on p.oid = t.tgfoid \
+             where t.tgrelid = d.relid and t.tgname = e.trigger \
+               and not t.tgisinternal and t.tgenabled = 'A' \
+               and p.proname = e.function \
+               and p.pronamespace = ( \
+                   select oid from pg_catalog.pg_namespace where nspname = $1))) \
+     order by d.level, 1";
+
 /// The tables under the partitioned root `table` that lack any of the five
 /// capture triggers: missing, not `ENABLE ALWAYS`, or not calling the root's
 /// function for the event. `functions` and `triggers` are the root's names,
@@ -505,21 +535,7 @@ async fn nodes_missing_capture(
 ) -> Result<Vec<String>, CaptureError> {
     Ok(client
         .query(
-            "select n.nspname::text || '.' || c.relname::text \
-             from pg_catalog.pg_partition_tree(pg_catalog.to_regclass($3)) d \
-             join pg_catalog.pg_class c on c.oid = d.relid \
-             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-             where d.level > 0 and exists ( \
-                 select 1 from unnest($2::text[], $4::text[]) as e(function, trigger) \
-                 where not exists ( \
-                     select 1 from pg_catalog.pg_trigger t \
-                     join pg_catalog.pg_proc p on p.oid = t.tgfoid \
-                     where t.tgrelid = d.relid and t.tgname = e.trigger \
-                       and not t.tgisinternal and t.tgenabled = 'A' \
-                       and p.proname = e.function \
-                       and p.pronamespace = ( \
-                           select oid from pg_catalog.pg_namespace where nspname = $1))) \
-             order by d.level, 1",
+            NODES_MISSING_CAPTURE,
             &[
                 &schema,
                 &functions,
@@ -727,7 +743,9 @@ pub async fn narrow(
 
 /// Drops `table`'s capture triggers and functions, in one transaction under
 /// the table's `ACCESS EXCLUSIVE` lock (`DROP TRIGGER`'s), retried as the
-/// module doc describes. A table the application already dropped takes its
+/// module doc describes. A partitioned root's nodes, and any table detached
+/// from its tree that still carries its triggers, lose theirs too (see
+/// "Partitioned tables"). A table the application already dropped takes its
 /// triggers with it, so only the functions go. Lands `false`, having done
 /// nothing, when nothing is installed.
 pub async fn uninstall(
@@ -739,7 +757,12 @@ pub async fn uninstall(
     if installed(&*client, schema, table).await? == Installed::Absent {
         return Ok(Progress::Done(false));
     }
-    let nodes = descendants(&*client, table).await?;
+    let mut nodes = descendants(&*client, table).await?;
+    for bearer in bearers(&*client, schema, table).await? {
+        if !nodes.contains(&bearer) {
+            nodes.push(bearer);
+        }
+    }
     if nodes.len() < SINGLE_TRANSACTION_TABLES {
         return Ok(run(
             client,
@@ -948,7 +971,11 @@ async fn attempt(
         Op::Widen(_) => crate::intake::markers::park_widen_marker(&txn, table).await?,
         Op::Install { .. } | Op::Uninstall { .. } => {}
     }
-    let locks = table_exists || !matches!(op, Op::Uninstall { .. });
+    // A node dropped since the tree was read has nothing to lock or change.
+    let locks = match op.scope() {
+        Scope::Node(_) => table_exists,
+        _ => table_exists || !matches!(op, Op::Uninstall { .. }),
+    };
     if locks {
         // From here on the transaction holds the table, so nothing in it may
         // wait longer than the attempt's timeout.
@@ -966,7 +993,7 @@ async fn attempt(
             if !matches!(scope, Scope::Node(_)) {
                 statements.extend(sql::install_statements(schema, spec)?);
             }
-            for node in nodes_in_scope(&txn, scope, table).await? {
+            for node in nodes_in_scope(&txn, scope, table, table_exists).await? {
                 statements.extend(sql::node_trigger_statements(schema, spec, &node)?);
             }
             statements
@@ -974,10 +1001,18 @@ async fn attempt(
         Op::Widen(spec) => sql::function_statements(schema, spec)?,
         Op::Uninstall { table, scope } => {
             let mut statements = Vec::new();
-            if table_exists {
-                for node in nodes_in_scope(&txn, scope, table).await? {
-                    statements.extend(sql::drop_node_trigger_statements(schema, &node)?);
+            let mut nodes = nodes_in_scope(&txn, scope, table, table_exists).await?;
+            if !matches!(scope, Scope::Node(_)) {
+                // A table that left the tree keeps triggers that call the
+                // root's functions, which can't be dropped while it does.
+                for bearer in bearers(&txn, schema, table).await? {
+                    if !nodes.contains(&bearer) {
+                        nodes.push(bearer);
+                    }
                 }
+            }
+            for node in nodes {
+                statements.extend(sql::drop_node_trigger_statements(schema, &node)?);
             }
             if !matches!(scope, Scope::Node(_)) {
                 statements.extend(sql::uninstall_statements(schema, table, table_exists)?);
@@ -985,10 +1020,8 @@ async fn attempt(
             statements
         }
     };
-    if table_exists || !matches!(op.scope(), Scope::Node(_)) {
-        for statement in statements {
-            txn.batch_execute(&statement).await?;
-        }
+    for statement in statements {
+        txn.batch_execute(&statement).await?;
     }
     if let Some(owner) = owner {
         for statement in sql::owner_statements(schema, table, &owner)? {
@@ -1020,12 +1053,51 @@ async fn nodes_in_scope(
     client: &impl GenericClient,
     scope: Scope<'_>,
     root: &str,
+    exists: bool,
 ) -> Result<Vec<String>, CaptureError> {
     match scope {
         Scope::All => descendants(client, root).await,
         Scope::Root => Ok(Vec::new()),
-        Scope::Node(node) => Ok(vec![node.to_string()]),
+        Scope::Node(node) if exists => Ok(vec![node.to_string()]),
+        Scope::Node(_) => Ok(Vec::new()),
     }
+}
+
+/// Every table other than `root` that carries a capture trigger calling one
+/// of `root`'s functions: its tree's nodes and any table detached from the
+/// tree since its install. An uninstall drops their triggers before the
+/// functions they depend on. Ordered by name.
+async fn bearers(
+    client: &impl GenericClient,
+    schema: &str,
+    root: &str,
+) -> Result<Vec<String>, CaptureError> {
+    let functions = function_names(root)?;
+    let triggers = trigger_names(schema);
+    Ok(client
+        .query(
+            "select distinct n.nspname::text || '.' || c.relname::text \
+             from pg_catalog.pg_trigger t \
+             join pg_catalog.pg_proc p on p.oid = t.tgfoid \
+             join pg_catalog.pg_class c on c.oid = t.tgrelid \
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+             where t.tgname = any($3) and not t.tgisinternal \
+               and p.proname = any($2) \
+               and p.pronamespace = ( \
+                   select oid from pg_catalog.pg_namespace where nspname = $1) \
+               and t.tgrelid is distinct from pg_catalog.to_regclass($4) \
+             order by 1",
+            &[
+                &schema,
+                &functions,
+                &triggers,
+                &crate::defs::ddl::regclass_arg(root),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
 /// A scalar subquery for the oid of the role that owns the ring of the
@@ -1215,12 +1287,26 @@ pub async fn blockers(
     table: &str,
     conflicts: &[&str],
 ) -> Result<Vec<Blocker>, tokio_postgres::Error> {
+    blockers_of(client, table, false, conflicts).await
+}
+
+/// [`blockers`], and with `tree` also those on any table of `table`'s
+/// partition tree, which a `LOCK TABLE` without `ONLY` waits for too: a
+/// writer that names a leaf locks only the leaf.
+async fn blockers_of(
+    client: &impl GenericClient,
+    table: &str,
+    tree: bool,
+    conflicts: &[&str],
+) -> Result<Vec<Blocker>, tokio_postgres::Error> {
     // A prepared transaction's locks have no pid. Its own `transactionid`
     // lock shares their `virtualtransaction` and names the xid that
-    // `pg_prepared_xacts` lists its gid under.
+    // `pg_prepared_xacts` lists its gid under. A session holding several of
+    // the tree's tables is listed once per mode.
     Ok(client
         .query(
-            "select l.pid, p.gid, \
+            "select distinct on (l.pid, p.gid, l.mode, l.granted) \
+                    l.pid, p.gid, \
                     case when l.pid is null then 'prepared transaction' \
                          else coalesce(a.backend_type, 'unknown') end, \
                     l.mode, l.granted, \
@@ -1240,14 +1326,18 @@ pub async fn blockers(
              where l.locktype = 'relation' \
                and l.database = (select oid from pg_catalog.pg_database \
                                  where datname = pg_catalog.current_database()) \
-               and l.relation = pg_catalog.to_regclass($1) \
+               and (l.relation = pg_catalog.to_regclass($1) \
+                    or ($4 and l.relation in ( \
+                        select relid from pg_catalog.pg_partition_tree( \
+                            pg_catalog.to_regclass($1))))) \
                and l.pid is distinct from pg_catalog.pg_backend_pid() \
                and l.mode = any($2) \
-             order by l.pid, p.gid, l.mode",
+             order by l.pid, p.gid, l.mode, l.granted",
             &[
                 &crate::defs::ddl::regclass_arg(table),
                 &conflicts,
                 &BLOCKER_QUERY_CHARS,
+                &tree,
             ],
         )
         .await?
@@ -1276,7 +1366,8 @@ async fn lock_wait(
         .query_one("select pg_catalog.clock_timestamp()", &[])
         .await?
         .get(0);
-    let blockers = blockers(client, op.locked(), conflicts).await?;
+    let tree = matches!(op.scope(), Scope::All);
+    let blockers = blockers_of(client, op.locked(), tree, conflicts).await?;
     Ok(LockWait {
         table: op.table().to_string(),
         operation: op.operation(),
