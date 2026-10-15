@@ -54,7 +54,7 @@
 
 use std::time::Duration;
 
-use tokio_postgres::types::PgLsn;
+use tokio_postgres::types::{PgLsn, Type};
 
 use crate::defs::model::TransformStatus;
 use crate::pool::Pool;
@@ -594,7 +594,7 @@ async fn claim(
     let client = pool.get().await?;
     let ttl_secs = options.reclaim_ttl.as_secs_f64();
     let row = client
-        .query_opt(
+        .query_typed_opt(
             "with claimed as ( \
                  update self_check_jobs set state = 'running', claimed_by = $1, claimed_at = now() \
                  where id = ( \
@@ -609,7 +609,11 @@ async fn claim(
              select c.id, split_part(d.target_table, '.', 2), c.mode, c.await_timeout_ms, \
                     c.after_key, c.rows_compared, c.divergences::text \
              from claimed c join transform_definitions d on d.id = c.definition_id",
-            &[&claimed_by, &ttl_secs, &millis(options.compare_budget)],
+            &[
+                (&claimed_by, Type::TEXT),
+                (&ttl_secs, Type::FLOAT8),
+                (&millis(options.compare_budget), Type::INT8),
+            ],
         )
         .await?;
     Ok(row.map(|row| {

@@ -69,7 +69,7 @@ pub async fn segment_state_counts(
     client: &Client,
 ) -> Result<[(SegmentState, i64); 4], StagingError> {
     let rows = client
-        .query("select state, count(*) from segments group by state", &[])
+        .query_typed("select state, count(*) from segments group by state", &[])
         .await?;
     let mut counts = [
         (SegmentState::Active, 0i64),

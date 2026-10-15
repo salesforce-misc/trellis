@@ -12613,7 +12613,7 @@ pub async fn next_claimable_segments(
     drain_batch_cap: usize,
 ) -> Result<Vec<i64>, ApplyError> {
     let rows = client
-        .query(
+        .query_typed(
             "select seg_seq, has_truncate, row_count from segments \
              where state in ('sealed', 'draining') \
                and fence_snapshot is not null \

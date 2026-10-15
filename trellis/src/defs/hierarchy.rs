@@ -47,6 +47,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use crate::defs::ddl::regclass_arg;
 
@@ -125,7 +126,7 @@ pub async fn hierarchy(
     table: &str,
 ) -> Result<Vec<Hierarchy>, tokio_postgres::Error> {
     let rows = client
-        .query(
+        .query_typed(
             "with t as (select pg_catalog.to_regclass($1) as oid) \
              select 0, ''::text from pg_catalog.pg_class c, t \
              where c.oid = t.oid and c.relkind = 'p' \
@@ -144,7 +145,7 @@ pub async fn hierarchy(
              join pg_catalog.pg_namespace cn on cn.oid = c.relnamespace, t \
              where h.inhparent = t.oid and not c.relispartition \
              order by 1, 2",
-            &[&regclass_arg(table)],
+            &[(&regclass_arg(table), Type::TEXT)],
         )
         .await?;
     Ok(rows

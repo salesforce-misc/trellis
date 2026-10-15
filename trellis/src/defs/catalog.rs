@@ -101,6 +101,7 @@ use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident, quote_literal};
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use super::ast::{
     AlterClause, AlterTransform, Expr, FieldDef, GroupByKey, KeySpace, RelationshipDef,
@@ -4477,7 +4478,7 @@ pub(crate) async fn capture_readers(
     CatalogError,
 > {
     let definitions = client
-        .query(
+        .query_typed(
             "select d.id, d.source_table, d.definition_text, \
                     exists (select 1 from capture_failures f where f.transform_id = d.id), \
                     d.target_table, d.grammar_version \
@@ -4493,7 +4494,7 @@ pub(crate) async fn capture_readers(
         })
         .collect::<Result<Vec<_>, CatalogError>>()?;
     let relationships = client
-        .query(
+        .query_typed(
             &format!(
                 "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions order by id"
             ),
@@ -8168,7 +8169,7 @@ pub async fn transforms_for_source(
 pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let client = pool.get().await?;
     let rows = client
-        .query(
+        .query_typed(
             &format!(
                 "{} select table_name from reachable",
                 reachable_tables_cte("true")
@@ -8330,12 +8331,12 @@ async fn own_targets(
     tables: &[String],
 ) -> Result<std::collections::HashSet<String>, CatalogError> {
     let rows = client
-        .query(
+        .query_typed(
             "select r.table_name from unnest($1::text[]) as r(table_name) \
              where exists ( \
                  select 1 from transform_definitions d where d.target_table = r.table_name \
              )",
-            &[&tables],
+            &[(&tables, Type::TEXT_ARRAY)],
         )
         .await?;
     Ok(rows.into_iter().map(|r| r.get(0)).collect())

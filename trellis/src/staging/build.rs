@@ -283,6 +283,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use tokio_postgres::types::Type;
 use tokio_postgres::{GenericClient, IsolationLevel, Transaction};
 
 use crate::defs::ast::{TransformDef, ValueType};
@@ -2314,13 +2315,16 @@ pub async fn chunk_allowed(
         .unwrap_or(i64::MAX / 2)
         .saturating_mul(2);
     Ok(client
-        .query_one(
+        .query_typed_one(
             "select coalesce((select sum(row_count)::bigint from segments \
                      where state in ('sealed', 'draining') \
                        and drained_mask <> ((1::bigint << bucket_count) - 1)), 0) < $1 \
                  and not exists (select 1 from segments \
                      where ring_slot = ((select ring_slot from segment_pointer) + 1) % $2)",
-            &[&bound, &i32::from(super::append::RING_SIZE)],
+            &[
+                (&bound, Type::INT8),
+                (&i32::from(super::append::RING_SIZE), Type::INT4),
+            ],
         )
         .await?
         .get(0))
@@ -3485,7 +3489,7 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
 /// test. A dropped target reads as not done.
 async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQueueError> {
     let Some(row) = client
-        .query_opt(
+        .query_typed_opt(
             &format!(
                 "select d.target_table, not exists ( \
                      select 1 from backfill_chunks bc \
@@ -3497,7 +3501,11 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
                 chunk_queue::STALE,
                 deltas_exist_sql("d.target_table"),
             ),
-            &[&id, &TransformStatus::Backfilling.as_str(), &BUILD_REDERIVE],
+            &[
+                (&id, Type::INT8),
+                (&TransformStatus::Backfilling.as_str(), Type::TEXT),
+                (&BUILD_REDERIVE, Type::TEXT),
+            ],
         )
         .await?
     else {

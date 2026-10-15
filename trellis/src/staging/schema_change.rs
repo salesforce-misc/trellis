@@ -37,7 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 use tokio_postgres::Client;
 
@@ -502,13 +502,13 @@ pub(crate) async fn pause_readers_of_retyped(
     // Each recorded type, with its `format_type` rendering for the reason.
     let mut recorded: BTreeMap<(i64, String), (key_types::ColumnType, String)> = BTreeMap::new();
     for row in client
-        .query(
+        .query_typed(
             "select transform_id, column_name, type_name, typmod, \
                     coalesce(pg_catalog.format_type(pg_catalog.to_regtype(type_name), typmod), \
                              type_name) \
              from definition_key_types \
              where transform_id = any($1) and table_name = $2",
-            &[&readers, &table],
+            &[(&readers, Type::INT8_ARRAY), (&table, Type::TEXT)],
         )
         .await?
     {

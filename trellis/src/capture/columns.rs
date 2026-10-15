@@ -51,6 +51,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use crate::defs::ast::{GroupByKey, KeySpace, TransformDef};
 use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
@@ -253,14 +254,14 @@ pub async fn load_catalog(
     ];
     let mut projection_columns: HashMap<i64, Vec<String>> = HashMap::new();
     for row in client
-        .query(
+        .query_typed(
             "select rp.relationship_id, a.attname::text \
              from relationship_projections rp \
              join pg_catalog.pg_attribute a \
                on a.attrelid = pg_catalog.to_regclass(pg_catalog.format('%I.%I', $1::text, rp.projection_table)) \
              where a.attnum > 0 and not a.attisdropped and a.attname::text <> all($2::text[]) \
              order by rp.relationship_id, a.attnum",
-            &[&schema, &bookkeeping.as_slice()],
+            &[(&schema, Type::TEXT), (&bookkeeping.as_slice(), Type::TEXT_ARRAY)],
         )
         .await?
     {
@@ -286,7 +287,7 @@ pub(crate) async fn live_columns(
     table: &str,
 ) -> Result<(HashMap<String, i16>, Vec<String>), CaptureError> {
     let rows = client
-        .query(
+        .query_typed(
             "select a.attname::text, a.attnum, \
                     pg_catalog.array_position(i.indkey, a.attnum) \
              from pg_catalog.pg_attribute a \
@@ -295,7 +296,7 @@ pub(crate) async fn live_columns(
               and a.attnum = any(i.indkey) \
              where a.attrelid = pg_catalog.to_regclass($1) \
                and a.attnum > 0 and not a.attisdropped",
-            &[&crate::defs::ddl::regclass_arg(table)],
+            &[(&crate::defs::ddl::regclass_arg(table), Type::TEXT)],
         )
         .await?;
     let mut attnums: HashMap<String, i16> = HashMap::with_capacity(rows.len());
@@ -327,9 +328,9 @@ pub async fn capture_spec(
 ) -> Result<CaptureSpec, CaptureError> {
     let regclass = crate::defs::ddl::regclass_arg(table);
     let exists: bool = client
-        .query_one(
+        .query_typed_one(
             "select pg_catalog.to_regclass($1) is not null",
-            &[&regclass],
+            &[(&regclass, Type::TEXT)],
         )
         .await?
         .get(0);

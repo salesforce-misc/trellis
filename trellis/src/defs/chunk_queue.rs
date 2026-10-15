@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
@@ -594,7 +595,7 @@ pub async fn claim_chunks_of(
     // (issue #231) — see [`TransformStatus::dispatchable`].
     let dispatchable = TransformStatus::dispatchable();
     let rows = client
-        .query(
+        .query_typed(
             // The `exists` gate is issue #142 / ADR-0014's: the pause is what
             // quiesces in-flight work, and a *backfilling* definition's
             // in-flight work lives here rather than in the claim-time fold.
@@ -651,7 +652,12 @@ pub async fn claim_chunks_of(
                        c.key_collations",
                 dispatchable_gate = dispatchable_gate_sql("$3"),
             ),
-            &[&claimed_by, &limit, &dispatchable, &kinds],
+            &[
+                (&claimed_by, Type::TEXT),
+                (&limit, Type::INT8),
+                (&dispatchable, Type::TEXT_ARRAY),
+                (&kinds, Type::TEXT_ARRAY),
+            ],
         )
         .await?;
     rows.into_iter()

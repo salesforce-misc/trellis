@@ -40,6 +40,7 @@
 use std::time::Duration;
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use super::error::StagingError;
 
@@ -110,7 +111,8 @@ const RECLAIM_STALE_WORKERS_SQL: &str = "\
         where last_seen < now() - (interval '1 second' * $1) \
         for update skip locked \
     ) \
-    delete from worker_registry where worker_id in (select worker_id from dead)";
+    delete from worker_registry where worker_id in (select worker_id from dead) \
+    returning 1";
 
 /// Runs `RECLAIM_STALE_WORKERS_SQL`: sweeps every worker row whose
 /// `last_seen` is older than `ttl`, returning how many it removed. Purely
@@ -130,7 +132,7 @@ pub async fn reclaim_stale_workers(
 ) -> Result<u64, StagingError> {
     let ttl_secs = ttl.as_secs_f64();
     let n = client
-        .execute(RECLAIM_STALE_WORKERS_SQL, &[&ttl_secs])
+        .query_typed(RECLAIM_STALE_WORKERS_SQL, &[(&ttl_secs, Type::FLOAT8)])
         .await?;
-    Ok(n)
+    Ok(n.len() as u64)
 }

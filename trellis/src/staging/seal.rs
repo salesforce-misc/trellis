@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::append::{self, RING_SIZE, ring_table_name};
@@ -66,9 +66,26 @@ pub struct SealOutcome {
 /// [`seal_phase2`] depends on.
 async fn active_pointer(client: &impl GenericClient) -> Result<(i64, i16), StagingError> {
     let row = client
-        .query_one("select active_seq, ring_slot from segment_pointer", &[])
+        .query_typed_one("select active_seq, ring_slot from segment_pointer", &[])
         .await?;
     Ok((row.get(0), row.get(1)))
+}
+
+/// [`active_pointer`] and whether the active ring slot holds a row, as one
+/// statement: this is what the staging worker asks every tick, and two
+/// autocommit statements cost two transactions on an idle database (#273).
+/// The `case` evaluates only the active slot's `exists`.
+async fn active_pointer_and_nonempty(
+    client: &impl GenericClient,
+) -> Result<(i64, bool), StagingError> {
+    let mut sql = String::from("select active_seq, case ring_slot");
+    for slot in 0..RING_SIZE {
+        let table = ring_table_name(slot)?;
+        sql.push_str(&format!(" when {slot} then exists (select 1 from {table})"));
+    }
+    sql.push_str(" end from segment_pointer");
+    let row = client.query_typed_one(&sql, &[]).await?;
+    Ok((row.get(0), row.get::<_, Option<bool>>(1).unwrap_or(false)))
 }
 
 /// The seal gate (docs/staging-and-claiming/03-sealing-and-the-fence.md):
@@ -394,12 +411,12 @@ async fn predecessor_has_unfenced_row(
     };
     let table = ring_table_name(ring_slot)?;
     let exists: bool = client
-        .query_one(
+        .query_typed_one(
             &format!(
                 "select exists (select 1 from {table} \
                  where not pg_visible_in_snapshot(row_txid, $1::text::pg_snapshot))"
             ),
-            &[&fence],
+            &[(&fence, Type::TEXT)],
         )
         .await?
         .get(0);
@@ -449,12 +466,7 @@ pub async fn seal_if_active_nonempty(
     client: &mut Client,
     wake_channel: &str,
 ) -> Result<Option<SealOutcome>, StagingError> {
-    let (active_seq, ring_slot) = active_pointer(client).await?;
-    let table = ring_table_name(ring_slot)?;
-    let nonempty: bool = client
-        .query_one(&format!("select exists (select 1 from {table})"), &[])
-        .await?
-        .get(0);
+    let (active_seq, nonempty) = active_pointer_and_nonempty(client).await?;
     if !nonempty && !predecessor_has_unfenced_row(client, active_seq - 1).await? {
         return Ok(None);
     }
@@ -525,11 +537,11 @@ pub async fn recover_stuck_seals(
 ) -> Result<Vec<i64>, StagingError> {
     let age_gate_secs = config.age_gate.as_secs_f64();
     let stuck: Vec<(i64, i16)> = client
-        .query(
+        .query_typed(
             "select seg_seq, ring_slot from segments \
              where state = 'sealed' and seal_step1 is not null and fence_snapshot is null \
                and sealed_at < now() - (interval '1 second' * $1)",
-            &[&age_gate_secs],
+            &[(&age_gate_secs, Type::FLOAT8)],
         )
         .await?
         .into_iter()

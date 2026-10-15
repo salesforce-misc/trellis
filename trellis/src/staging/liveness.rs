@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient};
 
 use super::error::StagingError;
@@ -115,7 +116,7 @@ const RECLAIM_STALE_SQL: &str = "\
         where claimed_at < now() - (interval '1 second' * $1) \
         for update skip locked \
     ) \
-    delete from seg_claims where ctid in (select ctid from dead)";
+    delete from seg_claims where ctid in (select ctid from dead) returning 1";
 
 /// The fleet's default reclaim TTL: how long a claim (or, since issue #144,
 /// a [`super::worker_registry`] row) may go unrefreshed before it's treated
@@ -135,8 +136,10 @@ pub async fn reclaim_stale(
     ttl: Duration,
 ) -> Result<u64, StagingError> {
     let ttl_secs = ttl.as_secs_f64();
-    let n = client.execute(RECLAIM_STALE_SQL, &[&ttl_secs]).await?;
-    Ok(n)
+    let reclaimed = client
+        .query_typed(RECLAIM_STALE_SQL, &[(&ttl_secs, Type::FLOAT8)])
+        .await?;
+    Ok(reclaimed.len() as u64)
 }
 
 // ---------------------------------------------------------------------

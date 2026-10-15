@@ -120,6 +120,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use crate::capture::install::RING_OWNER;
 use crate::defs::ddl::regclass_arg;
@@ -238,7 +239,7 @@ pub async fn applying(
     readers: Readers,
 ) -> Result<Option<RowSecurity>, tokio_postgres::Error> {
     let row = client
-        .query_opt(
+        .query_typed_opt(
             &format!(
                 "select r.rolname::text, \
                         pg_catalog.pg_has_role(r.oid, c.relowner, 'USAGE') \
@@ -254,10 +255,13 @@ pub async fn applying(
                  limit 1"
             ),
             &[
-                &schema,
-                &regclass_arg(table),
-                &(readers != Readers::Ring),
-                &matches!(readers, Readers::Ring | Readers::RingAndSession),
+                (&schema, Type::TEXT),
+                (&regclass_arg(table), Type::TEXT),
+                (&(readers != Readers::Ring), Type::BOOL),
+                (
+                    &matches!(readers, Readers::Ring | Readers::RingAndSession),
+                    Type::BOOL,
+                ),
             ],
         )
         .await?;

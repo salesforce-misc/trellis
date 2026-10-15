@@ -61,6 +61,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use crate::defs::ddl::regclass_arg;
 
@@ -110,14 +111,14 @@ pub async fn subscribed(
     table: &str,
 ) -> Result<Option<Subscribed>, tokio_postgres::Error> {
     let row = client
-        .query_opt(
+        .query_typed_opt(
             "select s.subname::text, s.subenabled \
              from pg_catalog.pg_subscription_rel r \
              join pg_catalog.pg_subscription s on s.oid = r.srsubid \
              where r.srrelid = pg_catalog.to_regclass($1) \
              order by s.subenabled desc, s.subname \
              limit 1",
-            &[&regclass_arg(table)],
+            &[(&regclass_arg(table), Type::TEXT)],
         )
         .await?;
     Ok(row.map(|row| Subscribed {

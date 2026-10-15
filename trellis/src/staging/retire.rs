@@ -24,6 +24,7 @@
 //! still arrive, and the drained prefix says when none can.
 
 use tokio_postgres::Client;
+use tokio_postgres::types::Type;
 
 use super::append::ring_table_name;
 use super::error::StagingError;
@@ -76,7 +77,7 @@ const RETIRE_CANDIDATES_SQL: &str = "\
 /// below on why the delete must be the thing that decides.
 pub async fn retire_drained_segments(client: &mut Client) -> Result<Vec<i64>, StagingError> {
     let candidates: Vec<(i64, i16)> = client
-        .query(RETIRE_CANDIDATES_SQL, &[])
+        .query_typed(RETIRE_CANDIDATES_SQL, &[])
         .await?
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
@@ -244,7 +245,7 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// lock with a transient error, and the page retries
 /// (`ledger::lock_entries` and `one_to_one_ledger::lock_entries`, #712).
 pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError> {
-    let row = client.query_one(DRAINED_PREFIX_SQL, &[]).await?;
+    let row = client.query_typed_one(DRAINED_PREFIX_SQL, &[]).await?;
     let prefix: Option<i64> = row.get(0);
     #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_variables))]
     let highest_drained: Option<i64> = row.get(1);
@@ -264,7 +265,7 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
     };
 
     let ledgers: Vec<(String, i64)> = client
-        .query(LEDGER_TABLES_SQL, &[&crate::defs::ledger::LEDGER_SUFFIX])
+        .query_typed(LEDGER_TABLES_SQL, &[(&crate::defs::ledger::LEDGER_SUFFIX, Type::TEXT)])
         .await?
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))

@@ -60,6 +60,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use super::ast::{GroupByKey, KeySpace, TransformDef};
 
@@ -447,7 +448,7 @@ pub(crate) async fn live_columns(
     table: &str,
 ) -> Result<(HashMap<String, LiveColumn>, Vec<String>), tokio_postgres::Error> {
     let rows = client
-        .query(
+        .query_typed(
             "select a.attname::text, n.nspname::text || '.' || t.typname::text, a.atttypmod, \
                     pg_catalog.format_type(a.atttypid, a.atttypmod), a.atttypid, \
                     t.typtype = 'e', \
@@ -459,7 +460,7 @@ pub(crate) async fn live_columns(
              left join pg_catalog.pg_collation c on c.oid = a.attcollation \
              where a.attrelid = pg_catalog.to_regclass($1) \
                and a.attnum > 0 and not a.attisdropped",
-            &[&super::ddl::regclass_arg(table)],
+            &[(&super::ddl::regclass_arg(table), Type::TEXT)],
         )
         .await?;
     let columns: HashMap<String, LiveColumn> = rows

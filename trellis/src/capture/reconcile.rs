@@ -104,6 +104,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient};
 
 use super::CaptureError;
@@ -152,7 +153,7 @@ pub async fn reconcile(
     let snapshot = read_snapshot(client, schema).await?;
     let installed = installed_tables(&*client, schema).await?;
     let database: String = client
-        .query_one("select pg_catalog.current_database()::text", &[])
+        .query_typed_one("select pg_catalog.current_database()::text", &[])
         .await?
         .get(0);
     let instance = instance_key(&database, schema);
@@ -382,9 +383,9 @@ pub async fn reconcile(
         .chain(outcome.failed.iter().map(|(table, _)| table.as_str()))
         .collect();
     client
-        .execute(
+        .query_typed(
             "delete from capture_holdups where table_name <> all($1)",
-            &[&held],
+            &[(&held, Type::TEXT_ARRAY)],
         )
         .await?;
 
@@ -420,7 +421,7 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
         )
         .await?;
     let targets = txn
-        .query("select target_table from transform_definitions", &[])
+        .query_typed("select target_table from transform_definitions", &[])
         .await?
         .into_iter()
         .map(|row| row.get(0))
@@ -496,7 +497,7 @@ fn ready_definitions(
 /// Every table with a marker an install or widen parked, still pending.
 async fn gated_marker_tables(client: &impl GenericClient) -> Result<HashSet<String>, CaptureError> {
     Ok(client
-        .query(
+        .query_typed(
             "select table_name from pending_backfill where capture_gate_lsn is not null",
             &[],
         )
@@ -523,7 +524,7 @@ pub async fn installed_tables(
         .map(|event| trigger_name(schema, *event))
         .collect();
     Ok(client
-        .query(
+        .query_typed(
             "with recorded as ( \
                  select c.j ->> 'table' as name from ( \
                      select d.description::jsonb as j \
@@ -553,7 +554,7 @@ pub async fn installed_tables(
                    join pg_catalog.pg_class k on k.oid = a.relid \
                    join pg_catalog.pg_namespace kn on kn.oid = k.relnamespace \
                    where x.name = kn.nspname::text || '.' || k.relname::text))",
-            &[&schema, &triggers],
+            &[(&schema, Type::TEXT), (&triggers, Type::TEXT_ARRAY)],
         )
         .await?
         .into_iter()

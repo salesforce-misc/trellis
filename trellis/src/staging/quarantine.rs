@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::SystemTime;
 
-use tokio_postgres::types::PgLsn;
+use tokio_postgres::types::{PgLsn, Type};
 use tokio_postgres::{GenericClient, Transaction};
 
 use crate::defs::ast::{KeySpace, TransformDef};
@@ -3102,11 +3102,11 @@ async fn walk_marked_pauses(
     let pending: Vec<(String, String, String)> = pool
         .get()
         .await?
-        .query(
+        .query_typed(
             "select transform_table, column_name, xmin::text from column_status \
              where cascade_pending and ($1::text is null or transform_table = $1) \
              order by transform_table, column_name",
-            &[&transform],
+            &[(&transform, Type::TEXT)],
         )
         .await?
         .into_iter()
@@ -4480,7 +4480,7 @@ pub(crate) async fn resume_caused_definitions(
     schema: &str,
 ) -> Result<(), tokio_postgres::Error> {
     let candidates: Vec<(i64, i64)> = client
-        .query(&caused_candidates_sql(), &[&TransformStatus::Live.as_str()])
+        .query_typed(&caused_candidates_sql(), &[(&TransformStatus::Live.as_str(), Type::TEXT)])
         .await?
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
@@ -4640,7 +4640,7 @@ pub(crate) async fn finish_requested_resumes(
     schema: &str,
 ) -> Result<(), tokio_postgres::Error> {
     let ids: Vec<i64> = client
-        .query(
+        .query_typed(
             "select transform_id from resume_requests order by transform_id",
             &[],
         )
@@ -5386,14 +5386,14 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
     let requests = {
         let client = pool.get().await?;
         client
-            .execute(
+            .query_typed(
                 "delete from retype_releases r where not exists \
                  (select 1 from transform_definitions d where d.id = r.transform_id)",
                 &[],
             )
             .await?;
         client
-            .query(
+            .query_typed(
                 "select r.transform_id, r.sqlstate, r.requested_at, \
                         split_part(d.target_table, '.', 2) \
                  from retype_releases r join transform_definitions d on d.id = r.transform_id \

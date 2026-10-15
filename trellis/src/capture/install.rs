@@ -271,7 +271,7 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio_postgres::types::PgLsn;
+use tokio_postgres::types::{PgLsn, Type};
 use tokio_postgres::{Client, GenericClient};
 
 use super::CaptureError;
@@ -367,7 +367,7 @@ pub async fn installed(
     // A comment this generator didn't write reads as no spec, rather than
     // failing the cast.
     let rows = client
-        .query(
+        .query_typed(
             &format!(
                 "select p.oid is not null, p.prosrc, \
                     c.j ->> 'table', c.j ->> 'event', \
@@ -401,7 +401,12 @@ pub async fn installed(
               and not t.tgisinternal \
              order by e.ord"
             ),
-            &[&schema, &functions, &regclass, &triggers],
+            &[
+                (&schema, Type::TEXT),
+                (&functions, Type::TEXT_ARRAY),
+                (&regclass, Type::TEXT),
+                (&triggers, Type::TEXT_ARRAY),
+            ],
         )
         .await?;
     let partitioned: bool = rows.first().is_some_and(|row| row.get(11));

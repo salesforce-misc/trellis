@@ -62,6 +62,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -528,7 +529,7 @@ pub(crate) async fn identity_key_columns(
     table: &str,
 ) -> Result<Vec<PrimaryKeyColumn>, tokio_postgres::Error> {
     let rows = client
-        .query(
+        .query_typed(
             "with chosen_index as (
                  select i.indexrelid
                  from pg_index i
@@ -573,7 +574,7 @@ pub(crate) async fn identity_key_columns(
                on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
              where i.indrelid = pg_catalog.to_regclass($1)
              order by array_position(i.indkey, a.attnum)",
-            &[&regclass_arg(table)],
+            &[(&regclass_arg(table), Type::TEXT)],
         )
         .await?;
     Ok(rows

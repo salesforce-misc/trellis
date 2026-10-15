@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use tokio_postgres::types::Type;
 use tokio_postgres::{GenericClient, Transaction};
 
 use super::error::StagingError;
@@ -95,17 +96,18 @@ pub async fn reclaim_stale_drainers(
 ) -> Result<u64, StagingError> {
     let older_than_secs = older_than.as_secs_f64();
     let n = client
-        .execute(
+        .query_typed(
             "with dead as ( \
                  select drainer_id from drainers \
                  where last_seen < now() - (interval '1 second' * $1) \
                  for update skip locked \
              ) \
-             delete from drainers where drainer_id in (select drainer_id from dead)",
-            &[&older_than_secs],
+             delete from drainers where drainer_id in (select drainer_id from dead) \
+             returning 1",
+            &[(&older_than_secs, Type::FLOAT8)],
         )
         .await?;
-    Ok(n)
+    Ok(n.len() as u64)
 }
 
 /// Counts drainers seen within `window` of now — the share denominator

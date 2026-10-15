@@ -71,6 +71,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
 
 use tokio_postgres::GenericClient;
+use tokio_postgres::types::Type;
 
 use crate::capture::columns::{CaptureCatalog, CaptureReader};
 use crate::defs::copies;
@@ -95,7 +96,7 @@ impl Fingerprints {
         catalog: &CaptureCatalog,
     ) -> Result<Fingerprints, tokio_postgres::Error> {
         let projections: HashMap<i64, String> = client
-            .query(
+            .query_typed(
                 "select relationship_id, projection_table from relationship_projections",
                 &[],
             )
@@ -112,7 +113,7 @@ impl Fingerprints {
             HashMap::new()
         } else {
             client
-                .query(FINGERPRINT_SQL, &[&names])
+                .query_typed(FINGERPRINT_SQL, &[(&names, Type::TEXT_ARRAY)])
                 .await?
                 .into_iter()
                 .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))

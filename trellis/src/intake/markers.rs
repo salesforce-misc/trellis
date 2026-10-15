@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use tokio_postgres::types::PgLsn;
+use tokio_postgres::types::{PgLsn, Type};
 use tokio_postgres::{GenericClient, Transaction};
 
 use super::error::IntakeError;
@@ -109,14 +109,17 @@ pub async fn park_ready_registration_markers(
     ready: &[i64],
 ) -> Result<(), IntakeError> {
     let tables: Vec<String> = client
-        .query(
+        .query_typed(
             "select distinct d.source_table from transform_definitions d \
              where d.id = any($2) and d.status = $1 \
                and not exists ( \
                    select 1 from pending_backfill pb where pb.table_name = d.source_table \
                ) \
              order by 1",
-            &[&TransformStatus::WaitingToBackfill.as_str(), &ready],
+            &[
+                (&TransformStatus::WaitingToBackfill.as_str(), Type::TEXT),
+                (&ready, Type::INT8_ARRAY),
+            ],
         )
         .await?
         .into_iter()
@@ -462,7 +465,7 @@ pub(crate) async fn park_marker(
 /// waiting passes back to back (`client::early_pass_allowed`).
 pub(crate) async fn discharge_wanted(client: &impl GenericClient) -> Result<bool, IntakeError> {
     Ok(client
-        .query_one(
+        .query_typed_one(
             "select exists (select 1 from pending_backfill \
              where fence_xid is null and coalesce(next_attempt_at <= now(), true))",
             &[],
@@ -591,7 +594,7 @@ async fn fetch_pending_backfills(
     client: &impl GenericClient,
 ) -> Result<Vec<PendingBackfill>, IntakeError> {
     let rows = client
-        .query(
+        .query_typed(
             "select table_name, fence_xid::text::bigint, generation, attempts, \
                     coalesce(next_attempt_at <= now(), true), refresh_projections, \
                     capture_gate_lsn \
