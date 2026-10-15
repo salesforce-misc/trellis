@@ -791,8 +791,8 @@ impl Trellis {
                     ),
                     &[
                         &target_table,
-                        &self.held_key_retry.map(|r| r.initial_backoff.as_secs_f64()),
-                        &self.held_key_retry.map(|r| r.max_backoff.as_secs_f64()),
+                        &self.held_key_retry.map(|r| r.sql_backoffs().0),
+                        &self.held_key_retry.map(|r| r.sql_backoffs().1),
                     ],
                 )
                 .await?;
@@ -1294,7 +1294,7 @@ impl Trellis {
                         next_retry_at: self
                             .held_key_retry
                             .zip(poisoned_at)
-                            .map(|(retry, at)| at + retry.backoff(retry_attempts)),
+                            .and_then(|(retry, at)| at.checked_add(retry.backoff(retry_attempts))),
                     }
                 })
                 .collect())

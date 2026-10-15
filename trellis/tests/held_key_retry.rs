@@ -331,3 +331,98 @@ async fn the_option_is_off_by_default_and_status_reports_the_schedule_when_on() 
         Some(poisoned_at + POLICY.initial_backoff)
     );
 }
+
+#[tokio::test]
+async fn a_key_poisoned_again_since_the_pass_read_it_is_not_retried_ahead_of_its_backoff() {
+    let mut d = start().await;
+    hold_key_1(&mut d).await;
+    let (first_at, _) = poison_row(&d).await;
+
+    // An operator releases the key and it fails back in: a later
+    // `poisoned_at`, so a pass that read the first one (another staging
+    // worker's, say) must leave it held.
+    quarantine::release_key(d.pool(), "doubles", NUMS, "1")
+        .await
+        .expect("operator release");
+    let batch = d.seal().await;
+    drain_through_evictions(&d, batch).await;
+    let (again_at, _) = poison_row(&d).await;
+    assert!(again_at > first_at);
+
+    let stale = quarantine::retry_held_key(d.pool(), "doubles", NUMS, "1", first_at).await;
+    assert!(
+        matches!(stale, Err(trellis::staging::ApplyError::KeyNotHeld { .. })),
+        "{stale:?}"
+    );
+    assert_eq!(poison_row(&d).await, (again_at, 0), "still held, untouched");
+    assert_eq!(
+        d.rows("select count(*) from key_deaths where retry_attempts > 0")
+            .await,
+        vec!["(0)"]
+    );
+
+    quarantine::retry_held_key(d.pool(), "doubles", NUMS, "1", again_at)
+        .await
+        .expect("the current poisoning is retried");
+    assert_eq!(held(&d).await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_paused_definitions_keys_stay_held() {
+    let mut d = start().await;
+    hold_key_1(&mut d).await;
+    let (poisoned_at, _) = poison_row(&d).await;
+    d.ctl
+        .batch_execute(
+            "update transform_definitions set status = 'paused' \
+             where split_part(target_table, '.', 2) = 'doubles'",
+        )
+        .await
+        .expect("pause");
+
+    let pass = retry_at(&d, poisoned_at + POLICY.max_backoff).await;
+    assert_eq!(pass.released, 0);
+    assert_eq!(held(&d).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_cap_past_what_a_timestamp_holds_does_not_overflow() {
+    let policy = HeldKeyRetry {
+        initial_backoff: Duration::MAX,
+        max_backoff: Duration::MAX,
+        batch: 100,
+    };
+    assert!(
+        SystemTime::now()
+            .checked_add(policy.backoff(u32::MAX))
+            .is_some()
+    );
+
+    let mut d = start().await;
+    hold_key_1(&mut d).await;
+    let pass = quarantine::retry_held_keys(d.pool(), &policy, CAP, None)
+        .await
+        .expect("the due time stays in range");
+    assert_eq!(pass.released, 0);
+
+    let config = Config::with_schema(d.db.dsn().to_string(), DEFAULT_SCHEMA).expect("config");
+    let on = Trellis::connect(
+        config,
+        TrellisOptions {
+            held_key_retry: Some(policy),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+    let held_keys = on
+        .status("doubles")
+        .await
+        .expect("status")
+        .unwrap()
+        .held_keys
+        .expect("held");
+    assert!(held_keys.next_retry_at.is_some());
+    let sample = on.sample_quarantined("doubles", None, 10).await.unwrap();
+    assert!(sample[0].next_retry_at.is_some());
+}

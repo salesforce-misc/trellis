@@ -5229,23 +5229,41 @@ pub async fn release_key(
     src_table: &str,
     key: &str,
 ) -> Result<usize, ApplyError> {
-    release_key_as(pool, transform, src_table, key, false).await
+    release_key_as(pool, transform, src_table, key, None).await
 }
 
-/// [`release_key`], or, with `retry`, the release of the automatic retry
-/// ([`retry_held_keys`], #861). A retry carries the key's attempt count
-/// through the release: it writes the key's death counter one below the
-/// death threshold, with the count plus one, so the key is poisoned again on
-/// its first failure ([`still_charged_to_threshold`] and
-/// [`partition_by_threshold`] read the counter, #880), and the new `poison`
-/// row keeps the count ([`evict_key`]) for the longer backoff. An
+/// The automatic retry's release of one held key ([`retry_held_keys`],
+/// #861): [`release_key`], provided the key is still held under the
+/// `poisoned_at` the pass judged it due by. A key poisoned again since
+/// (an operator released it and it failed back in, or another staging
+/// worker's pass retried it first) has a later `poisoned_at` and so a later
+/// due time: it is left held, [`ApplyError::KeyNotHeld`], rather than retried
+/// ahead of its backoff. Read under the definition's row lock, which every
+/// eviction takes before it poisons a key.
+pub async fn retry_held_key(
+    pool: &Pool,
+    transform: &str,
+    src_table: &str,
+    key: &str,
+    poisoned_at: SystemTime,
+) -> Result<usize, ApplyError> {
+    release_key_as(pool, transform, src_table, key, Some(poisoned_at)).await
+}
+
+/// [`release_key`], or, with `retry` (the `poisoned_at` of
+/// [`retry_held_key`]), the release of the automatic retry. A retry carries
+/// the key's attempt count through the release: it writes the key's death
+/// counter one below the death threshold, with the count plus one, so the
+/// key is poisoned again on its first failure ([`still_charged_to_threshold`]
+/// and [`partition_by_threshold`] read the counter, #880), and the new
+/// `poison` row keeps the count ([`evict_key`]) for the longer backoff. An
 /// operator's release deletes the counter, count included.
 async fn release_key_as(
     pool: &Pool,
     transform: &str,
     src_table: &str,
     key: &str,
-    retry: bool,
+    retry: Option<SystemTime>,
 ) -> Result<usize, ApplyError> {
     // Issue #283: quarantine's tables are keyed canonically, but this is an
     // operator entry point that may be handed either spelling of a source.
@@ -5286,6 +5304,26 @@ async fn release_key_as(
             transform: transform.to_string(),
         })?
         .get(0);
+
+    if let Some(poisoned_at) = retry {
+        let still_due = txn
+            .query_opt(
+                "select 1 from poison \
+                 where transform_id = $3 and src_table = any($1::text[]) and key = $2 \
+                   and poisoned_at = $4",
+                &[&names, &key, &transform_id, &poisoned_at],
+            )
+            .await?
+            .is_some();
+        if !still_due {
+            // Dropping `txn` rolls the fence bump back.
+            return Err(ApplyError::KeyNotHeld {
+                transform: transform.to_string(),
+                src_table: src_table.to_string(),
+                key: key.to_string(),
+            });
+        }
+    }
 
     let marked = txn
         .query(
@@ -5354,7 +5392,7 @@ async fn release_key_as(
         &[&names, &key, &transform_id],
     )
     .await?;
-    if retry {
+    if retry.is_some() {
         let attempts = marked
             .iter()
             .map(|row| row.get::<_, i32>(1))
@@ -5559,22 +5597,46 @@ impl Default for HeldKeyRetry {
     }
 }
 
+/// The longest backoff a [`HeldKeyRetry`] applies, whatever its
+/// `max_backoff`: 100 years, which a `SystemTime` and a Postgres `interval`
+/// both hold, so a policy that means "practically never" (a
+/// `Duration::MAX` cap) can't overflow the due time.
+const BACKOFF_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 impl HeldKeyRetry {
     /// How long a key that has been retried `attempts` times is held before
     /// its next retry: `initial_backoff * 2^attempts`, capped at
     /// `max_backoff`.
     pub fn backoff(&self, attempts: u32) -> std::time::Duration {
+        let cap = self.cap();
         let factor = 1u32.checked_shl(attempts).unwrap_or(u32::MAX);
         self.initial_backoff
             .checked_mul(factor)
-            .unwrap_or(self.max_backoff)
-            .min(self.max_backoff)
+            .unwrap_or(cap)
+            .min(cap)
+    }
+
+    /// `max_backoff`, at most [`BACKOFF_CEILING`].
+    fn cap(&self) -> std::time::Duration {
+        self.max_backoff.min(BACKOFF_CEILING)
+    }
+
+    /// The initial backoff and the cap in seconds, the two parameters
+    /// [`retry_due_sql`] takes.
+    pub(crate) fn sql_backoffs(&self) -> (f64, f64) {
+        let cap = self.cap();
+        (
+            self.initial_backoff.min(cap).as_secs_f64(),
+            cap.as_secs_f64(),
+        )
     }
 }
 
 /// The SQL that is `poison`'s (alias `p`) due time under a retry policy, the
-/// parameters numbered `initial` and `cap` the backoffs in seconds:
-/// [`HeldKeyRetry::backoff`] in SQL, after `poisoned_at`.
+/// parameters numbered `initial` and `cap` the backoffs in seconds
+/// ([`HeldKeyRetry::sql_backoffs`]): [`HeldKeyRetry::backoff`] in SQL, after
+/// `poisoned_at`.
 pub(crate) fn retry_due_sql(initial: u8, cap: u8) -> String {
     format!(
         "(p.poisoned_at + least(${initial}::float8 \
@@ -5603,9 +5665,13 @@ pub struct RetryPass {
 /// The pass yields to the drain: while the ring holds more than twice
 /// `drain_batch_cap` sealed rows, or has no free slot, it releases nothing
 /// ([`build::chunk_allowed`](super::build::chunk_allowed)), so retries never
-/// compete with live changes. A definition that is paused or quarantined
-/// keeps its keys held, as a resume releases them. A key whose release fails
-/// (a lock timeout, say) is left for the next pass.
+/// compete with live changes. A release whose fence wait runs out the lock
+/// timeout ([`ApplyError::ReleaseLockTimeout`]) ends the pass too: a page
+/// holding the fence that long is a busy drain, and the pass runs on the
+/// maintenance loop, which must not sit out a lock timeout per key. A
+/// definition that is paused or quarantined keeps its keys held, as a resume
+/// releases them. A key whose release fails otherwise is left for the next
+/// pass.
 pub async fn retry_held_keys(
     pool: &Pool,
     policy: &HeldKeyRetry,
@@ -5625,10 +5691,12 @@ pub async fn retry_held_keys(
             Err(crate::defs::chunk_queue::ChunkQueueError::Db(err)) => return Err(err.into()),
             Err(_) => return Ok(RetryPass::default()),
         }
+        let (initial, cap) = policy.sql_backoffs();
         client
             .query(
                 &format!(
-                    "select split_part(t.target_table, '.', 2), p.src_table, p.key \
+                    "select split_part(t.target_table, '.', 2), p.src_table, p.key, \
+                            p.poisoned_at \
                      from poison p join transform_definitions t on t.id = p.transform_id \
                      where {} and {due} <= coalesce($3::timestamptz, now()) \
                      order by {due}, p.transform_id, p.src_table, p.key \
@@ -5637,8 +5705,8 @@ pub async fn retry_held_keys(
                     due = retry_due_sql(1, 2),
                 ),
                 &[
-                    &policy.initial_backoff.as_secs_f64(),
-                    &policy.max_backoff.as_secs_f64(),
+                    &initial,
+                    &cap,
                     &now,
                     &i64::try_from(policy.batch).unwrap_or(i64::MAX),
                 ],
@@ -5650,10 +5718,19 @@ pub async fn retry_held_keys(
         let transform: String = row.get(0);
         let src_table: String = row.get(1);
         let key: String = row.get(2);
-        match release_key_as(pool, &transform, &src_table, &key, true).await {
+        let poisoned_at: SystemTime = row.get(3);
+        match retry_held_key(pool, &transform, &src_table, &key, poisoned_at).await {
             Ok(_) => released += 1,
-            // Released by an operator or dropped meanwhile.
+            // Released by an operator, poisoned again since the read above
+            // (so not due), or dropped meanwhile.
             Err(ApplyError::KeyNotHeld { .. } | ApplyError::TransformNotFound { .. }) => {}
+            Err(err @ ApplyError::ReleaseLockTimeout { .. }) => {
+                crate::instance_log::info!(
+                    error = %err,
+                    "ending a retry pass of held keys early; the drain holds their table's fence"
+                );
+                break;
+            }
             Err(err) => {
                 crate::instance_log::warn!(
                     transform = %transform,

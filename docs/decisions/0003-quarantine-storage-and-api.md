@@ -444,10 +444,14 @@ it bumps the key's table fence, locks the definition row and stages one `Recompu
 is due once `initial * 2^attempts` (at most the cap) has passed since `poisoned_at`, where
 `attempts` is how many times it has been retried since it last applied cleanly, so a key
 that is still bad backs off further each time. The schedule is derived, not stored, so a
-change to the option applies to keys already held. A paused or quarantined definition keeps
-its keys held, as a resume releases them. The pass yields to the drain, as a build chunk
-does: while the ring has more than twice `drain_batch_cap` sealed rows undrained, or no free
-slot, it releases nothing.
+change to the option applies to keys already held. A cap past 100 years counts as 100
+years. A paused or quarantined definition keeps its keys held, as a resume releases them.
+The pass yields to the drain, as a build chunk does: while the ring has more than twice
+`drain_batch_cap` sealed rows undrained, or no free slot, it releases nothing, and a release
+whose fence wait runs out the lock timeout ends the pass. Each release re-reads the key's
+`poisoned_at` under the definition-row lock and leaves the key held if it changed since the
+pass judged it due, so a key poisoned again in between (by another staging worker's pass, or
+after an operator's release) waits out its own backoff.
 
 A retried key that fails again is poisoned on its first failure, not after the death
 threshold. The retry's release writes the key's `key_deaths` row one below the threshold with
