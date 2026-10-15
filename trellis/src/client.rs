@@ -1823,6 +1823,17 @@ async fn reconcile_source_tables(
     let mut outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
     release_retyped_keys(pool).await;
     complete_pause_cascades(pool).await;
+    // ADR-0017 P4a: the corrections the pass above queued get their rows in
+    // the same pass, so a definition reads `backfilling` from the pass that
+    // detects the partition operation. A failure here is logged and the
+    // step runs again next pass: the queue is durable, and the rest of the
+    // pass doesn't depend on it.
+    if let Err(err) = staging::partition_correction::schedule(pool).await {
+        crate::instance_log::warn!(
+            error = %err,
+            "couldn't schedule the queued partition corrections; trying again next pass"
+        );
+    }
     // #625 F2/F3: a ready definition the Re-derive build takes gets no
     // registration marker, and the discharge below doesn't dispatch it.
     let taken = staging::build::start_ready_builds(client, pool, &outcome.ready).await?;

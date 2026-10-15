@@ -89,6 +89,9 @@ pub enum ChunkQueueError {
     /// (`backfill_chunks_kind_bounds` rules out a mismatch), or a Re-derive
     /// build's row reached the old build's runner.
     UnknownKind { kind: String },
+    /// A partition correction failed (ADR-0017 P4a,
+    /// `staging::partition_correction`).
+    Correction(Box<crate::staging::partition_correction::CorrectionError>),
 }
 
 impl ChunkQueueError {
@@ -110,6 +113,7 @@ impl ChunkQueueError {
             ChunkQueueError::Quarantine(err) => err.code(),
             ChunkQueueError::Build(err) => err.code(),
             ChunkQueueError::UnknownKind { .. } => ErrorCode::Internal,
+            ChunkQueueError::Correction(err) => err.code(),
         }
     }
 }
@@ -138,6 +142,7 @@ impl std::fmt::Display for ChunkQueueError {
             ChunkQueueError::UnknownKind { kind } => {
                 write!(f, "claimed a backfill chunk of unknown kind {kind:?}")
             }
+            ChunkQueueError::Correction(err) => write!(f, "{err}"),
         }
     }
 }
@@ -153,6 +158,7 @@ impl std::error::Error for ChunkQueueError {
             ChunkQueueError::Quarantine(err) => Some(err.as_ref()),
             ChunkQueueError::Build(err) => Some(err.as_ref()),
             ChunkQueueError::UnknownKind { .. } => None,
+            ChunkQueueError::Correction(err) => Some(err.as_ref()),
         }
     }
 }
@@ -229,6 +235,11 @@ pub enum ChunkWork {
     /// build's chunks didn't. It is claimed only once its build's plan job
     /// and every chunk are done ([`claim_chunks_of`]).
     Sweep { cursor: Option<String> },
+    /// A partition correction for one aggregate definition (ADR-0017 P4a,
+    /// `staging::partition_correction`): re-derives the key set of
+    /// `partition_corrections` row `correction_id`, resuming from its
+    /// `partition_correction_progress`.
+    Correction { correction_id: i64 },
 }
 
 impl ChunkWork {
@@ -240,6 +251,7 @@ impl ChunkWork {
             ChunkWork::Plan { .. } => KIND_PLAN,
             ChunkWork::Rederive { .. } => KIND_REDERIVE,
             ChunkWork::Sweep { .. } => KIND_SWEEP,
+            ChunkWork::Correction { .. } => KIND_CORRECTION,
         }
     }
 }
@@ -254,6 +266,8 @@ pub const KIND_PLAN: &str = "plan";
 pub const KIND_REDERIVE: &str = "rederive";
 /// `backfill_chunks.kind` of a rebuild's sweep job (#625 F3).
 pub const KIND_SWEEP: &str = "sweep";
+/// `backfill_chunks.kind` of a partition correction (ADR-0017 P4a).
+pub const KIND_CORRECTION: &str = "correction";
 
 /// The kinds the old builds' path claims ([`claim_chunks`]). A drain worker
 /// runs these after its segments, as it does the Re-derive build's kinds
@@ -649,7 +663,7 @@ pub async fn claim_chunks_of(
              from candidate \
              where c.id = candidate.id \
              returning c.id, c.definition_id, c.lo, c.hi, c.kind, c.fields, \
-                       c.key_collations",
+                       c.key_collations, c.correction_id",
                 dispatchable_gate = dispatchable_gate_sql("$3"),
             ),
             &[
@@ -664,7 +678,11 @@ pub async fn claim_chunks_of(
         .map(|row| {
             let kind: String = row.get(4);
             let (lo, hi): (Option<String>, Option<String>) = (row.get(2), row.get(3));
+            let correction: Option<i64> = row.get(7);
             let work = match (kind.as_str(), hi) {
+                (KIND_CORRECTION, None) if let Some(correction_id) = correction => {
+                    ChunkWork::Correction { correction_id }
+                }
                 (KIND_RANGE, Some(hi)) => ChunkWork::Range { lo, hi },
                 (KIND_DIRECT, None) => ChunkWork::DirectBuild,
                 (KIND_PLAN, None) => ChunkWork::Plan { cursor: lo },
@@ -1007,6 +1025,28 @@ pub async fn fail_chunk(
                 cursor.as_deref().unwrap_or("-infinity")
             );
             (outcome, attempts, location)
+        }
+        // A correction is not narrowed: a failure on one key's data fails
+        // its page, whose keys are not a range a split could halve. It backs
+        // off as a Re-derive chunk does, and its charged failures pause the
+        // definition, whose resume rebuilds it from the source.
+        ChunkWork::Correction { correction_id } => {
+            let (outcome, attempts) = fail_range_chunk(
+                pool,
+                chunk,
+                None,
+                claimed_by,
+                kind,
+                &message,
+                sqlstate.as_deref(),
+                REDERIVE_RETRY_CAP,
+            )
+            .await?;
+            (
+                outcome,
+                attempts,
+                format!("the partition correction {correction_id}"),
+            )
         }
         ChunkWork::DirectBuild => {
             let (outcome, attempts) =
@@ -1485,13 +1525,15 @@ pub async fn run_claimed_chunk(
         .await
         .map_err(ChunkQueueError::from),
         ChunkWork::DirectBuild => run_direct_build(pool, &definition, target_schema, fence).await,
-        // A Re-derive build's work runs through `staging::build`, which
-        // claims it itself; `claim_chunks` never hands it out.
-        work @ (ChunkWork::Plan { .. } | ChunkWork::Rederive { .. } | ChunkWork::Sweep { .. }) => {
-            Err(ChunkQueueError::UnknownKind {
-                kind: work.kind().to_string(),
-            })
-        }
+        // A Re-derive build's work and a partition correction run through
+        // `staging::build`, which claims them itself; `claim_chunks` never
+        // hands them out.
+        work @ (ChunkWork::Plan { .. }
+        | ChunkWork::Rederive { .. }
+        | ChunkWork::Sweep { .. }
+        | ChunkWork::Correction { .. }) => Err(ChunkQueueError::UnknownKind {
+            kind: work.kind().to_string(),
+        }),
     };
     match ran {
         // The fence stopped the write (issue #434). The caller's

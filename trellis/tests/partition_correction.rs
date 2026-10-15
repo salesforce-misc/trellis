@@ -20,6 +20,9 @@ use trellis::capture::partitions::{self, PendingCorrection};
 use trellis::capture::reconcile::PassOutcome;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
+use trellis::defs::chunk_queue;
+use trellis::staging::build::{self, WorkerOptions};
+use trellis::staging::interleave::{PausePoint, PauseScope};
 use trellis::staging::partition_correction::{self, Options, Outcome};
 
 const SOURCE: &str = "public.items";
@@ -160,7 +163,7 @@ impl Fx {
     }
 
     async fn run(&self, options: &Options) -> Outcome {
-        partition_correction::run_pending(self.d.pool(), SOURCE, options)
+        partition_correction::run_pending(self.d.pool(), options)
             .await
             .expect("run the pending corrections")
     }
@@ -169,6 +172,94 @@ impl Fx {
         let plan = self.d.build_plan("agg").await;
         self.d.merge_all(&plan).await;
         self.d.settle().await;
+    }
+
+    /// The definition's status.
+    async fn status(&self) -> String {
+        self.status_of("agg").await
+    }
+
+    /// The status of the definition whose bare target is `target`.
+    async fn status_of(&self, target: &str) -> String {
+        self.d
+            .ctl
+            .query_one(
+                "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
+                &[&target],
+            )
+            .await
+            .expect("status")
+            .get(0)
+    }
+
+    /// One whole staging-worker pass, as the maintenance loop runs it:
+    /// capture, then the corrections' rows (the status flip), then builds and
+    /// markers.
+    async fn full_pass(&mut self) {
+        let pool = self.d.pool().clone();
+        trellis::client::reconcile_pass(
+            &mut self.d.ctl,
+            &pool,
+            DEFAULT_SCHEMA,
+            drain_driver::WAKE,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("reconcile pass");
+    }
+
+    /// The drain workers' build work, run in this task until no build is
+    /// running: the correction rows, the merges of their deltas, and the
+    /// completion that moves a definition back to `live`.
+    async fn settle_builds(&mut self) {
+        self.d.settle().await;
+        build::settle_builds(self.d.pool()).await;
+    }
+
+    /// Claims and runs every claimable correction row once, as a drain worker
+    /// does: a row that fails is given up through the chunk queue's
+    /// `fail_chunk`, which records the error and backs the row off.
+    async fn worker_turns(&self) {
+        let options = WorkerOptions {
+            chunk_rows: build::DEFAULT_CHUNK_ROWS,
+            drain_batch_cap: usize::MAX,
+            heartbeat_interval: Duration::from_secs(5),
+            reclaim_ttl: Duration::from_secs(60),
+        };
+        loop {
+            let claimed = {
+                let client = self.d.pool().get().await.expect("pool");
+                chunk_queue::claim_chunks_of(
+                    &**client,
+                    "worker",
+                    1,
+                    &[chunk_queue::KIND_CORRECTION],
+                )
+                .await
+                .expect("claim")
+            };
+            let Some(chunk) = claimed.into_iter().next() else {
+                return;
+            };
+            build::run_claimed(self.d.pool(), &chunk, "worker", &options).await;
+        }
+    }
+
+    /// The correction rows, as `(target, done, attempts, last_error)`.
+    async fn rows(&self) -> Vec<(String, bool, i32, Option<String>)> {
+        self.d
+            .ctl
+            .query(
+                "select split_part(d.target_table, '.', 2), bc.done, bc.attempts, bc.last_error \
+                 from backfill_chunks bc join transform_definitions d on d.id = bc.definition_id \
+                 where bc.kind = 'correction' order by bc.id",
+                &[],
+            )
+            .await
+            .expect("rows")
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect()
     }
 
     async fn exec(&self, sql: &str) {
@@ -886,16 +977,24 @@ async fn a_gone_hash_leaf_whose_middle_was_dropped_after_it_is_covered_by_the_mi
     assert_eq!(wrong, 0);
 }
 
-/// Review of #1062: a `catching_up` definition applies as a `live` one does,
-/// so a correction re-derives its keys too, instead of completing without it.
+/// A `catching_up` definition applies, so the correction waits for it: it
+/// gets its row once its catch-up has moved it `live` (the merger folds only
+/// a `backfilling` definition's deltas), and the correction stays queued
+/// until then rather than completing without it.
 #[tokio::test]
-async fn a_catching_up_aggregate_is_corrected() {
+async fn a_catching_up_aggregate_holds_the_correction_until_it_is_live() {
     let mut fx = Fx::start(&tree("range")).await;
     fx.exec("update transform_definitions set status = 'catching_up'")
         .await;
     fx.exec("drop table public.items_p1").await;
     fx.pass().await;
     fx.d.settle().await;
+    let waiting = fx.run(&Options::default()).await;
+    assert_eq!(waiting.completed, 0);
+    assert_eq!(waiting.remaining, 1);
+    assert_eq!(fx.status().await, "catching_up");
+    fx.exec("update transform_definitions set status = 'live'")
+        .await;
     let outcome = fx.run(&Options::default()).await;
     assert_eq!(outcome.completed, 1);
     assert_eq!(
@@ -943,4 +1042,327 @@ async fn a_leaf_attached_again_before_its_correction_ran_does_not_hold_the_queue
         fx.merge().await;
         assert_eq!(fx.wrong_groups().await, Vec::<String>::new(), "{kind}");
     }
+}
+
+/// `items` partitioned `by` on `g` into two middles, each partitioned again,
+/// with the same 160 rows as [`tree`]. `items_m0` holds half the groups.
+fn nested(kind: &str) -> String {
+    let head = format!(
+        "create table public.items (id integer not null, g integer not null, \
+         v integer not null, primary key (g, id)) partition by {kind} (g);"
+    );
+    let (m0, m1, sub) = match kind {
+        "hash" => (
+            "for values with (modulus 2, remainder 0)",
+            "for values with (modulus 2, remainder 1)",
+            ["for values from (0) to (8)", "for values from (8) to (16)"],
+        ),
+        "range" => (
+            "for values from (0) to (8)",
+            "for values from (8) to (16)",
+            [
+                "for values with (modulus 2, remainder 0)",
+                "for values with (modulus 2, remainder 1)",
+            ],
+        ),
+        _ => (
+            "for values in (0, 1, 2, 3, 4, 5, 6, 7)",
+            "for values in (8, 9, 10, 11, 12, 13, 14, 15)",
+            [
+                "for values with (modulus 2, remainder 0)",
+                "for values with (modulus 2, remainder 1)",
+            ],
+        ),
+    };
+    let by = if kind == "hash" { "range" } else { "hash" };
+    let mut ddl = head;
+    for (middle, bound) in [("items_m0", m0), ("items_m1", m1)] {
+        ddl.push_str(&format!(
+            "create table public.{middle} partition of public.items {bound} partition by {by} (g);"
+        ));
+        for (leaf, sub) in ["a", "b"].iter().zip(sub) {
+            ddl.push_str(&format!(
+                "create table public.{middle}{leaf} partition of public.{middle} {sub};"
+            ));
+        }
+    }
+    ddl.push_str("insert into public.items select i, i % 16, i from generate_series(1, 160) i;");
+    ddl
+}
+
+/// Through the staging worker's own path, for each lifecycle operation on
+/// each partitioning: the pass that queues the correction moves the aggregate
+/// to `backfilling` (its groups are wrong until the correction drains), the
+/// drain workers' build work runs the correction's row and folds its deltas,
+/// and the definition is `live` again, with no group wrong and nothing left
+/// in the queue.
+#[tokio::test]
+async fn every_lifecycle_operation_reports_backfilling_until_its_correction_drains() {
+    for kind in ["hash", "range", "list"] {
+        for op in ["attach", "detach", "drop", "new leaf", "middle drop"] {
+            let ddl = if op == "middle drop" {
+                nested(kind)
+            } else {
+                tree(kind)
+            };
+            let mut fx = Fx::start(&ddl).await;
+            assert_eq!(fx.status().await, "live", "{kind} {op}");
+            match op {
+                "attach" => {
+                    fx.exec("alter table public.items detach partition public.items_p2")
+                        .await;
+                    fx.full_pass().await;
+                    fx.settle_builds().await;
+                    assert_eq!(fx.status().await, "live", "{kind} {op}: the detach drained");
+                    fx.exec("update public.items_p2 set v = v + 1000").await;
+                    let bound = match kind {
+                        "hash" => "for values with (modulus 4, remainder 2)",
+                        "range" => "for values from (8) to (12)",
+                        _ => "for values in (8, 9, 10, 11)",
+                    };
+                    fx.exec(&format!(
+                        "alter table public.items attach partition public.items_p2 {bound}"
+                    ))
+                    .await;
+                }
+                "detach" => {
+                    fx.exec("alter table public.items detach partition public.items_p1")
+                        .await;
+                }
+                "drop" => fx.exec("drop table public.items_p1").await,
+                "new leaf" => {
+                    let clause = match kind {
+                        "hash" => "for values with (modulus 4, remainder 3)",
+                        "range" => "for values from (12) to (16)",
+                        _ => "for values in (12, 13, 14, 15)",
+                    };
+                    let group: i32 =
+                        fx.d.ctl
+                            .query_one("select g from public.items_p3 limit 1", &[])
+                            .await
+                            .expect("a group of the leaf")
+                            .get(0);
+                    fx.exec("drop table public.items_p3").await;
+                    fx.exec(&format!(
+                        "create table public.items_new partition of public.items {clause}; \
+                         insert into public.items_new values (1001, {group}, 7), (1002, {group}, 9)"
+                    ))
+                    .await;
+                }
+                _ => fx.exec("drop table public.items_m0").await,
+            }
+            fx.full_pass().await;
+            assert!(!fx.queue().await.is_empty(), "{kind} {op}");
+            assert_eq!(
+                fx.status().await,
+                "backfilling",
+                "{kind} {op}: from the pass that queued the correction"
+            );
+            fx.d.settle().await;
+            assert!(
+                !fx.wrong_groups().await.is_empty(),
+                "{kind} {op}: wrong until the correction drains"
+            );
+            fx.settle_builds().await;
+            assert_eq!(fx.status().await, "live", "{kind} {op}");
+            assert!(fx.queue().await.is_empty(), "{kind} {op}");
+            assert!(
+                fx.rows().await.is_empty(),
+                "{kind} {op}: the rows went with the correction"
+            );
+            assert_eq!(fx.wrong_groups().await, Vec::<String>::new(), "{kind} {op}");
+        }
+    }
+}
+
+/// A worker that dies before the last page of a correction commits: the page
+/// rolls back, the stale-claim sweep frees the row, and the next claim resumes
+/// after the last committed page. The definition reads `backfilling`
+/// throughout, and `live` once the correction has drained.
+#[tokio::test]
+async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_progress() {
+    const KEY: i64 = 1_062_002;
+    let mut fx = Fx::start(&tree("range")).await;
+    fx.exec("drop table public.items_p1").await;
+    fx.full_pass().await;
+    fx.d.settle().await;
+    assert_eq!(fx.status().await, "backfilling");
+    let correction = fx.queue().await.remove(0);
+    let (definition, target): (i64, String) = {
+        let row =
+            fx.d.ctl
+                .query_one("select id, target_table from transform_definitions", &[])
+                .await
+                .expect("definition");
+        (row.get(0), row.get(1))
+    };
+    // The leaf's 40 live entries in pages of seven: five pages commit.
+    let first = fx
+        .run(&Options {
+            page_keys: 7,
+            max_pages: Some(5),
+        })
+        .await;
+    assert_eq!((first.pages, first.keys, first.remaining), (5, 35, 1));
+
+    // The worker that claims it next stops before the sixth, last page
+    // commits, and dies there.
+    let holder = drain_driver::connect(fx.d.db.dsn()).await;
+    holder
+        .execute("select pg_advisory_lock($1)", &[&KEY])
+        .await
+        .expect("hold the pause");
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeCorrectionCommit, &target, KEY);
+    let pool = fx.d.pool().clone();
+    let worker = tokio::spawn(trellis::staging::interleave::with_scope(
+        scope,
+        async move {
+            partition_correction::run_pending(
+                &pool,
+                &Options {
+                    page_keys: 7,
+                    max_pages: None,
+                },
+            )
+            .await
+        },
+    ));
+    let at = reached.await.expect("the last page reached its commit");
+    worker.abort();
+    fx.d.ctl
+        .execute("select pg_terminate_backend($1)", &[&at.backend_pid])
+        .await
+        .expect("end the worker's session");
+    holder
+        .execute("select pg_advisory_unlock($1)", &[&KEY])
+        .await
+        .expect("release");
+
+    let saved = partition_correction::progress(&fx.d.ctl, correction.id, definition)
+        .await
+        .expect("progress")
+        .expect("committed progress");
+    assert_eq!(
+        (saved.phase(), saved.keys_done),
+        ("ledger", 35),
+        "the dead page's progress rolled back with its keys"
+    );
+    assert_eq!(fx.status().await, "backfilling");
+    let claimed: Option<String> =
+        fx.d.ctl
+            .query_one(
+                "select claimed_by from backfill_chunks where kind = 'correction'",
+                &[],
+            )
+            .await
+            .expect("the row")
+            .get(0);
+    assert!(claimed.is_some(), "the dead worker's claim is still there");
+    let freed = chunk_queue::reclaim_stale_chunks(&mut fx.d.ctl, Duration::ZERO)
+        .await
+        .expect("reclaim");
+    assert_eq!(freed, 1);
+
+    let rest = fx
+        .run(&Options {
+            page_keys: 7,
+            max_pages: None,
+        })
+        .await;
+    assert_eq!(rest.completed, 1);
+    assert_eq!(rest.keys, 5, "only the page that did not commit runs again");
+    fx.settle_builds().await;
+    assert_eq!(fx.status().await, "live");
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+}
+
+/// One aggregate's correction keeps failing (its ledger refuses the
+/// tombstones the correction writes). The other aggregate reading the source
+/// is corrected and goes `live`. The failing row records its error and backs
+/// off, and its charged failures pause its definition; the correction then
+/// stays queued with the row, the record of why, until a resume.
+#[tokio::test]
+async fn a_failing_correction_holds_up_no_other_definition_and_pauses_its_own() {
+    const SECOND: &str =
+        "TRANSFORM agg2 FROM public.items GROUP BY g SELECT MAX(v) AS top, COUNT(*) AS n";
+    let mut fx = Fx::start_with(&tree("range"), &[DEFINITION, SECOND]).await;
+    let ledger: String =
+        fx.d.ctl
+            .query_one(
+                "select format('%I.%I', schemaname, tablename) from pg_tables \
+                 where tablename = 'agg__ledger'",
+                &[],
+            )
+            .await
+            .expect("the ledger")
+            .get(0);
+    fx.exec(&format!(
+        "alter table {ledger} add constraint no_tombstones check (not __tombstone) not valid"
+    ))
+    .await;
+    fx.exec("drop table public.items_p1").await;
+    fx.full_pass().await;
+    fx.d.settle().await;
+    assert_eq!(fx.status_of("agg").await, "backfilling");
+    assert_eq!(fx.status_of("agg2").await, "backfilling");
+
+    fx.worker_turns().await;
+    let rows = fx.rows().await;
+    assert_eq!(rows.len(), 2);
+    let failing = rows.iter().find(|r| r.0 == "agg").expect("agg's row");
+    assert!(!failing.1 && failing.2 == 1, "{failing:?}");
+    assert!(
+        failing
+            .3
+            .as_deref()
+            .is_some_and(|e| e.contains("no_tombstones")),
+        "{failing:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.0 == "agg2" && r.1),
+        "the other aggregate's correction ran: {rows:?}"
+    );
+    // The other aggregate's deltas fold, and it goes live.
+    let plan = fx.d.build_plan("agg2").await;
+    fx.d.merge_all(&plan).await;
+    let agg2: i64 =
+        fx.d.ctl
+            .query_one(
+                "select id from transform_definitions where target_table like '%.agg2'",
+                &[],
+            )
+            .await
+            .expect("agg2")
+            .get(0);
+    assert!(
+        build::try_complete(fx.d.pool(), agg2)
+            .await
+            .expect("complete")
+    );
+    assert_eq!(fx.status_of("agg2").await, "live");
+    assert_eq!(fx.queue().await.len(), 1, "agg has not re-derived it");
+
+    // Each later attempt fails the same way, after its backoff (skipped
+    // here), until the fifth charged failure (the chunk queue's
+    // `MAX_CHARGED_ATTEMPTS`) pauses the definition.
+    for _ in 1..5 {
+        fx.exec("update backfill_chunks set next_attempt_at = null where kind = 'correction'")
+            .await;
+        fx.worker_turns().await;
+    }
+    assert_eq!(fx.status_of("agg").await, "paused");
+    fx.full_pass().await;
+    assert_eq!(
+        fx.queue().await.len(),
+        1,
+        "the paused definition's row keeps the correction queued"
+    );
+    let kept = fx.rows().await;
+    assert!(
+        kept.iter().any(|r| r.0 == "agg"
+            && !r.1
+            && r.3.as_deref().is_some_and(|e| e.contains("no_tombstones"))),
+        "the row is the record of why: {kept:?}"
+    );
 }

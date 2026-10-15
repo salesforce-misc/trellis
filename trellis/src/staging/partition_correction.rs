@@ -74,25 +74,55 @@
 //! writers with older snapshots, before it starts: only then is the ring
 //! complete for the node.
 //!
-//! # What this module does not do
+//! # Scheduling
 //!
-//! It does not schedule itself. [`run_pending`] runs every queued correction
-//! of one source to its end (or to a page limit, for a test that stops it
-//! mid-way); the staging worker's scheduling, the `correcting` status and the
-//! definition's `backfilling` status while it runs are later phases of
-//! ADR-0017. A to-many relationship's recompute is P4b.
+//! A correction runs for each aggregate that reads the source as a
+//! `backfill_chunks` row of kind `correction` (V92), one per correction and
+//! definition, which the staging worker's pass enqueues ([`schedule`]) right
+//! after the capture pass that queued the correction. The row gives it what a
+//! build chunk has: one runner at a time (the claim), a heartbeat, the
+//! stale-claim sweep for a runner that died, and a fence on every write
+//! (`ClaimFence`), so a runner whose claim was reclaimed, or that held it
+//! across a pause and a resume, writes nothing.
 //!
-//! Until the staging worker calls it, only tests and embedders built with the
-//! `internals` feature reach it.
-#![cfg_attr(not(any(test, feature = "internals")), allow(dead_code))]
+//! The pass that enqueues the row moves a `live` definition to `backfilling`
+//! under a Re-derive build (`build = 'rederive'`), in the same transaction,
+//! so from the pass that detects the operation the definition reports
+//! `backfilling`. The drain workers claim the row like a build chunk
+//! ([`super::build::work_once`]), run up to [`CLAIM_PAGES`] pages, and give
+//! it back for the next claim; the merger folds the correction's group
+//! deltas while the definition is `backfilling`, and
+//! [`super::build::try_complete`] moves it back to `live` once the row is
+//! done and its deltas are folded, as it does at the end of a build. A
+//! definition already under a Re-derive build stays `backfilling` until both
+//! are done. A `catching_up` definition gets its row once its catch-up has
+//! moved it `live`: the merger folds only a `backfilling` definition's
+//! deltas, and the catch-up's discharge owns its status until then. It holds
+//! the correction in the queue meanwhile.
+//!
+//! A correction that fails is given up through the chunk queue's
+//! `fail_chunk`: its row records the error, which `Trellis::status` reports,
+//! and is retried after a backoff (a transient failure is not charged), and
+//! its [`chunk_queue::MAX_CHARGED_ATTEMPTS`]th charged failure pauses the
+//! definition, whose resume rebuilds it from the source; the row stays, with
+//! the correction, as the record `Trellis::status` reports until that resume.
+//! Each row is its own claim, so a failing correction holds up no other
+//! correction, definition or source. A correction leaves the queue once every
+//! aggregate that applies has re-derived it ([`schedule`], and the runner
+//! that finishes the last).
+//!
+//! A to-many relationship's recompute is P4b.
 
 use std::fmt;
+use std::time::Duration;
 
 use tokio_postgres::{GenericClient, IsolationLevel};
 
 use crate::capture::partitions::{self, Key, PendingCorrection, Recorded};
+use crate::defs::chunk_queue::{self, ChunkQueueError, ClaimFence, ClaimedChunk};
 use crate::defs::model::{APPLYING_SQL, Definition, TransformStatus};
 use crate::defs::{backfill, catalog, ddl};
+use crate::error_code::ErrorCode;
 use crate::pool::{Pool, quote_ident};
 
 use super::apply::ApplyError;
@@ -104,6 +134,16 @@ use super::ledger::LedgerTargetPlan;
 /// lock set, so it bounds the locks and the WAL a transaction holds.
 pub const DEFAULT_PAGE_KEYS: usize = 10_000;
 
+/// Pages a drain worker runs per claim of a correction before it gives the
+/// row back: about a second of work at [`DEFAULT_PAGE_KEYS`], so the
+/// worker's segments, merges and other chunks get their turn, and the ring's
+/// backlog is checked again before the next claim.
+pub const CLAIM_PAGES: usize = 10;
+
+/// How long a correction waits before it looks again at a detach that is
+/// still pending or a fence that has not settled.
+const WAIT_RETRY: Duration = Duration::from_secs(1);
+
 /// Why a correction stopped.
 #[derive(Debug)]
 pub enum CorrectionError {
@@ -114,6 +154,36 @@ pub enum CorrectionError {
     Catalog(catalog::CatalogError),
     /// The node's group cannot be presented to its constraint text.
     Unroutable(String),
+    /// The Re-derive build does not serve the definition's shape, so its keys
+    /// cannot be re-derived.
+    Unserved {
+        target: String,
+    },
+}
+
+impl CorrectionError {
+    /// This error's [`ErrorCode`] category.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            CorrectionError::Db(err) => crate::error_code::classify_pg_error(err),
+            CorrectionError::Pool(err) => err.code(),
+            CorrectionError::Apply(err) => err.code(),
+            CorrectionError::Catalog(err) => err.code(),
+            CorrectionError::Capture(err) => {
+                let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+                while let Some(err) = link {
+                    if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+                        return crate::error_code::classify_pg_error(pg);
+                    }
+                    link = err.source();
+                }
+                ErrorCode::Internal
+            }
+            CorrectionError::Unroutable(_) | CorrectionError::Unserved { .. } => {
+                ErrorCode::Internal
+            }
+        }
+    }
 }
 
 impl fmt::Display for CorrectionError {
@@ -125,11 +195,33 @@ impl fmt::Display for CorrectionError {
             CorrectionError::Capture(err) => write!(f, "partition correction: {err}"),
             CorrectionError::Catalog(err) => write!(f, "partition correction: {err}"),
             CorrectionError::Unroutable(why) => write!(f, "partition correction: {why}"),
+            CorrectionError::Unserved { target } => write!(
+                f,
+                "partition correction: the Re-derive build does not serve {target}'s shape, \
+                 so its keys cannot be re-derived"
+            ),
         }
     }
 }
 
-impl std::error::Error for CorrectionError {}
+impl std::error::Error for CorrectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CorrectionError::Db(err) => Some(err),
+            CorrectionError::Pool(err) => Some(err),
+            CorrectionError::Apply(err) => Some(err),
+            CorrectionError::Capture(err) => Some(err),
+            CorrectionError::Catalog(err) => Some(err),
+            CorrectionError::Unroutable(_) | CorrectionError::Unserved { .. } => None,
+        }
+    }
+}
+
+impl From<CorrectionError> for ChunkQueueError {
+    fn from(err: CorrectionError) -> Self {
+        ChunkQueueError::Correction(Box::new(err))
+    }
+}
 
 impl From<tokio_postgres::Error> for CorrectionError {
     fn from(err: tokio_postgres::Error) -> Self {
@@ -161,14 +253,15 @@ impl From<catalog::CatalogError> for CorrectionError {
     }
 }
 
-/// How [`run_pending`] runs.
+/// How a correction runs: a drain worker's claim ([`CLAIM_PAGES`] pages of
+/// [`DEFAULT_PAGE_KEYS`]), or a test's [`run_pending`].
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     /// Keys per page.
     pub page_keys: usize,
     /// Stops after this many pages in all, leaving the progress committed so
-    /// far for the next call: a test's deterministic stand-in for a crash or
-    /// a restart in the middle of a correction.
+    /// far for the next claim: a worker's turn, or a test's deterministic
+    /// stand-in for a crash or a restart in the middle of a correction.
     pub max_pages: Option<usize>,
 }
 
@@ -181,7 +274,7 @@ impl Default for Options {
     }
 }
 
-/// What [`run_pending`] did.
+/// What a run of corrections did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outcome {
     /// Pages run (a page is one transaction).
@@ -350,6 +443,10 @@ impl Progress {
     }
 
     /// Keys still to re-derive by the estimate.
+    #[cfg_attr(
+        not(any(test, feature = "internals")),
+        allow(dead_code, reason = "read by tests and embedders through `internals`")
+    )]
     pub fn keys_remaining(&self) -> Option<i64> {
         self.keys_total.map(|t| (t - self.keys_done).max(0))
     }
@@ -377,51 +474,366 @@ pub async fn progress(
         }))
 }
 
-/// Runs every queued correction of `source_table` for the aggregate
-/// definitions that read it and apply (`live`, `catching_up`, or
-/// `backfilling` under a Re-derive build: `defs::model::APPLYING_SQL`),
-/// taking a correction off the queue once all of them have re-derived it.
-/// See the module doc for the order.
+/// What [`schedule`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Scheduled {
+    /// Correction rows it enqueued.
+    pub enqueued: usize,
+    /// Corrections it took off the queue.
+    pub completed: usize,
+    /// Corrections still queued.
+    pub pending: usize,
+}
+
+/// The staging worker pass's step for the queued corrections (see the module
+/// doc's "Scheduling"): for each correction and each aggregate that reads its
+/// source and applies (`live`, `catching_up`, or `backfilling` under a
+/// Re-derive build: `defs::model::APPLYING_SQL`) and has not re-derived it,
+/// enqueues the correction's row unless one is there, moving a `live`
+/// definition to `backfilling`. A `catching_up` one gets its row once it is
+/// `live`. Takes a correction off the queue once every one of them has
+/// re-derived it.
 ///
 /// A definition that is frozen (paused, quarantined) or still waiting to
-/// build is skipped: its resume or its build reads the source afresh. One
+/// build gets no row: its resume or its build reads the source afresh. One
 /// whose build is on the old path (`backfilling` without a Re-derive build)
-/// holds every correction in the queue until it applies: its chunks may have
-/// read the node's rows before the operation, and nothing after them reads
-/// those keys again.
-pub async fn run_pending(
-    pool: &Pool,
-    source_table: &str,
-    options: &Options,
-) -> Result<Outcome, CorrectionError> {
-    let mut outcome = Outcome::default();
-    let corrections = {
+/// holds every correction of its source in the queue until it applies: its
+/// chunks may have read the node's rows before the operation, and nothing
+/// after them reads those keys again.
+pub async fn schedule(pool: &Pool) -> Result<Scheduled, CorrectionError> {
+    let mut out = Scheduled::default();
+    let tables: Vec<String> = {
         let client = pool.get().await?;
-        partitions::pending_corrections(&**client, source_table).await?
+        client
+            .query(
+                "select distinct table_name from partition_corrections order by 1",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
     };
-    let (definitions, held) = readers(pool, source_table).await?;
-    for correction in &corrections {
-        let mut finished = !held;
-        for definition in &definitions {
-            match correct(pool, definition, correction, options, &mut outcome).await? {
-                Step::Done => {}
-                Step::Waiting | Step::Stopped => finished = false,
-            }
-            if budget_spent(options, &outcome) {
-                break;
-            }
-        }
-        if finished {
+    for table in tables {
+        let (corrections, (readers, held)) = {
             let client = pool.get().await?;
-            partitions::complete_correction(&**client, correction.id).await?;
-            outcome.completed += 1;
-        } else {
-            outcome.remaining += 1;
-        }
-        if budget_spent(options, &outcome) {
-            break;
+            (
+                partitions::pending_corrections(&**client, &table).await?,
+                readers(&**client, &table).await?,
+            )
+        };
+        for correction in &corrections {
+            let mut drained = !held && !kept_by_frozen(pool, correction.id).await?;
+            for &id in &readers {
+                if done(pool, correction.id, id).await? {
+                    continue;
+                }
+                drained = false;
+                if enqueue(pool, id, correction.id).await? {
+                    out.enqueued += 1;
+                }
+            }
+            if drained {
+                let client = pool.get().await?;
+                partitions::complete_correction(&**client, correction.id).await?;
+                out.completed += 1;
+            } else {
+                out.pending += 1;
+            }
         }
     }
+    Ok(out)
+}
+
+/// Whether `definition_id` has re-derived correction `correction_id`.
+async fn done(
+    pool: &Pool,
+    correction_id: i64,
+    definition_id: i64,
+) -> Result<bool, CorrectionError> {
+    let client = pool.get().await?;
+    Ok(progress(&**client, correction_id, definition_id)
+        .await?
+        .is_some_and(|p| p.phase() == Phase::Done.as_str()))
+}
+
+/// Enqueues correction `correction_id`'s row for `definition_id` unless the
+/// definition is not `live` or `backfilling` under a Re-derive build (one
+/// `catching_up` waits for its catch-up), or a current row of it is there (one held
+/// across a resume, [`chunk_queue::STALE`], is not current: its runner writes
+/// nothing). Moves a `live` definition to `backfilling` under a Re-derive
+/// build in the same transaction, under its row lock, which every enqueue,
+/// pause and resume takes. Returns whether it enqueued.
+async fn enqueue(
+    pool: &Pool,
+    definition_id: i64,
+    correction_id: i64,
+) -> Result<bool, CorrectionError> {
+    let current_sql = format!(
+        "select exists (select 1 from backfill_chunks bc \
+                        join transform_definitions d on d.id = bc.definition_id \
+                        where bc.definition_id = $1 and bc.correction_id = $2 \
+                          and not bc.done and not ({}))",
+        chunk_queue::STALE
+    );
+    let mut client = pool.get().await?;
+    // Every pass asks again while the correction runs: a row already there
+    // needs no lock on the definition's row, which drain pages share.
+    let current: bool = client
+        .query_one(&current_sql, &[&definition_id, &correction_id])
+        .await?
+        .get(0);
+    if current {
+        return Ok(false);
+    }
+    let txn = client.transaction().await?;
+    let applies = txn
+        .query_opt(
+            "select status from transform_definitions \
+             where id = $1 and (status = $2 or (status = $3 and build = $4)) for update",
+            &[
+                &definition_id,
+                &TransformStatus::Live.as_str(),
+                &TransformStatus::Backfilling.as_str(),
+                &build::BUILD_REDERIVE,
+            ],
+        )
+        .await?;
+    let Some(row) = applies else {
+        txn.rollback().await?;
+        return Ok(false);
+    };
+    let status: String = row.get(0);
+    // Again under the lock, which every enqueue takes.
+    let current: bool = txn
+        .query_one(&current_sql, &[&definition_id, &correction_id])
+        .await?
+        .get(0);
+    if current {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    txn.execute(
+        "insert into backfill_chunks (definition_id, kind, correction_id, fuse_rearmed_at) \
+         select id, $2, $3, fuse_rearmed_at from transform_definitions where id = $1",
+        &[
+            &definition_id,
+            &chunk_queue::KIND_CORRECTION,
+            &correction_id,
+        ],
+    )
+    .await?;
+    let flipped = status == TransformStatus::Live.as_str();
+    if flipped {
+        txn.execute(
+            "update transform_definitions set status = $2, build = $3 where id = $1",
+            &[
+                &definition_id,
+                &TransformStatus::Backfilling.as_str(),
+                &build::BUILD_REDERIVE,
+            ],
+        )
+        .await?;
+    }
+    txn.commit().await?;
+    if flipped {
+        crate::instance_log::info!(
+            definition_id,
+            correction_id,
+            from = %TransformStatus::Live.as_str(),
+            to = %TransformStatus::Backfilling.as_str(),
+            "transform status transition: a partition correction started"
+        );
+    }
+    Ok(true)
+}
+
+/// Takes `correction` off the queue if every aggregate reading its source
+/// that applies has re-derived it, no old-path build holds it and no frozen
+/// definition keeps it ([`kept_by_frozen`]): [`schedule`]'s test. Returns
+/// whether it did.
+async fn complete_if_drained(
+    pool: &Pool,
+    correction: &PendingCorrection,
+) -> Result<bool, CorrectionError> {
+    let (ids, held) = {
+        let client = pool.get().await?;
+        readers(&**client, &correction.table).await?
+    };
+    if held || kept_by_frozen(pool, correction.id).await? {
+        return Ok(false);
+    }
+    for id in ids {
+        if !done(pool, correction.id, id).await? {
+            return Ok(false);
+        }
+    }
+    let client = pool.get().await?;
+    partitions::complete_correction(&**client, correction.id).await?;
+    Ok(true)
+}
+
+/// Whether a definition that no longer applies (paused, quarantined) has an
+/// undone row of correction `correction_id`. Such a row is the record of why
+/// its definition was paused (its charged failures, which `Trellis::status`
+/// reports), or of a correction an operator's pause stopped. The correction
+/// stays queued with it, and the row with the correction, until the
+/// definition's resume deletes the row and rebuilds the definition from its
+/// source.
+async fn kept_by_frozen(pool: &Pool, correction_id: i64) -> Result<bool, CorrectionError> {
+    let client = pool.get().await?;
+    Ok(client
+        .query_one(
+            &format!(
+                "select exists (select 1 from backfill_chunks bc \
+                                join transform_definitions d on d.id = bc.definition_id \
+                                where bc.correction_id = $1 and not bc.done \
+                                  and not {})",
+                crate::defs::model::applying_sql("d")
+            ),
+            &[&correction_id],
+        )
+        .await?
+        .get(0))
+}
+
+/// Runs a claimed correction row (`ChunkWork::Correction`) for its
+/// definition, from its committed progress, for up to `options.max_pages`
+/// pages in all of `outcome`, then gives the claim back: done once the key
+/// set is re-derived (then the correction leaves the queue if it was the
+/// last, and [`build::try_complete`] may move the definition `live`), for a
+/// later claim when it stopped at the budget, or after [`WAIT_RETRY`] while
+/// it waits for a detach or its fence. A row held across a resume, or whose
+/// claim was reclaimed, writes nothing. An error leaves the claim to the
+/// caller's `fail_chunk`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_chunk(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    correction_id: i64,
+    claimed_by: &str,
+    heartbeat_interval: Duration,
+    reclaim_ttl: Duration,
+    options: &Options,
+    outcome: &mut Outcome,
+) -> Result<(), ChunkQueueError> {
+    let definition = catalog::definition_by_id(pool, chunk.definition_id)
+        .await?
+        .ok_or(ChunkQueueError::DefinitionNotFound {
+            definition_id: chunk.definition_id,
+        })?;
+    let correction = {
+        let client = pool.get().await?;
+        partitions::pending_corrections(&**client, &definition.source_table)
+            .await?
+            .into_iter()
+            .find(|c| c.id == correction_id)
+    };
+    let Some(correction) = correction else {
+        // The correction left the queue, and its rows with it.
+        return Ok(());
+    };
+    let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
+        pool.clone(),
+        chunk.id,
+        claimed_by.to_string(),
+        heartbeat_interval,
+    );
+    let fence = ClaimFence::new(chunk.id, claimed_by, reclaim_ttl);
+    match correct(pool, &definition, &correction, options, outcome, &fence).await? {
+        Step::Done => {
+            if !finish_row(pool, &fence, chunk.id).await? {
+                return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+            }
+            if complete_if_drained(pool, &correction).await? {
+                outcome.completed += 1;
+            }
+            build::try_complete(pool, chunk.definition_id).await?;
+            Ok(())
+        }
+        Step::Waiting => build::defer_claim(pool, chunk, claimed_by, WAIT_RETRY).await,
+        Step::Stopped => build::defer_claim(pool, chunk, claimed_by, Duration::ZERO).await,
+        Step::Superseded => chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await,
+    }
+}
+
+/// Marks the correction row `id` done under its fence. Returns `false`, with
+/// nothing written, when the fence no longer holds.
+async fn finish_row(pool: &Pool, fence: &ClaimFence<'_>, id: i64) -> Result<bool, CorrectionError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    txn.execute(
+        "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
+         where id = $1",
+        &[&id],
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// Runs every queued correction to its end, or to `options.max_pages` pages
+/// in all, in this task: [`schedule`], then claims and runs every claimable
+/// correction row as a drain worker would ([`run_chunk`]), then
+/// [`schedule`] again. The synchronous stand-in for the staging worker and
+/// the drain workers, for a test with neither running. `completed` and
+/// `remaining` count the queue across every source.
+///
+/// A row that fails is given its claim back at once and the error returned;
+/// a row that waits (a detach pending, a fence not settled) is left for a
+/// later call, which tries it again at once.
+#[cfg(any(test, feature = "internals"))]
+pub async fn run_pending(pool: &Pool, options: &Options) -> Result<Outcome, ChunkQueueError> {
+    const CLAIMED_BY: &str = "run_pending_corrections";
+    let mut outcome = Outcome::default();
+    schedule(pool).await?;
+    {
+        // A row that waited in an earlier call is tried again now: what it
+        // waited for may have happened since, not on its backoff's clock.
+        let client = pool.get().await?;
+        client
+            .execute(
+                "update backfill_chunks set next_attempt_at = null \
+                 where kind = $1 and not done and claimed_by is null and last_error is null",
+                &[&chunk_queue::KIND_CORRECTION],
+            )
+            .await?;
+    }
+    while !budget_spent(options, &outcome) {
+        let claimed = {
+            let client = pool.get().await?;
+            chunk_queue::claim_chunks_of(&**client, CLAIMED_BY, 1, &[chunk_queue::KIND_CORRECTION])
+                .await?
+        };
+        let Some(chunk) = claimed.into_iter().next() else {
+            break;
+        };
+        let chunk_queue::ChunkWork::Correction { correction_id } = chunk.work else {
+            unreachable!("claimed only correction rows");
+        };
+        let ran = run_chunk(
+            pool,
+            &chunk,
+            correction_id,
+            CLAIMED_BY,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            options,
+            &mut outcome,
+        )
+        .await;
+        if let Err(err) = ran {
+            build::defer_claim(pool, &chunk, CLAIMED_BY, Duration::ZERO).await?;
+            return Err(err);
+        }
+    }
+    let scheduled = schedule(pool).await?;
+    outcome.completed += scheduled.completed;
+    outcome.remaining = scheduled.pending;
     Ok(outcome)
 }
 
@@ -429,72 +841,68 @@ fn budget_spent(options: &Options, outcome: &Outcome) -> bool {
     options.max_pages.is_some_and(|max| outcome.pages >= max)
 }
 
-/// The definitions reading `source_table` that apply, and whether one is
-/// under an old-path build (`backfilling` without a Re-derive build), which
-/// holds the corrections in the queue.
+/// The ids of the aggregate definitions reading `source_table` that apply,
+/// and whether one is under an old-path build (`backfilling` without a
+/// Re-derive build), which holds the corrections in the queue.
 async fn readers(
-    pool: &Pool,
+    client: &impl GenericClient,
     source_table: &str,
-) -> Result<(Vec<Definition>, bool), CorrectionError> {
-    let (ids, held): (Vec<i64>, bool) = {
-        let client = pool.get().await?;
-        let ids = client
-            .query(
-                &format!(
-                    "select id from transform_definitions \
-                     where source_table = $1 and {APPLYING_SQL} order by id"
-                ),
-                &[&source_table],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        let held = client
-            .query_one(
-                "select exists (select 1 from transform_definitions \
-                                where source_table = $1 and status = $2 \
-                                  and build is distinct from 'rederive')",
-                &[&source_table, &TransformStatus::Backfilling.as_str()],
-            )
-            .await?
-            .get(0);
-        (ids, held)
-    };
-    let mut out = Vec::new();
-    for id in ids {
-        if let Some(definition) = catalog::definition_by_id(pool, id).await? {
-            out.push(definition);
-        }
-    }
-    Ok((out, held))
+) -> Result<(Vec<i64>, bool), CorrectionError> {
+    let ids = client
+        .query(
+            &format!(
+                "select id from transform_definitions \
+                 where source_table = $1 and {APPLYING_SQL} order by id"
+            ),
+            &[&source_table],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let held = client
+        .query_one(
+            "select exists (select 1 from transform_definitions \
+                            where source_table = $1 and status = $2 \
+                              and build is distinct from 'rederive')",
+            &[&source_table, &TransformStatus::Backfilling.as_str()],
+        )
+        .await?
+        .get(0);
+    Ok((ids, held))
 }
 
 /// What one call of [`correct`] left.
 enum Step {
     /// The definition re-derived the correction's key set.
     Done,
-    /// It waits for a detach to finalize or for the fence to settle, or the
-    /// definition's shape is one the engine cannot re-derive.
+    /// It waits for a detach to finalize or for the fence to settle.
     Waiting,
     /// The page budget ran out.
     Stopped,
+    /// The row's fence no longer holds: its claim was reclaimed, or it was
+    /// held across a resume. Nothing was written.
+    Superseded,
 }
 
 /// Runs correction `correction` for `definition` page by page, resuming from
-/// its progress.
+/// its progress, each write under `fence`.
 async fn correct(
     pool: &Pool,
     definition: &Definition,
     correction: &PendingCorrection,
     options: &Options,
     outcome: &mut Outcome,
+    fence: &ClaimFence<'_>,
 ) -> Result<Step, CorrectionError> {
     let Some(plan) = BuildPlan::for_definition(pool, definition).await? else {
         // A shape the Re-derive build does not serve yet (an aggregate that
-        // reads a relationship): this engine cannot re-derive its keys, so
-        // the correction stays queued rather than completing uncorrected.
-        return Ok(Step::Waiting);
+        // reads a relationship): this engine cannot re-derive its keys. The
+        // failure is the row's to report, rather than a correction that
+        // completes uncorrected.
+        return Err(CorrectionError::Unserved {
+            target: definition.target_table.clone(),
+        });
     };
     let ledger = plan.ledger();
     if correction.kind == partitions::Kind::GoneNode.as_str()
@@ -513,7 +921,11 @@ async fn correct(
             .await?
             .get(0);
         if !alive {
-            return Ok(Step::Done);
+            return Ok(if mark_done(pool, fence, correction, definition).await? {
+                Step::Done
+            } else {
+                Step::Superseded
+            });
         }
     }
     let recorded = {
@@ -533,20 +945,22 @@ async fn correct(
             progress(&**client, correction.id, definition.id).await?
         };
         let Some(current) = current else {
-            if !start(pool, definition, correction).await? {
-                return Ok(Step::Waiting);
+            match start(pool, definition, correction, fence).await? {
+                Started::Recorded => continue,
+                Started::Pending => return Ok(Step::Waiting),
+                Started::Superseded => return Ok(Step::Superseded),
             }
-            continue;
         };
-        match Phase::parse(current.phase) {
+        let page = match Phase::parse(current.phase) {
             Phase::Done => return Ok(Step::Done),
             Phase::Fence => {
                 if !settle_fence(pool, definition, correction).await? {
                     return Ok(Step::Waiting);
                 }
+                continue;
             }
             Phase::Ledger => {
-                let page = ledger_page(
+                ledger_page(
                     pool,
                     ledger,
                     &route,
@@ -556,36 +970,84 @@ async fn correct(
                     correction,
                     definition,
                     options.page_keys,
+                    fence,
                 )
-                .await?;
-                outcome.pages += 1;
-                outcome.keys += page;
+                .await?
             }
             Phase::Node => {
-                let page = node_page(
+                node_page(
                     pool,
                     ledger,
                     &current,
                     correction,
                     definition,
                     options.page_keys,
+                    fence,
                 )
-                .await?;
-                outcome.pages += 1;
-                outcome.keys += page;
+                .await?
             }
-        }
+        };
+        let Some(keys) = page else {
+            return Ok(Step::Superseded);
+        };
+        outcome.pages += 1;
+        outcome.keys += keys;
     }
+}
+
+/// Records `correction` done for `definition` with no work (its parent's
+/// correction covers it), under `fence`. Returns `false`, with nothing
+/// written, when the fence no longer holds.
+async fn mark_done(
+    pool: &Pool,
+    fence: &ClaimFence<'_>,
+    correction: &PendingCorrection,
+    definition: &Definition,
+) -> Result<bool, CorrectionError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    fence.arm(&*txn).await?;
+    // The definition's row before the claim's (`ClaimFence`): the insert's
+    // foreign key takes it.
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for key share",
+        &[&definition.id],
+    )
+    .await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    txn.execute(
+        "insert into partition_correction_progress (correction_id, definition_id, phase) \
+         values ($1, $2, 'done') \
+         on conflict (correction_id, definition_id) do update set phase = 'done', cursor = null",
+        &[&correction.id, &definition.id],
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// What [`start`] did.
+enum Started {
+    /// The progress row is recorded.
+    Recorded,
+    /// The node's detach is still pending.
+    Pending,
+    /// The row's fence no longer holds.
+    Superseded,
 }
 
 /// Starts `correction` for `definition`: waits for a pending detach to
 /// finish, then stamps the definition's `build_seg` and records the progress
-/// row, in one transaction. Returns `false` while the detach is pending.
+/// row, in one transaction under `fence`.
 async fn start(
     pool: &Pool,
     definition: &Definition,
     correction: &PendingCorrection,
-) -> Result<bool, CorrectionError> {
+    fence: &ClaimFence<'_>,
+) -> Result<Started, CorrectionError> {
     let mut client = pool.get().await?;
     if correction.kind == partitions::Kind::GoneNode.as_str() {
         // The node's `pg_inherits` row is there, `inhdetachpending`, until
@@ -604,16 +1066,22 @@ async fn start(
             .await?
             .get(0);
         if pending {
-            return Ok(false);
+            return Ok(Started::Pending);
         }
     }
     let txn = client.transaction().await?;
-    // The definition's row first, as a rebuild's start takes it.
+    fence.arm(&*txn).await?;
+    // The definition's row first, as a rebuild's start takes it, then the
+    // claim's (`ClaimFence`: resume's order).
     txn.execute(
         "select 1 from transform_definitions where id = $1 for update",
         &[&definition.id],
     )
     .await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(Started::Superseded);
+    }
     txn.execute(
         "insert into partition_correction_progress (correction_id, definition_id, phase) \
          values ($1, $2, 'fence') on conflict do nothing",
@@ -624,7 +1092,7 @@ async fn start(
     // only for the commit.
     build::stamp_rebuild_seg(&*txn, &[definition.id]).await?;
     txn.commit().await?;
-    Ok(true)
+    Ok(Started::Recorded)
 }
 
 /// `oid` as the `i64` a text-free bind takes.
@@ -770,7 +1238,9 @@ fn and_all(parts: &[String], last: &str) -> String {
 }
 
 /// Reads one page of the ledger phase's keys and re-derives them, then
-/// commits the progress with them. Returns the keys re-derived.
+/// commits the progress with them, under `fence`. Returns the keys
+/// re-derived, or `None`, with nothing written, when the fence no longer
+/// holds.
 #[allow(clippy::too_many_arguments)]
 async fn ledger_page(
     pool: &Pool,
@@ -782,7 +1252,8 @@ async fn ledger_page(
     correction: &PendingCorrection,
     definition: &Definition,
     page_keys: usize,
-) -> Result<i64, CorrectionError> {
+    fence: &ClaimFence<'_>,
+) -> Result<Option<i64>, CorrectionError> {
     let groups = ledger.plain_group_cols();
     let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
     let live = format!(
@@ -880,6 +1351,10 @@ async fn ledger_page(
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
     .await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(None);
+    }
     let keys = unpoisoned(&txn, ledger, &found).await?;
     let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
     if !refs.is_empty() {
@@ -913,8 +1388,27 @@ async fn ledger_page(
         ],
     )
     .await?;
+    pause_before_commit(&txn, definition).await?;
     txn.commit().await?;
-    Ok(i64::try_from(keys.len()).unwrap_or(i64::MAX))
+    Ok(Some(i64::try_from(keys.len()).unwrap_or(i64::MAX)))
+}
+
+/// The test hook before a page commits ([`super::interleave`]'s
+/// `BeforeCorrectionCommit`), for the definition's target.
+async fn pause_before_commit(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition: &Definition,
+) -> Result<(), tokio_postgres::Error> {
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::BeforeCorrectionCommit,
+        &definition.target_table,
+    )
+    .await?;
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = (txn, definition);
+    Ok(())
 }
 
 /// Whether the correction walks the node's rows after the ledger: a node in
@@ -980,7 +1474,9 @@ async fn node_estimate(
 }
 
 /// Reads one page of the node phase's keys from the node itself and
-/// re-derives them, committing the progress with them.
+/// re-derives them, committing the progress with them, under `fence`.
+/// Returns the keys re-derived, or `None`, with nothing written, when the
+/// fence no longer holds.
 async fn node_page(
     pool: &Pool,
     ledger: &LedgerTargetPlan,
@@ -988,7 +1484,8 @@ async fn node_page(
     correction: &PendingCorrection,
     definition: &Definition,
     page_keys: usize,
-) -> Result<i64, CorrectionError> {
+    fence: &ClaimFence<'_>,
+) -> Result<Option<i64>, CorrectionError> {
     let mut client = pool.get().await?;
     let txn = client
         .build_transaction()
@@ -999,6 +1496,10 @@ async fn node_page(
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
     .await?;
+    if !fence.hold(&*txn).await? {
+        txn.rollback().await?;
+        return Ok(None);
+    }
     // The node by oid, so a rename doesn't lose it; none once it is dropped.
     // Qualified whatever the search path is.
     let node: Option<String> = txn
@@ -1013,7 +1514,7 @@ async fn node_page(
     let Some(node) = node else {
         finish(&txn, correction, definition, 0, None, true).await?;
         txn.commit().await?;
-        return Ok(0);
+        return Ok(Some(0));
     };
     // A gone node read here has no usable text (`reads_node`): its table,
     // once detached, is read the same way, and each key re-derived reads the
@@ -1081,8 +1582,9 @@ async fn node_page(
         finished,
     )
     .await?;
+    pause_before_commit(&txn, definition).await?;
     txn.commit().await?;
-    Ok(i64::try_from(keys.len()).unwrap_or(i64::MAX))
+    Ok(Some(i64::try_from(keys.len()).unwrap_or(i64::MAX)))
 }
 
 /// Commits a node-phase page's progress: `done` keys more, the cursor, and

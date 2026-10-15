@@ -100,6 +100,11 @@
 //! the definition row and its claim, before it inserts its chunks. A test
 //! runs the job inside [`with_scope`].
 //!
+//! Each page of a partition correction (`super::partition_correction`) fires
+//! [`PausePoint::BeforeCorrectionCommit`] for the definition's target after
+//! it has re-derived its keys and recorded its progress, before it commits.
+//! A test runs the correction inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -226,6 +231,11 @@ pub enum PausePoint {
     /// bare name. The page holds no lock and no transaction, so the target
     /// can be dropped, written or checked again here.
     BeforeSelfCheckPage,
+    /// After a partition correction's page has re-derived its keys and
+    /// recorded its progress, just before it commits, for the definition's
+    /// target (`super::partition_correction`, ADR-0017 P4a). The page holds
+    /// its keys' entry locks and its row's claim fence.
+    BeforeCorrectionCommit,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

@@ -177,6 +177,20 @@ that commits its keys' entries and its progress together, so a restart resumes
 after the last committed page: the ledger walk in `(group, key)` order, then the
 node's rows in primary-key order.
 
+A correction runs for each aggregate as a row of the build-chunk queue, which
+the pass that queues the correction enqueues. The drain workers claim it as
+they claim a build chunk, behind the ring's backlog, and give it back after
+about a second of pages. The claim makes one runner per correction and
+definition at a time, the stale-claim sweep frees the row of a runner that
+died, and the claim's fence keeps a runner whose claim was reclaimed, or that
+held it across a pause and resume, from writing. A failing correction records
+its error on its row, which `status()` reports, and backs off. Charged
+failures pause its definition, whose resume rebuilds it from the source, and
+until that resume the row and the correction stay queued as the record of why.
+No other correction, definition or source waits on it. A `catching_up`
+definition gets its row once it is `live`, and the correction stays queued
+until then.
+
 A change staged before the DDL can still be in the ring when the correction
 runs. The correction starts by stamping the definition's `build_seg`, as a
 rebuild does: a page with a batch at or below it re-derives its keys from the

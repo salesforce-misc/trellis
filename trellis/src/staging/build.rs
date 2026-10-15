@@ -1118,7 +1118,7 @@ pub const CHUNK_APPLICATION_NAME: &str = "trellis build chunk";
 pub const MERGE_APPLICATION_NAME: &str = "trellis build merge";
 
 /// The `transform_definitions.build` word of a running Re-derive build.
-const BUILD_REDERIVE: &str = "rederive";
+pub(crate) const BUILD_REDERIVE: &str = "rederive";
 
 /// The shape a Re-derive build serves, if `definition` has one (see the
 /// module doc's "Shapes").
@@ -2055,7 +2055,7 @@ async fn capture_images(
 /// Gives `chunk`'s claim back without a charge, to be claimed again after
 /// `delay` (a field build's plan job waiting on capture). A claim already
 /// reclaimed from `claimed_by` is left to its new holder.
-async fn defer_claim(
+pub(crate) async fn defer_claim(
     pool: &Pool,
     chunk: &ClaimedChunk,
     claimed_by: &str,
@@ -2115,7 +2115,8 @@ impl Step {
 
 /// One step of the Re-derive builds' work for a drain worker, which runs it
 /// after its segments (#625 B6): a merge when a building target has group
-/// deltas, else a plan job, else one chunk or a sweep batch run if the
+/// deltas, else a plan job, else one chunk, a sweep batch run or a
+/// partition correction's turn (`super::partition_correction`) if the
 /// ring's backlog allows ([`chunk_allowed`]). A building definition with
 /// nothing left to do is moved to `live` ([`try_complete`]).
 ///
@@ -2174,7 +2175,11 @@ pub async fn work_once(
                 &**client,
                 claimed_by,
                 1,
-                &[chunk_queue::KIND_REDERIVE, chunk_queue::KIND_SWEEP],
+                &[
+                    chunk_queue::KIND_REDERIVE,
+                    chunk_queue::KIND_SWEEP,
+                    chunk_queue::KIND_CORRECTION,
+                ],
             )
             .await?
         };
@@ -2377,6 +2382,22 @@ pub async fn run_claimed(
         }
         ChunkWork::Sweep { cursor } => {
             run_sweep(pool, chunk, claimed_by, cursor.clone(), options).await
+        }
+        ChunkWork::Correction { correction_id } => {
+            super::partition_correction::run_chunk(
+                pool,
+                chunk,
+                *correction_id,
+                claimed_by,
+                options.heartbeat_interval,
+                options.reclaim_ttl,
+                &super::partition_correction::Options {
+                    page_keys: super::partition_correction::DEFAULT_PAGE_KEYS,
+                    max_pages: Some(super::partition_correction::CLAIM_PAGES),
+                },
+                &mut super::partition_correction::Outcome::default(),
+            )
+            .await
         }
         work => Err(ChunkQueueError::UnknownKind {
             kind: work.kind().to_string(),
@@ -3631,6 +3652,7 @@ pub async fn settle_builds(pool: &Pool) {
                     chunk_queue::KIND_PLAN,
                     chunk_queue::KIND_REDERIVE,
                     chunk_queue::KIND_SWEEP,
+                    chunk_queue::KIND_CORRECTION,
                 ],
             )
             .await
@@ -3667,7 +3689,7 @@ async fn deferred(pool: &Pool, chunk: &ClaimedChunk) -> bool {
         .query_one(
             "select exists (select 1 from backfill_chunks \
              where id = $1 and not done and claimed_by is null and lo is null \
-               and (fields is not null or fence_xid is not null) \
+               and (fields is not null or fence_xid is not null or kind = 'correction') \
                and next_attempt_at > now())",
             &[&chunk.id],
         )
