@@ -55,6 +55,7 @@
 #![cfg_attr(not(feature = "internals"), allow(dead_code))]
 
 pub mod columns;
+pub mod complement;
 pub mod install;
 pub mod partitions;
 pub mod reconcile;

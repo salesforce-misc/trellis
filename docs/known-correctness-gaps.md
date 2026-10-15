@@ -115,6 +115,7 @@ These are the tools the entries refer to:
 | 24 | A trigger or constraint refusing a change only when two separate pairs of definitions apply it | no (the drain fails) | `drain_failure` and `self_check` | none |
 | 25 | A `MERGE` moving a row to another partition, once partitioned sources are supported (#897) | yes | `self_check` (1-1 targets only) | none; reported to Postgres (#942) |
 | 26 | A partitioned source renamed away and back within one pass, once partitioned sources are supported (#897) | yes | no | none filed |
+| 27 | A `DEFAULT` partition beside a leaf created and dropped within one pass, once partitioned sources are supported (#897) | yes | no | none filed |
 
 ## 1. A rewriting `ALTER COLUMN TYPE … USING`
 
@@ -780,6 +781,31 @@ resume them.
 **Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
 `request_backfill` it.
 
+## 27. A `DEFAULT` partition beside a leaf created and dropped within one pass
+
+**Trigger:** on a partitioned source, a leaf created beside a `DEFAULT`
+partition (under the same parent), written through the parent, and dropped
+or detached before the staging worker's next reconcile pass. It applies once
+partitioned sources are supported (epic #897). A leaf that is still there
+when a pass runs is recorded, and its later drop or detach is corrected.
+Without a `DEFAULT` beside it, every pass's sweep for groups that route to no
+partition finds the groups such a leaf leaves behind and corrects them.
+
+**Effect:** silent. The removed rows stay counted in their groups. Neither
+fingerprint of the pass sees a leaf that came and went between two passes,
+and the sweep has nothing to search: the `DEFAULT` takes every row its
+siblings don't, so no group routes to no partition.
+
+**Detected?** No.
+
+**Planned work:** none.
+
+**Workaround:** delete a short-lived leaf's rows through the parent before
+dropping or detaching it, or keep the leaf until a reconcile pass has run.
+
+**Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
+`request_backfill` it.
+
 ## Repair caveats
 
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
@@ -924,8 +950,9 @@ refusing them up front:
   never seen, which is entry 5. Capture's
   window before the pass sees row-level security is entry 11. Once
   partitioned sources are supported (#897), a `MERGE` that moves a row
-  between partitions is entry 25, and a partitioned source renamed away and
-  back between two passes is entry 26.
+  between partitions is entry 25, a partitioned source renamed away and
+  back between two passes is entry 26, and a leaf created and dropped
+  between two passes beside a `DEFAULT` partition is entry 27.
 * **A capture function's privilege revoked, or the function made
   `SECURITY INVOKER`.** This is loud rather than silent: every write to the
   captured table fails, naming the capture function, so no change is lost.

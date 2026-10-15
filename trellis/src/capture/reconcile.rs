@@ -21,7 +21,9 @@
 //! hierarchy": the pass fingerprints its tree, pauses the readers it stopped
 //! complying for, and records the tree and the corrections for its partition
 //! maintenance once capture covers every node ([`super::partitions`], ADR-0017
-//! P3). While that gate is closed, the check above pauses its readers.
+//! P3). Then it sweeps the source for groups that route to no current leaf
+//! and queues their correction ([`super::complement`], P7). While that gate
+//! is closed, the check above pauses its readers.
 //!
 //! Before it regenerates a table's functions, the pass pauses every
 //! definition that reads a column the table no longer has (#622 C6,
@@ -140,6 +142,9 @@ pub struct PassOutcome {
     /// fingerprint changed, none was stored, the process had not yet checked
     /// it, or it was non-compliant (ADR-0017, [`super::partitions`]).
     pub partition_deep_checks: Vec<String>,
+    /// Each partitioned source's every-pass sweep for groups that route to
+    /// no current leaf ([`super::complement`]).
+    pub partition_sweeps: Vec<(String, super::complement::Sweep)>,
 }
 
 /// One pass: brings every table in `desired` (the tables some definition
@@ -302,6 +307,20 @@ pub async fn reconcile(
                             crate::instance_log::info!(table = %table, corrections = queued, "partition maintenance detected; corrections queued");
                         }
                         Ok(_) => {}
+                        Err(err) => {
+                            outcome.failed.push((table.clone(), err));
+                            continue;
+                        }
+                    }
+                    // ADR-0017 P7: groups that route to no current leaf, which
+                    // a leaf created and dropped between two passes leaves.
+                    match super::complement::sweep(client, schema, &snapshot.catalog, table).await {
+                        Ok(sweep) => {
+                            if sweep.queued {
+                                crate::instance_log::info!(table = %table, "groups that route to no partition found; correction queued");
+                            }
+                            outcome.partition_sweeps.push((table.clone(), sweep));
+                        }
                         Err(err) => {
                             outcome.failed.push((table.clone(), err));
                             continue;

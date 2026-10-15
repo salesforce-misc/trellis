@@ -105,6 +105,11 @@
 //! it has re-derived its keys and recorded its progress, before it commits.
 //! A test runs the correction inside [`with_scope`].
 //!
+//! A partitioned source's every-pass sweep (`crate::capture::complement`)
+//! fires [`PausePoint::AfterSweepCatalogRead`] for the source after its
+//! catalog reads, before its search (#1066). A test runs the reconcile pass
+//! inside [`with_scope`].
+//!
 //! A later part that replaces a step moves its hook with it.
 //!
 //! # Stalls
@@ -236,6 +241,13 @@ pub enum PausePoint {
     /// target (`super::partition_correction`, ADR-0017 P4a). The page holds
     /// its keys' entry locks and its row's claim fence.
     BeforeCorrectionCommit,
+    /// After the every-pass sweep of a partitioned source has read the
+    /// lifecycle fingerprint, the bounds and the queued corrections, before
+    /// it searches the targets, for the source's unquoted `schema.table`
+    /// (`capture::complement`, #1066). The sweep's `READ COMMITTED`
+    /// transaction holds no lock, so a leaf can be created, written and
+    /// drained here.
+    AfterSweepCatalogRead,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

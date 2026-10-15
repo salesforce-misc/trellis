@@ -176,6 +176,9 @@ pub enum Kind {
     /// one that has started may have walked past the rows the truncate
     /// removed.
     Truncated,
+    /// Correct the groups that route to no current leaf, by the complement
+    /// text the every-pass sweep found groups in ([`super::complement`]).
+    Complement,
 }
 
 impl Kind {
@@ -184,6 +187,7 @@ impl Kind {
             Kind::NewLeaf => "new_leaf",
             Kind::GoneNode => "gone_node",
             Kind::Truncated => "truncated",
+            Kind::Complement => "complement",
         }
     }
 }
@@ -941,6 +945,16 @@ async fn read_live(
         .filter(|n| n.partitioned)
         .map(|n| i64::from(n.oid))
         .collect();
+    let keys = read_keys(client, &partitioned).await?;
+    Ok(live_from(tree, &inherits, keys))
+}
+
+/// The partition-key columns of each of the partitioned nodes `partitioned`,
+/// with their types and collations, in key order.
+pub(crate) async fn read_keys(
+    client: &impl GenericClient,
+    partitioned: &[i64],
+) -> Result<Vec<Key>, tokio_postgres::Error> {
     let rows = client
         .query(
             "select p.partrelid::bigint, a.attname::text, \
@@ -960,7 +974,7 @@ async fn read_live(
             &[&partitioned],
         )
         .await?;
-    let keys = rows
+    Ok(rows
         .iter()
         .map(|r| Key {
             node: r.get::<_, i64>(0) as u32,
@@ -968,8 +982,7 @@ async fn read_live(
             pg_type: r.get(2),
             collation: r.get(3),
         })
-        .collect();
-    Ok(live_from(tree, &inherits, keys))
+        .collect())
 }
 
 /// Fetches `pg_get_partition_constraintdef` of each of `oids`, `Some(map)`
