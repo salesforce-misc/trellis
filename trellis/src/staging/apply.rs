@@ -7158,6 +7158,12 @@ pub struct ApplyPlan {
     /// clean drain clears the counters for the keys it just applied", for
     /// every definition the key isn't poisoned for (#799).
     applied_keys: Vec<(String, String)>,
+    /// How many of those keys were an automatic retry of a held key (#861),
+    /// set when the page clears their death counters
+    /// ([`quarantine::clear_key_deaths`]) and counted by
+    /// [`flush_apply_metrics`] once the page commits. Shared, so a clone of
+    /// the plan sees the same count.
+    retries_succeeded: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Issue #30's reverse recompute: when a *to-side* (related) row changed,
     /// each `(from_table, from_key_text, hop_gen)` here is a from-side row
     /// whose relationship enrichment depends on that changed related row and
@@ -9115,6 +9121,7 @@ pub(super) async fn compute_page(
         aggregate_clears,
         poisoned_park,
         applied_keys,
+        retries_succeeded: Default::default(),
         reverse_recomputes,
         transform_observations,
         end_to_end_origins: terminal_end_to_end_origins,
@@ -9145,6 +9152,12 @@ pub(super) async fn compute_page(
 /// inline, since both hand it the exact same `&ApplyPlan` shape regardless
 /// of how many segments that attempt coalesced.
 fn flush_apply_metrics(plan: &ApplyPlan) {
+    let retried = plan
+        .retries_succeeded
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if retried > 0 {
+        crate::metrics::increment_held_key_retries_succeeded(retried);
+    }
     for observation in &plan.transform_observations {
         if let Some(src_changed) = observation.src_changed {
             let latency = std::time::SystemTime::now()
@@ -11083,7 +11096,9 @@ pub(crate) async fn apply_page(
     // 4b. Issue #16: a clean drain clears the death counters for every key
     // it just applied (not the poisoned ones it parked above) — doc 06's
     // "clean drain clears counters for keys it applied."
-    quarantine::clear_key_deaths(txn, &plan.applied_keys).await?;
+    let retried = quarantine::clear_key_deaths(txn, &plan.applied_keys).await?;
+    plan.retries_succeeded
+        .store(retried, std::sync::atomic::Ordering::Relaxed);
 
     // 5. Completion: release each coalesced segment's claim and mark its
     // buckets drained, in one statement per segment — inherently per-segment

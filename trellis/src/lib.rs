@@ -186,6 +186,7 @@ pub use numeric::Numeric;
 #[cfg(feature = "otlp")]
 pub use otel::OtelError;
 pub use pool::Pool;
+pub use staging::quarantine::HeldKeyRetry;
 pub use staging::{
     CaptureFault, Divergence, DrainFailure, HeldKeys, SelfCheckJob, SelfCheckJobState,
     SelfCheckMode, SelfCheckOutcome, SelfCheckReport, UnindexedJoin,

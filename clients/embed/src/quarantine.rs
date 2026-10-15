@@ -246,6 +246,8 @@ mod tests {
             src_table: "public.orders".to_string(),
             key: key.to_string(),
             error_message: "integer out of range".to_string(),
+            retry_attempts: 0,
+            next_retry_at: None,
         }
     }
 

@@ -88,6 +88,12 @@ below, and the histograms above, also carries the `trellis_instance` label
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)), so a nonzero rate means a
   holder stayed in it too long, or column pauses became a hot path. Each timeout failed
   one call with a retryable error; nothing is retried in a loop.
+* `held_key_retries_total` and `held_key_retries_succeeded_total` — held keys the
+  staging worker released on its own ([the automatic retry](decisions/0003-quarantine-storage-and-api.md#retry-policy),
+  off unless `TrellisOptions::held_key_retry` is set), and the retries whose key then applied
+  cleanly and left quarantine. The difference is the retries that were poisoned again, or
+  have not drained yet. The first counts a pass's releases; the second counts on the page that
+  clears the key, in whichever process drains it.
 * `staging_segments{state}` — a cheap system-level gauge counting segments by
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
   chosen over a per-transform depth gauge for lower cost. The staging worker
@@ -332,8 +338,11 @@ quarantine, whatever its status: how many, and when the one held longest was poi
 A held key's target row stays as it was, and a key with changes parked holds back every
 watermark token taken since, so `await_converged` and `self_check` don't converge past it
 until it is released. A finished `self_check` job's report carries the same `held_keys`, so a
-`live` transform can't hide one. `Trellis::sample_quarantined` lists the keys and their
-errors; fix the cause and release each with `Trellis::release_key`, or resume the
+`live` transform can't hide one. With the automatic retry on, `held_keys` also carries
+`max_retry_attempts`, the most retries any held key has had, and `next_retry_at`, the earliest
+time one is due (reported by a connection with `held_key_retry` set; `self_check` reports
+none), and each `sample_quarantined` row carries its `retry_attempts` and `next_retry_at`.
+`Trellis::sample_quarantined` lists the keys and their errors; fix the cause and release each with `Trellis::release_key`, or resume the
 transform ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
 
 `drain_failure` on `DefinitionStatus` is set while the drain keeps failing on a page

@@ -679,23 +679,31 @@ pub(super) async fn park_batch_contribution(
 pub(super) async fn clear_key_deaths(
     txn: &Transaction<'_>,
     keys: &[(String, String)],
-) -> Result<(), ApplyError> {
+) -> Result<u64, ApplyError> {
     if keys.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let src_tables: Vec<&str> = keys.iter().map(|(t, _)| t.as_str()).collect();
     let ks: Vec<&str> = keys.iter().map(|(_, k)| k.as_str()).collect();
-    txn.execute(
-        "delete from key_deaths d \
-         using unnest($1::text[], $2::text[]) as u(src_table, key) \
-         where d.src_table = u.src_table and d.key = u.key \
-           and not exists (select 1 from poison p \
-                           where p.transform_id = d.transform_id \
-                             and p.src_table = d.src_table and p.key = d.key)",
-        &[&src_tables, &ks],
-    )
-    .await?;
-    Ok(())
+    // A cleared counter that carried a retry count (#861) is an automatic
+    // retry of a held key that applied cleanly: the caller counts it once the
+    // page commits.
+    let retried = txn
+        .query_one(
+            "with cleared as (\
+                 delete from key_deaths d \
+                 using unnest($1::text[], $2::text[]) as u(src_table, key) \
+                 where d.src_table = u.src_table and d.key = u.key \
+                   and not exists (select 1 from poison p \
+                                   where p.transform_id = d.transform_id \
+                                     and p.src_table = d.src_table and p.key = d.key) \
+                 returning d.retry_attempts) \
+             select count(*) filter (where retry_attempts > 0) from cleared",
+            &[&src_tables, &ks],
+        )
+        .await?
+        .get::<_, i64>(0);
+    Ok(u64::try_from(retried).unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------
@@ -796,11 +804,13 @@ async fn evict_key(
          death threshold, and every other definition reading it keeps applying it"
     );
     txn.execute(
-        "insert into poison (transform_id, src_table, key, last_error, sqlstate) \
-         values ($1, $2, $3, $4, $5) \
+        "insert into poison (transform_id, src_table, key, last_error, sqlstate, retry_attempts) \
+         values ($1, $2, $3, $4, $5, coalesce( \
+             (select retry_attempts from key_deaths \
+              where transform_id = $1 and src_table = $2 and key = $3), 0)) \
          on conflict (transform_id, src_table, key) do update set \
              last_error = excluded.last_error, sqlstate = excluded.sqlstate, \
-             poisoned_at = now()",
+             poisoned_at = now(), retry_attempts = excluded.retry_attempts",
         &[
             &culprit.transform_id,
             &probe.canonical_src_table,
@@ -916,9 +926,9 @@ pub(crate) fn describe_charged_keys(charged: &[ChargedKey], threshold: i32) -> S
 /// row-level `threshold`: the one place that decision is made. Both the
 /// partition of a page's charges ([`partition_by_threshold`]) and the
 /// eviction's re-check under the definition's row lock
-/// ([`still_charged_to_threshold`], #880) ask it, so a key whose threshold
-/// isn't the global one (#861's retried key, poisoned on its first failure)
-/// changes here and nowhere else.
+/// ([`still_charged_to_threshold`], #880) ask it. A retried key (#861) is
+/// poisoned on its first failure without a different threshold: its retry's
+/// release wrote its `deaths` one below this one ([`release_key_as`]).
 fn crosses_threshold(_probe: &PoisonedProbe, deaths: i32, threshold: i32) -> bool {
     deaths >= threshold
 }
@@ -5219,6 +5229,24 @@ pub async fn release_key(
     src_table: &str,
     key: &str,
 ) -> Result<usize, ApplyError> {
+    release_key_as(pool, transform, src_table, key, false).await
+}
+
+/// [`release_key`], or, with `retry`, the release of the automatic retry
+/// ([`retry_held_keys`], #861). A retry carries the key's attempt count
+/// through the release: it writes the key's death counter one below the
+/// death threshold, with the count plus one, so the key is poisoned again on
+/// its first failure ([`still_charged_to_threshold`] and
+/// [`partition_by_threshold`] read the counter, #880), and the new `poison`
+/// row keeps the count ([`evict_key`]) for the longer backoff. An
+/// operator's release deletes the counter, count included.
+async fn release_key_as(
+    pool: &Pool,
+    transform: &str,
+    src_table: &str,
+    key: &str,
+    retry: bool,
+) -> Result<usize, ApplyError> {
     // Issue #283: quarantine's tables are keyed canonically, but this is an
     // operator entry point that may be handed either spelling of a source.
     // Matching the set of both is what keeps a release total either way — a
@@ -5263,7 +5291,7 @@ pub async fn release_key(
         .query(
             "delete from poison \
              where transform_id = $3 and src_table = any($1::text[]) and key = $2 \
-             returning src_table",
+             returning src_table, retry_attempts",
             &[&names, &key, &transform_id],
         )
         .await?;
@@ -5326,6 +5354,26 @@ pub async fn release_key(
         &[&names, &key, &transform_id],
     )
     .await?;
+    if retry {
+        let attempts = marked
+            .iter()
+            .map(|row| row.get::<_, i32>(1))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        txn.execute(
+            "insert into key_deaths (transform_id, src_table, key, deaths, retry_attempts) \
+             values ($1, $2, $3, $4, $5)",
+            &[
+                &transform_id,
+                &names[0],
+                &key,
+                &(DEFAULT_DEATH_THRESHOLD - 1).max(0),
+                &attempts,
+            ],
+        )
+        .await?;
+    }
     // Issue #754: the `Recompute` builds no reverse record, so a to-one
     // projection of this table hears about the parked changes only here.
     // A parked change's ring rows stay in its segment, at or below the held
@@ -5479,6 +5527,154 @@ pub(crate) async fn release_retyped_keys(pool: &Pool) -> Result<(), ApplyError> 
 pub(crate) const RETYPE_RELEASE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(2 * crate::locks::LOCK_TIMEOUT.as_secs());
 
+/// The opt-in automatic retry of held keys (#861,
+/// [`TrellisOptions::held_key_retry`](crate::TrellisOptions::held_key_retry)).
+///
+/// The staging worker releases a held key on its own once it has been held
+/// for its backoff: `initial_backoff` after the key was poisoned, doubling
+/// with every retry that is poisoned again, up to `max_backoff`. A key whose
+/// cause went away (a parent row arriving, a constraint fixed, a value that
+/// fits again) then leaves quarantine without an operator; one that is still
+/// bad is poisoned again on its first failure, with the longer backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldKeyRetry {
+    /// How long a key is held before its first retry. Default one minute.
+    pub initial_backoff: std::time::Duration,
+    /// The longest a key is held between retries. Default 24 hours.
+    pub max_backoff: std::time::Duration,
+    /// The most keys one pass releases, so a pass never stages a flood of
+    /// recomputes at once. The pass runs on the housekeeping cadence
+    /// ([`ClientOptions::housekeeping_interval`](crate::ClientOptions::housekeeping_interval)).
+    /// Default 100.
+    pub batch: usize,
+}
+
+impl Default for HeldKeyRetry {
+    fn default() -> Self {
+        Self {
+            initial_backoff: std::time::Duration::from_secs(60),
+            max_backoff: std::time::Duration::from_secs(24 * 60 * 60),
+            batch: 100,
+        }
+    }
+}
+
+impl HeldKeyRetry {
+    /// How long a key that has been retried `attempts` times is held before
+    /// its next retry: `initial_backoff * 2^attempts`, capped at
+    /// `max_backoff`.
+    pub fn backoff(&self, attempts: u32) -> std::time::Duration {
+        let factor = 1u32.checked_shl(attempts).unwrap_or(u32::MAX);
+        self.initial_backoff
+            .checked_mul(factor)
+            .unwrap_or(self.max_backoff)
+            .min(self.max_backoff)
+    }
+}
+
+/// The SQL that is `poison`'s (alias `p`) due time under a retry policy, the
+/// parameters numbered `initial` and `cap` the backoffs in seconds:
+/// [`HeldKeyRetry::backoff`] in SQL, after `poisoned_at`.
+pub(crate) fn retry_due_sql(initial: u8, cap: u8) -> String {
+    format!(
+        "(p.poisoned_at + least(${initial}::float8 \
+           * power(2::float8, least(p.retry_attempts, 60)), ${cap}::float8) \
+           * interval '1 second')"
+    )
+}
+
+/// What one [`retry_held_keys`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetryPass {
+    /// Keys the pass released.
+    pub released: usize,
+    /// The pass found the drain behind (the ring's backlog bound, as for a
+    /// build chunk, `build::chunk_allowed`) and released nothing.
+    pub yielded: bool,
+}
+
+/// One pass of the automatic retry (#861): releases up to `policy.batch` of
+/// the held keys that are due, the longest-held first, each through the same
+/// path as [`release_key`] (it bumps the key's table fence, locks the
+/// definition row and stages one `Recompute`) with the attempt count carried
+/// ([`release_key_as`]). `now` is the time due is judged at: `None` for the
+/// database's clock, a time for a test to drive the pass.
+///
+/// The pass yields to the drain: while the ring holds more than twice
+/// `drain_batch_cap` sealed rows, or has no free slot, it releases nothing
+/// ([`build::chunk_allowed`](super::build::chunk_allowed)), so retries never
+/// compete with live changes. A definition that is paused or quarantined
+/// keeps its keys held, as a resume releases them. A key whose release fails
+/// (a lock timeout, say) is left for the next pass.
+pub async fn retry_held_keys(
+    pool: &Pool,
+    policy: &HeldKeyRetry,
+    drain_batch_cap: usize,
+    now: Option<SystemTime>,
+) -> Result<RetryPass, ApplyError> {
+    let due = {
+        let client = pool.get().await?;
+        match super::build::chunk_allowed(&**client, drain_batch_cap).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(RetryPass {
+                    released: 0,
+                    yielded: true,
+                });
+            }
+            Err(crate::defs::chunk_queue::ChunkQueueError::Db(err)) => return Err(err.into()),
+            Err(_) => return Ok(RetryPass::default()),
+        }
+        client
+            .query(
+                &format!(
+                    "select split_part(t.target_table, '.', 2), p.src_table, p.key \
+                     from poison p join transform_definitions t on t.id = p.transform_id \
+                     where {} and {due} <= coalesce($3::timestamptz, now()) \
+                     order by {due}, p.transform_id, p.src_table, p.key \
+                     limit $4",
+                    not_frozen_sql(),
+                    due = retry_due_sql(1, 2),
+                ),
+                &[
+                    &policy.initial_backoff.as_secs_f64(),
+                    &policy.max_backoff.as_secs_f64(),
+                    &now,
+                    &i64::try_from(policy.batch).unwrap_or(i64::MAX),
+                ],
+            )
+            .await?
+    };
+    let mut released = 0;
+    for row in due {
+        let transform: String = row.get(0);
+        let src_table: String = row.get(1);
+        let key: String = row.get(2);
+        match release_key_as(pool, &transform, &src_table, &key, true).await {
+            Ok(_) => released += 1,
+            // Released by an operator or dropped meanwhile.
+            Err(ApplyError::KeyNotHeld { .. } | ApplyError::TransformNotFound { .. }) => {}
+            Err(err) => {
+                crate::instance_log::warn!(
+                    transform = %transform,
+                    src_table = %src_table,
+                    key = %key,
+                    error = %err,
+                    "couldn't retry a held key; trying again next pass"
+                );
+            }
+        }
+    }
+    if released > 0 {
+        crate::metrics::increment_held_key_retries(released as u64);
+        crate::instance_log::info!(released, "retried held keys whose backoff was up");
+    }
+    Ok(RetryPass {
+        released,
+        yielded: false,
+    })
+}
+
 /// The keys one definition holds in quarantine (#759): its `poison` rows,
 /// each a source key whose changes the definition's apply leaves out until
 /// a release ([`release_key`]), a resume or a drop. `None` where a
@@ -5493,6 +5689,16 @@ pub struct HeldKeys {
     /// last poisoned. A key poisoned again (after a release, or a drain that
     /// charged it again) counts from then.
     pub oldest_poisoned_at: SystemTime,
+    /// The most automatic retries ([`HeldKeyRetry`]) any held key has had
+    /// since it last applied cleanly; 0 if the option is off or none has
+    /// been retried.
+    pub max_retry_attempts: u32,
+    /// When the next automatic retry of any of these keys is due, which
+    /// may be past if the staging worker hasn't reached it yet. `None`
+    /// where the connection that reports it has no
+    /// [`TrellisOptions::held_key_retry`](crate::TrellisOptions::held_key_retry)
+    /// (so `self_check`, which has none, never reports one).
+    pub next_retry_at: Option<SystemTime>,
 }
 
 /// The [`HeldKeys`] of definition `transform_id`, in one read of its
@@ -5503,19 +5709,29 @@ pub(crate) async fn held_keys(
 ) -> Result<Option<HeldKeys>, tokio_postgres::Error> {
     let row = client
         .query_one(
-            "select count(*), min(poisoned_at) from poison where transform_id = $1",
+            "select count(*), min(poisoned_at), coalesce(max(retry_attempts), 0) \
+             from poison where transform_id = $1",
             &[&transform_id],
         )
         .await?;
-    Ok(held_keys_from(row.get(0), row.get(1)))
+    Ok(held_keys_from(row.get(0), row.get(1), row.get(2), None))
 }
 
-/// A [`HeldKeys`] from a `count(*)` and `min(poisoned_at)` over a
-/// definition's `poison` rows; `None` when there are none.
-pub(crate) fn held_keys_from(count: i64, oldest: Option<SystemTime>) -> Option<HeldKeys> {
+/// A [`HeldKeys`] from a `count(*)`, `min(poisoned_at)` and
+/// `max(retry_attempts)` over a definition's `poison` rows, and the earliest
+/// due time under a retry policy if the caller has one; `None` when there
+/// are no rows.
+pub(crate) fn held_keys_from(
+    count: i64,
+    oldest: Option<SystemTime>,
+    max_retry_attempts: i32,
+    next_retry_at: Option<SystemTime>,
+) -> Option<HeldKeys> {
     oldest.map(|oldest_poisoned_at| HeldKeys {
         count: u64::try_from(count).unwrap_or(0),
         oldest_poisoned_at,
+        max_retry_attempts: u32::try_from(max_retry_attempts).unwrap_or(0),
+        next_retry_at,
     })
 }
 

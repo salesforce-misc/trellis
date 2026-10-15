@@ -187,6 +187,11 @@ const BUILD_CHUNK_LOCK_TIMEOUTS_METRIC: &str = "trellis_build_chunk_lock_timeout
 /// retirement the seal answers that with (`staging::seal_if_active_nonempty`).
 const SEAL_REFUSED_METRIC: &str = "trellis_seal_refused_total";
 
+/// #861: held keys the staging worker released on its own, and the retries
+/// that came out of quarantine (applied cleanly, so the key left it).
+const HELD_KEY_RETRIES_METRIC: &str = "trellis_held_key_retries_total";
+const HELD_KEY_RETRIES_SUCCEEDED_METRIC: &str = "trellis_held_key_retries_succeeded_total";
+
 /// #922: waits for the column-pause lock (`locks::lock_column_pauses`) that
 /// ran out the transaction's `lock_timeout`, labeled `op` (`pause`, `resume`,
 /// `fuse`, `cascade`, `define`, `drop`, `alter`, `capture`). Nonzero means a
@@ -334,6 +339,19 @@ pub fn increment_seal_refused() {
     metrics::counter!(SEAL_REFUSED_METRIC, INSTANCE_LABEL => instance()).increment(1);
 }
 
+/// Counts held keys the automatic retry released (#861).
+pub fn increment_held_key_retries(count: u64) {
+    ensure_installed();
+    metrics::counter!(HELD_KEY_RETRIES_METRIC, INSTANCE_LABEL => instance()).increment(count);
+}
+
+/// Counts automatic retries whose key stayed out of quarantine (#861).
+pub fn increment_held_key_retries_succeeded(count: u64) {
+    ensure_installed();
+    metrics::counter!(HELD_KEY_RETRIES_SUCCEEDED_METRIC, INSTANCE_LABEL => instance())
+        .increment(count);
+}
+
 /// The process-wide recorder handle, built and installed on first use. See
 /// the module doc comment's "Recorder installation" section.
 fn handle() -> &'static PrometheusHandle {
@@ -419,6 +437,14 @@ fn describe_metrics() {
     metrics::describe_counter!(
         SEAL_REFUSED_METRIC,
         "Count of seals refused because the staging ring had no free slot."
+    );
+    metrics::describe_counter!(
+        HELD_KEY_RETRIES_METRIC,
+        "Count of held keys the staging worker released on its own for a retry."
+    );
+    metrics::describe_counter!(
+        HELD_KEY_RETRIES_SUCCEEDED_METRIC,
+        "Count of automatic retries whose key applied cleanly and left quarantine."
     );
     metrics::describe_histogram!(
         TRANSFORM_LATENCY_METRIC,
@@ -928,6 +954,8 @@ mod tests {
         increment_build_chunk_lock_timeouts();
         increment_column_pause_lock_timeouts("pause");
         increment_seal_refused();
+        increment_held_key_retries(1);
+        increment_held_key_retries_succeeded(1);
         record_transform_latency("t", Duration::from_millis(1));
         record_end_to_end_latency("t", Duration::from_millis(1));
         increment_changes_applied("t", 1);
@@ -1044,6 +1072,8 @@ mod tests {
                 BUILD_CHUNK_LOCK_TIMEOUTS_METRIC,
                 COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC,
                 SEAL_REFUSED_METRIC,
+                HELD_KEY_RETRIES_METRIC,
+                HELD_KEY_RETRIES_SUCCEEDED_METRIC,
                 TRANSFORM_LATENCY_METRIC,
                 END_TO_END_LATENCY_METRIC,
                 CHANGES_APPLIED_METRIC,

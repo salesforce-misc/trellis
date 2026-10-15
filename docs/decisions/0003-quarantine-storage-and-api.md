@@ -436,6 +436,31 @@ reclaimed them and committed the page can't be left a stale row. A transient fai
 including a storm of them that stops isolation, is never recorded: retrying is how it
 resolves.
 
+A held key can be retried automatically, which is off by default
+(`TrellisOptions::held_key_retry`: an initial backoff, a cap and a batch size; one minute,
+24 hours and 100 keys by default). The staging worker's housekeeping pass releases the held
+keys that are due, the longest-held first, through the same release as `Trellis::release_key`:
+it bumps the key's table fence, locks the definition row and stages one `Recompute`. A key
+is due once `initial * 2^attempts` (at most the cap) has passed since `poisoned_at`, where
+`attempts` is how many times it has been retried since it last applied cleanly, so a key
+that is still bad backs off further each time. The schedule is derived, not stored, so a
+change to the option applies to keys already held. A paused or quarantined definition keeps
+its keys held, as a resume releases them. The pass yields to the drain, as a build chunk
+does: while the ring has more than twice `drain_batch_cap` sealed rows undrained, or no free
+slot, it releases nothing.
+
+A retried key that fails again is poisoned on its first failure, not after the death
+threshold. The retry's release writes the key's `key_deaths` row one below the threshold with
+`retry_attempts` one higher, which carries the count through the release; the drain's
+threshold test and the eviction's re-check under the definition-row lock
+(`still_charged_to_threshold`) both read that row, so they need no notion of a retry, and an
+eviction that charged the key before the release still finds the release's row below the
+threshold and poisons nothing. The eviction copies the count onto the new `poison` row. A
+clean apply of the key deletes its `key_deaths` row, which ends a successful retry's state,
+and an operator's release, a resume and a drop delete it too. `status().held_keys` and
+`sample_quarantined` report the attempt count and the next retry time, and the metrics count
+retries attempted and succeeded ([Observability](../observability.md)).
+
 `poison` and `poison_held` are where evicted work waits until it is released, or its
 transform is resumed or dropped ([Releasing held keys](#releasing-held-keys)); nothing
 moves entries elsewhere by age. A held key's parked work is one row, so it doesn't grow

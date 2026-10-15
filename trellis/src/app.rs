@@ -131,7 +131,7 @@ use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::holdup::DrainFailure;
-use crate::staging::quarantine::{self, HeldKeys};
+use crate::staging::quarantine::{self, HeldKeyRetry, HeldKeys};
 use crate::staging::self_check::{SelfCheckError, SelfCheckMode};
 use crate::staging::self_check_job::{self, SelfCheckJob};
 use crate::staging::unindexed_joins::{self, UnindexedJoin};
@@ -199,6 +199,24 @@ pub struct TrellisOptions {
     /// out 30 seconds.
     #[doc(hidden)]
     pub call_deadline: Option<Duration>,
+    /// Retries held quarantine keys automatically (#861). `None` (the
+    /// default) retries nothing: a key stays held until an operator releases
+    /// it ([`Trellis::release_key`]) or the definition is resumed.
+    ///
+    /// With a [`HeldKeyRetry`], the staging worker (`staging` set)
+    /// releases each held key once its backoff is up, the same release as
+    /// [`Trellis::release_key`], so a key whose cause went away (a parent row
+    /// arriving later, a constraint that was fixed, a value that fits again)
+    /// leaves quarantine on its own. A retried key that fails again is
+    /// poisoned again on its first failure, and its backoff doubles, up to
+    /// the policy's cap. The retries yield to the drain: none is released
+    /// while the ring's backlog is past the bound a build chunk waits on.
+    ///
+    /// [`Trellis::status`]'s [`HeldKeys`](crate::HeldKeys) and
+    /// [`Trellis::sample_quarantined`] report the next retry time and the
+    /// attempt count; the next retry time is reported only by a connection
+    /// with this option set.
+    pub held_key_retry: Option<HeldKeyRetry>,
 }
 
 /// A connected Trellis instance — see the [module docs](self).
@@ -218,6 +236,9 @@ pub struct Trellis {
     /// How long each public call has to finish (issue #599,
     /// `crate::deadline`).
     call_budget: Duration,
+    /// [`TrellisOptions::held_key_retry`], which `status` and
+    /// `sample_quarantined` read the next retry time under.
+    held_key_retry: Option<HeldKeyRetry>,
     /// Keeps `trellis_instance_up` at 1 for this instance until the handle
     /// is dropped or shut down.
     _running: crate::metrics::RunningInstance,
@@ -245,6 +266,7 @@ impl Trellis {
             _running: crate::metrics::RunningInstance::new(&instance),
             instance,
             call_budget: options.call_deadline.unwrap_or(crate::DEFAULT_CALL_BUDGET),
+            held_key_retry: options.held_key_retry,
             config,
             pool,
             client,
@@ -754,15 +776,24 @@ impl Trellis {
                             (select count(*) from poison p where p.transform_id = d.id) \
                               as held_count, \
                             (select min(p.poisoned_at) from poison p \
-                             where p.transform_id = d.id) as held_since \
+                             where p.transform_id = d.id) as held_since, \
+                            (select coalesce(max(p.retry_attempts), 0) from poison p \
+                             where p.transform_id = d.id) as held_retries, \
+                            (select min({due}) from poison p \
+                             where p.transform_id = d.id) as held_retry_at \
                      from transform_definitions d \
                      left join pending_backfill pb \
                        on pb.table_name = d.source_table and pb.last_error is not null \
                      {CHUNK_FAILURE_JOIN} \
                      left join capture_failures cf on cf.transform_id = d.id \
-                     where split_part(d.target_table, '.', 2) = $1"
+                     where split_part(d.target_table, '.', 2) = $1",
+                        due = quarantine::retry_due_sql(2, 3),
                     ),
-                    &[&target_table],
+                    &[
+                        &target_table,
+                        &self.held_key_retry.map(|r| r.initial_backoff.as_secs_f64()),
+                        &self.held_key_retry.map(|r| r.max_backoff.as_secs_f64()),
+                    ],
                 )
                 .await?;
             let mut status = None;
@@ -814,7 +845,12 @@ impl Trellis {
                 backfill_failure: backfill_failure(&row),
                 capture_wait,
                 capture_failure: capture_failure(&row).or(stalled),
-                held_keys: quarantine::held_keys_from(row.get("held_count"), row.get("held_since")),
+                held_keys: quarantine::held_keys_from(
+                    row.get("held_count"),
+                    row.get("held_since"),
+                    row.get("held_retries"),
+                    row.get("held_retry_at"),
+                ),
                 drain_failure,
                 unindexed_joins: unindexed,
                 build_wait: row
@@ -1188,7 +1224,7 @@ impl Trellis {
                     Some((after_src, after_key)) => {
                         client
                             .query(
-                                "select src_table, key, error from column_failures \
+                                "select src_table, key, error, 0, null::timestamptz from column_failures \
                              where transform_table = $1 and column_name = $2 \
                                and (src_table, key) > ($3, $4) \
                              order by src_table, key limit $5",
@@ -1199,7 +1235,7 @@ impl Trellis {
                     None => {
                         client
                             .query(
-                                "select src_table, key, error from column_failures \
+                                "select src_table, key, error, 0, null::timestamptz from column_failures \
                              where transform_table = $1 and column_name = $2 \
                              order by src_table, key limit $3",
                                 &[t, c, &limit],
@@ -1225,7 +1261,7 @@ impl Trellis {
                         Some((after_src, after_key)) => {
                             client
                                 .query(
-                                    "select src_table, key, last_error from poison \
+                                    "select src_table, key, last_error, retry_attempts, poisoned_at from poison \
                                  where transform_id = $1 and (src_table, key) > ($2, $3) \
                                  order by src_table, key limit $4",
                                     &[&id, after_src, after_key, &limit],
@@ -1235,7 +1271,7 @@ impl Trellis {
                         None => {
                             client
                                 .query(
-                                    "select src_table, key, last_error from poison \
+                                    "select src_table, key, last_error, retry_attempts, poisoned_at from poison \
                                  where transform_id = $1 \
                                  order by src_table, key limit $2",
                                     &[&id, &limit],
@@ -1247,10 +1283,19 @@ impl Trellis {
             };
             Ok(rows
                 .into_iter()
-                .map(|row| PoisonSample {
-                    src_table: row.get(0),
-                    key: row.get(1),
-                    error_message: row.get(2),
+                .map(|row| {
+                    let retry_attempts = u32::try_from(row.get::<_, i32>(3)).unwrap_or(0);
+                    let poisoned_at: Option<SystemTime> = row.get(4);
+                    PoisonSample {
+                        src_table: row.get(0),
+                        key: row.get(1),
+                        error_message: row.get(2),
+                        retry_attempts,
+                        next_retry_at: self
+                            .held_key_retry
+                            .zip(poisoned_at)
+                            .map(|(retry, at)| at + retry.backoff(retry_attempts)),
+                    }
                 })
                 .collect())
         })
@@ -1600,6 +1645,7 @@ impl Trellis {
             staging_worker: options.staging,
             application_threads: options.drain_threads,
             worker_threads: options.worker_threads,
+            held_key_retry: options.held_key_retry,
             ..Default::default()
         }
     }
@@ -2327,6 +2373,14 @@ pub struct PoisonSample {
     pub src_table: String,
     pub key: String,
     pub error_message: String,
+    /// How many times the automatic retry ([`TrellisOptions::held_key_retry`])
+    /// has released this key since it last applied cleanly. 0 for a column
+    /// target's rows and where none has.
+    pub retry_attempts: u32,
+    /// When the key's next automatic retry is due: `None` for a column
+    /// target's rows and where this connection has no
+    /// [`TrellisOptions::held_key_retry`].
+    pub next_retry_at: Option<SystemTime>,
 }
 
 /// Why a [`Trellis`] operation failed. Composes the crate's lower-level error
@@ -2643,6 +2697,7 @@ mod client_options_tests {
             drain_threads: 3,
             worker_threads: Some(2),
             call_deadline: None,
+            held_key_retry: None,
         };
         let client = Trellis::client_options(&options);
         assert_eq!(client.worker_threads, Some(2));

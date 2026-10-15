@@ -64,6 +64,8 @@ mod tests {
             src_table: src_table.to_string(),
             key: key.to_string(),
             error_message: "division by zero".to_string(),
+            retry_attempts: 0,
+            next_retry_at: None,
         }
     }
 

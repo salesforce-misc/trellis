@@ -484,6 +484,8 @@ mod tests {
             held_keys: Some(trellis::HeldKeys {
                 count: 3,
                 oldest_poisoned_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
+                max_retry_attempts: 0,
+                next_retry_at: None,
             }),
             drain_failure: None,
             unindexed_joins: Vec::new(),

@@ -57,6 +57,7 @@ use crate::defs::{self, CatalogError};
 use crate::error_code::{self, ErrorCode};
 use crate::intake::{self, IntakeError};
 use crate::pool::{Pool, quote_ident};
+use crate::staging::quarantine::HeldKeyRetry;
 use crate::staging::{
     self, ApplyError, HeartbeatDaemon, HeartbeatDaemonConfig, ProducerSession, SealConfig,
     StagingError,
@@ -204,6 +205,11 @@ pub struct ClientOptions {
     /// anything. The cap is per client: two clients in one process each build
     /// a runtime of this size, and no budget is shared between them.
     pub worker_threads: Option<usize>,
+    /// Retries held quarantine keys automatically (#861): the staging worker
+    /// releases each once its backoff is up, on the housekeeping cadence
+    /// ([`Self::housekeeping_interval`]). `None` (the default) retries
+    /// nothing. See [`TrellisOptions::held_key_retry`](crate::TrellisOptions::held_key_retry).
+    pub held_key_retry: Option<HeldKeyRetry>,
 }
 
 impl Default for ClientOptions {
@@ -223,6 +229,7 @@ impl Default for ClientOptions {
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
             build_chunk_rows: staging::build::DEFAULT_CHUNK_ROWS,
             worker_threads: None,
+            held_key_retry: None,
         }
     }
 }
@@ -761,6 +768,8 @@ async fn run(
             reconcile_interval: options.reconcile_interval,
             watermark: watermark.clone(),
             backfill_catch_up_timeout: BACKFILL_CATCH_UP_TIMEOUT,
+            held_key_retry: options.held_key_retry,
+            drain_batch_cap: options.drain_batch_cap,
         };
         maintenance_task = Some(tokio::spawn(maintenance_loop(
             maintenance_config,
@@ -1158,6 +1167,11 @@ struct MaintenanceConfig {
     watermark: staging::StagedWatermark,
     /// [`BACKFILL_CATCH_UP_TIMEOUT`] outside tests.
     backfill_catch_up_timeout: Duration,
+    /// [`ClientOptions::held_key_retry`].
+    held_key_retry: Option<HeldKeyRetry>,
+    /// [`ClientOptions::drain_batch_cap`], the backlog bound the retry pass
+    /// yields to.
+    drain_batch_cap: usize,
 }
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
@@ -1189,6 +1203,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         reconcile_interval,
         watermark,
         backfill_catch_up_timeout,
+        held_key_retry,
+        drain_batch_cap,
     } = config;
 
     let seal_config = SealConfig::default();
@@ -1317,6 +1333,20 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                         for (state, count) in counts {
                             crate::metrics::set_staging_segments(state.as_sql(), count as u64);
                         }
+                    }
+                }
+                if !failed && let Some(policy) = &held_key_retry {
+                    // #861: its own pool connections, and a failure is logged
+                    // and tried again at the next housekeeping, not a reason
+                    // to reconnect this session.
+                    if let Err(err) =
+                        staging::quarantine::retry_held_keys(&pool, policy, drain_batch_cap, None)
+                            .await
+                    {
+                        crate::instance_log::warn!(
+                            error = %err,
+                            "couldn't retry the held keys that are due; trying again next pass"
+                        );
                     }
                 }
                 // A failed pass is retried on the next tick, not a cadence later.
@@ -3255,6 +3285,8 @@ mod maintenance_failure_tests {
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::new(),
             backfill_catch_up_timeout: Duration::from_secs(1),
+            held_key_retry: None,
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         };
         let seal_warning = || {
             captured.0.lock().unwrap().iter().any(|e| {
@@ -3335,6 +3367,8 @@ mod maintenance_failure_tests {
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::new(),
             backfill_catch_up_timeout: Duration::from_secs(1),
+            held_key_retry: None,
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         };
         let watcher = async {
             // An event, not a convergence budget: the bound only turns a
@@ -3432,6 +3466,8 @@ mod maintenance_failure_tests {
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::new(),
             backfill_catch_up_timeout: Duration::from_secs(1),
+            held_key_retry: None,
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         };
         let watcher = async {
             // An event, not a convergence budget: the bound only turns a
@@ -4520,6 +4556,8 @@ mod backfill_shutdown_tests {
             reconcile_interval: Duration::from_secs(3600),
             watermark: staging::StagedWatermark::saturated(),
             backfill_catch_up_timeout: Duration::from_secs(600),
+            held_key_retry: None,
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         };
         let task = tokio::spawn(maintenance_loop(config, shutdown_rx));
 

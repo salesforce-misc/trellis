@@ -278,6 +278,8 @@ mod tests {
             count: 2,
             oldest_poisoned_at: std::time::UNIX_EPOCH
                 + std::time::Duration::from_micros(1_727_222_400_000_001),
+            max_retry_attempts: 0,
+            next_retry_at: None,
         });
         assert_eq!(
             PlainSelfCheckReport::from(&held).held_keys,
