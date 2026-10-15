@@ -217,6 +217,12 @@ async fn a_detached_or_dropped_leaf_is_overcounted_until_its_correction_drains()
     for kind in ["hash", "range", "list"] {
         for op in ["detach", "drop"] {
             let mut fx = Fx::start(&tree(kind)).await;
+            let rows: i64 =
+                fx.d.ctl
+                    .query_one("select count(*) from public.items_p1", &[])
+                    .await
+                    .expect("the leaf's rows")
+                    .get(0);
             match op {
                 "detach" => {
                     fx.exec("alter table public.items detach partition public.items_p1")
@@ -237,7 +243,9 @@ async fn a_detached_or_dropped_leaf_is_overcounted_until_its_correction_drains()
             );
             let outcome = fx.run(&Options::default()).await;
             assert_eq!(outcome.completed, 1, "{kind} {op}");
-            assert!(outcome.keys > 0, "{kind} {op}");
+            // The leaf's live entries, once each: a detached table's rows are
+            // not walked again (the text found their entries).
+            assert_eq!(outcome.keys, rows, "{kind} {op}");
             assert!(fx.queue().await.is_empty());
             // The correction wrote deltas; until the merger folds them the
             // groups are as they were.
@@ -754,7 +762,7 @@ async fn the_node_phase_resumes_from_its_cursor() {
 }
 
 /// `--ignored`: what a retention `DROP` of a leaf of one million rows costs
-/// (ADR-0017's "about 7 s" is an extrapolation). The leaf holds 1,000,000
+/// (ADR-0017 reports the figures). The leaf holds 1,000,000
 /// rows over 50,000 groups; its three siblings 10,000 each. Prints the time
 /// the engine takes, the time the merger takes to fold its deltas, and the
 /// WAL both wrote.
@@ -876,4 +884,63 @@ async fn a_gone_hash_leaf_whose_middle_was_dropped_after_it_is_covered_by_the_mi
             .expect("oracle")
             .get(0);
     assert_eq!(wrong, 0);
+}
+
+/// Review of #1062: a `catching_up` definition applies as a `live` one does,
+/// so a correction re-derives its keys too, instead of completing without it.
+#[tokio::test]
+async fn a_catching_up_aggregate_is_corrected() {
+    let mut fx = Fx::start(&tree("range")).await;
+    fx.exec("update transform_definitions set status = 'catching_up'")
+        .await;
+    fx.exec("drop table public.items_p1").await;
+    fx.pass().await;
+    fx.d.settle().await;
+    let outcome = fx.run(&Options::default()).await;
+    assert_eq!(outcome.completed, 1);
+    assert_eq!(
+        outcome.keys, 40,
+        "the dropped leaf's entries are re-derived"
+    );
+    fx.merge().await;
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+}
+
+/// Review of #1062: a detached leaf attached again before its correction ran
+/// has a `pg_inherits` row that is not detach-pending. Its correction runs
+/// (each key it re-derives reads the source as it is) rather than waiting
+/// for a detach that is not happening.
+#[tokio::test]
+async fn a_leaf_attached_again_before_its_correction_ran_does_not_hold_the_queue() {
+    for kind in ["hash", "range", "list"] {
+        let mut fx = Fx::start(&tree(kind)).await;
+        fx.exec("alter table public.items detach partition public.items_p2")
+            .await;
+        fx.pass().await;
+        fx.exec("update public.items_p2 set v = v + 1000").await;
+        let bound = match kind {
+            "hash" => "for values with (modulus 4, remainder 2)",
+            "range" => "for values from (8) to (12)",
+            _ => "for values in (8, 9, 10, 11)",
+        };
+        fx.exec(&format!(
+            "alter table public.items attach partition public.items_p2 {bound}"
+        ))
+        .await;
+        fx.pass().await;
+        fx.d.settle().await;
+        let queue = queued(&fx.queue().await);
+        assert_eq!(
+            queue,
+            [
+                entry("gone_node", "public.items_p2"),
+                entry("new_leaf", "public.items_p2")
+            ],
+            "{kind}"
+        );
+        let outcome = fx.run(&Options::default()).await;
+        assert_eq!(outcome.completed, 2, "{kind}");
+        fx.merge().await;
+        assert_eq!(fx.wrong_groups().await, Vec::<String>::new(), "{kind}");
+    }
 }

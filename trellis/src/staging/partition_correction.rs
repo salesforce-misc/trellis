@@ -26,11 +26,13 @@
 //!    routes to the node ([`Route`]), found through the ledger's `GROUP BY`
 //!    index (a partitioned source's aggregate always has it) in
 //!    `(group, key)` order, so a restart resumes after the last page.
-//! 2. **The node phase**, when the node still exists: the keys of its
-//!    current rows, read from the node in primary-key order, as a build
-//!    reads the source. It finds the rows a new, attached or re-attached
-//!    leaf holds that no entry knows, including rows written into it
-//!    directly before its capture existed.
+//! 2. **The node phase**, for a node in the tree: the keys of its current
+//!    rows, read from the node in primary-key order, as a build reads the
+//!    source. It finds the rows a new, attached or re-attached leaf holds
+//!    that no entry knows, including rows written into it directly before
+//!    its capture existed. A gone node needs it only without a usable text
+//!    (a detached table is then read the same way): every row of a gone node
+//!    routed by its text has its live entry found by the ledger phase.
 //!
 //! # Routing
 //!
@@ -89,7 +91,7 @@ use std::fmt;
 use tokio_postgres::{GenericClient, IsolationLevel};
 
 use crate::capture::partitions::{self, Key, PendingCorrection, Recorded};
-use crate::defs::model::{Definition, TransformStatus};
+use crate::defs::model::{APPLYING_SQL, Definition, TransformStatus};
 use crate::defs::{backfill, catalog, ddl};
 use crate::pool::{Pool, quote_ident};
 
@@ -372,12 +374,17 @@ pub async fn progress(
 }
 
 /// Runs every queued correction of `source_table` for the aggregate
-/// definitions that read it and apply (`live`, or `backfilling` under a
-/// Re-derive build), taking a correction off the queue once all of them have
-/// re-derived it. See the module doc for the order.
+/// definitions that read it and apply (`live`, `catching_up`, or
+/// `backfilling` under a Re-derive build: `defs::model::APPLYING_SQL`),
+/// taking a correction off the queue once all of them have re-derived it.
+/// See the module doc for the order.
 ///
-/// A definition that does not apply (paused, still waiting to build) is
-/// skipped: its resume or its build reads the source afresh.
+/// A definition that is frozen (paused, quarantined) or still waiting to
+/// build is skipped: its resume or its build reads the source afresh. One
+/// whose build is on the old path (`backfilling` without a Re-derive build)
+/// holds every correction in the queue until it applies: its chunks may have
+/// read the node's rows before the operation, and nothing after them reads
+/// those keys again.
 pub async fn run_pending(
     pool: &Pool,
     source_table: &str,
@@ -388,9 +395,9 @@ pub async fn run_pending(
         let client = pool.get().await?;
         partitions::pending_corrections(&**client, source_table).await?
     };
-    let definitions = readers(pool, source_table).await?;
+    let (definitions, held) = readers(pool, source_table).await?;
     for correction in &corrections {
-        let mut finished = true;
+        let mut finished = !held;
         for definition in &definitions {
             match correct(pool, definition, correction, options, &mut outcome).await? {
                 Step::Done => {}
@@ -418,25 +425,37 @@ fn budget_spent(options: &Options, outcome: &Outcome) -> bool {
     options.max_pages.is_some_and(|max| outcome.pages >= max)
 }
 
-/// The aggregate definitions reading `source_table` that apply.
-async fn readers(pool: &Pool, source_table: &str) -> Result<Vec<Definition>, CorrectionError> {
-    let ids: Vec<i64> = {
+/// The definitions reading `source_table` that apply, and whether one is
+/// under an old-path build (`backfilling` without a Re-derive build), which
+/// holds the corrections in the queue.
+async fn readers(
+    pool: &Pool,
+    source_table: &str,
+) -> Result<(Vec<Definition>, bool), CorrectionError> {
+    let (ids, held): (Vec<i64>, bool) = {
         let client = pool.get().await?;
-        client
+        let ids = client
             .query(
-                "select id from transform_definitions \
-                 where source_table = $1 and (status = $2 or (status = $3 and build = 'rederive')) \
-                 order by id",
-                &[
-                    &source_table,
-                    &TransformStatus::Live.as_str(),
-                    &TransformStatus::Backfilling.as_str(),
-                ],
+                &format!(
+                    "select id from transform_definitions \
+                     where source_table = $1 and {APPLYING_SQL} order by id"
+                ),
+                &[&source_table],
             )
             .await?
             .into_iter()
             .map(|row| row.get(0))
-            .collect()
+            .collect();
+        let held = client
+            .query_one(
+                "select exists (select 1 from transform_definitions \
+                                where source_table = $1 and status = $2 \
+                                  and build is distinct from 'rederive')",
+                &[&source_table, &TransformStatus::Backfilling.as_str()],
+            )
+            .await?
+            .get(0);
+        (ids, held)
     };
     let mut out = Vec::new();
     for id in ids {
@@ -444,14 +463,15 @@ async fn readers(pool: &Pool, source_table: &str) -> Result<Vec<Definition>, Cor
             out.push(definition);
         }
     }
-    Ok(out)
+    Ok((out, held))
 }
 
 /// What one call of [`correct`] left.
 enum Step {
     /// The definition re-derived the correction's key set.
     Done,
-    /// It waits for a detach to finalize, or for the fence to settle.
+    /// It waits for a detach to finalize or for the fence to settle, or the
+    /// definition's shape is one the engine cannot re-derive.
     Waiting,
     /// The page budget ran out.
     Stopped,
@@ -467,8 +487,10 @@ async fn correct(
     outcome: &mut Outcome,
 ) -> Result<Step, CorrectionError> {
     let Some(plan) = BuildPlan::for_definition(pool, definition).await? else {
-        // Not a shape the ledger serves: nothing to correct here.
-        return Ok(Step::Done);
+        // A shape the Re-derive build does not serve yet (an aggregate that
+        // reads a relationship): this engine cannot re-derive its keys, so
+        // the correction stays queued rather than completing uncorrected.
+        return Ok(Step::Waiting);
     };
     let ledger = plan.ledger();
     if correction.kind == partitions::Kind::GoneNode.as_str()
@@ -562,14 +584,17 @@ async fn start(
 ) -> Result<bool, CorrectionError> {
     let mut client = pool.get().await?;
     if correction.kind == partitions::Kind::GoneNode.as_str() {
-        // The node's `pg_inherits` row is there until the detach is final. A
-        // writer with an older snapshot can still write through the parent
-        // into a detach-pending leaf, and `DETACH ... FINALIZE` waits for
-        // those writers, so only a node that has left the tree has all its
-        // changes in the ring.
+        // The node's `pg_inherits` row is there, `inhdetachpending`, until
+        // the detach is final. A writer with an older snapshot can still
+        // write through the parent into a detach-pending leaf, and `DETACH
+        // ... FINALIZE` waits for those writers, so only a node that has left
+        // the tree has all its changes in the ring. A node attached again
+        // since has a row that is not pending: its correction runs, and every
+        // key it re-derives reads the source as it is.
         let pending: bool = client
             .query_one(
-                "select exists (select 1 from pg_catalog.pg_inherits where inhrelid = $1::bigint::oid)",
+                "select exists (select 1 from pg_catalog.pg_inherits \
+                                where inhrelid = $1::bigint::oid and inhdetachpending)",
                 &[&u32_param(correction.node_oid)],
             )
             .await?
@@ -678,15 +703,19 @@ struct LedgerCursor {
 
 /// The predicate selecting entries strictly after `cursor` in
 /// `(group columns, key)` order, `NULL` groups last, binding the cursor's
-/// values from `$first`. Also a seek condition on the first group column, so
-/// the index scan starts there instead of at its beginning.
+/// values from `$first`, and the seeks on the first group column that the
+/// walk reads in turn: a range condition the `GROUP BY` index starts its scan
+/// at (`>=` the cursor's value, then `is null`, which sorts last). A single
+/// `(>= or is null)` would not be an index condition, so every page would
+/// scan the index from its beginning and the walk would read a quadratic
+/// number of entries.
 fn after_cursor(
     alias: &str,
     groups: &[&str],
     types: &[String],
     cursor: &LedgerCursor,
     first_param: usize,
-) -> (String, Vec<String>) {
+) -> (String, Vec<String>, Vec<String>) {
     let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
     let mut params: Vec<String> = Vec::new();
     let mut bind = |value: &str, ty: &str| -> String {
@@ -711,21 +740,22 @@ fn after_cursor(
     }
     let bound_key = bind(&cursor.key, "text");
     any.push(and_all(&equal, &format!("{alias}.{key} > {bound_key}")));
-    let mut predicate = format!("({})", any.join(" or "));
-    if let Some(first) = groups.first() {
-        let column = format!("{alias}.{}", quote_ident(first));
-        match &cursor.groups[0] {
-            Some(_) => {
+    let predicate = format!("({})", any.join(" or "));
+    let seeks = match groups.first() {
+        Some(first) => {
+            let column = format!("{alias}.{}", quote_ident(first));
+            match &cursor.groups[0] {
                 // The first group's bind is the first parameter.
-                predicate.push_str(&format!(
-                    " and ({column} >= ${first_param}::text::{} or {column} is null)",
-                    types[0]
-                ));
+                Some(_) => vec![
+                    format!("{column} >= ${first_param}::text::{}", types[0]),
+                    format!("{column} is null"),
+                ],
+                None => vec![format!("{column} is null")],
             }
-            None => predicate.push_str(&format!(" and {column} is null")),
         }
-    }
-    (predicate, params)
+        None => vec!["true".to_string()],
+    };
+    (predicate, params, seeks)
 }
 
 fn and_all(parts: &[String], last: &str) -> String {
@@ -763,9 +793,9 @@ async fn ledger_page(
         .map(serde_json::from_str)
         .transpose()
         .map_err(|e| CorrectionError::Unroutable(format!("an unreadable cursor: {e}")))?;
-    let (after, bound) = match &cursor {
+    let (after, bound, seeks) = match &cursor {
         Some(cursor) => after_cursor("l", &groups, types, cursor, 2),
-        None => ("true".to_string(), Vec::new()),
+        None => ("true".to_string(), Vec::new(), vec!["true".to_string()]),
     };
     let group_list: Vec<String> = groups
         .iter()
@@ -778,13 +808,19 @@ async fn ledger_page(
         format!("{}, l.{key}", group_list.join(", "))
     };
     let limit = i64::try_from(page_keys.max(1)).unwrap_or(i64::MAX);
-    let select = format!(
-        "select l.{key}{}{} from {ledger} l where {live} and {predicate} and {after} \
-         order by {order} limit $1",
-        if group_text.is_empty() { "" } else { ", " },
-        group_text.join(", "),
-        ledger = ledger.ledger_ident(),
-    );
+    let selects: Vec<String> = seeks
+        .iter()
+        .map(|seek| {
+            format!(
+                "select l.{key}{}{} from {ledger} l \
+                 where {live} and {predicate} and {after} and {seek} \
+                 order by {order} limit $1",
+                if group_text.is_empty() { "" } else { ", " },
+                group_text.join(", "),
+                ledger = ledger.ledger_ident(),
+            )
+        })
+        .collect();
     let count = format!(
         "select count(*) from {ledger} l where {live} and {predicate}",
         ledger = ledger.ledger_ident(),
@@ -801,11 +837,21 @@ async fn ledger_page(
             .start()
             .await?;
         txn.batch_execute(&partitions::pinned_settings()).await?;
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&limit];
-        for value in &bound {
-            params.push(value);
+        txn.batch_execute(WALK_PLAN_SETTINGS).await?;
+        // Each seek's entries follow the previous one's in the walk's order,
+        // so the page is the first `limit` of them read in turn.
+        let mut rows = Vec::new();
+        for select in &selects {
+            let want = limit - i64::try_from(rows.len()).unwrap_or(i64::MAX);
+            if want <= 0 {
+                break;
+            }
+            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&want];
+            for value in &bound {
+                params.push(value);
+            }
+            rows.extend(txn.query(select, &params).await?);
         }
-        let rows = txn.query(&select, &params).await?;
         let total: Option<i64> = if current.keys_total.is_none() {
             Some(txn.query_one(&count, &[]).await?.get(0))
         } else {
@@ -839,10 +885,12 @@ async fn ledger_page(
         (Some(last), false) => Some(serde_json::to_string(last).expect("a cursor serializes")),
         _ => None,
     };
-    let (phase, total_estimate) = if finished {
+    let (phase, total_estimate) = if !finished {
+        (Phase::Ledger, 0)
+    } else if reads_node(correction, route) {
         (Phase::Node, node_estimate(&txn, correction).await?)
     } else {
-        (Phase::Ledger, 0)
+        (Phase::Done, 0)
     };
     // The node phase's keys join the total once the ledger phase is done.
     txn.execute(
@@ -864,6 +912,26 @@ async fn ledger_page(
     txn.commit().await?;
     Ok(i64::try_from(keys.len()).unwrap_or(i64::MAX))
 }
+
+/// Whether the correction walks the node's rows after the ledger: a node in
+/// the tree (new, attached, or a `DEFAULT` whose siblings changed), whose
+/// rows may have no entry yet, and a gone node without a usable text, which
+/// routes no entry. A gone node routed by its text needs no node phase: every
+/// row it held satisfied that text while it was in the tree, so the ledger
+/// phase found every live entry of its rows, and reading a detached table's
+/// rows would only rewrite those tombstones again.
+fn reads_node(correction: &PendingCorrection, route: &Route) -> bool {
+    correction.kind != partitions::Kind::GoneNode.as_str() || *route == Route::Unusable
+}
+
+/// The ledger walk's planner settings: an ordered scan of the `GROUP BY`
+/// index from the seek, sorted by key only within a group, which stops after
+/// a page of entries. On a ledger whose statistics lag (a fresh build's), the
+/// planner otherwise picks a bitmap scan of every entry past the seek and a
+/// sort of them all for each page, which made the walk of a 1M-entry leaf
+/// read 800,000 entries a page at its start: quadratic in the node.
+const WALK_PLAN_SETTINGS: &str = "set local enable_seqscan = off; \
+     set local enable_bitmapscan = off; set local enable_sort = off";
 
 /// The keys of `found` that are not quarantined for the definition, as a
 /// build leaves them out (`poison`).
@@ -943,9 +1011,9 @@ async fn node_page(
         txn.commit().await?;
         return Ok(0);
     };
-    // A gone node's rows are not the source's: the ledger phase retracted its
-    // groups' entries. Its table, once detached, is read the same way, and
-    // each key re-derived reads the source, finding no row for it.
+    // A gone node read here has no usable text (`reads_node`): its table,
+    // once detached, is read the same way, and each key re-derived reads the
+    // source, finding no row for it.
     let pk = ledger.source_pk();
     let idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let cursor_parts: Option<Vec<String>> = match current.cursor.as_deref() {
@@ -1122,7 +1190,7 @@ mod tests {
             groups: vec![Some("5".to_string()), None],
             key: "k9".to_string(),
         };
-        let (sql, params) = after_cursor(
+        let (sql, params, seeks) = after_cursor(
             "l",
             &["a", "b"],
             &["integer".to_string(), "text".to_string()],
@@ -1133,8 +1201,24 @@ mod tests {
         assert_eq!(
             sql,
             "((l.\"a\" > $2::text::integer or l.\"a\" is null) \
-             or (l.\"a\" = $2::text::integer and l.\"b\" is null and l.\"__from_key\" > $3::text::text)) \
-             and (l.\"a\" >= $2::text::integer or l.\"a\" is null)"
+             or (l.\"a\" = $2::text::integer and l.\"b\" is null and l.\"__from_key\" > $3::text::text))"
         );
+        assert_eq!(
+            seeks,
+            ["l.\"a\" >= $2::text::integer", "l.\"a\" is null"],
+            "a seek the index can start at, then the NULLs, which sort last"
+        );
+        let null_first = LedgerCursor {
+            groups: vec![None, Some("x".to_string())],
+            key: "k1".to_string(),
+        };
+        let (_, _, seeks) = after_cursor(
+            "l",
+            &["a", "b"],
+            &["integer".to_string(), "text".to_string()],
+            &null_first,
+            2,
+        );
+        assert_eq!(seeks, ["l.\"a\" is null"]);
     }
 }
