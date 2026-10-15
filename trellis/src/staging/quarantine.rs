@@ -4480,7 +4480,10 @@ pub(crate) async fn resume_caused_definitions(
     schema: &str,
 ) -> Result<(), tokio_postgres::Error> {
     let candidates: Vec<(i64, i64)> = client
-        .query_typed(&caused_candidates_sql(), &[(&TransformStatus::Live.as_str(), Type::TEXT)])
+        .query_typed(
+            &caused_candidates_sql(),
+            &[(&TransformStatus::Live.as_str(), Type::TEXT)],
+        )
         .await?
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))

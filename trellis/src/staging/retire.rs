@@ -265,7 +265,10 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
     };
 
     let ledgers: Vec<(String, i64)> = client
-        .query_typed(LEDGER_TABLES_SQL, &[(&crate::defs::ledger::LEDGER_SUFFIX, Type::TEXT)])
+        .query_typed(
+            LEDGER_TABLES_SQL,
+            &[(&crate::defs::ledger::LEDGER_SUFFIX, Type::TEXT)],
+        )
         .await?
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
