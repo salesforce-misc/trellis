@@ -6575,10 +6575,12 @@ async fn to_col_cardinality_in_txn(
 /// [`super::partition_tree::PartitionTree::refusal`] (ADR-0017). Capture is
 /// installed on every node of the tree and stages each write once under the
 /// root's identity, and nothing for a table that has left the tree. That is
-/// not enough to serve a definition: partition maintenance (`ATTACH`,
-/// `DETACH`, `DROP`, a leaf `TRUNCATE`) changes the root's rows without a
-/// write the triggers see, and the reconcile pass that detects and corrects
-/// it is not in place, so the definition would count wrongly until a rebuild.
+/// not enough to serve a definition: `ATTACH`, `DETACH` and `DROP` of a
+/// partition change the root's rows without a write the triggers see, and a
+/// leaf or middle `TRUNCATE` stages the root's truncate sentinel, which
+/// empties the whole target. The reconcile pass that detects and corrects
+/// them is not in place, so the definition would count wrongly until a
+/// rebuild.
 /// While this is `false`, [`accept_partitioned`] refuses every servable tree
 /// with [`CatalogError::PartitionedSourceNotCaptured`], after every shape
 /// check, so a refusal for the shape still names its column.

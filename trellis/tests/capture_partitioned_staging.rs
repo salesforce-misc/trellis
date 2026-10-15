@@ -353,8 +353,7 @@ async fn truncate_stages_one_sentinel_per_table_of_the_subtree_under_the_roots_i
     }
 }
 
-/// Ring rows staged for any table other than the root's, plus rows whose
-/// `src_table` is the root's, as `(root, other)`.
+/// Every ring row staged so far, whatever its `src_table`.
 async fn staged_total(client: &Client) -> i64 {
     client
         .query_one(&format!("select count(*) from {RING} s"), &[])
@@ -636,4 +635,103 @@ async fn measure_per_write_capture_cost_against_a_plain_table() {
         ));
     }
     eprintln!("MEASURE {}", results.join(" | "));
+}
+
+/// A plain table detached from the tree is no partition at all, so
+/// `pg_partition_root` reads NULL for it; once the root is dropped the root's
+/// name reads NULL too. The check must still stage nothing for a write to
+/// the detached table, which keeps the dropped root's triggers.
+#[tokio::test]
+async fn a_write_to_a_detached_table_after_its_root_is_dropped_stages_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = tree(&db).await;
+    client
+        .batch_execute(
+            "alter table public.m2 detach partition public.m2_0; \
+             alter table public.r detach partition public.m1; \
+             drop table public.r",
+        )
+        .await
+        .expect("detach a leaf and a middle, then drop the root");
+    let before = staged_total(&client).await;
+    client
+        .batch_execute(
+            "insert into public.m2_0 values (2, 2, 'x'); update public.m2_0 set v = 'y'; \
+             insert into public.m1 values (1, 1, 'x'); delete from public.m1; \
+             truncate public.m2_0",
+        )
+        .await
+        .expect("writes to the detached tables");
+    assert_eq!(staged_total(&client).await, before, "nothing staged");
+}
+
+/// A leaf under a middle whose `DETACH … CONCURRENTLY` is pending is not
+/// listed for cleanup either: `pg_partition_ancestors` stops at the pending
+/// link, so the leaf no longer reaches the captured root, but a writer with
+/// an older snapshot can still write through the root into it.
+#[tokio::test]
+async fn the_leaves_of_a_detach_pending_middle_are_not_cleaned_up_until_the_detach_completes() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = tree(&db).await;
+    step(
+        &client,
+        "insert into public.r values (1, 2, 'a'), (2, 2, 'b'), (3, 2, 'c'), (4, 2, 'd')",
+        &[&format!("{INS}=4")],
+    )
+    .await;
+
+    let holder = connect(db.dsn()).await;
+    holder
+        .batch_execute("begin; lock table public.m2 in access share mode")
+        .await
+        .expect("hold the middle");
+    let detacher = connect(db.dsn()).await;
+    detacher
+        .batch_execute("set statement_timeout = '1500ms'")
+        .await
+        .expect("timeout");
+    let interrupted = detacher
+        .batch_execute("alter table public.r detach partition public.m2 concurrently")
+        .await;
+    assert!(interrupted.is_err(), "the second phase waits on the holder");
+    let pending: bool = client
+        .query_one(
+            "select inhdetachpending from pg_inherits where inhrelid = 'public.m2'::regclass",
+            &[],
+        )
+        .await
+        .expect("pending")
+        .get(0);
+    assert!(pending, "public.m2 is detach-pending");
+
+    // A write named on the pending middle or a leaf under it stages nothing.
+    let before = staged_total(&client).await;
+    client
+        .batch_execute(
+            "update public.m2 set v = 'm'; update public.m2_0 set v = 'x'; \
+             update public.m2_1 set v = 'y'",
+        )
+        .await
+        .expect("writes under the pending middle");
+    assert_eq!(staged_total(&client).await, before);
+
+    let tables = trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA)
+        .await
+        .expect("installed tables");
+    assert_eq!(tables.into_iter().collect::<Vec<_>>(), ["public.r"]);
+
+    holder.batch_execute("commit").await.expect("release");
+    client
+        .batch_execute("alter table public.r detach partition public.m2 finalize")
+        .await
+        .expect("finalize");
+    let tables = trellis::capture::reconcile::installed_tables(&client, DEFAULT_SCHEMA)
+        .await
+        .expect("installed tables");
+    assert_eq!(
+        tables.into_iter().collect::<Vec<_>>(),
+        ["public.m2", "public.m2_0", "public.m2_1", "public.r"]
+    );
 }

@@ -601,8 +601,9 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// # A table that left the tree stages nothing (ADR-0017 P2b)
 ///
 /// For a partitioned source, each function first compares
-/// `pg_partition_root(tg_relid)` with the source root and returns when they
-/// differ. A table detached from the tree keeps its triggers until the
+/// `pg_partition_root(tg_relid)` with the source root and returns unless
+/// they are equal (a NULL on either side is a mismatch: a detached plain
+/// table has no root, and a dropped root has no name). A table detached from the tree keeps its triggers until the
 /// reconcile pass drops them, and a write to it in that interval must never
 /// count. The lookup reads the catalog snapshot, so it is right for a
 /// `REPEATABLE READ` or `SERIALIZABLE` writer whose snapshot predates the
@@ -793,14 +794,16 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
 ///
 /// `to_regclass` rather than a `::regclass` cast, so a root that no longer
 /// exists reads as a mismatch instead of failing a write to a detached table
-/// that still carries the triggers.
+/// that still carries the triggers. Either side may be NULL (a detached plain
+/// table is no partition, so its root is NULL, and so is a dropped root's
+/// name), and a NULL comparison is a mismatch too.
 fn root_guard(spec: &CaptureSpec) -> String {
     let root =
         text_expr(&quoted_table(&spec.table).expect("CaptureSpec::new checked the table name"));
     format!(
         "    -- ADR-0017: a table that left the tree stages nothing.\n    \
-         if pg_catalog.pg_partition_root(tg_relid)\n        \
-         is distinct from pg_catalog.to_regclass({root}) then\n        \
+         if not coalesce(pg_catalog.pg_partition_root(tg_relid)\n        \
+         = pg_catalog.to_regclass({root}), false) then\n        \
          return null;\n    end if;\n"
     )
 }
