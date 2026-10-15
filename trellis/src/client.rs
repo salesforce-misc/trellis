@@ -175,6 +175,10 @@ pub struct ClientOptions {
     /// and it applies only while the worker's `LISTEN` is up; with the
     /// listener down the worker polls every `poll_interval`. Set equal to
     /// `poll_interval` to turn the backoff off.
+    ///
+    /// The `self_check` job worker backs off the same way (#1075): a queued
+    /// job announces itself on the work channel, and a job a dead worker left
+    /// `running` is found within this past its reclaim TTL.
     pub idle_wake_cap: Duration,
     /// The most folded records one drain batch holds at once (issue #620,
     /// ADR-0002): a segment share larger than this drains in pages of at most
@@ -851,9 +855,15 @@ async fn run(
     if options.application_threads > 0 {
         app_worker_tasks.push(tokio::spawn(self_check_loop(
             pool.clone(),
+            WakeListener::spawn(
+                dsn.clone(),
+                config.schema().to_string(),
+                wake_channel.clone(),
+            ),
             format!("{client_id}-self-check"),
             options.reclaim_ttl,
             options.poll_interval,
+            options.idle_wake_cap,
             shutdown_rx.clone(),
         )));
     }
@@ -2211,8 +2221,15 @@ impl IdleBackoff {
 
 /// The task that runs `self_check` jobs (#1023) in a process that runs drain
 /// workers: one page per pass ([`self_check_step`]), straight on to the next
-/// while there is one, `poll_interval` apart while there is none, until
-/// shutdown.
+/// while there is one, until shutdown.
+///
+/// With no job to run it waits like an idle drain worker (#273, #1075): from
+/// `poll_interval`, doubling up to `idle_wake_cap`, and starting over on
+/// work and whenever the wake listener changes state. A queued job ends the
+/// wait by itself: a `self_check` call inserts the row and the database
+/// announces it on the work channel (migration V90). Only a job a dead
+/// worker left `running` is found by the clock, within the cap past its
+/// reclaim TTL.
 ///
 /// It is its own task, not a step of the drain workers' loop, because a page
 /// waits for the target to converge before it compares, and convergence is
@@ -2222,24 +2239,36 @@ impl IdleBackoff {
 /// connection at a time and takes nothing from the drains.
 async fn self_check_loop(
     pool: Pool,
+    mut wake: WakeListener,
     claimed_by: String,
     reclaim_ttl: Duration,
     poll_interval: Duration,
+    idle_wake_cap: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
+        // Wakes already heard are answered by the claim below; one that
+        // arrives after this drain is kept for the wait.
+        while wake.rx.try_recv().is_ok() {}
         let ran = self_check_step(&pool, &claimed_by, reclaim_ttl, &mut shutdown_rx).await;
         if *shutdown_rx.borrow() {
             break;
         }
-        if !ran {
-            tokio::select! {
-                _ = shutdown_rx.changed() => break,
-                _ = tokio::time::sleep(poll_interval) => {}
-            }
+        if ran {
+            backoff.reset();
+            continue;
+        }
+        let wait = backoff.idle_wait(wake.is_up(), None);
+        match wait_for_wake(&mut wake, &mut shutdown_rx, wait).await {
+            WakeEnd::Shutdown => break,
+            // A wake that is not a job (a seal shares the channel) finds
+            // nothing at the claim and the wait goes on growing.
+            WakeEnd::Notified | WakeEnd::Elapsed => {}
+            WakeEnd::ListenerChanged => backoff.reset(),
         }
     }
 }

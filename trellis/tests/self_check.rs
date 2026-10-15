@@ -1950,6 +1950,75 @@ async fn self_check_returns_a_queued_job_and_the_result_is_readable_once_a_worke
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// An idle `self_check` worker waits out its poll floor (here 30 s, with the
+/// cap above it), so a job queued meanwhile is run by the wake the database
+/// sends when the row is inserted (migration V90, #1075), not by the clock.
+/// The only wait is for the worker's `LISTEN` to be in place, which the test
+/// reads from the server, and then for the job it queued.
+#[tokio::test]
+async fn a_queued_job_wakes_an_idle_worker_that_is_backing_off() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = totals_fixture(&db, 2).await;
+
+    let client = trellis::Client::start(
+        db.dsn(),
+        trellis::ClientOptions {
+            staging_worker: false,
+            application_threads: 1,
+            poll_interval: Duration::from_secs(30),
+            idle_wake_cap: Duration::from_secs(60),
+            ..Default::default()
+        },
+    )
+    .expect("client start");
+
+    // The worker's listener is in place once the server shows its `LISTEN`.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let listening: i64 = raw
+                .query_one(
+                    "select count(*) from pg_stat_activity \
+                     where datname = current_database() and query like 'listen %'",
+                    &[],
+                )
+                .await
+                .expect("activity")
+                .get(0);
+            if listening > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the worker's LISTEN never came up");
+
+    let job = trellis
+        .self_check("widget_totals", SelfCheckMode::Strict, GENEROUS_TIMEOUT)
+        .await
+        .expect("start");
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let polled = trellis
+                .self_check_job(job.id)
+                .await
+                .expect("poll")
+                .expect("job");
+            if polled.state.is_finished() {
+                break polled;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the idle worker was not woken by the queued job");
+    assert_eq!(done.state, SelfCheckJobState::Done);
+
+    client.shutdown().await.expect("client shutdown");
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// While a worker is in the middle of a page the job reads `running`, with
 /// the call that started it long since returned. A second `self_check` of the
 /// target gets that same job back, not a second one; and the report is there
