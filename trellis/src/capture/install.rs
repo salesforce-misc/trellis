@@ -491,6 +491,33 @@ pub async fn installed(
     }
 }
 
+/// The partitioned root `$root` (a SQL regclass expression)'s tree below it as
+/// `(relid, level)` rows, one level per step of `pg_inherits`. Read from the
+/// catalogs alone: `pg_partition_tree` takes `ACCESS SHARE` on every node, so
+/// a leaf held under `ACCESS EXCLUSIVE` would stall the caller, which no
+/// `lock_timeout` bounds. Like it, this omits a child whose detach is pending,
+/// and yields nothing for a root that isn't partitioned.
+macro_rules! partition_nodes {
+    ($root:literal) => {
+        concat!(
+            "(with recursive t(relid, level) as ( \
+                 select i.inhrelid, 1 from pg_catalog.pg_inherits i \
+                 where i.inhparent = ",
+            $root,
+            " and not i.inhdetachpending \
+                   and exists (select 1 from pg_catalog.pg_class r \
+                               where r.oid = ",
+            $root,
+            " and r.relkind = 'p') \
+                 union all \
+                 select i.inhrelid, t.level + 1 \
+                 from t join pg_catalog.pg_inherits i on i.inhparent = t.relid \
+                 where not i.inhdetachpending) \
+             select relid, level from t)"
+        )
+    };
+}
+
 /// The tables under the partitioned root `table` (an unquoted `schema.table`),
 /// every level, shallowest first and by name within a level; empty for a table
 /// that isn't partitioned or doesn't exist. Each carries its own five capture
@@ -502,12 +529,13 @@ pub async fn descendants(
 ) -> Result<Vec<String>, CaptureError> {
     Ok(client
         .query(
-            "select n.nspname::text || '.' || c.relname::text \
-             from pg_catalog.pg_partition_tree(pg_catalog.to_regclass($1)) d \
-             join pg_catalog.pg_class c on c.oid = d.relid \
-             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-             where d.level > 0 \
-             order by d.level, 1",
+            concat!(
+                "select n.nspname::text || '.' || c.relname::text from ",
+                partition_nodes!("pg_catalog.to_regclass($1)"),
+                " d join pg_catalog.pg_class c on c.oid = d.relid \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 order by d.level, 1"
+            ),
             &[&crate::defs::ddl::regclass_arg(table)],
         )
         .await?
@@ -519,11 +547,12 @@ pub async fn descendants(
 /// The query behind [`nodes_missing_capture`], which [`installed`] also
 /// embeds: `$1` the instance schema, `$2` the root's functions, `$3` the
 /// root's regclass text and `$4` the triggers, in [`CaptureEvent::ALL`] order.
-const NODES_MISSING_CAPTURE: &str = "select n.nspname::text || '.' || c.relname::text \
-     from pg_catalog.pg_partition_tree(pg_catalog.to_regclass($3)) d \
-     join pg_catalog.pg_class c on c.oid = d.relid \
+const NODES_MISSING_CAPTURE: &str = concat!(
+    "select n.nspname::text || '.' || c.relname::text from ",
+    partition_nodes!("pg_catalog.to_regclass($3)"),
+    " d join pg_catalog.pg_class c on c.oid = d.relid \
      join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-     where d.level > 0 and exists ( \
+     where exists ( \
          select 1 from unnest($2::text[], $4::text[]) as e(function, trigger) \
          where not exists ( \
              select 1 from pg_catalog.pg_trigger t \
@@ -533,7 +562,8 @@ const NODES_MISSING_CAPTURE: &str = "select n.nspname::text || '.' || c.relname:
                and p.proname = e.function \
                and p.pronamespace = ( \
                    select oid from pg_catalog.pg_namespace where nspname = $1))) \
-     order by d.level, 1";
+     order by d.level, 1"
+);
 
 /// The tables under the partitioned root `table` that lack any of the five
 /// capture triggers: missing, not `ENABLE ALWAYS`, or not calling the root's
@@ -1318,7 +1348,8 @@ async fn blockers_of(
     // the tree's tables is listed once per mode.
     Ok(client
         .query(
-            "select distinct on (l.pid, p.gid, l.mode, l.granted) \
+            concat!(
+                "select distinct on (l.pid, p.gid, l.mode, l.granted) \
                     l.pid, p.gid, \
                     case when l.pid is null then 'prepared transaction' \
                          else coalesce(a.backend_type, 'unknown') end, \
@@ -1341,11 +1372,13 @@ async fn blockers_of(
                                  where datname = pg_catalog.current_database()) \
                and (l.relation = pg_catalog.to_regclass($1) \
                     or ($4 and l.relation in ( \
-                        select relid from pg_catalog.pg_partition_tree( \
-                            pg_catalog.to_regclass($1))))) \
+                        select relid from ",
+                partition_nodes!("pg_catalog.to_regclass($1)"),
+                "))) \
                and l.pid is distinct from pg_catalog.pg_backend_pid() \
                and l.mode = any($2) \
-             order by l.pid, p.gid, l.mode, l.granted",
+             order by l.pid, p.gid, l.mode, l.granted"
+            ),
             &[
                 &crate::defs::ddl::regclass_arg(table),
                 &conflicts,

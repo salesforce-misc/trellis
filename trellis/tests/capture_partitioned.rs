@@ -663,3 +663,59 @@ async fn a_whole_tree_install_waiting_on_a_leaf_writer_reports_that_writer() {
     assert_eq!(plain.len(), 1);
     writer.batch_execute("rollback").await.expect("release");
 }
+
+/// Reading the tree takes no relation lock, so a leaf held under an uncommitted
+/// `ACCESS EXCLUSIVE` stalls neither the installed check nor the walk: a
+/// reconcile of a captured tree sees it unchanged, and one that has to install
+/// reports it waiting on the leaf's holder and installs nothing. The raw test
+/// client has no `lock_timeout`, so a stalled read fails the outer timeout.
+#[tokio::test]
+async fn a_leaf_held_access_exclusive_stalls_no_read_of_the_tree() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    client.batch_execute(&flat(4)).await.expect("tree");
+    let holder = connect(db.dsn()).await;
+    let within = Duration::from_secs(10);
+    let deadline = || Some(Instant::now() + Duration::from_millis(300));
+
+    holder
+        .batch_execute("begin; lock table public.r_1 in access exclusive mode")
+        .await
+        .expect("hold the leaf");
+    let nodes = tokio::time::timeout(within, install::descendants(&client, "public.r"))
+        .await
+        .expect("the walk stalled on the held leaf")
+        .expect("descendants");
+    assert_eq!(nodes.len(), 4);
+    let progress = tokio::time::timeout(
+        within,
+        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec("public.r"), deadline()),
+    )
+    .await
+    .expect("the reconcile stalled on the held leaf")
+    .expect("reconcile");
+    assert!(matches!(progress, Progress::Waiting(_)), "{progress:?}");
+    assert!(trigger_map(&client).await.is_empty(), "nothing installed");
+    holder.batch_execute("rollback").await.expect("release");
+
+    landed(
+        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec("public.r"), None)
+            .await
+            .expect("install"),
+    );
+    holder
+        .batch_execute("begin; lock table public.r_2 in access exclusive mode")
+        .await
+        .expect("hold another leaf");
+    let progress = tokio::time::timeout(
+        within,
+        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec("public.r"), deadline()),
+    )
+    .await
+    .expect("the installed check stalled on the held leaf")
+    .expect("reconcile");
+    assert!(matches!(progress, Progress::Done(_)), "{progress:?}");
+    assert!(!trigger_map(&client).await.is_empty(), "still installed");
+    holder.batch_execute("rollback").await.expect("release");
+}
