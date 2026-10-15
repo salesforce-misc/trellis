@@ -508,6 +508,12 @@ async fn gated_marker_tables(client: &impl GenericClient) -> Result<HashSet<Stri
 
 /// Every table instance `schema` has any capture piece on: a function whose
 /// comment names it, or one of the instance's triggers.
+///
+/// A partition of a captured root is not listed: its triggers belong to the
+/// root's. Neither is a table (or one under a table) whose `DETACH
+/// CONCURRENTLY` is still pending: a writer with an older snapshot can still
+/// write through the parent into it, so its triggers come off only once the
+/// detach has completed (ADR-0017).
 pub async fn installed_tables(
     client: &impl GenericClient,
     schema: &str,
@@ -537,6 +543,10 @@ pub async fn installed_tables(
              join pg_catalog.pg_class r on r.oid = t.tgrelid \
              join pg_catalog.pg_namespace n on n.oid = r.relnamespace \
              where t.tgname = any($2) and not t.tgisinternal \
+               and not exists ( \
+                   select 1 from pg_catalog.pg_partition_ancestors(r.oid) a \
+                   join pg_catalog.pg_inherits i on i.inhrelid = a.relid \
+                   where i.inhdetachpending) \
                and not (r.relispartition and exists ( \
                    select 1 from recorded x \
                    join pg_catalog.pg_partition_ancestors(r.oid) a on true \

@@ -30,6 +30,7 @@ async fn connect(dsn: &str) -> Client {
 fn spec(table: &str) -> CaptureSpec {
     CaptureSpec::new(table, vec!["id".to_string()], ["v".to_string()], Vec::new())
         .expect("valid spec")
+        .with_partitioned(true)
 }
 
 /// `public.r` partitioned by list on `region`: `m1` and `m2`, each hash

@@ -6572,13 +6572,16 @@ async fn to_col_cardinality_in_txn(
 }
 
 /// Whether a definition may read a partitioned root whose shape passed
-/// [`super::partition_tree::PartitionTree::refusal`] (ADR-0017). It may once
-/// capture is installed on every node of the tree, staging under the root's
-/// identity. Until then a statement trigger on the root alone misses a write
-/// aimed at a partition, so such a definition would run on incomplete
-/// capture. While this is `false`, [`accept_partitioned`] refuses every
-/// servable tree with [`CatalogError::PartitionedSourceNotCaptured`], after
-/// every shape check, so a refusal for the shape still names its column.
+/// [`super::partition_tree::PartitionTree::refusal`] (ADR-0017). Capture is
+/// installed on every node of the tree and stages each write once under the
+/// root's identity, and nothing for a table that has left the tree. That is
+/// not enough to serve a definition: partition maintenance (`ATTACH`,
+/// `DETACH`, `DROP`, a leaf `TRUNCATE`) changes the root's rows without a
+/// write the triggers see, and the reconcile pass that detects and corrects
+/// it is not in place, so the definition would count wrongly until a rebuild.
+/// While this is `false`, [`accept_partitioned`] refuses every servable tree
+/// with [`CatalogError::PartitionedSourceNotCaptured`], after every shape
+/// check, so a refusal for the shape still names its column.
 const PARTITIONED_SOURCES_CAPTURED: bool = false;
 
 /// Whether `qualified` (an unquoted `schema.table`) has a primary key, the

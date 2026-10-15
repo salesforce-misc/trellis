@@ -212,7 +212,16 @@
 //! its triggers, which still call the root's functions: [`uninstall`] drops
 //! them along with the nodes' ([`bearers`]), and the reconcile pass lists
 //! such a table as installed in its own right, so it drops them while the
-//! root stays captured (ADR-0017's cleanup).
+//! root stays captured (ADR-0017's cleanup). The cleanup waits for a
+//! `DETACH CONCURRENTLY` to complete: a writer with an older snapshot can
+//! still write through the parent into the pending leaf.
+//!
+//! Until the pass drops them, the detached table's triggers stage nothing:
+//! a partitioned source's functions begin by comparing
+//! `pg_partition_root(tg_relid)` with the root ([`sql`]'s "A table that left
+//! the tree stages nothing"). [`installed`] marks the spec it reads back as
+//! partitioned from the root's `relkind`, so the comparison of generated and
+//! installed function bodies covers the check.
 //!
 //! # What is installed
 //!
@@ -372,7 +381,9 @@ pub async fn installed(
                     case when e.ord = 1 and exists ( \
                         select 1 from pg_catalog.pg_class r \
                         where r.oid = pg_catalog.to_regclass($3) and r.relkind = 'p') \
-                    then array({NODES_MISSING_CAPTURE}) end \
+                    then array({NODES_MISSING_CAPTURE}) end, \
+                    exists (select 1 from pg_catalog.pg_class r \
+                        where r.oid = pg_catalog.to_regclass($3) and r.relkind = 'p') \
              from unnest($2::text[], $4::text[]) with ordinality as e(function, trigger, ord) \
              left join pg_catalog.pg_proc p \
                on p.proname = e.function and p.pronargs = 0 \
@@ -393,6 +404,7 @@ pub async fn installed(
             &[&schema, &functions, &regclass, &triggers],
         )
         .await?;
+    let partitioned: bool = rows.first().is_some_and(|row| row.get(11));
     let mut present = false;
     let mut current = true;
     let mut faults = Vec::new();
@@ -420,7 +432,8 @@ pub async fn installed(
                 row.get(4),
                 row.get(5),
                 row.get(6),
-            );
+            )
+            .map(|spec| spec.with_partitioned(partitioned));
             match recorded {
                 Some(spec) => {
                     let source: String = row.get(1);

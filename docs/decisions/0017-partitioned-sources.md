@@ -47,8 +47,8 @@ I tested every decision here against real clusters with Trellis's generated
 capture and an oracle diff after each step: the trigger and lifecycle behaviour
 on PostgreSQL 14 through 18, routing and bound evaluation on 15 through 18, and
 the detach check, the cheap cleanup forms, to-many targets and the cleanup race
-on 16 through 18. Apart from PostgreSQL 16 refusing to attach a table that still
-carries capture triggers, no result differed by version.
+on 16 through 18. No result differed by version; a table that still carries
+capture triggers re-attaches on each of 16, 17 and 18.
 
 ### Trees of up to 1,000 leaves are supported; larger ones are unsupported, not refused
 

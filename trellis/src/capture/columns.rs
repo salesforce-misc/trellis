@@ -338,6 +338,14 @@ pub async fn capture_spec(
             table: table.to_string(),
         });
     }
+    let partitioned: bool = client
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_class \
+                 where oid = pg_catalog.to_regclass($1) and relkind = 'p')",
+            &[&regclass],
+        )
+        .await?
+        .get(0);
     let (attnums, key) = live_columns(client, table).await?;
     if key.is_empty() {
         return Err(CaptureError::NoPrimaryKey {
@@ -381,7 +389,7 @@ pub async fn capture_spec(
     }
     let mut group_key: Vec<String> = read.group_key.into_iter().collect();
     group_key.sort_by_key(|c| attnums[c]);
-    CaptureSpec::new(table, key, read.columns, group_key)
+    Ok(CaptureSpec::new(table, key, read.columns, group_key)?.with_partitioned(partitioned))
 }
 
 #[cfg(test)]

@@ -122,6 +122,12 @@ pub struct CaptureSpec {
     /// ring row's `group_key` array has had (issue #133), and a reader
     /// comparing arrays relies on it.
     group_key: Vec<String>,
+    /// Whether `table` is a partitioned root (ADR-0017). Its functions then
+    /// stage nothing for a table that has left its tree (see "A table that
+    /// left the tree stages nothing" on [`function_body`]). A plain table's
+    /// functions are unchanged. Not part of the function's comment: the
+    /// catalog says it (`relkind = 'p'`).
+    partitioned: bool,
 }
 
 impl CaptureSpec {
@@ -151,7 +157,20 @@ impl CaptureSpec {
             key,
             columns: columns.into_iter().collect(),
             group_key,
+            partitioned: false,
         })
+    }
+
+    /// The same spec, marked as the capture of a partitioned root.
+    #[must_use]
+    pub fn with_partitioned(mut self, partitioned: bool) -> Self {
+        self.partitioned = partitioned;
+        self
+    }
+
+    /// Whether the table is a partitioned root.
+    pub fn is_partitioned(&self) -> bool {
+        self.partitioned
     }
 
     pub fn table(&self) -> &str {
@@ -579,6 +598,21 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// and a statement after one in the same transaction probes the new catalog.
 /// The truncate function images nothing, so it has no probe.
 ///
+/// # A table that left the tree stages nothing (ADR-0017 P2b)
+///
+/// For a partitioned source, each function first compares
+/// `pg_partition_root(tg_relid)` with the source root and returns when they
+/// differ. A table detached from the tree keeps its triggers until the
+/// reconcile pass drops them, and a write to it in that interval must never
+/// count. The lookup reads the catalog snapshot, so it is right for a
+/// `REPEATABLE READ` or `SERIALIZABLE` writer whose snapshot predates the
+/// `DETACH` too: a `pg_inherits` probe there is stale and stages the write.
+/// It returns NULL after a plain `DETACH` and the leaf itself while a
+/// `DETACH CONCURRENTLY` is pending, takes no lock and does not wait behind
+/// uncommitted DDL. While the source root is attached under another table it
+/// returns the outer root, so the source's own writes stage nothing and the
+/// rebuild on resume repairs them. A plain table's functions have no check.
+///
 /// # The live re-read is conditional (#623 D8a)
 ///
 /// The live re-read ([`ring_select`]) is an index probe of the source table
@@ -677,6 +711,9 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
         );
     }
     body.push_str("begin\n");
+    if spec.partitioned {
+        body.push_str(&root_guard(spec));
+    }
     if let Some(rows) = rows {
         body.push_str(&format!(
             "    -- #622 C6: how many imaged columns the table still has, or -1 for a\n    \
@@ -748,6 +785,24 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
          end case;\n    return null;\nend;\n",
     );
     body
+}
+
+/// The first statement of a partitioned source's capture function: stage
+/// nothing unless the firing table's root is the source root (see "A table
+/// that left the tree stages nothing" on [`function_body`]).
+///
+/// `to_regclass` rather than a `::regclass` cast, so a root that no longer
+/// exists reads as a mismatch instead of failing a write to a detached table
+/// that still carries the triggers.
+fn root_guard(spec: &CaptureSpec) -> String {
+    let root =
+        text_expr(&quoted_table(&spec.table).expect("CaptureSpec::new checked the table name"));
+    format!(
+        "    -- ADR-0017: a table that left the tree stages nothing.\n    \
+         if pg_catalog.pg_partition_root(tg_relid)\n        \
+         is distinct from pg_catalog.to_regclass({root}) then\n        \
+         return null;\n    end if;\n"
+    )
 }
 
 /// The transaction-local setting holding instance `schema`'s statement-span
@@ -1395,6 +1450,35 @@ mod tests {
 
     fn ddl(spec: &CaptureSpec, event: CaptureEvent) -> String {
         function_ddl("trellis", spec, event).unwrap()
+    }
+
+    #[test]
+    fn only_a_partitioned_sources_capture_functions_check_the_root() {
+        let plain = spec();
+        let partitioned = spec().with_partitioned(true);
+        for event in CaptureEvent::CAPTURED {
+            assert!(
+                !function_source("trellis", &plain, event).contains("pg_partition_root"),
+                "{event:?}: a plain table's function has no check"
+            );
+            let source = function_source("trellis", &partitioned, event);
+            let guard = source
+                .find("pg_catalog.pg_partition_root(tg_relid)")
+                .unwrap_or_else(|| panic!("{event:?}: the check is missing"));
+            // The check is the first statement: before the transition
+            // tables, the span state and any ring write.
+            assert!(source[..guard].matches("begin").count() == 1, "{event:?}");
+            assert!(!source[..guard].contains("insert into"), "{event:?}");
+            assert!(
+                source.contains("to_regclass('\"public\".\"orders\"')"),
+                "{event:?}: the root is looked up by name, tolerating its absence"
+            );
+        }
+        // Everything else about the function is the plain table's.
+        assert_eq!(
+            function_source("trellis", &partitioned, CaptureEvent::Begin),
+            function_source("trellis", &plain, CaptureEvent::Begin)
+        );
     }
 
     #[test]
