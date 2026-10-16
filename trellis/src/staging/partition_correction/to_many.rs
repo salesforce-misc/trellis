@@ -33,7 +33,11 @@
 //! straggler of the one before, claimed by its fenced read), so once every
 //! segment through `drain_seg` is drained or retired, every one is applied,
 //! and the reader is done. Until then its row waits, and the definition reads
-//! `backfilling`.
+//! `backfilling`. A `drain_seg` that is still the active segment and empty,
+//! with no straggler of the one before, holds none of them (the last page
+//! staged nothing after the ring sealed the earlier pages'), so only the
+//! segments before it are waited for: the staging worker never seals an
+//! empty segment, and an idle ring would otherwise never let it finish.
 //!
 //! # Routing
 //!
@@ -285,6 +289,18 @@ pub(super) async fn correct(
 /// Moves the progress from `drain` to `done` once every segment through its
 /// `drain_seg` is drained or retired, under `fence`. Returns whether it
 /// moved, or `None`, with nothing written, when the fence no longer holds.
+///
+/// `drain_seg` can still be the active segment with nothing in it: the last
+/// page staged nothing (the parents filled the pages before it exactly, or
+/// none routes to the node) after the ring sealed the earlier pages'
+/// segment. The staging worker seals no empty segment, so on an idle ring it
+/// would never drain. Every row the correction staged committed before this
+/// check, so an empty active slot holds none of them, and when its
+/// predecessor holds no row its own fence left out (a straggler the active
+/// segment's read would claim, `staging::seal`'s phase-gap
+/// straggler), the segments before it are all there is to wait for. The
+/// pointer, the slots and the registry are read in the one statement, so
+/// against one snapshot.
 async fn drained(
     pool: &Pool,
     fence: &ClaimFence<'_>,
@@ -298,16 +314,40 @@ async fn drained(
         return Ok(None);
     }
     let moved = txn
-        .execute(
-            "update partition_correction_progress p set phase = 'done', drain_seg = null \
-             where p.correction_id = $1 and p.definition_id = $2 and p.phase = 'drain' \
-               and not exists (select 1 from segments s \
-                               where s.seg_seq <= p.drain_seg and s.state <> 'drained')",
-            &[&correction.id, &definition.id],
-        )
+        .execute(&drained_sql()?, &[&correction.id, &definition.id])
         .await?;
     txn.commit().await?;
     Ok(Some(moved > 0))
+}
+
+/// [`drained`]'s statement: the ring's state, then the move.
+fn drained_sql() -> Result<String, CorrectionError> {
+    let mut active_rows = String::from("case p.ring_slot");
+    let mut stragglers = String::from("case s.ring_slot");
+    for slot in 0..append::RING_SIZE {
+        let table = append::ring_table_name(slot)?;
+        active_rows.push_str(&format!(" when {slot} then exists (select 1 from {table})"));
+        stragglers.push_str(&format!(
+            " when {slot} then exists (select 1 from {table} \
+                                       where not pg_visible_in_snapshot(row_txid, s.fence_snapshot))"
+        ));
+    }
+    active_rows.push_str(" end");
+    stragglers.push_str(" end");
+    Ok(format!(
+        "with ring as ( \
+             select p.active_seq, {active_rows} as active_rows, \
+                    coalesce((select {stragglers} from segments s \
+                              where s.seg_seq = p.active_seq - 1), false) as stragglers \
+             from segment_pointer p) \
+         update partition_correction_progress pr set phase = 'done', drain_seg = null \
+         from ring r \
+         where pr.correction_id = $1 and pr.definition_id = $2 and pr.phase = 'drain' \
+           and not exists (select 1 from segments s \
+                           where s.seg_seq <= pr.drain_seg and s.seg_seq < r.active_seq \
+                             and s.state <> 'drained') \
+           and (pr.drain_seg < r.active_seq or not (r.active_rows or r.stragglers))"
+    ))
 }
 
 /// The segment active now, read under a share lock on `segment_pointer` that

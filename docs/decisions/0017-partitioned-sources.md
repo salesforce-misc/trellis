@@ -224,7 +224,10 @@ the seal from moving it, and the correction's row is done only once every
 segment through that one has drained. Until then the definition reports
 `backfilling`, and a `keys_remaining` of 0 means every recompute is staged, not
 yet applied. The wait is for a fixed segment, which seals and drains as the ring
-rotates, not for an empty ring.
+rotates, not for an empty ring. When that segment is still the active one and
+holds nothing, with no straggler of the one before it, the last page staged
+nothing after the earlier pages' segment sealed, and only the segments before
+it are waited for: an idle ring never seals an empty segment.
 
 My cleanup measurements deleted a leaf's routed rows from a model target, a
 virtual sum with no ledger and no real Apply, then re-aggregated the leaf. That

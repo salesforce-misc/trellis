@@ -929,3 +929,48 @@ async fn a_truncated_leaf_leaves_its_orders_at_zero() {
         assert_eq!(fx.zero_parents().await, zero, "{kind}");
     }
 }
+
+/// The last page of a walk stages nothing when the routed parents fill the
+/// pages before it exactly, or when no parent routes to the node (a new,
+/// empty partition). If the ring sealed and drained the earlier pages'
+/// recomputes in between, the segment active at that page's commit is empty,
+/// and on an idle ring the staging worker never seals an empty segment
+/// (`seal_if_active_nonempty`). The correction finishes anyway: nothing it
+/// staged can be in that empty segment.
+#[tokio::test]
+async fn a_correction_whose_last_page_stages_nothing_finishes_on_an_idle_ring() {
+    let mut fx = Fx::start(&tree("range")).await;
+    fx.exec("drop table public.items_p1").await;
+    fx.pass().await;
+    fx.d.settle().await;
+    // The orders 4-7 fill two pages of two; a third finds none.
+    let first = fx
+        .run(&Options {
+            page_keys: 2,
+            max_pages: Some(2),
+        })
+        .await;
+    assert_eq!((first.pages, first.keys), (2, 4));
+    // Their recomputes seal and drain; the active segment is now empty.
+    fx.d.settle().await;
+    assert_eq!(fx.wrong_parents().await, Vec::<String>::new());
+    let last = fx
+        .run(&Options {
+            page_keys: 2,
+            max_pages: None,
+        })
+        .await;
+    // The staging worker's own seal: it leaves an empty segment alone.
+    let sealed = trellis::staging::seal::seal_if_active_nonempty(&mut fx.d.ctl, drain_driver::WAKE)
+        .await
+        .expect("seal");
+    assert!(sealed.is_none(), "an idle ring seals nothing");
+    let again = fx.run(&Options::default()).await;
+    assert_eq!(
+        last.completed + again.completed,
+        1,
+        "the correction finishes without traffic to seal its empty segment"
+    );
+    assert!(fx.queue().await.is_empty());
+    assert_eq!(fx.status("public.totals").await, "live");
+}
