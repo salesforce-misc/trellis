@@ -72,6 +72,20 @@ impl Fx {
         sweep_of(&self.pass().await)
     }
 
+    /// The definition's status.
+    async fn status(&self) -> String {
+        self.d
+            .ctl
+            .query_one(
+                "select status from transform_definitions \
+                 where split_part(target_table, '.', 2) = 'agg'",
+                &[],
+            )
+            .await
+            .expect("status")
+            .get(0)
+    }
+
     async fn queue(&self) -> Vec<PendingCorrection> {
         partitions::pending_corrections(&self.d.ctl, SOURCE)
             .await
@@ -97,7 +111,7 @@ impl Fx {
     /// Drains the ring, runs the engine to its end and merges its deltas.
     async fn correct(&mut self) {
         self.d.settle().await;
-        partition_correction::run_pending(self.d.pool(), SOURCE, &Options::default())
+        partition_correction::run_pending(self.d.pool(), &Options::default())
             .await
             .expect("run the pending corrections");
         let plan = self.d.build_plan("agg").await;
@@ -219,9 +233,21 @@ async fn a_leaf_created_written_and_dropped_between_two_passes_converges() {
         let sweep = sweep_of(&outcome);
         assert!(sweep.queued, "{kind}: {sweep:?}");
         assert_eq!(kinds(&fx.queue().await), ["complement"], "{kind}");
+        // Scheduled as any correction is: a `correction` row that holds the
+        // definition `backfilling` until it drains.
+        partition_correction::schedule(fx.d.pool())
+            .await
+            .expect("schedule the corrections");
+        assert_eq!(fx.status().await, "backfilling", "{kind}");
         fx.correct().await;
         assert_eq!(fx.wrong_groups().await, Vec::<String>::new(), "{kind}");
         assert!(fx.queue().await.is_empty(), "{kind}");
+        trellis::staging::build::settle_builds(fx.d.pool()).await;
+        assert_eq!(
+            fx.status().await,
+            "live",
+            "{kind}: the drained correction releases the definition"
+        );
         // And the next pass finds nothing.
         assert!(!fx.sweep().await.queued, "{kind}");
         assert!(fx.queue().await.is_empty(), "{kind}");
