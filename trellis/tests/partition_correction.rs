@@ -1507,8 +1507,28 @@ async fn a_failing_correction_holds_up_no_other_definition_and_pauses_its_own() 
     fx.d.settle().await;
     assert_eq!(fx.status_of("agg").await, "backfilling");
     assert_eq!(fx.status_of("agg2").await, "backfilling");
+    let handle = Trellis::connect(
+        Config::from_dsn(fx.d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let correcting = async |target: &str| -> Vec<String> {
+        let status = handle.status(target).await.expect("status").expect(target);
+        status.correcting.into_iter().map(|c| c.node).collect()
+    };
 
     fx.worker_turns().await;
+    assert_eq!(
+        correcting("agg").await,
+        vec!["public.items_p1".to_string()],
+        "its failing row is a correction still in progress"
+    );
+    assert_eq!(
+        correcting("agg2").await,
+        Vec::<String>::new(),
+        "its keys are re-derived"
+    );
     let rows = fx.rows().await;
     assert_eq!(rows.len(), 2);
     let failing = rows.iter().find(|r| r.0 == "agg").expect("agg's row");
@@ -1553,6 +1573,11 @@ async fn a_failing_correction_holds_up_no_other_definition_and_pauses_its_own() 
         fx.worker_turns().await;
     }
     assert_eq!(fx.status_of("agg").await, "paused");
+    assert_eq!(
+        correcting("agg").await,
+        Vec::<String>::new(),
+        "a paused definition's row is the record of why, not a correction in progress"
+    );
     fx.full_pass().await;
     assert_eq!(
         fx.queue().await.len(),
@@ -1588,4 +1613,6 @@ async fn a_failing_correction_holds_up_no_other_definition_and_pauses_its_own() 
     );
     assert!(fx.rows().await.is_empty());
     assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+    assert_eq!(correcting("agg").await, Vec::<String>::new());
+    handle.shutdown().await.expect("shut down");
 }
