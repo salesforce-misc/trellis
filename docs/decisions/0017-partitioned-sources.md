@@ -127,12 +127,15 @@ hosts don't offer one, and I found it fires neither for an interrupted
 ### Target rows route to nodes by each leaf's recorded bound, under pinned settings
 
 The pass records each leaf's `pg_get_partition_constraintdef` text with the key
-columns' types and collations, fetching only for new or changed leaves and for a
-`DEFAULT` whose siblings changed. A correction routes a group to a node by
-evaluating that text over the group key, each group column cast to the source
-key column's type and collation. Every fetch and evaluation runs under
-`search_path = pg_catalog, pg_temp`, `DateStyle ISO, YMD` and `TimeZone UTC`, in
-short transactions under a short `lock_timeout` that retry on a lock timeout.
+columns' types and those types' collations, fetching only for new or changed
+leaves and for a `DEFAULT` whose siblings changed. A correction routes a group to
+a node by evaluating that text over the group key, each group column cast to the
+source key column's type, under the type's own collation. A text names a level's
+collation on a bound only when it differs from the type's, so every comparison
+runs under its own level's collation, even when the levels of one tree differ.
+Every fetch and evaluation runs under `search_path = pg_catalog, pg_temp`,
+`DateStyle ISO, YMD` and `TimeZone UTC`, in short transactions under a short
+`lock_timeout` that retry on a lock timeout.
 
 The catalog loses a leaf's bound when it is dropped or detached, so the pass
 records it while it can. With the cast I found 0 disagreements in about 3.4M

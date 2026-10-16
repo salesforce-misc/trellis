@@ -142,7 +142,11 @@ pub struct Key {
     pub column: Option<String>,
     /// `format_type(atttypid, atttypmod)`.
     pub pg_type: String,
-    /// The key's collation, schema-qualified, empty when the type has none.
+    /// The collation a constraint text's bound carries when the text names
+    /// none: the key column type's own (`typcollation`), schema-qualified,
+    /// empty when the type has none. A text names its level's collation on a
+    /// bound (`COLLATE`) only when it differs from this one, so a column
+    /// presented under it compares under each level's own (#1084).
     pub collation: String,
 }
 
@@ -945,14 +949,15 @@ async fn read_live(
         .query(
             "select p.partrelid::bigint, a.attname::text, \
                     coalesce(pg_catalog.format_type(a.atttypid, a.atttypmod), ''), \
-                    case when k.collid = 0 then '' else coalesce( \
+                    coalesce( \
                         (select n.nspname::text || '.' || co.collname::text \
-                         from pg_catalog.pg_collation co \
+                         from pg_catalog.pg_type ty \
+                         join pg_catalog.pg_collation co on co.oid = ty.typcollation \
                          join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
-                         where co.oid = k.collid), '') end \
+                         where ty.oid = a.atttypid), '') \
              from pg_catalog.pg_partitioned_table p \
-             cross join lateral unnest(p.partattrs::int2[], p.partcollation::oid[]) \
-                 with ordinality as k(attnum, collid, ord) \
+             cross join lateral unnest(p.partattrs::int2[]) \
+                 with ordinality as k(attnum, ord) \
              left join pg_catalog.pg_attribute a \
                  on a.attrelid = p.partrelid and a.attnum = k.attnum and k.attnum > 0 \
              where p.partrelid = any($1::bigint[]::oid[]) \
