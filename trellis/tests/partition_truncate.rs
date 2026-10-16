@@ -135,7 +135,7 @@ impl Fx {
     }
 
     async fn run(&self, options: &Options) -> Outcome {
-        partition_correction::run_pending(self.d.pool(), SOURCE, options)
+        partition_correction::run_pending(self.d.pool(), options)
             .await
             .expect("run the pending corrections")
     }
