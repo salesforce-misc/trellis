@@ -782,3 +782,59 @@ async fn a_leaf_attached_written_and_dropped_between_two_passes_converges() {
     .await;
     converge_twice(&mut fx, "attached and dropped").await;
 }
+
+/// A complement that names a `HASH` middle, queued while the middle is in
+/// the tree, runs after the middle is dropped: it can't be evaluated, so it
+/// completes without work, and the middle's own correction, queued by the
+/// next pass, covers its groups.
+#[tokio::test]
+async fn a_complement_whose_hash_middle_is_dropped_completes_and_converges() {
+    let mut fx = Fx::start(
+        "create table public.items (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)) partition by range (g); \
+         create table public.items_lo partition of public.items for values from (0) to (4); \
+         create table public.items_m partition of public.items for values from (4) to (20) \
+             partition by hash (g); \
+         create table public.items_m0 partition of public.items_m \
+             for values with (modulus 4, remainder 0); \
+         create table public.items_m1 partition of public.items_m \
+             for values with (modulus 4, remainder 1); \
+         create table public.items_m2 partition of public.items_m \
+             for values with (modulus 4, remainder 2); \
+         insert into public.items select i, i % 20, i from generate_series(1, 200) i \
+             where i % 20 < 4 \
+                or not satisfies_hash_partition('public.items_m'::regclass, 4, 3, i % 20);",
+        ValueType::Numeric,
+    )
+    .await;
+    fx.exec(
+        "create table public.items_m3 partition of public.items_m \
+             for values with (modulus 4, remainder 3); \
+         insert into public.items select 5000 + i, i % 20, 7 from generate_series(1, 200) i \
+             where i % 20 >= 4 \
+               and satisfies_hash_partition('public.items_m'::regclass, 4, 3, i % 20);",
+    )
+    .await;
+    fx.d.settle().await;
+    fx.exec("drop table public.items_m3").await;
+    fx.d.settle().await;
+    let sweep = fx.sweep().await;
+    assert!(sweep.queued, "{sweep:?}");
+    let queue = fx.queue().await;
+    assert_eq!(kinds(&queue), ["complement"]);
+    let text = queue[0].constraint.clone().expect("a complement text");
+    assert!(text.contains("satisfies_hash_partition"), "{text}");
+    fx.exec("drop table public.items_m").await;
+    fx.correct().await;
+    assert!(
+        fx.queue().await.is_empty(),
+        "the complement completes once its HASH middle is gone"
+    );
+    // The middle's rows went with it; its own correction clears its groups.
+    assert!(!fx.wrong_groups().await.is_empty());
+    fx.pass().await;
+    assert_eq!(kinds(&fx.queue().await), ["gone_node"]);
+    fx.correct().await;
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+    assert!(fx.queue().await.is_empty());
+}

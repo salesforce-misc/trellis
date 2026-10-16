@@ -1726,6 +1726,36 @@ mod tests {
     }
 
     #[test]
+    fn each_kind_reads_its_node_or_not() {
+        let correction = |kind: partitions::Kind| PendingCorrection {
+            id: 1,
+            table: "public.t".to_string(),
+            kind: kind.as_str().to_string(),
+            node_oid: 7,
+            node_name: "public.t_7".to_string(),
+            cause: partitions::Cause::Truncated.as_str().to_string(),
+            constraint: Some("(a = 1)".to_string()),
+            node_default: false,
+            parent_oid: None,
+            queued_lsn: "0/1".to_string(),
+        };
+        let text = Route::Text("(a = 1)".to_string());
+        for route in [&text, &Route::Every, &Route::Unusable] {
+            assert!(reads_node(&correction(partitions::Kind::NewLeaf), route));
+            assert!(reads_node(&correction(partitions::Kind::Truncated), route));
+            assert!(!reads_node(
+                &correction(partitions::Kind::Complement),
+                route
+            ));
+        }
+        assert!(!reads_node(&correction(partitions::Kind::GoneNode), &text));
+        assert!(reads_node(
+            &correction(partitions::Kind::GoneNode),
+            &Route::Unusable
+        ));
+    }
+
+    #[test]
     fn a_truncated_node_routes_by_its_record() {
         let node = |oid: u32, constraint: Option<&str>, is_default: bool| partitions::Node {
             oid,
