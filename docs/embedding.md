@@ -483,6 +483,19 @@ as `unindexed_joins`, each entry with `relationship`, `table`, `column` and the
 `fix` sentence. The CLI's
 `trellis status` prints each entry as a warning line under its definition.
 
+### Partitions under correction
+
+`status(target)` reports, as `correcting`, each partition of a partitioned
+source the definition is being corrected for after the partition was
+attached, detached, dropped or truncated: `node` (`schema.table`), `since`
+(when the staging worker queued the correction) and `keys_remaining` (`None`
+until the correction has counted its keys). The definition reads `backfilling`
+while an entry is listed
+([observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
+In `trellis-embed`, `PlainDefinitionStatus` carries it as `correcting`, each
+entry with `node`, `since_micros` and `keys_remaining`. The CLI's
+`trellis status` prints each entry on a `correcting` line under its definition.
+
 ## Migrations and transactions
 
 **Trellis never joins your migration's transaction.** `migrate`, `define` and

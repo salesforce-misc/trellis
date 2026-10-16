@@ -131,6 +131,7 @@ use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::holdup::DrainFailure;
+use crate::staging::partition_correction::CorrectingNode;
 use crate::staging::quarantine::{self, HeldKeyRetry, HeldKeys};
 use crate::staging::self_check::{SelfCheckError, SelfCheckMode};
 use crate::staging::self_check_job::{self, SelfCheckJob};
@@ -722,7 +723,10 @@ impl Trellis {
     /// instead: it is applying changes, but its target may still be missing
     /// some (issue #476). A `live` 1-1 one rebuilding fields (an `ALTER
     /// TRANSFORM` that added or changed fields, a resumed column) reports
-    /// [`TransformStatus::Backfilling`] until they are built (#625 F8b). So does
+    /// [`TransformStatus::Backfilling`] until they are built (#625 F8b), and so
+    /// does an aggregate over a partitioned source while it is corrected for a
+    /// partition that was attached, detached, dropped or truncated (ADR-0017),
+    /// each listed in [`DefinitionStatus::correcting`]. So does
     /// a `live` one reading an upstream (another definition's target, as its
     /// source or through a relationship) that isn't `live` itself: paused,
     /// quarantined, rebuilding or catching up, down the whole chain (issue
@@ -800,12 +804,15 @@ impl Trellis {
             let mut holdup = (None, None);
             let mut drain_failure = None;
             let mut unindexed = Vec::new();
+            let mut correcting = Vec::new();
             if let Some(row) = &row {
                 let status_text: String = row.get(0);
                 let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                     panic!("transform_definitions.status held unrecognized value '{status_text}'")
                 });
                 status = Some(reported_status(&*txn, row.get(1), stored).await?);
+                correcting =
+                    crate::staging::partition_correction::correcting(&*txn, row.get(1)).await?;
                 // #687: an edit whose new field awaits a widen is stuck on
                 // capture as much as a registration is. Not one a schema change
                 // paused (#705): capture stops widening for it, and its field
@@ -853,6 +860,7 @@ impl Trellis {
                 ),
                 drain_failure,
                 unindexed_joins: unindexed,
+                correcting,
                 build_wait: row
                     .get::<_, Option<i64>>("build_fence")
                     .map(|xid| BuildWait::Fence { xid }),
@@ -1962,6 +1970,18 @@ pub struct DefinitionStatus {
     /// do. Read live on each call, so an index created since shows. Empty
     /// when there is none; see `docs/recommendations.md`.
     pub unindexed_joins: Vec<UnindexedJoin>,
+    /// The partitions of its partitioned source the definition is being
+    /// corrected for (ADR-0017): one entry per node whose attach, detach,
+    /// drop or truncate (or rows routing to no current leaf) the staging
+    /// worker's pass detected and queued a correction for, with when it was
+    /// queued and the keys left to re-derive. The definition reports
+    /// [`TransformStatus::Backfilling`] while one is listed, and once each
+    /// node's keys are re-derived and their changes folded into its target
+    /// it is `live` again. An entry leaves once its node's keys are
+    /// re-derived. Empty when nothing is being corrected, and for a
+    /// definition that is paused or quarantined: a correction that kept
+    /// failing is reported in [`DefinitionStatus::backfill_failure`].
+    pub correcting: Vec<CorrectingNode>,
     /// Set while the definition's Re-derive build waits on something other
     /// than its own work (#625 F6): see [`BuildWait`]. Cleared once the
     /// wait is over.

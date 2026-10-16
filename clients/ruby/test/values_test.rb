@@ -28,7 +28,7 @@ class ValuesTest < Minitest::Test
       backfill_failure: { source_table: "public.orders", attempts: 3,
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
       capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
-      unindexed_joins: []
+      unindexed_joins: [], correcting: []
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -40,7 +40,8 @@ class ValuesTest < Minitest::Test
       capture_failure: nil,
       held_keys: nil,
       drain_failure: nil,
-      unindexed_joins: []
+      unindexed_joins: [],
+      correcting: []
     ), status
   end
 
@@ -53,7 +54,7 @@ class ValuesTest < Minitest::Test
       capture_failure: { kind: :capture, source_table: "public.lines", columns: ["qty"],
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
-      drain_failure: nil, unindexed_joins: []
+      drain_failure: nil, unindexed_joins: [], correcting: []
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -69,7 +70,8 @@ class ValuesTest < Minitest::Test
       ),
       held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
       drain_failure: nil,
-      unindexed_joins: []
+      unindexed_joins: [],
+      correcting: []
     ), status
   end
 
@@ -79,7 +81,7 @@ class ValuesTest < Minitest::Test
       drain_failure: { seg_seq: 17, tables: ["public.lines", "public.orders"],
                        error: "permission denied for function audit_hook", sqlstate: "42501",
                        since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
-      unindexed_joins: []
+      unindexed_joins: [], correcting: []
     )
     assert_equal Trellis::DrainFailure.new(
       seg_seq: 17, tables: ["public.lines", "public.orders"],
@@ -120,9 +122,25 @@ class ValuesTest < Minitest::Test
 
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
-      drain_failure: nil, unindexed_joins: [join]
+      drain_failure: nil, unindexed_joins: [join], correcting: []
     )
     assert_equal expected, status.unindexed_joins
+  end
+
+  def test_a_node_under_correction_becomes_a_value_with_its_queue_time
+    status = Trellis::Status.from_native(
+      status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, unindexed_joins: [],
+      correcting: [{ node: "public.items_p1", since_micros: MICROS, keys_remaining: 5 },
+                   { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }]
+    )
+    assert_equal :backfilling, status.status
+    assert_equal [
+      Trellis::CorrectingNode.new(node: "public.items_p1", since: Trellis::EpochMicros.to_time(MICROS),
+                                  keys_remaining: 5),
+      Trellis::CorrectingNode.new(node: "public.items_p2", since: Trellis::EpochMicros.to_time(MICROS + 1),
+                                  keys_remaining: nil)
+    ], status.correcting
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure

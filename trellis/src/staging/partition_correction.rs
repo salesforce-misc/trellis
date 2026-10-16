@@ -121,7 +121,7 @@
 //! A to-many relationship's recompute is P4b.
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio_postgres::{GenericClient, IsolationLevel};
 
@@ -469,9 +469,69 @@ impl Progress {
         not(any(test, feature = "internals")),
         allow(dead_code, reason = "read by tests and embedders through `internals`")
     )]
-    pub fn keys_remaining(&self) -> Option<i64> {
-        self.keys_total.map(|t| (t - self.keys_done).max(0))
+    pub fn keys_remaining(&self) -> Option<u64> {
+        keys_remaining(self.keys_total, self.keys_done)
     }
+}
+
+/// Keys still to re-derive by the estimate, whatever the phase: `None` before
+/// the first page counted them, and never below zero, since the node phase's
+/// total is an estimate.
+fn keys_remaining(keys_total: Option<i64>, keys_done: i64) -> Option<u64> {
+    keys_total.map(|total| u64::try_from(total.saturating_sub(keys_done)).unwrap_or(0))
+}
+
+/// A node a definition is being corrected for: one entry of
+/// [`crate::DefinitionStatus::correcting`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectingNode {
+    /// The schema-qualified node the correction is for: the leaf or middle
+    /// partition that was attached, detached, dropped or truncated, or, for
+    /// rows that route to no current leaf, the source's root.
+    pub node: String,
+    /// When the staging worker's pass queued the correction.
+    pub since: SystemTime,
+    /// The keys still to re-derive for this definition, from its persisted
+    /// progress. `None` until the correction's first page has counted them.
+    /// An estimate while it walks the node's own rows.
+    pub keys_remaining: Option<u64>,
+}
+
+/// The nodes `definition_id` is being corrected for, oldest first: one per
+/// current, undone correction row of it (one a resume superseded,
+/// [`chunk_queue::STALE`], is not current), while the definition applies. A
+/// frozen definition's row is the record of why it froze, not a correction
+/// in progress.
+pub(crate) async fn correcting(
+    client: &impl GenericClient,
+    definition_id: i64,
+) -> Result<Vec<CorrectingNode>, tokio_postgres::Error> {
+    let rows = client
+        .query(
+            &format!(
+                "select c.node_name, c.queued_at, p.keys_total, coalesce(p.keys_done, 0) \
+                 from backfill_chunks bc \
+                 join transform_definitions d on d.id = bc.definition_id \
+                 join partition_corrections c on c.id = bc.correction_id \
+                 left join partition_correction_progress p \
+                   on p.correction_id = c.id and p.definition_id = d.id \
+                 where bc.definition_id = $1 and bc.kind = $2 and not bc.done \
+                   and not ({}) and {} \
+                 order by c.queued_at, c.id",
+                chunk_queue::STALE,
+                crate::defs::model::applying_sql("d"),
+            ),
+            &[&definition_id, &chunk_queue::KIND_CORRECTION],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| CorrectingNode {
+            node: row.get(0),
+            since: row.get(1),
+            keys_remaining: keys_remaining(row.get(2), row.get(3)),
+        })
+        .collect())
 }
 
 /// The progress of `definition_id` on correction `correction_id`, `None`
@@ -1682,6 +1742,15 @@ mod tests {
                 level_collation: collation.to_string(),
             }),
         }
+    }
+
+    #[test]
+    fn keys_remaining_is_uncounted_before_the_first_page_and_never_negative() {
+        assert_eq!(keys_remaining(None, 0), None);
+        assert_eq!(keys_remaining(Some(40), 35), Some(5));
+        assert_eq!(keys_remaining(Some(40), 40), Some(0));
+        // The node phase's total is an estimate the walk can pass.
+        assert_eq!(keys_remaining(Some(40), 52), Some(0));
     }
 
     #[test]

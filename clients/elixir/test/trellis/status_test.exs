@@ -23,7 +23,8 @@ defmodule Trellis.StatusTest do
         capture_failure: nil,
         held_keys: nil,
         drain_failure: nil,
-        unindexed_joins: []
+        unindexed_joins: [],
+        correcting: []
       })
 
     assert %Trellis.Status{
@@ -61,7 +62,8 @@ defmodule Trellis.StatusTest do
         },
         held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323},
         drain_failure: nil,
-        unindexed_joins: []
+        unindexed_joins: [],
+        correcting: []
       })
 
     assert %Trellis.Status{
@@ -106,7 +108,8 @@ defmodule Trellis.StatusTest do
           last_seen_micros: 1_727_222_400_654_322,
           attempts: 5
         },
-        unindexed_joins: []
+        unindexed_joins: [],
+        correcting: []
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -136,7 +139,8 @@ defmodule Trellis.StatusTest do
             column: "customer_id",
             fix: "create an index on public.orders (customer_id)"
           }
-        ]
+        ],
+        correcting: []
       })
 
     assert status.unindexed_joins == [
@@ -145,6 +149,36 @@ defmodule Trellis.StatusTest do
                table: "public.orders",
                column: "customer_id",
                fix: "create an index on public.orders (customer_id)"
+             }
+           ]
+  end
+
+  test "a node under correction becomes a struct with a DateTime" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :backfilling,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        unindexed_joins: [],
+        correcting: [
+          %{node: "public.items_p1", since_micros: 1_727_222_400_654_321, keys_remaining: 5},
+          %{node: "public.items_p2", since_micros: 1_727_222_400_654_322, keys_remaining: nil}
+        ]
+      })
+
+    assert status.correcting == [
+             %Trellis.CorrectingNode{
+               node: "public.items_p1",
+               since: ~U[2024-09-25 00:00:00.654321Z],
+               keys_remaining: 5
+             },
+             %Trellis.CorrectingNode{
+               node: "public.items_p2",
+               since: ~U[2024-09-25 00:00:00.654322Z],
+               keys_remaining: nil
              }
            ]
   end

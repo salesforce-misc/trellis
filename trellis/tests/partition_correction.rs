@@ -13,7 +13,7 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use drain_driver::Driver;
 use trellis::capture::partitions::{self, PendingCorrection};
@@ -24,6 +24,7 @@ use trellis::defs::chunk_queue;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::interleave::{PausePoint, PauseScope};
 use trellis::staging::partition_correction::{self, Options, Outcome};
+use trellis::{Config, CorrectingNode, TransformStatus, Trellis, TrellisOptions};
 
 const SOURCE: &str = "public.items";
 const DEFINITION: &str =
@@ -1355,6 +1356,126 @@ async fn a_worker_that_dies_before_the_last_page_commits_is_resumed_from_its_pro
     fx.settle_builds().await;
     assert_eq!(fx.status().await, "live");
     assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+}
+
+/// `Trellis::status` reports a definition under correction as `backfilling`,
+/// with a `correcting` entry for the node: its schema-qualified name, when
+/// the pass queued the correction, and the keys left by the persisted
+/// progress. A page that has not committed doesn't count. Once the last page
+/// commits the entry leaves, and once the deltas are folded the definition is
+/// `live` with nothing listed.
+#[tokio::test]
+async fn status_lists_the_node_under_correction_until_its_keys_drain() {
+    const KEY: i64 = 1_065_001;
+    let mut fx = Fx::start(&tree("range")).await;
+    let handle = Trellis::connect(
+        Config::from_dsn(fx.d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(
+        (status.status, status.correcting),
+        (TransformStatus::Live, Vec::new())
+    );
+
+    fx.exec("drop table public.items_p1").await;
+    fx.full_pass().await;
+    fx.d.settle().await;
+    let queued_at: SystemTime =
+        fx.d.ctl
+            .query_one("select queued_at from partition_corrections", &[])
+            .await
+            .expect("the correction")
+            .get(0);
+    let node = |keys_remaining| CorrectingNode {
+        node: "public.items_p1".to_string(),
+        since: queued_at,
+        keys_remaining,
+    };
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(status.status, TransformStatus::Backfilling);
+    assert_eq!(
+        status.correcting,
+        vec![node(None)],
+        "listed from the pass that queued it, uncounted before its first page"
+    );
+
+    // The leaf's 40 live entries in pages of seven: five pages commit.
+    let first = fx
+        .run(&Options {
+            page_keys: 7,
+            max_pages: Some(5),
+        })
+        .await;
+    assert_eq!((first.pages, first.keys, first.remaining), (5, 35, 1));
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(status.correcting, vec![node(Some(5))]);
+
+    // The next claim stops before its last page commits.
+    let holder = drain_driver::connect(fx.d.db.dsn()).await;
+    holder
+        .execute("select pg_advisory_lock($1)", &[&KEY])
+        .await
+        .expect("hold the pause");
+    let target: String =
+        fx.d.ctl
+            .query_one("select target_table from transform_definitions", &[])
+            .await
+            .expect("definition")
+            .get(0);
+    let scope = PauseScope::new();
+    let reached = scope.arm(PausePoint::BeforeCorrectionCommit, &target, KEY);
+    let pool = fx.d.pool().clone();
+    let worker = tokio::spawn(trellis::staging::interleave::with_scope(
+        scope,
+        async move {
+            partition_correction::run_pending(
+                &pool,
+                &Options {
+                    page_keys: 7,
+                    max_pages: None,
+                },
+            )
+            .await
+        },
+    ));
+    reached.await.expect("the last page reached its commit");
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(
+        (status.status, status.correcting),
+        (TransformStatus::Backfilling, vec![node(Some(5))]),
+        "the page that has not committed doesn't count"
+    );
+    holder
+        .execute("select pg_advisory_unlock($1)", &[&KEY])
+        .await
+        .expect("release");
+    let rest = worker
+        .await
+        .expect("the worker")
+        .expect("run the pending corrections");
+    assert_eq!(rest.completed, 1);
+    assert_eq!(
+        handle
+            .status("agg")
+            .await
+            .expect("status")
+            .expect("agg")
+            .correcting,
+        Vec::new(),
+        "its keys are re-derived"
+    );
+
+    fx.settle_builds().await;
+    let status = handle.status("agg").await.expect("status").expect("agg");
+    assert_eq!(
+        (status.status, status.correcting),
+        (TransformStatus::Live, Vec::new())
+    );
+    assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
+    handle.shutdown().await.expect("shut down");
 }
 
 /// One aggregate's correction keeps failing (its ledger refuses the

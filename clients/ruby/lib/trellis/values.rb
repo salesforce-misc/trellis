@@ -87,8 +87,15 @@ module Trellis
   # join columns of the relationships it reads that have no usable index
   # ([] when every one is indexed). It leaves status alone, and an index you
   # create shows on the next call.
+  #
+  # correcting lists the CorrectingNodes of its partitioned source it is being
+  # corrected for, oldest first ([] when none): a partition was attached,
+  # detached, dropped or truncated, and the definition re-derives the keys
+  # it touched. It reads :backfilling while one is listed, and :live again
+  # once they are re-derived and folded into its target. A paused or
+  # quarantined definition lists none.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
-                       :held_keys, :drain_failure, :unindexed_joins) do
+                       :held_keys, :drain_failure, :unindexed_joins, :correcting) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -101,7 +108,21 @@ module Trellis
           capture_failure: capture_failure && CaptureFailure.from_native(capture_failure),
           held_keys: held_keys && HeldKeys.from_native(held_keys),
           drain_failure: drain_failure && DrainFailure.from_native(drain_failure),
-          unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) })
+          unindexed_joins: hash.fetch(:unindexed_joins).map { |j| UnindexedJoin.new(**j) },
+          correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) })
+    end
+  end
+
+  # A node of a partitioned source a definition is being corrected for, as
+  # Trellis.status reports it: the schema-qualified node (node), when the
+  # staging worker queued its correction (since, a Time), and the keys still
+  # to re-derive (keys_remaining, nil until the correction has counted them;
+  # an estimate while it reads the node's own rows).
+  CorrectingNode = Data.define(:node, :since, :keys_remaining) do
+    def self.from_native(hash)
+      new(node: hash.fetch(:node),
+          since: EpochMicros.to_time(hash.fetch(:since_micros)),
+          keys_remaining: hash.fetch(:keys_remaining))
     end
   end
 

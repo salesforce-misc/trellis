@@ -69,7 +69,10 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
   columns of the relationships a transform reads that have no usable index
   (`unindexed_joins`, each a `Trellis.UnindexedJoin` with `relationship`,
   `table`, `column` and the `fix` sentence), a warning that never changes its
-  status.
+  status. `status/2` lists the partitions of a partitioned source a transform
+  is being corrected for while it reads `:backfilling` for them
+  (`correcting`, each a `Trellis.CorrectingNode` with `node`, `since` and
+  `keys_remaining`).
 - `request_backfill/2`, `has_live_drain_workers/1`,
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
 - `self_check/3` and `self_check_job/2`: check a target against a fresh

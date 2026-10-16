@@ -77,7 +77,10 @@ Nothing in the binding uses it.
   relationships a definition reads that have no usable index
   (`unindexed_joins`, each a `Trellis::UnindexedJoin` with `relationship`,
   `table`, `column` and the `fix` sentence), a warning that never changes its
-  status.
+  status. `status` lists the partitions of a partitioned source a definition
+  is being corrected for while it reads `:backfilling` for them
+  (`correcting`, each a `Trellis::CorrectingNode` with `node`, `since` and
+  `keys_remaining`).
 - `Trellis.request_backfill(source_table)`,
   `Trellis.has_live_drain_workers?`, `Trellis.has_live_staging_worker?`,
   `Trellis.watermark_token`, `Trellis.await_converged(token, timeout_ms:)`.

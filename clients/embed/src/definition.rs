@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 
 use trellis::{
-    BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, Definition, DefinitionStatus,
-    DefinitionSummary, DrainFailure, UnindexedJoin,
+    BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode, Definition,
+    DefinitionStatus, DefinitionSummary, DrainFailure, UnindexedJoin,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -121,6 +121,32 @@ pub struct PlainDefinitionStatus {
     /// The join columns of the relationships the definition reads that have
     /// no usable index; see [`DefinitionStatus::unindexed_joins`].
     pub unindexed_joins: Vec<PlainUnindexedJoin>,
+    /// The nodes of its partitioned source the definition is being corrected
+    /// for, oldest first; see [`DefinitionStatus::correcting`].
+    pub correcting: Vec<PlainCorrectingNode>,
+}
+
+/// A [`CorrectingNode`] flattened to plain data: a node of a partitioned
+/// source a definition is being corrected for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainCorrectingNode {
+    /// The schema-qualified node.
+    pub node: String,
+    /// When the correction was queued, as [`crate::epoch_micros`].
+    pub since_micros: i64,
+    /// The keys still to re-derive, `None` until the correction has counted
+    /// them.
+    pub keys_remaining: Option<u64>,
+}
+
+impl From<&CorrectingNode> for PlainCorrectingNode {
+    fn from(node: &CorrectingNode) -> Self {
+        PlainCorrectingNode {
+            node: node.node.clone(),
+            since_micros: epoch_micros(node.since),
+            keys_remaining: node.keys_remaining,
+        }
+    }
 }
 
 /// An [`UnindexedJoin`] flattened to plain data: a join column of a
@@ -223,6 +249,11 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .unindexed_joins
                 .iter()
                 .map(PlainUnindexedJoin::from)
+                .collect(),
+            correcting: status
+                .correcting
+                .iter()
+                .map(PlainCorrectingNode::from)
                 .collect(),
         }
     }
@@ -457,6 +488,7 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             unindexed_joins: Vec::new(),
+            correcting: Vec::new(),
             build_wait: None,
         };
 
@@ -470,6 +502,7 @@ mod tests {
                 held_keys: None,
                 drain_failure: None,
                 unindexed_joins: Vec::new(),
+                correcting: Vec::new(),
             }
         );
     }
@@ -489,6 +522,7 @@ mod tests {
             }),
             drain_failure: None,
             unindexed_joins: Vec::new(),
+            correcting: Vec::new(),
             build_wait: None,
         };
 
@@ -515,6 +549,7 @@ mod tests {
                 table: "public.orders".to_string(),
                 column: "customer_id".to_string(),
             }],
+            correcting: Vec::new(),
             build_wait: None,
         };
 
@@ -526,6 +561,51 @@ mod tests {
                 column: "customer_id".to_string(),
                 fix: "create an index on public.orders (customer_id)".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn a_correcting_node_crosses_with_its_queue_time_in_microseconds() {
+        let status = DefinitionStatus {
+            status: TransformStatus::Backfilling,
+            backfill_failure: None,
+            capture_wait: None,
+            capture_failure: None,
+            held_keys: None,
+            drain_failure: None,
+            unindexed_joins: Vec::new(),
+            correcting: vec![
+                CorrectingNode {
+                    node: "public.items_p1".to_string(),
+                    since: UNIX_EPOCH + Duration::from_micros(1_727_222_400_123_456),
+                    keys_remaining: Some(5),
+                },
+                CorrectingNode {
+                    node: "public.items_p2".to_string(),
+                    since: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
+                    keys_remaining: None,
+                },
+            ],
+            build_wait: None,
+        };
+
+        let plain = PlainDefinitionStatus::from(&status);
+
+        assert_eq!(plain.status, "backfilling");
+        assert_eq!(
+            plain.correcting,
+            vec![
+                PlainCorrectingNode {
+                    node: "public.items_p1".to_string(),
+                    since_micros: 1_727_222_400_123_456,
+                    keys_remaining: Some(5),
+                },
+                PlainCorrectingNode {
+                    node: "public.items_p2".to_string(),
+                    since_micros: 1_727_222_400_654_321,
+                    keys_remaining: None,
+                },
+            ]
         );
     }
 
@@ -548,6 +628,7 @@ mod tests {
                 attempts: 5,
             }),
             unindexed_joins: Vec::new(),
+            correcting: Vec::new(),
             build_wait: None,
         };
 
@@ -580,6 +661,7 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             unindexed_joins: Vec::new(),
+            correcting: Vec::new(),
             build_wait: None,
         };
 
@@ -598,6 +680,7 @@ mod tests {
                 held_keys: None,
                 drain_failure: None,
                 unindexed_joins: Vec::new(),
+                correcting: Vec::new(),
             }
         );
     }
@@ -626,6 +709,7 @@ mod tests {
             held_keys: None,
             drain_failure: None,
             unindexed_joins: Vec::new(),
+            correcting: Vec::new(),
             build_wait: None,
         };
 

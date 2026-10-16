@@ -63,10 +63,10 @@ use magnus::{
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
-    PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
-    PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys, PlainPoisonEntry,
-    PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
-    PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
+    PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinition, PlainDefinitionStatus,
+    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainUnindexedJoin, SELF_CHECK_MODES,
     SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
     decode_watermark, encode_watermark, quarantine_state_names, relationship_cardinality_names,
     require_transform_statement, self_check_mode, system_time_from_epoch_micros,
@@ -925,6 +925,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .map(|failure| drain_failure_hash(ruby, failure))
         .transpose()?;
     let unindexed_joins = array(ruby, status.unindexed_joins, unindexed_join_hash)?;
+    let correcting = array(ruby, status.correcting, correcting_hash)?;
     record(
         ruby,
         [
@@ -935,6 +936,19 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failure", ruby.into_value(drain_failure)),
             ("unindexed_joins", unindexed_joins.as_value()),
+            ("correcting", correcting.as_value()),
+        ],
+    )
+}
+
+/// A node of a partitioned source a definition is being corrected for.
+fn correcting_hash(ruby: &Ruby, node: PlainCorrectingNode) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("node", ruby.into_value(node.node)),
+            ("since_micros", ruby.into_value(node.since_micros)),
+            ("keys_remaining", ruby.into_value(node.keys_remaining)),
         ],
     )
 }

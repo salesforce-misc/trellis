@@ -39,6 +39,13 @@ defmodule Trellis.Status do
   index, `[]` when every one is indexed. It leaves `status` alone, and an
   index you create shows on the next call.
 
+  `correcting` lists a `Trellis.CorrectingNode` for each partition of its
+  partitioned source it is being corrected for, oldest first (`[]` when
+  none): a partition was attached, detached, dropped or truncated, and the
+  transform re-derives the keys it touched. It reads `:backfilling` while one
+  is listed, and `:live` again once they are re-derived and folded into its
+  target. A paused or quarantined transform lists none.
+
   Every process sees them, whichever one runs the staging worker.
   """
 
@@ -53,7 +60,8 @@ defmodule Trellis.Status do
           capture_failure: Trellis.CaptureFailure.t() | nil,
           held_keys: Trellis.HeldKeys.t() | nil,
           drain_failure: Trellis.DrainFailure.t() | nil,
-          unindexed_joins: [Trellis.UnindexedJoin.t()]
+          unindexed_joins: [Trellis.UnindexedJoin.t()],
+          correcting: [Trellis.CorrectingNode.t()]
         }
 
   @enforce_keys [
@@ -63,7 +71,8 @@ defmodule Trellis.Status do
     :capture_failure,
     :held_keys,
     :drain_failure,
-    :unindexed_joins
+    :unindexed_joins,
+    :correcting
   ]
   defstruct @enforce_keys
 
@@ -75,7 +84,8 @@ defmodule Trellis.Status do
         capture_failure: capture_failure,
         held_keys: held_keys,
         drain_failure: drain_failure,
-        unindexed_joins: unindexed_joins
+        unindexed_joins: unindexed_joins,
+        correcting: correcting
       }) do
     %__MODULE__{
       status: status,
@@ -84,7 +94,36 @@ defmodule Trellis.Status do
       capture_failure: capture_failure && Trellis.CaptureFailure.from_native(capture_failure),
       held_keys: held_keys && Trellis.HeldKeys.from_native(held_keys),
       drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure),
-      unindexed_joins: Enum.map(unindexed_joins, &Trellis.UnindexedJoin.from_native/1)
+      unindexed_joins: Enum.map(unindexed_joins, &Trellis.UnindexedJoin.from_native/1),
+      correcting: Enum.map(correcting, &Trellis.CorrectingNode.from_native/1)
+    }
+  end
+end
+
+defmodule Trellis.CorrectingNode do
+  @moduledoc """
+  A partition of a partitioned source a transform is being corrected for, as
+  `Trellis.status/2` reports it: the schema-qualified `node`, when the staging
+  worker queued its correction (`since`), and the keys still to re-derive
+  (`keys_remaining`, `nil` until the correction has counted them; an estimate
+  while it reads the node's own rows).
+  """
+
+  @type t :: %__MODULE__{
+          node: String.t(),
+          since: DateTime.t(),
+          keys_remaining: non_neg_integer() | nil
+        }
+
+  @enforce_keys [:node, :since, :keys_remaining]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{node: node, since_micros: since, keys_remaining: keys_remaining}) do
+    %__MODULE__{
+      node: node,
+      since: Trellis.Time.from_micros(since),
+      keys_remaining: keys_remaining
     }
   end
 end

@@ -245,6 +245,26 @@ pause are arcs of one lifecycle:
   for a shape neither build can render) never shows this status: it goes from
   `waiting_to_backfill` straight to `live` in the discharge's own transaction (or
   to `catching_up`, when its source is another transform's target).
+  A `live` aggregate over a partitioned source comes back here while it is
+  corrected for a partition of its source that was attached, detached, dropped
+  or truncated, or for rows left in its target that route to no current
+  partition ([ADR-0017](decisions/0017-partitioned-sources.md)). The staging
+  worker pass that detects the change queues the correction and moves the
+  transform `backfilling` in the same transaction; until that pass, at most one
+  pass after the DDL, it still reads `live`. It goes back to `live` once the
+  correction's keys are re-derived and folded into its target, as at the end of
+  a Re-derive build. The correction's progress is persisted, so a restart
+  resumes it and the transform still reads `backfilling`.
+  `DefinitionStatus::correcting` lists one entry per partition it is being
+  corrected for, oldest first: `node`, the schema-qualified partition (the
+  source's root, for rows that route to no partition); `since`, when the pass
+  queued the correction; and `keys_remaining`, the keys still to re-derive from
+  the correction's persisted progress (`None` until its first page has counted
+  them, and an estimate while it reads the partition's own rows). An entry
+  leaves once its keys are re-derived. A paused or quarantined transform lists
+  none; a correction that keeps failing is reported in `backfill_failure`. The
+  CLI's `trellis status` prints one `correcting` line per entry under the
+  transform.
 * **`catching_up`** — the build has finished and apply maintains the
   transform exactly as a `live` one, but a go-live catch-up (a re-read of a
   table it reads, parked as a `pending_backfill` marker) hasn't been

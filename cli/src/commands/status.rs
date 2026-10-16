@@ -20,7 +20,8 @@
 //! drain keeps failing on with nothing charged or paused, if one holds it
 //! back (`drain_failure` from [`Trellis::status`], issue #817), and one per
 //! join column of a relationship it reads that has no usable index
-//! (`unindexed_joins`, issue #973) — and every
+//! (`unindexed_joins`, issue #973), and one per node of its partitioned
+//! source it is being corrected for (`correcting`, ADR-0017) — and every
 //! relationship ([`Trellis::relationships`]). Finer-grained per-`(transform,
 //! column)` pause state (docs/decisions/0008-public-api-design.md's
 //! decision 5 and
@@ -42,8 +43,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
-    Config, DefinitionSummary, DrainFailure, RelationshipSummary, Trellis, TrellisOptions,
-    UnindexedJoin,
+    Config, CorrectingNode, DefinitionSummary, DrainFailure, RelationshipSummary, Trellis,
+    TrellisOptions, UnindexedJoin,
 };
 
 use super::release::shell_quote;
@@ -123,9 +124,9 @@ even though the engine tracks it.";
 /// then [`STATUS_NOTE`].
 async fn report(trellis: &Trellis) -> Result<String, String> {
     let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
-    // `definitions()` doesn't carry a drain failure or the unindexed join
-    // columns, so each definition's own status is read for them, by the bare
-    // target name `status` takes.
+    // `definitions()` doesn't carry a drain failure, the unindexed join
+    // columns or the nodes under correction, so each definition's own status
+    // is read for them, by the bare target name `status` takes.
     let mut listed = Vec::with_capacity(definitions.len());
     for def in definitions {
         let status = trellis
@@ -135,6 +136,7 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
         let warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
             drain_failure: status.drain_failure,
             unindexed_joins: status.unindexed_joins,
+            correcting: status.correcting,
         });
         listed.push((def, warnings));
     }
@@ -192,11 +194,13 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
 struct StatusWarnings {
     drain_failure: Option<DrainFailure>,
     unindexed_joins: Vec<UnindexedJoin>,
+    correcting: Vec<CorrectingNode>,
 }
 
 /// One line per definition, each followed by an indented line per thing
 /// holding it back: a failing backfill, a halt, and the drain failure its
-/// status reports, if any; then one per join column without an index.
+/// status reports, if any; then one per node it is being corrected for, and
+/// one per join column without an index.
 fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> String {
     if definitions.is_empty() {
         return "  no transform definitions registered\n".to_string();
@@ -243,6 +247,12 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
             if let Some(failure) = &warnings.drain_failure {
                 line.push_str(&format_drain_failure(failure));
             }
+            // ADR-0017: why a definition reads `backfilling` with no build
+            // of its own asked for: a partition of its source was attached,
+            // detached, dropped or truncated, and its keys are re-derived.
+            for node in &warnings.correcting {
+                line.push_str(&format_correcting(node));
+            }
             // #973: a warning only. The definition reads the column
             // regardless; each read of it scans the table until the index
             // exists. See docs/recommendations.md.
@@ -260,6 +270,18 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
 /// a name holding a `.` of its own.
 fn bare_target(qualified: &str) -> &str {
     qualified.split('.').nth(1).unwrap_or(qualified)
+}
+
+fn format_correcting(node: &CorrectingNode) -> String {
+    let remaining = node
+        .keys_remaining
+        .map_or(String::new(), |keys| format!(" keys_remaining={keys}"));
+    format!(
+        "    correcting {} since={}{}\n",
+        node.node,
+        format_timestamp(node.since),
+        remaining
+    )
 }
 
 fn format_unindexed_join(join: &UnindexedJoin) -> String {
@@ -579,6 +601,42 @@ mod tests {
              warning: relationship items joins on public.order_items.order_id, \
              which has no usable index; \
              create an index on public.order_items (order_id)\n"
+        );
+    }
+
+    #[test]
+    fn each_node_under_correction_is_shown_under_its_definition() {
+        let def = DefinitionSummary {
+            id: 7,
+            target_table: "public.order_totals".to_string(),
+            source_table: "public.orders".to_string(),
+            source_version: 1,
+            status: trellis::TransformStatus::Backfilling,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        };
+        let warnings = StatusWarnings {
+            correcting: vec![
+                CorrectingNode {
+                    node: "public.orders_2026".to_string(),
+                    since: UNIX_EPOCH + Duration::from_secs(60),
+                    keys_remaining: Some(1200),
+                },
+                CorrectingNode {
+                    node: "public.orders_2027".to_string(),
+                    since: UNIX_EPOCH + Duration::from_secs(90),
+                    keys_remaining: None,
+                },
+            ],
+            ..StatusWarnings::default()
+        };
+        assert_eq!(
+            format_definitions(&[(def, warnings)]),
+            "  id=7 source=public.orders target=public.order_totals \
+             status=backfilling created_at=1970-01-01 00:00:00 UTC\n    \
+             correcting public.orders_2026 since=1970-01-01 00:01:00 UTC keys_remaining=1200\n    \
+             correcting public.orders_2027 since=1970-01-01 00:01:30 UTC\n"
         );
     }
 
