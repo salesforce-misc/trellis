@@ -922,6 +922,86 @@ async fn measure_a_correction_of_a_million_row_leaf() {
     assert_eq!(fx.wrong_groups().await, Vec::<String>::new());
 }
 
+/// A page's Re-derive reads each key's source row once, whether the rows
+/// are all there (an attached leaf's keys, the node phase's) or none is (a
+/// dropped leaf's), #1085. Joining the keys to the source and then the keys
+/// to that join, the planner estimated the first join at one row and put it
+/// on the inner side of a nested loop over the keys: materialized and
+/// compared with every key (16.8 s for a page of 10,000 present keys), or
+/// rescanned per key. The check is on `explain analyze`'s actual counts, so
+/// it is deterministic: no node handles more rows over all its loops than
+/// twice the page.
+#[tokio::test]
+async fn a_rederive_page_reads_each_key_once_whether_or_not_its_row_is_there() {
+    const PAGE: usize = 2_000;
+    let mut over = Vec::new();
+    for op in ["present", "dropped"] {
+        let fx = Fx::start(
+            "create table public.items (id integer not null, g integer not null, \
+                 v integer not null, primary key (g, id)) partition by range (g); \
+             create table public.items_p0 partition of public.items for values from (0) to (10000); \
+             create table public.items_p1 partition of public.items \
+                 for values from (10000) to (20000); \
+             create table public.items_p2 partition of public.items \
+                 for values from (20000) to (30000); \
+             insert into public.items select i, i % 30000, i from generate_series(1, 60000) i; \
+             analyze public.items;",
+        )
+        .await;
+        if op == "dropped" {
+            fx.exec("drop table public.items_p1").await;
+        }
+        let keys: Vec<String> =
+            fx.d.ctl
+                .query(
+                    "select __from_key from public.agg__ledger \
+                     where g >= 10000 and g < 20000 order by g, __from_key limit $1",
+                    &[&i64::try_from(PAGE).expect("a page")],
+                )
+                .await
+                .expect("the leaf's keys")
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+        assert_eq!(keys.len(), PAGE);
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let plan = fx.d.build_plan("agg").await;
+        let mut client = fx.d.pool().get().await.expect("pool");
+        let txn = client.transaction().await.expect("begin");
+        let plans = build::explain_sweep(&txn, &plan, &keys, "analyze, timing off, buffers off")
+            .await
+            .expect("explain the Re-derive");
+        txn.rollback().await.expect("roll back");
+        for explained in plans {
+            if explained.lines().any(|line| handled_rows(line) > 2 * PAGE) {
+                over.push(format!("{op}:\n{explained}"));
+            }
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "a node handled more than twice the page:\n{}",
+        over.join("\n")
+    );
+}
+
+/// The rows an `explain analyze` line's node handled over all its loops: its
+/// actual `rows=` times its `loops=`.
+fn handled_rows(line: &str) -> usize {
+    let Some(actual) = line.split("(actual ").nth(1) else {
+        return 0;
+    };
+    let figure = |name: &str| -> usize {
+        actual
+            .split(name)
+            .nth(1)
+            .and_then(|rest| rest.split([' ', ')']).next())
+            .and_then(|n| n.parse::<f64>().ok())
+            .map_or(0, |n| n as usize)
+    };
+    figure("rows=") * figure("loops=")
+}
+
 /// A `HASH` leaf's text embeds its parent's oid. A middle dropped before the
 /// leaf's correction has run takes that oid with it, and the middle's own
 /// correction routes every group of its bound, the leaf's among them.

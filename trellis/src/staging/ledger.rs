@@ -1421,7 +1421,11 @@ fn ledger_statement(
 /// is older than the fence of the newest one it does see: that fence sees
 /// every change the snapshot sees.
 pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: &str) -> String {
-    rederive_statement(plan, &chunk_source_filter(plan, range_where, keys), keys)
+    rederive_statement(
+        plan,
+        SourceRead::Joined(&chunk_source_filter(plan, range_where, keys)),
+        keys,
+    )
 }
 
 /// A rebuild's sweep batch's statement for one [`SweepGroup`] (#625 F3;
@@ -1441,6 +1445,15 @@ pub(super) fn chunk_statement(plan: &LedgerTargetPlan, range_where: &str, keys: 
 /// per column) would leave all but the key's first column out of the
 /// index's condition, reading every source row that shares that column
 /// with the key.
+///
+/// Each key reads its row in a `left join lateral` of its own
+/// ([`SourceRead::Probed`]), so the read is linear in the keys whatever the
+/// planner expects to find (#1085). Joining the keys to the source first,
+/// and then the keys to that join's result, left the planner estimating
+/// the first join at one row (an `unnest` has no statistics), and it put
+/// that join on the inner side of a nested loop over the keys: rescanned
+/// per key, or materialized and compared with every key. Either is
+/// quadratic in the page: 16.8 s for 10,000 keys whose rows were all there.
 pub(super) fn sweep_statement(plan: &LedgerTargetPlan, nulls: &[bool]) -> String {
     let mut on = Vec::with_capacity(plan.source_pk.len());
     let mut arrays = Vec::new();
@@ -1462,12 +1475,32 @@ pub(super) fn sweep_statement(plan: &LedgerTargetPlan, nulls: &[bool]) -> String
     }
     // A key that is `NULL` in every column (one at most: the source's index
     // is `NULLS NOT DISTINCT`) binds no column.
-    let keys = if arrays.is_empty() {
-        "(select) as u".to_string()
-    } else {
-        format!("unnest({}) as u({})", arrays.join(", "), columns.join(", "))
-    };
-    rederive_statement(plan, &format!("join {keys} on {}", on.join(" and ")), "$1")
+    let keys_from = format!(
+        "unnest($1::text[]{}) as u(__k{})",
+        arrays.iter().map(|a| format!(", {a}")).collect::<String>(),
+        columns.iter().map(|c| format!(", {c}")).collect::<String>(),
+    );
+    rederive_statement(
+        plan,
+        SourceRead::Probed {
+            keys_from,
+            on: on.join(" and "),
+        },
+        "$1",
+    )
+}
+
+/// How a Re-derive's read ([`rederive_read_ctes`]) reaches its keys' source
+/// rows.
+enum SourceRead<'a> {
+    /// A chunk's: what follows `from <source> s` to pick the keys' rows (a
+    /// join to the keys and a range filter), and the keys then joined to
+    /// those rows by their encoded key.
+    Joined(&'a str),
+    /// A sweep's: `keys_from` is the `from` item that yields each key as
+    /// `u.__k` and its typed parts, and `on` matches a source row `s` to
+    /// them. Each key reads its row in a `left join lateral` of its own.
+    Probed { keys_from: String, on: String },
 }
 
 /// The keys of a sweep batch that are `NULL` in the same primary-key
@@ -1517,12 +1550,11 @@ pub(super) fn sweep_groups<'a>(
     Ok(groups.into_values().collect())
 }
 
-/// [`chunk_statement`] and [`sweep_statement`]'s shared body. `src_from` is
-/// what follows `from <source> s` in the source read: the join and filter
-/// that pick the keys' rows. `keys` is the locked keys' `text[]` parameter,
+/// [`chunk_statement`] and [`sweep_statement`]'s shared body. `read` is how
+/// the source read reaches the keys' rows. `keys` is the locked keys' `text[]` parameter,
 /// which also bounds the entry rewrite's read of the ledger. The caller runs
 /// it under [`ENTRY_PLAN_SETTINGS`] (#778).
-fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> String {
+fn rederive_statement(plan: &LedgerTargetPlan, read: SourceRead<'_>, keys: &str) -> String {
     let shape = &plan.shape;
     let q = |c: &str| quote_ident(c);
     let (groups, args) = entry_columns(shape);
@@ -1545,7 +1577,7 @@ fn rederive_statement(plan: &LedgerTargetPlan, src_from: &str, keys: &str) -> St
              insert into {deltas} ({delta_cols}) select {delta_cols} from d \
          ) \
          select (select count(*) from upd), (select count(*) from d)",
-        reads = rederive_read_ctes(plan, src_from, keys, None),
+        reads = rederive_read_ctes(plan, read, keys, None),
         old = old_cte(plan, keys),
         ledger = plan.ledger_ident,
         set_values = set_values.join(", "),
@@ -1641,7 +1673,7 @@ pub(super) fn chunk_insert_statement(
                 (select count(*) from d)",
         reads = rederive_read_ctes(
             plan,
-            &chunk_source_filter(plan, range_where, keys),
+            SourceRead::Joined(&chunk_source_filter(plan, range_where, keys)),
             keys,
             pause
         ),
@@ -1688,15 +1720,15 @@ fn delta_columns(shape: &LedgerShape) -> Vec<String> {
     columns
 }
 
-/// A build Re-derive's read, as the `snap`, `src` and `v` CTEs:
+/// A build Re-derive's read, as the `snap` and `v` CTEs, and for a
+/// [`SourceRead::Joined`] read a `src` CTE between them:
 /// `pg_current_snapshot()` and the newest segment's `seg_seq` (`snap`), the
-/// keys' source rows (`src`; `src_from` follows `from <source> s`), and per
-/// key of `keys` (a `text[]` parameter) whether it has a row and its
-/// entry's values from it (`v`). `pause` adds a test's pause lock to `snap`
-/// ([`chunk_insert_statement`]).
+/// keys' source rows (`src`), and per key of `keys` (a `text[]` parameter)
+/// whether it has a row and its entry's values from it (`v`). `pause` adds
+/// a test's pause lock to `snap` ([`chunk_insert_statement`]).
 fn rederive_read_ctes(
     plan: &LedgerTargetPlan,
-    src_from: &str,
+    read: SourceRead<'_>,
     keys: &str,
     pause: Option<i64>,
 ) -> String {
@@ -1722,22 +1754,34 @@ fn rederive_read_ctes(
     let pause = pause.map_or(String::new(), |key| {
         format!(", pg_catalog.pg_advisory_xact_lock_shared({key}::bigint) as __pause")
     });
+    let select_src = format!(
+        "select {k_expr} as __k, {src_cols} from {source} s{joins}",
+        source = ddl::qualified_source_table(&plan.source_table),
+        joins = shape.joins,
+        src_cols = src_cols.join(", "),
+    );
+    let r_cols = prefixed(&values, "r");
+    let reads = match read {
+        SourceRead::Joined(src_from) => format!(
+            "src as ({select_src} {src_from}), \
+             v as ( \
+                 select u.__k, r.__k is not null as __present, {r_cols} \
+                 from unnest({keys}::text[]) as u(__k) left join src r on r.__k = u.__k \
+             )"
+        ),
+        SourceRead::Probed { keys_from, on } => format!(
+            "v as ( \
+                 select u.__k, r.__k is not null as __present, {r_cols} \
+                 from {keys_from} left join lateral ({select_src} where {on}) r on true \
+             )"
+        ),
+    };
     format!(
         "snap as ( \
              select pg_catalog.pg_current_snapshot() as __snap, \
                     (select max(seg_seq) from segments) as __seg{pause} \
          ), \
-         src as ( \
-             select {k_expr} as __k, {src_cols} from {source} s{joins} {src_from} \
-         ), \
-         v as ( \
-             select u.__k, r.__k is not null as __present, {r_cols} \
-             from unnest({keys}::text[]) as u(__k) left join src r on r.__k = u.__k \
-         )",
-        source = ddl::qualified_source_table(&plan.source_table),
-        joins = shape.joins,
-        src_cols = src_cols.join(", "),
-        r_cols = prefixed(&values, "r"),
+         {reads}"
     )
 }
 

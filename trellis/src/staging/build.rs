@@ -853,6 +853,39 @@ pub async fn explain_merge(
         .join("\n"))
 }
 
+/// The plans of [`rederive_keys`]'s statements over `keys` (encoded), as
+/// `explain ({options})`'s text, one per pattern of `NULL` parts among
+/// `keys`, under the settings [`rederive_keys`] runs them with. For tests
+/// of the plans' shape. With `analyze` among `options` the statements run,
+/// so the caller rolls `txn` back.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_sweep(
+    txn: &Transaction<'_>,
+    plan: &BuildPlan,
+    keys: &[&str],
+    options: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let mut plans = Vec::new();
+    for group in ledger::sweep_groups(&plan.ledger, keys)? {
+        let rows = ledger::query_by_entry_key(
+            txn,
+            &format!(
+                "explain ({options}) {}",
+                ledger::sweep_statement(&plan.ledger, &group.nulls)
+            ),
+            &group.params(),
+        )
+        .await?;
+        plans.push(
+            rows.iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    Ok(plans)
+}
+
 /// The plans of a build's Re-derive statements over `keys` (encoded, as a
 /// chunk's key read returns them), as `explain`'s text, each labelled,
 /// under the settings a chunk and a sweep batch run them with (#778): the
