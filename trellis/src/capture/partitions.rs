@@ -891,7 +891,7 @@ async fn read_tree(
     }
 }
 
-async fn read_tree_once(
+pub(crate) async fn read_tree_once(
     client: &mut Client,
     table: &str,
 ) -> Result<Option<(PartitionTree, i32, Recorded)>, tokio_postgres::Error> {
